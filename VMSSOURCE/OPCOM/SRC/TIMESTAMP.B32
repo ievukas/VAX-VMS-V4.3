@@ -1,0 +1,618 @@
+MODULE	OPC$TIMESTAMP	(
+			 LANGUAGE (BLISS32),
+			 IDENT = 'V04-000'
+			) =
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:
+!
+!	OPCOM
+!
+! ABSTRACT:
+!
+!	This module contains all the various and sundry general
+!	purpose utility routines used by OPCOM's request handlers.
+!
+! Environment:
+!
+!	VAX/VMS operating system.
+!
+! Author:
+!
+!	Steven T. Jeffreys
+!
+! Creation date:
+!
+!	March 10, 1981
+!
+! Revision history:
+!
+!	V03-005	CWH3005		CW Hobbs 			25-Jul-1984
+!		Tune the workset purge algorithm to eliminate purges on
+!		a quiet OPCOM.
+!
+!	V03-004	CWH3169		CW Hobbs			5-May-1984
+!		Second pass for cluster-wide OPCOM:
+!		 - Slow from 15 second timestamps to 5 minute timestamps.
+!		 - No longer do configures during a timestamp.
+!		 - Purge the working set on an hourly basis.
+!
+!	V03-003	CWH3003		CW Hobbs			16-Sep-1983
+!		Clear ioerr flag at each timestamp
+!
+!	V03-002	CWH3002		CW Hobbs			30-Jul-1983
+!		Various and sundry things to make OPCOM distributed
+!		across the cluster.
+!
+!	V03-001	STJ3031		Steven T. Jeffreys,		05-Oct-1982
+!		- Added the IMPLICITLY_CANCELED routine.
+!		- Added the IMPLIED_CANCEL routine.
+!		- Added the IMPLIED_DISABLE dummy routine.
+!		- Flush the logfile if it has been written to.
+!
+!--
+
+BEGIN						! Start of TIMESTAMP
+
+LIBRARY	'SYS$LIBRARY:LIB.L32';
+LIBRARY 'LIB$:OPCOMLIB';
+
+FORWARD ROUTINE
+	TIME_STAMP	: NOVALUE,	! Periodic wakeup routine
+	IMPLICITLY_CANCELED,		! Determine if request canceled
+	IMPLIED_CANCEL	: NOVALUE,	! Perform implicit request cancellation
+	IMPLIED_DISABLE	: NOVALUE;	! Perform implicit operator disable
+
+BUILTIN
+	INSQUE,				! Insert entry onto a queue
+	REMQUE;				! Remove entry from a queue
+
+
+GLOBAL ROUTINE TIME_STAMP : NOVALUE =
+
+!++
+! Functional description:
+!
+!	TIME_STAMP is an AST service routine that is executed periodically
+!	to cause OPCOM to perform its periodic timestamp function and then
+!	issue another timer AST request.  The timestamp function is to remind
+!	all operators of outstanding requests.  If the operator has the
+!	NOREMIND option set, then the operator will not be reminded.
+!	TIME_STAMP uses an interlock mechanism to insure that the timestamp
+!	will not occur at an inappropriate time for OPCOM.
+!	
+!	No timestamp message is explicitly logged, but messages may be logged
+!	as operators are implicitly disabled and requests are canceled.
+!
+! Input:
+!
+!	None.
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of TIME_STAMP
+
+EXTERNAL ROUTINE
+	ALLOCATE_DS,				! Get structure
+	CLUSMSG_ACK_PLEASE,			! Request acknowledgement from a remote node
+	CLUSMSG_STATE_SEND,			! Tell cluster about current operators and requests
+	DEALLOCATE_RQCB,			! Return RQCB structure
+	FORMAT_MESSAGE,				! Format a message
+	LOG_MESSAGE,				! Send a message to the log file
+	NOTIFY_LISTED_OPERATORS;		! Notify a given operator
+
+EXTERNAL LITERAL
+	RQCB_K_TYPE,				! Type code for RQCB structure
+	MIN_SCOPE,				! Minimum scope value
+	MAX_SCOPE;				! Maximum scope value
+
+EXTERNAL
+	LOGFILE_RAB	: $bblock,		! RAB for operator logfile
+	OCD_VECTOR	: VECTOR,		! OCD list heads
+	GLOBAL_STATUS	: BITVECTOR,		! Global status bits for OPCOM
+	NOD_HEAD	: VECTOR [2, LONG],	! Head of node queue
+	WAIT_DELTA	: $ref_bblock,		! Delta time quadword
+	SYI_SWPOUTPGCNT	: LONG,			! Swap out page count
+	LOGTIME_COUNTER	: LONG;			! Counter for log file timestamp messages
+
+GLOBAL						! Make it easy to find with SDA
+	PURGE_LIMIT	: LONG;			! Purge work set if above this value
+
+OWN
+	GPGCNT		: LONG,			! Global pages in working set
+	PPGCNT		: LONG,			! Process pages in working set
+	JPI_WSITEMS	: VECTOR [8, LONG]	! Item list to get working set items
+			PRESET ([0] = (jpi$_gpgcnt^16 OR 4),
+				[1] = GPGCNT,
+				[2] = 0,
+				[3] = (jpi$_ppgcnt^16 OR 4),
+				[4] = PPGCNT,
+				[5] = 0,
+				[6] = 0,		! End of item list, head of $PURGWS addr desc
+				[7] = %X'7FFFFFFF');	! End of $PURGWS addr desc
+
+LOCAL
+	RQST		: $ref_bblock,		! RQCB (request) data structure
+	NEXT_RQST	: $ref_bblock,		! ditto
+	RQST_COUNT	: LONG,			! Count of requests in list
+	NOD		: $ref_bblock,		! Node data structure
+	OCD		: $ref_bblock,		! OCD data structure
+	NEXT_OCD	: $ref_bblock,		! ditto
+	OCD_COUNT	: LONG,			! Count of OCDs in list
+	STATUS		: LONG;
+
+!
+! If shutdown is pending, then do nothing.
+!
+IF .GLOBAL_STATUS [GBLSTS_K_SHUTDOWN_PENDING]
+THEN
+    BEGIN
+    GLOBAL_STATUS [GBLSTS_K_TIMESTAMP_PENDING] = FALSE;
+    RETURN;
+    END;
+!
+! Set GBLSTS_K_TIMESTAMP_PENDING.  If OPCOM is busy, then return.
+! If not, then set GBLSTS_K_BUSY to prevent another timestamp AST from arriving.
+!
+GLOBAL_STATUS [GBLSTS_K_TIMESTAMP_PENDING] = TRUE;
+IF .GLOBAL_STATUS [GBLSTS_K_BUSY]
+THEN
+    RETURN;
+GLOBAL_STATUS [GBLSTS_K_BUSY] = TRUE;
+
+!
+! Every twelve timestamps (once an hour), stamp the log file.  Also, since we might
+! have a lot of garbage sitting in memory, flush the working set so that we do not
+! eat up unnecessary pages on small systems.
+!
+IF (LOGTIME_COUNTER = .LOGTIME_COUNTER + 1) GEQ 12
+THEN
+    BEGIN
+    !+
+    ! Start of 60 minute timestamp
+    !-
+    LOCAL
+	MSGVEC : VECTOR [2, LONG],	! Temporary vector for message
+	LOG_RQCB : $ref_bblock;
+    LOGTIME_COUNTER = 0;
+    IF ALLOCATE_DS (RQCB_K_TYPE, LOG_RQCB)
+    THEN
+	BEGIN
+	MSGVEC [0] = OPC$_LOGTIME;
+	MSGVEC [1] = 0;
+	FORMAT_MESSAGE (.LOG_RQCB, MSGVEC);
+	LOG_MESSAGE (.LOG_RQCB);
+	DEALLOCATE_RQCB (.LOG_RQCB);
+	END;
+    !
+    ! Flush the working set, but first check to make sure that we are big enough to need it
+    ! Note also that by flushing before the 5 minute section, we will most likely fault in
+    ! the code and data needed by the timestamp from the lists, rather than doing real I/O.
+    !
+    IF NOT (STATUS = $GETJPI (ITMLST=JPI_WSITEMS))
+    THEN
+	$signal_stop (.STATUS);
+    IF .PPGCNT+.GPGCNT GTR .PURGE_LIMIT
+    THEN
+	BEGIN
+	PURGE_LIMIT = 0;			! Reset so we will recalculate what we need
+	$PURGWS (INADR=JPI_WSITEMS[6]);		! Reuse a longword of the item list
+	END;
+    !+
+    ! End of 60 minute
+    !-
+    END;
+
+!+
+! Start of 5 minute timestamp
+!-
+
+!
+! For each request outstanding, notify all interested operators.
+!
+! Before notifying the interested operators, check to see if the request
+! has been implicitly canceled.  If so, insert it on a special queue for
+! processing later in this routine.
+!
+! Also note that as this is happening, implicitly disabled operators are
+! being processed.  They too will be removed from the data base later in
+! this routine.
+!
+!
+INCR I FROM MIN_SCOPE TO MAX_SCOPE DO
+    BEGIN
+    !
+    ! For each each class of operator (SYSTEM, GROUP, USER) ...
+    !
+    NEXT_OCD = .OCD_VECTOR [(.I-1)*2];		! Get first OCD in list
+    INCR J FROM 1 TO .OCD_VECTOR [(.I-1)*2+1] DO
+	BEGIN
+	!
+	! For each OCD in the operator class list...
+	!
+	OCD = .NEXT_OCD;			    ! Get current OCD address
+	NEXT_OCD = .OCD [OCD_L_FLINK];		    ! Get next OCD address
+	NEXT_RQST = .OCD [OCD_L_RQSTFLINK];	    ! Get first request address
+	INCR K FROM 1 TO .OCD [OCD_W_RQSTCOUNT] DO
+	    BEGIN
+	    !
+	    ! For each request in the OCD list...
+	    !
+	    RQST = .NEXT_RQST;				! Get current request address
+	    NEXT_RQST = .RQST [RQCB_L_FLINK];		! Get next request address
+	    IF NOT IMPLICITLY_CANCELED (.RQST)
+	    THEN
+		!
+		! The reply mailbox exists.  Inform operators of the request.
+		!
+		NOTIFY_LISTED_OPERATORS (.RQST)
+	    END;
+	END;
+    END;
+!
+! After sweeping through the data base, we may have discovered some
+! implicitly canceled requests and implicitly disabled operators.
+! Process them now.  The requests should be done first, as yet more
+! implicitly disabled operators may turn up.
+!
+IMPLIED_CANCEL ();
+IMPLIED_DISABLE ();
+!
+! Make a scan through the node database
+!
+NOD = .NOD_HEAD [0];
+WHILE .NOD NEQ NOD_HEAD [0]
+DO
+    BEGIN
+    !
+    ! Clear the error message flag.  This limits the rate of OPC$_CLUSCOMM error messages to
+    ! one per five minutes.
+    !
+    NOD [NOD_V_IOERR_DISPLAYED] = FALSE;
+    !
+    ! If we have any nodes in "START" state, then request an acknowledgement from them.
+    !
+    IF .NOD [NOD_B_STATE] EQL NOD_K_STATE_START
+    THEN
+	BEGIN
+	NOD [NOD_V_ACK_PEND] = FALSE;		! Clear so that we can
+	CLUSMSG_ACK_PLEASE (.NOD);		!  request an acknowledgement
+	END;
+    NOD = .NOD [NOD_L_FLINK];
+    END;
+!
+! If the operator logfile was written to since the last timestamp operation,
+! flush the contents of the RMS buffers to the disk.  This also has the effect
+! of writing the file header, so the information is not lost in the event of
+! a system crash.  This is necessary because the log file is kept open until
+! explicitly closed via REPLY/[NO]LOG.
+!
+!
+IF .GLOBAL_STATUS [GBLSTS_K_FLUSH_PENDING]
+THEN
+    BEGIN
+    GLOBAL_STATUS [GBLSTS_K_FLUSH_PENDING] = FALSE;
+    $FLUSH (RAB = LOGFILE_RAB);
+    END;    
+!
+! If we purged the working set on this pass, then save the size we have now.
+! This lets us react to peaks in working set use, without a lot of faults
+! during periods of non-activity.
+!
+IF .PURGE_LIMIT EQL 0		
+THEN
+    BEGIN
+    REGISTER
+	SWAPO, LIMIT;
+    IF NOT (STATUS = $GETJPI (ITMLST=JPI_WSITEMS))
+    THEN
+	$signal_stop (.STATUS);
+    !
+    ! Set new value to 10 more pages than we are currently using, but no lower
+    ! than swap-out-page-count and no higher than 3 times swap-out-page-count.
+    !
+    SWAPO = .SYI_SWPOUTPGCNT;			! Get it into a register
+    LIMIT = MAX (.PPGCNT+.GPGCNT+10, .SWAPO);	! Limit is larger of swapo and 10 more than current
+    SWAPO = 3 * .SWAPO;				! Compute the max
+    PURGE_LIMIT = MIN (.SWAPO, .LIMIT);		! Actual limit is smaller of the two
+    END;
+!
+! Queue another timer ast.
+!
+GLOBAL_STATUS [GBLSTS_K_BUSY] = FALSE;
+GLOBAL_STATUS [GBLSTS_K_TIMESTAMP_PENDING] = FALSE;
+IF NOT (STATUS = $SETIMR (EFN = EFN_K_TIME_STAMP, DAYTIM = WAIT_DELTA, ASTADR = TIME_STAMP))
+THEN
+    $signal_stop (.STATUS);
+  
+END;						! End of TIME_STAMP
+
+GLOBAL ROUTINE IMPLICITLY_CANCELED (RQST) =
+
+!++
+! Functional description:
+!
+!	Check a given request to see if it has been implicitly canceled.
+!	An implicit cancelation is defined as the requestor deleting the
+!	reply mailbox without first having sent an explicit request cancelation
+!	message to OPCOM.
+!
+! Input:
+!
+!	RQST	: address of a request control block
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	If the request has been implicitly canceled, it will be inserted
+!	into a queue of canceled requests.  The queue will be processed later.
+!
+! Routine value:
+!
+!	TRUE	: the request has been implicitly canceled
+!	FALSE	: the request is still active
+!--
+
+BEGIN						! Start of IMPLICITLY_CANCELED
+
+MAP
+	RQST		: $ref_bblock;		! Request control block
+
+EXTERNAL ROUTINE
+	CLUSUTIL_SYSTEMID_EQUAL : JSB_R0R1;
+
+EXTERNAL
+	GLOBAL_STATUS	: BITVECTOR [32],
+	CANCELED_RQST_Q	: VECTOR,		! List head of canceled requests
+	LCL_NOD		: $ref_bblock,
+	MBX_FAO		: $bblock;		! FAO control string
+
+LOCAL
+	MBX_NAME	: $bblock [MAX_DEV_NAM],! Mailbox device name buffer
+	MBX_DESC	: $desc_block,		! Mailbox device name descriptor
+	DEV_CHAR	: $bblock [DIB$K_LENGTH],! Mailbox dev. char. buffer
+	CHAR_DESC	: $desc_block;		! Mailbox dev. char. descriptor
+
+!
+! Do not implicitly cancel requests from other nodes
+!
+IF .GLOBAL_STATUS [GBLSTS_K_IN_VAXcluster]
+THEN
+    IF NOT CLUSUTIL_SYSTEMID_EQUAL (RQST [RQCB_T_SYSTEMID], LCL_NOD [NOD_T_NODE_SYSTEMID])
+    THEN
+	RETURN FALSE;				! Not disabled
+!
+!
+! Check to see if the request has been implicitly canceled.
+! The simplest way to do this is to attempt to get the device
+! characteristics.  If the device no longer exists, then assume
+! the user is no longer interested in the request.  First format
+! the mailbox name from the information in the RQCB.
+!
+!
+MBX_DESC [DSC$W_LENGTH]  = MAX_DEV_NAM;	! Create a descriptor
+MBX_DESC [DSC$B_DTYPE]   = 0;
+MBX_DESC [DSC$B_CLASS]   = 0;
+MBX_DESC [DSC$A_POINTER] = MBX_NAME;
+$FAO (MBX_FAO, MBX_DESC, MBX_DESC, .RQST [RQCB_W_REPLYMBX]);
+CHAR_DESC [DSC$W_LENGTH]  = DIB$K_LENGTH;	! Create a descriptor
+CHAR_DESC [DSC$B_DTYPE]   = 0;
+CHAR_DESC [DSC$B_CLASS]   = 0;
+CHAR_DESC [DSC$A_POINTER] = DEV_CHAR;
+IF ($GETDEV (DEVNAM=MBX_DESC, PRIBUF=CHAR_DESC))
+THEN
+    !
+    ! The reply mailbox still exists.
+    !
+    RETURN FALSE
+ELSE
+    BEGIN
+    !
+    ! The reply mailbox no longer exists.  Assume request canceled.
+    !
+    RQST [RQSTS_V_IMPCANCEL] = TRUE;
+    INSQUE (RQST [RQCB_L_DSBLFLINK], CANCELED_RQST_Q);
+    RETURN TRUE;
+    END;
+
+END;						! End of IMPLICITLY_CANCELED
+
+GLOBAL ROUTINE IMPLIED_CANCEL : NOVALUE =
+
+!++
+! Functional description:
+!
+!	For all requests on the canceled request queue, create a
+!	cancellation message from the information in the request
+!	control block, and CALL the request cancellation handler
+!	as if the user had sent the cancellation message.
+!
+! Input:
+!
+!	None.
+!
+! Implicit Input:
+!
+!	CANCELED_RQST_Q	: The list head of all implicitly canceled requests.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	All interested operators will be notified of the canceled requests.
+!	As this is done, implicitly disabled operators may be discovered.
+!	Those operators will be placed on the implicit disable queue and
+!	be processed later.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of IMPLIED_CANCEL
+
+EXTERNAL ROUTINE
+	CNCL_HANDLER	: NOVALUE,		! Old CANCEL message handler
+	NOTIFY_LISTED_OPERATORS;		! Notify a list of operators
+
+EXTERNAL
+	CANCELED_RQST_Q	: VECTOR;		! List head of canceled requests
+
+LITERAL
+	MSG_HDR_SIZE	= ($BYTEOFFSET(RQCB_B_RQSTCODE) - $BYTEOFFSET(RQCB_W_MSGTYPE)),
+	OLD_MSG_SIZE	= 8,
+	MSG_BUF_SIZE	= MSG_HDR_SIZE + OLD_MSG_SIZE;
+
+MACRO
+	REQUEST_TYPE	= MSG_HDR_SIZE,   0,  8, 0%,
+	TARGET_MASK	= MSG_HDR_SIZE+1, 0, 24, 0%,
+	REQUEST_ID	= MSG_HDR_SIZE+4, 0, 32, 0%;
+
+LOCAL
+	CANCEL_MSG_BUF	: $bblock [MSG_BUF_SIZE],! CANCEL request message buffer
+	CANCEL_MSG_DESC	: $desc_block,		! CANCEL request descriptor
+	RQST		: $ref_bblock;		! Request control block
+
+!
+!
+! Create the message buffer descriptor.  We need do this only once.
+!
+!
+CANCEL_MSG_DESC [DSC$W_LENGTH]	= MSG_BUF_SIZE;
+CANCEL_MSG_DESC [DSC$B_DTYPE]	= 0;
+CANCEL_MSG_DESC [DSC$B_CLASS]	= 0;
+CANCEL_MSG_DESC [DSC$A_POINTER]	= CANCEL_MSG_BUF;
+!
+!
+! For all requests on the queue, create a cancel message
+! (old format) and call the cancel request handler.
+!
+!
+WHILE NOT REMQUE (.CANCELED_RQST_Q, RQST) DO
+   BEGIN
+   RQST = .RQST - ($BYTEOFFSET(RQCB_L_DSBLFLINK) - $BYTEOFFSET(RQCB_L_FLINK));
+   CH$MOVE (MSG_HDR_SIZE, RQST [RQCB_W_MSGTYPE], CANCEL_MSG_BUF);
+   CANCEL_MSG_BUF [REQUEST_TYPE] = OPC$_RQ_CANCEL;
+   CANCEL_MSG_BUF [TARGET_MASK]  = .RQST [RQCB_L_ATTNMASK1];
+   CANCEL_MSG_BUF [REQUEST_ID]   = .RQST [RQCB_L_RQSTID];
+   CNCL_HANDLER (CANCEL_MSG_DESC);
+   END;
+      
+END;						! End of IMPLIED_CANCEL
+
+GLOBAL ROUTINE IMPLIED_DISABLE : NOVALUE =
+
+!++
+! Functional description:
+!
+!	For all implicitly disabled operators create an operator disable
+!	message using the info in the operator control block, and CALL the
+!	operator enable message handler as if the user had sent the message.
+!	Note that notification of the operator disable in NOT sent to the
+!	operator.  This is because the terminal is no longer an operator
+!	terminal, and the user now at the terminal doesn't need to see the
+!	message.
+!
+! Input:
+!
+!	None.
+!
+! Implicit Input:
+!
+!	DISABLED_OPER_Q	: The list head of all implicitly disabled operators.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	As operators are disabled, more implicitly disabled operators may
+!	be discovered.  If so, they will be inserted on the queue, and
+!	processed in turn.  Likewise, as operators are disabled, some requests
+!	may lose operator coverage.  These requests will be canceled and
+!	the user notified.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of IMPLIED_DISABLE
+
+EXTERNAL
+	DISABLED_OPER_Q	: VECTOR;		! List head of disabled operators
+
+LOCAL
+	STATUS;
+
+STATUS = 1;					! *** TEMP ***
+
+END;						! End of IMPLIED_DISABLE
+
+END						! End of TIMESTAMP
+ELUDOM
+

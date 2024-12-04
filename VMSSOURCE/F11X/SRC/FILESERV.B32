@@ -1,0 +1,388 @@
+MODULE FILESERV (	%TITLE	'File System Cache Flush Server'
+		MAIN = CACHE_SERVER,
+		IDENT = 'V04-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:  VAX/VMS Cluster File System
+!
+! ABSTRACT:
+!
+!	This module is the process responsible for flushing file system
+!	caches when requested by other nodes in the cluster. It receives
+!	flush requests as kernel mode AST's queued by the swapper process.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system running as a member of a cluster;
+!	kernel mode and file system data structures.
+!
+!--
+!
+! AUTHOR:  Andrew C. Goldstein, CREATION DATE:  17-Jul-1984  19:35
+!
+! MODIFIED BY:
+!
+!	V03-001	ACG0438		Andrew C. Goldstein,	4-Aug-1984  20:43
+!		Fix width of cache type field; fix args in call
+!		to LIB$FREE_VM.
+!
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB';
+
+FORWARD ROUTINE
+	CACHE_SERVER,			! main routine
+	INITIALIZATION,			! kernel mode initialization
+	GET_REQUEST	: NOVALUE,	! request handling routine
+	START_REQUEST	: NOVALUE;	! start next request
+
+!
+! Own Storage
+!
+
+OWN
+					! work request queue head
+	WORK_QUEUE	: VECTOR [2] INITIAL (WORK_QUEUE, WORK_QUEUE),
+	BUSY,				! flag indicating we're busy
+	CHANNEL,			! channel for file system calls
+	CCB		: REF $BBLOCK,	! address of channel CCB
+					! FIB for cache flush calls
+	IO_STATUS	: VECTOR [4, WORD], ! I/O status block
+	FIB		: $BBLOCK [FIB$C_LENGTH]
+			  PRESET ([FIB$W_CNTRLFUNC] = FIB$C_FLUSH_CACHE),
+					! descriptor for above
+	FIB_DESC	: VECTOR [2] INITIAL (FIB$C_LENGTH, FIB);
+
+!
+! Structure of queue entry
+!
+
+MACRO
+	QE_FLINK	= 0, 0, 32, 0 %,
+	QE_BLINK	= 4, 0, 32, 0 %,
+	QE_UCB		= 8, 0, 32, 0 %;
+
+LITERAL
+	QUEUE_SIZE	= 12;
+
+!
+! Structure of UCB / cache ID parameter
+!
+
+MACRO
+	CACHE_ID	= 0, 0, 3, 0 %,
+	UCB_ADDRESS	= 0, 3, 29,0 %;
+
+!
+! Macro to generate a bug check
+!
+
+MACRO
+	BUG_CHECK (CODE, MESSAGE) =
+		BEGIN
+		BUILTIN BUGW;
+		EXTERNAL LITERAL %NAME ('BUG$_', CODE);
+		BUGW (%NAME ('BUG$_', CODE) OR 4)
+		END
+		%;
+
+GLOBAL ROUTINE CACHE_SERVER =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This is the main program and entry point of the cache server.
+!	all it does is to dive into kernel mode to accomplish initialization.
+!
+! CALLING SEQUENCE:
+!	CACHE_SERVER ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	System status code if initialization error
+!
+! SIDE EFFECTS:
+!	Cache server process started
+!
+!--
+
+BEGIN
+
+$CMKRNL (ROUTIN = INITIALIZATION)
+
+END;					! End of routine CACHE_SERVER
+
+ROUTINE INITIALIZATION =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine initializes the cache server process. This consists
+!	simply of writing the process' PID into system common so the
+!	process can be found by the swapper. This routine executes in
+!	kernel mode.
+!
+! CALLING SEQUENCE:
+!	INITIALIZATION ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	XQP$GL_FILESERV_ENTRY: receives entry point for requests
+!	XQP$GL_FILESERVER: receives PID of this process
+!
+! ROUTINE VALUE:
+!	(Does not return)
+!
+! SIDE EFFECTS:
+!	Cache server process started
+!
+!--
+
+BEGIN
+
+LINKAGE
+	L_FFCHAN	= JSB (; REGISTER = 1, REGISTER = 2)
+			: NOTUSED (3, 4, 5, 6, 7, 8, 9, 10, 11);
+
+LOCAL
+	STATUS;				! system status return
+
+EXTERNAL
+	CTL$GL_PCB	: REF $BBLOCK ADDRESSING_MODE (GENERAL),
+					! address of process PID
+	XQP$GL_FILESERV_ENTRY : ADDRESSING_MODE (GENERAL),
+	XQP$GL_FILESERVER : ADDRESSING_MODE (GENERAL);
+					! system cell to store PID
+
+EXTERNAL ROUTINE
+	IOC$FFCHAN	: L_FFCHAN ADDRESSING_MODE (GENERAL);
+					! find available I/O channel
+
+
+! Set up a channel on which to do I/O.
+!
+
+STATUS = IOC$FFCHAN (; CHANNEL, CCB);
+IF NOT .STATUS THEN RETURN .STATUS;
+CCB[CCB$B_AMOD] = PSL$C_KERNEL + 1;
+
+! Set up our PID in system space and then wait for work to roll in.
+!
+
+XQP$GL_FILESERV_ENTRY = GET_REQUEST;
+XQP$GL_FILESERVER = .CTL$GL_PCB[PCB$L_PID];
+
+WHILE 1
+DO $HIBER;
+
+1
+END;					! End of routine INITIALIZATION
+
+ROUTINE GET_REQUEST (UCB) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is entered as a kernel mode AST when a request to
+!	flush a cache occurs. We execute the request immediately if
+!	we are not currently busy, or queue it internally if we are.
+!
+! CALLING SEQUENCE:
+!	GET_REQUEST (UCB)
+!
+! INPUT PARAMETERS:
+!	UCB: address of UCB to operate on, with request type
+!	     encoded into low 4 bits
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	Request initiated or queued
+!
+!--
+
+BEGIN
+
+BUILTIN
+	INSQUE;
+
+LOCAL
+	ENTRY		: REF $BBLOCK;	! address of allocated queue entry
+
+EXTERNAL ROUTINE
+	LIB$GET_VM;			! allocate virtual memory
+
+
+IF NOT .BUSY
+THEN
+    START_REQUEST (.UCB)
+ELSE
+    BEGIN
+    IF NOT LIB$GET_VM (%REF (QUEUE_SIZE), ENTRY)
+    THEN BUG_CHECK (XQPERR, 'Failed to allocate queue entry');
+    ENTRY[QE_UCB] = .UCB;
+    INSQUE (.ENTRY, .WORK_QUEUE[1]);
+    END;
+
+END;					! End of routine GET_REQUEST
+
+ROUTINE START_REQUEST (UCB_ARG) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine actually initiates a cache flush request. It is also
+!	entered as the completion AST of a flush operation to check if
+!	another one is pending.
+!
+! CALLING SEQUENCE:
+!	START_REQUEST (UCB_ARG)
+!
+! INPUT PARAMETERS:
+!	UCB_ARG: address of UCB to operate on
+!		 0 to get next entry from the work queue
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	Next queue entry, if any, initiated
+!
+!--
+
+BEGIN
+
+BUILTIN
+	REMQUE;
+
+LOCAL
+	STATUS,				! system service status
+	ENTRY		: REF $BBLOCK,	! current work queue entry
+	UCB		: $BBLOCK [4];	! local copy of UCB address
+
+EXTERNAL ROUTINE
+	LIB$FREE_VM;			! return virtual memory
+
+
+! If no UCB address was given, we just completed a request. Get the next
+! work queue entry to process. If the work queue is empty, there's
+! nothing to do. We loop until we successfully fire off a flush request.
+!
+
+UCB = .UCB_ARG;
+
+WHILE 1 DO
+    BEGIN
+    BUSY = 0;
+    IF .UCB EQL 0
+    THEN
+	BEGIN
+	IF REMQUE (.WORK_QUEUE[0], ENTRY)
+	THEN RETURN;
+	UCB = .ENTRY[QE_UCB];
+	STATUS = LIB$FREE_VM (%REF (QUEUE_SIZE), ENTRY);
+	IF NOT .STATUS THEN BUG_CHECK (XQPERR, 'Unexpected VM error');
+	END;
+
+! Unpack the cache identifier code from the low bits of the UCB
+! address. Set up the channel and fire off the request. Note that
+! the volume and UCB are uninterlocked while the request is queued.
+! This is harmless since (1) disk UCB's never go away and (2) we ignore
+! the appropriate errors if the volume is now dismounted (and possibly
+! a different volume mounted). The worst that happens is that we do
+! an unnecessary flush on some volume.
+!
+
+    BUSY = 1;
+    FIB[FIB$L_CNTRLVAL] = .UCB[CACHE_ID];
+    UCB[CACHE_ID] = 0;
+    CCB[CCB$L_UCB] = .UCB;
+    STATUS = $QIO  (CHAN   = .CHANNEL,
+		    FUNC   = IO$_ACPCONTROL,
+		    IOSB   = IO_STATUS,
+		    ASTADR = START_REQUEST,
+		    P1     = FIB_DESC
+		    );
+    IF .STATUS
+    THEN EXITLOOP
+    ELSE IF .STATUS NEQ SS$_WRITLCK
+	AND .STATUS NEQ SS$_DEVNOTMOUNT
+	AND .STATUS NEQ SS$_DEVFOREIGN
+    THEN BUG_CHECK (XQPERR, 'Unexpected QIO service error');
+    UCB = 0;
+    END;				! end of loop
+
+END;					! End of routine START_REQUEST
+
+END
+ELUDOM

@@ -1,0 +1,1152 @@
+MODULE table		(IDENT='V04-000',
+			ADDRESSING_MODE(EXTERNAL=GENERAL))
+= BEGIN
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! Facility:	Command Definition Utility, Table Management Module
+!
+! Abstract:	This module contains all of the routines that manage the
+!		CLI table.  This includes creation, input, modification, and
+!		output of the tables.
+!
+!		It is recommended that you read over the CLITABDEF.SDL file
+!		before reading this code.
+!
+! Environment:	Standard CDU Environment.
+!
+! Author:	Paul C. Anagnostopoulos
+! Creation:	13 January 1983 (Happy Birthday to me)
+!
+! Modifications:
+!
+!	V03-001	MCN0160		Maria del C. Nasr	29-Mar-1984
+!		Only allow modification of the DCL image table if it matches
+!		the current version being created by the linker.
+!
+!--
+
+
+library 'sys$library:lib';
+require 'clitabdef';
+require 'cdureq';
+
+!	T A B L E   O F   C O N T E N T S
+!	---------   ---   ---------------
+
+forward routine
+	cdu$prepare_input_table: novalue,
+	cdu$prepare_new_table: novalue,
+	cdu$prepare_image_table: novalue,
+	cdu$prepare_p1_table: novalue,
+	cdu$write_output_table: novalue,
+	cdu$write_image_table: novalue,
+	cdu$write_p1_table: novalue,
+	cdu$delete_verb_name,
+	cdu$add_verb_name: novalue,
+	cdu$collect_table_blocks: novalue,
+	long_move: novalue;
+
+!	E X T E R N A L   R E F E R E N C E S
+!	---------------   -------------------
+
+external routine
+	cdu$report_rms_error,
+	cdu$upgrade_table,
+	cli$get_value,
+	cli$present,
+	lib$get_vm;
+
+external
+	ctl$ag_clitable: pointer,
+	ctl$gl_ctlbasva: pointer;
+
+$shr_msgdef(cdu,17,local,
+	(closeout,severe),
+	(openin,severe),
+	(openout,severe),
+	(writeerr,severe)
+	);
+
+!	D C L   T A B L E   C O N T R O L   B L O C K S
+!	-----   ---------   -------------   -----------
+
+! The following items define the RMS control blocks needed to open
+! and map an existing CLI table image.
+
+own
+	input_xabfhc: $xabfhc(),
+
+	input_esa: block[nam$c_maxrss,byte],
+	input_rsa: block[nam$c_maxrss,byte],
+	input_nam: $nam(
+			esa=input_esa,
+			ess=%allocation(input_esa),
+			rsa=input_rsa,
+			rss=%allocation(input_rsa)
+			),
+
+	dbuffer(input_spec,nam$c_maxrss),
+	input_fab: $fab(
+			dnm='.EXE',
+			fna=input_spec+8,
+			fns=%allocation(input_spec)-8,
+			fop=ufo,
+			nam=input_nam,
+			xab=input_xabfhc
+			);
+
+! The following items define the RMS control blocks needed to create
+! and write a new CLI table image.
+
+own
+	output_esa: block[nam$c_maxrss,byte],
+	output_rsa: block[nam$c_maxrss,byte],
+	output_nam: $nam(
+			esa=output_esa,
+			ess=%allocation(output_esa),
+			rlf=input_nam,
+			rsa=output_rsa,
+			rss=%allocation(output_rsa)
+			),
+
+	dbuffer(output_spec,nam$c_maxrss),
+	output_fab: $fab(
+			dnm='.EXE',
+			fac=bio,
+			fna=output_spec+8,
+			fns=%allocation(output_spec)-8,
+			fop=<cbt,sqo,nam,ofp>,
+			mrs=512,
+			nam=output_nam,
+			org=seq,
+			rfm=fix
+			),
+
+	output_rab: $rab(
+			fab=output_fab,
+			rac=seq,
+			rop=wbh
+			);
+
+! The following items are needed to control the modification of the DCL
+! Table on which we will work.  This first item points at the beginning of
+! the table, the primary vector block.
+
+global
+	cdu$gl_table: pointer;
+
+! This item points at the header for the input table image.  If zero, there
+! was no input table image.
+
+own
+	input_image_header: pointer initial(0);
+
+! We try to keep unused longwords at the end of the verb name table and
+! command block pointer table.  The following item tells us how many.
+
+own
+	free_longwords: long initial(0);
+
+!++
+! Description:	This routine is called to prepare a CLI table for modification.
+!		The /TABLE qualifier controls which table is prepared, and
+!		this is the only table that is modified hereafter.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$prepare_input_table		: novalue
+= BEGIN
+
+local
+	status: long,
+	work_ptr: pointer;
+
+
+! Determine whether or not the user specified an input table image.
+
+status = cli$get_value(dtext('TABLES'),input_spec);
+if .status then
+
+	! Yes, an input table image was specified.  Call a routine to
+	! prepare it for modification.
+
+	cdu$prepare_image_table()
+
+else
+
+	! No input table image was specified, so the user wants to modify
+	! the P1 space table.
+
+	cdu$prepare_p1_table();
+
+! Upgade the CLI table to the latest format level.  If that fails, then
+! signal the resulting CLI status as a fatal error.
+
+status = cdu$upgrade_table(.cdu$gl_table);
+check(.status, (.status and not sts$m_severity) + sts$k_severe);
+
+! Ensure that the CLI type specified in the primary vector block matches
+! the CLI type specified in the command that invoked us.
+
+if .cdu$gl_table[vec_b_subtype] nequ
+   (if cli$present(dtext('CLI_MCR')) then vec_k_mcr else vec_k_dcl) then
+	signal(msg(cdu$_climismatch));
+
+return;
+
+END;
+
+!++
+! Description:	This routine is called to prepare a fresh new CLI table to
+!		receive command definitions.  We have to create a primary
+!		vector block so that all new blocks can be hung off it.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$prepare_new_table	: novalue
+= BEGIN
+
+local
+	status: long;
+
+
+! Allocate space for a primary vector block.
+
+allocate_largest_table_block(vec_k_length,cdu$gl_table);
+
+! Initialize the block.  The verb name and command block pointer tables will
+! be created later.
+
+cdu$gl_table[vec_b_type] = block_k_vector;
+cdu$gl_table[vec_b_subtype] = (if cli$present(dtext('CLI_MCR')) then vec_k_mcr else vec_k_dcl);
+cdu$gl_table[vec_w_flags] = 0;
+cdu$gl_table[vec_b_strlvl] = vec_k_strlvl;
+cdu$gl_table[vec_w_tro_count] = 2;
+cdu$gl_table[vec_l_verbtbl] = cdu$gl_table[vec_l_comdptr] = 0;
+
+! Clear the longword that tells us the overall size of the CLI table.  This
+! longword will be adjusted as we allocate table blocks.
+
+cdu$gl_table[vec_l_table_size] = 0;
+
+! Set the size of the block.
+
+set_table_block_size(vec_k_length,cdu$gl_table);
+
+return;
+
+END;
+
+!++
+! Description:	This routine is called when it has been determined that the
+!		user wants to modify an existing CLI table image.  The image
+!		is mapped into memory and checked to ensure that it really
+!		is a CLI table.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$prepare_image_table		: novalue
+= BEGIN
+
+local
+	status: long,
+	return_array: vector[2,long],
+	isd: pointer,
+	isd2: pointer;
+
+
+! The input table file spec has been placed in the spec buffer.  Open the
+! image file and map it into memory.
+
+status = $open(fab=input_fab);
+if not .status then
+	cdu$report_rms_error(msg(cdu$_openin),input_fab);
+status = $crmpsc(inadr=uplit(0,0),
+		 retadr=return_array,
+		 flags=sec$m_crf + sec$m_expreg + sec$m_wrt,
+		 chan=.input_fab[fab$l_stv]);
+check(.status, .status);
+
+! Let's verify that this image really contains a CLI table.  We check the
+! following things:
+!
+!	Majorid and minorid should match does currently created by linker.
+!	Must be a native-mode image.
+!	Must be a sharable image.
+!	Must be linked without Debug, no transfer, PIC.
+!	Must have only one image section.
+!	Image section must start at VBN 2, not null, read-only.
+
+input_image_header = .return_array[0];
+
+If .input_image_header[ihd$w_majorid] neq ihd$k_majorid
+  or .input_image_header[ihd$w_minorid] neq ihd$k_minorid
+then
+    signal ( msg(cli$_oldtab) );
+
+isd = .input_image_header + .input_image_header[ihd$w_size];
+isd2 = .isd + .isd[isd$w_size];
+if .input_image_header[510,0,16,1] neq -1 or
+   .input_image_header[ihd$b_imgtype] nequ ihd$k_lim or
+   .input_image_header[ihd$v_lnkdebug] or
+   not .input_image_header[ihd$v_lnknotfr] or
+   not .input_image_header[ihd$v_picimg] or
+   .isd2[isd$w_size] nequ 0 or
+   .isd[isd$l_vbn] nequ 2 or
+   .isd[isd$w_pagcnt] eqlu 0 or
+   .isd[isd$v_wrt]		then
+	signal(msg(cdu$_notclitable),2,.input_nam[nam$b_rsl],.input_nam[nam$l_rsa]);
+
+! Store the address of the CLI table so other modules can get at it.
+
+cdu$gl_table = .input_image_header + 512;
+
+return;
+
+END;
+
+!++
+! Description:	This routine is responsible for preparing the CLI table in
+!		P1 space for modification.  This is the table that is
+!		currently being used by the CLI for its command
+!		definitions.  We allow the user to modify the table and put
+!		it back in P1 space later.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$prepare_p1_table		: novalue
+= BEGIN
+
+local
+	status: long;
+
+
+! Allocate memory to contain a modifiable copy of the P1 CLI table.  Place
+! its address in the global table pointer.
+
+status = lib$get_vm(%ref(round_up(.ctl$ag_clitable[vec_l_table_size],512)), cdu$gl_table);
+check(.status, .status);
+
+! Copy the P1 table into the memory we just allocated.
+
+long_move(.ctl$ag_clitable[vec_l_table_size],.ctl$ag_clitable, .cdu$gl_table);
+
+return;
+
+END;
+
+!++
+! Description:	This routine is responsible for writing out a freshly modified
+!		CLI table to the destination specified by the /OUTPUT
+!		qualifier.  The table can be thrown away, written to P1
+!		space, or written as an image.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$write_output_table		: novalue
+= BEGIN
+
+local
+	status: long;
+
+
+! If the user doesn't want us to write the table, then just quit.
+
+if not cli$present(dtext('OUTPUT')) then
+	return;
+
+! Determine whether or not the user specified an output table image.
+
+status = cli$get_value(dtext('OUTPUT'),output_spec);
+if .status then
+
+	! Yes, an output table image is desired.  Call a routine to do it.
+
+	cdu$write_image_table()
+
+else
+
+	! No output table image was specified, so the user wants to replace
+	! the P1 space table.
+
+	cdu$write_p1_table();
+
+return;
+
+END;
+
+!++
+! Description:	This routine is called to write out a new image containing the
+!		CLI table we have just compiled.  The new image contains
+!		the header and symbols from the input table (/TABLE), but
+!		contains the new table blocks.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$write_image_table		: novalue
+= BEGIN
+
+local
+	status: long,
+	final_area: pointer,
+	input_image_gst_vbn: long,
+	length: long,
+	channel: word;
+
+own
+	acp_fib: block[fib$k_length,byte],
+	acp_fib_dsc: descriptor preset(
+			[len] = fib$k_length,
+			[ptr] = acp_fib
+			),
+	acp_record_attributes: block[fat$k_length,byte];
+bind
+	acp_attributes_list = uplit(word(atr$s_recattr),word(atr$c_recattr),
+				    long(acp_record_attributes),
+				    long(0));
+
+builtin
+	rot;
+
+
+! An output image can only be created if an input image was specified.
+! Make sure this is the case.
+
+if .input_image_header eqlu 0 then
+	signal(msg(cdu$_nointable));
+
+! Begin by creating the output image file.  The output spec has already
+! been stored in the spec buffer.
+
+status = $create(fab=output_fab);
+if not .status then
+	cdu$report_rms_error(msg(cdu$_openout),output_fab);
+status = $connect(rab=output_rab);
+if not .status then
+	cdu$report_rms_error(msg(cdu$_openout),output_rab);
+
+! Allocate a large area to contain the final CLI table.  Collect all of the
+! table blocks into that area.
+
+status = lib$get_vm(cdu$gl_table[vec_l_table_size], final_area);
+check(.status, .status);
+cdu$collect_table_blocks(.final_area);
+
+! Update the length of the table image section.  Save the VBN of the global
+! symbol table and update it, since it resides after the image section.
+
+begin
+bind
+	isd = .input_image_header + .input_image_header[ihd$w_size]: block[,byte],
+	ihs = .input_image_header + .input_image_header[ihd$w_symdbgoff]: block[,byte];
+
+isd[isd$w_pagcnt] = (.cdu$gl_table[vec_l_table_size] + 511) / 512;
+input_image_gst_vbn = .ihs[ihs$l_gstvbn];
+ihs[ihs$l_gstvbn] = 2 + .isd[isd$w_pagcnt];
+end;
+
+! Write the image header into the output image.
+
+output_rab[rab$l_rbf] = .input_image_header;
+output_rab[rab$w_rsz] = 512;
+status = $write(rab=output_rab);
+if not .status then
+	cdu$report_rms_error(msg(cdu$_writeerr),output_rab);
+
+! Now we want to write out the new CLI table blocks as the image section.
+
+output_rab[rab$l_rbf] = .cdu$gl_table;
+length = round_up(.cdu$gl_table[vec_l_table_size],512);
+while .length gtru 0 do (
+
+	! Write out 63K, or fewer bytes if there aren't 63K left.
+
+	output_rab[rab$w_rsz] = minu(63*1024, .length);
+	status = $write(rab=output_rab);
+	if not .status then
+		cdu$report_rms_error(msg(cdu$_writeerr),output_rab);
+
+	! Advance the table address and reduce the number of bytes
+	! remaining to be written.
+
+	output_rab[rab$l_rbf] = .output_rab[rab$l_rbf] + .output_rab[rab$w_rsz];
+	length = .length - .output_rab[rab$w_rsz];
+);
+
+! Now we must copy the global symbol records from the input table image to
+! the new image.  These records begin at the VBN specified in the input image
+! header, and extend through the last block of the file.
+
+output_rab[rab$l_rbf] = .input_image_header + (.input_image_gst_vbn-1) * 512;
+output_rab[rab$w_rsz] = (.input_xabfhc[xab$l_ebk] - .input_image_gst_vbn + 1) * 512;
+status = $write(rab=output_rab);
+if not .status then
+	cdu$report_rms_error(msg(cdu$_writeerr),output_rab);
+
+! Close the new image file.
+
+status = $close(fab=output_fab);
+if not .status then
+	cdu$report_rms_error(msg(cdu$_closeout),output_fab);
+
+! Now we have to set the end-of-file on the new image so that it points
+! after the end of the global symbol records.  This must be done with the
+! ACP, since there is no such RMS function.  Begin by opening a channel to
+! the device containing the file.
+
+begin
+local
+	device_dsc: descriptor;
+
+build_descriptor(device_dsc,.output_nam[nam$b_dev],.output_nam[nam$l_dev]);
+status = $assign(devnam=device_dsc,
+		 chan=channel);
+check(.status, .status);
+end;
+
+! Read in the record attribute area from the file header of the new image.
+! This is done using the file identification (FID) from the output NAM block.
+
+acp_fib[fib$v_write] = true;
+ch$move(fib$s_fid,output_nam[nam$w_fid], acp_fib[fib$w_fid]);
+status = $qiow(chan=.channel,
+	       func=io$_access + io$m_access,
+	       p1=acp_fib_dsc,
+	       p5=acp_attributes_list);
+check(.status, .status);
+
+! Back up the end-of-file so that it points into the last block at the same
+! byte offset as the input file.  The two words of the end-of-file VBN are
+! stored reversed.
+
+acp_record_attributes[fat$l_efblk] = rot(rot(.acp_record_attributes[fat$l_efblk],-16)-1,-16);
+acp_record_attributes[fat$w_ffbyte] = .input_xabfhc[xab$w_ffb];
+
+! Update the record attributes area.
+
+status = $qiow(chan=.channel,
+	       func=io$_deaccess,
+	       p1=acp_fib_dsc,
+	       p5=acp_attributes_list);
+check(.status, .status);
+
+! Now we can deassign the channel.
+
+status = $dassgn(chan=.channel);
+check(.status, .status);
+
+return;
+
+END;
+
+!++
+! Description:	This routine is called to write out the new CLI table into
+!		P1 space, making it the current table for this process.  If
+!		the new table is no bigger than the current one, we can
+!		just overwrite it.  If it's bigger, we have to allocate new
+!		memory in P1 space.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$write_p1_table		: novalue
+= BEGIN
+
+own
+	existing_table: pointer,
+	existing_table_size: long;
+
+local
+	status: long,
+	final_area: pointer;
+
+! This internal routine resets the base address of process-permanent P1
+! space.  The argument list address is the new base.
+!
+! Note that we are in kernel mode.
+
+ROUTINE reset_p1_base
+= BEGIN
+
+builtin
+	ap;
+
+
+! Just set the new base address in the global longword.
+
+ctl$gl_ctlbasva = .ap;
+
+return true;
+
+END;
+
+! This internal routine will unmap the existing CLI table in P1 space.
+! Since we are about to copy a new table, there is no point in keeping the
+! old one around.
+!
+! Note that we are in executive mode.
+
+ROUTINE unmap_existing_table
+= BEGIN
+
+local
+	status: long,
+	range: vector[2,long];
+
+
+! Delete the virtual memory containing the existing table.
+
+range[0] = .existing_table;
+range[1] = .existing_table + .existing_table_size - 1;
+status = $deltva(inadr=range);
+if not .status then
+	return .status;
+
+! If we just deleted virtual memory at the end of process-permanent
+! P1 space, the we must reset the P1 base address so that it is accurate.
+
+if .existing_table eqla .ctl$gl_ctlbasva then (
+	status = $cmkrnl(routin=reset_p1_base,
+			 arglst=.existing_table+.existing_table_size);
+	if not .status then
+		return .status;
+);
+
+return true;
+
+END;
+
+! This routine will copy the new CLI table into the same virtual address
+! space as the existing one occupied.  This is done if the new table is no
+! larger than the existing one.
+!
+! Note that we are in executive mode.
+
+ROUTINE overmap_existing_table
+= BEGIN
+
+local
+	status: long,
+	range: vector[2,long];
+
+
+! Create virtual address space in the place where the existing table was
+! (we already deleted it).  The space must be owned by supervisor mode.
+
+range[0] = .existing_table;
+range[1] = .existing_table + .existing_table_size - 1;
+status = $cretva(inadr=range,
+		 acmode=psl$c_super);
+if not .status then
+	return .status;
+
+! If we just created virtual address space at the end of the process-permanent
+! portion of P1 space, then reset the base address.
+
+if .range[1]+1 eqla .ctl$gl_ctlbasva then (
+	status = $cmkrnl(routin=reset_p1_base,
+			 arglst=.existing_table);
+	if not .status then
+		return .status;
+);
+
+! Move the new CLI table into the space.
+
+long_move(.cdu$gl_table[vec_l_table_size],.cdu$gl_table, .existing_table);
+
+! Make the new memory read-only to user mode.
+
+status = $setprt(inadr=range,
+		 prot=prt$c_ur);
+if not .status then
+	return .status;
+
+return true;
+
+END;
+
+! This routine will copy a new CLI table into a hunk of virtual memory in
+! P1 space.  The address of this memory has nothing to do with the address
+! of the existing P1 table, because the new table is bigger.  The existing
+! table has already been deleted.
+!
+! Note that we are in executive mode.
+
+ROUTINE map_bigger_table
+= BEGIN
+
+local
+	status: long,
+	range: vector[2,long];
+
+
+! Expand P1 space so it can accomodate the new table.  The new memory must be
+! owned by supervisor mode.
+
+status = $expreg(pagcnt=(.cdu$gl_table[vec_l_table_size]+511) / 512,
+		 retadr=range,
+		 acmode=psl$c_super,
+		 region=1);
+if not .status then
+	return .status;
+
+! Set the base address of process-permanent P1 space, since it has just
+! been moved with the expand region.
+
+status = $cmkrnl(routin=reset_p1_base,
+		 arglst=.range[1]);
+if not .status then
+	return .status;
+
+! Move the new CLI table into the memory we just created.
+
+long_move(.cdu$gl_table[vec_l_table_size],.cdu$gl_table, .range[1]);
+
+! Make the new memory read-only to user mode.
+
+status = $setprt(inadr=range,
+		 prot=prt$c_ur);
+if not .status then
+	return .status;
+
+! Reset the address range of the table in P1 space.
+
+ctl$ag_clitable = .range[1];
+begin
+bind
+	end_address = ctl$ag_clitable+4: pointer;
+
+end_address = .range[0];
+end;
+
+return true;
+
+END;
+
+! Main routine.
+! Allocate a large area to contain the final CLI tables, before we move
+! them into P1 space.  Collect all of the table blocks into the area.  We
+! can't collect directly into P1 space, because we don't know where the
+! final table will fit.
+
+status = lib$get_vm(cdu$gl_table[vec_l_table_size], final_area);
+check(.status, .status);
+cdu$collect_table_blocks(.final_area);
+
+! Place the address and size of the existing P1 table into own storage,
+! so that the internal routines can get at it.
+
+existing_table = .ctl$ag_clitable;
+existing_table_size = round_up(.existing_table[vec_l_table_size],512);
+
+! Unmap the existing CLI table from P1 space.
+
+status = $cmexec(routin=unmap_existing_table);
+check(.status, .status);
+
+! If the new table is no larger than the old one, then we can use the same
+! memory in P1 space to contain it.  Otherwise, we have to allocate new
+! memory.
+
+if .cdu$gl_table[vec_l_table_size] lequ .existing_table_size then
+	status = $cmexec(routin=overmap_existing_table)
+else
+	status = $cmexec(routin=map_bigger_table);
+check(.status, .status);
+
+return;
+
+END;
+
+!++
+! Description:	This routine is responsible for deleting a verb name from a
+!		CLI table.  This is done by removing the verb name and
+!		its corresponding command block pointer from the two
+!		vector blocks in which they reside.  The blocks which
+!		define the verb simply fall into disuse.
+!
+! Parameters:	verb_name	By descriptor, the name of the verb.
+!
+! Returns:	By value, a boolean which is true if the verb name existed.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$delete_verb_name(verb_name: ref descriptor)
+= BEGIN
+	
+local
+	key: long,
+	entry: pointer,
+	length: long;
+
+
+! If there is no verb name table now, then the command can't exist.
+
+if .cdu$gl_table[vec_l_verbtbl] eqla 0 then
+	return false;
+
+! The verb name table contains longwords, each of which is the first four
+! characters of a verb name, padded with NULs.
+
+ch$copy(minu(.verb_name[len],4),.verb_name[ptr], NUL,4,key);
+
+! Search the verb name table for the key just built.  If not found,
+! forget it.
+
+begin
+bind
+	vector_verb = .cdu$gl_table + .cdu$gl_table[vec_l_verbtbl]: block[,byte],
+	verb_names = vector_verb + vec_k_header_length: vector[,long],
+	vector_command = .cdu$gl_table + .cdu$gl_table[vec_l_comdptr]: block[,byte],
+	command_block_pointers = vector_command + vec_k_header_length: vector[,long];
+
+entry = (incr i from 0 to .vector_command[vec_w_tro_count]-1 do
+		if ch$eql(4,key, 4,verb_names[.i],NUL) then exitloop .i);
+if .entry eql -1 then
+	return false;
+
+! Eliminate the found entry and the corresponding entry in the command
+! block pointer table by closing up the tables around the entry.
+
+length = (.vector_command[vec_w_tro_count] - .entry - 1) * 4;
+ch$move(.length,verb_names[.entry+1], verb_names[.entry]);
+ch$move(.length,command_block_pointers[.entry+1], command_block_pointers[.entry]);
+
+! Adjust the length of the verb name table, along with the length and TRO
+! count in the command block pointer table.
+
+vector_verb[vec_w_size] = .vector_verb[vec_w_size] - 4;
+vector_command[vec_w_size] = .vector_command[vec_w_size] - 4;
+decrement(vector_command[vec_w_tro_count]);
+end;
+
+! Increment the count of unused longwords at the ends of the tables.
+
+increment(free_longwords);
+return true;
+
+END;
+
+!++
+! Description:	This routine is responsible for adding a verb name to a
+!		CLI table.  First any existing verb name is removed.
+!		Then the verb name is added, along with its corresponding
+!		command block pointer.
+!
+! Parameters:	verb_name	By descriptor, the name of the verb.
+!		command_block	By reference, the command block for the verb.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$add_verb_name(verb_name: ref descriptor,
+				 command_block: long)		: novalue
+= BEGIN
+
+local
+	status: long,
+	vector_verb: pointer,
+	vector_command: pointer,
+	length: long,
+	new_block: pointer,
+	key: long,
+	entry: long;
+
+
+! Decide if we have an existing verb name table.
+
+if .cdu$gl_table[vec_l_verbtbl] eqla 0 then (
+
+	! No, we don't.  This must be a new CLI table, so we want to
+	! allocate a verb name and command block table and initialize
+	! them.  Allocate enough space for 128 free longwords.  Hang
+	! the two tables off of the primary vector block.
+
+	length = vec_k_header_length + 128*4;
+	allocate_largest_table_block(.length,vector_verb);
+	vector_verb[vec_b_type] = block_k_vector;
+	vector_verb[vec_b_subtype] = vec_k_verb;
+	vector_verb[vec_w_flags] = 0;
+	vector_verb[vec_w_tro_count] = 0;
+	set_table_block_size(vec_k_header_length,vector_verb);
+	cdu$gl_table[vec_l_verbtbl] = .vector_verb - .cdu$gl_table;
+
+	allocate_largest_table_block(.length,vector_command);
+	vector_command[vec_b_type] = block_k_vector;
+	vector_command[vec_b_subtype] = vec_k_command;
+	vector_command[vec_w_flags] = 0;
+	vector_command[vec_w_tro_count] = 0;
+	set_table_block_size(vec_k_header_length,vector_command);
+	cdu$gl_table[vec_l_comdptr] = .vector_command - .cdu$gl_table;
+
+	free_longwords = 128;
+
+) else
+
+	! A verb name table already exists.  If there is an entry for the
+	! new verb name, delete it.
+
+	cdu$delete_verb_name(.verb_name);
+
+! There must be at least one free longword after the end of the tables,
+! or else we need to make the tables bigger.  If we must, then extend
+! them by 32 entries.
+
+if .free_longwords eqlu 0 then (
+	bind
+		vector_verb = .cdu$gl_table + .cdu$gl_table[vec_l_verbtbl]: block[,byte],
+		vector_command = .cdu$gl_table + .cdu$gl_table[vec_l_comdptr]: block[,byte];
+
+	allocate_largest_table_block(.vector_verb[vec_w_size] + 32*4, new_block);
+	ch$move(.vector_verb[vec_w_size],vector_verb, .new_block);
+	cdu$gl_table[vec_l_verbtbl] = .new_block - .cdu$gl_table;
+
+	allocate_largest_table_block(.vector_command[vec_w_size] + 32*4, new_block);
+	ch$move(.vector_command[vec_w_size],vector_command, .new_block);
+	cdu$gl_table[vec_l_comdptr] = .new_block - .cdu$gl_table;
+
+	free_longwords = 32;
+);
+
+! The verb name table contains longwords, each of which is the first four
+! characters of a verb name, padded with NULs.
+
+ch$copy(minu(.verb_name[len],4),.verb_name[ptr], NUL,4,key);
+
+! Search the verb name table to find the first verb name that collates
+! higher than the new one.
+
+begin
+bind
+	vector_verb = .cdu$gl_table + .cdu$gl_table[vec_l_verbtbl]: block[,byte],
+	verb_names = vector_verb + vec_k_header_length: vector[,long],
+	vector_command = .cdu$gl_table + .cdu$gl_table[vec_l_comdptr]: block[,byte],
+	command_block_pointers = vector_command + vec_k_header_length: vector[,long];
+
+entry =	(incr i from 0 to .vector_command[vec_w_tro_count]-1 do
+		if ch$gtr(4,verb_names[.i], 4,key,NUL) then exitloop .i);
+if .entry eql -1 then
+	entry = .vector_command[vec_w_tro_count];
+
+! Make a hole in the verb name and command block pointer tables to
+! accomodate the new verb name.
+
+length = (.vector_command[vec_w_tro_count] - .entry) * 4;
+ch$move(.length,verb_names[.entry], verb_names[.entry+1]);
+ch$move(.length,command_block_pointers[.entry], command_block_pointers[.entry+1]);
+
+! Put the verb name and command block pointer into the table.  Adjust
+! the verb name table size, and the size and TRO count in the command
+! block pointer table.
+
+verb_names[.entry] = .key;
+extend_table_block_size(4,vector_verb);
+command_block_pointers[.entry] = .command_block - .cdu$gl_table;
+extend_table_block_size(4,vector_command);
+increment(vector_command[vec_w_tro_count]);
+end;
+
+! Decrement the count of free longwords at the end of the tables.
+
+decrement(free_longwords);
+return;
+
+END;
+
+!++
+! Description:	This routine is called to collect all of the table blocks
+!		and copy them into the final CLI table area.  After the CLD
+!		files have been compiled, the table blocks are scattered
+!		throughout memory and must be collected in a contiguous
+!		area before being written.
+!
+!		The blocks are collected by traversing the tree of blocks
+!		which is rooted in the primary vector block.  As the blocks
+!		are copied into the final area, all inter-block pointers
+!		(TROs) are adjusted accordingly.
+!
+! Parameters:	final_area	By reference, an area of memory to contain
+!				the final tables.  It is assumed to be
+!				large enough.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$collect_table_blocks(final_area: pointer)	: novalue
+= BEGIN
+
+own
+	own_final_area: pointer,
+	allocation_offset: long;
+
+! This internal routine collects a block and all of its children.  It is passed
+! the address of the block and returns the TRO of the block in the final
+! area.
+
+ROUTINE collect_block(a_block: pointer)
+= BEGIN
+
+local
+	new_tro: long;
+
+
+! If the table block has already been visited for collection, a special type
+! code will exist in its header.  Simply return the saved TRO.
+
+if .a_block[vec_b_type] eqlu block_k_cdu_visited then
+	return .a_block[4,0,32,0];
+
+! Remember the new TRO of this block and copy it there.  Advance the allocation
+! offset to account for the block.
+
+new_tro = .allocation_offset;
+ch$move(.a_block[vec_w_size],.a_block, .own_final_area+.new_tro);
+allocation_offset = .allocation_offset + .a_block[vec_w_size];
+
+! Mark this block as collected by storing a special type code in its
+! header.  Also save its new TRO in the second longword.  This will ensure
+! that we don't collect the block more than once if it is referenced
+! multiple times.
+
+a_block[vec_b_type] = block_k_cdu_visited;
+a_block[4,0,32,0] = .new_tro;
+
+! Loop through each of the blocks that are directly referenced by this
+! block.  Collect them and update the TROs in this block.
+
+begin
+bind
+	new_block = .own_final_area + .new_tro: block[,byte],
+	tro_list = new_block + vec_k_header_length: vector[,long];
+
+incr i from 0 to .new_block[vec_w_tro_count]-1 do
+	if .tro_list[.i] nequ 0 then
+		tro_list[.i] = collect_block(.cdu$gl_table+.tro_list[.i]);
+end;
+
+! Return the new TRO of this block in the final area.
+
+return .new_tro;
+
+END;
+
+! Main routine.
+! Call an internal routine to collect all of the blocks.
+
+own_final_area = .final_area;
+allocation_offset = 0;
+collect_block(.cdu$gl_table);
+
+! Reset the global variable that points at the beginning of the table.
+! The uncollected table will fade into oblivion.
+
+cdu$gl_table = .final_area;
+
+! Store the exact size of the CLI table in the primary vector block.
+
+cdu$gl_table[vec_l_table_size] = .allocation_offset;
+
+return;
+
+END;
+
+!++
+! Description:	This internal routine is called to move an arbitrarily-long
+!		block of bytes from one place to another.  A loop must be
+!		used since the stupid VAX instructions can't move more than
+!		65K-1 bytes at a time.
+!
+! Parameters:	length		By value, the length of the block.
+!		from_address	By reference, the source address.
+!		to_address	By reference, the destination address.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE long_move(length: long,
+			 from_address: pointer,
+			 to_address: pointer)		: novalue
+= BEGIN
+
+local
+	remaining_length: long;
+
+
+! Just move the block in 65K-1 chunks.
+
+remaining_length = .length;
+incru offset from 0 to .length by %x'0ffff' do (
+	ch$move(minu(.remaining_length,%x'0ffff'),.from_address+.offset, .to_address+.offset);
+	remaining_length = .remaining_length - minu(.remaining_length,%x'0ffff');
+);
+
+return;
+
+END;
+
+END
+ELUDOM

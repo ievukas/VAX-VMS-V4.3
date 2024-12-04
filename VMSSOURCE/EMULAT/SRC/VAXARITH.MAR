@@ -1,0 +1,2497 @@
+	.TITLE	VAX$DECIMAL_ARITHMETIC - VAX-11 Packed Decimal Arithmetic Instruction Emulator
+	.IDENT	/V04-000/
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; Facility: 
+;
+;	VAX-11 Instruction Emulator
+;
+; Abstract:
+;
+;	The routines in this module emulate the VAX-11 packed decimal
+;	instructions that perform arithmetic operations. These procedures can
+;	be a part of an emulator package or can be called directly after the
+;	input parameters have been loaded into the architectural registers. 
+;
+;	The input parameters to these routines are the registers that
+;	contain the intermediate instruction state. 
+;
+; Environment: 
+;
+;	These routines run at any access mode, at any IPL, and are AST 
+;	reentrant.
+;
+; Author: 
+;
+;	Lawrence J. Kenah	
+;
+; Creation Date
+;
+;	19 October 1983
+;
+; Modified by:
+;
+;	V01-003	LJK0037		Lawrence J. Kenah	17-Jul-1984
+;		Fix two minor bugs in exception handling code that caused
+;		MULP and DIVP tests to generate spurious access violations.
+;
+;	V01-002	LJK0024		Lawrence J. Kenah	21-Feb-1984
+;		Add code to handle access violations. Perform minor cleanup.
+;		Eliminate double use of R10 in MULP and DIVP.
+;
+;	V01-001	LJK0008		Lawrence J. Kenah	19-Oct-1983
+;		The emulation code for ADDP4, ADDP6, SUBP4, SUBP6, MULP and
+;		DIVP was moved into a separate module.
+;--
+
+	.SUBTITLE	Declarations
+
+; Include files:
+
+	.NOCROSS			; No cross reference for these
+	.ENABLE		SUPPRESSION	; No symbol table entries either
+
+	ADDP4_DEF			; Bit fields in ADDP4 registers
+	ADDP6_DEF			; Bit fields in ADDP6 registers
+	DIVP_DEF			; Bit fields in DIVP registers
+	MULP_DEF			; Bit fields in MULP registers
+	SUBP4_DEF			; Bit fields in SUBP4 registers
+	SUBP6_DEF			; Bit fields in SUBP6 registers
+
+	$PSLDEF				; Define bit fields in PSL
+	$SRMDEF				; Define arithmetic trap codes
+
+	.DISABLE	SUPPRESSION	; Turn on symbol table again
+	.CROSS				; Cross reference is OK now
+
+; Symbol definitions
+
+;	The architecture requires that R4 be zero on completion of an ADDP6 or 
+;	SUBP6 instruction. If we did not have to worry about restarting 
+;	instructions after an access violation, we could simply zero the saved 
+;	R4 value on the code path that these two instructions have in common 
+;	before they merge with the ADDP4 and SUBP4 routines. The ability to 
+;	restart requires that we keep the original R4 around at least until no 
+;	more access violations are possible. To accomplish this, we store the 
+;	fact that R4 must be cleared on exit in R11, which also contains the 
+;	evolving condition codes. We use bit 31, the compatibility mode bit 
+;	because it is nearly impossible to enter the emulator with CM set.
+
+	ADD_SUB_V_ZERO_R4 = PSL$V_CM
+
+; External declarations
+
+	.DISABLE	GLOBAL
+
+	.EXTERNAL -
+			DECIMAL$BOUNDS_CHECK,-
+			DECIMAL$BINARY_TO_PACKED_TABLE,-
+			DECIMAL$PACKED_TO_BINARY_TABLE,-
+			DECIMAL$STRIP_ZEROS_R0_R1,-
+			DECIMAL$STRIP_ZEROS_R2_R3
+
+	.EXTERNAL -
+			VAX$DECIMAL_EXIT,-
+			VAX$DECIMAL_ACCVIO,-
+			VAX$REFLECT_TRAP,-
+			VAX$ROPRAND
+
+; PSECT Declarations:
+
+	.DEFAULT	DISPLACEMENT , WORD
+
+	.PSECT _VAX$CODE PIC, USR, CON, REL, LCL, SHR, EXE, RD, NOWRT, LONG
+
+	BEGIN_MARK_POINT
+
+
+	.SUBTITLE	VAX$SUBP6 - Subtract Packed (6 Operand Format)
+;+
+; Functional Description:
+;
+;	In 6 operand format, the subtrahend string specified by  the  subtrahend
+;	length  and  subtrahend  address operands is subtracted from the minuend
+;	string specified by the minuend length  and  minuend  address  operands.
+;	The  difference string specified by the difference length and difference
+;	address operands is replaced by the result.
+;
+; Input Parameters:
+;
+;	R0 - sublen.rw		Number of digits in subtrahend string
+;	R1 - subaddr.ab		Address of subtrahend string
+;	R2 - minlen.rw		Number of digits in minuend string
+;	R3 - minaddr.ab		Address of minuend string
+;	R4 - diflen.rw		Number of digits in difference string
+;	R5 - difaddr.ab		Address of difference string
+;
+; Output Parameters:
+;
+;	R0 = 0
+;	R1 = Address of the byte containing the most significant digit of
+;	     the subtrahend string
+;	R2 = 0
+;	R3 = Address of the byte containing the most significant digit of
+;	     the minuend string
+;	R4 = 0
+;	R5 = Address of the byte containing the most significant digit of
+;	     the string containing the difference
+;
+; Condition Codes:
+;
+;	N <- difference string LSS 0
+;	Z <- difference string EQL 0
+;	V <- decimal overflow
+;	C <- 0
+;
+; Register Usage:
+;
+;	This routine uses all of the general registers. The condition codes 
+;	are recorded in R11 as the routine executes.
+;-
+
+	.ENABLE		LOCAL_BLOCK
+
+VAX$SUBP6::
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>	; Save the lot
+	MOVZBL	#1,R9			; Indicate that this is subtraction
+	BRB	10$			; Merge with ADDP6 code
+
+	.SUBTITLE	VAX$ADDP6 - Add Packed (6 Operand Format)
+;+
+; Functional Description:
+;
+;	In 6 operand format, the addend 1  string  specified  by  the  addend  1
+;	length  and  addend  1  address operands is added to the addend 2 string
+;	specified by the addend 2 length and addend 2 address operands.  The sum
+;	string  specified by the sum length and sum address operands is replaced
+;	by the result.
+;
+; Input Parameters:
+;
+;	R0 - add1len.rw		Number of digits in first addend string
+;	R1 - add1addr.ab	Address of first addend string
+;	R2 - add2len.rw		Number of digits in second addend string
+;	R3 - add2addr.ab	Address of second addend string
+;	R4 - sumlen.rw		Number of digits in sum string
+;	R5 - sumaddr.ab		Address of sum string
+;
+; Output Parameters:
+;
+;	R0 = 0
+;	R1 = Address of the byte containing the most significant digit of
+;	     the first addend string
+;	R2 = 0
+;	R3 = Address of the byte containing the most significant digit of
+;	     the second addend string
+;	R4 = 0
+;	R5 = Address of the byte containing the most significant digit of
+;	     the string containing the sum
+;
+; Condition Codes:
+;
+;	N <- sum string LSS 0
+;	Z <- sum string EQL 0
+;	V <- decimal overflow
+;	C <- 0
+;
+; Register Usage:
+;
+;	This routine uses all of the general registers. The condition codes 
+;	are recorded in R11 as the routine executes.
+;-
+
+VAX$ADDP6::
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>	; Save the lot
+	CLRL	R9			; This is addition
+10$:	ROPRAND_CHECK	R4		; Insure that R4 is LEQU 31
+	MOVPSL	R11			; Get initial PSL
+
+; Indicate that the saved R4 must be cleared on the exit path
+
+	BBCS	#ADD_SUB_V_ZERO_R4,R11,30$	; Set bit and join common code
+	BRB	30$				; In case we drop through BBCS
+
+	.SUBTITLE	VAX$SUBP4 - Subtract Packed (4 Operand Format)
+;+
+; Functional Description:
+;
+;	In 4 operand format,  the  subtrahend  string  specified  by  subtrahend
+;	length and subtrahend address operands is subtracted from the difference
+;	string  specified  by  the  difference  length  and  difference  address
+;	operands and the difference string is replaced by the result.
+;
+; Input Parameters:
+;
+;	R0 - sublen.rw		Number of digits in subtrahend string
+;	R1 - subaddr.ab		Address of subtrahend decimal string
+;	R2 - diflen.rw		Number of digits in difference string
+;	R3 - difaddr.ab		Address of difference decimal string
+;
+; Output Parameters:
+;
+;	R0 = 0
+;	R1 = Address of the byte containing the most significant digit of
+;	     the subtrahend string
+;	R2 = 0
+;	R3 = Address of the byte containing the most significant digit of
+;	     the string containing the difference
+;
+; Condition Codes:
+;
+;	N <- difference string LSS 0
+;	Z <- difference string EQL 0
+;	V <- decimal overflow
+;	C <- 0
+;
+; Register Usage:
+;
+;	This routine uses all of the general registers. The condition codes 
+;	are recorded in R11 as the routine executes.
+;-
+
+VAX$SUBP4::
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>	; Save the lot
+	MOVZBL	#1,R9			; Indicate that this is subtraction
+	BRB	20$			; Merge with ADDP4 code
+
+	.SUBTITLE	VAX$ADDP4 - Add Packed (4 Operand Format)
+;+
+; Functional Description:
+;
+;	In 4 operand format, the addend string specified by  the  addend  length
+;	and  addend address operands is added to the sum string specified by the
+;	sum length and sum address operands and the sum string  is  replaced  by
+;	the result.
+;
+; Input Parameters:
+;
+;	R0 - addlen.rw		Number of digits in addend string
+;	R1 - addaddr.ab		Address of addend decimal string
+;	R2 - sumlen.rw		Number of digits in sum string
+;	R3 - sumaddr.ab		Address of sum decimal string
+;
+; Output Parameters:
+;
+;	R0 = 0
+;	R1 = Address of the byte containing the most significant digit of
+;	     the addend string
+;	R2 = 0
+;	R3 = Address of the byte containing the most significant digit of
+;	     the string containing the sum
+;
+; Condition Codes:
+;
+;	N <- sum string LSS 0
+;	Z <- sum string EQL 0
+;	V <- decimal overflow
+;	C <- 0
+;
+; Register Usage:
+;
+;	This routine uses all of the general registers. The condition codes 
+;	are recorded in R11 as the routine executes.
+;-
+
+VAX$ADDP4::
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>	; Save the lot
+	CLRL	R9			; This is addition
+
+; The output string, described by R4 and R5, will be the same as the input
+; string for ADDP4 and SUBP4. It is necessary to explicitly clear R4<31:16>
+; along this code path so MOVQ R2,R4 will not always work.
+
+20$:	MOVZWL	R2,R4			; Set output size equal to input size
+	MOVL	R3,R5			; ... and ditto for string addresses
+	MOVPSL	R11			; Get initial PSL
+
+; Indicate that the saved R4 will be restored on the common exit path
+
+	BBCC	#ADD_SUB_V_ZERO_R4,R11,30$	; Clear bit and join common code
+
+	.SUBTITLE	ADDPx/SUBPx Common Initialization Code
+;+
+; All four routines converge at this point and execute common initialization
+; code until a later decision is made to do addition or subtraction.
+;
+;	R4 - Number of digits in destination string
+;	R5 - Address of destination string
+;
+;	R9 - Indicates whether operation is addition or subtraction
+;		0 => addition
+;		1 => subtraction
+;
+;	R11<31> - Indicates whether this is a 4-operand or 6-operand instruction
+;		0 => 4-operand (restore saved R4 on exit)
+;		1 => 6-operand (set R4 to zero on exit)
+;-
+
+30$:	INSV	#PSL$M_Z,#0,#4,R11	; Set Z-bit, clear the rest in saved PSW
+	ESTABLISH_HANDLER	-	; Store address of access
+		ARITH_ACCVIO		;  violation handler
+
+	ROPRAND_CHECK	R2			; Insure that R2 is LEQU 31
+	MARK_POINT	ADD_SUB_BSBW_0
+	BSBW	DECIMAL$STRIP_ZEROS_R2_R3	; Strip high order zeros from R2/R3 string
+
+	ROPRAND_CHECK	R0			; Insure that R0 is LEQU 31
+	MARK_POINT	ADD_SUB_BSBW_0
+	BSBW	DECIMAL$STRIP_ZEROS_R0_R1	; Strip high order zeros from R0/R1 string
+
+; Rather than totally confuse the already complicated logic dealing with
+; different length strings in the add or subtract loop, we will put the
+; result into an intermediate buffer on the stack. This buffer will be long
+; enough to handle the worst case so that the addition loop need only concern
+; itself with the lengths of the two input loops. The required length is 17
+; bytes, to handle an addition with a carry out of the most significant byte.
+; We will allocate 20 bytes to maintain whatever alignment the stack has.
+
+	CLRQ	-(SP)			; Set aside space for output string
+	CLRQ	-(SP)			; Worst case string needs 16 bytes
+	CLRL	-(SP)			; Add slack for a CARRY
+	EXTZV	#1,#4,R4,R8		; Get byte count of destination string
+	ADDL3	R8,R5,-(SP)		; Save high address end of destination
+	MOVAB	24(SP),R5		; Point R5 one byte beyond buffer
+
+; The number of minus signs will determine whether the real operation that we
+; perform is addition or subtraction. That is, two plus signs or two minus
+; signs will both result in addition, while a plus sign and a minus sign will
+; result in subtraction. The addition and subtraction routines have their own
+; methods for determining the correct sign of the result. 
+; 
+; For the purpose of counting minus signs, we treat subtraction as the
+; addition of the negative of the input operand. That is, subtraction of a
+; positive quantity causes the sign to be remembered as minus and counted as
+; a minus sign while subtraction of a minus quantity stores a plus sign and
+; counts nothing. 
+; 
+; On input to this code sequence, R9 distinguished addition from subtraction.
+; On output, it contains either 0, 1, or 2, indicating the total number of
+; minus signs, real or implied, that we counted. 
+
+	EXTZV	#1,#4,R0,R6		; Get byte count for first input string
+	ADDL	R6,R1			; Point R1 to byte containing sign
+	MARK_POINT	ADD_SUB_24
+	BICB3	#^B11110000,(R1),R6	; R6 contains the sign "digit"
+	BLBS	R9,35$			; Use second CASE if subtraction
+
+; This case statement is used for addition
+
+	CASE	R6,TYPE=B,LIMIT=#10,<-	; Dispatch on sign digit
+		50$,-			; 10 => sign is "+"
+		40$,-			; 11 => sign is "-"
+		50$,-			; 12 => sign is "+"
+		40$,-			; 13 => sign is "-"
+		50$,-			; 14 => sign is "+"
+		50$,-			; 15 => sign is "+"
+		>
+
+; This case statement is used for subtraction
+
+35$:	CASE	R6,TYPE=B,LIMIT=#10,<-	; Dispatch on sign digit
+		40$,-			; 10 => treat sign as "-"
+		50$,-			; 11 => treat sign as "+"
+		40$,-			; 12 => treat sign as "-"
+		50$,-			; 13 => treat sign as "+"
+		40$,-			; 14 => treat sign as "-"
+		40$,-			; 15 => treat sign as "-"
+		>
+
+40$:	MOVL	#1,R9			; Count a minus sign
+	MOVZBL	#13,R6			; The preferred minus sign is 13
+	BRB	60$			; Now check second input sign
+
+50$:	CLRL	R9			; No real minus signs so far
+	MOVZBL	#12,R6			; The preferred minus sign is 12
+
+60$:	EXTZV	#1,#4,R2,R7		; Get byte count for second input string
+	ADDL	R7,R3			; Point R3 to byte containing sign
+	MARK_POINT	ADD_SUB_24
+	BICB3	#^B11110000,(R3),R7	; R7 contains the sign "digit"
+
+	CASE	R7,TYPE=B,LIMIT=#10,<-	; Dispatch on sign digit
+		80$,-			; 10 => sign is "+"
+		70$,-			; 11 => sign is "-"
+		80$,-			; 12 => sign is "+"
+		70$,-			; 13 => sign is "-"
+		80$,-			; 14 => sign is "+"
+		80$,-			; 15 => sign is "+"
+		>
+
+70$:	INCL	R9			; Remember that sign was minus
+	MOVZBL	#13,R7			; The preferred minus sign is 13
+	BRB	90$			; Now check second input sign
+
+80$:	MOVZBL	#12,R7			; The preferred minus sign is 12
+
+90$:	BLBC	R9,ADD_PACKED		; Even parity indicates addition
+
+	BRW	SUBTRACT_PACKED		; Odd parity calls for subtraction
+
+	.DISABLE	LOCAL_BLOCK
+
+	.SUBTITLE	ADD_PACKED - Add Two Packed Decimal Strings
+;+
+; Functional Description:
+;
+;	This routine adds two packed decimal strings whose descriptors
+;	are passed as input parameters and places their sum into another
+;	(perhaps identical) packed decimal string.
+;
+;	At the present time, the result is placed into a 16-byte storage
+;	area while the sum is being evaluated. This drastically reduces
+;	the number of different cases that must be dealt with as each
+;	pair of bytes in the two input strings is added.
+;
+;	The signs of the two input strings have already been dealt with
+;	so this routine performs addition in all cases, even if the original
+;	entry was at SUBP4 or SUBP6. The cases that arrive in this routine
+;	are as follows.
+;
+;                          R2/R3           R0/R1          result
+;                    +---------------+---------------+---------------+
+;                    |               |               |               |
+;      R2/R3 + R0/R1 |     plus      |     plus      |     plus      |
+;                    |               |               |               |
+;                    +---------------+---------------+---------------+
+;                    |               |               |               |
+;      R2/R3 + R0/R1 |     minus     |     minus     |     minus     |
+;                    |               |               |               |
+;                    +---------------+---------------+---------------+
+;                    |               |               |               |
+;      R2/R3 - R0/R1 |     minus     |     plus      |     minus     |
+;                    |               |               |               |
+;                    +---------------+---------------+---------------+
+;                    |               |               |               |
+;      R2/R3 - R0/R1 |     plus      |     minus     |     plus      |
+;                    |               |               |               |
+;                    +---------------+---------------+---------------+
+;
+;	Note that the correct choice of sign in all four cases is the sign
+;	of the second input string, the one described by R2 and R3.
+;
+; Input Parameters:
+;
+;	R0<4:0> - Number of digits in first input decimal string
+;	R1      - Address of least significant digit of first input 
+;		  decimal string (the byte containing the sign)
+;
+;	R2<4:0> - Number of digits in second input decimal string
+;	R3      - Address of least significant digit of second input 
+;		  decimal string (the byte containing the sign)
+;
+;	R4<4:0> - Number of digits in output decimal string
+;	R5      - Address of one byte beyond least significant digit of 
+;		  intermediate string stored on the stack
+;
+;	R6<3:0> - Sign of first input string in preferred form
+;	R7<3:0> - Sign of second input string in preferred form
+;
+;	R11     - Saved PSL (Z-bit is set, other condition codes are clear)
+;
+;	(SP)	- Saved R5, address of least significant digit of ultimate
+;		  destination string.
+;	4(SP)   - Beginning of 20-byte buffer to hold intermediate result
+;
+; Output Parameters:
+;
+;	The particular input operation (ADDPx or SUBPx) is completed in
+;	this routine. See the routine headers for the four routines that
+;	request addition or subtraction for a list of output parameters
+;	from this routine.
+;-
+
+ADD_PACKED:
+	MOVB	R7,R9			; Use sign of second string for output
+	BLBC	R9,10$			; Check if sign is negative
+	BISB	#PSL$M_N,R11		; ... so the saved N-bit can be set
+
+	MARK_POINT	ADD_SUB_24
+10$:	BICB3	#^B00001111,(R1),R6	; Get least significant digit to R6
+	MARK_POINT	ADD_SUB_24
+	BICB3	#^B00001111,(R3),R7	; Get least significant digit to R7
+	CLRL	R8			; Start the add with CARRY off
+	BSBW	ADD_PACKED_BYTE_R6_R7	; Add the two low order digits
+
+; The following set of instructions computes the number of bytes in the two
+; strings and, if necessary, performs a switch so that R0 and R1 always
+; describe the shorter of the two strings.
+
+	EXTZV	#1,#4,R0,R0		; Convert digit count to byte count
+	EXTZV	#1,#4,R2,R2		; Do it for both strings
+	CMPL	R0,R2			; We want to compare the byte counts
+	BLEQU	20$			; Skip the swap if we're already correct
+	MOVQ	R0,R6			; Save the longer
+	MOVQ	R2,R0			; Store the shorter on R0 and R1
+	MOVQ	R6,R2			; ... and store the longer in R2 and R3
+20$:	SUBL	R0,R2			; Make R2 a difference (R2 GEQU 0)
+
+; R0 now contains the number of bytes remaining in the shorter string.
+; R2 contains the difference in bytes between the two input strings.
+
+	TSTL	R0			; Does shorter string have any room?
+	BEQL	40$			; Skip loop if no room at all
+
+30$:	BSBW	ADD_PACKED_BYTE_STRING	; Add the next two bytes together
+	SOBGTR	R0,30$			; Check for end of loop
+
+40$:	TSTL	R2			; Does longer string have any room?
+	BEQL	70$			; Skip next loops if all done
+
+50$:	BLBC	R8,60$			; Life is simple if CARRY clear
+
+	CLRL	R6			; Otherwise, CARRY must propogate
+	MARK_POINT	ADD_SUB_24
+	MOVZBL	-(R3),R7		; So add CARRY to single string
+	BSBW	ADD_PACKED_BYTE_R6_R7	; Use the special entry point
+	SOBGTR	R2,50$			; Check for this string exhausted
+	BRB	70$			; Join common completion code
+
+	MARK_POINT	ADD_SUB_24
+60$:	MOVB	-(R3),-(R5)		; Simply move src to dst if no CARRY
+	SOBGTR	R2,60$			; ... until we're all done
+
+70$:	MOVB	R8,-(R5)		; Store the final CARRY
+
+;+
+; At this point, the result has been computed. That result must be moved to
+; its ultimate destination, noting whether any nonzero digits are stored
+; so that the Z-bit will have its correct setting. 
+;
+; Input Parameters:
+;
+;	R9<7:0>  - Sign of result in preferred form
+;	R11<3:0> - Saved condition codes
+;	R11<31>  - Indicates whether to set saved R4 to zero
+;
+;	(SP)    - Saved R5, high address end of destination string
+;-
+
+ADD_SUBTRACT_EXIT:
+	ADDL3	#1,(SP),R5		; Point R5 beyond real destination 
+	MOVAB	24(SP),R1		; R1 locates the saved result
+	BSBW	STORE_RESULT		; Store the result and record the Z-bit
+	BBS	#PSL$V_Z,R11,100$	; Step out of line for minus zero check
+
+	MARK_POINT	ADD_SUB_24
+80$:	INSV	R9,#0,#4,@(SP)+		; The sign can finally be stored
+	ADDL	#20,SP			; Get rid of intermediate buffer
+	BBC	#ADD_SUB_V_ZERO_R4,R11,90$	; Branch if 4-operand opcode
+	CLRL	16(SP)			; Clear saved R4 to return zero
+90$:	BRW	VAX$DECIMAL_EXIT	; Exit through common code path
+
+; If the result is negative zero, then the N-bit is cleared and the sign
+; is changed to a plus sign.
+
+100$:	BICB	#PSL$M_N,R11		; Clear the N-bit unconditionally
+	BBS	#PSL$V_V,R11,80$	; Do not change the sign on overflow
+	MOVB	#12,R9			; Make sure that the sign is plus
+	BRB	80$			; ... and rejoin the exit code
+
+	.SUBTITLE	ADD_PACKED_BYTE - Add Two Bytes Containing Decimal Digits
+;+
+; Functional Description:
+;
+;	This routine adds together two bytes containing decimal digits and 
+;	produces a byte containing the sum that is stored in the output 
+;	string. Each of the input bytes is converted to a binary number
+;	(with a table-driven conversion), the two numbers are added, and
+;	the sum is converted back to two decimal digits stored in a byte.
+;
+;	This routine makes no provisions for bytes that contain illegal
+;	decimal digits. We are using the UNPREDICTABLE statement in the
+;	architectural description of the decimal instructions to its fullest.
+;
+;	The bytes that contain a pair of packed decimal digits can either
+;	exist in packed decimal strings located by R1 and R3 or they can
+;	be stored directly in registers. In the former case, the digits must
+;	be extracted from registers before they can be used in later operations
+;	because the sum will be used as an index register.
+;
+; For entry at ADD_PACKED_BYTE_STRING:
+;
+;	Input Parameters:
+;
+;		R1  - Address one byte beyond first byte that is to be added
+;		R3  - Address one byte beyond second byte that is to be added
+;		R5  - Address one byte beyond location to store sum
+;
+;		R8  - Carry from previous byte (R8 is either 0 or 1)
+;
+;	Implicit Input:
+;
+;		R6 - Scratch
+;		R7 - Scratch
+;
+;	Output Parameters:
+;
+;		R1 - Decreased by one to point to current byte in first input string
+;		R3 - Decreased by one to point to current byte in second input string
+;		R5 - Decreased by one to point to current byte in output string
+;
+;		R8 - Either 0 or 1, reflecting whether this most recent ADD resulted
+;		     in a CARRY to the next byte.
+;
+; For entry at ADD_PACKED_BYTE_R6_R7:
+;
+;	Input Parameters:
+;
+;		R6  - First byte containing decimal digit pair
+;		R7  - Second byte containing decimal digit pair
+;
+;		R5  - Address one byte beyond location to store sum
+;
+;		R8  - Carry from previous byte (R8 is either 0 or 1)
+;
+;	Output Parameters:
+;
+;		R5 - Decreased by one to point to current byte in output string
+;
+;		R8 - Either 0 or 1, reflecting whether this most recent ADD resulted
+;		     in a CARRY to the next byte.
+;
+; Side Effects:
+;
+;	R6 and R7 are modified by this routine
+;
+;	R0, R2, R4, and R9 (and, of course, R10 and R11) are preserved 
+;	by this routine
+;
+; Assumptions:
+;
+;	This routine makes two important assumptions.
+;
+;	1.  If both of the input bytes contain only legal decimal digits, then
+;	    it is only necessary to subtract 100 at most once to put all 
+;	    possible sums in the range 0..99. That is,
+;
+;		99 + 99 + 1 = 199 LSS 200
+;
+;	2.  The result will be checked in some way to determine whether the
+;	    result is nonzero so that the Z-bit can have its correct setting.
+;-
+
+ADD_PACKED_BYTE_STRING:
+
+	MARK_POINT	ADD_SUB_BSBW_24
+	MOVZBL	-(R1),R6		; Get byte from first string
+	MARK_POINT	ADD_SUB_BSBW_24
+	MOVZBL	-(R3),R7		; Get byte from second string
+
+VAX$ADD_PACKED_BYTE_R6_R7::		; ASHP also uses this routine
+ADD_PACKED_BYTE_R6_R7:
+	MOVB	DECIMAL$PACKED_TO_BINARY_TABLE[R6],-
+			R6		; Convert digits to binary
+	MOVB	DECIMAL$PACKED_TO_BINARY_TABLE[R7],-
+			R7		; Convert digits to binary
+	ADDB	R6,R7			; Form their sum
+	ADDB	R8,R7			; Add CARRY from last step
+	CLRB	R8			; Assume no CARRY this time
+	CMPB	R7,#99			; Check for CARRY
+	BLEQU	10$			; Branch if within bounds
+	MOVB	#1,R8			; Propogate CARRY to next step
+	SUBB	#100,R7			; Put R7 into interval 0..99
+10$:	MOVB	DECIMAL$BINARY_TO_PACKED_TABLE[R7],-
+			-(R5)		; Store converted sum byte
+	RSB
+
+	.SUBTITLE	SUBTRACT_PACKED - Subtract Two Packed Decimal Strings
+;+
+; Functional Description:
+;
+;	This routine takes two packed decimal strings whose descriptors
+;	are passed as input parameters, subtracts one string from the
+;	other, and places their sum into another (perhaps identical) 
+;	packed decimal string.
+;
+;	At the present time, the result is placed into a 16-byte storage
+;	area while the difference is being evaluated. This drastically reduces
+;	the number of different cases that must be dealt with as each
+;	pair of bytes in the two input strings is added.
+;
+;	The signs of the two input strings have already been dealt with so
+;	this routine performs subtraction in all cases, even if the original
+;	entry was at ADDP4 or ADDP6. 
+;
+; Input Parameters:
+;
+;	R0<4:0> - Number of digits in first input decimal string
+;	R1      - Address of least significant digit of first input 
+;		  decimal string (the byte containing the sign)
+;
+;	R2<4:0> - Number of digits in second input decimal string
+;	R3      - Address of least significant digit of second input 
+;		  decimal string (the byte containing the sign)
+;
+;	R4<4:0> - Number of digits in output decimal string
+;	R5      - Address of one byte beyond least significant digit of 
+;		  intermediate string stored on the stack
+;
+;	R6<3:0> - Sign of first input string in preferred form
+;	R7<3:0> - Sign of second input string in preferred form
+;
+;	R11     - Saved PSL (Z-bit is set, other condition codes are clear)
+;
+;	(SP)	- Saved R5, address of least significant digit of ultimate
+;		  destination string.
+;	4(SP)   - Beginning of 20-byte buffer to hold intermediate result
+;
+; Output Parameters:
+;
+;	The particular input operation (ADDPx or SUBPx) is completed in
+;	this routine. See the routine headers for the four routines that
+;	request addition or subtraction for a list of output parameters
+;	from this routine.
+;
+; Algorithm for Choice of Sign:
+;
+;	The choice of sign for the output string is not nearly so 
+;	straightforward as it is in the case of addition. One approach that is 
+;	often taken is to make a reasonable guess at the sign of the result. 
+;	If the final subtraction causes a BORROW, then the choice was incorrect. 
+;	The sign must be changed and the result must be replaced by its tens 
+;	complement.
+;
+;	This routine does not guess. Instead, it chooses the input string of 
+;	the larger absolute magnitude as the minuend for this internal 
+;	routine and chooses its sign as the sign of the result.
+;	This algorithm is actually more efficient than the reasonable 
+;	guess method and is probably better than a guess method that is never 
+;	wrong. All complete bytes that are processed in the sign evaluation 
+;	preprocessing loop are eliminated from consideration in the 
+;	subtraction loop, which has a higher cost per byte.
+;
+;	The actual algorithm is as follows. (Note that both input strings have 
+;	already had leading zeros stripped so their lengths reflect 
+;	significant digits.)
+;
+;	1.  If the two strings have unequal lengths, then choose the sign of 
+;	    the string that has the longer length.
+;
+;	2.  For strings of equal length, choose the sign of the string whose 
+;	    most significant byte is larger in magnitude.
+;
+;	3.  If the most significant bytes test equal, then decrease the 
+;	    lengths of each string by one byte, drop the previous most 
+;	    significant bytes, and go back to step 2.
+;
+;	4.  If the two strings test equal, it is not necessary to do any 
+;	    subtraction. The result is identically zero.
+;
+;	Note that the key to this routine's efficiency is that high order 
+;	bytes that test equal in this loop are dropped from consideration in 
+;	the more complicated subtraction loop.
+;-
+
+SUBTRACT_PACKED:
+	EXTZV	#1,#4,R0,R0		; Convert digit count to byte count
+	EXTZV	#1,#4,R2,R2		; Do it for both strings
+	CMPL	R0,R2			; We want to compare the byte counts
+	BLSSU	40$			; R0/R1 represent the smaller string
+	BGTRU	30$			; R2/R3 represent the smaller string
+
+; The two input strings have an equal number of bytes. Compare magnitudes to
+; determine which string is really larger. If the two strings test equal, then
+; skip the entire subtraction loop.
+
+	SUBL3	R0,R1,R8		; Point R8 to low address end of R0/R1
+	SUBL3	R2,R3,R9		; Point R9 to low address end of R2/R3
+	TSTL	R0			; See if both strings have zero bytes
+	BEQL	20$			; Still need to check low order digit
+
+	MARK_POINT	ADD_SUB_24
+10$:	CMPB	(R8)+,(R9)+		; Compare most significant bytes
+	BLSSU	40$			; R0/R1 represent the smaller string
+	BGTRU	30$			; R2/R3 represent the smaller string
+	DECL	R2			; Keep R2 in step with R0	
+	SOBGTR	R0,10$			; ... which gets decremented here
+
+; At this point, we have reduced both input strings to single bytes that
+; contain a sign "digit" and may contain a digit in the high order nibble
+; if the original digit counts were nonzero.
+
+	MARK_POINT	ADD_SUB_24
+20$:	BICB3	#^B00001111,(R8),R8	; Look only at digit, ignoring sign
+	MARK_POINT	ADD_SUB_24
+	BICB3	#^B00001111,(R9),R9	; Get the digit from the other string
+	CMPB	R8,R9			; Compare these digits
+	BLSSU	40$			; R0/R1 represent the smaller string
+	BGTRU	30$			; R2/R3 represent the smaller string
+
+; The two strings have identical magnitudes. Enter the end processing code
+; with the intermediate result unchanged (that is, zero).
+
+	BRW	ADD_SUBTRACT_EXIT	; Join the common completion code
+
+; The string described by R0 and R1 has the larger magnitude. Choose its sign.
+; Then swap the two string descriptors so that the main subtraction loops
+; always have R2 and R3 describing the larger string. Note that the use of
+; R6 and R7 as scratch leaves R7<31:8> in an UNPREDICTABLE state. 
+
+30$:	MOVB	R6,R9			; Load preferred sign into R9
+	MOVQ	R0,R6			; Save the longer
+	MOVQ	R2,R0			; Store the shorter on R0 and R1
+	MOVQ	R6,R2			; ... and store the longer in R2 and R3
+	CLRL	R7			; Insure that R7<31:8> is zero
+	BRB	50$			; Continue along common code path
+
+; The string described by R2 and R3 has the larger magnitude. Choose its sign.
+
+40$:	MOVB	R7,R9			; Load preferred sign into R9
+
+50$:	SUBL	R0,R2			; Make R2 a difference (R2 GEQU 0)
+	BLBC	R9,60$			; Check if sign is negative
+	BISB	#PSL$M_N,R11		; ... so the saved N-bit can be set
+
+	MARK_POINT	ADD_SUB_24
+60$:	BICB3	#^B00001111,(R1),R6	; Get least significant digit to R6
+	MARK_POINT	ADD_SUB_24
+	BICB3	#^B00001111,(R3),R7	; Get least significant digit to R7
+	CLRL	R8			; Start subtracting with BORROW off
+	BSBW	SUB_PACKED_BYTE_R6_R7	; Subtract the two low order digits
+
+; R0 contains the number of bytes remaining in the smaller string
+; R2 contains the difference in bytes between the two input strings
+
+	TSTL	R0			; Does smaller string have any room?
+	BEQL	80$			; Skip loop if no room at all
+
+70$:	BSBW	SUB_PACKED_BYTE_STRING	; Subtract the next two bytes 
+	SOBGTR	R0,70$			; Check for end of loop
+
+80$:	TSTL	R2			; Does one of the strings have more?
+	BEQL	110$			; Skip next loops if all done
+
+90$:	BLBC	R8,100$			; Life is simple if BORROW clear
+
+	CLRL	R6			; Otherwise, BORROW must propogate
+	MARK_POINT	ADD_SUB_24
+	MOVZBL	-(R3),R7		; So subtract BORROW from single string
+	BSBW	SUB_PACKED_BYTE_R6_R7	; Use the special entry point
+	SOBGTR	R2,90$			; Check for this string exhausted
+	BRB	110$			; Join common completion code
+
+	MARK_POINT	ADD_SUB_24
+100$:	MOVB	-(R3),-(R5)		; Simply move src to dst if no BORROW
+	SOBGTR	R2,100$			; ... until we're all done
+
+110$:
+
+;;; ********** BEGIN TEMP ********** 
+;;;
+;;; THE FOLLOWING HALT INSTRUCTION SHOULD BE REPLACED WITH THE CORRECT
+;;; ABORT CODE.
+;;;
+;;; THE HALT IS SIMILAR TO THE
+;;;
+;;;	MICROCODE CANNOT GET HERE
+;;;
+;;; ERRORS THAT OTHER IMPLEMENTATIONS USE. 
+;;;
+	tstl	r8			; If BORROW is set here, we blew it
+	beql	120$			; Branch out if OK
+	halt				; This will cause an OPCDEC exception
+120$:
+;;;
+;;; *********** END TEMP ***********
+
+	BRW	ADD_SUBTRACT_EXIT	; Join common completion code
+
+	.SUBTITLE	SUB_PACKED_BYTE - Subtract Two Bytes Containing Decimal Digits
+;+
+; Functional Description:
+;
+;	This routine takes as input two bytes containing decimal digits and
+;	produces a byte containing their difference. This result is stored in
+;	the output string. Each of the input bytes is converted to a binary
+;	number (with a table-driven conversion), the first number is
+;	subtracted from the second, and the difference is converted back to
+;	two decimal digits stored in a byte. 
+;
+;	This routine makes no provisions for bytes that contain illegal
+;	decimal digits. We are using the UNPREDICTABLE statement in the
+;	architectural description of the decimal instructions to its fullest.
+;
+;	The bytes that contain a pair of packed decimal digits can either
+;	exist in packed decimal strings located by R1 and R3 or they can
+;	be stored directly in registers. In the former case, the digits must
+;	be extracted from registers before they can be used in later operations
+;	because the difference will be used as an index register.
+;
+; For entry at SUB_PACKED_BYTE_STRING:
+;
+;	Input Parameters:
+;
+;		R1  - Address one byte beyond byte containing subtrahend
+;		R3  - Address one byte beyond byte containing minuend
+;		R5  - Address one byte beyond location to store difference
+;
+;		R8  - BORROW from previous byte (R8 is either 0 or 1)
+;
+;	Implicit Input:
+;
+;		R6 - Scratch
+;		R7 - Scratch
+;
+;	Output Parameters:
+;
+;		R1 - Decreased by one to point to current byte 
+;		     in subtrahend string
+;		R3 - Decreased by one to point to current byte 
+;		     in minuend string
+;		R5 - Decreased by one to point to current byte 
+;		     in difference string
+;
+;		R8 - Either 0 or 1, reflecting whether this most recent 
+;		     subtraction resulted in a BORROW from the next byte.
+;
+; For entry at SUB_PACKED_BYTE_R6_R7:
+;
+;	Input Parameters:
+;
+;		R6<7:0>  - Byte containing decimal digit pair for subtrahend 
+;		R6<31:8> - MBZ
+;		R7<7:0>  - Byte containing decimal digit pair for minuend 
+;		R7<31:8> - MBZ
+;
+;		R5 - Address one byte beyond location to store difference 
+;
+;		R8 - BORROW from subtraction of previous byte 
+;		     (R8 is either 0 or 1)
+;
+;	Output Parameters:
+;
+;		R5 - Decreased by one to point to current byte 
+;		     in difference string
+;
+;		R8 - Either 0 or 1, reflecting whether this most recent 
+;		     subtraction resulted in a BORROW from the next byte.
+;
+; Side Effects:
+;
+;	R6 and R7 are modified by this routine
+;
+;	R0, R2, R4, and R9 (and, of course, R10 and R11) are preserved 
+;	by this routine
+;
+; Assumptions:
+;
+;	This routine makes two important assumptions.
+;
+;	1.  If both of the input bytes contain only legal decimal digits, then
+;	    it is only necessary to add 100 at most once to put all 
+;	    possible differences in the range 0..99. That is,
+;
+;		0 - 99 - 1 = -100
+;
+;	2.  The result will be checked in some way to determine whether the
+;	    result is nonzero so that the Z-bit can have its correct setting.
+;-
+
+SUB_PACKED_BYTE_STRING:
+
+	MARK_POINT	ADD_SUB_BSBW_24
+	MOVZBL	-(R1),R6		; Get byte from first string
+	MARK_POINT	ADD_SUB_BSBW_24
+	MOVZBL	-(R3),R7		; Get byte from second string
+
+SUB_PACKED_BYTE_R6_R7:
+	MOVB	DECIMAL$PACKED_TO_BINARY_TABLE[R6],-
+			R6		; Convert digits to binary
+	MOVB	DECIMAL$PACKED_TO_BINARY_TABLE[R7],-
+			R7		; Convert digits to binary
+	SUBB	R6,R7			; Form their difference
+	SUBB	R8,R7			; Include BORROW from last step
+	BLSS	10$			; Branch if need to BORROW
+	CLRB	R8			; No BORROW next time
+	BRB	20$			; Join common exit code
+
+10$:	ADDB	#100,R7			; Put R7 into interval 0..99
+	MOVB	#1,R8			; Propogate BORROW to next step
+
+20$:	MOVB	DECIMAL$BINARY_TO_PACKED_TABLE[R7],-
+			-(R5)		; Store converted sum byte
+	RSB
+
+	.SUBTITLE	STORE_RESULT - Store Decimal String 
+;+
+; Functional Description:
+;
+;	This routine takes a packed decimal string that typically contains
+;	the result of an arithmetic operation and stores it in another
+;	decimal string whose descriptor is specified as an input parameter 
+;	to the original arithmetic operation.
+;
+;	The string is stored from the high address end (least significant
+;	digits) to the low address end (most significant digits). This order
+;	allows all of the special cases to be handled in the simplest fashion.
+;
+; Input Parameters:
+;
+;	R1      - Address one byte beyond high address end of input string
+;		  (Note that this string must be at least 17 bytes long.)
+;
+;	R4<4:0> - Number of digits in ultimate destination
+;	R5      - Address one byte beyond destination string
+;
+;       R11     - Contains saved condition codes
+;
+; Implicit Input:
+;
+;	The input string must be at least 17 bytes long to contain a potential
+;	carry out of the highest digit when doing an add of two large numbers. 
+;	This carry out of the last byte will be detected and reported as a 
+;	decimal overflow, either as an exception or simply by setting the V-bit.
+;
+;	The least significant digit (highest addressed byte) cannot contain a
+;	sign digit because that would cause the Z-bit to be incorrectly cleared.
+;
+; Output Parameters:
+;
+;	R11<PSL$V_Z> - Cleared if a nonzero digit is stored in output string
+;	R11<PSL$V_V> - Set if a nonzero digit is detected after the output
+;		       string is exhausted
+;
+;	A portion of the result (dictated by the size of R4 on input) is
+;	moved to the destination string.
+;-
+
+STORE_RESULT:
+	INCL	R4			; Want number of "complete" bytes in
+	ASHL	#-1,R4,R0		;  output string
+	BEQL	30$			; Skip first loop if none
+
+	MARK_POINT	ADD_SUB_BSBW_24
+10$:	MOVB	-(R1),-(R5)		; Move the next complete byte
+	BEQL	20$			; Check whether to clear Z-bit
+	BICB	#PSL$M_Z,R11		; Clear Z-bit if nonzero
+20$:	SOBGTR	R0,10$			; Keep going?
+
+30$:	BLBC	R4,50$			; Was original R4 odd? Branch if yes
+	MARK_POINT	ADD_SUB_BSBW_24
+	BICB3	#^B11110000,-(R1),-(R5)	; If R4 was even, store half a byte
+	BEQL	40$			; Need to check for zero here, too
+	BICB	#PSL$M_Z,R11		; Clear Z-bit if nonzero	
+	MARK_POINT	ADD_SUB_BSBW_24
+40$:	BITB	#^B11110000,(R1)	; If high order nibble is nonzero,
+	BNEQ	70$			; ... then overflow has occurred
+
+; The entire destination has been stored. We must now check whether any of
+; the remaining input string is nonzero and set the V-bit if nonzero is
+; detected. Note that at least one byte of the output string has been examined
+; in all cases already. This makes the next byte count calculation correct.
+
+50$:	DECL	R4			; Restore R4 to its original self
+	EXTZV	#1,#4,R4,R0		; Extract a byte count
+	SUBB3	R0,#16,R0		; Loop count is 16 minus byte count
+
+; Note that the loop count can never be zero because we are testing a 17-byte
+; string and the largest output string can be 16 bytes long.
+
+	MARK_POINT	ADD_SUB_BSBW_24
+60$:	TSTB	-(R1)			; Check next byte for nonzero
+	BNEQ	70$			; Nonzero means overflow has occurred
+	SOBGTR	R0,60$			; Check for end of this loop
+
+	RSB				; This is return path for no overflow
+
+70$:	BISB	#PSL$M_V,R11		; Indicate that overflow has occurred
+	RSB				; ... and return to the caller
+
+	.SUBTITLE	VAX$MULP - Multiply Packed
+;+
+; Functional Description:
+;
+;	The  multiplicand  string  specified  by  the  multiplicand  length  and
+;	multiplicand  address  operands  is  multiplied by the multiplier string
+;	specified by the multiplier length and multiplier address operands.  The
+;	product  string  specified  by  the  product  length and product address
+;	operands is replaced by the result.
+;
+; Input Parameters:
+;
+;	R0 - mulrlen.rw		Number of digits in multiplier string
+;	R1 - mulraddr.ab	Address of multiplier string
+;	R2 - muldlen.rw		Number of digits in multiplicand string
+;	R3 - muldaddr.ab	Address of multiplicand string
+;	R4 - prodlen.rw		Number of digits in product string
+;	R5 - prodaddr.ab	Address of product string
+;
+; Output Parameters:
+;
+;	R0 = 0
+;	R1 = Address of the byte containing the most significant digit of
+;	     the multiplier string
+;	R2 = 0
+;	R3 = Address of the byte containing the most significant digit of
+;	     the multiplicand string
+;	R4 = 0
+;	R5 = Address of the byte containing the most significant digit of
+;	     the string containing the product
+;
+; Condition Codes:
+;
+;	N <- product string LSS 0
+;	Z <- product string EQL 0
+;	V <- decimal overflow
+;	C <- 0
+;
+; Register Usage:
+;
+;	This routine uses all of the general registers. The condition codes
+;	are computed at the end of the instruction as the final result is
+;	stored in the product string. R11 is used to record the condition
+;	codes.
+;
+; Notes:
+;
+;    1.	This routine uses a large amount of stack space to allow storage of
+;	intermediate results in a convenient form. Specifically, each digit
+;	pair of the longer input string is stored in binary in a longword on
+;	the stack. In addition, 32 longwords are set aside to hold the product
+;	intermediate result. Each longword contains a binary number between 0
+;	and 99. 
+;
+;	After the multiplication is complete. Each longword is removed from
+;	the stack, converted to a packed decimal pair, and stored in the
+;	output string. Any nonzero cells remaining on the stack after the
+;	output string has been completely filled are the indication of decimal
+;	overflow. 
+;
+;	The purpose of this method of storage is to avoid decimal/binary or
+;	even byte/longword conversions during the calculation of intermediate
+;	results. 
+;
+;    2.	Trailing zeros are removed from the larger string. All zeros in
+;	the shorter string are eliminated in the sense that no arithmetic
+;	is performed. The output array pointer is simply advanced to point
+;	to the next higher array element.
+;-
+
+VAX$MULP::
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>	; Save the lot
+
+	ESTABLISH_HANDLER	-	; Store address of access
+		ARITH_ACCVIO		;  violation handler
+
+	ROPRAND_CHECK	R4			; Insure that R4 is LEQU 31
+
+	ROPRAND_CHECK	R2			; Insure that R2 is LEQU 31
+	MARK_POINT	MULP_BSBW_0
+	BSBW	DECIMAL$STRIP_ZEROS_R2_R3	; Strip high order zeros from R2/R3 string
+
+	ROPRAND_CHECK	R0			; Insure that R0 is LEQU 31
+	MARK_POINT	MULP_BSBW_0
+	BSBW	DECIMAL$STRIP_ZEROS_R0_R1	; Strip high order zeros from R0/R1 string
+
+	EXTZV	#1,#4,R0,R0		; Convert digit count to byte count
+	INCL	R0			; Include least significant digit
+
+	EXTZV	#1,#4,R2,R2		; Convert digit count to byte count
+	INCL	R2			; Include least significant digit
+
+	CMPL	R0,R2			; See which string is larger
+	BGTRU	3$			; R2/R3 describes the longer string
+	MOVQ	R2,R8			; R8 and R9 describe the longer string
+	MOVQ	R0,-(SP)		; Shorter string descriptor also saved
+	BRB	6$
+
+3$:	MOVQ	R0,R8			; R8 and R9 describe the longer string
+	MOVQ	R2,-(SP)		; Shorter string descriptor also saved
+
+; Create space for the output array on the stack (32 longwords of zeros)
+
+6$:	MOVL	#8,R0			; Eight pairs of quadwords
+
+10$:	CLRQ	-(SP)			; Clear one pair
+	CLRQ	-(SP)			; ... and another
+	SOBGTR	R0,10$			; Do all eight pairs
+
+	MOVL	SP,R7			; Store beginning of output array in R7
+
+; The longer input array will be stored on the stack as an array of 
+; longwords. Each array element contains a number between 0 and 99, 
+; representing a pair of digits in the original packed decimal string. 
+; Because the units digit is stored with the sign in packed decimal format, 
+; it is necessary to shift the number as we store it. This is accomplished by 
+; multiplying the number by ten.
+;
+; The longer array is described by R8 (byte count) and R9 (address of most
+; significant digit pair).
+
+	ADDL3	R9,R8,R5		; Point R5 beyond sign digit
+	MOVL	R8,R4			; R4 contains the loop count
+
+; An array of longwords is allocated on the stack. R3 starts out pointing
+; at the longword beyond the top of the stack. The first remainder, guaranteed
+; to be zero, is "stored" here. The rest of the digit pairs are stored safely
+; below the top of the stack.
+
+	MNEGL	R8,R3			; Stack grows toward lower addresses
+	MOVAL	(SP)[R3],SP		; Allocate the space
+	SUBL3	#4,SP,R3		; Point R3 at next lower longword
+
+	MARK_POINT	MULP_R8
+20$:	MOVZBL	-(R5),R1		; Get next digit pair
+	MOVZBL	DECIMAL$PACKED_TO_BINARY_TABLE[R1],-
+			R1		; Convert digits to binary
+	EMUL	#10,R1,R2,R0		; Multiply by 10
+	EDIV	#100,R0,R2,(R3)+	; Divide by 100
+	SOBGTR	R4,20$	
+
+	MOVL	R2,(R3)			; Store final quotient
+	MOVL	SP,R9			; Remember array address in R9
+	PUSHAL	(SP)[R8]		; Store start of fixed size area
+
+; Check for trailing zeros in the input array stored on the stack. If any are 
+; present, they are removed and the product array is adjusted accordingly.
+
+30$:	TSTL	(R9)+			; Is next number zero?
+	BNEQ	40$			; Leave loop if nonzero
+	ADDL	#4,R7			; Advance output pointer to next element
+	SOBGTR	R8,30$			; Keep going
+
+; If we drop through the loop, then the entire input array is zero. There is
+; no need to perform any arithmetic because the product will be zero (and the
+; output array on the stack starts out as zero). The only remaining work is
+; to store the result in the output string and set the condition codes.
+
+	BRB	70$			; Exit to end processing
+
+; Now multiply the input array by each successive digit pair. In order to
+; allow R10 to continue to locate ARITH_ACCVIO while we execute this loop, it
+; is necessary to perform a small amount of register juggling. In essence,
+; R8 and R9 switch the identity of the string that they describe.
+
+40$:	SUBL	#4,R9			; Readjust input array pointer
+	MOVQ	R8,-(SP)		; Save R8/R9 descriptor on stack
+	MOVL	8(SP),R8		; Point R8 at start of 32-longword array
+	MOVQ	<32*4>(R8),R8		; Get descriptor that follows that array
+	ADDL2	R8,R9			; Point R9 beyond sign byte
+
+50$:	MOVAL	(R7)+,R3		; Output array address to R3 
+	MARK_POINT	MULP_AT_SP
+	MOVZBL	-(R9),R1		; Next digit pair to R1
+	MOVZBL	DECIMAL$PACKED_TO_BINARY_TABLE[R1],-
+			R6		; Convert digits to binary
+	BEQL	60$			; Skip the work if zero
+	MOVQ	(SP),R4			; Input array descriptor to R4/R5
+	BSBW	EXTEND_STRING_MULTIPLY	; Do the work
+60$:	SOBGTR	R8,50$			; Any more multiplier digits?
+
+	ADDL	#8,SP			; Discard saved long string descriptor
+
+70$:	MOVL	(SP),SP			; Remove input array from stack
+
+; At this point, the product string is located in a 32-longword array on
+; the top of the stack. Each longword corresponds to a pair of digits in
+; the output string. As digits are removed from the stack, they are checked
+; for nonzero to obtain the correct setting of the Z-bit. After the output
+; string has been filled, the remainder of the product string is removed from
+; the stack. If a nonzero result is detected at this stage, the V-bit is set.
+
+	MOVL	#32,R9			; Set up array counter
+	MOVQ	< <32*4> + -		; Skip over 32-longword array
+		  <2*4>  + -		;  and saved string descriptor
+		  <4*4> >(SP),R4	;  to retrieve original R4 and R5
+
+	.SUBTITLE	Common Exit Path for VAX$MULP and VAX$DIVP
+;+
+; The code for VAX$MULP and VAX$DIVP merges at this point. The result is stored
+; in an array of longwords at the top of the stack. The size of this array is
+; stored in R9. The original R4 and R5 heve been retrieved from the stack. 
+;
+; Input Parameters:
+;
+;	R4 - Contains byte count of destination string in R4 <1:4>
+;	R5 - Address of most significant digit of destination string
+;	R9 - Count of longwords in result array on stack
+;
+;	Contents of result array
+;
+; Implicit Input:
+;
+;	Signs of two input factors (multiplier and multiplicand or
+;		divisor and dividend)
+;-
+
+MULTIPLY_DIVIDE_EXIT:
+	MOVPSL	R11			; Get current PSL
+	INSV	#PSL$M_Z,#0,#4,R11	; Clear all codes except Z-bit
+	ESTABLISH_HANDLER	-	; Store address of access
+		ARITH_ACCVIO		;  violation handler again
+	EXTZV	#1,#4,R4,R3		; Excess byte count to R3
+	BEQL	125$			; Skip to single digit code
+	ADDL3	R3,R5,R7		; Remember address of sign byte
+	ADDL3	#1,R7,R5		; Point R5 beyond end of product string
+
+80$:	MOVL	(SP)+,R1		; Remove next value from stack
+	BEQL	90$			; Do not clear Z-bit if zero
+	BICB2	#PSL$M_Z,R11		; Clear Z-bit
+
+	MARK_POINT	MULP_DIVP_R9
+90$:	MOVB	DECIMAL$BINARY_TO_PACKED_TABLE[R1],-
+			-(R5)		; Store converted sum byte
+	DECL	R9			; One less element on the stack
+	BLEQ	116$			; Exit loop if result array exhausted
+	SOBGTR	R3,80$			; Keep going?
+
+100$:	BLBC	R4,120$			; Different for even digit count
+
+; The output string consists of an odd number of digits. A complete digit
+; pair can be stored in the most significant (lowest addressed) byte of
+; the product string.
+
+	MOVL	(SP)+,R1		; Remove next value from stack
+	BEQL	110$			; Do not clear Z-bit if zero
+	BICB2	#PSL$M_Z,R11		; Clear Z-bit
+
+	MARK_POINT	MULP_DIVP_R9
+110$:	MOVB	DECIMAL$BINARY_TO_PACKED_TABLE[R1],-
+			-(R5)		; Store converted sum byte
+	DECL	R9			; One less element on the stack
+	BLEQ	116$			; Exit loop if result array exhausted
+	BRB	140$			; Perform overflow check
+
+; This loop executes if the result array has fewer elements than the output
+; string. The remaining bytes in the output string are filled with zeros.
+; There is no need for an overflow check.
+
+	MARK_POINT	MULP_DIVP_8
+114$:	CLRB	-(R5)			; Store another zero byte
+116$:	SOBGEQ	R3,114$			; Any more room in output string
+
+	BRB	150$			; Determine sign of result
+
+; This code path is used in the case where the output digit count is 0 or 1.
+; R5 must be advanced 
+
+125$:	MOVL	R5,R7			; Remember address of output sign byte
+	INCL	R5			; Advance R5 so common code can be used
+	BRB	100$			; Join common code path
+
+; The output string consists of an even number of digits. Only the low order 
+; nibble is stored in the most significant (lowest addresses) byte. A zero is 
+; stored in the high order nibble. If the high order digit would have been 
+; nonzero, the V-bit is set and the overflow check is bypassed because there 
+; are faster ways to clean the stack if we do not have to check for nonzero 
+; at the same time.
+
+120$:	MOVL	(SP)+,R1		; Remove next value from stack
+	MOVB	DECIMAL$BINARY_TO_PACKED_TABLE[R1],-
+			R1		; Obtain converted sum byte
+	MARK_POINT	MULP_DIVP_R9
+	BICB3	#^XF0,R1,-(R5)		; Store byte, clearing high order nibble
+	BEQL	130$			; Do not clear Z-bit if zero
+	BICB2	#PSL$M_Z,R11		; Clear Z-bit
+130$:	BITB	#^XF0,R1		; Is high order nibble nonzero?
+	BNEQ	133$			; Yes, go set overflow bit
+	DECL	R9			; One less element on the stack
+	BLEQ	116$			; Exit loop if result array exhausted
+	BRB	140$			; Check rest of result array for nonzero
+
+; If we detect overflow, we need to adjust R9 to reflect the nonzero longword
+; removed from the stack before we enter the next code block that sets the
+; V-bit and cleans off the stack based on the contents of R9. 
+
+133$:	DECL	R9			; One more longword removed from stack
+
+; A nonzero digit has been discovered in a position that cannot be stored in 
+; the output string. Set the V-bit, remove the rest of the product array from
+; the stack, and join the exit processing in the code that determines the sign
+; of the product.
+
+135$:	BISB	#PSL$M_V,R11		; Set the overflow bit 
+	MOVAL	(SP)[R9],SP		; Clean off remaining product string
+	BRB	150$			; Go to code that determines the sign
+
+; The remainder of the product array must be removed from the stack. A nonzero
+; result causes the V-bit to be set and the rest of the loop to be skipped.
+; Note that there is always a nonzero loop count remaining at this point.
+
+140$:	TSTL	(SP)+			; Is next longword zero?
+	BNEQ	133$			; No, leave loop
+	SOBGTR	R9,140$
+
+; The final product string has been stored and the V- and Z-bits have their
+; correct settings. The sign of the product must be determined from the
+; signs of the two input strings. Opposite signs produce a negative product.
+; Same signs (in any representation) produce a plus sign in the output string.
+
+150$:	ADDL	#8,SP			; Discard saved string descriptor
+	MOVL	#12,R6			; Assume final result is positive
+	MOVQ	(SP),R0			; Retrieve original R0/R1 pair
+	EXTZV	#1,#4,R0,R0		; Get byte count for first input string
+	ADDL	R0,R1			; Point R1 to byte containing sign
+	MARK_POINT	MULP_DIVP_0
+	BICB3	#^B11110000,(R1),R0	; R0 contains the sign "digit"
+
+	CASE	R0,TYPE=B,LIMIT=#10,<-	; Dispatch on sign digit
+		220$,-			; 10 => sign is "+"
+		210$,-			; 11 => sign is "-"
+		220$,-			; 12 => sign is "+"
+		210$,-			; 13 => sign is "-"
+		220$,-			; 14 => sign is "+"
+		220$,-			; 15 => sign is "+"
+		>
+
+210$:	MOVL	#1,R4			; Count a minus sign
+	BRB	230$			; Now check second input sign
+
+220$:	CLRL	R4			; No real minus signs so far
+
+230$:	MOVQ	8(SP),R2		; Retrieve original R2/R3 pair
+	EXTZV	#1,#4,R2,R2		; Get byte count for second input string
+	ADDL	R2,R3			; Point R3 to byte containing sign
+	MARK_POINT	MULP_DIVP_0
+	BICB3	#^B11110000,(R3),R2	; R2 contains the sign "digit"
+
+	CASE	R2,TYPE=B,LIMIT=#10,<-	; Dispatch on sign digit
+		250$,-			; 10 => sign is "+"
+		240$,-			; 11 => sign is "-"
+		250$,-			; 12 => sign is "+"
+		240$,-			; 13 => sign is "-"
+		250$,-			; 14 => sign is "+"
+		250$,-			; 15 => sign is "+"
+		>
+
+240$:	INCL	R4			; Remember that sign was minus
+250$:	BLBC	R4,260$			; Even parity indicates positive result
+	BBS	#PSL$V_Z,R11,270$	; Step out of line for minus zero check
+	BISB	#PSL$M_N,R11		; Set N-bit in saved PSW
+255$:	INCL	R6			; Change sign to minus
+
+	MARK_POINT	MULP_DIVP_0
+260$:	INSV	R6,#0,#4,(R7)		; Store sign in result string
+	CLRL	16(SP)			; Set saved R4 to zero
+	BRW	VAX$DECIMAL_EXIT	; Join common exit code
+
+; If the result is negative zero, then it must be changed to positive zero
+; unless overflow has occurred, in which case, the sign is left as negative
+; but the N-bit is clear.
+
+270$:	BBS	#PSL$V_V,R11,255$	; Make sign negative if overflow
+	BRB	260$			; Sign will be positive
+
+	.SUBTITLE	EXTEND_STRING_MULTIPLY - Multiply a String by a Number
+;+
+; Functional Description:
+;
+;	This routine multiplies an array of numbers (each array element LEQU 
+;	99) by a number (also LEQU 99). The resulting product array is added 
+;	to another array, each of whose elements is also LEQU 99.
+;
+; Input Parameters:
+;
+;	R3 - Pointer to output array
+;	R4 - Input array size
+;	R5 - Input array address
+;	R6 - Multiplier 
+;
+; Output Parameters:
+;
+;	None
+;
+; Implicit Output:
+;
+;	The output array is altered.
+;
+;	An intermediate product array is produced by multiplying each input
+;	array element by the multiplier. Each product array element is then
+;	added to the corresponding output array element. 
+;
+; Side Effects:
+;
+;	R3, R4, and R5 are modified by this routine.
+;
+;	R6 is preserved.
+;
+;	R0, R1, and R2 are used as scratch registers. R0 and R1 contain the
+;	quadword result of EMUL that is then passed into EDIV.
+;
+; Assumptions:
+;
+;	This routine assumes that all array elements lie in the range from 0 
+;	to 99 inclusive. (This is true if all input strings contain only legal 
+;	decimal digits.) The arithmetic performed by this routine will 
+;	maintain this assumption. That is, 
+;
+;		             input array element    LEQU 99
+;		times                 multiplier    LEQU 99
+;		        ------------------------
+;		                         product              LEQU 99*99
+;		plus                       carry    LEQU 99
+;		        ------------------------
+;		                modified product              LEQU 99*100
+;		plus    old output array element    LEQU 99
+;		        ------------------------
+;		        new output array element              LEQU 99*101 = 9999
+;
+;	A number LEQU 9999, when divided by 100, is guaranteed to produce both 
+;	a quotient and a remainder LEQU 99.
+;-
+
+EXTEND_STRING_MULTIPLY:
+	CLRL	R2			; Initial carry is zero
+
+10$:	EMUL	R6,(R5)+,R2,R0		; Form modified product (R0 LEQU 9900)
+	ADDL2	(R3),R0			; Add old output array element
+	EDIV	#100,R0,R2,(R3)+	; Remainder to output array
+					; Quotient becomes carry
+	SOBGTR	R4,10$			; Keep going?
+
+; This remaining code looks more complicated than it actually is. In the 
+; usual case, the routine exits immediately. In the event that a carry 
+; occurs, one additional entry in the output array will be modified. Only in 
+; the rare case of an output array consisting of a string of 99s will any 
+; significant looping occur.
+
+	ADDL2	R2,(R3)			; Add final carry
+20$:	CMPL	(R3),#100		; Do we overflow into next digit pair?
+	BGEQU	30$			; Branch if carry
+	RSB				; Otherwise, all done
+
+30$:	SUBL	#100,(R3)+		; Readjust entry and advance pointer
+	INCL	(R3)			; Propogate carry
+	BRB	20$			; ... and test this entry for overflow
+
+	.SUBTITLE	VAX$DIVP - Divide Packed
+;+
+; Functional Description:
+;
+;	The dividend string  specified  by  the  dividend  length  and  dividend
+;	address  operands  is  divided  by  the  divisor string specified by the
+;	divisor length  and  divisor  address  operands.   The  quotient  string
+;	specified  by  the  quotient  length  and  quotient  address operands is
+;	replaced by the result.
+;
+; Input Parameters:
+;
+;	R0 - divrlen.rw		Number of digits in divisor string
+;	R1 - divraddr.ab	Address of divisor string
+;	R2 - divdlen.rw		Number of digits in dividend string
+;	R3 - divdaddr.ab	Address of dividend string
+;	R4 - quolen.rw		Number of digits in quotient string
+;	R5 - quoaddr.ab		Address of quotient string
+;
+; Output Parameters:
+;
+;	R0 = 0
+;	R1 = Address of the byte containing the most significant digit of
+;	     the divisor string
+;	R2 = 0
+;	R3 = Address of the byte containing the most significant digit of
+;	     the dividend string
+;	R4 = 0
+;	R5 = Address of the byte containing the most significant digit of
+;	     the string containing the quotient
+;
+; Condition Codes:
+;
+;	N <- quotient string LSS 0
+;	Z <- quotient string EQL 0
+;	V <- decimal overflow
+;	C <- 0
+;
+; Register Usage:
+;
+;	This routine uses all of the general registers. The condition codes
+;	are computed at the end of the instruction as the final result is
+;	stored in the quotient string. R11 is used to record the condition
+;	codes.
+;
+; Algorithm:
+;
+;	This algorithm is the straightforward approach described in
+;
+;		The Art of Computer Programming
+;		Second Edition
+;
+;		Volume 2 / Seminumerical Algorithms
+;		Donald E. Knuth
+;
+;		1981
+;		Addison-Wesley Publishing Company
+;		Reading, Massachusetts
+;
+; Notes:
+;
+;	The choice of a longword array to store the auotient deserves a 
+;	comment. In VAX$MULP, a longword array was used because its elements 
+;	were used directly by MULP and DIVP instructions. The use of longwords 
+;	eliminated the need to convert back and forth between longwords and 
+;	bytes. In this routine, the QUOTIENT_DIGIT routine returns its result 
+;	in a register, which result can easily be stored in whatever way is 
+;	convenient. By using longwords instead of bytes, this routine can use 
+;	the same end processing code as MULP, a sizeable savings in code.
+;-
+
+	.ENABLE		LOCAL_BLOCK
+
+;+
+; This code path is entered if the divisor is zero.
+;
+; Input Parameter:
+;
+;	(SP) - Return PC
+;
+; Output Parameters:
+;
+;	0(SP) - SRM$K_FLT_DIV_T (Arithmetic trap code)
+;	4(SP) - Final state PSL
+;	8(SP) - Return PC
+;
+; Implicit Output:
+;
+;	Control passes through this code to VAX$REFLECT_TRAP.
+;-
+
+DIVIDE_BY_ZERO:
+	POPR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>	
+					; Restore registers and reset SP
+	MOVPSL	-(SP)			; Save final PSL on stack
+	PUSHL	#SRM$K_FLT_DIV_T	; Store arithmetic trap code
+	BRW	VAX$REFLECT_TRAP	; Report exception
+
+; If the divisor contains more nonzero digits than the dividend, then the
+; quotient will be identically zero. Set up the stack and the registers (R4,
+; R5, and R9)  so that the exit code will be entered to produce this result.
+
+1$:	CLRL	-(SP)			; Fake a quotient digit
+	MOVL	#1,R9			; Count that digit
+	BRW	MULTIPLY_DIVIDE_EXIT	; Store the zero in the output string
+
+VAX$DIVP::
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>	; Save the lot
+
+	ESTABLISH_HANDLER	-	; Store address of access
+		ARITH_ACCVIO		;  violation handler
+
+	ROPRAND_CHECK	R4			; Insure that R4 is LEQU 31
+
+	ROPRAND_CHECK	R2			; Insure that R2 is LEQU 31
+	MARK_POINT	DIVP_BSBW_0
+	BSBW	DECIMAL$STRIP_ZEROS_R2_R3	; Strip high order zeros from R2/R3 string
+
+	ROPRAND_CHECK	R0			; Insure that R0 is LEQU 31
+	MARK_POINT	DIVP_BSBW_0
+	BSBW	DECIMAL$STRIP_ZEROS_R0_R1	; Strip high order zeros from R0/R1 string
+
+; Insure that the divisor is not zero. Because leading zeros have already
+; been eliminated, the divisor can only be zero if R0 is 0 (zero length
+; strings are identically zero) or 1 (R1 contains a sign digit in the low
+; order nibble and zero in the high order nibble). Note that an exception
+; will not be generated if an even length string has an illegal nonzero digit
+; stored in its most significant nibble (including an illegal form of a zero
+; length string. 
+
+	EXTZV	#1,#4,R0,R0		; Convert divisor digit count to bytes
+	BNEQ	10$			; Skip zero divisor check unless zero
+	MARK_POINT	DIVP_0
+	BITB	#^B11110000,(R1)	; Check for zero in ones digit
+	BEQL	DIVIDE_BY_ZERO		; Generate exception if zero
+
+; This routine chooses to do its work with a fair amount of internal storage,
+; all of it allocated on the stack. The quotient is stored as it is computed,
+; in a 16-longword array. The dividend and divisor are stored as longword arrays,
+; with each array element storing a digit pair from the original packed 
+; decimal string. The numerator digits are shifted by one digit (multiplied
+; by ten) so that the quotient has its digits correctly placed, leaving room
+; for a sign in the low order nibble of the least significant byte. A scratch
+; array is also allocated on the stack to accommodate intermediate results
+; of the QUOTIENT_DIGIT routine.
+
+10$:	INCL	R0			; Include least significant digit
+	MOVQ	R0,R8			; Let R8 and R9 describe the divisor
+
+	EXTZV	#1,#4,R2,R2		; Convert dividend digit count to bytes
+	INCL	R2			; Include least significant digit
+	MOVQ	R2,-(SP)		; Save dividend descriptor on stack
+
+	SUBL3	R0,R2,R6		; Calculate main loop count
+	BLSSU	1$			; Quotient will be zero
+	INCL	R6			; One extra digit is always there
+	
+; Allocate R6 longwords of zero on the stack
+
+	MOVL	R6,R0			; Let R0 be the loop counter
+15$:	CLRL	-(SP)			; Set aside another quotient digit
+	SOBGTR	R0,15$			; Keep going 
+
+	MOVL	SP,R7			; Remember where this array starts
+
+; The divisor will be stored on the stack as an array of 
+; longwords. Each array element contains a number between 0 and 99, 
+; representing a pair of digits in the original packed decimal string. 
+; Because the units digit is stored with the sign in packed decimal format, 
+; it is necessary to shift the number as we store it. This is accomplished by 
+; multiplying the number by ten.
+;
+; The divisor string is described by R8 (byte count) and R9 (address of most
+; significant digit pair).
+
+	ADDL3	R9,R8,R5		; Point R5 beyond sign digit
+	MOVL	R8,R4			; R4 contains the loop count
+
+; Put in an extra digit place for the divisor. This allows several common
+; subroutines to be used when operating on the divisor string.
+
+	CLRL	-(SP)			; Set aside a place holder
+
+; An array of longwords is allocated on the stack. R3 starts out pointing
+; at the longword beyond the top of the stack. The first remainder, guaranteed
+; to be zero, is "stored" here. The rest of the digit pairs are stored safely
+; below the top of the stack.
+
+	MNEGL	R8,R3			; Stack grows toward lower addresses
+	MOVAL	(SP)[R3],SP		; Allocate the space
+	SUBL3	#4,SP,R3		; Point R3 at next lower longword
+
+	MARK_POINT	DIVP_R6_R7
+20$:	MOVZBL	-(R5),R1		; Get next digit pair
+	MOVZBL	DECIMAL$PACKED_TO_BINARY_TABLE[R1],-
+			R1		; Convert digits to binary
+	EMUL	#10,R1,R2,R0		; Multiply by 10
+	EDIV	#100,R0,R2,(R3)+	; Divide by 100
+	SOBGTR	R4,20$	
+
+; There are two cases where the final quotient (contents of R2) is zero.
+; In these cases, the number of nonzero digit pairs in the divisor array is
+; smaller by one than the number of bytes containing the original packed decimal
+; string. One case is a divisor string with an even number of digits. The
+; second case is a divisor string with an odd number of digits but the most
+; significant digit is zero (essentially a variant of the first case). The
+; simplest way to handle all of these cases is to decrement R8, the divisor 
+; counter, if R2 is zero. Note that previous checks for a zero divisor
+; prevent R8 from going to zero.
+
+	MOVL	R2,(R3)			; Store final quotient
+	BNEQ	25$			; Leave well enough alone if nonzero
+	INCL	R6			; One more quotient digit
+	SUBL	#4,R7			; Make room for it
+	DECL	R8			; Count one less divisor "digit"
+	BNEQ	25$
+
+;;; ********** BEGIN TEMP ********** 
+;;;
+;;; THE FOLLOWING HALT INSTRUCTION SHOULD BE REPLACED WITH THE CORRECT
+;;; ABORT CODE.
+;;;
+;;; THE HALT IS SIMILAR TO THE
+;;;
+;;;	MICROCODE CANNOT GET HERE
+;;;
+;;; ERRORS THAT OTHER IMPLEMENTATIONS USE. 
+;;;
+	halt				; This will cause an OPCDEC exception
+;;;
+;;; *********** END TEMP ***********
+
+25$:	MOVL	SP,R9			; R9 locates low order divisor digit 
+
+; The dividend is stored on the stack as an array of longwords. It does not
+; have its digit pairs shifted so that this storage loop is simpler. An extra
+; place is set aside in the event that it is necessary to normalize the
+; dividend and divisor before division is attempted.
+
+	CLRL	-(SP)			; Set aside space for U[0]
+	MOVAL	(R7)[R6],R2		; Retrieve dividend descriptor
+	MOVQ	(R2),R2			; ... in two steps
+
+	MARK_POINT	DIVP_R6_R7
+30$:	MOVZBL	(R3)+,R1		; Get next decimal digit pair
+	MOVZBL	DECIMAL$PACKED_TO_BINARY_TABLE[R1],-
+			-(SP)		; Convert digits to binary
+	SOBGTR	R2,30$			; Loop through entire input string
+
+; From this point until the common exit path for MULP and DIVP is entered, 
+; no access violations that need to be backed out can occur. We do not need 
+; to keep the address of ARITH_ACCVIO in R10 for this stretch of code. Note 
+; that R10 must be reloaded before the exit code executes because the 
+; destination string is written and may cause access violations.
+
+	MOVL	(R7)[R6],R10		; Retrieve size of dividend array
+	MOVL	SP,R11			; R11 locates low order dividend digit 
+
+; Allocate a scratch array on the stack the same size as the divisor array 
+; (which is one larger than the number of digit pairs)
+
+	MNEGL	R8,R2			; Need a negative index
+	MOVAL	-4(SP)[R2],SP		; Adjust stack pointer
+
+;+
+; At this point, the stack and relevant general registers contain the
+; following information. In this description, N represents the number
+; of digit pairs in the divisor and M represents the number of digit
+; pairs in the dividend.
+;
+;                   +------------------------------+ <-- SP
+;     scratch       |        N+1 longwords         |
+;                   +------------------------------+ <-- R11
+;     dividend      |        M+1 longwords         |
+;                   +------------------------------+ <-- R9
+;     divisor       |        N+1 longwords         |
+;                   +------------------------------+ <-- R7
+;     quotient      |       M+1-N longwords        |
+;                   +------------------------------+
+;                   |           R0..R11            |
+;                   +------------------------------+
+;
+;	R6  - Number of longwords in quotient array (M+1-N)
+;	R7  - Address of beginning of quotient array
+;	R8  - Number of digit pairs in divisor (called N)
+;	R9  - Address of low order digits in divisor
+;	R10 - Number of digit pairs in dividend (called M)
+;	R11 - Address of low order digits in dividend
+;-
+
+	PUSHAL	(SP)			; Store address of scratch array
+	MOVQ	R8,-(SP)		; Remember divisor descriptor
+	MOVQ	R10,-(SP)		; Remember dividend descriptor
+
+; The algorithm that guesses the quotient digit can be guaranteed to be off
+; by no more than two if the high order digit of the divisor (called V[1]) is
+; at least as large as 50 (our radix divided by 2). If the high order digit
+; is too small, we "normalize" the numerator and denomonator by multiplying
+; them by the same number, namely 100/(V[1]+1). 
+
+	ADDL3	#1,-4(R9)[R8],R0	; Compute V[1] + 1
+	CMPL	R0,#51			; Compare to 50 + 1
+	BGEQ	40$			; Skip normalization if V[1] big enough
+	DIVL3	R0,#100,R3		; Compute normalization factor
+	MOVQ	R8,R4			; Get descriptor of divisor
+	BSBW	MULTIPLY_STRING		; Normalize divisor
+	MOVQ	R10,R4			; Get descriptor of dividend
+	BSBW	MULTIPLY_STRING		; Normalize dividend
+
+; We have now reached the point where we can start calculating quotient digits.
+; In the following loop, R5 and R6 are loop invariants. R5 contains the number
+; of digit pairs in the divisor. R6 always points to the longword beyond the
+; most significant digit in the dividend string. R7 and R8 must be loaded on
+; each pass through because these two pointers are modified. Notice that the
+; address of the divisor array is exactly what we want to store in R6.
+
+40$:	MOVQ	R6,R10			; Let R10/R11 describe quotient and loop
+	PUSHL	R11			; Save quotient address for exit code
+	MOVAL	(R11)[R10],R11		; Store quotient digits from high end
+
+; This rather harmless looking loop is where the work is done
+
+	MOVQ	R8,R5			; Initialize count and dividend address
+	MOVL	R10,R9			; Remember the loop count in R9
+
+50$:	MOVQ	16(SP),R7		; Load divisor and scratch addresses
+	BSBW	QUOTIENT_DIGIT		; Get the next quotient digit
+	MOVL	R3,-(R11)		; Store it
+	SUBL	#4,R6			; "Advance" dividend pointer
+	SOBGTR	R10,50$			; ... and go gack for more
+
+; The quotient digits have been stored on the stack. Eliminate the rest of the
+; stack storage and enter the completion code that this routine shares with
+; VAX$MULP. Note that R9 is already set up with the longword count used by 
+; the exit code. Note also that R11 is pointing to the saved dividend descriptor
+; that sits on top of the saved register array.
+
+	MOVL	(SP),SP			; Reset stack pointer
+	MOVAL	< <4*2> + -		; Skip over saved dividend descriptor
+		  <4*4> >(R11)[R9],R4	;  and retrieve original R4 and R5
+	MOVQ	(R4),R4			; ... in two steps
+
+; The following is a HACK.
+;
+; The method used to obtain quotient digits generally leaves garbage (nonzero)
+; in what will become the sign digit. (In fact, this is the tenths digit of a
+; decimal expansion of the remainder.) We need to make the least significant
+; digit a multiple of ten. 
+
+	DIVL3	#10,(SP),R0		; Divide by ten, losing remainder
+	MULL3	#10,R0,(SP)		; Store only tens digit
+
+	BRW	MULTIPLY_DIVIDE_EXIT	; Join common exit code
+
+	.DISABLE	LOCAL_BLOCK
+
+	.SUBTITLE 	QUOTIENT_DIGIT - Get Next Digit in Quotient
+;+
+; Functional Description:
+;
+;	This routine divides an (N+1)-element array of longwords by an N-element 
+;	array, producing a single quotient digit in the range of 0 to 99 
+;	inclusive. The dividend array is modified by subtracting the product 
+;	of the divisor array and the quotient digit. 
+;
+;	The "numbers" that this array operates on multiple precision numbers 
+;	in radix 100. Each digit (a number between 0 and 99) is stored in a 
+;	longword array element with more significant digits stored at higher 
+;	addresses. The dividend string and the scratch string (also called the
+;	product string) contain one more element than the divisor string. 
+;
+; Input Parameters:
+;
+;	R5 - Number of "digits" (array elements) in divisor array (preserved)
+;	R6 - Address of longword immediately following most significant
+;		digit of dividend string (preserved)
+;	R7 - Address of least significant digit in divisor string (modified)
+;	R8 - Address of least significant digit in product string (modified)
+;
+; Output Parameters:
+;
+;	R3 - The quotient that results from dividing the dividend string
+;		by the divisor string.
+;
+;	The final states of the three pointer registers are listed here
+;	for completeness.
+;
+;	R6 - Address of longword immediately following most significant
+;		digit of dividend string
+;
+;	R7 - Address of longword immediately following most significant digit 
+;		of divisor string. This longword must always contain zero.
+;
+;	R8 - Address of longword immediately following most significant
+;		digit of product string
+;
+; Implicit Output:
+;
+;	The contents of the dividend array are modified to reflect the 
+;	subtraction of the product string. The result of this subtraction 
+;	could be stored elsewhere. It is a convenience to store it in the 
+;	dividend array on top of those array elements that are no longer 
+;	needed.
+;
+;	The contents of the divisor array are preserved.
+;
+; Side Effects:
+;
+;	R7 and R8 are modified by this routine. (See implicit output list.)
+;
+;	R5 and R6 are preserved.
+;
+;	R0, R1, R2, and R4 are used as scratch registers. R0 and R1 contain the
+;	quadword result of EMUL that is then passed into EDIV. R2 is the
+;	carry from one step to the next. R4 is the loop counter.
+;-
+
+QUOTIENT_DIGIT:
+	EMUL	#100,-4(R6),-8(R6),R0	; R0 <- 100 * U[j] + U[j+1]
+	DIVL2	-4(R7)[R5],R0		; R0 <- R0 / V[1]
+	MOVL	R0,R3			; Store quotient "digit" in R3
+	BEQL	45$			; Nothing to do if quotient is zero
+	CMPL	R3,#100			; Is quotient LEQU 99?
+	BLSSU	5$			; Branch if quotient OK
+	MOVL	#99,R3			; Otherwise start with 99
+
+; We will now multiply the divisor array by the quotient digit, storing the	
+; product in the scratch array.
+
+5$:	CLRL	R2			; Start out with a carry of zero
+	MOVL	R5,R4			; R4 will be the loop counter
+
+10$:	EMUL	R3,(R7)+,R2,R0		; Multiply next divisor digit
+	EDIV	#100,R0,R2,(R8)+	; Remainder to input array
+					; Quotient becomes carry
+	SOBGTR	R4,10$			; More divisor digits?
+
+	MOVL	R2,(R8)+		; Store final carry
+
+; If the product array is larger than the dividend array, then the quotient is
+; too large. To avoid a second trip through the rather costly EMUL/EDIV loop,
+; and also to avoid array subtraction that produces a negative result, we will
+; first compare the product and dividend arrays. If the product is smaller, we
+; can safely subtract. If the product is larger, we decrease the quotient by 
+; one and subtract the divisor array from the product array.
+
+15$:	MOVL	R6,R0			; Point R0 and R1 to high address ends
+	MOVL	R8,R1			; ... of dividend and scratch strings
+	MOVL	R5,R4			; Initialize the loop counter
+
+; The comparison is done from most to least significant digits
+
+20$:	CMPL	-(R1),-(R0)		; Compare next pair of digits
+	BLSSU	30$			; Leave loop if product is smaller
+	BGTRU	50$			; Also leave if product is larger
+	SOBGEQ	R4,20$			; More to test?
+
+; If we drop through the loop, then the dividend and product are equal. We
+; simply store zeros in the dividend array (the equivalent of subtraction
+; of equal arrays) and return. Note that R0 is already pointing to the
+; least significant dividend array element.
+
+	MOVL	R5,R4			; Initialize still another loop counter
+
+25$:	CLRL	(R0)+			; Store another zero
+	SOBGEQ	R4,25$			; Keep going?
+
+	RSB				; Return to caller
+
+; If we drop through the loop, then the quotient that is stored in R3 is good.
+; We need to subtract the product array from the dividend array. Note that R0
+; and R1 need to be adjusted to point to the least significant array elements
+; before the subtraction can begin.
+
+30$:	MNEGL	R4,R4			; We need a negative index
+	MOVAL	(R0)[R4],R0		; Adjust dividend pointer
+	MOVAL	(R1)[R4],R1		; ... and product pointer
+	MOVL	R5,R4			; R4 will count still another loop 
+
+35$:	SUBL2	(R1)+,(R0)+		; Subtract next digits
+	BGEQ	40$			; Skip to end of loop if no borrow
+	ADDL2	#100,-4(R0)		; Add borrow back to this digit
+	DECL	(R0)			; ... and borrow from next highest digit
+40$:	SOBGEQ	R4,35$			; Keep going?
+
+; This is the exit path. R3 contains the quotient digit. The pointers to the
+; various input and scratch arrays are in an indeterminate state.
+
+45$:	RSB				; Return to caller
+
+; The first guess at the quotient digit is too large. The brute force
+; approach is to decrement the quotient by one and execute the EMUL/EDIV loop
+; again. Note, however, that we can evaluate the modified product by
+; subtracting the divisor from the initial product. Note also that, because
+; the leading digit in the divisor is "large enough", we can only end up in
+; this code path twice. (That is, the initial guess at the quotient will
+; never be off by more than two.) 
+
+50$:	DECL	R3			; Try quotient smaller by one
+	BEQL	45$			; All done if zero
+
+; Point R1 and R2 at the least significant digits of the scratch and product
+; strings respectively.
+
+	MNEGL	R5,R0			; Need a negative index
+	MOVAL	-4(R8)[R0],R1		; Scratch array contains N+1 elements
+	MOVAL	(R7)[R0],R2		; Product array contains N elements
+	MOVL	R5,R4			; R4 will count still another loop
+
+60$:	SUBL2	(R2)+,(R1)+		; Subtract next digits
+	BGEQ	70$			; Skip to end of loop if no borrow
+	ADDL2	#100,-4(R1)		; Add borrow back to this digit
+	DECL	(R1)			; ... and borrow from next highest digit
+70$:	SOBGEQ	R4,60$			; Keep going?
+
+	ADDL2	#4,R1			; Point R1 at most significant digit
+	BRB	15$			; Make another comparison
+
+	.SUBTITLE	MULTIPLY_STRING - Multiply a String by a Number
+;+
+; Functional Description:
+;
+;	This routine multiplies an array of numbers (each array element LEQU 
+;	99) by a number (also LEQU 99). Each array element in the input array
+;	is replaced with the modified product, with the carry propogated to
+;	the next array element.
+;
+; Input Parameters:
+;
+;	R3 - Multiplier 
+;	R4 - Input array size
+;	R5 - Input array address
+;
+; Output Parameters:
+;
+;	None
+;
+; Implicit Output:
+;
+;	The input array elements are altered.
+;
+; Side Effects:
+;
+;	R4 and R5 are modified by this routine.
+;
+;	R3 is preserved.
+;
+;	R0, R1, and R2 are used as scratch registers. R0 and R1 contain the
+;	quadword result of EMUL that is then passed into EDIV. R2 is the
+;	carry from one step to the next.
+;
+; Assumptions:
+;
+;	This routine assumes that all array elements lie in the range from 0
+;	to 99 inclusive. (This is true if all input strings contain only legal
+;	decimal digits.) The arithmetic performed by this routine will
+;	maintain this assumption. The details of this argument can be found in
+;	the routine header for EXTENDED_MULTIPLY_STRING. This routine performs
+;	less work so that those arguments also apply here. 
+;-
+
+MULTIPLY_STRING:
+	CLRL	R2			; Initial carry is zero
+
+10$:	EMUL	R3,(R5),R2,R0		; Form modified product (R0 LEQU 9900)
+	EDIV	#100,R0,R2,(R5)+	; Remainder to input array
+					; Quotient becomes carry
+	SOBGTR	R4,10$			; Keep going?
+
+	MOVL	R2,(R5)			; Store final carry
+	RSB
+
+	.SUBTITLE	DECIMAL_ROPRAND
+;-
+; Functional Description:
+;
+;	This routine receives control when a digit count larger than 31
+;	is detected. The exception is architecturally defined as an
+;	abort so there is no need to store intermediate state. All of the
+;	routines in this module save all registers R0 through R11 before
+;	performing the digit check. These registers must be restored
+;	before control is passed to VAX$ROPRAND.
+;
+; Input Parameters:
+;
+;	00(SP) - Saved R0
+;	  .
+;	  .
+;	44(SP) - Saved R11
+;	48(SP) - Return PC from VAX$xxxxxx routine
+;
+; Output Parameters:
+;
+;	00(SP) - Offset in packed register array to delta PC byte
+;	04(SP) - Return PC from VAX$xxxxxx routine
+;
+; Implicit Output:
+;
+;	This routine passes control to VAX$ROPRAND where further
+;	exception processing takes place.
+;-
+
+	ASSUME ADDP6_B_DELTA_PC EQ ADDP4_B_DELTA_PC 
+	ASSUME SUBP4_B_DELTA_PC EQ ADDP4_B_DELTA_PC 
+	ASSUME SUBP6_B_DELTA_PC EQ ADDP4_B_DELTA_PC 
+	ASSUME MULP_B_DELTA_PC  EQ ADDP4_B_DELTA_PC 
+	ASSUME DIVP_B_DELTA_PC  EQ ADDP4_B_DELTA_PC 
+
+DECIMAL_ROPRAND:
+	POPR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	PUSHL	#ADDP4_B_DELTA_PC	; Store offset to delta PC byte
+	BRW	VAX$ROPRAND		; Pass control along
+
+	.SUBTITLE	ARITH_ACCVIO - Reflect an Access Violation
+;+
+; Functional Description:
+;
+;	This routine receives control when an access violation occurs while
+;	executing within the emulator routines for ADDP4, ADDP6, SUBP4, SUBP6,
+;	MULP, or DIVP. 
+;
+;	The routine header for ASHP_ACCVIO in module VAX$ASHP contains a
+;	detailed description of access violation handling for the decimal
+;	string instructions. 
+;
+; Input Parameters:
+;
+;	See routine ASHP_ACCVIO in module VAX$ASHP
+;
+; Output Parameters:
+;
+;	See routine ASHP_ACCVIO in module VAX$ASHP
+;-
+
+ARITH_ACCVIO:
+	CLRL	R2			; Initialize the counter
+	PUSHAB	MODULE_BASE		; Store base address of this module
+	PUSHAB	MODULE_END		; Store module end address
+	BSBW	DECIMAL$BOUNDS_CHECK	; Check if PC is inside the module
+	ADDL	#4,SP			; Discard end address
+	SUBL2	(SP)+,R1		; Get PC relative to this base
+
+10$:	CMPW	R1,PC_TABLE_BASE[R2]	; Is this the right PC?
+	BEQL	30$			; Exit loop if true
+	AOBLSS	#TABLE_SIZE,R2,10$	; Do the entire table
+
+; If we drop through the dispatching based on PC, then the exception is not 
+; one that we want to back up. We simply reflect the exception to the user.
+
+20$:	POPR	#^M<R0,R1,R2,R3>	; Restore saved registers
+	RSB				; Return to exception dispatcher
+
+; The exception PC matched one of the entries in our PC table. R2 contains
+; the index into both the PC table and the handler table. R1 has served
+; its purpose and can be used as a scratch register.
+
+30$:	MOVZWL	HANDLER_TABLE_BASE[R2],R1	; Get the offset to the handler
+	JMP	MODULE_BASE[R1]		; Pass control to the handler
+	
+; In all of the instruction-specific routines, the state of the stack
+; will be shown as it was when the exception occurred. All offsets will
+; be pictured relative to R0. 
+
+	.SUBTITLE	Access Violation Handling for ADDPx and SUBPx
+;+
+; Functional Description:
+;
+;	The only difference among the various entry points is the number of
+;	longwords on the stack. R0 is advanced beyond these longwords to point
+;	to the list of saved registers. These registers are then restored,
+;	effectively backing the routine up to its initial state. 
+;
+; Input Parameters:
+;
+;	R0 - Address of top of stack when access violation occurred
+;
+;	See specific entry points for details
+;
+; Output Parameters:
+;
+;	See input parameter list for VAX$DECIMAL_ACCVIO in module VAX$ASHP
+;-
+
+;+
+; ADD_SUB_BSBW_24
+;
+; An access violation occurred in one of the subroutines ADD_PACKED_BYTE,
+; SUB_PACKED_BYTE, or STORE_RESULT. In addition to the six longwords of work
+; space, this routine has an additional longword, the return PC, on the
+; stack. 
+;
+;	00(R0) - Return PC in mainline VAX$xxxxxx routine
+;	04(R0) - Address of sign byte of destination string
+;	08(R0) - First longword of scratch space
+;	 etc.
+;-
+
+ADD_SUB_BSBW_24:
+	ADDL	#4,R0			; Skip over return PC and drop into ...
+
+;+
+; ADD_SUB_24
+;
+; There are five longwords of workspace and a saved string address on the stack
+; for this entry point.
+;
+;	00(R0) - Address of sign byte of destination string
+;	04(R0) - First longword of scratch space
+;	  .
+;	  .
+;	20(R0) - Fifth longword of scratch space
+;	24(SP) - Saved R0
+;	28(SP) - Saved R1
+;	 etc.
+;-
+
+ADD_SUB_24:
+	ADDL	#24,R0			; Discard scratch space on stack
+	BRW	VAX$DECIMAL_ACCVIO	; Join common code to restore registers
+
+;+
+; ADD_SUB_BSBW_0
+;
+; An access violation occurred in one of the subroutine STRIP_ZEROS. This
+; entry point has an additional longword, the return PC, on the stack on top
+; of the saved register array. 
+;
+;	00(R0) - Return PC in mainline VAX$xxxxxx routine
+;	04(R0) - Saved R0
+;	08(R0) - Saved R1
+;	 etc.
+;-
+
+ADD_SUB_BSBW_0:
+	ADDL	#4,R0			; Skip over return PC and ...
+	BRW	VAX$DECIMAL_ACCVIO	; Join common code to restore registers
+
+	.SUBTITLE	Access Violation Handling for MULP and DIVP
+;+
+; Functional Description:
+;
+;	The only difference among the various entry points is the number of
+;	longwords on the stack. R0 is advanced beyond these longwords to point
+;	to the list of saved registers. These registers are then restored,
+;	effectively backing the routine up to its initial state. 
+;
+; Input Parameters:
+;
+;	R0 - Address of top of stack when access violation occurred
+;
+;	See specific entry points for details
+;
+; Output Parameters:
+;
+;	See input parameter list for VAX$DECIMAL_ACCVIO in module VAX$ASHP
+;-
+
+;+
+; MULP_R8
+;
+; An access violation occurred while MULP was accessing one of its two source
+; strings. In this particular case, MULP was storing the longer of the two
+; input strings in a longword array on the top of the stack. There is an
+; array of R8 longwords on top of an array of 32 longwords on top of the
+; saved register array. 
+;
+;	R8 - Number of longwords on top of the 32-longword array
+;-
+
+	.ENABLE		LOCAL_BLOCK
+
+MULP_R8:
+	MOVAL	(R0)[R8],R0		; Discard input array storage
+	BRB	10$			; Might as well share a little code
+
+;+
+; MULP_AT_SP
+;
+; An access violation occurred while MULP was accessing one of its two source
+; strings. In this case, the access violation occurred in the middle of the
+; grand multiply loop as a digit pair was being retrieved from the shorter of
+; the two input strings. The address of the start of the 32-longword array 
+; was itself stored on top of the stack for convenience.
+;
+;	00(R0) - Saved byte count of longer input string
+;	04(R0) - Saved address of longer input string
+;	08(R0) - Address of 32-longword array farther down the stack
+;-
+
+MULP_AT_SP:
+	MOVL	8(R0),R0		; Locate start of 32-longword array
+10$:	MOVAB	<<4*32> + <4*2>>(R0),R0	; Throw that away, too
+	BRW	VAX$DECIMAL_ACCVIO	; Join common code to restore registers
+
+	.DISABLE	LOCAL_BLOCK
+
+;+
+; MULP_DIVP_R9
+;
+; An access violation occurred while the final result was being stored in the
+; result string. In this common exit code path, R9 counts the number of
+; longwords on the stack. In all cases where an access violation can occur, a
+; longword has been removed from the stack but R9 has not yet been
+; decremented to reflect this. The conceptual instruction sequence that
+; resets the stack pointer (really R0) to point to the start of the saved
+; register array is 
+;
+;	DECL	R9
+;	MOVAL	(R0)[R9]
+;
+; A single instruction accomplishes this.
+;
+;	R9 - One more than the number of longwords on the stack on top
+;		of the saved register array.
+;
+;	00(R0) - First longword of scratch storage remaining on the stack
+;	  .
+;	  .
+;	zz-4(R0)  - Last longword of scratch storage 
+;	zz+0(R0)  - Saved count of dividend or multiplier string
+;	zz+4(R0)  - Saved address of dividend or multiplier string
+;	zz+8(R0)  - Saved R0
+;	zz+12(R0) - Saved R1
+;	 etc.
+;
+;	where zz = 4 * (R9 - 1)
+;-
+
+MULP_DIVP_R9:
+	MOVAL	4(R0)[R9],R0		; Discard scratch storage on stack
+	BRW	VAX$DECIMAL_ACCVIO	; Join common code to restore registers
+
+;+
+; MULP_DIVP_8
+;
+; An access violation occurred in the common exit path after the scratch array
+; had been removed from the stack but before the saved descriptor for the
+; multiplier string was discarded.
+;
+;	0(R0)  - Saved count of dividend or multiplier string
+;	4(R0)  - Saved address of dividend or multiplier string
+;	8(R0)  - Saved R0
+;	12(R0) - Saved R1
+;	 etc.
+;-
+
+MULP_DIVP_8:
+	ADDL	#8,R0			; Discard multiplier string descriptor
+	BRW	VAX$DECIMAL_ACCVIO	; Join common code to restore registers
+
+;+
+; MULP_BSBW_0
+; DIVP_BSBW_0
+;
+; An access violation occurred in one of the subroutine STRIP_ZEROS. This
+; entry point has an additional longword, the return PC, on the stack on top
+; of the saved register array. 
+;
+;	00(R0) - Return PC in mainline VAX$MULP or VAX$DIVP routine
+;	04(R0) - Saved R0
+;	08(R0) - Saved R1
+;	 etc.
+;-
+
+MULP_BSBW_0:
+DIVP_BSBW_0:
+	ADDL	#4,R0			; Skip over return PC and drop into ...
+
+;+
+; DIVP_0
+; MULP_DIVP_0
+;
+; There was nothing allocated on the stack other than the saved register
+; array when the access violation occurred. We merely pass control to common
+; code to restore the registers. 
+;
+;	00(R0) - Saved R0
+;	04(R0) - Saved R1
+;	 etc.
+;-
+
+DIVP_0:
+MULP_DIVP_0:
+	BRW	VAX$DECIMAL_ACCVIO	; Join common code to restore registers
+
+;+
+; DIVP_R6_R7
+;
+; An access violation occurred while one of the two input strings was being
+; converted to an array of longwords on the stack. The state of the stack
+; is rather complicated but R6 and R7 contain enough information to allow
+; the rest of the stack contents to be ignored.
+;
+;	R6 - Count of longwords in quotient array on stack
+;	R7 - Address of quotient array on stack
+;
+;	00(R0) - First longword of quotient array
+;	  .
+;	  .
+;	zz-4(R0) - Last longword of scratch storage 
+;	zz+0(R0) - Digit count of dividend string
+;	zz+4(R0) - Address of dividend string
+;	zz+8(R0) - Saved R0
+;	zz+12(R0) - Saved R1
+;	 etc.
+;
+;	where zz = 4 * R6
+;-
+
+DIVP_R6_R7:
+	MOVAL	8(R7)[R6],R0		; Discard everything on stack
+	BRW	VAX$DECIMAL_ACCVIO	; Join common code to restore registers
+
+	END_MARK_POINT
+
+	.END

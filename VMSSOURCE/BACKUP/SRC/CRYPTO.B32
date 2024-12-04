@@ -1,0 +1,1484 @@
+MODULE CRYPTO	(%TITLE	'Encrypt/Decrypt Save sets'
+		IDENT = 'V04-000',
+		ADDRESSING_MODE(EXTERNAL=GENERAL)
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:
+!	Backup/Restore
+!
+! ABSTRACT:
+!	This module contains the routines to encrypt or decrypt a save set.
+!
+! ENVIRONMENT:
+!	VAX/VMS user mode.
+!--
+!
+! AUTHOR: J. E. Pollack, CREATION DATE: 1-Apr-1983
+!
+! MODIFIED BY:
+!	V01-004 JEP0007 J. Eric Pollack,	31-October-1983 15:06
+!			Correct key compression when value specified,
+!			Correct compression of random key.
+!	V01-003 JEP0004	J. Eric POllack,	10-August-1983 11:40
+!			Extend key value command syntax, change
+!			encrypt facilty entrypoint names.
+!
+!	V01-002	JEP0003	J. Eric Pollack,	20-June-1983	9:47
+!			Correct checksum useage.
+!
+!**
+
+REQUIRE 'SRC$:COMMON';
+LIBRARY 'SYS$LIBRARY:STARLET';
+REQUIRE 'LIB$:BACKDEF';
+
+G$DEFINE();				! define global area
+
+LINKAGE
+    L_P$ =		CALL: GLOBAL(P$=11);
+
+MACRO
+    L_DECL =	EXTERNAL REGISTER P$ = 11: REF VECTOR %,
+    $DDESCRIP = $BBLOCK [ DSC$C_S_BLN ] % ,	! allocate a descriptor
+    $DSTATIC =  WORD(0),BYTE(0),
+    		BYTE(DSC$K_CLASS_Z),LONG(0) % ,	! initial for static desc
+	$DDYNAMIC = WORD(0),BYTE(0),
+			BYTE(DSC$K_CLASS_D),LONG(0) % , ! initial for dynamic descriptor
+    $IDESCRIP(len,ptr) = BBLOCK [8] INITIAL (WORD(len),BYTE(0),
+    		BYTE(DSC$K_CLASS_Z),LONG(ptr)) % , ! a static descriptor
+!
+! The following macros define the algorithm used by BACKUP when encrypting
+! and decrypting savesets. 
+!
+    $saveset_alg_desc = $descriptor('DESCBC') %, ! algorithm used for savesets
+    $saveset_alg_code = BSA$K_CRYP_DESCBC % ;	! corresponding code value
+
+FORWARD ROUTINE
+	CRYPTO_INIT :	NOVALUE,	! Initialize encryption contexts
+	CRYPTO_FINI :	NOVALUE,	! Finish any open contexts
+    	ASKFOR_KEYVALUE,		! Ask usre for key value
+	POP_N_PARSE : 	NOVALUE,	! Get next key value list item
+    	CRYPTO_INIENC:	NOVALUE,	! Initialize for writing savesets
+	CRYPTO_INIDEC,			! Extract crypto data from summary record
+    	SEARCHFOR_BSR:
+    			L_P$ NOVALUE,	! Scan records for backup summary
+    	SEARCHFOR_CRYPDATKEY:
+    			L_P$ NOVALUE,	! Scan BSR for CRYPDATKEY attribute field
+	CRYPTO_ENCR_BLOCK:
+			NOVALUE,	! Encrypt one block
+    	ENCRYPT_ONE_RECORD:
+    			L_P$ NOVALUE,	! Encrypt one record
+    	ENCRYPT_BSR_FIELDS:
+    			L_P$ NOVALUE,	! Encrypt fields in a BSR record.
+	CRYPTO_DECR_BLOCK:
+			NOVALUE,	! Decrypt one block
+    	DECRYPT_ONE_RECORD:
+    			L_P$ NOVALUE,	! Decrypt one record
+    	DECRYPT_BSR_FIELDS:
+    			L_P$ NOVALUE,	! Decrypt fields in a BSR record.
+    	ADJUST_TOEIGHTS: NOVALUE,	! Copy string adjusting to 8byte bound
+		GENERATE_RANDOM_KEY:
+			NOVALUE;	! Generate data key for encryption of
+					! savesets
+EXTERNAL ROUTINE
+	ENCRYPT$INIT: ADDRESSING_MODE(GENERAL),! Initialize synchronous encrypt stream
+	ENCRYPT$ENCRYPT: ADDRESSING_MODE(GENERAL),	! Encrypt record
+	ENCRYPT$DECRYPT: ADDRESSING_MODE(GENERAL),	! Decrypt record
+	ENCRYPT$FINI: ADDRESSING_MODE(GENERAL),! Close encrypt stream
+	ENCRYPT$$COMPRESS_KEY : ADDRESSING_MODE(GENERAL),! Key compress
+    	LIB$SCOPY_R_DX: ADDRESSING_MODE(GENERAL),	! Copy string
+	OTS$CVT_TZ_L,			! Convert hex ascii to binary
+    	WRITE_BUFFER:   NOVALUE,	! Write buffer to saveset
+    	GET_VM,				! Allocate virtual memory
+    	FREE_VM,			! Release virtual memory
+	DEBLOCK:	L_P$ NOVALUE,	! Deblock a save set buffer
+	DEBLOCK_ATTR:	L_P$ NOVALUE;	! Deblock an attribute record
+
+EXTERNAL LITERAL
+    	BACKUP$_KEYNOTVER,
+    	BACKUP$_KEYLENERR,
+	BACKUP$_ENCBSRNOT,
+	BACKUP$_ENCKEYMAT,
+	BACKUP$_ENCRYPERR,
+	BACKUP$_ENCALGNOT,
+	BACKUP$_DECRYPERR,
+    	BACKUP$_ENCFINERR,
+	BACKUP$_ENCINIERR;
+
+%SBTTL 'Initialze saveset encryption contexts'
+GLOBAL ROUTINE CRYPTO_INIT: NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine initializes global encryption context for encryption
+!	or decryption of the datakey.
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	QUAL_CRYP_USERKEY = descriptor for command line specified key name
+!		or value
+!	QUAL_CRYP_USERALG = descriptor for command line specified algorithm
+!	QUAL_CRYP_VLIST = list pointer to string of zero or more key
+!		value descriptors.
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	CRYP_DATA_KEY = generated DES key for encrypting or decrypting all
+!		saveset protected data. This value is encrypted under the
+!		user specified key and algorithm.
+!	CRYP_DATA_IV = generated DES initialize vector prototype for same.
+!		This value is encrypted under the user specified key 
+!		and algorithm.
+!	CRYP_IN_CONTEXT = pointer to decryption context initialized for
+!		reading the saveset.
+!	CRYP_OU_CONTEXT = pointer to encryption context initialized for
+!		writing the saveset.
+!	CRYP_DA_CONTEXT = pointer to encryption context for datakey
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	As noted above.
+!
+!--
+
+BEGIN
+
+LOCAL
+    status,			! scratch status value
+    key_value_descriptor : $DDESCRIP INITIAL ($DDYNAMIC), !
+    data_value_descriptor : $DDESCRIP INITIAL ($DDYNAMIC), !
+    key_type_code: LONG;	!
+
+CRYP_DA_CONTEXT = 0;
+CRYP_IN_CONTEXT = 0;
+CRYP_OU_CONTEXT = 0;
+!
+! In order to permit the operator to typein the actual key value while
+! controlling the echo, if the command did not include a keyname
+! parameter or a keyvalue for the "/ENCRYPT=(NAME=key,ALGORITHM=alg)" 
+! qualifier, we prompt for the key value here.
+!
+key_type_code = 0;		! assume user supplied key name
+
+IF .$BBLOCK[ qual + $byteoffset(qual_cryp_userkey) , DSC$W_LENGTH ] EQLU 0
+AND .QUAL[ qual_cryp_vlist ] EQLU 0
+THEN
+    BEGIN
+    !
+    ! Neither keyname nor keyvalue was supplied in the command line
+    !
+    status = askfor_keyvalue(qual[qual_cryp_userkey]) ;
+    IF NOT .status
+    THEN
+	SIGNAL ( .status );
+    key_type_code = 1;		! indicate user supplied key value
+    END;
+!
+! Use the user supplied key name/value string and algorithm code to
+! setup an encryption context to be used to encrypt/decrypt the actual
+! datakey for the saveset.
+!
+IF .$BBLOCK[ qual + $byteoffset(qual_cryp_userkey) , DSC$W_LENGTH ] NEQU 0
+THEN
+    BEGIN
+    !
+    ! A keyname was supplied.
+    !
+    status = ENCRYPT$INIT (CRYP_DA_CONTEXT, 
+				qual[qual_cryp_useralg],
+				key_type_code,
+				qual[qual_cryp_userkey] );
+    IF NOT .status
+    THEN
+	SIGNAL(BACKUP$_ENCINIERR,0,.status);
+    END
+ELSE
+IF .QUAL[ qual_cryp_vlist ] NEQU 0
+THEN
+    BEGIN
+    !
+    ! A value list was provided. This list is processed from RIGHT
+    ! to LEFT as expressed in the command line. Each list element
+    ! is taken as a hexadecimal constant or as a string depending
+    ! on how it can be parsed. The first (rightmost) value is
+    ! taken as the key which decrypts (via DESECB) the next left
+    ! value. The result is established as the key for the next
+    ! loop. After the last step, the decrypt context is established
+    ! with the last result as the key. Creation of this series
+    ! of keys and intermediate results is done by a separate program.
+    !
+    key_type_code = 1;		! indicate user supplied key value
+
+    pop_n_parse ( key_value_descriptor ) ; ! Get the first value item
+    !
+    ! key_value_descriptor is of DTYPE = Text or DTYPE = Quadword Integer.
+    ! The later is set if the value string was parsable as a HEX constant.
+    !
+    status = ENCRYPT$INIT (CRYP_DA_CONTEXT, 
+				qual[qual_cryp_useralg],
+				key_type_code,
+				key_value_descriptor );
+    IF NOT .status
+    THEN
+	SIGNAL(BACKUP$_ENCINIERR,0,.status);
+
+    WHILE .QUAL[ qual_cryp_vlist ] NEQU 0 DO
+    BEGIN
+	!
+	! get the next list item
+	!
+	pop_n_parse ( data_value_descriptor ) ; 
+	!
+	! decrypt it using the prevous result as a key
+	!
+	status = ENCRYPT$DECRYPT ( CRYP_DA_CONTEXT,
+				data_value_descriptor,
+				key_value_descriptor) ;
+	IF NOT .status
+	THEN
+	    SIGNAL(BACKUP$_ENCINIERR,0,.status);
+	!
+	! release the context
+	!
+    	status = ENCRYPT$FINI ( CRYP_DA_CONTEXT ) ;
+	!
+	! and reinitalize it using the result as the new key
+	!
+	status = ENCRYPT$INIT (CRYP_DA_CONTEXT, 
+				qual[qual_cryp_useralg],
+				key_type_code,
+				key_value_descriptor );
+	IF NOT .status
+	THEN
+	    SIGNAL(BACKUP$_ENCINIERR,0,.status);
+    END ;
+    END;
+!
+! Since we are using DES block cyphers to encrypt saveset components, any
+! data record encrypted must have a length a multiple of 8 bytes. This 
+! restriction is met by backup records being multiples of 16 bytes. However
+! the command line attribute of the BSR can be of any length. Reallocate
+! the dynamic string containing the command line, padding it with blanks
+! to a multiple of 8 bytes.
+!
+adjust_toeights(QUAL[QUAL_CMD_DESC]) ;
+END;
+
+
+%SBTTL 'Ask user to enter key value'
+ROUTINE ASKFOR_KEYVALUE( buffer ) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine prompts and reads the key value from sys$command
+!
+! INPUT PARAMETERS:
+!	buffer = address of a dynamic string descriptor to reference the
+!		users input value.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	SS$_NORMAL if a key value string was provided
+!	backup$_keynotver if the operator was unable to typein the correct
+!		key twice.
+!
+! SIDE EFFECTS:
+!	NONE.
+!
+!--
+
+BEGIN
+
+MAP
+	buffer : REF $DDESCRIP;		! argument points to descriptor
+
+LITERAL
+    keylenmax = 80,				! maximum length of typed key
+    verify_retry = 3,				! times to retry key verify
+    RECSIZ = 85;				! i/o buffer length
+
+LOCAL
+    infab: $FAB(
+	FNM = 'SYS$INPUT',
+	FAC = (GET)
+	),
+    inrab: $RAB(
+	ROP = (PMT,RNE),
+	USZ = RECSIZ
+	),
+    status: LONG,				! local scratch status
+    first_key_response: $BBLOCK[recsiz],	! response to first question
+    second_key_response: $BBLOCK[recsiz],	! response to second question
+    key_value_length: LONG ;			! length of first typein
+
+BIND
+    first_prompt = $descriptor(%CHAR(13),%CHAR(10),'Enter key value: '):$BBLOCK[4],
+    verify_prompt = $descriptor(%CHAR(13),%CHAR(10),'Verification: '):$BBLOCK[4];
+!
+! open and connect to the command input stream
+!
+    IF NOT ( status = $OPEN(FAB = infab))
+    THEN
+    	RETURN ( .status ) ;
+
+    inrab[RAB$L_FAB] = infab;
+    IF NOT ( status = $CONNECT(RAB = inrab))
+    THEN
+    	RETURN ( .status ) ;
+!
+! Obtain the key value.
+!
+inrab[RAB$L_UBF] = first_key_response;
+inrab[RAB$L_PBF] = .first_prompt[dsc$a_pointer];
+inrab[RAB$B_PSZ] = .first_prompt[dsc$w_length];
+
+IF NOT (status = $GET(RAB = inrab))
+THEN
+    RETURN (.status);
+
+IF ((key_value_length = .inrab[RAB$W_RSZ]) GTRU keylenmax)
+THEN
+    RETURN BACKUP$_KEYLENERR;		! Key value must have legal size.
+!
+! Since all reads are done with echo disabled the key value is verified.
+!
+inrab[RAB$L_UBF] = second_key_response;
+
+INCR counter FROM 1 TO verify_retry
+DO
+    BEGIN
+    inrab[RAB$L_PBF] = .verify_prompt[dsc$a_pointer];
+    inrab[RAB$B_PSZ] = .verify_prompt[dsc$w_length];
+
+    IF (status = $GET(RAB = inrab))
+    THEN
+	!
+	! response must be of the same length
+	!
+	IF .inrab[RAB$W_RSZ] EQLU .key_value_length
+	THEN
+	    !
+	    ! response must be exactly equal
+	    !
+	    IF CH$EQL(.key_value_length, first_key_response,
+			.key_value_length, second_key_response, 0)
+	    THEN
+	    BEGIN
+		buffer[DSC$B_CLASS] = DSC$K_CLASS_D;
+		buffer[DSC$B_DTYPE] = DSC$K_DTYPE_T ;
+		lib$scopy_r_dx ( key_value_length, first_key_response, .buffer);
+    		$DISCONNECT(RAB = inrab);
+		$CLOSE(FAB = infab);
+		RETURN SS$_NORMAL;
+	    END;
+    END;
+
+$DISCONNECT(RAB = inrab);
+$CLOSE(FAB = infab);
+RETURN BACKUP$_KEYNOTVER;
+
+END;
+
+
+%SBTTL 'POP_N_PARSE'
+ROUTINE POP_N_PARSE ( Output : $DDESCRIP ) : NOVALUE  =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine pops the next value descriptor off the value
+!	list, parses the string referenced and returns either
+!	the values string value or the value converted to a binary
+!	quadword from a hex constant.
+!
+! FORMAL PARAMETERS:
+!
+!	Output = a dynamic descriptor to reference the outut value
+!
+! IMPLICIT INPUTS:
+!
+!	The linked list of key values is at QUAL[qual_cryp_vlist]
+!
+! IMPLICIT OUTPUTS:
+!
+!	The linked list nodes are returned to dynamic memory. The
+!	value list items are either returned to dynamic memory or
+!	transfered to the output descriptor.
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	See above.
+!
+!--
+BEGIN
+    LOCAL
+	status : LONG , 		! local status
+    	Input_descr : REF $DDESCRIP ,	! Input String Descriptor
+	node_address : REF BBLOCK ,	! temp address of value list node
+	Binbuffer : BBLOCK[ 8 ] ;	! Binary holding buffer
+
+    !
+    ! Get the next input value descriptor address
+    !
+    Input_descr = .QUAL[qual_cryp_vlist] + $BYTEOFFSET(qual_enva_desc) ;
+    !
+    ! Attempt to convert the value as though it were a hex constant
+    !
+    status =
+	BEGIN
+	IF 
+	    BEGIN
+	    LOCAL char : BYTE ;
+	    char = .(.input_descr [ DSC$A_POINTER ] ) ;
+	    IF .char GEQU %C'0' AND .char LEQU %C'9'
+	    THEN
+	    	TRUE
+	    ELSE
+	    	FALSE
+	    END
+	THEN
+	    OTS$CVT_TZ_L ( .input_descr , binbuffer , 8 , 1 ) 
+	ELSE
+	    FALSE
+	END ;
+
+    IF .status NEQU SS$_NORMAL
+    THEN
+	BEGIN
+	!
+	! Use the key compress routine to put the string key value into
+	! a standard form so that it is handled exactly as though it
+	! had been supplied via the encrypt/create_key mechanism.
+	! Copy the key value to output.
+	!
+	status = encrypt$$compress_key ( .input_descr , .output ) ;
+	IF NOT .status
+	THEN
+	    SIGNAL ( .status ) ;
+	END
+    ELSE
+	!
+	! If the hex convert succeeded, then assign the converted
+	! binary value to output and coerce the descriptor to
+	! numeric type.
+	!
+	BEGIN
+	status = lib$scopy_r_dx ( %REF(8) , Binbuffer , .output ) ;
+	IF NOT .status
+	THEN
+	    SIGNAL ( .status ) ;
+
+	$BBLOCK [ .output , DSC$B_DTYPE ] = DSC$K_DTYPE_Q ;
+	END ;
+    !
+    ! Finally clean up the value list. Deallocate the value element
+    ! and deallocate the list node.
+    !
+       	free_vm ( .BBLOCK[ .input_descr , DSC$W_LENGTH ] , 
+    		  .BBLOCK[ .input_descr , DSC$A_POINTER ] );
+
+    	node_address = .QUAL[ qual_cryp_vlist ] ;
+    	QUAL [ qual_cryp_vlist ] = ..node_address ; ! dlink value element
+    	free_vm ( qual_s_encv , .node_address ) ;
+    END;
+    
+
+
+%SBTTL 'Initialize for writing savesets'
+GLOBAL ROUTINE CRYPTO_INIENC: NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine initializes for the writing of a saveset.
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	QUAL_CRYP_USERKEY = descriptor for command line specified key name
+!		or value
+!	QUAL_CRYP_USERALG = descriptor for command line specified algorithm
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	CRYP_DATA_KEY = generated DES key for encrypting or decrypting all
+!		saveset protected data. This value is encrypted under the
+!		user specified key and algorithm.
+!	CRYP_DATA_IV = generated DES initialize vector prototype for same.
+!		This value is encrypted under the user specified key 
+!		and algorithm.
+!	CRYP_IN_CONTEXT = pointer to decryption context initialized for
+!		reading the saveset.
+!	CRYP_OU_CONTEXT = pointer to encryption context initialized for
+!		writing the saveset.
+!	CRYP_DA_CONTEXT = pointer to encryption context for datakey
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	As noted above.
+!
+!
+BEGIN
+BUILTIN
+    CRC;
+
+LOCAL
+    status,			! scratch status value
+    gen_key_buffer: BBLOCK [16],! buffer for generated saveset data key
+    dat_key_desc: BBLOCK [8],	! descriptor referencing key portion of data key
+    dat_key_iv: LONG,		! address of IV portion of data key
+    null_iv: VECTOR[2,LONG] INITIAL (0,0),! null IV for encrypt of datakey
+    checksum: LONG,		! checksum temporary
+    cdk_desc: $IDESCRIP(BSA$S_CRYPDATKEY,CRYP_DATA_CODE) ; ! static descriptor
+    				! referencing CRYP_DATA_KEY and CRYP_DATA_IV
+!
+! We are writing a saveset so generate a random DES key and IV to be
+! used as the actual encryption key for the saveset. Setup for reading
+! a saveset will be accomplished after we've read the first block.
+!
+    IF .qual[qual_osav]
+    THEN
+    BEGIN
+	generate_random_key (gen_key_buffer) ;
+
+	dat_key_iv = gen_key_buffer + 8 ;	! point to iv in buffer
+
+	dat_key_desc[DSC$B_CLASS] = DSC$K_CLASS_Z ;
+	dat_key_desc[DSC$B_DTYPE] = DSC$K_DTYPE_QU ;
+	dat_key_desc[DSC$W_LENGTH] = 8 ;	! build descriptor for key in buffer
+	dat_key_desc[DSC$A_POINTER] = gen_key_buffer ;
+!
+! Initialize the output (saveset writing) encryption stream using the
+! generated key.
+!
+!
+	status = ENCRYPT$INIT ( CRYP_OU_CONTEXT,
+				$saveset_alg_desc,
+				%REF(1),
+    				dat_key_desc) ;
+
+	IF NOT .status
+	THEN
+	    SIGNAL(BACKUP$_ENCINIERR,0,.status);
+!
+! If we will be verifying the saveset, initialize the input (saveset reading)
+! decryption context. This must be intialized now because if the key encryption
+! algorithm is a one-way or public-key algorithm, we may not have the
+! information available to decrypt the data key from the backup summary
+! record for the verification pass.
+!
+	IF .qual[qual_veri]
+	THEN
+	BEGIN
+	    status = ENCRYPT$INIT ( CRYP_IN_CONTEXT,
+				$saveset_alg_desc,
+				%REF(1),
+    				dat_key_desc) ;
+
+	    IF NOT .status
+	    THEN
+		SIGNAL(BACKUP$_ENCINIERR,0,.status);
+	END;
+!
+! Move the datakey information into the global area for use in building
+! the backup summary record
+!
+    dat_key_desc[DSC$W_LENGTH] = 16 ; ! modify descriptor to cover key+iv
+
+!
+! set the constant that identifies the algorithm used to encrypt
+! the data in the saveset. If a different algorithm is implemented
+! then this is where the addition is made
+!
+    CRYP_DATA_CODE = $saveset_alg_code ;
+
+    ch$copy (.dat_key_desc[DSC$W_LENGTH], .dat_key_desc[DSC$A_POINTER],
+    	0, 16, CRYP_DATA_KEY);
+
+    CRYP_DATA_CKSM = 0;
+!
+! Checksum the key code, datakey, and iv 
+!
+    CRC (RWSV_AUTODIN, %REF (-1), %REF (BSA$S_CRYPDATKEY),
+    					CRYP_DATA_CODE, checksum);
+    CRYP_DATA_CKSM = NOT .checksum ;
+!
+! keep a copy of the randomly generated IV for use in encrypting the
+! saveset records and command line.
+!
+    CRYP_DATA_ENCIV[0,0,32,0] = .CRYP_DATA_IV[0,0,32,0];
+    CRYP_DATA_ENCIV[4,0,32,0] = .CRYP_DATA_IV[4,0,32,0];
+!
+! Encrypt the generated key information using the user supplied key and algorithm.
+! This is placed into CRYP_DATA_CODE -> CRYP_DATA_CKSM for later copying
+! into the backup summary record of the saveset.
+!
+	status = ENCRYPT$ENCRYPT ( CRYP_DA_CONTEXT,
+				cdk_desc,
+				cdk_desc,
+    				0,
+    				null_iv) ;
+	IF NOT .status
+	THEN
+	SIGNAL(BACKUP$_ENCRYPERR,0,.status);
+
+!
+! We no longer need the data key encrypting context so close it
+!
+	status = ENCRYPT$FINI ( CRYP_DA_CONTEXT ) ;
+
+	IF NOT .status
+	THEN
+	SIGNAL(BACKUP$_ENCFINERR,0,.status);
+
+    END;
+
+END;
+
+%SBTTL 'Init decryption data for reading saveset'
+GLOBAL ROUTINE CRYPTO_INIDEC (BCB) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine locates the backup summary record in a block and
+!	extracts the crypto control fields. It then initializes the
+!	input decryption stream.
+!
+! INPUT PARAMETERS:
+!	BCB = address of block containing the backup summary record.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	The input decryption stream is initialized.
+!
+! ROUTINE VALUE:
+!	TRUE if the backup summary record indicates the saveset is encrypted.
+!	FALSE if not encrypted.
+!
+! SIDE EFFECTS:
+!	The input decryption stream is initialized
+!
+!--
+
+BEGIN
+BUILTIN
+    CRC;
+GLOBAL REGISTER
+    P$ = 11:	REF VECTOR;		! linkage for data passed to inner routine
+MAP
+    BCB:	REF BBLOCK;		! parameter points to buffer
+
+LOCAL
+    status,				! scratch status
+    oldcheck,				! temp
+    checksum,				! computed checksum
+    null_iv: VECTOR[2,LONG] INITIAL (0,0),! null IV for decrypt of datakey
+    temp_desc: $IDESCRIP(BSA$S_CRYPDATKEY, CRYP_DATA_CODE),
+    					! static descriptor initialized to
+    					! the whole crypt data record
+    key_desc: $IDESCRIP(8,CRYP_DATA_KEY) ;
+    					! static descriptor referencing the
+    					! 8-byte datakey
+key_desc[DSC$B_DTYPE] = DSC$K_DTYPE_QU ;	! set descriptor type
+						! to prevent compression
+!
+! Set flag to indicate whether BSR was located.
+!
+CRYP_DATA_CODE = -1;
+!
+! Use the BACKUP facility routine DEBLOCK to extract all records
+! of the buffer.
+!
+DEBLOCK (.BCB, SEARCHFOR_BSR , TRUE ) ;
+!
+! If we didn't find the summary record, then signal an error. This is
+! fatal.
+!
+IF CRYP_DATA_CODE EQLU -1
+THEN
+    SIGNAL(BACKUP$_ENCBSRNOT);
+!
+! Now, Using the userkey context initialized by CRYPTO_INIT above at
+! command parse time, attempt to decrypt the datakey from the saveset
+! and use the results to initialize the input (saveset reading) encryption
+! stream.
+!
+status = ENCRYPT$DECRYPT ( CRYP_DA_CONTEXT,
+       			temp_desc,
+       			temp_desc,
+   				0,
+       			null_iv);
+
+IF NOT .status
+THEN
+    SIGNAL(BACKUP$_ENCINIERR,0,.status);
+!
+! Verify that the user supplied key can be assumed to be correct by checksuming
+! the just decrypted datakey data. If the checksum matches, we assume that
+! the user supplied the right userkey to decrypt the saveset datakey.
+!
+oldcheck = .CRYP_DATA_CKSM ;
+CRYP_DATA_CKSM = 0;
+
+CRC (RWSV_AUTODIN, %REF (-1), %REF (BSA$S_CRYPDATKEY),
+    					CRYP_DATA_CODE, checksum);
+IF .oldcheck NEQU (NOT .checksum)
+THEN
+    SIGNAL(BACKUP$_ENCKEYMAT);
+!
+! It seems ok. If the saveset is encrypted using an algorithm
+! we support, then initialize the data decryption stream using the data key
+! from the BSR.
+!
+IF .CRYP_DATA_CODE NEQ $saveset_alg_code
+THEN
+    SIGNAL(BACKUP$_ENCALGNOT);
+
+status = ENCRYPT$INIT ( CRYP_IN_CONTEXT,
+			$saveset_alg_desc,
+			%REF(1),
+			key_desc);
+
+IF NOT .status
+THEN
+    SIGNAL(BACKUP$_ENCINIERR,0,.status);
+
+CRYP_DATA_ENCIV[0,0,32,0] = .CRYP_DATA_IV[0,0,32,0];
+CRYP_DATA_ENCIV[4,0,32,0] = .CRYP_DATA_IV[4,0,32,0];
+!
+! We don't need the user key decryption context anymore, so close it
+!
+status = ENCRYPT$FINI ( CRYP_DA_CONTEXT );
+
+IF NOT .status
+THEN
+    SIGNAL ( BACKUP$_ENCFINERR,0,.status);
+!
+! If the buffer is from a saveset that is encrypted and we were able
+! to initialize the input decryption context return TRUE,
+! else return FALSE
+!
+IF CRYP_IN_CONTEXT NEQU 0 THEN TRUE ELSE FALSE
+
+END;
+
+%SBTTL 'Search for Backup Summary in block'
+ROUTINE SEARCHFOR_BSR(PTR): L_P$ NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine analyzes the contents of one attribute record.
+!
+! INPUT PARAMETERS:
+!	PTR = address of record to examine
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	The listing is produced.
+!
+!--
+
+BEGIN
+
+GLOBAL REGISTER
+    P$ = 11:	REF VECTOR;		! linkage for data passed to inner routine
+MAP
+    PTR:	REF BBLOCK;		! address of record from block to examine
+
+!
+! We are only interested in backup summary records
+!
+IF .ptr[BRH$W_RTYPE] NEQU BRH$K_SUMMARY THEN RETURN;
+!
+! Clear the return flag to indicate that we did find the BSR
+!
+CRYP_DATA_CODE = 0;
+!
+! Use the facility deblock routine to break apart attribute sub-records
+!
+DEBLOCK_ATTR(.PTR, 0, SEARCHFOR_CRYPDATKEY);
+
+END;
+
+%SBTTL 'Locate and extract data key from summary record'
+ROUTINE SEARCHFOR_CRYPDATKEY (ATT): L_P$ NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine examines the passed backup summary record looking for the
+!	CRYPDATKEY attribute field.
+!
+! INPUT PARAMETERS:
+!	ATT = address of the attribute record.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	The CRYPDATKEY record contents are moved to CRYP_DATA_CODE through
+!	CRYP_DATA_IV.
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	As noted.
+!
+!--
+
+BEGIN
+MAP
+    ATT:	REF BBLOCK;		! Address of attribute record
+
+
+IF .att[BSA$W_TYPE] NEQU BSA$K_CRYPDATKEY THEN RETURN;
+!
+! Got it. Move the contents of the record to appropriate global storage
+!
+ch$copy (.att[BSA$W_SIZE], att[BSA$C_LENGTH,0,0,0], 0,
+    BSA$S_CRYPDATKEY , CRYP_DATA_CODE);
+
+END;
+
+%SBTTL 'Encrypt one block'
+GLOBAL ROUTINE CRYPTO_ENCR_BLOCK (BCB) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine encrypts one block and starts the output operation
+!
+! INPUT PARAMETERS:
+!	BCB = address of block to encrypt
+!
+! IMPLICIT INPUTS:
+!	The output encryption context is assumed to be initialized
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	The block is encrypted.
+!
+!--
+
+BEGIN
+
+GLOBAL REGISTER
+    P$ = 11:	REF VECTOR;		! impure work area passed by DEBLOCK
+
+MAP
+    BCB:	REF BBLOCK;
+
+!
+! Use the BACKUP facility block scanning routine DEBLOCK to identify
+! each record in the block
+!
+DEBLOCK(.BCB, ENCRYPT_ONE_RECORD, TRUE );
+WRITE_BUFFER(.BCB);
+
+END;
+
+%SBTTL 'Encrypt one record in the current block'
+ROUTINE ENCRYPT_ONE_RECORD (RECPTR): L_P$ NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine encrypts one record in the current block
+!
+! INPUT PARAMETERS:
+!	RECPTR = address of the record to encrypt.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	The record is encrypted if appropriate to the record type.
+!
+!--
+
+BEGIN
+
+GLOBAL REGISTER
+    P$ = 11:	REF VECTOR;		! impure work area passed by DEBLOCK
+MAP
+    RECPTR:	REF BBLOCK;
+!
+! Diverge on record type and encrypt it if appropriate.
+!
+CASE .recptr[BRH$W_RTYPE] FROM BRH$K_NULL TO BRH$K_FILE_EXT OF
+    SET
+
+    [OUTRANGE]:
+    RETURN;
+
+    [BRH$K_SUMMARY]:
+    BEGIN
+    DEBLOCK_ATTR(.RECPTR, 0, ENCRYPT_BSR_FIELDS);
+    RETURN;
+    END;
+
+    [INRANGE]:
+	BEGIN
+	LOCAL
+	    status: LONG,		! local scratch status
+	    rec_desc: $DDESCRIP INITIAL ($DSTATIC), ! descriptor for record
+	    encr_len_actual: LONG,	! actual length of encrypted data
+	    ini_vec: BBLOCK [8];	! initialize vector for this block
+
+	!
+	! setup buffer descriptor
+	!
+	rec_desc[DSC$A_POINTER] = .recptr + BRH$C_LENGTH ;
+	rec_desc[DSC$W_LENGTH] = .recptr[BRH$W_RSIZE] ;
+	!
+	! create the record IV from the prototype IV and record header info
+	!
+	! The RSIZE, RTYPE, and ADDRESS(VBN/LBN) are all constant data 
+	! that is written to the saveset in clear text form and therefore 
+	! is identical and available for use to create the IV again 
+	! when restoring the saveset.
+	!
+	ini_vec[0,0,16,0] = .recptr[BRH$W_RSIZE];
+	ini_vec[0,16,16,0] = .recptr[BRH$W_RTYPE];
+	ini_vec[0,0,32,0] = .ini_vec[0,0,32,0] XOR .CRYP_DATA_ENCIV[0,0,32,0] ;
+	ini_vec[4,0,32,0] = .recptr[BRH$L_ADDRESS] XOR .CRYP_DATA_ENCIV[4,0,32,0] ;
+	!
+	! and encrypt the record
+	!
+	status = ENCRYPT$ENCRYPT ( CRYP_OU_CONTEXT,
+				rec_desc,
+				rec_desc,
+				encr_len_actual,
+				ini_vec);
+	IF NOT .status
+	THEN
+	    SIGNAL(BACKUP$_ENCRYPERR,0,.status);
+
+	END;
+    TES;
+END;
+
+%SBTTL 'Encrypt fields in Backup Summary Record'
+ROUTINE ENCRYPT_BSR_FIELDS(PTR): L_P$ NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine encrypts protected fields of the BSR
+!
+! INPUT PARAMETERS:
+!	PTR = address of a BSR record
+!
+! IMPLICIT INPUTS:
+!	The output encryption context
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+GLOBAL REGISTER
+    P$ = 11:	REF VECTOR;		! linkage for data passed to inner routine
+MAP
+    PTR:	REF BBLOCK;		! address of BSR record 
+
+CASE .ptr[BSA$W_TYPE] FROM BSA$K_SSNAME TO BSA$K_CRYPDATKEY OF
+    SET
+    [BSA$K_COMMAND]:
+    BEGIN
+    LOCAL
+	temp_desc: $IDESCRIP(0,0),	! static descriptor to reference attr record
+	status: LONG;			! local temp status
+
+	!
+	! build descriptor to reference the command line
+	!
+	temp_desc[DSC$W_LENGTH] = .ptr[BSA$W_SIZE] ;
+	temp_desc[DSC$A_POINTER] = ptr[BSA$C_LENGTH,0,32,0] ;;
+	!
+	! encrypt it
+	!
+	status = ENCRYPT$ENCRYPT ( CRYP_OU_CONTEXT,
+    				temp_desc,
+    				temp_desc,
+    				0,
+    				CRYP_DATA_ENCIV) ;
+
+	IF NOT .status
+	THEN
+	    SIGNAL(BACKUP$_ENCRYPERR, 0, .status);
+
+    END;
+    [OUTRANGE,INRANGE]:
+    TES;
+END;
+
+%SBTTL 'Decrypt one block'
+GLOBAL ROUTINE CRYPTO_DECR_BLOCK(BCB) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine decrypts one block.
+!
+! INPUT PARAMETERS:
+!	BCB = address of block to decrypt.
+!
+! IMPLICIT INPUTS:
+!	The input decryption context is assumed to be initialized
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	The block is decrypted.
+!
+!--
+
+BEGIN
+
+GLOBAL REGISTER
+    P$ = 11:	REF VECTOR;		! impure work area passed by DEBLOCK
+MAP
+    BCB:	REF BBLOCK;
+
+!
+! Use the BACKUP facility record deblocking routine to separate each
+! record of the block
+!
+DEBLOCK(.BCB,DECRYPT_ONE_RECORD,TRUE);
+END;
+
+%SBTTL 'Decrypt one record in the current block'
+ROUTINE DECRYPT_ONE_RECORD (RECPTR): L_P$ NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine decrypts one record in the current block
+!
+! INPUT PARAMETERS:
+!	RECPTR = address of the record
+!
+! IMPLICIT INPUTS:
+!	CRYP_IN_CONTEXT points to the input decryption stream context
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	The record is decrypted according to type.
+!
+!--
+
+BEGIN
+
+GLOBAL REGISTER
+    P$ = 11:	REF VECTOR;		! impure work area passed by DEBLOCK
+MAP
+    RECPTR:	REF BBLOCK;
+!
+! Diverge on record type and decrypt it if appropriate.
+!
+CASE .recptr[BRH$W_RTYPE] FROM BRH$K_NULL TO BRH$K_FILE_EXT OF
+    SET
+
+    [OUTRANGE]:
+    RETURN;
+
+    [BRH$K_SUMMARY]:
+    BEGIN
+    DEBLOCK_ATTR(.RECPTR, 0, DECRYPT_BSR_FIELDS);
+    RETURN;
+    END;
+
+    [INRANGE]:
+	BEGIN
+	LOCAL
+	    status: LONG,		! local scratch status
+	    rec_desc: $DDESCRIP INITIAL ($DSTATIC), ! descriptor for record
+	    decr_len_actual: LONG,	! actual length of decrypted data
+	    ini_vec: BBLOCK [8];	! initialize vector for this block
+
+	!
+	! setup buffer descriptor
+	!
+	rec_desc[DSC$A_POINTER] = .recptr + BRH$C_LENGTH ;
+	rec_desc[DSC$W_LENGTH] = .recptr[BRH$W_RSIZE] ;
+	!
+	! create the record IV from the prototype IV and record header info
+	!
+	ini_vec[0,0,16,0] = .recptr[BRH$W_RSIZE];
+	ini_vec[0,16,16,0] = .recptr[BRH$W_RTYPE];
+	ini_vec[0,0,32,0] = .ini_vec[0,0,32,0] XOR .CRYP_DATA_ENCIV[0,0,32,0] ;
+    	ini_vec[4,0,32,0] = .recptr[BRH$L_ADDRESS] XOR .CRYP_DATA_ENCIV[4,0,32,0] ;
+	!
+	! and decrypt the record
+	!
+	status = ENCRYPT$DECRYPT ( CRYP_IN_CONTEXT,
+				rec_desc,
+				rec_desc,
+				decr_len_actual,
+				ini_vec);
+	IF NOT .status
+	THEN
+	    SIGNAL(BACKUP$_DECRYPERR,0,.status);
+
+	END;
+    TES;
+END;
+
+%SBTTL 'Decrypt fields in Backup Summary Record'
+ROUTINE DECRYPT_BSR_FIELDS(PTR): L_P$ NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine decrypts protected fields of the BSR
+!
+! INPUT PARAMETERS:
+!	PTR = address of a BSR record
+!
+! IMPLICIT INPUTS:
+!	The input encryption context
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+GLOBAL REGISTER
+    P$ = 11:	REF VECTOR;		! linkage for data passed to inner routine
+MAP
+    PTR:	REF BBLOCK;		! address of BSR record 
+
+CASE .ptr[BSA$W_TYPE] FROM BSA$K_SSNAME TO BSA$K_CRYPDATKEY OF
+    SET
+    [BSA$K_COMMAND]:
+    BEGIN
+    LOCAL
+	temp_desc: $IDESCRIP(0,0),	! static descriptor to reference attr record
+	status: LONG;			! local temp status
+
+	!
+	! build descriptor to reference the command line
+	!
+	temp_desc[DSC$W_LENGTH] = .ptr[BSA$W_SIZE] ;
+	temp_desc[DSC$A_POINTER] = ptr[BSA$C_LENGTH,0,32,0] ;
+	!
+	! decrypt it
+	!
+	status = ENCRYPT$DECRYPT ( CRYP_IN_CONTEXT,
+    				temp_desc,
+    				temp_desc,
+    				0,
+    				CRYP_DATA_ENCIV) ;
+
+	IF NOT .status
+	THEN
+	    SIGNAL(BACKUP$_DECRYPERR, 0, .status);
+
+    END;
+    [OUTRANGE,INRANGE]:
+    TES;
+END;
+
+%SBTTL 'Adjust dynamic string allocation'
+ROUTINE ADJUST_TOEIGHTS(ADESC): NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine adjusts dynamic string allocation to 8-byte bounds.
+!
+! INPUT PARAMETERS:
+!	ADESC = address of dynamic string descriptor
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+MAP
+    adesc:	REF BBLOCK[8];
+
+LOCAL
+    new_pointer: LONG,		! address of newly allocated string
+    new_length: LONG;		! length of new string
+
+new_length = .adesc[DSC$W_LENGTH] + 7 AND NOT 7;
+new_pointer = get_vm(.new_length) ;
+
+ch$copy(.adesc[DSC$W_LENGTH], .adesc[DSC$A_POINTER] , %x'20' ,
+    .new_length , .new_pointer );
+
+free_vm( .adesc[DSC$W_LENGTH], .adesc[DSC$A_POINTER] );
+
+adesc[DSC$W_LENGTH] = .new_length ;
+adesc[DSC$A_POINTER] = .new_pointer ;
+
+END;
+
+
+%SBTTL 'Generate random saveset encryption key'
+ROUTINE GENERATE_RANDOM_KEY ( BUFFER ) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine generates the DES key and IV prototype to be used for
+!	enrypting the saveset.
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	The time-of-day and the commandline string are used to create
+!	a pseudo-random 8-byte key value and associated IV value.
+!
+! OUTPUT PARAMETERS:
+!	The two 8-byte values are returned in the supplied buffer.
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	As above.
+!
+!--
+
+BEGIN
+MAP
+    buffer: REF VECTOR [16,BYTE];		! buffer to load with key and iv.
+
+LOCAL
+    status: LONG,			! local scratch status
+    src_length: LONG,			! temp counter
+    src_pointer: REF VECTOR[,BYTE],	! temp character pointer
+    temp_context: LONG INITIAL (0),		! pointer to temporary encrypt context
+    buf_desc: $IDESCRIP(16,0) ; 	! static descriptor referencing
+    					! generated key buffer
+
+buf_desc[DSC$A_POINTER] = .buffer ;	! init descriptor
+buf_desc[DSC$B_DTYPE] = DSC$K_DTYPE_OU ; ! indicate keytype is
+					     ! uncompressable
+ch$fill ( %x'00', 16, .buffer);
+!
+! Initialize the key and iv accumulator with the current time
+!
+$GETTIM(TIMADR = .buffer) ;
+!
+! Acquire the command line as typed by the user and XOR it into the
+! key/iv accumulator.
+!
+src_pointer = .BBLOCK[qual[qual_cmd_desc],DSC$A_POINTER] ;
+src_length = .BBLOCK[qual[qual_cmd_desc],DSC$W_LENGTH] ;
+
+INCR j from 0 to .src_length-1 DO
+    buffer [ .j MOD 16 ] = 
+	.buffer [ .j MOD 16 ] XOR .src_pointer[ .j ] ;
+!
+! The best randomizer is the DES algorithm itself, encrypt the accumulator
+! against itself once.
+!
+status = ENCRYPT$INIT ( temp_context , $DESCRIPTOR('DESCBC'),
+    	%REF(1), buf_desc ) ;
+IF NOT .status
+THEN
+    SIGNAL(BACKUP$_ENCINIERR,0,.status);
+status = ENCRYPT$ENCRYPT ( temp_context , buf_desc , buf_desc ) ;
+IF NOT .status
+THEN
+    SIGNAL(BACKUP$_ENCINIERR,0,.status);
+status = ENCRYPT$FINI ( temp_context ) ;
+IF NOT .status
+THEN
+    SIGNAL(BACKUP$_ENCINIERR,0,.status);
+
+
+END;
+
+%SBTTL 'Close any open crypt contexts'
+GLOBAL ROUTINE CRYPTO_FINI: NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Close any open encryption streams.
+!
+! FORMAL PARAMETERS:
+!
+!	None.
+!
+! IMPLICIT INPUTS:
+!
+!	Pointers to crypto contexts in global area.
+!
+! IMPLICIT OUTPUTS:
+!
+!	None.
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	Any open contexts are closed.
+!
+!--
+
+    BEGIN
+
+    IF CRYP_DA_CONTEXT NEQA 0 THEN ENCRYPT$FINI (CRYP_DA_CONTEXT);
+    IF CRYP_IN_CONTEXT NEQA 0 THEN ENCRYPT$FINI (CRYP_IN_CONTEXT);
+    IF CRYP_OU_CONTEXT NEQA 0 THEN ENCRYPT$FINI (CRYP_OU_CONTEXT);
+
+    END;
+
+
+END
+ELUDOM

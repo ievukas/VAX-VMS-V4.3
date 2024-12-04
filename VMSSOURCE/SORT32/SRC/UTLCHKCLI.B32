@@ -1,0 +1,552 @@
+MODULE UTIL$CHK_CLI (
+		IDENT = 'V04-000'	! File: UTLCHKCLI.B32 Edit: PDG3001
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+!
+! FACILITY:	VAX-11 SORT/MERGE
+!		VAX-11 CHECKPOINT/RESTART
+!		VAX-11 CLI
+!
+! ABSTRACT:
+!
+!	This module contains routines that can be used by a checkpointed
+!	subprocess to obtain CLI information from a parent process.
+!
+! ENVIRONMENT:	VAX/VMS user mode
+!
+! AUTHOR: Peter D Gilbert, CREATION DATE: 17-Oct-1983
+!
+! MODIFIED BY:
+!
+!	T03-001		Original
+!--
+
+LIBRARY	'SYS$LIBRARY:LIB';
+REQUIRE 'SRC$:SORMSG';
+
+FORWARD ROUTINE
+    !
+    ! Global routines that interface to the CLI
+    !
+    CLI_BEGIN,					! Setup CLI processing
+    CLI_GET_VALUE,				! Get value of item
+    CLI_PRESENT,				! Determine if item is present
+    CLI_NEXT_QUAL,				! Get next qualifier
+    CLI_END,					! End CLI processing
+    !
+    ! Utility routines
+    !
+    INIT_MBX:		NOVALUE,		! Initialize mailbox
+    GET_SYS_LOG:	NOVALUE,		! Translate system logical
+    CLI_CHECKPOINT;				! Field requests
+
+EXTERNAL ROUTINE
+    STR$COPY_R:		ADDRESSING_MODE(GENERAL),
+    CHK$CHKPNT:		ADDRESSING_MODE(GENERAL) WEAK,
+    LIB$SYS_TRNLOG:	ADDRESSING_MODE(GENERAL),
+    STR$COPY_R:		ADDRESSING_MODE(GENERAL);
+
+EXTERNAL LITERAL
+    CLI$_FACILITY,
+    CLI$_SPAWNED,
+    CLI$_INVREQTYP,
+    CHK$_NOTINIT:	WEAK;
+
+LITERAL	FALSE =	0;
+LITERAL	TRUE =	1;
+MACRO	BASE_ =	0,0,0,0 %;
+MACRO	ELIF =	ELSE IF %;
+MACRO	STR_MAILBOX =	'SORTMERGE_MBX' %;	! Mailbox name
+
+
+! Define the format of a message
+!
+FIELD
+    MSG_FIELDS =
+	SET
+	MSG_L_ID=	[ 0,0,32,0],		! Message ID
+	MSG_L_STS=	[ 4,0,32,0],		! Returned status of request
+	MSG_L_RQST=	[ 8,0,32,0],		! Request code
+	MSG_L_LEN=	[12,0,32,0],		! Length of following text
+	MSG_A_TXT=	[16,0,32,0]		! Start of text
+	TES;
+LITERAL	MSG_K_TEXT=	256;				! Largest text size
+LITERAL	MSG_K_SIZE=	%FIELDEXPAND(MSG_A_TXT,0) + MSG_K_TEXT;	! Size in bytes
+MACRO	MSG_BLOCK=	BLOCK[MSG_K_SIZE,BYTE] FIELD(MSG_FIELDS) %;
+%MESSAGE('MSG_K_SIZE = ', %NUMBER(MSG_K_SIZE))
+
+! Values of MSG_L_ID
+!
+LITERAL
+!   MSG$_DELPROC	= whatever,
+    MSG_K_CHKCLI	= MSG$_DELPROC + 1;
+
+! Values of MSG_L_RQST
+!
+LITERAL
+    MSG_K_GET_VALUE	= 1,
+    MSG_K_PRESENT	= 2,
+    MSG_K_NEXT_QUAL	= 3,
+    MSG_K_END		= 4;
+
+OWN
+    MBX_CHAN:	WORD,			! Mailbox channel
+    MBX_UNIT,				! Mailbox unit
+    CHK_SUBP:	BYTE,			! True if a checkpoint subprocess
+    MSG:	MSG_BLOCK;		! Message block
+
+BIND
+    CLI$_SHR_SYSERROR = SHR$_SYSERROR + STS$K_SEVERE + CLI$_FACILITY ^ 16,
+    CLI$_SHR_BADLOGIC = SHR$_BADLOGIC + STS$K_SEVERE + CLI$_FACILITY ^ 16;
+
+GLOBAL ROUTINE CLI_BEGIN
+	(
+	IMAGE_AP:	REF $BBLOCK,	! AP of main routine
+	CHK_POINT			! True is checkpointing was specified
+	) =
+    BEGIN
+    LOCAL
+	STATUS;
+
+    ! Determine whether we're a checkpoint subprocess
+    !
+    CHK_SUBP = FALSE;
+!    %IF %SWITCHES(DEBUG) %THEN
+	IF .CHK_POINT EQL CLI$_INVREQTYP
+	THEN
+	    CHK_SUBP = TRUE;
+!    %ELSE
+!	IF CHK$CHKPNT NEQ 0
+!	THEN
+!	    BEGIN
+!	    STATUS = CHK$CHKPNT();
+!	    IF .STATUS AND .STATUS NEQ CHK$_NOTINIT THEN CHK_SUBP = TRUE;
+!	    END;
+!    %FI
+
+    ! If we're a checkpoint subprocess, call the CLI through a mailbox
+    !
+    IF .CHK_SUBP
+    THEN
+	INIT_MBX()		! Attach to the communication mailbox
+    ELIF .CHK_POINT
+    THEN
+	$EXIT(CODE = CLI_CHECKPOINT(IMAGE_AP[BASE_]))	! Create subprocess
+    ELSE
+	0;			! Just continue normally
+
+    RETURN SS$_NORMAL;
+    END;
+
+GLOBAL ROUTINE CLI_END =
+    BEGIN
+    !+
+    !
+    ! This routine is called after all other calls to the CLI_xxx routines.
+    ! It is called by a main process only if no checkpointing is requested.
+    ! It is called by a checkpointed subprocess.
+    !
+    !-
+    LOCAL
+	STATUS;
+
+    IF NOT .CHK_SUBP THEN RETURN SS$_NORMAL;
+
+    ! Deassign the channel to the mailbox
+    !
+    STATUS = $DASSGN(CHAN=.MBX_CHAN);
+    IF NOT .STATUS THEN RETURN SIGNAL(CLI$_SHR_SYSERROR, 0, .STATUS);
+
+    RETURN SS$_NORMAL;
+    END;
+
+! Read a message from a mailbox
+!
+MACRO
+    MBX_GET_(MSG_CODE, DESC) =
+	BEGIN
+	LOCAL S;
+	LOCAL IOSB: VECTOR[4,BYTE];
+	S = $QIOW(
+	    EFN=	0,
+	    CHAN=	.MBX_CHAN,
+	    FUNC=	IO$_READVBLK,
+	    IOSB=	IOSB[0],
+	    ASTADR=	0,
+	    ASTPRM=	0,
+	    P1=	MSG[BASE_],
+	    P2=	%ALLOCATION(MSG));
+	IF .S THEN S = .IOSB[0];
+	IF NOT .S THEN SIGNAL(CLI$_SHR_SYSERROR, 0, .S);
+	%IF NOT %NULL(MSG_CODE) %THEN
+	    IF .MSG[MSG_L_ID] EQL MSG$_DELPROC
+	    THEN
+		$EXIT(CODE = .MSG[MSG_L_STS] OR STS$M_INHIB_MSG)
+	    ELIF
+		.MSG[MSG_L_ID] NEQ MSG_K_CHKCLI OR .MSG[MSG_L_RQST] NEQ MSG_CODE
+	    THEN
+		SIGNAL(CLI$_SHR_BADLOGIC);
+	%FI
+	%IF NOT %NULL(DESC) %THEN
+	    BEGIN
+	    STR$COPY_R(DESC, MSG[MSG_L_LEN], MSG[MSG_A_TXT]);
+	    END;
+	%FI
+	END %;
+
+! Write a message to a mailbox
+!
+MACRO
+    MBX_PUT_(MSG_CODE, DESC) =
+	BEGIN
+	LOCAL S;
+	LOCAL IOSB: VECTOR[4,BYTE];
+	%IF NOT %NULL(MSG_CODE) %THEN
+	    MSG[MSG_L_RQST] = MSG_CODE;
+	%FI
+	%IF NOT %NULL(DESC) %THEN
+	    CH$MOVE(MSG[MSG_L_LEN] = MINU(MSG_K_TEXT, .DESC[DSC$W_LENGTH]),
+		.DESC[DSC$A_POINTER], MSG[MSG_A_TXT]);
+	%FI
+	S = $QIOW(
+	    EFN=	0,
+	    CHAN=	.MBX_CHAN,
+	    FUNC=	IO$_WRITEVBLK,
+	    IOSB=	IOSB[0],
+	    ASTADR=	0,
+	    ASTPRM=	0,
+	    P1=	MSG[BASE_],
+	    P2=	(MSG[MSG_A_TXT] - MSG[BASE_]) + .MSG[MSG_L_LEN]);
+	IF .S THEN S = .IOSB[0];
+	IF NOT .S THEN SIGNAL(CLI$_SHR_SYSERROR, 0, .S);
+	END %;
+
+! These routines are used as an interface to the CLI.
+! If sort is running as a checkpoint subprocess, there is no CLI.
+! These routines allow us to pass information to the subprocess.
+!
+MACRO GEN_CLI_RTN_(RTN) =
+    %NAME('CLI_',RTN)
+	(
+	NAME:	REF $BBLOCK
+	%IF %IDENTICAL(RTN,'GET_VALUE') %THEN ,RETBUF: REF $BBLOCK %FI
+	) =
+    BEGIN
+    BUILTIN
+	CALLG, AP;
+    LOCAL
+	STATUS;
+
+    ! Are we are a checkpoint subprocess?
+    !
+    IF .CHK_SUBP
+    THEN
+	BEGIN
+	!
+	! Ask the main process for this.
+	!
+	MBX_PUT_(%NAME('MSG_K_',RTN), NAME);
+	MBX_GET_(%NAME('MSG_K_',RTN),
+	    %IF %DECLARED(RETBUF) %THEN RETBUF[BASE_] %FI);
+	STATUS = .MSG[MSG_L_STS];
+	END
+    ELSE
+	BEGIN
+	!
+	! Get the value from the CLI directly
+	!
+	EXTERNAL ROUTINE %NAME('CLI$',RTN): ADDRESSING_MODE(GENERAL);
+	%IF %IDENTICAL(RTN,'NEXT_QUAL')		! Hack for CLI$NEXT_QUAL
+	%THEN
+	    OWN FIRST: BYTE INITIAL(TRUE);
+	    IF %NAME('CLI$',RTN) EQL 0
+	    THEN
+		BEGIN
+		STATUS = .FIRST;
+		FIRST = FALSE;
+		END
+	    ELSE
+	%FI
+	STATUS = CALLG(.AP, %NAME('CLI$',RTN));
+	END;
+    RETURN .STATUS;
+    END %;
+GLOBAL ROUTINE GEN_CLI_RTN_('GET_VALUE');
+GLOBAL ROUTINE GEN_CLI_RTN_('PRESENT');
+GLOBAL ROUTINE GEN_CLI_RTN_('NEXT_QUAL');
+
+KEYWORDMACRO
+    $CRECHK(
+	PIDADR=0, IMAGE=0, INPUT=0, OUTPUT=0, ERROR=0, PRVADR=0,
+	QUOTA=0, PRCNAM=0, BASPRI=0, UIC=0, MBXUNT=0, STSFLG=0,
+	FLAGS=0, RSTMODE=0, EXTSTA=0, PAGFIL=0) =
+	    BEGIN
+	    MACRO
+		F_(X) =
+		    %IF %CTCE(X)
+		    %THEN
+			%IF X NEQ 0 %THEN %ERROR('Error in $CRECHK') %FI
+			X
+		    %ELSE
+			(IF CHK$CRECHK NEQ 0 THEN X ELSE .X)
+		    %FI %QUOTE %;
+	    EXTERNAL ROUTINE
+		SYS$CREPRC: ADDRESSING_MODE(GENERAL),
+	        CHK$CRECHK: ADDRESSING_MODE(GENERAL) WEAK;
+	    (IF CHK$CRECHK NEQ 0 THEN CHK$CRECHK ELSE SYS$CREPRC)
+		(PIDADR, IMAGE, INPUT, OUTPUT, ERROR, PRVADR,
+		 QUOTA, PRCNAM, F_(BASPRI), F_(UIC), F_(MBXUNT), F_(STSFLG)
+		 ,F_(FLAGS), RSTMODE, EXTSTA, PAGFIL
+		)
+	    END %;
+
+ROUTINE CLI_CHECKPOINT(
+	IMAGE_AP:	REF $BBLOCK
+	) =
+    BEGIN
+    !
+    ! Create a checkpoint subprocess and field it's requests.
+    !
+    MACRO
+	STR_INPUT =	'SYS$INPUT' %,
+	STR_OUTPUT =	'SYS$OUTPUT' %,
+	STR_ERROR =	'SYS$ERROR' %;
+    MACRO
+	DYNAMIC_STRING = $BBLOCK[DSC$C_D_BLN]
+	    PRESET(
+		[DSC$W_LENGTH] = 0,
+		[DSC$B_CLASS] = DSC$K_CLASS_D,
+		[DSC$B_DTYPE] = DSC$K_DTYPE_T,
+		[DSC$A_POINTER] = 0) %;
+    LOCAL
+	BUFFER: $BBLOCK[64];
+    LOCAL
+	DYN:	DYNAMIC_STRING,
+	INPUT:	DYNAMIC_STRING,
+	OUTPUT:	DYNAMIC_STRING,
+	ERROR:	DYNAMIC_STRING,
+	PRCNAM:	$BBLOCK[DSC$C_S_BLN],
+	STATUS;
+
+    ! First create the communication mailbox
+    !
+    INIT_MBX();
+
+    ! Get the names of system input/output/error logicals
+    !
+    BEGIN
+    MACRO
+	LENADR_R_(X) = %IF %ISSTRING(X)
+	    %THEN %REF(%CHARCOUNT(X)), UPLIT BYTE(X)
+	    %ELSE X[DSC$W_LENGTH], .X[DSC$A_POINTER] %FI %;
+    STR$COPY_R(INPUT [BASE_], LENADR_R_(STR_INPUT ));
+    STR$COPY_R(OUTPUT[BASE_], LENADR_R_(STR_OUTPUT));
+    STR$COPY_R(ERROR [BASE_], LENADR_R_(STR_ERROR ));
+    GET_SYS_LOG(INPUT [BASE_]);
+    GET_SYS_LOG(OUTPUT[BASE_]);
+    GET_SYS_LOG(ERROR [BASE_]);
+    END;
+
+    ! Kickoff subprocess
+    !
+    INCR I FROM 1 TO 255 DO
+	BEGIN
+	LOCAL PID, BASPRI, FLAGS;
+	LOCAL PRCJPI: $BBLOCK[8] INITIAL(%ALLOCATION(BUFFER), BUFFER[BASE_]);
+	LOCAL ITMLST: VECTOR[3+3+1] INITIAL(
+	    WORD(%ALLOCATION(BUFFER), JPI$_USERNAME), BUFFER[BASE_], PRCJPI[DSC$W_LENGTH],
+	    WORD(%ALLOCATION(BASPRI), JPI$_PRIB), BASPRI, 0,
+	    0);
+	LOCAL P;
+	STATUS = $GETJPIW(
+		EFN = 0,
+		ITMLST = ITMLST[0]);
+	P = CH$FIND_CH(.PRCJPI[DSC$W_LENGTH], .PRCJPI[DSC$A_POINTER], %C' ');
+	IF CH$FAIL(.P) THEN P = .PRCJPI[DSC$A_POINTER] + .PRCJPI[DSC$W_LENGTH];
+	PRCJPI[DSC$W_LENGTH] = .P - .PRCJPI[DSC$A_POINTER];
+	PRCNAM[DSC$W_LENGTH] = %ALLOCATION(BUFFER);
+	PRCNAM[DSC$B_DTYPE] = 0;
+	PRCNAM[DSC$B_CLASS] = 0;
+	PRCNAM[DSC$A_POINTER] = BUFFER[BASE_];
+	STATUS = $FAO($DESCRIPTOR('!AS_!UL'),
+		PRCNAM[DSC$W_LENGTH], PRCNAM[BASE_], PRCJPI[BASE_], .I);
+	IF NOT .STATUS THEN RETURN SIGNAL(CLI$_SHR_SYSERROR, 0, .STATUS);
+	FLAGS = CHKPNT$M_AUTO_RESTART OR CHKPNT$M_ASYNC;
+	STATUS = $CRECHK(
+	    PIDADR=	PID,
+	    IMAGE=
+!	    %IF %SWITCHES(DEBUG) %THEN
+		    $BBLOCK[.IMAGE_AP[CLI$A_IMGFILED],IFD$Q_CURPROG],
+!	    %ELSE
+!		    (LOCAL D: VECTOR[2]; D[1] =
+!		    $BBLOCK[.IMAGE_AP[CLI$A_IMGHDADR],IHX$T_IMGNAM];
+!		    D[0] = CH$RCHAR_A(D[1]); D[0]),
+!	    %FI
+	    INPUT=	INPUT [BASE_],
+	    OUTPUT=	OUTPUT[BASE_],
+	    ERROR=	ERROR [BASE_],
+	    PRCNAM=	PRCNAM[BASE_],
+	    BASPRI=	BASPRI,
+	    FLAGS=	FLAGS,
+	    MBXUNT=	MBX_UNIT);
+	IF .STATUS NEQ SS$_DUPLNAM THEN EXITLOOP;
+	END;
+    IF NOT .STATUS THEN RETURN SIGNAL(CLI$_SHR_SYSERROR, 0, .STATUS);
+    SIGNAL(CLI$_SPAWNED, 1, PRCNAM[BASE_]);
+
+
+    WHILE TRUE DO
+	BEGIN
+	LOCAL
+	    D:	VECTOR[2];
+
+	! Read a request
+	!
+	MBX_GET_(,);
+	IF .MSG[MSG_L_ID] EQL MSG$_DELPROC
+	THEN
+	    RETURN .MSG[MSG_L_STS] OR STS$M_INHIB_MSG
+	ELIF
+	    .MSG[MSG_L_ID] NEQ MSG_K_CHKCLI
+	THEN
+	    SIGNAL(CLI$_SHR_BADLOGIC);
+
+	! Field the request
+	!
+	D[0] = .MSG[MSG_L_LEN];
+	D[1] =  MSG[MSG_A_TXT];
+	CASE .MSG[MSG_L_RQST] FROM 1 TO 3 OF
+	    SET
+	    [MSG_K_GET_VALUE]:
+		BEGIN
+		MSG[MSG_L_STS] = CLI_GET_VALUE(D[0], DYN[BASE_]);
+		CH$MOVE(MSG[MSG_L_LEN] = MINU(MSG_K_TEXT, .DYN[DSC$W_LENGTH]),
+		    .DYN[DSC$A_POINTER], MSG[MSG_A_TXT]);
+		END;
+	    [MSG_K_PRESENT]:
+		BEGIN
+		MSG[MSG_L_STS] = CLI_PRESENT(D[0]);
+		MSG[MSG_L_LEN] = 0;
+		END;
+	    [MSG_K_NEXT_QUAL]: 
+		BEGIN
+		MSG[MSG_L_STS] = CLI_NEXT_QUAL(D[0]);
+		MSG[MSG_L_LEN] = 0;
+		END;
+	    [OUTRANGE]:
+		RETURN SIGNAL(CLI$_SHR_BADLOGIC);
+	    TES;
+	
+	! Send the response
+	!
+	MBX_PUT_(,);
+	END;
+	
+    RETURN SS$_NORMAL;
+    END;
+
+ROUTINE GET_SYS_LOG(
+	DSC:	REF $BBLOCK[DSC$C_D_BLN]
+	): NOVALUE =
+    BEGIN
+    LOCAL
+	STATUS;
+    STATUS = LIB$SYS_TRNLOG(DSC[BASE_], 0, DSC[BASE_]);
+    IF NOT .STATUS THEN RETURN SIGNAL(CLI$_SHR_SYSERROR, 0, .STATUS);
+    IF CH$RCHAR(.DSC[DSC$A_POINTER]) EQL %X'1B'		! Escape?
+    THEN
+	STR$COPY_R(DSC[BASE_],
+	    %REF(.DSC[DSC$W_LENGTH]-4), .DSC[DSC$A_POINTER]+4);
+    END;
+
+ROUTINE INIT_MBX:	NOVALUE =
+    BEGIN
+    MACRO
+	STR_LOG_1 = 'CHK$CLI_' %,	STR_LOG_2 = '' %,
+	STR_DEV_1 = '_MBA' %,		STR_DEV_2 = ':' %;
+    LOCAL
+	PID:	INITIAL(0);
+    LOCAL
+	ITMLST:	VECTOR[4] INITIAL(%ALLOCATION(PID), PID, 0, 0);
+    LOCAL
+	LOGBUF:	$BBLOCK[%CHARCOUNT(STR_LOG_1,STR_LOG_2)+8],
+!	DEVBUF:	$BBLOCK[%CHARCOUNT(STR_DEV_1,STR_DEV_2)+10],
+	LOGNAM:	$BBLOCK[8] INITIAL(%ALLOCATION(LOGBUF), LOGBUF[BASE_]),
+!	DEVNAM:	$BBLOCK[8] INITIAL(%ALLOCATION(DEVBUF), DEVBUF[BASE_]),
+	STATUS;
+    BIND
+	ITMLST_W = ITMLST[0]: VECTOR[,WORD];
+
+    ! Initialize the message area
+    !
+    MSG[MSG_L_ID] = MSG_K_CHKCLI;
+
+    ! Get job process information for constructing a logical name.
+    ! Get the job process id (main process)
+    ! Get the owner process id (subprocess)
+    !
+    ITMLST_W[1] = (IF NOT .CHK_SUBP THEN JPI$_PID ELSE JPI$_OWNER);
+    STATUS = $GETJPIW(
+	EFN	= 0,
+	ITMLST	= ITMLST[0]);
+    IF NOT .STATUS THEN RETURN SIGNAL(CLI$_SHR_SYSERROR, 0, .STATUS);
+
+    ! Form mailbox logical name
+    !
+    STATUS = $FAO($DESCRIPTOR(%STRING(STR_LOG_1,'!XL',STR_LOG_2)),
+	    LOGNAM[DSC$W_LENGTH], LOGNAM[BASE_], .PID);
+    IF NOT .STATUS THEN RETURN SIGNAL(CLI$_SHR_SYSERROR, 0, .STATUS);
+
+    ! Create the mailbox (main process)
+    ! Access the mailbox (subprocess)
+    !
+    STATUS = $CREMBX(
+	CHAN	= MBX_CHAN,
+	MAXMSG	= %ALLOCATION(MSG),
+	LOGNAM	= LOGNAM[BASE_]);
+    IF NOT .STATUS THEN RETURN SIGNAL(CLI$_SHR_SYSERROR, 0, .STATUS);
+
+    ! The subprocess doesn't need the unit number
+    !
+    IF .CHK_SUBP THEN RETURN SS$_NORMAL;
+
+    ! Get the unit number, needed to specify the termination mailbox.
+    !
+    ITMLST[0] = DVI$_UNIT ^ 16 + %ALLOCATION(MBX_UNIT);
+    ITMLST[1] = MBX_UNIT;
+    STATUS = $GETDVIW(
+	EFN		= 0,
+	CHAN	= .MBX_CHAN,
+	ITMLST	= ITMLST[0]);
+    IF NOT .STATUS THEN RETURN SIGNAL(CLI$_SHR_SYSERROR, 0, .STATUS);
+
+    END;
+
+END
+ELUDOM

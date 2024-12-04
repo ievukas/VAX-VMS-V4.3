@@ -1,0 +1,778 @@
+MODULE SMG$$PUT_TEXT_TO_BUFFER ( %TITLE 'Put text to display buffer'
+		IDENT = '1-012'		! File: SMGPUTTEX.B32 Edit: PLL1012
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	Screen Management
+!
+! ABSTRACT:
+!
+!	This is an internal routine used by screen management procedures to
+! 	place user's text into a display buffer.  The text is spanned for
+!	special characters.
+!
+! ENVIRONMENT:	User mode - AST reentrant
+!
+! AUTHOR: P. Levesque, CREATION DATE: 14-Apr-1983
+!
+! MODIFIED BY:
+!
+! 1-001	- Original.  PLL 14-Apr-1983
+! 1-002 - Finish coding.  PLL 20-Apr-1983
+! 1-003 - Add error message, character set buffer allocation.  PLL 4-May-1983
+! 1-004 - Fix second half of the scan table to agree with actions for
+!	  DEC Multinational.  PLL 5-May-1983
+! 1-005 - If on the last line and we have found a line feed, scroll.  PLL 11-May-1983
+! 1-006 - If a bell character is found, call SMG$RING_BELL instead of setting
+!	  a bell bit.  PLL 20-May-1983
+! 1-007 - If a LF is found, scroll according to the new dcb top & bottom of
+!	  scrolling region fields.  PLL 26-May-1983
+! 1-008 - If an ESC is detected, call the terminal simulator routine to
+!	  interpret the sequence and perform the correct SMG$ function.
+!	  PLL 7-Jul-1983
+! 1-009 - Allow 2 'reserved' positions in upper half of table to pass thru
+!	  as printable characters.  PLL 17-Aug-1983
+! 1-010 - SMG$$SIM_TERM may set the graphics bit in the DCB's default
+! 	  attributes byte.  Take this into account when copying the attribute
+!	  bytes for characters into the buffer.  PLL 29-Aug-1983
+! 1-011 - Call SMG$$SIM_TERM when DCB_V_ALLOW_ESC is set.  PLL 2-Sept-1983
+! 1-012 - In order to print carriage control characters instead of execute
+!	  them, check the DCB_V_DISPLAY_CONTROLS bit and move the ascii rep
+!	  into the text buffer in a different way.  PLL 23-Sep-1983
+!--
+
+
+%SBTTL 'Declarations'
+!
+! SWITCHES:
+!
+
+SWITCHES ADDRESSING_MODE (EXTERNAL = GENERAL, NONEXTERNAL = WORD_RELATIVE);
+
+!
+! LINKAGES:
+!
+!	NONE
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+    SMG$$PUT_TEXT_TO_BUFFER;			
+
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'RTLIN:SMGPROLOG';		! defines Psects, macros, data base
+
+!
+! MACROS:
+!
+!	NONE
+!
+! EQUATED SYMBOLS:
+!
+!	NONE
+!
+! FIELDS:
+!
+!	NONE
+!
+! PSECTS:
+!
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL ROUTINE
+    SMG$$SIM_TERM,
+    SMG$$SCROLL_AREA,
+    SMG$RING_BELL;
+
+EXTERNAL LITERAL
+    SMG$_FATERRLIB,
+    SMG$_STRTERESC;
+
+! Some constants needed by reference.
+OWN
+    ALLONES	: BYTE INITIAL (-1);
+
+! The following macro is used to move a control character into the
+! text buffer in such a way that output will later convert to the
+! appropriate device dependent graphic character.
+
+MACRO
+	$INSERT_CTRL_CHAR (CHAR) =
+	BEGIN
+	LOCAL
+	    INDEX,
+	    REMAINING_COLS;
+
+	REMAINING_COLS = .DCB [DCB_W_NO_COLS] - .DCB [DCB_W_CURSOR_ROW];
+	INDEX = $SMG$LINEAR (.DCB [DCB_W_CURSOR_ROW], .DCB [DCB_W_CURSOR_COL]);
+
+	IF 1 GTR .REMAINING_COLS
+	THEN
+	    WORK_OVERFLOW = .BYTES_REMAINING
+	ELSE
+	    BEGIN		! move the low nibble into the high nibble
+	    LOCAL
+		SHIFT_NIBBLE : BYTE,
+		WORK_ATTR;
+	    SHIFT_NIBBLE = (CHAR <0,4>) ^ 4;
+	    CH$MOVE (1, SHIFT_NIBBLE, TEXT_BUF [.INDEX]);
+	    WORK_ATTR = ATTR_M_USER_GRAPHIC OR .ATTR_CODE;
+	    CH$MOVE (1, WORK_ATTR, ATTR_BUF [.INDEX]);
+	    END;
+
+	DCB [DCB_W_CURSOR_COL] = .DCB [DCB_W_CURSOR_COL] + 1;
+	IF .DCB [DCB_W_CURSOR_COL] EQL .DCB [DCB_W_NO_COLS]
+	THEN
+	    DCB [DCB_W_CURSOR_COL] = .DCB [DCB_W_NO_COLS];
+	END%;
+
+!<BLF/PAGE>
+
+!+
+! The table below (CHAR_TABLE) is used with a SCANC instruction to
+! detect characters that have an impact on how text needs to be
+! positioned in a text buffer that models what is on a portion of the
+! screen.  Each character position is occupied by a code indicating
+! the kind of action that this character has on text placement.
+! Characters are grouped into 10 categories based on their impact on
+! the terminal and hence on their impact on what should be placed in
+! the buffer at what position.
+!
+! These categories (codes) are:
+!
+!	Action Code	Action
+!	-----------	------
+!	     0		Normal processing.  Character occupies next
+!			available slot in buffer.  Cursor column is
+!			advanced by 1 after placement.
+!
+!	     1		Character can be discarded.  Cursor is not
+!			advanced.
+!
+!	     2		Character can be discarded.  Cursor is not
+!			modified, but a note must be made that the
+!			bell needs to be sounded.  
+!
+!	     3		Character can be discarded, but cursor must be
+!			backed up one column.  Be careful about cursor
+!			already being in column 1.
+!
+!	     4		Character can be discarded, but cursor must be
+!			advanced to next TAB stop and intervening
+!			character positions in the buffer are
+!			undisturbed.
+!
+!			TAB stops are assumed to be set in the following
+!			columns with column numbering starting at 1:
+!			9, 17, 25, 33, 41, 49, 57, 65, 73 ( width=80)
+!
+!			9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, 
+!			105, 113, 121, 129 ( width=132)
+!
+!	     5		Character can be discarded.  Cursor must be
+!			advanced by one line. 
+!
+!	     6		Character can be discarded.  Cursor must be
+!			advanced by one line.  (VT treated the same
+!			as #5, FF.)
+!
+!	     7		Character can be discarded.  Effect is
+!			to clear the buffer and reset the cursor to
+!			line 1 column 1.
+!
+!	     8		Character can be discarded.  Effect is to set
+!			cursor to column 1 of current line.
+!
+!	     9		Character can be discarded.  For this version,
+!			ESC terminates the string.  Eventually, subsequent
+!			characters need to be inspected to see if they
+!			constitute a recognized escape sequence whose
+!			effect must be simulated-- E.g., cursor setting,
+!			rendition setting.
+!
+!			Some problems with this are:
+!			    1. What to do about sequences that we don't
+!			       recognize ?
+!			    2. What to do about sequences that we
+!			       recognize as ones that can cause
+!			       confusion later is allowed to be
+!			       sent to terminal -- E.g. select graphics
+!			       rendition, etc ?
+!
+!	    10		Character can be discarded.  Character is
+!			treated as a no-op.  It is broken out separately
+!			in case we ever need to do something special
+!			with it.
+!
+! In summary:
+!
+!   Hex	Character Codes	  ASCII Character		Action Code
+!   -------------------	  ---------------		-----------
+!	00 to 06	  NUL to ACK			    1
+!	   07		  BEL				    2
+!	   08		  BS				    3
+!	   09		  HT				    4
+!	   0A		  LF				    5
+!	   0B		  VT				    6
+!	   0C		  FF				    7
+!	   0D		  CR				    8
+!	0E to 0F	  SO to SI			    9
+!	10 to 1A	  DLE to SUB			    1
+!	   1B		  ESC				    9
+!	1C to 1F	  FS to US			    1
+!	20 to 7E	  SP to ~			    0
+!	   7F		  DEL			           10
+!
+!	80 to 9F	  control chars			    1
+!	   A0		  reserved			    1
+!	A1 to FE	  printing chars		    0
+!	   FF		  reserved			    1
+!
+
+GLOBAL
+    CHAR_TABLE : VECTOR [256, BYTE] INITIAL ( BYTE (
+				! 1st half is US ASCII
+				! for DEC Multinational set (default)
+	1, 1, 1, 1, 1, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9,	! 00 to 0F
+	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 9, 1, 1, 1, 1,	! 10 to 1F
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	! 20 to 2F
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	! 30 to 3F
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	! 40 to 4F
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	! 50 to 5F
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	! 60 to 6F
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,10, ! 70 to 7F
+				! 2nd half is DEC Supplemental Graphics
+				! for DEC Multinational set (default)
+	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,	! 80 to 8F
+	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,	! 90 to 9F
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	! A0 to AF
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	! B0 to BF
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	! C0 to CF
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	! D0 to DF
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	! E0 to EF
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 	! F0 to FF
+					    ));
+
+
+
+
+!<BLF/PAGE>
+
+%SBTTL 'SMG$$PUT_TEXT_TO_BUFFER - Put text to buffer'
+GLOBAL ROUTINE SMG$$PUT_TEXT_TO_BUFFER (
+				DCB : REF BLOCK [,BYTE],
+				ATTR_CODE : BYTE,
+				TEXT_LEN,
+				TEXT_ADDR,
+				CHAR_SET,
+				OVERFLOW
+				      ) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This procedure places a text string into a buffer given the
+!	current row and column in the buffer where output is to go.
+!	The input text string is scanned for special characters that
+!	prohibit simply moving the text into the buffer.  For example,
+!	TABs reposition the maintained cursor position and the text 
+!	must be deposited at the appropriate tab boundaries as a 
+!	function of current position in the line.  Escape sequences
+!	are not handled; an escape character is treated as a terminator,
+!	and a qualified success status will be returned to indicate
+!	that truncation occurred.
+!
+!	Positions in BUFFER that are modified have the corresponding
+!	positions in ATTR_BUFFER and CHAR_BUFFER set.
+!
+!
+!
+! CALLING SEQUENCE:
+!
+!	ret_status.wlc.v = SMG$$PUT_TEXT_TO_BUFFER ( 
+!				DCB.mab.r,
+!				ATTR_CODE.rb.v,
+!				TEXT_LEN.rl.v,
+!				TEXT_ADDR.rl.v,
+!				CHAR_SET.rl.v
+!				[,OVERFLOW.wl.r])
+!
+! FORMAL PARAMETERS:
+!
+!	DCB.mab.r	Address of virtual display control block.
+!			Various fields from within in this block are
+!			are interrogated and/or updated.
+!
+!	ATTR_CODE.rb.v	Video rendition attribute code.
+!			Bit 0	Bold
+!			Bit 1	Reverse video
+!			Bit 2	Blinking
+!			Bit 3	Underscored
+!
+!	TEXT_LEN.rl.v	Length of text string
+!
+!	TEXT_ADDR.rl.v	Address of text string
+!
+!	CHAR_SET.rl.v   Character set to use.
+!				SMG$C_UNITED_KINGDOM
+!				SMG$C_ASCII
+!				SMG$C_SPEC_GRAPHICS
+!				SMG$C_ALT_CHAR
+!				SMG$C_ALT_GRAPHICS
+!
+!	OVERFLOW.wl.r	Optional.  Address of longword in which
+!			to return the number of characters that
+!			did not fit on the line.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS:
+!
+!	SS$_NORMAL	Normal successful completion
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+
+    BEGIN
+
+    BUILTIN
+	SCANC,
+	NULLPARAMETER;
+
+    LOCAL
+	TEXT_BUF : REF VECTOR [,BYTE],	! Addr of text buffer
+	ATTR_BUF : REF VECTOR [,BYTE],	! Addr of attr buffer
+	CHAR_BUF : REF VECTOR [,BYTE],	! Addr of char set buffer
+	STATUS,		! status of subroutine calls
+	WORK_OVERFLOW : INITIAL (0),	! no. of overflow chars
+	BYTES_REMAINING,! No. of bytes in input string yet to be 
+			! processed.
+	IN_POINTER;	! Current pointer into input string
+
+    LITERAL
+	K_OVERFLOW_ARG = 6;
+
+    TEXT_BUF = .DCB [DCB_A_TEXT_BUF];
+    ATTR_BUF = .DCB [DCB_A_ATTR_BUF];
+    CHAR_BUF = .DCB [DCB_A_CHAR_SET_BUF];
+
+    BYTES_REMAINING = .TEXT_LEN;
+    IN_POINTER = .TEXT_ADDR;
+
+    WHILE .BYTES_REMAINING NEQ 0
+    DO
+	BEGIN	! Overall loop
+	LOCAL
+	    CHARS_TO_MOVE,	  ! No. of characters to move on this
+				  ! iteration
+	    PLACE_TO_MOVE,	  ! Place to move from on this iteration
+	    NEW_BYTES_REMAINING,  ! No. of bytes remaining as returned 
+				  ! by SCANC
+	    ADDR_DIFF;		  ! Addr of char in input stream whose 
+				  ! index into scanc table yields 
+				  ! non-zero code.
+	!+
+	! See if any of the remaining input characters require special
+	! treatment.
+	!-
+	SCANC ( BYTES_REMAINING,	! No. of bytes remaining
+		.IN_POINTER,		! Current pointer to source
+		CHAR_TABLE,		! Address of SCANC table
+		ALLONES;		! Mask for ANDing
+		NEW_BYTES_REMAINING,	! New remaining no. of bytes
+					! including the byte which
+					! caused the instruction to
+					! halt.  Is zero only if all
+					! bytes did not satify search.
+		ADDR_DIFF);		! Addr of char in input stream
+					! whose index into scanc table
+					! yields non-zero code.
+
+	CHARS_TO_MOVE = .BYTES_REMAINING - .NEW_BYTES_REMAINING;
+	PLACE_TO_MOVE = .IN_POINTER;
+	IN_POINTER = .IN_POINTER + .CHARS_TO_MOVE;
+	BYTES_REMAINING = .NEW_BYTES_REMAINING;
+
+	!+
+	! Copy the appropriate number of characters into the text buffer
+	! and the appropriate number of copies of the attribute code 
+	! into the attribute buffer.
+	!-
+	IF .CHARS_TO_MOVE NEQ 0
+	THEN
+	    BEGIN
+	    LOCAL
+		INDEX,	! 0-based index into BUFFER and ATTR_BUFFER.
+		REMAINING_COLS;
+
+	    INDEX = $SMG$LINEAR ( .DCB [DCB_W_CURSOR_ROW], .DCB [DCB_W_CURSOR_COL]);
+
+	    REMAINING_COLS = .DCB [DCB_W_NO_COLS] - .DCB [DCB_W_CURSOR_COL] + 1;
+	    IF .CHARS_TO_MOVE GTR .REMAINING_COLS
+	    THEN				! chars will overflow line
+		BEGIN
+		WORK_OVERFLOW = .BYTES_REMAINING + 
+				(.CHARS_TO_MOVE - .REMAINING_COLS);
+		CHARS_TO_MOVE = .REMAINING_COLS;
+		END;
+
+	    !+
+	    ! Move text into buffer.
+	    !-
+	    CH$MOVE (.CHARS_TO_MOVE,		! No. of chars
+		     .PLACE_TO_MOVE,		! From
+		     TEXT_BUF [ .INDEX ] );	! To
+
+	    !+
+	    ! Rewrite attribute bytes.  Normally the attributes are
+	    ! passed to us, but for the 'autobended' case where escape
+	    ! sequences are used, we should look at the default attributes
+	    ! which may have been altered by SMG$$SIM_TERM.
+	    !-
+	    BEGIN
+	    LOCAL
+		WORK_ATTR;
+	    WORK_ATTR = .ATTR_CODE;
+	    IF .DCB [DCB_V_ALLOW_ESC]
+	    THEN
+		WORK_ATTR = .DCB [DCB_B_DEF_VIDEO_ATTR];
+	    CH$FILL (.WORK_ATTR,		! Char. to replicate
+		     .CHARS_TO_MOVE,		! No. of times
+		     ATTR_BUF [ .INDEX ] ); 	! Destination
+	    END;
+
+	    !+
+	    ! Write the character set bytes, if necessary.
+	    !-
+	    IF .CHAR_BUF EQL 0 AND
+	       .CHAR_SET NEQ SMG$C_ASCII
+	    THEN
+		0;	! first char set - alloc buffer
+
+	    IF .CHAR_BUF NEQ 0
+	    THEN
+		CH$FILL (.CHAR_SET,
+			 .CHARS_TO_MOVE,
+			 CHAR_BUF [.INDEX]);
+
+	    !+
+	    ! Adjust resulting cursor position.  Check for overflow.
+	    !-
+	    DCB [DCB_W_CURSOR_COL] = .DCB [DCB_W_CURSOR_COL] + 
+				     .CHARS_TO_MOVE;
+	    IF .DCB [DCB_W_CURSOR_COL] GTR .DCB [DCB_W_NO_COLS]
+	    THEN
+	 	DCB [DCB_W_CURSOR_COL] = .DCB [DCB_W_NO_COLS];
+
+	    IF .WORK_OVERFLOW NEQ 0
+	    THEN
+		EXITLOOP;   						    
+	    END;
+
+
+	IF .NEW_BYTES_REMAINING EQL 0
+	THEN
+	    EXITLOOP;		! Break out of loop -- we're done
+
+	!+
+	! Dispatch on the non-zero code located to see what special
+	! action is needed.
+	!-
+	CASE .CHAR_TABLE [.(.ADDR_DIFF) <0,8>] FROM 1 TO 10 OF
+	SET
+	    [1]:
+	    !+
+	    !   Hex Character Codes	  ASCII Character
+	    !  	-------------------	  ---------------
+	    !	00 to 06	  	   NUL to ACK
+	    !	10 to 1A	  	   DLE to SUB
+	    !	1C to 1F	  	   FS to US
+	    !
+	    ! Character can be discarded.  Cursor is not advanced.
+	    !
+	    ! Special case if the user_graphic bit is set.  That indicates
+	    ! a device-independent code which should be placed in the buffer
+	    ! for later interpretation by output.  Notice that we are guaranteed
+	    ! that TEXT_ADDR contains only 1 character since only we call this
+	    ! routine.
+	    !-
+	    IF (.ATTR_CODE AND ATTR_M_USER_GRAPHIC) NEQ 0
+	    THEN
+		$INSERT_CTRL_CHAR (.TEXT_ADDR);
+
+	    [2]:
+	    !+
+	    !   Hex Character Codes	  ASCII Character
+	    !  	-------------------	  ---------------
+	    !	   07		  	    BEL
+	    !
+	    ! Character can be discarded.  Cursor is not modified, and we
+	    ! call a routine to ring the bell now.  (Note that if we had 
+	    ! stored the bell in the attribute buffer, the bell would've
+	    ! been rung every time the screen was repainted.)
+	    !-
+	    SMG$RING_BELL (.DCB [DCB_L_DID]);
+
+	    [3]:
+	    !+
+	    !   Hex Character Codes	  ASCII Character
+	    !  	-------------------	  ---------------
+	    !	   08		  	    BS
+	    !
+	    ! Character can be discarded, but cursor must be backed up 
+	    ! one column.  Be careful about cursor already being in 
+	    ! column 1.
+	    !-
+	    BEGIN
+	    IF .DCB [DCB_W_CURSOR_COL] NEQ 1
+	    THEN
+		DCB [DCB_W_CURSOR_COL] = .DCB [DCB_W_CURSOR_COL] -1;
+
+	    END;
+
+	    [4]:
+	    !+
+	    !   Hex Character Codes	  ASCII Character
+	    !  	-------------------	  ---------------
+	    !	   09		  	    HT
+	    !
+	    ! Character can be discarded, but cursor must be advanced to
+	    ! next TAB stop and intervening character positions in the 
+	    ! buffer must be left undisturbed.
+	    !
+	    ! TAB stops are assumed to be set in the following columns:
+	    ! 9, 17, 25, 33, 41, 49, 57, 65, 73 ( width=80)
+	    !
+	    ! 9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, 105, 113, 
+	    ! 121, 129 ( width=132)
+	    !-
+	    BEGIN
+	    !+
+	    ! Be careful about tabbing off the end of the line or beyond 
+	    ! the end of the virtual display line.
+	    !-
+	    IF NOT .DCB [DCB_V_DISPLAY_CONTROLS]
+	    THEN
+		BEGIN
+	    	DCB [DCB_W_CURSOR_COL] = 
+				((.DCB [DCB_W_CURSOR_COL]-1)/8+1)*8+1;
+	    	IF .DCB [DCB_W_CURSOR_COL] GTR .DCB [DCB_W_NO_COLS]
+	    	THEN
+		    DCB [DCB_W_CURSOR_COL] = .DCB [DCB_W_NO_COLS];
+		END
+	    ELSE
+		$INSERT_CTRL_CHAR (TAB);
+	    END;
+
+	    [5,6]:
+	    !+
+	    !   Hex Character Codes	  ASCII Character
+	    !  	-------------------	  ---------------
+	    !	   0A		  	    LF
+	    !	   0B		  	    VT
+	    !
+	    ! Character can be discarded.  Cursor must be advanced by 
+	    ! one line.  Don't advance beyond last line of display.
+	    !-
+	    BEGIN
+	    !+
+	    ! If cursor not at bottom, advance DCB [DCB_W_CURSOR_ROW]
+	    ! by one.
+	    !-
+	    IF NOT .DCB [DCB_V_DISPLAY_CONTROLS]
+	    THEN
+		BEGIN
+	    	IF .DCB [DCB_W_CURSOR_ROW] + 1 LEQ .DCB [DCB_W_BOTTOM_OF_SCRREG]
+	    	THEN
+		    DCB [DCB_W_CURSOR_ROW] = .DCB [DCB_W_CURSOR_ROW] + 1
+	    	ELSE
+		    SMG$$SCROLL_AREA (.DCB,
+				  .DCB [DCB_W_TOP_OF_SCRREG],
+				  .DCB [DCB_W_COL_START],
+				  (.DCB [DCB_W_BOTTOM_OF_SCRREG] -
+				   .DCB [DCB_W_TOP_OF_SCRREG] + 1),
+				  .DCB [DCB_W_NO_COLS],
+				  SMG$M_UP,
+				  1);
+		END
+	    ELSE
+		BEGIN
+		LOCAL
+		    CHAR;
+		CHAR = .(.ADDR_DIFF)<0,8>;
+		$INSERT_CTRL_CHAR (.CHAR);
+		END;
+	    END;
+
+	    [7]:
+	    !+
+	    !   Hex Character Codes	  ASCII Character
+	    !  	-------------------	  ---------------
+	    !	   0C		  	    FF
+	    !
+	    ! Character can be discarded.  Effect is to clear the buffer
+	    ! and reset the cursor to line 1 column 1.
+	    !-
+	    BEGIN
+	    IF NOT .DCB [DCB_V_DISPLAY_CONTROLS]
+	    THEN
+		BEGIN
+	    	IF .DCB [DCB_W_CURSOR_ROW] + 1 LEQ .DCB [DCB_W_BOTTOM_OF_SCRREG]
+	    	THEN
+		    DCB [DCB_W_CURSOR_ROW] = .DCB [DCB_W_CURSOR_ROW] + 1
+	    	ELSE
+		    SMG$$SCROLL_AREA (.DCB,
+				  .DCB [DCB_W_TOP_OF_SCRREG],
+				  .DCB [DCB_W_COL_START],
+				  (.DCB [DCB_W_BOTTOM_OF_SCRREG] -
+				   .DCB [DCB_W_TOP_OF_SCRREG] + 1),
+				  .DCB [DCB_W_NO_COLS],
+				  SMG$M_UP,
+				  1);
+	    	END
+	    ELSE
+		$INSERT_CTRL_CHAR (FF);
+	    END;
+
+	    [8]:
+	    !+
+	    !   Hex Character Codes	  ASCII Character
+	    !  	-------------------	  ---------------
+	    !	   0D		  	   CR
+	    !
+	    ! Character can be discarded.  Effect is to set cursor to 
+	    ! column 1 of current line.
+	    !-
+	    BEGIN
+	    IF NOT .DCB [DCB_V_DISPLAY_CONTROLS]
+	    THEN
+	        DCB [DCB_W_CURSOR_COL] = 1
+	    ELSE
+		$INSERT_CTRL_CHAR (CR);
+	    END;
+
+	    [9]:
+	    !+
+	    !   Hex Character Codes	  ASCII Character
+	    !  	-------------------	  ---------------
+	    !	   1B		  	   ESC
+	    !      0E			   SO
+	    !      0F			   SI
+	    !
+	    ! Character can be discarded.  Subsequent characters need 
+	    ! to be inspected to see if they constitute a recognized 
+	    ! escape sequence whose effect must be simulated-- E.g., 
+	    ! cursor setting, rendition setting.
+	    !
+	    ! SMG$$SIM_TERM processes the escape sequence, then returns
+	    ! here to allow any remaining characters to be processed.
+	    !-
+	    BEGIN
+	    IF NOT .DCB [DCB_V_ALLOW_ESC] 
+	    THEN
+		RETURN (SMG$_STRTERESC) ! error from true SMG$
+	    ELSE
+		BEGIN			! autobended - attempt to interpret
+	    	LOCAL
+		    LEN_OF_SEQUENCE,
+		    STATUS;
+	    	STATUS = SMG$$SIM_TERM (.DCB,
+				        .BYTES_REMAINING,
+				        .IN_POINTER,  ! pass ptr to esc char
+				        LEN_OF_SEQUENCE);
+	    	IF NOT .STATUS THEN RETURN (.STATUS);
+
+	    	!+
+	    	! Update the number of bytes processed.  Since there is
+	    	! an automatic update (by 1 character) at the end of this
+	    	! loop, don't count the ESC now.
+	    	!-
+	    	BYTES_REMAINING = .BYTES_REMAINING - .LEN_OF_SEQUENCE + 1;
+	    	IN_POINTER = .IN_POINTER + .LEN_OF_SEQUENCE - 1;
+	    	END;			! autobended - attempt to interpret
+
+	    END;
+
+	    [10]:
+	    !+
+	    !   Hex Character Codes	  ASCII Character
+	    !  	-------------------	  ---------------
+	    !	   7F		  	    DEL
+	    !
+	    ! Character can be discarded.
+	    !-
+	    ; 	! no special action
+
+	    [INRANGE, OUTRANGE]:
+	    !+
+	    ! Should never get here -- there are no other codes in
+	    ! CHAR_TABLE.  If we do, we've got a problem.
+	    !-
+	    BEGIN
+	    RETURN SMG$_FATERRLIB;
+	    END;
+	TES;
+
+
+	!+
+	! Re-adjust pointer and count of bytes left to account for
+	! the special character(s) just processed.
+	!-
+	IN_POINTER = .IN_POINTER + 1;
+	BYTES_REMAINING = .BYTES_REMAINING -1;
+	END;	! Overall loop
+
+    IF .DCB [DCB_W_CURSOR_COL] EQL .DCB [DCB_W_NO_COLS]
+    THEN
+	DCB [DCB_V_COL_80] = 1;
+
+    IF NOT NULLPARAMETER (K_OVERFLOW_ARG)
+    THEN
+	.OVERFLOW = .WORK_OVERFLOW;
+				! ret overflow chars if requested
+    RETURN (SS$_NORMAL);
+    END;			! End of routine SMG$$PUT_TEXT_TO_BUFFER
+!<BLF/PAGE>
+
+END			! End of module SMG$$PUT_TEXT_TO_BUFFER
+
+ELUDOM

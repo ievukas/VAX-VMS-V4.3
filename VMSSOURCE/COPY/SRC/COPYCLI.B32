@@ -1,0 +1,933 @@
+MODULE copycli (   ! Declarations of CLI data structures for the COPY command
+                    LANGUAGE (BLISS32),
+                    IDENT = 'V04-000'
+                    ) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:	COPY
+!
+! ABSTRACT:
+!
+!	This module contains all the routines for processing the COPY command
+!	qualifiers.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system, unprivileged user mode utility,
+!	operates at non-AST level.
+!
+!--
+!++
+!
+! AUTHOR:	Carol Peters,	CREATION DATE:	28 April 1978 07:36
+!
+! REVISION HISTORY:
+!
+!	V3-003	TSK0003		Tamar Krichevsky	 9-FEB-1984
+!		Change addressing mode for LIB$CVT_DTB and LIB$LOOKUP_KEY
+!		to general.
+!
+!	V3-002	TSK0002		Tamar Krichevsky	10-Aug-1983
+!		Fix default for /PROTECTION qualifier so that if fields which
+!		have not been specified are left alone.
+!
+!	V3-001	TSK0001		Tamar Krichevsky	18-Jan-1983
+!		Rework whole module.  Change Command Language Interface over
+!		to new CLI.  Create two global routines: COPY$GET_GLOBAL_QUAL
+!		and COPY$GET_LOCAL_QUAL.  These routines simulate parts of the 
+!		CLI so that COPY/QUAL a,b/NOQUAL,c * and COPY a,b/NOQUAL,c */QUAL
+!		behave the same.  
+!
+!		Add the common qualifiers (/BEFORE, /SINCE, /CREATED, /MODIFIED
+!		/BACKUP, /EXPIRED, /EXCLUDE, /BY_OWNER AND /CONFIRM).
+!
+!	003	TMH0003		T. Halvorsen	17-Nov-1979
+!		Add cleanup2_desc for output parameter cleanup call.
+!
+!	002	TMH0002		T. Halvorsen	25-Jul-1979
+!		Add relative volume placement control
+!--
+
+!
+! Table of contents
+!
+
+FORWARD ROUTINE
+    copy$get_global_qual: NOVALUE,			! Get global command qualifiers
+    copy$get_local_qual	: NOVALUE,			! Get local command qualifiers
+    protection_parse	: NOVALUE,			! Parse routine for /PROTECTION qualifier
+    parse_protection_value : NOVALUE;			! Parse the /PROTECTION keyword values (RWED)
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:STARLET.L32';			! Common system definitions
+REQUIRE 'SRC$:COPYMSG.REQ';				! Put message macros
+
+!
+! Literals
+!
+
+BIND
+
+    ! Descriptors for the qualifier names, used while parsing the command line.
+    !
+    verb_desc		= $DESCRIPTOR('$VERB'),
+    log_msg_desc	= $DESCRIPTOR('LOG'),
+    concatenate_desc	= $DESCRIPTOR('CONCATENATE'),
+    new_version_desc	= $DESCRIPTOR('NEW_VERSION'),
+    allocation_desc	= $DESCRIPTOR('ALLOCATION'),
+    contiguous_desc	= $DESCRIPTOR('CONTIGUOUS'),
+    extension_desc	= $DESCRIPTOR('EXTENSION'),
+    file_max_desc	= $DESCRIPTOR('FILE_MAXIMUM'),
+    protection_desc	= $DESCRIPTOR('PROTECTION'),
+    read_check_desc	= $DESCRIPTOR('READ_CHECK'),
+    write_check_desc	= $DESCRIPTOR('WRITE_CHECK'),
+    overlay_desc	= $DESCRIPTOR('OVERLAY'),
+    volume_desc		= $DESCRIPTOR('VOLUME'),
+    truncate_desc	= $DESCRIPTOR('TRUNCATE'),
+    replace_desc	= $DESCRIPTOR('REPLACE')
+    ;
+
+!
+! Macros
+!
+
+MACRO
+
+    ! These macros are all used in processing the /PROTECTION qualifier.
+    !
+    BIT_LOCATION( L, B, S, X) =			! Extract a bit from a field definition
+        	B %,
+    PROT_MASK(DISP,SIZE) =			! XAB$W_PRO bit and mask definitions macros
+    		MASK_DEF(XAB$W_PRO,DISP,SIZE) %,
+    MASK_DEF(L,B,S,X,DISP,SIZE) =
+    		0, B+DISP, SIZE, X %;
+
+!
+! External declarations
+!
+
+EXTERNAL
+    copy$prot_value,					! Protection keyword value table
+    copy$cli_status	: $BBLOCK,			! Results of the command line parse
+    copy$sem_status	: $BBLOCK			! Semantics for copy operation
+    ;
+
+REQUIRE
+    'SRC$:COPY.REQ';					! Field definitions for COPY$CLI_STATUS and COPY$SEM_STATUS
+
+
+EXTERNAL ROUTINE
+    cli$present,					! Determine if a qualifier appears on the command line
+    cli$get_value,					! Retrieve the qualifier's value
+    lib$qual_file_parse,				! Parse the common file qualifiers
+    lib$cvt_dtb : ADDRESSING_MODE(GENERAL),		! Convert String to binary
+    lib$lookup_key: ADDRESSING_MODE(GENERAL);		! Library keyword lookup routine
+
+!
+! Global variables
+!
+
+GLOBAL
+
+!
+! The following variables hold the current qualifier and option values gathered during the 
+! CLI processing.  These values may change as local qualifiers are parsed.  The global 
+! values are stored in COPY$CLI_STATUS.
+!
+
+    common_qual_context,				! Common qualifier data area
+    curr_allocation_value,				! Binary allocation value
+    curr_extension_value,				! Binary extension value
+    curr_file_max_value,				! Binary file maximum value
+    curr_protection_or	: 			        ! Protection mask to set bits
+    	$BBLOCK[ 2 ] 
+    	INITIAL (REP 2 OF BYTE (0)),
+    curr_protection_and	: 			        ! Protection mask to clear bits
+    	$BBLOCK[ 2 ] 
+    	INITIAL (REP 2 OF BYTE (-1)),
+    curr_volume_value	: INITIAL (0)			! Relative volume number
+    ;
+
+
+GLOBAL ROUTINE COPY$GET_GLOBAL_QUAL:  NOVALUE =		! Retrieve gloabl qualifiers from the CLI
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine retrieves the command level qualifiers from the
+!	Command Language Interpreter.  It treats any qualifiers found 
+!	as global, even if they are only locally present.  This ensures
+!	that qualifiers which appear on the output file have the same
+!	effect as ones which appear on the verb.  
+!	
+!
+! FORMAL PARAMETERS:
+!
+!	None
+!
+! IMPLICIT INPUTS:
+!
+!	None
+!
+! IMPLICIT OUTPUTS:
+!
+!	COPY$CLI_STATUS - Relevant command and qualifier indicators set
+!
+! ROUTINE VALUE:
+!
+!	None
+!
+! SIDE EFFECTS:
+!
+!	None
+!
+!--
+
+    BEGIN
+
+    LOCAL
+    	common_qual_flags,				! Bits which select the common qualifiers to be parsed
+    	rtn_status,					! Status returned from external calls
+    	cli_desc :  $BBLOCK[ dsc$c_s_bln ]		! Dynamic string descriptor, points to values 
+    	;						!   returned from calls to the CLI
+
+
+
+
+    ! Initialize descriptor.
+    !
+    CH$FILL( 0, DSC$C_S_BLN, cli_desc);
+    cli_desc[ DSC$B_CLASS ] = DSC$K_CLASS_D;
+
+
+    ! Retrieve the verb from the command line.  Determine if it is a COPY or APPEND command.
+    !
+    CLI$GET_VALUE( verb_desc, cli_desc);
+    IF CH$RCHAR( .cli_desc[ DSC$A_POINTER ]) EQL 'A'
+    THEN
+	BEGIN
+
+	! It was an APPEND command.  Set the append command flag and parse the APPEND 
+	! specific qualifiers.
+	!
+	append_command   = TRUE;
+	new_version_qual = CLI$PRESENT( new_version_desc );
+	END
+    ELSE
+	BEGIN
+
+	! It was a COPY command.  Parse the COPY specific qualifiers.
+	!
+    	! /CONCATENATE, /TRUNCATE -- Set the apropriate flags if the qualifier 
+    	! was given or negated.
+	!
+	SELECTONE CLI$PRESENT( concatenate_desc ) OF
+    	SET
+	    [ CLI$_PRESENT ] : BEGIN
+    			       concat_qual	    = TRUE;
+    			       explicit_concat_qual = TRUE;
+    			       END;
+	    [ CLI$_NEGATED ] : negated_concat_qual  = TRUE;
+	TES;
+
+	SELECTONE CLI$PRESENT( truncate_desc ) OF
+    	SET
+	    [ CLI$_PRESENT,
+    	      CLI$_LOCPRES ] : truncate_qual    = TRUE;
+	    [ CLI$_NEGATED ] : truncate_negated = TRUE;
+	TES;
+
+	! /OVERLAY and  /REPLACE
+	!
+	overlay_qual = CLI$PRESENT( overlay_desc );
+	replace_qual = CLI$PRESENT( replace_desc );
+
+
+	! /VOLUME
+	!
+	IF (volume_qual = CLI$PRESENT( volume_desc ))
+	THEN
+	    BEGIN
+
+	    ! Get the value and and convert it from a string into binary.
+	    !
+	    CLI$GET_VALUE( volume_desc, cli_desc );
+    	    IF NOT (rtn_status = LIB$CVT_DTB(.cli_desc[ DSC$W_LENGTH ],
+				 .cli_desc[ DSC$A_POINTER ], volume_value))
+	    THEN
+		PUT_MESSAGEX( MSG$_INVQUAVAL, 2, cli_desc, volume_desc );
+	    curr_volume_value = .volume_value;
+    	    END;
+	END;
+
+    ! Parse the qualifiers which are applicable to both commands.  First,
+    ! the common qualifiers (/CONFIRM, /BEFORE, /SINCE, /EXCLUDE, /CREATED, 
+    ! /MODIFIED, /BACKUP, /EXPIRED, /BY_OWNER)
+    !
+    ! Initialize the flags longword so that all of the common qualifiers will
+    ! be parsed.  Then, parse the qualifiers.
+    !
+    common_qual_flags = LIB$M_CQF_CONFIRM  OR  LIB$M_CQF_BEFORE  OR 
+    			LIB$M_CQF_SINCE    OR  LIB$M_CQF_CREATED OR
+    			LIB$M_CQF_MODIFIED OR  LIB$M_CQF_BACKUP  OR
+    			LIB$M_CQF_EXPIRED  OR  LIB$M_CQF_EXCLUDE OR
+    			LIB$M_CQF_BYOWNER;
+    
+    IF NOT (rtn_status = LIB$QUAL_FILE_PARSE( common_qual_flags, common_qual_context ))
+    THEN
+    	PUT_MESSAGEX( .rtn_status );
+
+
+    ! /LOG, /READ_CHECK, /WRITE_CHECK and /CONTIGUOUS
+    !
+    log_msg_qual  = CLI$PRESENT( log_msg_desc );
+
+    read_chk_qual = CLI$PRESENT( read_check_desc );	
+
+    SELECTONE CLI$PRESENT( write_check_desc ) OF
+    SET
+    	[ CLI$_PRESENT,
+    	  CLI$_LOCPRES ] : write_chk_qual    = TRUE;
+	[ CLI$_NEGATED ] : write_chk_negated = TRUE;
+    TES;
+    write_chk_qual = CLI$PRESENT( write_check_desc );	
+
+    SELECTONE CLI$PRESENT( contiguous_desc ) OF
+    SET
+    	[ CLI$_PRESENT,
+    	  CLI$_LOCPRES ] : contig_qual    = TRUE;
+	[ CLI$_NEGATED ] : contig_negated = TRUE;
+    TES;
+
+
+    ! /ALLOCATION
+    !
+    IF (alloc_qual = CLI$PRESENT( allocation_desc ))
+    THEN
+	BEGIN
+
+	! Get the value and and convert it from a string into binary.
+	!
+	CLI$GET_VALUE( allocation_desc, cli_desc );
+	IF NOT (rtn_status = LIB$CVT_DTB(.cli_desc[ DSC$W_LENGTH ],
+			    .cli_desc[ DSC$A_POINTER ], allocation_value))
+	THEN
+	    PUT_MESSAGEX( MSG$_INVQUAVAL, 2, cli_desc, allocation_desc );
+	curr_allocation_value = .allocation_value;
+	END;
+    
+    
+    ! /EXTENSION
+    !
+    IF (extend_qual = CLI$PRESENT( extension_desc ))
+    THEN
+	BEGIN
+
+	! Get the value and and convert it from a string into binary.
+	!
+	CLI$GET_VALUE( extension_desc, cli_desc );
+	IF NOT (rtn_status = LIB$CVT_DTB(.cli_desc[ DSC$W_LENGTH ],
+			    .cli_desc[ DSC$A_POINTER ], extension_value))
+	THEN
+	    PUT_MESSAGEX( MSG$_INVQUAVAL, 2, cli_desc, extension_desc );
+	curr_extension_value = .extension_value;
+	END;
+
+    
+    ! /FILE_MAXIMUM
+    !
+    IF (file_max_qual = CLI$PRESENT( file_max_desc ))
+    THEN
+	BEGIN
+
+	! Get the value and and convert it from a string into binary.
+	!
+	CLI$GET_VALUE( file_max_desc, cli_desc );
+	IF NOT (rtn_status = LIB$CVT_DTB(.cli_desc[ DSC$W_LENGTH ],
+			    .cli_desc[ DSC$A_POINTER ], file_max_value))
+	THEN
+	    PUT_MESSAGEX( MSG$_INVQUAVAL, 2, cli_desc, file_max_desc );
+	curr_file_max_value = .file_max_value;
+	END;
+
+    
+    ! /PROTECTION
+    !
+    IF (protect_qual = CLI$PRESENT( protection_desc ))
+    THEN
+	BEGIN
+
+    	! Parse the keyword value and save the results.
+	!
+    	protection_parse();
+    	protection_and = .(curr_protection_and);
+    	protection_or  = .(curr_protection_or);
+	END;
+    END;					! routine COPY$GET_GLOBAL_QUAL
+
+GLOBAL ROUTINE COPY$GET_LOCAL_QUAL:  NOVALUE =		! Retrieve local qualifiers from the CLI
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine retrieves the local command qualifiers from the command
+!	line.
+!
+! FORMAL PARAMETERS:
+!
+!	None
+!
+! IMPLICIT INPUTS:
+!
+!	None
+!
+! IMPLICIT OUTPUTS:
+!
+!	COPY$CLI_STATUS - Relevant command and qualifier indicators set
+!
+! ROUTINE VALUE:
+!
+!	None
+!
+! SIDE EFFECTS:
+!
+!	None
+!
+!--
+
+    BEGIN
+
+    LOCAL
+    	rtn_status,					! Status returned from external calls
+    	cli_desc :  $BBLOCK[ dsc$c_s_bln ]		! Dynamic string descriptor, points to values 
+    	;						!   returned from calls to the CLI
+
+    BIND
+
+	MSG_DESC	= $DESCRIPTOR('can"t change quals in the middle of the command')
+    	;
+
+
+
+    
+    ! Initialize descriptor.  Also, if a new output file is being created, then 
+    ! reset the current qualifier values to the global values.  This insures 
+    ! that if a previous local qualifier changed the value and, on this 
+    ! iteration, there is no local qualifier, the value used when creating the 
+    ! output file will be the one given by the global qualifier, not the 
+    ! previous local qualifier.
+    !
+    CH$FILL( 0, DSC$C_S_BLN, cli_desc);
+    cli_desc[ DSC$B_CLASS ] = DSC$K_CLASS_D;
+
+    IF not .outfile_open
+    THEN
+	BEGIN
+    	curr_allocation_value = .allocation_value;
+	curr_extension_value  = .extension_value;
+	curr_file_max_value   = .file_max_value;
+	curr_protection_or    = .protection_or;
+	curr_protection_and   = .protection_and;
+	curr_volume_value     = .volume_value;
+	END;
+
+
+    ! Determine if this is a COPY or APPEND command.
+    !
+    IF NOT .append_command
+    THEN
+	BEGIN
+
+	! It is a COPY command.  Parse the COPY specific qualifiers.
+	!
+	! Initialize the flags for the local qualifier states.  Assume that
+	! there will be no local qualifier.  See if the qualifier is present.
+	! If is is, see if it is locally present or locally negated.  Set the
+	! appropriate flags.  The output file can not be open for the local
+	! qualifiers to be accepted.  The local qualifiers effect the attributes
+	! of the output file at creation time (i.e. allocation, location, etc.).
+	! These things cannot change once the file is open.  Therefore, if the
+	! output file is open and a local qualifier has been encountered, issue
+	! a warning, ignore the qualifier and continue processing.
+	!
+	! /OVERLAY
+	!
+	loc_overlay_qual = neg_overlay_qual = FALSE;
+	rtn_status = CLI$PRESENT( overlay_desc );	
+	SELECTONE .rtn_status OF
+	    SET
+	    [CLI$_LOCPRES] : IF NOT .outfile_open
+	    		     THEN loc_overlay_qual = TRUE
+	    		     ELSE PUT_MESSAGE( MSG$_REPLACED, 1, MSG_DESC );
+
+	    [CLI$_LOCNEG]  : IF NOT .outfile_open
+	    		     THEN neg_overlay_qual = TRUE
+	    		     ELSE PUT_MESSAGE( MSG$_REPLACED, 1, MSG_DESC );
+	    TES;
+
+
+	! /REPLACE
+	!
+	loc_replace_qual = neg_replace_qual = FALSE;
+	rtn_status = CLI$PRESENT( replace_desc );	
+	SELECTONE .rtn_status OF
+	    SET
+	    [CLI$_LOCPRES] : IF NOT .outfile_open
+	    		     THEN loc_replace_qual = TRUE
+	    		     ELSE PUT_MESSAGE( MSG$_REPLACED, 1, MSG_DESC );
+
+	    [CLI$_LOCNEG]  : IF NOT .outfile_open
+	    		     THEN neg_replace_qual = TRUE
+	    		     ELSE PUT_MESSAGE( MSG$_REPLACED, 1, MSG_DESC );
+	    TES;
+
+
+	! /TRUNCATE
+	!
+	loc_truncate_qual = neg_truncate_qual = FALSE;
+	rtn_status = CLI$PRESENT( truncate_desc );	
+	SELECTONE .rtn_status OF
+	    SET
+	    [CLI$_LOCPRES] : IF NOT .outfile_open
+	    		     THEN loc_truncate_qual = TRUE
+	    		     ELSE PUT_MESSAGE( MSG$_REPLACED, 1, MSG_DESC );
+
+	    [CLI$_LOCNEG]  : IF NOT .outfile_open
+	    		     THEN neg_truncate_qual = TRUE
+	    		     ELSE PUT_MESSAGE( MSG$_REPLACED, 1, MSG_DESC );
+	    TES;
+
+
+	! /VOLUME
+	!
+	loc_volume_qual = neg_volume_qual = FALSE;
+	rtn_status = CLI$PRESENT( volume_desc );	
+	SELECTONE .rtn_status OF
+	    SET
+	    [CLI$_LOCPRES] : IF NOT .outfile_open
+	    		     THEN 
+				BEGIN
+
+				! Get the value and and convert it from a string into binary.
+				!
+				CLI$GET_VALUE( volume_desc, cli_desc );
+				IF NOT (rtn_status = LIB$CVT_DTB(.cli_desc[ DSC$W_LENGTH ],
+						     .cli_desc[ DSC$A_POINTER ], curr_volume_value))
+				THEN
+				    PUT_MESSAGEX( MSG$_INVQUAVAL, 2, cli_desc, volume_desc );
+    				loc_volume_qual = TRUE;
+				END
+	    		     ELSE PUT_MESSAGE( MSG$_REPLACED, 1, MSG_DESC );
+
+	    [CLI$_LOCNEG]  : IF NOT .outfile_open
+	    		     THEN neg_volume_qual = TRUE
+	    		     ELSE PUT_MESSAGE( MSG$_REPLACED, 1, MSG_DESC );
+	    TES;
+	END;
+
+    ! Parse the qualifiers which are applicable to both commands.
+    !
+    ! /READ_CHECK, /WRITE_CHECK and /CONTIGUOUS
+    !
+    loc_read_chk_qual = neg_read_chk_qual = FALSE;
+    rtn_status = CLI$PRESENT( read_check_desc );	
+    SELECTONE .rtn_status OF
+	SET
+	[CLI$_LOCPRES] : IF NOT .outfile_open
+		         THEN loc_read_chk_qual = TRUE
+		         ELSE PUT_MESSAGE( MSG$_REPLACED, 1, MSG_DESC );
+
+	[CLI$_LOCNEG]  : IF NOT .outfile_open
+		         THEN neg_read_chk_qual = TRUE
+		         ELSE PUT_MESSAGE( MSG$_REPLACED, 1, MSG_DESC );
+	TES;
+
+
+    loc_write_chk_qual = neg_write_chk_qual = FALSE;
+    rtn_status = CLI$PRESENT( write_check_desc );	
+    SELECTONE .rtn_status OF
+	SET
+        [CLI$_LOCPRES] : IF NOT .outfile_open
+    			 THEN loc_write_chk_qual = TRUE
+		         ELSE PUT_MESSAGE( MSG$_REPLACED, 1, MSG_DESC );
+
+ 	[CLI$_LOCNEG]  : IF NOT .outfile_open
+			 THEN neg_write_chk_qual = TRUE
+		         ELSE PUT_MESSAGE( MSG$_REPLACED, 1, MSG_DESC );
+	TES;
+
+
+    loc_contig_qual = neg_contig_qual = FALSE;
+    rtn_status = CLI$PRESENT( contiguous_desc );	
+    SELECTONE .rtn_status OF
+	SET
+	[CLI$_LOCPRES] : IF NOT .outfile_open
+		         THEN loc_contig_qual = TRUE
+		         ELSE PUT_MESSAGE( MSG$_REPLACED, 1, MSG_DESC );
+
+	[CLI$_LOCNEG]  : IF NOT .outfile_open
+		         THEN neg_contig_qual = TRUE
+		         ELSE PUT_MESSAGE( MSG$_REPLACED, 1, MSG_DESC );
+	TES;
+
+
+    ! /ALLOCATION
+    !
+    loc_alloc_qual = neg_alloc_qual = FALSE;
+    rtn_status = CLI$PRESENT( allocation_desc );	
+    SELECTONE .rtn_status OF
+    	SET
+    	[CLI$_LOCPRES] : IF NOT .outfile_open
+    			 THEN 
+			    BEGIN
+
+			    ! Get the value and and convert it from a string into binary.
+			    !
+			    CLI$GET_VALUE( allocation_desc, cli_desc );
+			    IF NOT (rtn_status = LIB$CVT_DTB(.cli_desc[ DSC$W_LENGTH ],
+			    			 .cli_desc[ DSC$A_POINTER ], curr_allocation_value))
+			    THEN
+			    	PUT_MESSAGEX( MSG$_INVQUAVAL, 2, cli_desc, allocation_desc );
+    			    loc_alloc_qual = TRUE;
+			    END
+			 ELSE PUT_MESSAGE( MSG$_REPLACED, 1, MSG_DESC );
+
+	[CLI$_LOCNEG]  : IF NOT .outfile_open
+			 THEN neg_alloc_qual = TRUE
+		         ELSE PUT_MESSAGE( MSG$_REPLACED, 1, MSG_DESC );
+	TES;
+    
+    
+    ! /EXTENSION
+    !
+    loc_extend_qual = neg_extend_qual = FALSE;
+    rtn_status = CLI$PRESENT( extension_desc );	
+    SELECTONE .rtn_status OF
+    	SET
+    	[CLI$_LOCPRES] : IF NOT .outfile_open
+    			 THEN 
+			    BEGIN
+
+			    ! Get the value and and convert it from a string into binary.
+			    !
+			    CLI$GET_VALUE( extension_desc, cli_desc );
+			    IF NOT (rtn_status = LIB$CVT_DTB(.cli_desc[ DSC$W_LENGTH ],
+			    			 .cli_desc[ DSC$A_POINTER ], curr_extension_value))
+			    THEN
+			    	PUT_MESSAGEX( MSG$_INVQUAVAL, 2, cli_desc, extension_desc );
+    			    loc_extend_qual = TRUE;
+			    END
+			 ELSE PUT_MESSAGE( MSG$_REPLACED, 1, MSG_DESC );
+
+	[CLI$_LOCNEG]  : IF NOT .outfile_open
+			 THEN neg_extend_qual = TRUE
+		         ELSE PUT_MESSAGE( MSG$_REPLACED, 1, MSG_DESC );
+	TES;
+    
+    
+    ! /FILE_MAXIMUM
+    !
+    loc_file_max_qual = neg_file_max_qual = FALSE;
+    rtn_status = CLI$PRESENT( file_max_desc );	
+    SELECTONE .rtn_status OF
+    	SET
+    	[CLI$_LOCPRES] : IF NOT .outfile_open
+    			 THEN 
+			    BEGIN
+
+			    ! Get the value and and convert it from a string into binary.
+			    !
+			    CLI$GET_VALUE( file_max_desc, cli_desc );
+			    IF NOT (rtn_status = LIB$CVT_DTB(.cli_desc[ DSC$W_LENGTH ],
+			    			 .cli_desc[ DSC$A_POINTER ], curr_file_max_value))
+			    THEN
+			    	PUT_MESSAGEX( MSG$_INVQUAVAL, 2, cli_desc, file_max_desc );
+    			    loc_file_max_qual = TRUE;
+			    END
+			 ELSE PUT_MESSAGE( MSG$_REPLACED, 1, MSG_DESC );
+
+	[CLI$_LOCNEG]  : IF NOT .outfile_open
+			 THEN neg_extend_qual = TRUE
+		         ELSE PUT_MESSAGE( MSG$_REPLACED, 1, MSG_DESC );
+	TES;
+    
+    
+    ! /PROTECTION
+    !
+    loc_protect_qual = neg_protect_qual = FALSE;
+    rtn_status = CLI$PRESENT( protection_desc );	
+    SELECTONE .rtn_status OF
+    	SET
+    	[CLI$_LOCPRES] : IF NOT .outfile_open
+    			 THEN 
+			    BEGIN
+
+    			    ! Parse the keyword values and save the results.
+    			    !
+    			    protection_parse();
+    			    loc_protect_qual = TRUE;
+			    END
+			 ELSE PUT_MESSAGE( MSG$_REPLACED, 1, MSG_DESC );
+
+	[CLI$_LOCNEG]  : IF NOT .outfile_open
+			 THEN neg_protect_qual = TRUE
+		         ELSE PUT_MESSAGE( MSG$_REPLACED, 1, MSG_DESC );
+	TES;
+    
+    END;					! routine COPY$GET_GLOBAL_QUAL
+
+ROUTINE PROTECTION_PARSE : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine parses a PROTECTION qualifier value.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	CURR_PROTECTION_OR  - Protection mask storage
+!	CURR_PROTECTION_AND - Protection mask storage
+!
+! ROUTINE VALUE:
+!
+!	None
+!
+! SIDE EFFECTS:
+!
+!	None
+!
+!--
+
+    BEGIN
+
+    MAP
+	CURR_PROTECTION_OR  :  $BBLOCK[ 2 ],		! Protection mask
+	CURR_PROTECTION_AND :  $BBLOCK[ 2 ];		! Protection mask
+
+    LOCAL
+	RTN_STATUS,					! Keyword lookup completion code
+    	CLI_DESC :					! Descriptor which points to the keyword value
+	    $BBLOCK[ DSC$C_S_BLN ],
+	KEY_DISP;					! Displacement of keyword nibble in XAB$W_PRO
+
+    BIND
+    	SYSTEM_DESC = $DESCRIPTOR('SYSTEM'),
+	OWNER_DESC  = $DESCRIPTOR('OWNER'),
+	GROUP_DESC  = $DESCRIPTOR('GROUP'),
+	WORLD_DESC  = $DESCRIPTOR('WORLD');
+	
+
+
+    ! Initialize descriptor.
+    !
+    CH$FILL( 0, DSC$C_S_BLN, cli_desc);
+    cli_desc[ DSC$B_CLASS ] = DSC$K_CLASS_D;
+
+
+    ! Check for SYSTEM keyword.
+    !
+    IF CLI$PRESENT( SYSTEM_DESC )
+    THEN
+	BEGIN
+
+	! Note that this is SYSTEM access.  Initialize the the system protection
+	! fields, in case noaccess is specified.
+	!
+	KEY_DISP = BIT_LOCATION( XAB$V_SYS );
+	CURR_PROTECTION_OR[ prot_mask( .KEY_DISP, 4)]  = -1;
+	CURR_PROTECTION_AND[ prot_mask( .KEY_DISP, 4)]  = 0;
+	
+	! Retrieve the keyword value, if any, and parse it.
+	!
+	IF CLI$GET_VALUE( SYSTEM_DESC, CLI_DESC )
+	THEN
+	    PARSE_PROTECTION_VALUE( CLI_DESC, .KEY_DISP );
+
+	END;						! SYSTEM parse
+
+
+    ! Check for OWNER keyword.
+    !
+    IF CLI$PRESENT( OWNER_DESC )
+    THEN
+	BEGIN
+
+	! Note that this is OWNER access.  Initialize the the OWNER protection
+	! fields, in case noaccess is specified.
+	!
+	KEY_DISP = BIT_LOCATION( XAB$V_OWN );
+	CURR_PROTECTION_OR[ prot_mask( .KEY_DISP, 4)]  = -1;
+	CURR_PROTECTION_AND[ prot_mask( .KEY_DISP, 4)]  = 0;
+	
+	! Retrieve the keyword value, if any, and parse it.
+	!
+	IF CLI$GET_VALUE( OWNER_DESC, CLI_DESC )
+	THEN
+	    PARSE_PROTECTION_VALUE( CLI_DESC, .KEY_DISP );
+
+	END;						! OWNER parse
+
+
+    ! Check for GROUP keyword.
+    !
+    IF CLI$PRESENT( GROUP_DESC )
+    THEN
+	BEGIN
+
+	! Note that this is GROUP access.  Initialize the the GROUP protection
+	! fields, in case noaccess is specified.
+	!
+	KEY_DISP = BIT_LOCATION( XAB$V_GRP );
+	CURR_PROTECTION_OR[ prot_mask( .KEY_DISP, 4)]  = -1;
+	CURR_PROTECTION_AND[ prot_mask( .KEY_DISP, 4)]  = 0;
+	
+	! Retrieve the keyword value, if any, and parse it.
+	!
+	IF CLI$GET_VALUE( GROUP_DESC, CLI_DESC )
+	THEN
+	    PARSE_PROTECTION_VALUE( CLI_DESC, .KEY_DISP );
+
+	END;						! GROUP parse
+
+
+    ! Check for WORLD keyword.
+    !
+    IF CLI$PRESENT( WORLD_DESC )
+    THEN
+	BEGIN
+
+	! Note that this is WORLD access.  Initialize the the WORLD protection
+	! fields, in case noaccess is specified.
+	!
+	KEY_DISP = BIT_LOCATION( XAB$V_WLD );
+	CURR_PROTECTION_OR[ prot_mask( .KEY_DISP, 4)]  = -1;
+	CURR_PROTECTION_AND[ prot_mask( .KEY_DISP, 4)]  = 0;
+	
+	! Retrieve the keyword value, if any, and parse it.
+	!
+	IF CLI$GET_VALUE( WORLD_DESC, CLI_DESC )
+	THEN
+	    PARSE_PROTECTION_VALUE( CLI_DESC, .KEY_DISP );
+
+	END;						! WORLD parse
+
+    RETURN;						! Return to the caller.
+    END;
+
+ROUTINE PARSE_PROTECTION_VALUE( DESC : REF $BBLOCK,
+			      FIELD_LOCATION ) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine parses the keyword value given by the /PROTECTION
+!	qualifier.  (/PROTECTION=(s:rewd))
+!
+! FORMAL PARAMETERS:
+!
+!	DESC		the address of a descriptor which points to the 
+!			keyword value.
+!	FIELD_LOCATION	the offset of the appropriate protection field
+!
+! IMPLICIT INPUTS:
+!
+!	None
+!
+! IMPLICIT OUTPUTS:
+!
+!	bits will be set in CURR_PROTECTION_OR
+!
+! ROUTINE VALUE:
+!
+!	None
+!
+! COMPLETION CODES:
+!
+!	None
+!
+! SIDE EFFECTS:
+!
+!	None
+!
+!--
+
+BEGIN
+
+LOCAL
+    RTN_STATUS,				! status returned from external calls
+    BIT_DISP,				! Location of bit to be set in protection  field
+    CHAR_DESC : $BBLOCK[ DSC$C_S_BLN]	! A descriptor
+    ;
+
+
+! The descriptor points to only one character at a time.
+!
+CH$FILL( 0, DSC$C_S_BLN, char_desc);
+CHAR_DESC[ DSC$W_LENGTH ] = 1;
+
+
+! Process the keyword value one character at a time.
+!
+INCR INDEX FROM 0 TO .DESC[ DSC$W_LENGTH ]-1 DO
+    BEGIN
+
+    CHAR_DESC[ DSC$A_POINTER ] = .DESC[ DSC$A_POINTER ] + .INDEX;
+
+    ! Look up the keyword in the keyword table.
+    !
+    IF NOT (RTN_STATUS = LIB$LOOKUP_KEY( CHAR_DESC, COPY$PROT_VALUE, BIT_DISP) )
+    THEN
+        BEGIN
+
+	! No character match was found, signal the error and return to caller.
+    	!
+        PUT_MESSAGE( MSG$_BADVALUE, 1, .desc );
+        RETURN;
+        END;
+
+    ! Clear the mask bit which corresponds to the protection attribute.
+    !
+    CURR_PROTECTION_OR[prot_mask( .FIELD_LOCATION + .BIT_DISP, 1)] = NO;
+
+    END;					! End of single character value loop.
+END;						! End of routine PARSE_PROTECTION_VAL
+
+END
+ELUDOM

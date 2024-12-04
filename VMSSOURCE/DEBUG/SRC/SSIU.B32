@@ -1,0 +1,444 @@
+MODULE SSIU (IDENT = 'V04-000') =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  VAX/VMS System Service Call Monitor
+!
+! ABSTRACT:
+!
+!	This module is the other portion of SSI.B32.  In this module, user
+!	declared routine is setup to be called at interception time.  
+!	Other information is also stored/retrieved by interfacing with this 
+!	module.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system
+!
+! Author:
+!
+!	   Ping Sager,  19-Sep-1983
+!
+!--
+
+!
+! Include files
+!
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+
+
+!
+! Table of contents
+!
+FORWARD ROUTINE
+    ssiu_start,				! Main routine
+    user_cancel_restore,		! Cancel/Restore user delcared routine
+    user_setup;				! Setup user declared routine
+
+
+EXTERNAL ROUTINE
+    sys$qiow : ADDRESSING_MODE (ABSOLUTE);! Base of transfer vector
+
+EXTERNAL LITERAL
+    issh_vec_length;			! Length of monitor code (ISSH)
+
+EXTERNAL
+    ssi_running_flag,			! Flag set to indicate this program
+    					!   is running
+    issh_data_beg,			! Begin data area (template)
+    issh_data_end,			! End data area (template)
+    issh_prio_mask,			! Mask to control the calling of the
+    					!  user routines
+    issh_ctrl_index,			! User routine index
+    issh_ctrl_prio_index,		! User routine index per priority
+    issh_vec_base;			! ISSH base address
+
+
+GLOBAL ROUTINE ssiu_start (
+    USER_SETUP_FLAGS, USER_ADDR, USER_ID, SAVE_MASK) =
+
+!---
+!
+! Function:
+!
+!	This is the main routine of the VAX/VMS to use System Service
+!	Monitor.  It calls appropriate actions.
+!
+! Inputs:
+!
+!	USER_SETUP_FLAGS - Set up user declared routine to be called at
+!			interception time, it contains 4 bytes of the 
+!			following values:
+!
+!	  SETUP_FLAG    - (0/1) Enable/Disable intercept systerm service for
+!			user declared routine.  When user first time declares
+!			user's routine, SETUP_FLAG must be set to 1.
+!
+!	  USER_PRIO	- (1/2/3/4) Running priority of the declared routine.
+!			Higher priority watches the lower priority.
+!
+!	  USER_MASK	- Enable/Disable user declared routine when intercept
+!			system service is enabled.  Mask has the following
+!			kind of values:
+!			  Prio. 1 has 1 bit value, 
+!			    for example, 1 - enable, 
+!					 0 - disable.
+!			  Prio. 2 has 2 bits value, for it watches prio. 1
+!			    for example, 0 - prio. 1&2 both are inactive,
+!					 1 - prio. 1 active, prio. 2 inactive,
+!					 2 - prio. 1 inactive, prio. 2 active,
+!					 3 - prio. 1&2 both are active.
+!			  Prio. 3 has 3 bits value, for it watches prio. 1&2
+!			    for example, expand above.
+!			  Prio. 4 has 4 bits value, for it watches prio. 1,2&3
+!			    for example, expand above.
+!
+!			Each priority only sets its own enable/disable bit,
+!			but, higher priority sees more bits values than the
+!			lower priority ones.
+!
+!	  USER_MODE	- (0/1/2/3) The mode of the user declared routine.
+!
+!	USER_ADDR	- User declared routine address.
+!
+!	USER_ID		- The address of an identification of the user declared 
+!			routine.  (This parameter can be eliminated, explanation
+!			is given in SSI_SETUP, for now, I have used this one as
+!			a handy way to know whether user has declared user's
+!			routine or not).
+!
+!	SAVE_MASK	- The address of the current state of the user declared 
+!			routine, before value is setting by USER_MASK, is 
+!			returned to the caller.
+!
+! Outputs:
+!
+!	Worst status encountered.
+!
+!---
+
+    BEGIN
+
+    BUILTIN FP;
+
+    MAP
+    	user_setup_flags: VECTOR[,BYTE];	! Important flag values set to
+    						! make intercept system service
+    						! to work
+
+    LOCAL
+    	intercept,				! Address of saved system vector,
+    						!   data, code area in P0
+    	setup_flag,				! SETUP_FLAG from 
+    	user_prio,				! USER_PRIO   USER_SETUP_FLAGS
+    	user_mask,				! USER_PRIO   (1 byte each).
+    	user_mode,				! USER_MODE
+    	mask_const,				! Calculated mask values for
+    						!  each priority
+        prio_mask: REF VECTOR[,BYTE],		! Current mask value after set
+    	status;					! Return status
+
+    
+    ! Cannot perform futher if there is no interception setup.
+    !
+    intercept = .(SYS$QIOW + sgn$c_sysvecpgs * 512 - 4);
+    IF .intercept EQL 0 THEN RETURN 1;
+
+
+    ! Indicate this program is running.  We never intercept anything from
+    ! this program.
+    !
+    ssi_running_flag = 1;
+
+
+    ! Get setup values from USER_SETUP_FLAGS.
+    !
+    setup_flag = .user_setup_flags[0];
+    user_prio = .user_setup_flags[1];
+    user_mask = .user_setup_flags[2];
+    user_mode = .user_setup_flags[3];
+    status = 1;
+
+
+    ! Set up user declared routine in the table.  Intercept is setup in
+    ! SSIK.B32 which must be called first, if user first time declares user's
+    ! routine, enter user declared routine address in the table, if user
+    ! has already declared user's routine before, simply place the routine
+    ! in the table given by USER_ID.
+    !
+    IF .setup_flag
+    THEN
+    	BEGIN
+
+
+    	! Enter User declared routine into the table.
+    	!
+    	IF .user_addr EQL 0 
+    	THEN 
+    	    BEGIN
+    	    ssi_running_flag = 0;
+    	    RETURN 0;
+    	    END
+    	ELSE
+    	    BEGIN
+    	    IF ..user_id EQL 0
+    	    THEN
+
+
+    		! Locate a spot in the table for the user routine to enter.
+    		!
+    		status = user_setup(.user_id, .user_addr, .user_prio, .user_mode)
+    	    ELSE
+
+    		! We know the spot, plung it in.
+    		!
+    		status = user_cancel_restore(.setup_flag, .user_id, .user_mode,
+    				.user_addr);
+    	    END;
+    	END
+
+
+    ! Delete user declared routine from the table.  If user declared routine
+    ! is no longer active.  
+    !
+    ELSE
+    	BEGIN
+    	IF ..user_id NEQ 0
+    	THEN
+    	    status = user_cancel_restore(.setup_flag, .user_id, .user_mode, 0);
+    	END;
+
+
+    IF NOT .status
+    THEN
+    	BEGIN
+    	ssi_running_flag = 0;
+    	RETURN .status;
+    	END;
+
+
+    ! Routine is already declared, set routine enable mask, and return
+    ! the old one back to the user.  Note: even if the routine is not
+    ! declared, this piece info. still flows through the program.
+    !
+    prio_mask = .intercept + issh_prio_mask - issh_vec_base;
+
+
+    ! 1 - prio. 1, 3 - prio. 2, 7 - prio. 3, 15 - prio. 4).
+    !
+    mask_const = (2 ^ (.user_prio-1)) - 1;
+
+
+    ! Preserved 1 bit value for prio. 1, 2 bits for prio. 2..., and return.
+    !
+    .save_mask = ..prio_mask AND .mask_const;
+
+
+    ! Preserve higher bits, through away the bits does not belong, then
+    ! set its own bits.
+    !
+    .prio_mask = (..prio_mask AND (15 - .mask_const)) OR 
+    		 (.user_mask AND .mask_const);
+
+
+    ! This program is no longer running.
+    !
+    ssi_running_flag = 0;
+    RETURN ss$_normal;
+
+    END;
+
+ROUTINE user_cancel_restore (setup_flag, routine_id, access_mode, routine_addr) =
+
+!---
+!
+! Function:
+!
+!	Delete/Restore the user routine in P0 space according to the given mode
+!	and id.
+!
+! Inputs:
+!
+!	setup_flag:     0 - cancel, 1 - restore.
+!
+!	access_mode:	mode of the user routine.
+!
+!	routine_id:	user routine identification.
+!
+!	routine_addr:   user routine address.
+!
+! Outputs:
+!
+!	None.
+!
+!---
+
+    BEGIN
+
+    LOCAL
+    	intercept,			! Address of saved system vector,
+    					!   data, code area in P0
+    	data_base : REF VECTOR[,LONG],	! Address of the data area
+    					!   (in which keeps a table of
+    					!    user routines indexed
+    					!    by (id, mode)
+    	ctrl_id;			! True position relative to 0
+
+
+    intercept = .(SYS$QIOW + sgn$c_sysvecpgs * 512 - 4);
+
+    IF (..routine_id LSS 1) OR (..routine_id GTR 16)
+    THEN
+    	RETURN 0;
+
+    data_base = .intercept + issh_data_beg - issh_vec_base;
+    ctrl_id = ..routine_id - 1;
+
+
+    ! Delete/Restore the entry/entries indexed by (id, mode) to (id, PSL$C_USER).
+    ! Note: there is no check being made in here.
+    !
+    INCR i FROM .access_mode to PSL$C_USER DO
+    	BEGIN
+    	IF .setup_flag
+    	THEN
+    	    data_base [.ctrl_id * 4] + .i * 4 = .routine_addr
+    	ELSE
+    	    data_base [.ctrl_id * 4] + .i * 4 = 0;
+    	END;
+
+    RETURN ss$_normal;
+    END;
+
+
+ROUTINE user_setup 
+    (routine_id, routine_addr, routine_prio, routine_mode) =
+
+!---
+!
+! Function:
+!
+!	Enter the user routine in P0 space according to the given mode
+!	and priority.
+!
+!       Note:
+!	The way I have set up the table in here has wasted a lot of
+!	space, ie., this table looks like,
+!
+!       prio\mode | 3  2  1  0 (kernel)
+!       ----------+--------------------   
+!            1    | x1 x1 x1 x1 (kernel, in prio. 1, x1)
+!            2    | x2          (user, in prio. 2, x2)
+!            3    |
+!            4    | x3          (user, in prio. 4, x3) <-- ctrl_index: 4
+!
+!       where this table can be condensed into 16 entries:
+!       prio\mode | 3  2  1  0 (kernel)
+!       ----------+--------------------
+!            1    | x1       x2 (kernel and all lowe modes, in prio. 1, x2;
+!            2    |              user in prio. 1, x1)
+!            3    |
+!            4    |
+!
+!       USER_ID in here is not needed at all, (easily identified locatation
+!	by prio. and mode). <-- future improvements
+!
+! Inputs:
+!
+!	routine_id:     Address of the ID.
+!
+!	routine_addr:   Address of the routine.
+!
+!       routine_prio:   Priority of the routine.
+!
+!	routine_mode:	Mode of the routine.
+!
+! Outputs:
+!
+!	None.
+!
+!---
+
+    BEGIN
+
+    LOCAL
+    	intercept,				! Address of saved system vector,
+    						!   data, code area in P0
+    	ctrl_index : REF VECTOR[,LONG],		! Total prio. entries.
+    	ctrl_prio_index : REF VECTOR[,BYTE],	! Total entries in each prio.
+     	data_base : REF VECTOR[,LONG],		! Pointer to data area in P0
+    	position,				! Exact location in the table
+    	priority;				! Prio. relative to 0
+
+
+    intercept = .(SYS$QIOW + sgn$c_sysvecpgs * 512 - 4);
+
+
+    ! Get the Address of the table in P0.
+    !
+    data_base = .intercept + issh_data_beg - issh_vec_base;
+
+
+    ! Calculate the position in the table for the routine to enter.
+    !
+    ! 4 modes, 4 priority per mode.
+    !
+    priority = .routine_prio - 1;
+    ctrl_prio_index = .intercept + issh_ctrl_prio_index - issh_vec_base;
+    position = .ctrl_prio_index[.priority] * 4 + .priority;
+
+
+    ! Table is full.  We have 128 longwords available.  We use half for the
+    ! table (in reality, 16 longwords is enough), the other half
+    ! we use it as local storage.  
+    ! so we have 64 longwords / 4 modes = 16 entries.
+    !
+    IF .position GEQ 16 THEN RETURN 0;
+
+
+    ! Enter the routine address.
+    !
+    INCR i FROM .routine_mode TO 3 DO
+    	data_base [.position * 4] + .i * 4 = .routine_addr;
+
+
+    ! Return the identification back to the user.
+    !
+    .routine_id = .position + 1;
+
+
+    ! Update the control indexes, one per priority, and one for the table.
+    !
+    ctrl_prio_index[.priority] = .ctrl_prio_index[.priority] + 1;
+    ctrl_index = .intercept + issh_ctrl_index - issh_vec_base;
+    ctrl_index[0] = MAX(.ctrl_index[0], ..routine_id);
+    RETURN 1;
+
+    END;
+
+END
+ELUDOM

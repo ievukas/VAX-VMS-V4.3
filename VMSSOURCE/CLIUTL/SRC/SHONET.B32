@@ -1,0 +1,754 @@
+MODULE show$network (IDENT = 'V04-000') =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  SHOW Command
+!
+! ABSTRACT:
+!
+!	This module processes the SHOW NETWORK command
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system. unprivileged user mode,
+!
+! AUTHOR:  Tim Halvorsen, August 1981
+!
+! Modified by:
+!
+!	V03-010	TMH0010		Tim Halvorsen	27-Jun-1983
+!		Make endnode display look better.
+!
+!	V03-009	TMH0009		Tim Halvorsen	17-May-1983
+!		Fix bug in routine which obtains the next node name
+!		in the area display.  It was accidentally sending
+!		a binary count to the terminal.
+!
+!	V03-008	TMH0008		Tim Halvorsen	13-Mar-1983
+!		Do not display loop nodes, and add new area display.
+!
+!	V03-007	GAS0105		Gerry Smith	20-Jan-1983
+!		Fix output display.
+!
+!	V03-006	GAS0100		Gerry Smith	11-Jan-1983
+!		Remove reference to SHOW$L_STATUS, since all
+!		errors are signaled.
+!
+!	V03-005	GAS0099		Gerry Smith	 7-Jan-1983
+!		Minor modifications to fit new SHOW image.
+!
+!	V004	MKP0001		Kathy Perko	14-Dec-1982
+!		Add capability to get multiple nodes in one QIO to NETACP.
+!
+!	V003	TMH0003		Tim Halvorsen	28-Nov-1982
+!		Add formatting of area node addresses.
+!
+!	V002	TMH0002		Tim Halvorsen	24-Jun-1982
+!		Fix failure to initialize an NFB field.
+!
+!	V001	TMH0001		Tim Halvorsen	03-Jun-1982
+!		Modify to use new NETACP control QIO interface.
+!--
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:STARLET';		! VAX/VMS common definitions
+
+LIBRARY 'SHRLIB$:NET';			! NETACP control QIO definitions
+
+REQUIRE 'SYS$LIBRARY:UTILDEF';		! Common BLISS definitions
+
+!
+! Table of contents
+!
+
+FORWARD ROUTINE
+    show$network:	NOVALUE,	! Process SHOW NETWORK
+    display_nodes:	NOVALUE,	! Produce reachable node display
+    format_area_info,			! Write area info to the display
+    format_node_info,			! Write node info to the display
+    get_node_name,			! Get node name given node address
+    write_line:		NOVALUE,	! Write line to output
+    format_nodeadr;			! Format a node address
+
+!
+! OWN storage
+!
+
+OWN
+    channel:	WORD;			! Channel to ACP
+
+!
+! Status codes
+!
+
+EXTERNAL LITERAL
+    show$_nonet;			! Network not available
+
+!
+! External routine
+!
+
+EXTERNAL ROUTINE
+    show$write_line:	NOVALUE;	! General SHOW FAO output routine
+
+GLOBAL ROUTINE show$network : NOVALUE =
+
+!---
+!
+!	This routine processes the SHOW NETWORK command
+!
+! Inputs:
+!
+!	None
+!
+! Outputs:
+!
+!	None 
+!---
+
+BEGIN
+
+LITERAL
+    buffer_size = 512;			! Size of return buffer.
+
+LOCAL
+    nfb:	BBLOCK [nfb$c_length+20*4],	! Network function block
+						! (room for 20 field requests)
+    nfb_desc:	VECTOR [2],		! Descriptor of NFB
+    iosb:	BBLOCK [8],		! I/O status block
+    total_count,			! Number of entries displayed
+    buffer_count,			! Number of entries returned in buffer
+    buffer:	BBLOCK [buffer_size],	! Return buffer
+    buffer_desc: VECTOR [2],		! Descriptor of above buffer
+    buffer_ptr,				! Pointer to return buffer
+    keys:	BBLOCK [4+8+nfb$c_ctx_size], ! Buffer for search keys & context
+    key_desc:	VECTOR [2],		! Descriptor of above buffer
+    node_name_buffer: VECTOR [32,BYTE],	! Node name buffer
+    node_name:	VECTOR [2],		! Descriptor of above buffer
+    exec_type,				! Executor node type
+    exec_addr,				! Executor address
+    exec_name_buffer: VECTOR [32,BYTE],	! Executor name buffer
+    exec_name:	VECTOR [2],		! Executor node name descriptor
+    status;
+
+!
+! Assign a channel to the network ACP
+!
+
+status = $ASSIGN(CHAN=channel,		! Assign channel to NETACP
+		DEVNAM=%ASCID '_NET:');
+
+IF NOT .status				! If error detected,
+THEN
+    BEGIN
+    IF .status EQL ss$_nosuchdev	! If network not yet up,
+    THEN SIGNAL(show$_nonet)		! then tell user
+    ELSE SIGNAL(.status);		! Else, report the status
+    RETURN;
+    END;
+
+!
+! Get our executor node name, address and type
+!
+
+key_desc [0] = 4 + nfb$c_ctx_size;	! Longword overhead, NO search values
+key_desc [1] = keys;			! and fixed context area
+
+keys [0,0,32,0] = 0;			! Zero count of fields in P4 (unused)
+keys [4,0,16,0] = 0;			! Start key = at beginning
+
+buffer_desc [0] = buffer_size;		! Setup descriptor of P4 buffer
+buffer_desc [1] = buffer;
+
+CH$FILL(0,nfb$c_length,nfb);		! Pre-zero NFB fields
+
+nfb [nfb$b_fct] = nfb$c_fc_show;	! Request "show" function
+nfb [nfb$b_database] = nfb$c_db_lni;	! of executor database
+
+nfb_desc [0] = $BYTEOFFSET(nfb$l_fldid) + 3*4;	! Construct descriptor of NFB
+nfb_desc [1] = nfb;
+
+CH$MOVE(3*4, UPLIT LONG(		! Request the following fields:
+		nfb$c_lni_add,		! Executor address
+		nfb$c_lni_ety,		! Executor type
+		nfb$c_lni_nam),		! Executor name
+		nfb [nfb$l_fldid]);
+
+status = $QIOW(FUNC = IO$_ACPCONTROL,	! Issue control function
+		CHAN = .channel,
+		IOSB = iosb,
+		P1 = nfb_desc,		! Address of NDB descriptor
+		P2 = key_desc,		! Address of key buffer descriptor
+		P4 = buffer_desc);	! Address of return buffer descriptor
+
+IF NOT .status				! If error detected,
+    OR NOT (status = .iosb [0,0,16,0])
+THEN
+    BEGIN
+    IF .status EQL ss$_devnotmount	! If ACP not yet started,
+    THEN SIGNAL(show$_nonet)		! then indicate network not up
+    ELSE SIGNAL(.status);		! Else, report the status
+    RETURN;
+    END;
+
+exec_addr = .buffer [0,0,32,0];		! Save our node address
+exec_type = .buffer [4,0,32,0];		! Save our node type
+exec_name [0] = .buffer [8,0,16,0];	! Construct descriptor of executor name
+exec_name [1] = exec_name_buffer;
+CH$MOVE(.exec_name [0], buffer+10, .exec_name [1]);
+
+!
+! Display title lines
+!
+
+write_line(%ASCID 'VAX/VMS Network status for local node !AS !AS on !%D',
+		format_nodeadr(.exec_addr),
+		exec_name,
+		0);
+write_line(%ASCID '');
+
+!
+! If we are a level 2 (area) router, then display cost/hops information
+! for all areas in the network.
+!
+! If we are a level 1 router, then the area database will display the
+! "nearest level 2 router".
+!
+
+buffer_desc [0] = buffer_size;		! Construct descriptor of return buffer
+buffer_desc [1] = buffer;
+
+key_desc [0] = 4 + 4 + nfb$c_ctx_size;	! Longword overhead, ONE search value
+key_desc [1] = keys;			! and fixed context area
+
+keys [0,0,32,0] = 0;			! Zero count of fields in P4 (unused)
+keys [4,0,32,0] = true;			! REA search value EQL TRUE
+keys [8,0,16,0] = 0;			! Start key = at beginning
+
+CH$FILL(0,nfb$c_length,nfb);		! Pre-zero NFB fields
+
+nfb [nfb$b_fct] = nfb$c_fc_show;	! Request "show" function
+nfb [nfb$b_database] = nfb$c_db_ari;	! of area database
+nfb [nfb$b_flags] = nfb$m_mult;		! Request multiple entries per QIO
+nfb [nfb$l_srch_key] = nfb$c_ari_rea;	! Only return reachable areas
+nfb [nfb$b_oper] = nfb$c_op_eql;	! by checking if field EQL P2 value
+
+nfb_desc [0] = $BYTEOFFSET(nfb$l_fldid) + 5*4;	! Construct descriptor of NFB
+nfb_desc [1] = nfb;
+
+CH$MOVE(5*4, UPLIT LONG(		! Request the following fields:
+		nfb$c_ari_add,		! Area number
+		nfb$c_ari_dco,		! Destination cost
+		nfb$c_ari_dho,		! Destination hops
+		nfb$c_ari_nnd,		! Next node to destination
+		nfb$c_ari_dli),		! Destination circuit name
+		nfb [nfb$l_fldid]);
+
+total_count = 0;			! Initialize area count
+
+WHILE true
+DO
+    BEGIN
+    status = $QIOW(FUNC = IO$_ACPCONTROL,	! Issue control function
+		CHAN = .channel,
+		IOSB = iosb,
+		P1 = nfb_desc,		! Address of NDB descriptor
+		P2 = key_desc,		! Address of key buffer descriptor
+		P4 = buffer_desc);	! Address of return buffer descriptor
+
+    IF NOT .status			! If error detected,
+	OR NOT (status = .iosb [0,0,16,0])
+    THEN
+	EXITLOOP;			! then stop looping
+
+    IF .exec_type NEQ adj$c_pty_area	! If we are not an area router,
+    THEN
+	BEGIN
+	BIND
+	    next_hop_addr = buffer [3*4,0,32,0];	
+
+	node_name [0] = 32;			! Make descriptor of output buffer
+	node_name [1] = node_name_buffer;
+	node_name [0] =			! Get node name of next hop
+	    get_node_name(.next_hop_addr, node_name);
+
+	SELECTONEU .exec_type OF
+	    SET
+	    [adj$c_pty_ph4n,adj$c_pty_ph3n]:
+		BEGIN
+		write_line(%ASCID 'This is a nonrouting node, and does not have any network information.');
+		IF .next_hop_addr NEQ -1
+		THEN
+		    write_line(%ASCID 'The designated router for !AS is node !AS !AS.',
+			exec_name,
+			format_nodeadr(.next_hop_addr),
+			node_name);
+		END;
+	    [OTHERWISE]:
+		BEGIN
+		IF .next_hop_addr NEQ -1
+		THEN
+		    write_line(%ASCID 'The next hop to the nearest area router is node !AS !AS.',
+			format_nodeadr(.next_hop_addr),
+			node_name);
+		END;
+	    TES;
+	total_count = 1;		! Force some spacing afterwards
+	EXITLOOP;			! Do not display area database
+	END;
+
+    IF .total_count EQL 0		! If first time through,
+    THEN				! Print header line
+	write_line(%ASCID '!/!13* Area   Cost  Hops    Next Hop to Area!/');
+                           
+    buffer_ptr = buffer;		! Point to first node in buffer.
+    buffer_count = .keys [0,0,32,0];	! Get number of nodes returned in the
+					!	buffer.
+    WHILE .buffer_count GTR 0
+    DO
+	BEGIN
+	buffer_ptr = format_area_info (.buffer_ptr);
+	total_count = .total_count + 1;	! Increment # areas reachable
+	buffer_count = .buffer_count - 1;
+	END;
+    END;
+
+!
+! As long as we aren't an endnode, display reachable nodes
+!
+
+IF .exec_type NEQ adj$c_pty_ph4n	! If we aren't an endnode,
+    AND .exec_type NEQ adj$c_pty_ph3n
+THEN
+    BEGIN
+    IF .total_count GTR 0		! If displayed at least 1 area,
+    THEN
+	write_line(%ASCID '');		! put 1 blank line here
+
+    display_nodes();			! Display reachable nodes in our area
+    END;
+
+!
+! Cleanup channel to ACP
+!
+
+$DASSGN(CHAN = .channel);		! Deassign the ACP channel
+
+RETURN;					! Return to CLI dispatcher
+
+END;
+
+ROUTINE display_nodes: NOVALUE =
+
+!---
+!
+!	This routine displays all reachable nodes in our area.
+!
+! Inputs:
+!
+!	None
+!
+! Outputs:
+!
+!	None 
+!---
+
+BEGIN
+
+LITERAL
+    buffer_size = 512;			! Size of return buffer.
+
+LOCAL
+    nfb:	BBLOCK [nfb$c_length+20*4],	! Network function block
+						! (room for 20 field requests)
+    nfb_desc:	VECTOR [2],		! Descriptor of NFB
+    iosb:	BBLOCK [8],		! I/O status block
+    total_node_count,			! Number of nodes displayed
+    buffer_node_count,			! Number of nodes returned in buffer
+    buffer:	BBLOCK [buffer_size],	! Return buffer
+    buffer_desc: VECTOR [2],		! Descriptor of above buffer
+    buffer_ptr,				! Pointer to return buffer
+    keys:	BBLOCK [4+8+nfb$c_ctx_size], ! Buffer for search keys & context
+    key_desc:	VECTOR [2],		! Descriptor of above buffer
+    status;
+
+!
+! Display the cost/hops information for all nodes in this area
+!
+
+buffer_desc [0] = buffer_size;		! Construct descriptor of return buffer
+buffer_desc [1] = buffer;
+
+key_desc [0] = 4 + 8 + nfb$c_ctx_size;	! Longword overhead, TWO search values
+key_desc [1] = keys;			! and fixed context area
+
+keys [0,0,32,0] = 0;			! Zero count of fields in P4 (unused)
+keys [4,0,32,0] = true;			! REA search value EQL TRUE
+keys [8,0,32,0] = true;			! LOO search value NEQ true
+keys [12,0,16,0] = 0;			! Start key = at beginning
+
+CH$FILL(0,nfb$c_length,nfb);		! Pre-zero NFB fields
+
+nfb [nfb$b_fct] = nfb$c_fc_show;	! Request "show" function
+nfb [nfb$b_database] = nfb$c_db_ndi;	! of node database
+nfb [nfb$b_flags] = nfb$m_mult;		! Request multiple entries per QIO
+nfb [nfb$l_srch_key] = nfb$c_ndi_rea;	! Only return reachable nodes
+nfb [nfb$b_oper] = nfb$c_op_eql;	! by checking if field EQL P2 value
+nfb [nfb$l_srch2_key] = nfb$c_ndi_loo;	! Do not return "loop nodes"
+nfb [nfb$b_oper2] = nfb$c_op_neq;	! by checking if field NEQ P2 value
+
+nfb_desc [0] = $BYTEOFFSET(nfb$l_fldid) + 8*4;	! Construct descriptor of NFB
+nfb_desc [1] = nfb;
+
+CH$MOVE(8*4, UPLIT LONG(		! Request the following fields:
+		nfb$c_ndi_tad,		! Translated node address
+		nfb$c_ndi_acl,		! Active links
+		nfb$c_ndi_dco,		! Destination cost
+		nfb$c_ndi_dho,		! Destination hops
+		nfb$c_ndi_nnd,		! Next hop node address
+		nfb$c_ndi_nna,		! Node name
+		nfb$c_ndi_nnn,		! Next hop node name
+		nfb$c_ndi_dli),		! Destination circuit name
+		nfb [nfb$l_fldid]);
+
+total_node_count = 0;			! Initialize node count
+
+WHILE true
+DO
+    BEGIN
+    status = $QIOW(FUNC = IO$_ACPCONTROL,	! Issue control function
+		CHAN = .channel,
+		IOSB = iosb,
+		P1 = nfb_desc,		! Address of NDB descriptor
+		P2 = key_desc,		! Address of key buffer descriptor
+		P4 = buffer_desc);	! Address of return buffer descriptor
+
+    IF NOT .status			! If error detected,
+	OR NOT (status = .iosb [0,0,16,0])
+    THEN
+	EXITLOOP;			! then stop looping
+
+    IF .total_node_count EQL 0		! If first time through,
+    THEN				! Print header line
+	write_line(%ASCID '!/!8* Node!9*  Links  Cost  Hops   Next Hop to Node!/');
+                           
+    buffer_ptr = buffer;		! Point to first node in buffer.
+    buffer_node_count = .keys [0,0,32,0];! Get number of nodes returned in the
+					!	buffer.
+    WHILE .buffer_node_count GTR 0
+    DO
+	BEGIN
+	buffer_ptr = format_node_info (.buffer_ptr);
+	total_node_count =		! Increment # nodes reachable
+			.total_node_count + 1;
+	buffer_node_count = .buffer_node_count - 1;
+	END;
+
+    END;
+
+IF .status EQL ss$_endoffile		! If normal termination,
+THEN
+    BEGIN
+    IF .total_node_count GTR 1		! If more than local node found,
+    THEN		 		! Write the total
+	write_line(%ASCID '!/!16* Total of !UL node!%S.',
+		   .total_node_count);
+    END
+ELSE
+    BEGIN
+    IF .status EQL ss$_devnotmount	! If ACP not yet started,
+    THEN SIGNAL(show$_nonet)		! then indicate network not up
+    ELSE SIGNAL(.status);		! Else, report the status
+    END;
+
+END;
+
+ROUTINE format_area_info (info_ptr: REF VECTOR) =
+
+!--
+!
+!	This routine accepts a pointer to one area's information in the buffer
+!	returned by NETACP.  It formats this information and writes it to the
+!	output stream.
+!
+! Inputs:
+!
+!	info_ptr = Address of the beginning of the area's information in
+!		the buffer returned by NETACP.
+!
+! Outputs:
+!
+!	Routine value = Address of next byte beyond area's information.
+!--
+
+BEGIN
+
+LOCAL
+    ptr:	REF BBLOCK,		! Pointer into area information.
+    circ_name:	VECTOR [2],		! Descriptor of circuit name
+    next_hop_name_buffer: VECTOR [32,BYTE], ! Buffer to hold next hop name
+    next_hop_name: VECTOR [2];		! Descriptor of next hop node name
+
+next_hop_name [0] = 32;			! Make descriptor of output buffer
+next_hop_name [1] = next_hop_name_buffer;
+next_hop_name [0] =			! Get node name of next hop
+    get_node_name(.info_ptr [3], next_hop_name);
+
+ptr = info_ptr [4];			! Point to word-counted circuit name
+
+circ_name [0] = .ptr [0,0,16,0];	! Construct descriptor of circuit name
+circ_name [1] = .ptr + 2;
+ptr = .ptr + 2 + .ptr [0,0,16,0];	! Skip by string in buffer
+
+!
+! Output the line
+!
+
+write_line(%ASCID '!13* !3UL   !4UL  !4UL      !10AS-> !6AS !AS',
+	   .info_ptr [0],		! Area number
+	   .info_ptr [1],		! Least cost to area
+	   .info_ptr [2],		! Actual hops to area
+	   (IF .circ_name [0] EQL 0 then %ASCID '(Local)' ELSE circ_name), ! Circuit name
+	   format_nodeadr(.info_ptr [3]), ! Next hop node address
+	   next_hop_name);		! Next hop node name
+
+RETURN .ptr;				! Return updated pointer
+
+END;
+
+ROUTINE format_node_info (info_ptr: REF VECTOR) =
+
+!--
+!
+!	This routine accepts a pointer to one node's information in the buffer
+!	returned by NETACP.  It formats this information and writes it to the
+!	output stream.
+!
+! Inputs:
+!
+!	info_ptr = Address of the beginning of the node's information in
+!		the buffer returned by NETACP.
+!
+! Outputs:
+!
+!	Routine value = Address of next byte beyond node's information.
+!--
+
+BEGIN
+
+LOCAL
+    ptr:	REF BBLOCK,		! Pointer into node information.
+    node_name:	VECTOR [2],		! Descriptor of node name
+    circ_name:	VECTOR [2],		! Descriptor of circuit name
+    next_hop_name: VECTOR [2],		! Descriptor of next hop node name
+    next_hop_ptr: REF VECTOR [2],	! Ptr to formatted next hop descriptor
+    next_hop_addr_buffer: VECTOR [32,BYTE], ! Buffer to hold next hop address
+    next_hop_addr: VECTOR [2];		! Descriptor of next hop node address
+
+ptr = info_ptr [5];			! Point to word-counted node name
+
+node_name [0] = .ptr [0,0,16,0];	! Construct descriptor of node name
+node_name [1] = .ptr + 2;
+ptr = .ptr + 2 + .ptr [0,0,16,0];	! Skip by string in buffer
+		
+next_hop_name [0] = .ptr [0,0,16,0];	! Construct descriptor of next hop
+next_hop_name [1] = .ptr + 2;
+ptr = .ptr + 2 + .ptr [0,0,16,0];	! Skip by string in buffer
+		
+circ_name [0] = .ptr [0,0,16,0];	! Construct descriptor of circuit name
+circ_name [1] = .ptr + 2;
+ptr = .ptr + 2 + .ptr [0,0,16,0];	! Skip by string in buffer
+
+next_hop_ptr = format_nodeadr(.info_ptr [4]); 	! Format next hop address
+next_hop_addr [0] = .next_hop_ptr [0];	! Save descriptor of formatted string
+next_hop_addr [1] = next_hop_addr_buffer;
+CH$MOVE(.next_hop_ptr [0], .next_hop_ptr [1], .next_hop_addr [1]);
+
+!
+! Output the line
+!
+
+write_line(%ASCID '!4* !15<!6AS !AS!> !6UL  !4UL  !4UL     !10AS-> !6AS !AS',
+	   format_nodeadr(.info_ptr [0]),	! Node address
+	   node_name,			! Node name
+	   (IF .info_ptr [1] GEQ 0 THEN .info_ptr [1] ELSE 0), ! Active links
+	   .info_ptr [2],		! Destination cost
+	   .info_ptr [3],		! Destination hops
+	   (IF .circ_name [0] EQL 0 then %ASCID '(Local)' ELSE circ_name), ! Circuit name
+	   next_hop_addr, 		! Next hop node address
+	   next_hop_name);		! Next hop node name
+
+RETURN .ptr;				! Return updated pointer
+
+END;
+
+ROUTINE get_node_name (addr, buffer_desc: REF VECTOR) =
+
+!---
+!
+!	This routine returns the node name associated with a given node
+!	address.
+!
+! Inputs:
+!
+!	addr = Node address
+!	buffer_desc = Address of descriptor of output buffer
+!
+! Outputs:
+!
+!	Routine Value = Length of returned string
+!-
+
+BEGIN
+
+LOCAL
+    nfb:	BBLOCK [nfb$c_length+1*4], ! Network function block
+    nfb_desc:	VECTOR [2],		! Descriptor of NFB
+    iosb:	BBLOCK [8],		! I/O status block
+    keys:	BBLOCK [4+4+nfb$c_ctx_size], ! Buffer for search keys & context
+    key_desc:	VECTOR [2],		! Descriptor of above buffer
+    buffer:	BBLOCK [16],		! P4 buffer (for node name)
+    p4_desc:	VECTOR [2],		! Descriptor of above buffer
+    status;
+
+key_desc [0] = 4 + 4 + nfb$c_ctx_size;	! Longword overhead, ONE search value
+key_desc [1] = keys;			! and fixed context area
+
+keys [0,0,32,0] = 0;			! Zero count of fields in P4 (unused)
+keys [4,0,32,0] = .addr;		! Insert desired node address
+keys [8,0,16,0] = 0;			! Start key = at beginning
+
+p4_desc [0] = 16;			! Setup descriptor of P4 buffer
+p4_desc [1] = buffer;
+
+CH$FILL(0,nfb$c_length,nfb);		! Pre-zero NFB fields
+
+nfb [nfb$b_fct] = nfb$c_fc_show;	! Request "show" function
+nfb [nfb$b_database] = nfb$c_db_ndi;	! of node database
+nfb [nfb$l_srch_key] = nfb$c_ndi_tad;	! Search for matching address
+nfb [nfb$b_oper] = nfb$c_op_eql;	! using "EQL" comparision
+
+nfb_desc [0] = $BYTEOFFSET(nfb$l_fldid) + 1*4;	! Construct descriptor of NFB
+nfb_desc [1] = nfb;
+
+CH$MOVE(1*4, UPLIT LONG(		! Request the following fields:
+		nfb$c_ndi_nna),		! Node name
+		nfb [nfb$l_fldid]);
+
+status = $QIOW(FUNC = IO$_ACPCONTROL,	! Issue control function
+		CHAN = .channel,
+		IOSB = iosb,
+		P1 = nfb_desc,		! Address of NDB descriptor
+		P2 = key_desc,		! Address of key buffer descriptor
+		P4 = p4_desc);		! Address of return buffer descriptor
+
+IF NOT .status				! If error detected,
+    OR NOT (status = .iosb [0,0,16,0])
+THEN
+    RETURN 0				! Return null string
+ELSE
+    BEGIN
+    CH$MOVE(.buffer [0,0,16,0], buffer [2,0,0,0], .buffer_desc [1]);
+    RETURN .buffer [0,0,16,0];		! Return length of string
+    END;
+
+END;
+
+ROUTINE write_line (message, args): NOVALUE =
+
+!---
+!
+!	This routine accepts a control string and a series of FAO
+!	arguments, and writes the resulting line to the output stream.
+!
+! Inputs:
+!
+!	message = Message control string 
+!	args = First FAO argument (any number of arguments may follow)
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+show$write_line(.message, args);	! Use standard SHOW output routine
+
+END;
+
+ROUTINE format_nodeadr(address) =
+
+!---
+!
+!	This routine formats a 16-bit node address into an
+!	formatted ASCII string of the form <area>.<node>.
+!	If the area number is zero, then the area portion
+!	is omitted.
+!
+! Inputs:
+!
+!	address = 16-bit node address
+!
+! Outputs:
+!
+!	Routine = Address of descriptor of string describing address
+!
+!	Since the string & descriptor is stored in OWN storage, it must
+!	be copied immediately after returning (with a standard routine
+!	such as "append").
+!---
+
+BEGIN
+
+OWN
+    string:	VECTOR [40,BYTE],	! Formatted node address string
+    desc:	VECTOR [2];		! FAO result string descriptor
+
+desc [0] = 40;				! Setup descriptor for FAO
+desc [1] = string;
+
+IF .address <10,6,0> EQL 0		! If area = 0,
+THEN
+    $FAO(%ASCID '   !UL',		! Format only node
+	desc, desc,
+	.address)
+ELSE
+    $FAO(%ASCID '!2UL.!UL',		! Format area and node
+	desc, desc,
+	.address <10,6,0>,
+	.address <0,10,0>);
+
+RETURN desc;
+
+END;
+
+END
+ELUDOM

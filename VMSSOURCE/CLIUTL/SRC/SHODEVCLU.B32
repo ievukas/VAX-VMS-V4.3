@@ -1,0 +1,466 @@
+MODULE shodevclu (IDENT = 'V04-000',
+		  ADDRESSING_MODE (EXTERNAL = GENERAL)) =
+
+BEGIN
+!
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!
+!++
+!
+! FACILITY:  SHOW utility
+!
+! ABSTRACT:
+!	This module contains the routines for finding cluster-wide
+!	information about devices by chasing through the lock structures.
+!
+! ENVIRONMENT:
+!	VAX native, user mode.
+!
+! AUTHOR:  CW Hobbs		 CREATION DATE:  19-Mar-1984
+!
+! MODIFIED BY:
+!
+!	V03-005	CWH3005			CW Hobbs		4-May-1984
+!		Exclude all null locks from consideration, since the are
+!		due to other SHOW DEVICE commands rather than something
+!		interesting.
+!
+!	V03-004	CWH3004			CW Hobbs		13-Apr-1984
+!		Remove declaration for a debugging routine.
+!
+!	V03-003	CWH3003			CW Hobbs 		13-Apr-1984
+!		Change name for LKI$L_REMSYSTEM to LKI$L_REMSYSID and LKI$B_STATE
+!		to LKI$B_QUEUE because the definitions changed.
+!
+!	V03-002	CWH3002			CW Hobbs		12-Apr-1984
+!		Complete work now that a full service $GETLKI is available
+!
+!
+!--
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:LIB';		! VAX/VMS system definitions
+REQUIRE 'SRC$:SHOWDEF';			! SHOW common definitions
+REQUIRE	'SRC$:SHODEVDEF';		! SHOW DEVICES common definitions
+
+!
+! Table of contents
+!
+FORWARD ROUTINE
+    scan_cluster_locks : NOVALUE,		! User-mode jacket
+    get_lock_info,				! Kernel routine to follow locks for device
+    get_lock_info_handler;			! Handler to keep get_lock_info out of trouble
+
+EXTERNAL ROUTINE
+    show$write_line;
+
+EXTERNAL LITERAL
+    show$_lockerr;				! Error chasing locks
+
+EXTERNAL
+    lck$gl_maxid,
+    lck$gl_idtbl : REF VECTOR [, LONG],
+    kernel_accvio : VECTOR [4, LONG];
+
+!
+! Define a structure for a local buffer used to pass various items from
+! the kernel-mode routine back to the user-mode routine
+!
+MACRO
+    lcl_null_lkid	=  0, 0, 32, 0 %,	! Id of the null mode lock we declared
+    lcl_lengths		=  4, 0, 32, 0 %,	! Longword containing both lengths
+    lcl_ret_length	=  4, 0, 16, 0 %,	! Word containing total length of items returned
+    lcl_itm_length	=  6, 0, 15, 0 %,	! Length of a single lock item
+    lcl_enq_status	=  8, 0, 32, 0 %,	! Status from $ENQ for null lock
+    lcl_val_block	= 12, 0,  0, 0 %;	! Value block for the resource
+
+LITERAL
+    lcl_size = 28;				! Total size 12 bytes + 16 byte value block
+
+!
+! We would like to be able to REQUIRE 'SHRLIB$:MOUDEF.B32', but MOUDEF has a bunch of
+! definitions which conflict with our own definitions.  Therefore, we have a copy of the
+! definitions which we need.
+!
+! Define fields within the device allocation lock value block.
+!
+
+MACRO
+	DC_FLAGS		= 0,0,16,0 %,
+	DC_NOTFIRST_MNT		= 0,0,1,0 %,
+	DC_FOREIGN		= 0,1,1,0 %,
+	DC_GROUP		= 0,2,1,0 %,
+	DC_SYSTEM		= 0,3,1,0 %,
+	DC_WRITE		= 0,4,1,0 %,
+	DC_NOQUOTA		= 0,5,1,0 %,
+	DC_OVR_PROT		= 0,6,1,0 %,
+	DC_OVR_OWNUIC		= 0,7,1,0 %,
+	DC_NOINTERLOCK		= 0,8,1,0 %,
+	DC_PROTECTION		= 2,0,16,0 %,
+	DC_OWNER_UIC		= 4,0,32,0 %;
+
+GLOBAL ROUTINE scan_cluster_locks (scratch : REF $BBLOCK, buffer : REF $BBLOCK) : NOVALUE =
+BEGIN
+
+!---
+!
+! This is a user-mode jacket routine for the lock searches
+!
+! Inputs
+!	SCRATCH  - address of scratch data for this device
+!
+! Outputs
+!	SCRATCH  - some values "adjusted" for cluster-wide information
+!	BUFFER   - output lock information, for now gets a vector containing
+!		   the CSIDs of the remote nodes.  First longword is the count
+!		   of the CSIDs, longword CSIDs start at second longword
+!
+!---
+
+OWN
+    local_csid : INITIAL (0);			! The CSID of the local node
+
+LOCAL
+    status,
+    lclbuf : $BBLOCK[lcl_size],			! Buffer to receive misc items from kernel call
+    lokbuf : $BBLOCK[1200],			! Lock info buffer for kernel routines (set to MAXBUF minimum)
+    arglist : VECTOR[16];			! CMKRNL and output argument list
+
+BIND
+    csid_vector = buffer[0,0,32,0] : VECTOR [, LONG],
+    csid_count = buffer[0,0,32,0];		! Treat first longword as the length field
+
+!
+! Zero the csid count field in the users buffer, and remember the local state of the mount bit
+!
+csid_count = 0;
+scratch[d_v_local_mount] = .$BBLOCK[scratch[d_l_devchar], dev$v_mnt];
+
+!
+! Get the CSID of the local node if necessary
+!
+IF .local_csid EQL 0
+THEN
+    BEGIN
+    arglist[0] = (syi$_node_csid^16 OR 4);
+    arglist[1] = local_csid;
+    arglist[2] = arglist[3] = 0;
+    IF NOT (status = $getsyi (itmlst=arglist))
+    THEN
+    	SIGNAL_STOP (.status);
+    END;
+
+!
+! Call the kernel mode routine, since the device lock is a kernel lock
+!
+arglist[0] = 4;				! Four arguments
+arglist[1] = .scratch;			! Device scratch area
+arglist[2] = lclbuf;			! Local buffer for misc returns
+arglist[3] = %ALLOCATION(lokbuf);	! Buffer for $GETLKI to place
+arglist[4] = lokbuf;			!  list of lock item blocks
+
+IF NOT (status = $CMKRNL(ROUTIN = get_lock_info, ARGLST = arglist))
+THEN
+    BEGIN
+    IF .status EQL ss$_accvio
+    THEN SIGNAL(show$_lockerr, 2, .scratch[d_b_devlen], scratch[d_t_device], .status,
+		.kernel_accvio[0], .kernel_accvio[1], .kernel_accvio[2], .kernel_accvio[3], 0)
+    ELSE SIGNAL(show$_lockerr, 2, .scratch[d_b_devlen], scratch[d_t_device], .status);
+    RETURN;
+    END;
+
+!
+! If there are any remote nodes represented, then update the device scratch area and pass the CSID
+! back to the caller.
+!
+INCR k FROM 0 TO .lclbuf[lcl_ret_length]-1 BY lki$k_length
+DO
+    BEGIN
+    BIND
+	lki = lokbuf[.k,0,32,0] : $BBLOCK;
+    !
+    ! Only look at non-null locks owned by remote nodes.
+    ! 
+    !	   null locks     -  not interesting, most likely just other show device commands
+    !      local locks    -  we can find far more info from the ucb than from the lock
+    !
+    IF	.lki[lki$l_remsysid] NEQ .local_csid
+      AND
+	.lki[lki$b_grmode] NEQ lck$k_nlmode
+    THEN
+	BEGIN
+	csid_count = .csid_count + 1;				! Bump the count of systems
+	csid_vector[.csid_count] = .lki[lki$l_remsysid];	! Copy the CSID into the vector
+	IF .$BBLOCK[lclbuf[lcl_val_block],dc_notfirst_mnt]	! If mounted on the remote node
+	THEN
+	    BEGIN
+	    scratch[d_v_remote_mounts] = 1;			! Remember that it is mounted elsewhere
+	    $BBLOCK[scratch[d_l_devchar],dev$v_mnt] = 1;	! Force the MNT bit on
+	    scratch[d_w_mcount] = .scratch[d_w_mcount] + 1;	! Bump the mount count
+	    $BBLOCK[scratch[d_l_devchar],dev$v_for] =		! Set the foreign bit if mounted foreign
+				.$BBLOCK[lclbuf[lcl_val_block],dc_foreign];
+	    $BBLOCK[scratch[d_l_devchar],dev$v_swl] =		! Set the write-locked bit
+				NOT .$BBLOCK[lclbuf[lcl_val_block],dc_write];
+	    IF NOT .scratch[d_v_local_mount]			! If not mounted locally, then set
+	    THEN						!  a dummy volume name
+		CH$MOVE (12, UPLIT BYTE ('(remote mnt)'), scratch[d_t_volnam]);
+	    END;
+	IF .lki[lki$b_grmode] EQL lck$k_exmode			! If lock mode is exclusive, then the
+	THEN							!  device is also allocated
+	    BEGIN
+	    $BBLOCK[scratch[d_l_devchar],dev$v_all] = 1;	! Force the ALL bit on
+	    scratch[d_v_remote_all] = 1;			! Set flag for the print routines
+	    END;
+	END;
+    END;
+
+!
+! Conditionally compile some debugging code.  If compiled with /VARIANT<>0, then if the
+! logical name SHOW$DEBUG is defined we will dump the lock state
+!
+%IF %VARIANT NEQ 0
+%THEN
+    !
+    ! If the logical name SHOW$DEBUG is defined, dump everything we found
+    !
+    IF (BEGIN
+	LOCAL
+	    lcl_buf : VECTOR [256, BYTE],
+	    out_dsc : VECTOR [2, LONG];
+	out_dsc [0] = 256;
+	out_dsc [1] = lcl_buf;
+	($trnlog (lognam=%ASCID 'SHOW$DEBUG', rsllen=out_dsc, rslbuf=out_dsc) EQL ss$_normal)
+	END)
+    THEN
+	BEGIN
+	IF NOT .lclbuf[lcl_enq_status]
+	THEN
+	    SIGNAL(show$_lockerr, 2, .scratch[d_b_devlen], scratch[d_t_device], .lclbuf[lcl_enq_status]);
+	show$write_line (%ASCID '   - Lock !XL,  length of items !XL,  $enq status !XL, value block !XL !XL !XL !XL',
+    						lclbuf[0,0,32,0]);
+	show$write_line (%ASCID '   - Mounted on nodes:  !AF', arglist);
+	show$write_line (%ASCID '   -  Lock id     PID       CSID              Remlkid   Remcsid            Rqmod   Grmod   State',
+			    arglist);
+	incr k from 0 to .lclbuf[lcl_ret_length]-1 by lki$k_length
+	do
+	    begin
+	    local
+		nodename : VECTOR [16, BYTE],
+		nodename2 : VECTOR [16, BYTE];
+	    bind
+		lki = lokbuf[.k,0,32,0] : $BBLOCK;
+	    arglist[0] = .lki[lki$l_lockid];
+	    arglist[1] = .lki[lki$l_pid];
+	    arglist[2] = .lki[lki$l_sysid];
+	    arglist[3] = 0;
+	    arglist[4] = nodename;
+	    arglist[5] = .lki[lki$l_remlkid];
+	    arglist[6] = .lki[lki$l_remsysid];
+	    arglist[7] = 0;
+	    arglist[8] = nodename2;
+	    arglist[9] = .lki[lki$b_rqmode];
+	    arglist[10] = .lki[lki$b_grmode];
+	    arglist[11] = .lki[lki$b_queue];
+	    IF .lki[lki$l_sysid] NEQ 0
+	    THEN
+		BEGIN
+		LOCAL
+		    itemlist : VECTOR [4, LONG];
+		itemlist[0] = (syi$_nodename^16 OR 16);
+		itemlist[1] = nodename;
+		itemlist[2] = arglist[3];
+		itemlist[3] = 0;
+		$getsyi (csidadr=lki[lki$l_sysid],itmlst=itemlist);
+		END;
+	    IF .lki[lki$l_remsysid] NEQ 0
+	    THEN
+		BEGIN
+		LOCAL
+		    itemlist : VECTOR [4, LONG];
+		itemlist[0] = (syi$_nodename^16 OR 16);
+		itemlist[1] = nodename2;
+		itemlist[2] = arglist[7];
+		itemlist[3] = 0;
+		$getsyi (csidadr=lki[lki$l_remsysid],itmlst=itemlist);
+		END;
+	    show$write_line (
+		%ASCID '   -  !XL  !XL  !XL !8<(!AF)!>  !XL  !XL !8<(!AF)!>    !XB      !XB     !XB', arglist);
+	    end;
+	!
+	! Format the buffer, 32 bytes at a time
+	!
+	show$write_line (%ASCID '   - Formatted dump of LKI$_LOCKS buffer:', arglist);
+	incr k from 0 to .lclbuf[lcl_ret_length]-1 by 32
+	do
+	    begin
+	    !
+	    ! Move the next chunk of data to the intermediate buffer
+	    !
+	    arglist[0]=.lokbuf[.k+28,0,32,0];
+	    arglist[1]=.lokbuf[.k+24,0,32,0];
+	    arglist[2]=.lokbuf[.k+20,0,32,0];
+	    arglist[3]=.lokbuf[.k+16,0,32,0];
+	    arglist[4]=.lokbuf[.k+12,0,32,0];
+	    arglist[5]=.lokbuf[.k+8,0,32,0];
+	    arglist[6]=.lokbuf[.k+4,0,32,0];
+	    arglist[7]=.lokbuf[.k,0,32,0];
+	    arglist[8]=32;
+	    arglist[9]=lokbuf[.k,0,32,0];
+	    arglist[10]=.k;
+	    show$write_line (%ASCID '   -  !8(9XL) !32AF !XW', arglist);
+	    end;
+	END;
+%FI		! End of variant for debug listing
+
+RETURN;
+END;
+
+GLOBAL ROUTINE get_lock_info (scratch : REF $BBLOCK, lclbuf : REF $BBLOCK, lokbuf_size, lokbuf : REF $BBLOCK) =
+BEGIN
+
+!---
+!
+! This routine is called in KERNEL mode to scan the device lock data base and
+! determine any cluster-wide information which is available.  
+!
+! Inputs
+!	SCRATCH     - address of scratch data for this device
+!	LOKBUF_SIZE - size of lock info buffer
+!	LOKBUF      - lock info buffer for the $GETLKI call, passed in so that we
+!		       don't have kernel stack restrictions on the size of the buffer
+!
+! Outputs
+!	SCRATCH  - some values "adjusted" for cluster-wide information
+!	LCLBUF   - output lock information for control and debug listings
+!	LOKBUF   - lock info vector
+!
+!---
+
+LOCAL
+    iosb : $BBLOCK [8],
+    itemlist : $BBLOCK [16],
+    lokbuf_len : $BBLOCK [4],
+    lksb : $BBLOCK [24],			! status block + value block
+    name : VECTOR [20, BYTE],
+    name_desc : VECTOR [2, LONG],
+    status;
+
+!
+! Trap anything weird, and turn it into a return
+!
+ENABLE
+    get_lock_info_handler;
+
+!
+! Get a null-mode lock on the device name
+!
+(name[0]) = 'SYS$';				! Sys prefix on the name
+CH$MOVE (.scratch[d_b_devlen], scratch[d_t_device], name[4]);
+name_desc[0] = 4 + .scratch[d_b_devlen];
+name_desc[1] = name;
+status = $ENQW (efn=0,
+		lkmode=LCK$K_NLMODE,
+		lksb=lksb,
+		flags=(LCK$M_NOQUEUE OR LCK$M_VALBLK OR LCK$M_SYNCSTS OR LCK$M_SYSTEM),
+		resnam=name_desc,
+		acmode=0);
+lclbuf[lcl_null_lkid]=.lksb[4,0,32,0];		! Stick the null lock id into the buffer
+CH$MOVE (16,lksb[8,0,32,0],lclbuf[lcl_val_block]);! Copy the value block
+IF .status					! If the enqueue worked then check the stat block
+THEN status = .lksb[0,0,16,0];
+lclbuf[lcl_enq_status] = .status;		! Save $enq status
+IF NOT .status
+THEN
+  IF .status NEQ ss$_valnotvalid		! Cope with a value block not being valid
+  THEN
+    BEGIN
+    $DEQ (lkid=.lksb[4,0,32,0]);		! Release the lock, just in case one was granted
+    RETURN .status;				! Return with status
+    END;
+
+!
+! Get lock information, and find out all the other locks on this resource name
+!
+itemlist[0,0,16,0] = .lokbuf_size;		! Size of scratch buffer
+itemlist[2,0,16,0] = LKI$_LOCKS;		! Find out which other locks
+itemlist[4,0,32,0] = .lokbuf;			! Address of scratch buffer
+itemlist[8,0,32,0] = lokbuf_len;		! Address for returned length
+itemlist[12,0,32,0] = 0;			! End of itemlist
+lokbuf_len = 0;					! Zero returned length (?? bogus when GETLKI works)
+status = $GETLKI (efn=0,
+		  lkidadr=lksb[4,0,32,0],
+		  itmlst=itemlist,
+		  iosb=iosb);
+lclbuf[lcl_lengths] = .lokbuf_len[0,0,32,0];	! Save both length fields
+IF .status					! If the getlki worked then check the stat block
+THEN status = .iosb[0,0,16,0];
+
+!
+! Release the null lock
+!
+$DEQ (lkid=.lksb[4,0,32,0]);
+
+RETURN .status;					! Return with status
+END;
+
+GLOBAL ROUTINE get_lock_info_handler (sig : REF BLOCK[,BYTE], mech : REF BLOCK[,BYTE]) =
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine intercepts kernel mode signals and converts ACCVIOs to returns
+!
+! INPUTS:
+!
+!	sig  - signal argument list
+!	mech - mechanism argument list
+!
+! SIDE EFFECTS:
+!
+!	A return is made to user mode code.
+!--
+
+EXTERNAL ROUTINE
+    LIB$SIG_TO_RET : ADDRESSING_MODE (GENERAL);
+
+! If the signal name is an accvio, then clean up
+!
+IF .sig [chf$l_sig_name] EQL ss$_accvio		! Is it an accvio?
+THEN
+    BEGIN
+    CH$MOVE (4*4, sig[chf$l_sig_arg1], kernel_accvio[0]);
+    RETURN LIB$SIG_TO_RET (.sig, .mech);	! Convert signal to return
+    END;
+
+RETURN ss$_resignal;
+END;
+
+END
+ELUDOM

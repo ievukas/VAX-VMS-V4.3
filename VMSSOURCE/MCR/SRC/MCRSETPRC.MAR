@@ -1,0 +1,745 @@
+	.TITLE	MCRSETPRC - SET PROCESS PARAMETERS
+	.IDENT	'V04-000'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;
+;++
+; FACILITY:	MCR - SET PROCESS commands
+;
+; ABSTRACT:	SET A PROCESS'S RUNTIME PARAMETERS
+;
+; AUTHOR:	Melanie A. Johnson	October 1982
+;
+;
+; Modified by:
+;
+;	V03.001	MAJ0001		Melanie Johnson	13-Jan-1983
+;		Write passback buffer information only when in a subprocess.
+;
+;--
+;
+; LOCAL MACROS
+;
+;
+; EXTERNAL SYMBOLS
+;
+	DEFCMDWRK			; define work area offsets
+	PTRDEF				; define result parse descriptor tokens
+	$CLIMSGDEF			; define cli messages
+	$PRVDEF				; define all the priv bits
+	$PBKDEF				; define passback structure
+
+;
+; LOCAL DATA
+;
+
+	LOC_V_VALSET = 0
+	LOC_M_VALSET = 1
+	LOC_V_IDENT  = 1
+	LOC_M_IDENT  = 2
+
+;
+; Offsets into the scratch buffer (scratch buffer descriptor is in R8)
+;
+
+	PROC_L_PID    =  0		; Process ID
+
+	OURPROC_L_PID =  4		; Our process's PID
+
+	PRIV          =  8		; Process temp privileges
+
+	SAVPRIV	      =  16		; A copy of the starting process privs
+
+	PSBK_BUFPTR   =  24		; Saved pointer of next free loc. in passback buffer
+
+	JPI_A_GETPID  =  28		; Item descriptor for $GETJPI call
+
+
+
+
+
+
+	.PSECT	MCR$ZCODE,BYTE,RD,NOWRT
+
+
+QUAL_TAB: .ASCII /IDENNAMENORENOSUNOSWPRIOPRIVRESORESUSUSPSWAP/
+QTAB_LEN  = . - QUAL_TAB
+
+
+;++
+; MCR$SETPROCESS - SET PROCESS PARAMETERS
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; THIS ROUTINE SETS A PROCESS'S:
+;
+;	NAME
+;	PRIORITY
+;	PRIVILEGES
+;	RESOURCE WAIT MODE
+;	SUSPEND /RESUME STATE
+;	SWAP MODE
+;
+; IT IS ENTERED AS A RESULT OF A DISPATCH FROM THE SET COMMAND PROCESSOR
+;
+; INPUTS:
+;
+;	R8  = Address of scratch buffer descriptor
+;	R9  = Address of scratch stack
+;	R10 = Result parse descriptor token pointer
+;	FP  = Base address of command work area
+;
+; OUTPUTS:
+;
+;	R0 = Status of the operation
+;--
+MCR$SETPROCESS::				; SET A PROCESS'S PARAMETERS
+	BICW	#LOC_M_VALSET,WRK_W_LOCFLG(FP) 	; Nothing has been accomplished yet
+	BICW	#LOC_M_IDENT,WRK_W_LOCFLG(FP)	; Clear /IDENT seen flag
+	MOVL	4(R8),R7			; Get scratch buffer address
+	ASSUME	PROC_L_PID EQ 0
+	ASSUME	OURPROC_L_PID EQ 4
+	CLRQ	PROC_L_PID(R7)			; Init. PIDs to 0
+;
+; ICP passback support  - if this is a subprocess, set up passback buffer pointer
+;
+	TSTL	PRC_L_OWNRPID(R11)		; Is this a subprocess?
+	BEQL	NEXTQUAL			; If EQL, no
+	MOVL	PRC_L_PBKPTR(R11),R6		; Get pointer to passback structure
+	MOVAL	PBK$A_INFO(R6),PSBK_BUFPTR(R7)	; Initialize pointer to passback buffer
+
+;
+; Get next qualifier and call action appropriate action routine
+;
+
+NEXTQUAL:
+	BSBW	MCR$GETDVAL		; Get next token
+	CMPB	R5,#PTR_K_ENDLINE	; At EOL?
+	BEQL	EOLINE			; If EQL, yes
+	CMPB	R5,#PTR_K_COMDQUAL	; Have we gotten to the keyword PROCESS?
+	BNEQ	EOLINE			; Finished command qualifiers - ignore the rest
+10$:	PUSHR	#^M<R1,R2>		; Save token string descr. for future use
+	CLRL	R6			; Clear table index
+	MOVAB	QUAL_TAB,R0		; Get qualifier table address
+
+;
+; Find the qualifier in the table and use index to determine which action
+; routine to call.
+;
+
+FINDQUAL:
+	MOVL	#4,R3			; Initialize counter
+	CMPB	R1,R3			; MIN (R1,R3)
+	BGEQ	MATCH			; If GEQ, R3=4 is ok
+	MOVL	R1,R3			; Typed length of qualifier was < 4
+MATCH:	CMPB	(R2)+,(R0)+		; Characters match?
+	BNEQ	NOWAY			; If NEQ, this isn't the right qualifier
+	SOBGTR	R3,MATCH		; Match up to 4 characters to resolve ambiguity
+
+
+;
+; We've found the qualifier, now branch to the correct action routine
+;
+; ***********************************************************************
+; NOTE:
+; The ordering of this CASE statement is based on the ordering of the
+; qualifier names (only four letters of which are given) in the table
+; (in this module), QUAL_TAB.  Any changes to this CASE statement should
+; be reflected in QUAL_TAB and vice versa.
+; ***********************************************************************
+;
+	ADDL	#8,SP			; Clean stack of R1, R2
+	CASE	R6,-			; Use index based on qual. found in table
+		LIMIT = #0,-		; Low limit of request
+		TYPE = B,<-		; Case on 8 bit value
+		IDENT,-			; /IDENTIFICATION=pid
+		SETPRN,-		; /NAME=procname
+		NORES_WAIT,-		; /NORESOURCE_WAIT
+		RESUME,-		; /NOSUSPEND
+		NOSWAP,-		; /NOSWAP
+		PRIORITY,-		; /PRIORITY=n
+		PRIVILEGE,-		; /PRIVILEGES=(priv[,...])
+		RES_WAIT,-		; /RESOURCE_WAIT
+		RESUME,-		; /RESUME
+		SUSPND,-		; /SUSPEND
+		SWAP,-			; /SWAP
+		>
+
+INVQ:	STATUS	INVQUAL			; If CASE fails, invalid qualifier
+	RSB
+
+;
+; This qualifier is definitely not right, prepare to check the next one
+;
+
+NOWAY:	SUBL3	R1,#4,R1		; Was typed qual. > 4 or < 4 char.
+	BLEQ	LRGR			; If LEQ, qual. was >= 4
+	ADDL	R1,R3			; Each qual. descr. in table is 4 char.
+LRGR:	DECL	R3			; Determining number of bytes to next entry
+	ADDL	R3,R0			; Move qual. table ptr. to begin of next qual.
+	INCL	R6			; Increment index (for CASE statement)
+	MOVL	(SP),R1			; Re-initialize token qual. length
+	MOVL	4(SP),R2		; Re-initialize token qual. address
+	BRB	FINDQUAL		; Try again to find this qualifier
+
+;
+; End of line token has been found
+;
+
+EOLINE:	STATUS	NORMAL			; Assume all went well
+	BITB	#LOC_M_VALSET,WRK_W_LOCFLG(FP) ; Was anything useful accomplished?
+	BNEQ	100$			; If NEQ, yes
+	STATUS	NOOPTPRS		; Nothing useful was accomplished
+100$:	RSB
+
+
+	.SBTTL	SET PROCESS PRIORITY
+;++
+; PRIORITY - SET PROCESS PRIORITY
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; THIS ACTION ROUTINE CALLS THE SYSTEM SERVICE SYS$SETPRI TO SET
+; THE PRIORITY OF A PROCESS.
+;
+;
+; INPUTS:
+;
+;	R7  = Address of scratch buffer
+;	R8  = Address of scratch buffer descriptor
+;	R9  = Address of scratch stack
+;	R10 = Result parse descriptor token pointer
+;	FP  = Base address of command work area
+;
+; OUTPUTS:
+;
+;	The priority of the current or of the specified process is changed if
+;	the user has ALTPRI.  (To affect other processes than this one requires
+;	GROUP or WORLD privilege as well.)  If no errors occur, a branch will
+;	be made to NEXTQUAL to process the next command qualifier.  If an error
+;	occurs, this will return with the error set in R0. 
+;--
+PRIORITY:
+	BISB	#LOC_M_VALSET,WRK_W_LOCFLG(FP) ; About to do something useful
+	BSBW	MCR$GETDVAL		; Get priority value
+	BLBS	R0,10$			; If LBS, found priority value
+	STATUS	VALREQ			; No priority value given
+	BRB	70$			; Error return
+10$:	MOVL	R2,R3			; Move descriptor address
+	MOVL	R1,R2			; and descriptor length to prepare for call
+	BSBW	MCR$CNVNUMDEC		; Convert ASCII value to decimal
+	MOVL	R1,-(R9)		; Save priority value
+	CMPL	(R9), #31		; Out of valid range 0-31?
+	BLEQU	40$			; Invalid if neg or GTR 31
+30$:	STATUS	IVVALU			; Invalid priority value
+	BRB	70$			; Return with error status
+40$:	BSBW	GETPROCID		; Get the process pid
+	BLBC	R0,70$			;
+50$:	$SETPRI_S PIDADR=PROC_L_PID(R7),- ; Set the priority
+		PRI=(R9)
+	TSTL	(R9)+			; Clean scratch stack
+	BLBC	R0,70$			; If error, exit with status
+;
+; ICP passback support  - if this is a subprocess, write the passback structure
+;
+	TSTL	PRC_L_OWNRPID(R11)	; Is this a subprocess?
+	BEQL	60$			; If EQL, no
+	MOVL	PRC_L_PBKPTR(R11),R6	; Get passback structure pointer
+	SETBIT	#PBK$V_PASSBACK,PBK$W_FLAGS(R6) ; Set passback flag
+	MOVZBL	#PBK$C_SETPROC,PBK$L_COMMANDS(R6) ; Mark this as the SET PROCESS command
+	MOVL	PSBK_BUFPTR(R7),R6	; Get address of passback buffer
+	MOVB	#PBK$C_PROC_PRIO,(R6)+	; Mark this as the /PRIORITY qualifier
+	MOVL	-4(R9),(R6)+		; Put the new priority into the passback buffer
+	MOVL	R6,PSBK_BUFPTR(R7)	; Save new pointer into passback buffer
+60$:	BRW	NEXTQUAL		; Go search for another qualifer
+
+70$:	RSB				; error return
+
+	.SBTTL	ENABLE/DISABLE SWAP MODE
+;++
+; SWAP - ENABLE PROCESS SWAP MODE
+; NOSWAP - DISABLE PROCESS SWAP MODE
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; THIS ACTION ROUTINE CALLS THE SYSTEM SERVICE SYS$SETSWM TO SET
+; THE PROCESS SWAP MODE.
+;
+;
+; INPUTS:
+;
+;	R7  = Address of scratch buffer
+;	R8  = Address of scratch buffer descriptor
+;	R9  = Address of scratch stack
+;	R10 = Result parse descriptor token pointer
+;	FP  = Base address of command work area
+;
+; OUTPUTS:
+;
+;	The current process is set to SWAP/NOSWAP according to
+;	the request if the user has the privilege, PSWAPM. 
+;	If an error occurs, this returns with the error in R0;
+;	otherwise, it branches to NEXTQUAL to process the next command
+;	qualifier.
+;--
+	.ENABL	LSB
+
+SWAP:	CLRL	R1			; Set flag to enable swapping
+	BRB	10$
+
+NOSWAP:	MOVL	#1,R1			; Set flag to disable swapping
+10$:	BISB	#LOC_M_VALSET,WRK_W_LOCFLG(FP) ; About to do something useful
+	PUSHL	R1			; Save swap flag
+	BSBW	GETPROCID		; Init. PROC_L_PID & OURPROC_L_PID
+	POPL	R1			; Restore swap flag
+	BLBC	R0,20$			; Something went wrong?
+	BSBB	CHECK_PROC		; Check that process other than ours not specified
+	BLBC	R0,20$			; A PID or proc. name other than ours specified
+	PUSHL	R1			; Save swap flag
+	$SETSWM_S R1			; Set swapping mode
+	POPL	R1			; Restore swap flag (for passbacks)
+	BLBC	R0,20$
+;
+; ICP passback support  - if this is a subprocess, write the passback structure
+;
+	TSTL	PRC_L_OWNRPID(R11)	; Is this a subprocess?
+	BEQL	15$			; If EQL, no
+	MOVL	PRC_L_PBKPTR(R11),R6	; Get the passback stucture pointer
+	SETBIT	PBK$V_PASSBACK,PBK$W_FLAGS(R6) ; Set passback flag
+	MOVZBL	#PBK$C_SETPROC,PBK$L_COMMANDS(R6) ; Indicate SET PROCESS command
+	MOVL	PSBK_BUFPTR(R7),R6	; Get ptr to passback information buffer
+	MOVB	#PBK$C_PROC_SWAP,(R6)+	; Indicate having seen [NO]SWAP qualifier
+	MOVL	R1,(R6)+		; Put swap/noswap flag into passback buffer
+	MOVL	R6,PSBK_BUFPTR(R7)	; Save new pointer into passback buffer
+15$:	BRW	NEXTQUAL
+20$:	RSB
+	.DSABL	LSB
+
+;++
+; CHECK_PROC -	LOCAL ROUTINE TO CHECK THAT A PROCESS NAME OR ID WERE
+;		NOT SPECIFIED
+;--
+; INPUTS:
+;
+;	R7  = Address of scratch buffer
+;	R8  = Address of scratch buffer descriptor
+;	R9  = Address of scratch stack
+;	R10 = Result parse descriptor token pointer
+;	FP  = Base address of command work area
+;
+; OUTPUTS:
+;
+;	R0 contains the status of the check
+;
+CHECK_PROC:
+	STATUS	NORMAL			; Assume no other process specified
+	CMPL	PROC_L_PID(R7),OURPROC_L_PID(R7) ; Process other than ours specified?
+	BEQL	20$			; If EQL no
+	BBC	#LOC_V_IDENT,WRK_W_LOCFLG(FP),10$ ; Br if no /IDENT=pid specified
+	STATUS	CONFQUAL		; /IDENT conflicts with qual. being processed
+	BRB	20$			;
+10$:	STATUS	MAXPARM			; The proc. name param can't be used w/ this qual.
+20$:	RSB				; Return
+
+	
+	.SBTTL	ENABLE/DISABLE RESOURCE WAIT MODE
+;++
+; RES_WAIT - ENABLE PROCESS RESOURCE WAIT MODE
+; NORES_WAIT - DISABLE PROCESS RESOURCE WAIT MODE
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; THIS ACTION ROUTINE CALLS THE SYSTEM SERVICE SYS$SETRWM TO SET
+; THE PROCESS RESOURCE WAIT MODE.
+;
+;
+; INPUTS:
+;
+;	R7  = Address of scratch buffer
+;	R8  = Address of scratch buffer descriptor
+;	R9  = Address of scratch stack
+;	R10 = Result parse descriptor token pointer
+;	FP  = Base address of command work area
+;
+; OUTPUTS:
+;
+;	The current process has resource wait mode enabled or disabled 
+;	according to the request.  If an error occurs, this returns with
+;	the error in R0;  otherwise, it branches to NEXTQUAL to process
+;	the next command qualifier.
+;--
+	.ENABL	LSB
+
+RES_WAIT:
+	CLRL	R1			; Set flag to enable waiting
+	BRB	10$
+
+NORES_WAIT:
+	MOVL	#1,R1			; Set flag to disable waiting
+10$:	BISB	#LOC_M_VALSET,WRK_W_LOCFLG(FP) ; About to do something useful
+	PUSHL	R1			; Save resource wait flag
+	BSBW	GETPROCID		; Init. PROC_L_PID and OURPROC_L_PID
+	POPL	R1			; Restore resource wait flag
+	BLBC	R0,20$			; Something went wrong?
+	BSBB	CHECK_PROC		; Check that process other than ours not specified
+	BLBC	R0,20$			; Process other than ours specified
+	PUSHL	R1			; Save resource wait flag
+	$SETRWM_S R1			; Set resource wait flag
+	POPL	R1			; Restore resource wait flag
+	BLBC	R0,20$
+;
+; ICP passback support  - if this is a subprocess, write the passback structure
+;
+	TSTL	PRC_L_OWNRPID(R11)	; Is this a subprocess?
+	BEQL	15$			; If EQL, no
+	MOVL	PRC_L_PBKPTR(R11),R6	; Get passback structure pointer
+	SETBIT	#PBK$V_PASSBACK,PBK$W_FLAGS(R6) ; Set passback flag
+	MOVZBL	#PBK$C_SETPROC,PBK$L_COMMANDS(R6) ; Mark this as the SET PROCESS command
+	MOVL	PSBK_BUFPTR(R7),R6	; Get address of next free loc. in passback buffer
+	MOVB	#PBK$C_PROC_RSRC,(R6)+	; Mark this as the /RESOURCE qualifier
+	MOVL	R1,(R6)+		; Put enable/disable flag into passback buffer
+	MOVL	R6,PSBK_BUFPTR(R7)	; Save new pointer into passback buffer
+15$:	BRW	NEXTQUAL
+20$:	RSB
+	.DSABL	LSB
+
+	.SBTTL	SET PROCESS PRIVILEGES
+;++
+; PRIVILEGE - SET PROCESS PRIVILEGES
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; THIS ACTION ROUTINE SETS THE SPECIFIED PRIVILEGES IN PCB$Q_PROCPRIV.
+; ONLY THE CURRENT PROCESS'S PRIVILEGES MAY BE ALTERED.
+;
+;
+; INPUTS:
+;
+;	R7  = Address of scratch buffer
+;	R8  = Address of scratch buffer descriptor
+;	R9  = Address of scratch stack
+;	R10 = Result parse descriptor token pointer
+;	FP  = Base address of command work area
+;
+; OUTPUTS:
+;
+;	The current process's privileges are altered according to
+;	the specifications if the user has SETPRV privilege.  If an
+;	error occurs, this returns with the error in R0;  otherwise,
+;	it branches to NEXTQUAL to process the next command qualifier.
+;--
+PRIVILEGE:
+	BISB	#LOC_M_VALSET,WRK_W_LOCFLG(FP) ; About to do something useful
+	PUSHR	#^M<R2,R3,R4,R5,R6>	; Save registers
+	BSBW	GETPROCID		; Init. PROC_L_PID and OURPROC_L_PID
+	BLBS	R0,5$			; Did we get a PID?
+4$:	BRW	90$			; Something went wrong
+5$:	BSBW	CHECK_PROC		; Check that process other than ours not specified
+	BLBC	R0,4$			; If LBC, process other than ours specified
+	$SETPRV_S PRVPRV=PRIV(R7),-	; Get current permanent privileges
+		  PRMFLG=#1		;
+	MOVQ	PRIV(R7),SAVPRIV(R7)	; Save the current privs
+10$:	BSBW	MCR$GETDVAL		; Get privilege name
+	CMPB	R5,#PTR_K_QUALVALU	; Is it really a priv?
+	BNEQ	20$			; If NEQ no
+	MOVQ	R1,-(R9)		; Put keyword descriptor on scratch stack
+	PUSHAQ	PRIV(R7)		; Set address of privilege mask
+	PUSHAQ	(R9)			; Set address of keyword descr.
+	CALLS	#2,PRV$SETPRIV		; Enable/disable specified privilege
+	ADDL	#8,R9			; Clean scratch stack
+	BLBS	R0,10$			; Look for next priv. keyword
+	BRB	50$			; If LBC, error
+20$:	SUBL	#PTR_C_LENGTH,R10	; Backup one token
+	MNEGL	#1,-(SP)		; Create privilege mask with all
+	MNEGL	#1,-(SP)		; (priv. mask is one quadword)
+	MOVL	SP,R2			; Get address of it
+	$SETPRV_S PRVADR=(R2),-		; Disable all privileges
+		  PRMFLG=#1,-		;
+		  ENBFLG=#0		;
+	$SETPRV_S PRVADR=PRIV(R7),-	; Enable new privileges
+		  PRMFLG=#1,-		;
+		  ENBFLG=#1		;
+	ADDL	#8,SP			; Clear quadword priv. mask off stack
+	CMPL	R0,#SS$_NOTALLPRIV	; Did this work the first time
+	BNEQ	30$			; Yes, then check it
+	$SETPRV_S PRVADR=PRIV(R7),-	; No then give him another chance
+		  PRMFLG=#1,-		; Because he may have set SETPRIV
+		  ENBFLG=#1		; The first time through
+30$:	CMPL	R0,#SS$_NOTALLPRIV	; If we didn't get everything
+	BNEQ	90$			; then
+	BBSC	#0,R0,90$		; make this a real error message
+	BRB	90$
+	
+50$:	CMPL	#PRV$_NOTUNQ,R0		; Ambiguous keyword?
+	BNEQ	60$			; If NEQ no
+	STATUS	ABKEYW			; Set ambiguous keyword error status
+	BRB	90$			;
+60$:	STATUS	IVKEYW			; Set invalid keyword error status
+90$:	POPR	#^M<R2,R3,R4,R5,R6>	; Restore registers
+	BLBC	R0,100$
+;
+; ICP passback support  - if this is a subprocess, write the passback structure
+;
+	TSTL	PRC_L_OWNRPID(R11)	; Is this a subprocess?
+	BEQL	95$			; If EQL, no
+	MOVL	PRC_L_PBKPTR(R11),R6	; Get the passback stucture pointer
+	SETBIT	PBK$V_PASSBACK,PBK$W_FLAGS(R6) ; Set passback flag
+	MOVZBL	#PBK$C_SETPROC,PBK$L_COMMANDS(R6) ; Indicate SET PROCESS command
+	MOVL	PSBK_BUFPTR(R7),R6	; Get ptr to passback information buffer
+	MOVB	#PBK$C_PROC_PRIV,(R6)+	; Indicate having seen PRIVILEGE qualifier
+	MOVQ	PRIV(R7),(R6)+		; Put new privilege mask into passback buffer
+	MOVL	R6,PSBK_BUFPTR(R7)	; Save new pointer into passback buffer
+95$:	BRW	NEXTQUAL
+100$:	RSB
+
+	.SBTTL	SET PROCESS NAME
+;++
+; SETPRN - SET PROCESS NAME
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; THIS ACTION ROUTINE SETS THE SPECIFIED PROCESS NAME.
+; ONLY THE CURRENT PROCESS'S NAME MAY BE ALTERED.
+;
+; INPUTS:
+;
+;	R7  = Address of scratch buffer
+;	R8  = Address of scratch buffer descriptor
+;	R9  = Address of scratch stack
+;	R10 = Result parse descriptor token pointer
+;	FP  = Base address of command work area
+;
+; OUTPUTS:
+;
+;	The current process's name is changed.  If an error occurs,
+;	this returns with the error in R0;  otherwise, it branches to
+;	NEXTQUAL to process the next command qualifier.
+;--
+SETPRN:
+	BISB	#LOC_M_VALSET,WRK_W_LOCFLG(FP) ; About to do something useful
+	PUSHR	#^M<R2,R3,R4,R5,R6,R7,R8> ; Save registers
+	BSBW	GETPROCID		; Init. PROC_L_PID & OURPROC_L_PID
+	BLBC	R0,20$			; Something went wrong?
+	BSBW	CHECK_PROC		; Check that process other than ours not specified
+	BLBC	R0,20$			; If LBC, a process other than ours was specified
+	BSBW	MCR$GETDVAL		; Get token for process name
+	BLBC	R0,10$			; Didn't find a process name token
+	CMPB	R5,#PTR_K_QUALVALU	; Make sure it is the new proc. name
+	BNEQ	10$			; If NEQ, error
+	MOVQ	R1,-(R9)		; Put process name descr. on scratch stack
+	$SETPRN_S PRCNAM=(R9)		; Set process name
+	ADDL	#8,R9			; Clean scratch stack
+	BLBC	R0,20$			;
+	POPR	#^M<R2,R3,R4,R5,R6,R7,R8> ; Restore registers
+	BRW	NEXTQUAL		; Process next qualifier in command
+10$:	STATUS	VALREQ			; No new process name given - required
+20$:	POPR	#^M<R2,R3,R4,R5,R6,R7,R8> ; Restore registers
+	RSB
+
+	.SBTTL	SUSPEND/RESUME processes
+;++
+; SUSPND / RESUME - Suspend or Resume
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Suspends or resumes the specified process.
+;
+; INPUTS:
+;
+;	R7  = Address of scratch buffer
+;	R8  = Address of scratch buffer descriptor
+;	R9  = Address of scratch stack
+;	R10 = Result parse descriptor token pointer
+;	FP  = Base address of command work area
+;
+; OUTPUTS:
+;
+;	If an error occurs, this returns with the error in R0; otherwise, it
+;	branches to NEXTQUAL to process the next command qualifier.
+;--
+	.ENABL	LSB
+SUSPND:	BISB	#LOC_M_VALSET,WRK_W_LOCFLG(FP) ; About to do something useful
+	BSBW	GETPROCID		; Get the process we are working on
+	BLBC	R0,100$			; If problems, error out
+	CMPL	OURPROC_L_PID(R7),PROC_L_PID(R7) ; Is this our process?
+	BEQL	70$			; If EQL, yes - don't suspend
+	CMPL	PROC_L_PID(R7),PRC_L_OWNRPID(R11) ; If subprocess, is this our owner
+	BNEQ	80$			; If NEQ, no - suspend the process
+70$:	MOVL	#SS$_ILLSELF,R0		; Don't allow suspension of self or owner
+	BRB	100$			;
+80$:	$SUSPND_S -			; Suspend requested process
+		PIDADR=PROC_L_PID(R7)	;
+	BLBC	R0,100$			; If LBC, error
+	BRW	NEXTQUAL		; Process next qualifier
+100$:	RSB
+	.DSABL	LSB
+
+;
+; Resumes a process
+;
+RESUME:	BISB	#LOC_M_VALSET,WRK_W_LOCFLG(FP) ; About to do something useful
+	BSBW	GETPROCID		; Get the process we are working on
+	BLBC	R0,100$			; If problems, error out
+	$RESUME_S -			; Resume requested process
+		PIDADR=PROC_L_PID(R7)	;
+	BLBC	R0,100$			; If LBC, error
+	BRW	NEXTQUAL		; Process next qualifier in line
+100$:	RSB
+
+	.SBTTL	IDENT - SET PROCESS ID
+;++
+; IDENT - Set process identification
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; Retrieves the process id specified by the /IDENT=pid qualifier
+; and sets PROC_L_PID to that value
+;
+; INPUTS:
+;
+;	R7  = Address of scratch buffer
+;	R8  = Address of scratch buffer descriptor
+;	R9  = Address of scratch stack
+;	R10 = Result parse descriptor token pointer
+;	FP  = Base address of command work area
+;
+; OUTPUTS:
+;
+;	PROC_L_PID(R7) contains the PID given.  If an error occurs,
+;	this returns with the error in R0;  otherwise, it branches
+;	to NEXTQUAL to process the next command qualifier.
+;__
+
+IDENT:	SETBIT	LOC_V_IDENT,WRK_W_LOCFLG(FP) ; Mark having seen /IDENT
+	TSTL	PROC_L_PID(R7)		; Have we already processed /IDENT?
+	BNEQ	30$			; If NEQ, yes
+;
+; Get our own pid first (needed to prevent us from self-suspension)
+;
+	MOVAL	JPI_A_GETPID(R7),R3	; Get address of itemlist descriptor
+	MOVW	#4,(R3)+		; Buffer length (PID is one longword)
+	MOVW	#JPI$_PID,(R3)+		; Item code
+	MOVAL	PROC_L_PID(R7),(R3)+	; Place to put returned PID
+	MOVQ	#0,(R3)			; Return length addr & item list terminator
+	$GETJPI_S ITMLST=JPI_A_GETPID(R7) ; Get the info on us first
+	MOVL	PROC_L_PID(R7),OURPROC_L_PID(R7) ; Keep this process id for comparison
+;
+; Get the pid specified in the command line
+;
+	BSBW	MCR$GETDVAL		; Get the PID
+	BLBC	R0,10$			; If LBC, error
+	CMPB	R5,#PTR_K_QUALVALU	; IS this a qualifier value as expected?
+	BNEQ	10$			; If NEQ, no
+	MOVL	R2,R3			; Relocate descriptor
+	MOVL	R1,R2			; to prepare for call
+	MOVL	#0,R1			; Zero means interpret ASCII as representing hex.
+	BSBW	MCR$CNVASCBIN		; Convert ASCII (hex rep.) to binary
+	BNEQ	20$			; If return (in R0) not zero, then error
+	MOVL	R1,PROC_L_PID(R7)	; Store the pid for future reference
+	BRW	NEXTQUAL		; Go on to process the next qualifier
+
+10$:	STATUS	VALREQ			; Assume value missing
+	BRB	30$
+20$:	STATUS	IVVALU			; Invalid value
+30$:	RSB				; Error return
+
+	.SBTTL	GETPROCID - WILL GET THE PROCESS ID
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+; Returns the process id of the process that was specified by the call
+; to this program.
+;
+; INPUTS:
+;
+;	R7  = Address of scratch buffer
+;	R8  = Address of scratch buffer descriptor
+;	R9  = Address of scratch stack
+;	R10 = Result parse descriptor token pointer
+;	FP  = Base address of command work area
+;
+; OUTPUTS:
+;
+;	PROC_L_PID contains the PID given using /IDENT=pid or the PID
+;	of the process name given as the process-name parameter or the
+;	PID of this process if neither of the above were specified.
+;	OURPROC_L_PID contains the PID of this process.  If an error
+;	occurs, R0 contains the error status.
+;__
+GETPROCID::
+	PUSHL	R10			; Save current token descriptor pointer
+	TSTL	PROC_L_PID(R7)		; Have we already determined PID for commmand?
+	BNEQ	25$			; We've already got a PID
+	MOVAL	JPI_A_GETPID(R7),R3	; Get address of itemlist descriptor
+	MOVW	#4,(R3)+		; Buffer length (PID is one longword)
+	MOVW	#JPI$_PID,(R3)+		; Item code
+	MOVAL	PROC_L_PID(R7),(R3)+	; Place to put returned PID
+	MOVQ	#0,(R3)			; Return length addr & item list terminator
+	$GETJPI_S ITMLST=JPI_A_GETPID(R7) ; Get the info on us first
+	MOVL	PROC_L_PID(R7),OURPROC_L_PID(R7) ; Keep this process id for comparison
+	MOVAB	WRK_AG_RESULT(FP),R10	; Start with beginning of token stream
+10$:	BSBW	MCR$GETDVAL		; Get next token
+	BLBC	R0,50$			; End of token stream
+	CMPB	R0,#PTR_K_ENDLINE	; Is this the end of the command line?
+	BEQL	50$			; If EQL, yes
+	CMPB	R5,#PTR_K_COMDQUAL	; Is this a command qualifier?
+	BNEQ	40$			; If NOT, no
+	CMPB	#4,R1			; Do we have 4 letters to compare?
+	BGTR	30$			; No, compare fewer letters
+	CMPL	(R2),#^A/IDEN/		; Is it the /IDENTIFICATION qualifier?
+	BNEQ	10$			; If NEQ, no - look at next token
+20$:	SETBIT	LOC_V_IDENT,WRK_W_LOCFLG(FP) ; Mark having seen /IDENT
+	BSBW	MCR$GETDVAL		; Get the PID
+	BLBC	R0,45$			; No PID in the command line
+	CMPB	R5,#PTR_K_QUALVALU	; Is this a qualifier value as expected?
+	BNEQ	45$			; If NEQ, no
+	MOVL	R2,R3			; Relocate descriptor for call
+	MOVL	R1,R2			; to conversion routine
+	MOVL	#0,R1			; Zero means interpret ASCII as respresenting hex.
+	BSBW	MCR$CNVASCBIN		; Convert ASCII (hex repr.) to binary
+	MOVL	R1,PROC_L_PID(R7)	; Store pid for future reference
+25$:	BRB	50$
+		
+30$:	CMPB	#^A/I/,(R2)		; Could it be /IDENT?
+	BEQL	20$			; If EQL, yes
+	BRB	10$			; No, try again
+
+40$:	CMPB	R5,#PTR_K_PARAMETR	; Looking for second parameter (proc. name)
+	BNEQ	10$			; If NEQ no, keep looking
+	CMPL	(R2),#^A/PROC/		; Is it the first parameter?
+	BEQL	10$			; If EQL yes, keep looking for proc. name
+	MOVQ	R1,-(R9)		; Copy descriptor to scratch stack
+	$GETJPI_S PRCNAM=(R9),ITMLST=JPI_A_GETPID(R7) ; Get PID of named process
+	ADDL	#8,R9			; Clean scratch stack
+	BRB	60$			; Return with PID of process named by param.
+
+45$:	STATUS	VALREQ			; PID is missing
+	BRB	60$			;
+50$:	STATUS	NORMAL			; Have a valid PID to return
+60$:	POPL	R10			; Restore token descriptor pointer
+	RSB
+
+	.END

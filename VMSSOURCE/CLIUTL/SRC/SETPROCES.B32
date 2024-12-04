@@ -1,0 +1,758 @@
+MODULE setproces ( IDENT = 'V04-000',
+		ADDRESSING_MODE (EXTERNAL = GENERAL)) =
+BEGIN
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  SETPRO Command
+!
+! ABSTRACT:
+!
+!	This module sets various parameters for a process.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system, user mode
+!
+! AUTHOR:  Gerry Smith				12-Jan-1983
+!
+! Modified by:
+!
+!	V03-007	AEW0002		Anne Warner		05-Jul-1984
+!		Change ALTPRV to ALTPRI from previous fix because
+!		there's no such creature as ALPTRV.
+!
+!	V03-006	AEW0001		Anne Warner		04-Jun-1984
+!		Add non-fatal error message SET$_NOPRIO indicating
+!		that the process priority could not be raised above
+!		base priority because it does not have the user
+!		privilege ALTPRV. (actually its ALTPRI - see  above)
+!
+!	V03-005	GAS0182		Gerry Smith		19-Sep-1983
+!		Change the way that privileges get set.  Instead of
+!		disabling all privileges and then re-enabling them,
+!		figure out which privileges to enable, and which
+!		to disable, and then do it explicitly.
+!
+!	V03-004	GAS0157		Gerry Smith		25-Jul-1983
+!		Use the real process ID of the process, rather than
+!		what the user input.
+!
+!	V03-003	WMC0001		Wayne Cardoza		11-Apr-1983
+!		Add SET PROC/DUMP.
+!
+!	V03-002 GAS0113			Gerry Smith	30-Mar-1983
+!		Collect and validate all qualifiers and values first,
+!		then make all the modifications.
+!
+!	V03-001	GAS0112			Gerry Smith	29-Mar-1983
+!		Remove last traces of the old command dispatcher.
+!
+!--
+
+!
+! Include files
+!
+LIBRARY 'SYS$LIBRARY:LIB';		! VAX/VMS common definitions
+
+
+
+!
+! Table of contents
+!
+
+FORWARD ROUTINE
+    set$process : NOVALUE,		! Main routine
+    get_name : NOVALUE,			! Get process name
+    get_quals : NOVALUE,		! Get all qualifiers and values
+    set_process : NOVALUE,		! Set them
+    set_dump	: NOVALUE;		! Kernel mode routine to set dump flag
+
+!
+! External routines
+!
+EXTERNAL ROUTINE
+    lib$cvt_htb,			! Convert ASCII (hex) to binary
+    lib$cvt_dtb,			! Convert ASCII (decimal) to binary
+    prv$setpriv,			! Set/clear privilege bits in bitmask
+    cli$get_value,			! Get value from CLI
+    cli$present;			! See if qualifier is present
+
+!
+! External globals
+!
+EXTERNAL
+    ctl$gq_procpriv : VECTOR[2],	! Process privileges
+    ctl$gl_phd	: REF BLOCK[,BYTE];	! P1 window to PHD
+
+!
+! Declare the final status return.
+!
+EXTERNAL
+    set$exit_status;
+
+
+!
+! Declare some shared messages
+!
+$SHR_MSGDEF	(SET,119,LOCAL,
+    		(invquaval,	error));
+
+!
+! Declare literals defined elsewhere
+!
+EXTERNAL LITERAL
+    cli$_absent, 			! Qualifier absent
+    cli$_negated,			! Qualifier explicitly negated
+    set$_writeerr,			! Error modifying
+    set$_noprio,			! Priority not changed
+    set$_prioset,			! Priority changed
+    set$_noname,			! Name not changed,
+    set$_nameset,			! Name changed
+    set$_notsuspnd,			! Process not suspended
+    set$_resumed,			! Process resumed
+    set$_notresumed,			! Process not resumed
+    set$_suspnd,			! Process suspended
+    set$_modeset,			! Process mode changed
+    set$_notpriv,			! Privileges not set
+    set$_privset,			! Privileges set
+    set$_ownproc;			! Qualifier only good for own process
+
+!
+! Declare the literals for the different qualifiers
+!
+LITERAL
+    $EQULST (set$_,,1,1,
+	(log,),
+    	(priority,),
+	(name,),
+	(resume,),
+	(suspend,),
+	(swap,),
+	(swapval,),
+	(wait,),
+	(waitval),
+	(priv),
+	(dump),
+	(dumpval));
+
+!
+! It is convenient to declare one large vector containing all the data,
+! and give the separate pieces names that humans like.  So, declare a
+! macro that will make those binds at the beginning of each subroutine.
+! 
+MACRO
+    BIND_DATA =
+	BIND
+	    flags	= data_buffer[0] : BITVECTOR[32],
+	    pid		= data_buffer[1] : VOLATILE,
+	    priority	= data_buffer[2],
+	    new_name	= data_buffer[3] : VECTOR[2],
+	    enab_priv	= data_buffer[5] : VECTOR[2],
+	    disab_priv  = data_buffer[7] : VECTOR[2],
+	    name_desc	= data_buffer[9] : VECTOR[2],
+	    name_buffer = data_buffer[11]: VECTOR[3];%;
+
+GLOBAL ROUTINE set$process : NOVALUE =
+BEGIN
+!++
+! Functional description
+!
+!	This is the routine for the SET PROCESS command.  It is called from the
+!	SET command processor,	and sets various runtime parameters for a 
+!	process.
+!
+! Inputs
+!	None
+!
+! Outputs
+!	None
+!
+!----
+
+LOCAL
+    status,				! Status return
+    data_buffer : VECTOR[20]		! Buffer containing all the data
+    		INITIAL(REP 20 of (0));	! initially clear
+
+get_name(data_buffer);			! Get the name of the process.
+
+get_quals(data_buffer);			! Get all the qualifiers.
+
+IF .set$exit_status			! If no errors so far,
+THEN set_process(data_buffer);		! set the new values.
+
+RETURN;
+END;
+
+ROUTINE get_name (data_buffer) : NOVALUE =
+BEGIN
+
+!++
+!
+! Get the process name and tuck it away to use later.
+!
+! Inputs
+!	DATA_BUFFER - contains all the data cells
+!
+! Outputs
+!	NAME_DESC will point to the process name
+!	PID will contain the process ID of the process to change
+!
+!__
+
+MAP
+    data_buffer : REF VECTOR;
+
+LOCAL
+    status,				! General status return
+    desc : $BBLOCK[dsc$c_s_bln],	! General descriptor
+    iosb : VECTOR[4,WORD],		! Status block for GETJPI
+    jpi_list : $ITMLST_DECL(ITEMS = 2); ! Item list for GETJPI
+
+!
+! Bind the data to names we can understand
+!
+bind_data;
+
+!
+! Collect the process name, if specified.  If no process name is
+! specified, try a process id.
+!
+$init_dyndesc(desc);			! Make the descriptor dynamic
+pid = 0;				! Show that no PID found yet.
+name_desc[1] = name_buffer;		! Point to process name buffer
+
+!
+! If the process name is given, also get the PID
+!
+IF cli$get_value(%ASCID 'PROCESS', desc)! Get the process name
+THEN					! If the process name exists,
+    BEGIN				! convert it to a PID.
+!
+! Set up the JPI item list to get the PID.
+!
+    $ITMLST_INIT(ITMLST = jpi_list,
+		(ITMCOD = jpi$_pid, BUFADR = pid));
+    status = $GETJPIW(ITMLST = jpi_list,
+		      PRCNAM = desc,
+		      IOSB   = iosb);
+    IF .status
+    THEN status = .iosb[0];
+    IF NOT .status
+    THEN SIGNAL(set$_writeerr, 1, desc, .status)
+    ELSE
+    	BEGIN
+	CH$MOVE(.desc[dsc$w_length], .desc[dsc$a_pointer], name_buffer);
+	name_desc[0] = .desc[dsc$w_length];
+	name_desc[1] = name_buffer;
+    	END;
+    END
+
+!
+! If no process name, perhaps the PID was specified.
+!
+ELSE					! If no process name,
+    BEGIN				! try for a PID
+    IF cli$get_value(%ASCID 'IDENTIFICATION',
+	    	     desc)
+    THEN				! If we get a PID,
+	BEGIN				! convert it to a number
+	IF NOT (status = lib$cvt_htb(.desc[dsc$w_length],
+				     .desc[dsc$a_pointer],
+				     pid))
+	THEN SIGNAL(set$_invquaval, 2, 
+    		    desc, %ASCID 'IDENTIFICATION')
+	ELSE
+	    BEGIN
+	    $ITMLST_INIT(ITMLST = jpi_list,
+    			(ITMCOD = jpi$_pid,
+    			 BUFADR = pid),
+			(ITMCOD = jpi$_prcnam,
+			 BUFADR = name_buffer,
+			 BUFSIZ = 20,
+			 RETLEN = name_desc[0]));
+	    status = $GETJPIW(ITMLST = jpi_list,
+			      PIDADR = pid,
+			      IOSB   = iosb);
+	    IF .status 
+	    THEN status = .iosb[0];
+	    IF NOT .status
+	    THEN SIGNAL(set$_writeerr, 1, desc, .status);
+	    END;
+	END;
+    END;
+!
+! If no PID specified, use the PID and name of the current process.
+!
+IF .pid EQL 0
+THEN
+    BEGIN
+    $ITMLST_INIT(ITMLST = jpi_list,		! Set up JPI list to get 
+		(ITMCOD = jpi$_pid,		! the current process
+		 BUFADR = pid),			! PID and name, and
+		(ITMCOD = jpi$_prcnam,		! stuff them into the
+		 BUFADR = name_buffer,		! appropriate places.
+		 BUFSIZ = 20,
+		 RETLEN = name_desc[0]));
+    status = $GETJPIW(ITMLST = jpi_list,
+		      IOSB   = iosb);
+    IF .status 
+    THEN status = .iosb[0];
+    IF NOT .status
+    THEN SIGNAL(set$_writeerr, 1, %ASCID 'this process', .status);
+    END;
+
+RETURN;
+END;
+
+ROUTINE get_quals (data_buffer) : NOVALUE =
+BEGIN
+!++
+!
+! Get all and validate all the qualifiers.  If any errors, signal them.
+!
+! Inputs
+!	DATA_BUFFER contains all the data cells.
+!
+! Outputs
+!	FLAGS will have bits set to indicate what is to change.
+!	PRIORITY will have the new priority.
+!	NEW_NAME will point to the new process name.
+!	PRIV will be the new privilege mask.
+!
+
+!
+! Bind the data buffer to names that humans like.
+!
+
+MAP
+    data_buffer : REF VECTOR;
+
+LOCAL
+    status,
+    ourpid,
+    iosb : VECTOR[2],
+    jpi_list : $ITMLST_DECL(ITEMS = 1),
+    desc : $BBLOCK[dsc$c_s_bln];
+
+!
+! Bind the data buffer to names that are more understandable
+!
+bind_data;
+
+!
+! Obtain the process ID of this process.  It will be used to check that
+! certain qualifiers are not requested inappropriately.
+!
+$ITMLST_INIT(ITMLST = jpi_list,
+	    (ITMCOD = jpi$_pid,
+    	     BUFADR = ourpid)
+    	    );
+$GETJPIW(ITMLST = jpi_list,
+	 IOSB   = iosb);
+
+
+!
+! See if logging is requested.
+!
+flags[set$_log] = cli$present(%ASCID 'LOG');
+
+!
+! /PRIORITY=n
+!
+$init_dyndesc(desc);					! Make desc. dynamic
+IF cli$get_value(%ASCID 'PRIORITY', desc)		! See if qualifier there
+THEN
+    BEGIN
+    flags[set$_priority] = 1;
+    IF NOT lib$cvt_dtb(.desc[dsc$w_length],		! If not a good value,
+		       .desc[dsc$a_pointer],		! tell the user
+		       priority)
+    THEN SIGNAL(set$_invquaval, 2, desc, %ASCID 'PRIORITY')
+    ELSE
+	BEGIN						! Perform bounds
+	IF .priority GTR 31				! checking, telling
+	OR .priority LSS 0				! if out of bounds
+	THEN SIGNAL(set$_invquaval, 2, desc, %ASCID 'PRIORITY');
+    	END;
+    END;
+
+!
+! /NAME = string 
+!
+IF cli$get_value(%ASCID 'NAME', desc)			! If a new name requested
+THEN
+    BEGIN
+    IF .ourpid NEQ .pid
+    THEN SIGNAL(set$_ownproc,
+    		1,
+    		%ASCID 'NAME');
+    flags[set$_name] = 1;				! Set the flag
+    new_name[0] = .desc[dsc$w_length];			! Point to the name
+    new_name[1] = .desc[dsc$a_pointer];
+    $init_dyndesc(desc);				! Re-use the descriptor
+    END;
+
+!
+! /SUSPEND and /RESUME are inverses of each other, and so are treated 
+! together.  However, although there is a /NOSUSPEND, there is no /NORESUME.
+!
+status = cli$present(%ASCID 'SUSPEND');
+IF .status
+THEN flags[set$_suspend] = 1
+ELSE IF .status EQL cli$_negated
+THEN flags[set$_resume] =1;
+IF cli$present(%ASCID 'RESUME')
+THEN flags[set$_resume] = 1;
+
+!
+! /[NO]SWAP 
+!
+status = cli$present(%ASCID 'SWAPPING');
+IF .status NEQ cli$_absent
+THEN
+    BEGIN
+    IF .ourpid NEQ .pid
+    THEN SIGNAL(set$_ownproc,
+    		1,
+    		%ASCID '[NO]SWAP');
+    flags[set$_swap] = 1;
+    flags[set$_swapval] = NOT .status;
+    END;
+
+!
+! /[NO]RESOURCE_WAIT 
+!
+status = cli$present(%ASCID 'RESOURCE_WAIT');
+IF .status NEQ cli$_absent
+THEN
+    BEGIN
+    IF .ourpid NEQ .pid
+    THEN SIGNAL(set$_ownproc,
+    		1,
+    		%ASCID '[NO]RESOURCE_WAIT');
+    flags[set$_wait] = 1;
+    flags[set$_waitval] = NOT .status;
+    END;
+
+!
+! /PRIVILEGES = list
+!
+IF cli$present(%ASCID 'PRIVILEGES')
+THEN
+    BEGIN
+    LOCAL
+	oldpriv : VECTOR[2],
+	newpriv : VECTOR[2];
+    IF .ourpid NEQ .pid
+    THEN SIGNAL(set$_ownproc,
+    		1,
+    		%ASCID 'PRIVILEGES');
+    flags[set$_priv] = 1;
+
+!
+! Copy the current process privileges into local memory.
+!
+    oldpriv[0] = newpriv[0] = .ctl$gq_procpriv[0];
+    oldpriv[1] = newpriv[1] = .ctl$gq_procpriv[1];
+
+!
+! Then get all the privileges that were specified by the user.  For 
+! each privilege given, call the unsupported, undocumented routine
+! PRV$SETPRIV, which will decipher the ASCII text given it (e.g. NOLOG)
+! and set or clear the corresponding bit in the two-longword privilege 
+! bitmask.
+!
+    WHILE cli$get_value(%ASCID 'PRIVILEGES', desc)
+    DO
+	BEGIN
+	IF NOT (status = PRV$SETPRIV(desc, newpriv))
+	THEN SIGNAL(set$_invquaval, 2,			! Say it's invalid
+	    	    desc,
+	    	    %ASCID 'PRIVILEGES');
+	END;
+
+!
+! Get the privileges to enable and disable.
+!
+    enab_priv[0] = .newpriv[0] AND NOT .oldpriv[0];
+    enab_priv[1] = .newpriv[1] AND NOT .oldpriv[1];
+    disab_priv[0] = .oldpriv[0] AND NOT .newpriv[0];
+    disab_priv[1] = .oldpriv[1] AND NOT .newpriv[1];
+    END;
+
+!
+! /[NO]DUMP
+!
+status = cli$present(%ASCID 'DUMP');
+IF .status NEQ cli$_absent
+THEN
+    BEGIN
+    IF .ourpid NEQ .pid
+    THEN SIGNAL(set$_ownproc,
+    		1,
+    		%ASCID 'DUMP');
+    flags[set$_dump] = 1;
+    flags[set$_dumpval] = .status;
+    END;
+
+RETURN;
+END;
+
+ROUTINE set_process (data_buffer) : NOVALUE =
+BEGIN
+!++
+!
+! Set all the parameters specified, signalling any errors.
+!
+! Inputs
+!	FLAGS will have bits set to indicate what is to change.
+!	PRIORITY will have the new priority.
+!	NEW_NAME will point to the new process name.
+!	PRIV will be the new privilege mask.
+!
+! Outputs
+!	None
+!__
+
+MAP
+    data_buffer : REF VECTOR;
+
+LOCAL
+    status;
+
+!
+! Bind the data buffer to pleasant, simple names that humans can enjoy
+!
+bind_data;
+
+!
+! /PRIORITY = n
+!
+IF .flags[set$_priority]
+THEN
+    BEGIN
+    LOCAL
+	want_priority;
+
+    IF NOT (status = $SETPRI(PIDADR = pid,
+			     PRI    = .priority))
+    THEN SIGNAL(set$_writeerr, 1, %ASCID 'process priority',
+		.status)
+!
+! If the priority requested is greater than the base priority and the process
+! does not have ALTPRI privilege then $SETPRI will only set the priority to the
+! base.  If this is the case or the user requested a log then we need further
+! information on the process to tell the user.  Since we cannot be sure if the
+! wanted priority was set until after the $GETJPIW we must do it in all cases.
+!
+    ELSE
+    BEGIN
+	LOCAL
+	    iosb : VECTOR[4,WORD],
+	    jpi_list : $ITMLST_DECL(ITEMS=2);
+
+        want_priority = .data_buffer[2];	! Save the priority requested
+						! Generic value because of BIND
+!
+! Set up the JPI item list to get the new process priority. 
+!
+	$ITMLST_INIT(ITMLST = jpi_list,
+		    (ITMCOD = jpi$_prib, BUFADR = priority));
+	status = $GETJPIW(ITMLST = jpi_list,
+			  PIDADR = pid,
+			  IOSB   = iosb);
+	IF .status
+	THEN status = .iosb[0];
+	IF NOT .status
+	THEN SIGNAL(.status)
+	ELSE 
+!
+! Display correct message
+!
+	BEGIN			
+	   IF .want_priority GTR .priority 	! If the desired priority was not
+	   THEN SIGNAL(set$_noprio)		! set then ALTPRI not set
+	   ELSE
+ 	      IF .flags[set$_log]		! If logging requested
+	      THEN SIGNAL(set$_prioset, 3, name_desc, .pid, .priority);
+        END;
+	END;
+    END;
+
+!
+! /NAME = string 
+!
+IF .flags[set$_name]
+THEN
+    BEGIN
+    IF NOT (status = $SETPRN(PRCNAM = new_name))
+    THEN SIGNAL(set$_writeerr, 1,			! Signal if an error
+    		%ASCID 'process name',
+    		.status)
+    ELSE IF .flags[set$_log]
+    THEN SIGNAL(set$_nameset, 1, new_name);		! or if /LOG
+    END;
+
+!
+! /SUSPEND 
+!
+IF .flags[set$_suspend]
+THEN
+    BEGIN
+    IF NOT (status = $SUSPND(PIDADR = pid))		! If a problem,
+    THEN SIGNAL(set$_notsuspnd, 2, name_desc, .pid,	! signal it
+		.status)
+    ELSE IF .flags[set$_log]				! If /LOG, signal it
+    THEN SIGNAL(set$_suspnd, 2, name_desc, .pid);
+    END;
+
+!
+! /NOSUSPEND or /RESUME
+!
+IF .flags[set$_resume]
+THEN
+    BEGIN
+    IF NOT (status = $RESUME(PIDADR = pid))
+    THEN SIGNAL(set$_notresumed, 2, name_desc, .pid, .status)
+    ELSE IF .flags[set$_log]
+    THEN SIGNAL(set$_resumed, 2, name_desc, .pid);
+    END;
+
+!
+! /[NO]SWAP 
+!
+IF .flags[set$_swap]
+THEN
+    BEGIN
+    IF NOT (status = $SETSWM(SWPFLG = .flags[set$_swapval]))	! If an error,
+    THEN SIGNAL(set$_writeerr, 1, %ASCID 'swap mode',		! signal it
+    		.status)
+    ELSE IF .flags[set$_log]
+    THEN SIGNAL(set$_modeset, 1,
+	        (IF .flags[set$_swapval]
+		 THEN %ASCID 'NOSWAP'
+		 ELSE %ASCID 'SWAP'));
+    END;
+
+!
+! /[NO]RESOURCE_WAIT 
+!
+IF .flags[set$_wait]
+THEN
+    BEGIN
+    IF NOT (status = $SETRWM(WATFLG = .flags[set$_waitval]))
+    THEN SIGNAL(set$_writeerr, 1,			! Signal if a problem
+    		%ASCID 'resource wait mode',
+    		.status)
+    ELSE IF .flags[set$_log]				! Signal if /LOG
+    THEN SIGNAL(set$_modeset, 1,
+	    	(IF .flags[set$_waitval]
+		 THEN %ASCID 'NORESOURCE_WAIT'
+		 ELSE %ASCID 'RESOURCE_WAIT'));
+    END;
+
+!
+! /PRIVILEGES = list
+!
+IF .flags[set$_priv]
+THEN
+    BEGIN
+
+!
+! Enable the new privileges.
+!
+    IF .enab_priv[0] NEQ 0			! If anything to enable,
+    OR .enab_priv[1] NEQ 0
+    THEN status = $SETPRV(PRVADR = enab_priv,	! do it and save the status,
+		          PRMFLG = 1,
+		          ENBFLG = 1)
+    ELSE status = 1;				! otherwise set success.
+
+    IF .disab_priv[0] NEQ 0			! If anything to disable,
+    OR .disab_priv[1] NEQ 0
+    THEN $SETPRV(PRVADR = disab_priv,		! do that as well.  Forget
+	         PRMFLG = 1,			! the status, you can always
+	         ENBFLG = 0);			! remove privilege.
+
+    IF NOT .status				! If it failed this time, then
+    THEN SIGNAL(set$_notpriv, .status)		! signal it
+    ELSE
+	BEGIN					! NOTALLPRIV is success, so 
+	IF .status EQL ss$_notallpriv		! signal it as an error
+	THEN SIGNAL(ss$_notallpriv AND %X'FFFFFFFE')
+	ELSE IF .flags[set$_log]		! Signal a real success if
+	THEN SIGNAL(set$_privset);		! logging requested
+	END;
+    END;
+
+!
+! /[NO]DUMP
+!
+IF .flags[set$_dump]
+THEN
+    IF .flags[set$_dumpval]
+    THEN
+	BEGIN
+	$CMKRNL( ROUTIN = set_dump,
+		 ARGLST = UPLIT(1,1));
+	SIGNAL(set$_modeset, 1, %ASCID 'DUMP');
+	END
+    ELSE
+	BEGIN
+	$CMKRNL( ROUTIN = set_dump,
+		 ARGLST = UPLIT(1,0));
+	SIGNAL(set$_modeset, 1, %ASCID 'NODUMP');
+	END;
+
+RETURN;
+END;
+
+ROUTINE set_dump (mode) : NOVALUE =
+BEGIN
+!++
+! Functional description
+!
+!	This routine sets the dump mode.  It can only affect the current 
+!	process.
+!
+! Inputs
+!	mode - 1 or 0 for mode on or off
+!
+! Outputs
+!	None
+!
+!----
+
+ctl$gl_phd[phd$v_imgdmp] = .mode;
+
+return;
+
+END;
+
+
+END
+ELUDOM

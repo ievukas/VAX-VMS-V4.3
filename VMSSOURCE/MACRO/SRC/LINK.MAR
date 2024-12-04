@@ -1,0 +1,688 @@
+    	.title	mac$link		link directive processor
+	.ident	'V04-000'
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+;
+; Facility:
+;
+;	VAX-11 Macro Assembler
+;
+; Abstract:
+;
+;	This module contains the routines required to handle the .LINK
+;	assembler directive.  The nature of this directive is to allow
+;	the user to specify linker options within the object module
+;	produced by the assembler.
+;
+; Environment:
+;
+;	Native Mode, User Mode
+;
+; Author: 
+;
+;	Michael T. Rhodes,			Creation Date: April, 1983
+;
+; Modified By:
+;
+;	V03-001	MTR0036		Michael T. Rhodes		16-Aug-1983
+;		Add abbreviated qualifier name synonyms and adjust CASE
+;		table dispatch address to accomodate the LNK$C_SHR object
+;		record type.
+;
+;--
+
+	.sbttl	declarations
+
+;
+; Macros:
+;
+	$macmsgdef			; Define Macro-32's messages.
+	$mac_ctlflgdef			; Define the control flags.
+	$mac_objcoddef			; Define the object code.
+	$mac_symblkdef			; Define the symbol block offsets etc..
+
+;
+; Equated Symbols:
+;
+cr = ^X0D				; Carriage return token.
+lnk_blk_siz =	^X13			; Size of the fixed portion of the linker options record.
+lnk_q_inclst =	^X4			; Offset to include list address.
+lnk_l_bytes =	^XC			; Offset to #bytes required for include list module names.
+lnk_l_states =	^X10			; Offset to link directive state flags.
+
+
+	.psect	mac$rw_data, noexe, rd, wrt
+;
+; Linker option records list head.
+;
+mac$gq_lnkopt::
+	.address mac$gq_lnkopt
+	.address mac$gq_lnkopt
+
+	.psect	mac$ro_data, noexe, nowrt, gbl, long
+;
+; Linker qualifier options table.
+;
+insymp = 0
+	$mac_insert_syx	SH,			lnk$c_sha
+	$mac_insert_syx	SE,			lnk$c_obj
+	$mac_insert_syx	I,			lnk$c_oli
+	$mac_insert_syx	L,			lnk$c_olb
+	$mac_insert_syx	SHAREABLE,		lnk$c_sha
+	$mac_insert_syx	SELECTIVE_SEARCH,	lnk$c_obj
+	$mac_insert_syx	INCLUDE,		lnk$c_oli
+	$mac_insert_syx	LIBRARY,		lnk$c_olb,	lnk_qualifiers
+
+
+	.sbttl	.link  --  process the .link directive
+;++
+;
+; Functional Description:
+;
+;	This routine is called to process the .LINK directive.
+;	The valid syntax for this directive is as follows:
+;
+;		.LINK	"filespec"[/qualifier[=module or (module list)]],...
+;
+;	The filespec within the delimiters is scanned (built into a
+;	.ASCID string), then we scan looking for a .LINK directive qualifier.
+;	If none are present, the default linker option record type (regardless
+;	of the extension specified in the filespec) is OBJECT (which includes
+;	symbol tables).
+;
+; Implicit Inputs:
+;
+;	mac$ab_tmpbuf	adr	The address of the assembler's temporary buffer
+;				used to accumulate the delimited file specification.
+;
+;	mac$ab_tmpsym	adr	The address of the assembler's temporary buffer
+;				used to accumulate the qualifier name(s) and
+;				module name(s) specified in an include list.
+;
+;	mac$gq_lnkopt	adr	The address of the head of the linker options
+;				records queue.
+;
+; Implicit Outputs:
+;
+;	Linker option record(s) are placed into an ordered queue
+;	(mac$gq_lnkopt) where the order is preserved FIFO.  This is done
+;	to remain compatible with the LINKER's normal processing of option
+;	records (as if they were speicified in a normal linker options file).
+;	The list is subsequently written to the object file during pass 2,
+;	following the object module header information.
+;
+; Special Case(s):
+;
+;	Special processing is performed when the /INCLUDE qualifier is specified.
+;	The object module names contained in the include list are constructed as
+;	.ASCIC strings following the filespec.  The record is terminated by a
+;	module name string with a zero length.
+;
+;	If both the /LIBRARY and /INCLUDE qualifiers are specified for the
+;	same library filespec, then the linker option record type is defaulted
+;	to LNK$C_OLI and a special flag bit is set to indicate that the library
+;	may be searched (LNK$V_LIBSRCH).
+;
+; Side Effects:
+;
+;	Two possible side effects can occur.  The first is a recoverable syntax
+;	error where a diagnotic is issued to inform the user of the problem and
+;	the assembly of the current input file continues.  The second is an
+;	insufficient virtual memory error in which a diagnotic is issued to the
+;	user and the assembly of the current input file is aborted.
+;
+; Stack Usage:
+;
+;	31		16	8	0
+;	+---------------+-------+-------+
+;	!	flags	! lnktyp! rectyp!
+;	+---------------+---------------+
+;	! module name include list flink!
+;	+-------------------------------+
+;	! module name include list blink!
+;	+-------------------------------+
+;	!   #bytes req for inclst	!
+;	+-------------------------------+
+;	!   link directive states	!
+;	+-------------------------------+
+;--
+
+	.psect	mac$ro_code_p1, nowrt, gbl, long
+
+link::					; Directive = klink
+	pushr	#^m<r8>			; Save registers.
+	movab	g^mac$ab_tmpbuf,r8	; Address of temporary buffer.
+	movab	8(r8),dsc$a_pointer(r8)	; Address of buffer to accumalate file name.
+	movab	-lnk_l_states(sp), sp	; Allocate STACK LOCAL storage.
+	clrl	lnk_l_states(sp)	; Initialize state flags.
+
+;
+; Perform initialization...then get the [next] file name.
+;
+10$:	clrl	(sp)			; Reset linker record type and flags.
+	clrl	lnk_l_bytes (sp)	; Reset the include list byte count.
+	movab	lnk_q_inclst (sp), lnk_q_inclst (sp)	; Reset the queue list
+	movab	lnk_q_inclst (sp), lnk_q_inclst+4 (sp)	; head to empty condition.
+	movb	#obj$c_lnk,lnk$b_rectyp(sp) ; Set the record type field.
+	pushl	r8			; Push address of descriptor/buffer.
+	calls	#1, get_file_name	; Get the [next] file name (if any).
+	blbs	r0, 20$			; We got one...go check for qualifier(s).
+	bbs	#0,lnk_l_states(sp),70$	; Have we processed at least one file?
+	brw	90$			; No, unterminated macro argument error.
+
+;
+; The file name has been accumulated, check for qualifiers.
+;
+20$:	tstw	(r8)			; Null file specification?
+	beql	80$			; Yes, directive syntax error.
+	jsb	g^mac$getchr		; Skip over delimiter.
+	jsb	g^mac$skipsp		; Skip spaces
+	cmpb	r10,#^A"/"		; Was the character a slash?
+	beql	25$			; Yes, process the qualifier(s).
+	cmpb	r10,#^A","		; No, was it a comma (valid syntax)?
+	beql	30$			; Yes, use defaults.
+	cmpb	r10,#^A"-"		; Is the line continued?
+	beql	30$			; Yes, finish current spec before continuing.
+	cmpb	r10,#cr			; Have we reached the end of the input line?
+	beql	30$			; Yes, normal terminator.
+	brb	80$			; No, syntax error.
+25$:	pushl	sp			; Push the address of the link vector.
+	calls	#1, process_qual	; Process the qualifier(s).
+	blbs	r0, 40$			; Use the option record type scanned.
+	brb	80$			; Syntax error in qualifier(s).
+
+;
+; Build the linker option record.
+;
+30$:	movb	#lnk$c_obj,lnk$b_lnktyp(sp) ; Default option record type.
+40$:	pushl	sp			; Build a linker record using the
+	pushl	r8			; type and flags scanned above
+	calls	#2, build_lnk_rec	; (Note: state flags are affected).
+
+;
+; What's our next move...?
+;
+	cmpb	r10, #^A","		; Is the current character a comma?
+	beql	50$			; Yes, go process the next list item.
+	cmpb	r10, #^A"-"		; Is the line continued?
+	bneq	60$			; No, check for eol.
+	movb	#cr, r10		; Yes, continue processing the directive.
+50$:	jsb	g^mac$getchr		; Skip current character.
+	jsb	g^mac$skipsp		; Skip spaces, tabs, etc..
+	brw	10$			; Continue
+60$:	cmpb	r10,#cr			; Have we reached the end of the line?
+	bneq	80$			; No, report syntax error.
+
+;
+; We're done, clean up and return to the parser.
+;
+70$:	addl	#lnk_l_states, sp	; Restore the stack.
+	popr	#^m<r8>			; Restore registers.
+	rsb				; Return to parser to continue.
+
+;
+; Some type of syntax error has been encountered...
+;
+80$:	$mac_err dirsynx		; A directive syntax error has been
+	brb	100$			; encountered, issue error and return.
+
+90$:	$mac_err untermarg		; A terminator has not been seen for
+					; the file name.
+
+100$:	addl	#lnk_l_states, sp	; Restore the stack.
+	popr	#^m<r8>			; Restore current token.
+	jmp	g^mac$errorpt		; Issue error message and return.
+
+
+	.sbttl	get_file_name	accumulate file name
+;++
+;
+; Functional Description:
+;
+;	This routine scans the input record for a delimitted file name.
+;
+; Inputs:
+;
+;	4(AP)	adr	The address of a descriptor which points to a buffer
+;			to store the file name which we will scan.
+;
+; Outputs:
+;
+;	4(AP)	adr	The descriptor has been updated to reflect the size
+;			of the file name which has been accumulated.
+;
+; Routine Value:
+;
+;	True	A file name has been scanned.
+;	False	No file name has been found (end of line or unterminated arg).
+;
+; Side Effects:
+;
+;	If there is no file name available (eg. we hit the end of the line)
+;	the length field of the descriptor will be zero upon exit or if the
+;	argument is unterminated, the length will be non-zero but the routine
+;	value will be false.
+;
+;--
+	.entry	get_file_name ^m<r2,r6> ; Save registers upon entry.
+	pushl	r1			; Preserve R1.
+	movl	4(ap), r1		; Get descriptor address.
+	clrl	(r1)			; Initialize length, class, and type fields.
+	movl	dsc$a_pointer(r1), r2	; Get the buffer address.
+	clrl	r0			; Assume the worst...
+	jsb	g^mac$skipsp		; Find the delimiter.
+	cmpb	r10,#cr			; Have we reached the end of the line?
+	beql	30$			; Yes, return FALSE to the caller.
+	movb	r10,r6			; No, copy the delimiter and pass semi
+	bisl2	#flg$m_allchr,(r11)	; colons (to allow a version number).
+
+10$:	jsb	g^mac$getchr		; Get the next character of the filename.
+	cmpb	r10,r6			; Is it the delimiter (end of filename)?
+	beql	20$			; Yes, we're done here, return.
+	cmpb	r10,#cr			; No, is it the end of the line?
+	beql	30$			; Yes, upon return issue unterminated argument error.
+	movb	r10,(r2)+		; No, store the character.
+	incw	(r1)			; Keep track of file name length.
+	brb	10$			; Gather the rest of the file name.
+
+20$:	movl	#1, r0			; Success...
+30$:	popl	r1			; Restore R1.
+	bicl2	#flg$m_allchr,(r11)	; Don't pass anymore semi-colons...
+	ret
+
+
+	.sbttl	process_qual	process link directive qualifiers
+;++
+;
+; Functional Description:
+;
+;	This routine processes the .LINK directive qualifiers.
+;
+; Inputs:
+;
+;	4(AP)	adr	Address of a linker record vector.
+;
+; Outputs:
+;
+;	4(AP)	adr	The linker record information is set in the vector.
+;
+; Routine Value:
+;
+;	True	Qualifiers have been processed without a problem.
+;	False	There was a syntax error in either the qualifier name or in
+;		the item list associated with the qualifier.
+;
+;--
+	.entry	process_qual ^m<r5,r6,r7,r8>	; Save registers.
+	movab	-8(sp), sp			; Get STACK LOCAL storage.
+	clrl	(sp)				; Initialize done bit.
+	movl	4(ap), r7			; Get base adr of link info vector.
+	movab	lnk_q_inclst (r7), r8		; Base address of file name list head.
+
+10$:	cmpb	r10, #^A/,/			; Did we stop on a comma?
+	beql	30$				; Yes, we're done with this file spec.
+	cmpb	r10, #cr			; No, have we reached eol?
+	beql	30$				; Yes, we're done, return.
+	cmpb	r10, #^A"/"			; Is the current character slash?
+	beql	40$				; Yes, scan qualifier name.
+20$:	brw	110$				; No, syntax error.
+30$:	brw	100$				; Done, return success.
+
+40$:	jsb	g^mac$getchr			; Yes, skip over it...
+	jsb	g^mac$symscnup			; Get the qualifier name.
+	blbc	r0, 20$				; None found, error.
+	movab	lnk_qualifiers, r5		; Use linker qualifier name table.
+	jsb	g^mac$src_list			; Look up linker option qualifier.
+	blbc	r0, 20$				; Not found, error.
+	jsb	g^mac$skipsp			; Position character pointer as needed.
+
+;
+; Dispatch to appropriate processing routine.
+;
+	casel	sym$l_val(r1), #0, #lnk$c_maxrectyp
+50$:	.word 60$-50$				; lnk$c_olb - /LIBRARY
+	.word 70$-50$				; lnk$c_shr - (unsupported)
+	.word 80$-50$				; lnk$c_oli - /INCLUDE=
+	.word 90$-50$				; lnk$c_obj - /SELECTIVE_SEARCH
+	.word 70$-50$				; lnk$c_sha - /SHAREABLE
+	brb	95$				; Default, OBJ or STB
+
+
+;
+; /LIBRARY 		Normal object library
+;
+60$:	tstb	lnk$b_lnktyp (r7)		; Check for conflicting qualifiers.
+	beql	63$				; None specified.
+	cmpb	lnk$b_lnktyp (r7), #lnk$c_oli	; If /INCLUDE was specified, no conflicts
+	bneq	110$				; but anything else will conflict.
+63$:	movb	#lnk$c_olb, lnk$b_lnktyp (r7)	; lnk$c_olb - Normal object library.
+	bbss	#0, (sp), .+1			; Indicate /LIBRARY has been specified.
+	bbc	#1, (sp), 65$			; If /INCLUDE has been specified, then
+	bisb	#lnk$m_libsrch, lnk$w_flags (r7); the library should be searched and
+	movb	#lnk$c_oli, lnk$b_lnktyp (r7)	; type precedence goes to LNK$C_OLI.
+65$:	brw	10$				; Get the next entity.
+
+;
+; /SHAREABLE		Shareable Image
+;
+70$:	tstb	lnk$b_lnktyp (r7)		; Check for conflicting qualifiers.
+	bneq	110$				; We have a conflict.
+	movb	#lnk$c_sha, lnk$b_lnktyp (r7)	; lnk$c_sha - Shareable Image
+	brw	10$				; Get the next entity.
+
+;
+; /INCLUDE		Object Library with Include list
+;
+80$:	tstb	lnk$b_lnktyp (r7)		; Check for conflicting qualifiers.
+	beql	82$				; None specified.
+	cmpb	lnk$b_lnktyp (r7), #lnk$c_olb	; If /LIBRARY was specified, no conflicts
+	bneq	110$				; but anything else will conflict.
+82$:	movb	#lnk$c_oli, lnk$b_lnktyp (r7)	; lnk$c_oli - Object Library with an Include list
+	bbss	#1, (sp), .+1			; Indicate /INCLUDE has been specified.
+	bbc	#0, (sp), 83$			; If /LIBRARY has been specified, then
+	bisb	#lnk$m_libsrch, lnk$w_flags (r7); the library should be searched.
+83$:	cmpb	r10, #^A/=/			; The next character should be an "=".
+	bneq	110$				; If not, its a syntax error.
+	calls	#0, get_incl_list		; Get the module name(s) in the include list.
+	blbc	r0, 110$			; Issue syntax error.
+85$:	brw	10$				; Get the next entity.
+
+;
+; /SELECTIVE_SEARCH	Selective search of OLB or STB
+;
+90$:	tstb	lnk$b_lnktyp (r7)		; Check for conflicting qualifiers.
+	bneq	110$				; We have a conflict.
+	bisb	#lnk$m_selser, lnk$w_flags (r7)	; lnk$v_selser - Selective search
+95$:	movb	#lnk$c_obj, lnk$b_lnktyp (r7)	; lnk$c_obj - Object Module
+	brw	10$				; Get the next entity.
+
+;
+; All done select status and return.
+;
+100$:	movl	#1, r0				; Success.
+	brb	120$				; Now return.
+110$:	clrl	r0				; Error.
+120$:	ret					; Restore registers and return.
+
+
+	.sbttl	get_incl_list	Get the module(s) in the list
+;++
+;
+; Functional Description:
+;
+;	This routine scans the include list and produces a linked list
+;	containing the counted ascii strings of the module name(s) entered
+;	in the include list.
+;
+; Implicit Inputs:
+;
+;	r7		The address of the linker record.
+;	r8		The address of the module name include list head.
+;
+;	mac$ab_tmpsym	The address of a symbol just scanned.
+;
+; Outputs:
+;
+;	Module names obtained from the include list are added to the linked
+;	list.
+;
+;--
+	.entry	get_incl_list ^m<>		; Get the module names to include.
+	movab	-4(sp), sp			; Get LOCAL STORAGE.
+	clrl	(sp)				; Initialize local storage.
+
+10$:	jsb	g^mac$getchr			; Get the next character.
+	jsb	g^mac$skipsp			; Skip spaces, tabs, etc..
+	cmpb	r10, #cr			; End of line?
+	beql	80$				; Yes, syntax error.
+
+20$:	cmpb	r10, #^A/(/			; Do we have a list of names?
+	beql	30$				; Yes, remove open paren and indicate a list.
+	cmpb	r10, #^A/,/			; Check for module name delimiter.
+	beql	40$				; Remove the comma, and validate string.
+	cmpb	r10, #^A/)/			; Do we have a close paren?
+	beql	50$				; Yes, end of the list?
+	cmpb	r10, #cr			; End of line?
+	beql	60$				; We're done, select return status.
+	bbsc	#0, (sp), .+1			; Reset comma seen flag.
+	jsb	g^mac$symscnup			; Get the module name.
+	blbc	r0, 80$				; No file name, error.
+	calls	#0, insert_module		; Insert this module name into the list.
+	brb	20$				; Get the next module (if any).
+
+30$:	bbss	#1, (sp), 80$			; Check for syntax error -- 2 or more "("
+	brb	10$				; Indicate a list and continue the module name parse.
+
+40$:	bbc	#1, (sp), 80$			; Comma seperated list not allowed outside of parens.
+	bbss	#0, (sp), 80$			; To many commas?
+	brb	10$				; Remove comma, step to next module name.
+
+50$:	bbc	#1, (sp), 80$			; Should we have a close paren?
+	jsb	g^mac$getchr			; Yes, skip it for correct grammatical parsing on return.
+	cmpl	r8, (r8)			; Have we got at least one module?
+	beql	80$				; No, and we don't accept null lists -- error.
+	brb	70$				; Everything looks ok, return success.
+
+60$:	bbs	#1, (sp), 80$			; Should we have a close paren? (premature EOL).
+
+70$:	movl	#1, r0				; Parse successful...
+	brb	90$				; return success.
+
+80$:	clrl	r0				; Parse failed.
+	movl	r8, (r8)			; Fake an empty queue...
+	movl	r8, 4(r8)			; reset the list head.
+90$:	ret					; Return
+
+
+	.sbttl	insert_module	Insert module name into list
+;++
+;
+; Functional Descrtipion:
+;
+;	This routine will allocate a block of memory to store the
+;	module name (counted asci string) and link it into the list
+;	of other modules in the include list.
+;
+; Implicit Inputs:
+;
+;	r7	adr	Address of the linker options record control block.
+;	r8	adr	Address of the head of the include list.
+;
+;	mac$ab_tmpsym	The buffer containing the counted asci string.
+;
+; Outputs:
+;
+;	The module has been added to the list.
+;
+; Side Effects:
+;
+;	If an error occurs while attempting to allocate dyanmic memory
+;	we'll exit in the normal tradition (abort this assembly).
+;
+;--
+	.entry	insert_module ^m<r2,r3,r4,r5,r6,r9>
+	pushl	r1			; Preserve R1.
+	movab	g^mac$ab_tmpsym, r6	; Get the beginning address of the buffer.
+	movzbl	(r6), r9		; Get the size of the string.
+	incl	r9			; Bump the string count to include count byte
+	subl2	#8, sp			; Get STACK LOCAL storage.
+	clrl	4(sp)			; Initialize the return address scalar.
+	pushab	4(sp)			; Push address of the return address scalar.
+	addl3	#8, r9, 4(sp)		; Compute the number of bytes to allocate.
+	pushab	4(sp)			; Push the address of the number of bytes.
+	calls	#2, g^lib$get_vm	; Allocate the module name block.
+	blbc	r0, ins_vir_mem		; Insufficient Vitrual Memory error.
+	movl	4(sp), r3		; Get the beginning address of the module name block.
+	movc3	r9, (r6), 8(r3)		; Copy the string.
+	insque	@4(sp), @4(r8)		; Insert this block at the tail of the list.
+	addl2	r9, lnk_l_bytes (r7)	; Add this string's byte count to the sum.
+	popl	r1			; Restore R1.
+	ret
+
+;
+; Insufficient Virtual Memory, report error and abort this assembly.
+;
+ins_vir_mem:
+	calls	#0, g^mac$err_nomem_0	; Report error.
+	jmp	g^mac$last_chance	; Abort this assembly.
+
+
+	.sbttl	build_lnk_rec	Build a linker options record
+;++
+;
+; Functional Description:
+;
+;	This routine builds a linker options record.  First we obtain
+;	a linker options record block (by a call to LIB$GET_VM), next
+;	fill in the information and link it into the queue of linker
+;	options records and set the 'at least one file processed' bit
+;	in the state flags.  Special handling of the object library with
+;	an include list is performed by copying the strings from the
+;	include module list and deallocating the module name blocks.
+;
+;	31		16	8	0
+;	+---------------+-------+-------+
+;	!		flink		!
+;	+-------------------------------+
+;	!		blink		!
+;	+-------------------------------+
+;	!size of this lnk opt rec block*!	* NOTE:	The size field contains
+;	+-------------------------------+		a value which represents
+;	! flags		! lnktyp! rectyp!		the total size of the
+;	+---------------+-------+-------+		block in bytes.
+;	!		!     namlng	!		It includes the overhead
+;	!		+---------------+		information (flink, blink,
+;	!	file specification	!		size field and the terminator).
+;	+-------------------------------+
+;	!			! count	!
+;	! optional module	+-------+
+;	! name from /INCLUDE=[()] list	!
+;	+-------------------------------+
+;	!		:		!
+;	!		:		!
+;	+-------------------------------+
+;	!			! count	!
+;	! optional module	+-------+
+;	! name from /INCLUDE=[()] list	!
+;	+-------------------------------+
+;				!   0	! Terminator byte (module name length 0)
+;				+-------+
+; Inputs:
+;
+;	4(AP)		adr	Address of the filespec descriptor.
+;	8(AP)		adr	Address of the linker record control block.
+;
+; Implicit Inputs:
+;
+;	mac$gq_lnkopt	adr	The address of the linker options record queue
+;				list head.
+;
+; Side Effects:
+;
+;	If an error occurs while attempting to allocate dyanmic memory
+;	we'll exit in the normal tradition (abort this assembly).
+;
+;--
+
+	.entry	build_lnk_rec ^m<r2,r3,r4,r5,r6,r7,r8>
+	movl	4(ap), r2		; Get the address of the filespec.
+	movl	8(ap), r7		; Get link control block address.
+	subl2	#8, sp			; Allocate STACK LOCAL storage.
+	clrl	4(sp)			; Initialize the return address scalar.
+	pushab	4(sp)			; Push the address of the return address scalar.
+	movzwl	dsc$w_length (r2),4(sp)	; Get the length.
+	addl3	4(sp),lnk_l_bytes(r7),4(sp) ; Compute the #bytes req for this record.
+	addl2	#lnk_blk_siz, 4(sp)	; Include the fixed area size in the count.
+	pushab	4(sp)			; Address of the number of byte req.
+	calls	#2, g^lib$get_vm	; Allocate memory for this linker options record.
+	blbc	r0, ins_vir_mem		; Insufficient Virtual Memory error.
+	movl	4(sp), r3		; Get the beginning address of the linker oprions record.
+	movl	r3, r8			; Preserve the block address for later use.
+	addl2	#8, r3			; Advance pointer to first data field.
+	movl	(sp), (r3)+		; Copy the number of bytes in this block.
+	movl	(r7), (r3)+		; Copy the record type and flags word to the record.
+	movw	(r2), (r3)+		; Copy the file spec length.
+	movc3	(r2),@dsc$a_pointer(r2),(r3) ; Copy the file spec.
+
+10$:	remque	@lnk_q_inclst(r7), r6	; Remove the next module name.
+	bvs	20$			; Is the queue empty?
+	movl	r6, 4(sp)		; No, get the address of the module name
+	pushab	4(sp)			; block to release and pass it by reference.
+	movzbl	8(r6), 4(sp)		; Get the string length and include
+	addb2	#1, 4(sp)		; the count byte in the string size.
+	movc3	4(sp), 8(r6), (r3)	; Copy the module size/name to the record.
+	addl2	#8, 4(sp)		; The linkage is included in the mnb size.
+	pushab	4(sp)			; Pass the block size by reference too.
+	calls	#2, g^lib$free_vm	; Release the module name block.
+	brb	10$			; Get the next module.
+
+20$:	clrb	(r3)			; Mark include list terminator.
+	movab	g^mac$gq_lnkopt, r6	; Get the address of the linker options queue.
+	insque	(r8), @4(r6)		; Insert this record into the linker options queue.
+	bbss	#0,lnk_l_states(r7),.+1	; Set flag indicating at least 1 file processed.
+	ret
+
+
+	.sbttl	mac$wrt_lnkopt	Write the linker options records to object
+;++
+;
+; Functional Description:
+;
+;	This routine removes the linker options records from the queue
+;	MAC$GQ_LNKOPT and writes them to the object module (following the GSD).
+;
+; Implicit Inputs:
+;
+;	R10		adr	Contains the address of the object code buffer.
+;	mac$gq_lnkopt	adr	The address of the linker option record queue.
+;
+; Side Effects:
+;
+;	All linker option record(s) have been written to the object file
+;	and the currect object record buffer type will be set to OBJ$C_TIR
+;	upon exit.
+;
+;--
+	.entry	mac$wrt_lnkopt ^m<r6>	; Save register(s).
+	subl2	#8, sp			; Allocate STACK LOCAL storage.
+10$:	remque	@mac$gq_lnkopt, r6	; Get a linker option record.
+	bvs	20$			; Is the queue empty?
+	decl	r10			; No, set the buffer pointer to origin.
+	subl3	#12, 8(r6), r1		; Compute the size of this record.
+	movc3	r1, 12(r6), (r10)	; Copy the record to the object code buffer.
+	movl	r3, r10			; Update the object code pointer.
+	bsbw	mac$wrtobj		; Write the object record.
+	movl	r6, 4(sp)		; Release dynamic memory...
+	pushab	4(sp)			; Pass the block's address by reference.
+	movl	8(r6), 4(sp)		; The linker option record's block size
+	pushab	4(sp)			; is also passed by reference.
+	calls	#2, g^lib$free_vm	; Release this block.
+	brb	10$			; Continue until the queue is empty.
+
+20$:	movb	#obj$c_tir, (r10)	; All done, correct the object record
+	ret				; type to assume TIR.
+
+	.end	; of MODULE mac$link

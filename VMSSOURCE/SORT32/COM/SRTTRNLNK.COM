@@ -1,0 +1,17 @@
+$ !
+$ !	[ S O R T 3 2 . C O M ] S R T T R N L N K . C O M
+$ !
+$ !	Command file to link SRTTRN.EXE
+$ !
+$ DELETE EXE$:SRTTRN.EXE;*,MAP$:SRTTRN.MAP;*
+$ LINK/NOTRACE	-
+/EXE=EXE$:SRTTRN	-	! Executable image
+/MAP=MAP$:SRTTRN/FULL/CROSS	-	! Link map
+LIB$:SORTMERGE/INCL=(-
+SRTTRN,-		! Main entry point
+SRTTRNMSG),-		! Error messages
+SYS$INPUT/OPTIONS
+PSECT=$PLIT$,PIC,SHR,EXE
+PSECT=$CODE$,PIC,SHR
+COLLECT=CODE,$CODE$,$PLIT$,SOR$RO_CODE,_LIB$CODE
+$ EXIT

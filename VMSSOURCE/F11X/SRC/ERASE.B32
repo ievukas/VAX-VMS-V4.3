@@ -1,0 +1,392 @@
+MODULE ERASE (
+		LANGUAGE (BLISS32),
+		IDENT = 'V04-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 2
+!
+! ABSTRACT:
+!
+!	This module contains the routines that perform the Data Security
+!	Erase (DSE) on a portion of a disk volume.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Steven T. Jeffreys,	 CREATION DATE:  23-Mar-1983
+!
+! MODIFIED BY:
+!
+!	V03-007	CDS0004		Christian D. Saether	20-Jun-1984
+!		Raise the process diocnt around the call to $qio so
+!		it will not fail for lack of quota.  Also raise ASTCNT
+!		so it will not fail for that reason.
+!
+!	V03-006	ACG0408		Andrew C. Goldstein,	23-Mar-1984  14:44
+!		Add AST parameter so that impure storage is fully based
+!
+!	V03-005	CDS0003		Christian D. Saether	30-Dec-1983
+!		Use L_NORM linkage and BIND_COMMON macro.
+!
+!	V03-004	CDS0002		Christian D. Saether	27-Sep-1983
+!		Enhance privileges for erase.
+!
+!	V03-003	STJ3104		Steven T. Jeffreys,	03-Jun-1983
+!		- Removed reference to VMSD2.
+!
+!	V03-002	CDS0001		Christian D. Saether	12-May-1983
+!		Make erase qio asychronous.
+!
+!	V03-001	STJ3082		Steven T. Jeffreys,	30-Mar-1983
+!		- Added CHANNEL parameter to ERASE_BLOCKS and DO_ERASE.
+!		  This makes for a cleaner interface with callers outside
+!		  of the Files-11 ACP.  (eg. REBUILD and ANALYZE/DISK)
+!		- Use VMSD2 to enable/disable erase. (Temporary)
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+!
+! Table of contents.
+!
+
+FORWARD ROUTINE
+	ERASE_BLOCKS	: L_NORM,		! Top level DSE routine
+	DO_ERASE	: L_NORM;		! Issues the erase $QIO
+
+GLOBAL ROUTINE ERASE_BLOCKS (START_LBN, BLOCK_COUNT, CHANNEL) : L_NORM =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Perform a data security erase (DSE) on a single contiguous extent
+!	on the disk.  This routine is recursive.
+!
+!
+!	The DSE is done by calling the erase pattern generator system service,
+!	$ERAPAT, and writing the pattern returned to the disk.  This is repeated
+!	until $ERAPAT returns a status of SS$_NOTRAN, which indicates that the
+!	DSE is complete.
+!
+!	The $ERAPAT code is loadable, and may vary from site to site.
+!	However, the default $ERAPAT code is very simple, and by checking to see
+!	if the default $ERAPAT code is still being used, we may save the
+!	overhead of calling $ERAPAT.  If the flag SGN$V_LOADERAPAT in the cell
+!	SGN$GL_LOADFLAGS is set, it indicates that an alternate $ERAPAT has been
+!	loaded, and that we should call the $ERAPAT routine instead of taking
+!	the shortcut.
+!
+!	Note that the flag SGN$V_LOADERAPAT corresponds to the SYSGEN parameter
+!	LOADERAPAT.  Since the SYSGEN parameter may be changed on the running
+!	system, it implies that until the system is rebooted, it is possible
+!	that the site-specific $ERAPAT will not be called, and the default
+!	erase pattern (0), will be used in its place.  We do not believe this
+!	to be a significant security risk.
+!
+!	Note that the default $ERAPAT code defines a one-step DSE procedure
+!	for disks, and the erase pattern is 0.
+!
+!	This routine assumes that I/O transfers of an arbitrary length can be
+!	done to any disk device with but a single QIO.
+!
+! CALLING SEQUENCE:
+!	ERASE_BLOCKS (ARG1, ARG2, ARG3)
+!
+! INPUT PARAMETERS:
+!	ARG1: LBN of first block to be erased
+!	ARG2: number of blocks to erase
+!	ARG3: I/O channel to the device
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: VCB of volume
+!	CURRENT_UCB: UCB of volume
+!
+! OUTPUT PARAMETERS:
+!	None.
+!
+! IMPLICIT OUTPUTS:
+!	LOC_LBN: plcement LBN of allocation or 0
+!
+! ROUTINE VALUE:
+!	1 if successful erase
+!	<a system status code> if an error was encountered.
+!
+! SIDE EFFECTS:
+!	None.
+!
+!--
+
+BEGIN						! Start of ERASE_BLOCKS
+
+EXTERNAL
+	SGN$GL_LOADFLAGS: BITVECTOR ADDRESSING_MODE (GENERAL);
+						! System flags bitvector
+
+EXTERNAL LITERAL
+	SGN$V_LOADERAPAT;			! System flag
+
+BASE_REGISTER;
+
+LOCAL
+	ERASE_PASS	: LONG,			! Count of erase passes
+	ERASE_PATTERN	: LONG,			! Pattern to write to the disk
+	ERASE_STATUS	: LONG,			! Intermediate status
+	STATUS		: LONG;			! Store status of operation
+
+!
+! Determine if default $ERAPAT routine is present.
+!
+IF NOT .SGN$GL_LOADFLAGS [SGN$V_LOADERAPAT]
+THEN
+    BEGIN
+    !
+    ! The default $ERAPAT is present.  That implies that the
+    ! DSE is a one-pass operation that zeroes each block.
+    !
+    STATUS = SS$_NOTRAN;
+    ERASE_STATUS = DO_ERASE (.START_LBN, .BLOCK_COUNT, 0, .CHANNEL);
+    END
+ELSE
+    BEGIN
+    !
+    ! A site-specific $ERAPAT has been loaded.
+    !
+    ERASE_PASS = 1;
+    STATUS = $ERAPAT (TYPE=ERA$K_DISK, COUNT=.ERASE_PASS, PATADR=ERASE_PATTERN);	
+    ERASE_STATUS = .STATUS;
+    WHILE .STATUS AND (.STATUS NEQ SS$_NOTRAN) DO
+	BEGIN
+	!
+	! Write the erase pattern to the disk and call $ERAPAT
+	! to generate the next data security erase pattern.
+	! Each time we call $ERAPAT, increment the ERASE_PASS.
+	! When $ERAPAT returns SS$_NOTRAN, the DSE is complete.
+	! Note that if the last attempt to erase the data succeeds,
+	! we assume that the operation was a success.
+	!
+	ERASE_STATUS = DO_ERASE (.START_LBN, .BLOCK_COUNT, .ERASE_PATTERN, .CHANNEL);
+	ERASE_PASS = .ERASE_PASS + 1;
+	STATUS = $ERAPAT (TYPE=ERA$K_DISK, COUNT=.ERASE_PASS, PATADR=ERASE_PATTERN);	
+	END;
+    END;
+!
+! Return the most significant status value.  At this point, ERASE_STATUS
+! is the status of the write to disk, and STATUS is the last of the last
+! call to $ERAPAT.  If the write had an error, return that status, other
+! wise return the status of the last call to $ERAPAT (which should be
+! SS$_NOTRAN).
+!
+IF NOT .ERASE_STATUS
+THEN
+    .ERASE_STATUS
+ELSE
+    .STATUS
+
+END;						! End of ERASE_BLOCKS
+
+ROUTINE DO_ERASE (START_LBN, BLOCK_COUNT, ERASE_PATTERN, CHANNEL) : L_NORM =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Helper routine to ERASE_BLOCKS.  Write the erase pattern to the disk,
+!	making sure every block gets written.  If a bad block is encountered,
+!	write around it.
+!
+!	This routine assumes that I/O transfers of an arbitrary length can be
+!	done to any disk device with but a single QIO.
+!
+!	Even though the nature of this routine lends itself to a recursive
+!	implementation, it was done iteratively to minimize stack usage.
+!
+! CALLING SEQUENCE:
+!	DO_ERASE (ARG1, ARG2, ARG3, ARG4)
+!
+! INPUT PARAMETERS:
+!	ARG1: LBN of first block to be erased
+!	ARG2: number of blocks to erase
+!	ARG3: 4 byte erase pattern
+!	ARG4: I/O channel to the device
+!
+! IMPLICIT INPUTS:
+!	None.
+!
+! OUTPUT PARAMETERS:
+!	None.
+!
+! IMPLICIT OUTPUTS:
+!	None.
+!
+! ROUTINE VALUE:
+!	1 if successful erase
+!	<a system status code> if an error was encountered.
+!
+! SIDE EFFECTS:
+!	The count of erase I/O operations is incremented.
+!
+!--
+
+BEGIN						! Start of DO_ERASE
+
+EXTERNAL
+	CTL$GL_PCB	: ADDRESSING_MODE (GENERAL),
+	CTL$GL_PHD	: ADDRESSING_MODE (GENERAL),
+	PMS$GL_ERASEIO	: LONG ADDRESSING_MODE (GENERAL);
+
+						! Count of erase I/O operations
+
+BASE_REGISTER;
+
+EXTERNAL ROUTINE
+	WAIT_FOR_AST	: L_NORM,
+	CONTINUE_THREAD	: L_NORM;
+
+LOCAL
+	LBN		: LONG,			! local copy of START_LBN
+	COUNT		: LONG,			! local copy of BLOCK_COUNT
+	BLOCKS_ERASED	: LONG,			! # of blocks actually erased
+	IOSTS		: BBLOCK [8],		! I/O status block
+	ERASE_STATUS	: LONG,			! Routine status
+	STATUS		: LONG;			! Store status of operation
+
+!
+! Erase the specified portion of the disk.  If the erase fails, retry
+! the operation starting from 1 block past the point of failure.  Only
+! the status coded from the first such error is returned.
+!
+!
+! Set things up for the loop.  The loop will terminate when no more
+! blocks need to be erased.
+!
+ERASE_STATUS = SS$_NORMAL;			! Assume no errors
+STATUS = SS$_NORMAL;				! Ditto
+LBN = .START_LBN;				! Copy starting LBN
+COUNT = .BLOCK_COUNT;				! Copy # of blocks to erase
+WHILE (.COUNT GTR 0) DO
+    BEGIN					! Start of erase loop
+
+    LOCAL
+	PTR	: REF BBLOCK,
+	SAVE_PRIV : VECTOR [4];
+
+    PTR = .CTL$GL_PCB;
+    PTR [PCB$W_DIOCNT] = .PTR [PCB$W_DIOCNT] + 1;
+    PTR [PCB$W_ASTCNT] = .PTR [PCB$W_ASTCNT] + 1;
+    SAVE_PRIV [0] = .(PTR [PCB$Q_PRIV]);
+    SAVE_PRIV [1] = .(PTR [PCB$Q_PRIV]+4);
+    BBLOCK [PTR [PCB$Q_PRIV], PRV$V_LOG_IO] = 1;
+    BBLOCK [PTR [PCB$Q_PRIV], PRV$V_BYPASS] = 1;
+    PTR = .CTL$GL_PHD;
+    SAVE_PRIV [2] = .(PTR [PHD$Q_PRIVMSK]);
+    SAVE_PRIV [3] = .(PTR [PHD$Q_PRIVMSK]+4);
+    BBLOCK [PTR [PHD$Q_PRIVMSK], PRV$V_LOG_IO] = 1;
+    BBLOCK [PTR [PHD$Q_PRIVMSK], PRV$V_BYPASS] = 1;
+
+    !
+    ! Issue an erase $QIO to the volume.  The IO$M_ERASE modifier turns
+    ! an ordinary write into a special low-overhead write.
+    !
+    STATUS = $QIO	(CHAN = .CHANNEL,
+			 FUNC = (IO$_WRITELBLK OR IO$M_ERASE),
+			 IOSB = IOSTS,
+			 ASTADR = CONTINUE_THREAD,
+			 ASTPRM = .BASE,
+			 P1   = ERASE_PATTERN,
+			 P2   = (.COUNT * 512),
+			 P3   = .LBN
+			);
+
+    PMS$GL_ERASEIO = .PMS$GL_ERASEIO + 1;	! Bump erase I/O counter
+
+    (PTR [PHD$Q_PRIVMSK]) = .SAVE_PRIV [2];
+    (PTR [PHD$Q_PRIVMSK]+4) = .SAVE_PRIV [3];
+    PTR = .CTL$GL_PCB;
+    PTR [PCB$W_ASTCNT] = .PTR [PCB$W_ASTCNT] - 1;
+    PTR [PCB$W_DIOCNT] = .PTR [PCB$W_DIOCNT] - 1;
+    (PTR [PCB$Q_PRIV]) = .SAVE_PRIV [0];
+    (PTR [PCB$Q_PRIV]+4) = .SAVE_PRIV [1];
+
+    IF .STATUS
+    THEN
+	BEGIN
+	WAIT_FOR_AST();
+	STATUS = .IOSTS;
+	END;
+
+    IF .STATUS
+    THEN
+	BEGIN
+	!
+	! The call to $QIO succeeded.
+	! Decrement the count of blocks to erase by the number of blocks
+	! actually erased.  Advance the starting lbn to 1 block past the
+	! last block actually erased.
+	!
+	BLOCKS_ERASED = .IOSTS [2,0,32,0] / 512;
+	COUNT = (.COUNT - .BLOCKS_ERASED) - 1;
+        LBN = (.LBN + .BLOCKS_ERASED) + 1;
+	!
+	! If an error was encountered during the erase, and it is the first
+	! such error, save the error status code so that if may be returned
+	! to the caller.
+	!
+	IF  (NOT (STATUS = .IOSTS [0,0,16,0]))
+	AND .ERASE_STATUS
+	THEN
+	    ERASE_STATUS = .STATUS;		! Save first error status
+	END
+    ELSE
+	BEGIN
+	!
+	! The erase $QIO failed outright.  Terminate the erase operation.
+	!
+	ERASE_STATUS = .STATUS;			! Save exit status
+	COUNT = 0;				! Insure loop termination
+	END;
+    END;					! End of erase loop
+
+!
+! Return the erase status.  Only the first error encountered is reported.
+!
+RETURN .ERASE_STATUS
+
+END;						! End of DO_ERASE
+
+END
+ELUDOM

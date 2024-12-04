@@ -1,0 +1,748 @@
+MODULE badstasys (%TITLE 'Analyze/Media Stand Alone Support Module'
+		   IDENT = 'V04-000') =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!
+!++
+!
+! Facility:
+!
+!	Analyze/Media
+!
+! Abstract:
+!
+!	This module contains the routines necessary to support $ ANALYZE/MEDIA
+!	(aka BAD) in the standalone environment.
+!
+! Environment:
+!
+!	VAX/VMS User Mode, Non-Privileged
+!
+! Author:
+!
+!	Michael T. Rhodes, 		Creation Date: February, 1983
+!
+! Modified By:
+!
+!	V03-001	MTR0006		Michael T. Rhodes		28-Apr-1983
+!		Change references to ANALYZECMD to ANALYZCMD for fiche program.
+!
+!--
+
+
+%SBTTL 'Declarations'
+
+!
+! Include Files:
+!
+REQUIRE	'lib$:baddef';					! Define BAD's structures.
+LIBRARY	'SYS$LIBRARY:LIB';				! Define VMS structures.
+
+!
+! Special Addressing/Linkage Declarations:
+!
+LINKAGE
+    JSB = JSB : NOPRESERVE(2,3,4,5,6,7,8,9,10,11),	! Define JSB linkage for Bugcheck Code.
+    JSB_R0 = JSB(REGISTER=0): PRESERVE(0,1,2,3,4,5,6,7,8,9,10,11),
+    JSB_PRESERVE = JSB:,
+    INI = JSB : PRESERVE(0,1,2,3,4,5,6,7,8,9,10,11);	! Define linkage for kernel modification.
+
+FORWARD
+    bugcheck_msg : VECTOR [14, BYTE];			! Allow forward references to 'Bugcheck' message.
+
+!
+! Table of Contents:
+!
+FORWARD ROUTINE
+    bad$bugcheck	: JSB NOVALUE,			! Bugcheck handler for Stand Alone BAD.
+    bad$handler,					! Condition Handler for Stand Alone Bad.
+    bad$install_code,					! Installs KERNEL mode code.
+    bad$putmsg_actrtn,					! Action routine for $PUTMSG.
+    bad$sta_io,						! Performs stand alone terminal IO.
+    bad$str_trim	: NOVALUE,			! Trim the string, removing any trailing CR.
+    bad$validate_pack	: NOVALUE,			! Set Volume Valid bit in device UCB.
+    LIB$GET_INPUT,					! Library input routine.
+    SYS$CLOSE,						! Revectored SYSTEM/RMS routines to perform
+    SYS$CONNECT,					! psuedo file operations on SYS$OUTPUT.
+    SYS$CREATE,						!
+    SYS$PUT;						!
+
+!
+! Private Storage
+!
+OWN
+    dyn_buf_adr,					! Starting address of the dynamic string buffer.
+    tt_chan,						! Channel number
+    tt_iosb	: VECTOR [4, WORD];			! IO status block
+
+BIND							!
+    sys$output =	$DESCRIPTOR ('SYS$OUTPUT'),	! Terminal Name.
+    image_name =	$DESCRIPTOR ('STABACKUP.EXE');	! Image name for stand alone restart.
+
+!
+! External references:
+!
+EXTERNAL ROUTINE
+    bad$alloc_mem	: ADDRESSING_MODE (GENERAL),	! Allocate virtual memory.
+    bad$sync_io		: ADDRESSING_MODE (GENERAL),	! Perform synchronous IO.
+    boo$actimage	: ADDRESSING_MODE (GENERAL),	! Restart the stand alone image.
+    ini$rdonly		: INI NOVALUE ADDRESSING_MODE (GENERAL),! Make VMS kernel read only.
+    ini$writable	: INI NOVALUE ADDRESSING_MODE (GENERAL),! Make VMS kernel writeable.
+    CLI$DCL_PARSE	: ADDRESSING_MODE (GENERAL),	! CLI call back routine.
+    CLI$GET_VALUE	: ADDRESSING_MODE (GENERAL),	! CLI call back routine.
+    CLI$PRESENT		: ADDRESSING_MODE (GENERAL),	! CLI call back routine.
+    STR$TRIM		: ADDRESSING_MODE (GENERAL),	! String routine to trim trailing blanks and tabs.
+    CON$PUTCHAR		: ADDRESSING_MODE(GENERAL) JSB_R0 NOVALUE,! Put a character out to the console terminal
+    CON$OWNCTY		: ADDRESSING_MODE(GENERAL) JSB_PRESERVE NOVALUE;! "Allocate" the console terminal
+
+EXTERNAL
+    exe$bug_check	: ADDRESSING_MODE (GENERAL),	! Address of the bugcheck code.
+    analyzcmd,						! Command Language Definition module.
+    bad$gl_chan,					! IO channel.
+    bad$ga_comnd_line	: $BBLOCK [dsc$c_s_bln],	! Command line descriptor.
+    bad$gl_context	: BITVECTOR [32],		! Context bits.
+    bad$ga_device	: $BBLOCK [dsc$c_s_bln],	! Device name descriptor.
+    bad$gq_devnam	: $BBLOCK [dsc$c_s_bln],	! Device name descriptor.
+    bad$ga_filespec	: $BBLOCK [dsc$c_s_bln],	! File name descriptor.
+    bad$gl_func,					! IO function.
+    bad$ga_input_desc	: $BBLOCK [dsc$c_s_bln],	! Generic input descriptor.
+    bad$gl_maxblock,					! Total number of blocks on the device.
+    bad$ga_mdbsf	: REF $BBLOCK,			! Address of the MDBSF.
+    bad$gl_pagcnt,					! Number of pages in each data buffer (1 & 2).
+    bad$ga_sdbsf	: REF $BBLOCK,			! Address of the SDBSF.
+    bad$gl_serialnum,					! Serial number for device.
+    bad$gl_status;					! Global status.
+
+!
+! Define message codes...
+!
+EXTERNAL LITERAL
+    bad$_closeout,					! Error closing output.
+    bad$_openout,					! Error opening output file.
+    bad$_readerr,					! Read error.
+    bad$_writeerr;					! Write error.
+
+
+GLOBAL ROUTINE bad$sta_init : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    This procedure is responsible for performing all of the necessary
+!    initialization for $ ANALYZE/MEDIA in the Stand Alone Environment.
+!    This includes such things as replacing the BUGCHECK code with a crude
+!    local bugcheck handler, allocation of dynamic buffers for the various
+!    dynamic string descriptors, prompting for a command line and performing
+!    the initial command parse.
+!
+! Implicit Outputs:
+!
+!    The BUGCHECK code has been installed, the dynamic string descriptors
+!    have dynamic buffers allocated for them (and have been initialized),
+!    the command line has been obtained and parsed.
+!
+!--
+BEGIN
+
+IF .dyn_buf_adr EQL 0					! If this is the first invocation, install the bugcheck
+THEN							! routine, allocate the required data buffers and 
+    BEGIN						! initialize the descriptors.
+    $CMKRNL (ROUTIN=bad$install_code);			! Install the bugcheck handler.
+    bad$alloc_mem (bad$k_page_size, dyn_buf_adr);	! Allocate the dynamic string buffers.
+    END
+ELSE							! Its not the first invocation, therefore we must clean up
+    $CNTREG (PAGCNT =					! the buffers which were previously allocated.
+		    (IF .bad$gl_context [ctx_v_ltdevice]! If the device is a last track format device then
+		    THEN 2				! the there are 2 buffers used for the MDBSF and SDBSF
+		    ELSE 1) +				! otherwise there is just one buffer used for the SDBSF.
+                    (IF .bad$gl_context [ctx_v_exercise]! If the device was exercised then deallocate the data
+                    THEN .bad$gl_pagcnt * 2 + 1		! buffers and the test pattern buffer.
+		    ELSE 0));
+
+bad$ga_comnd_line [dsc$w_length] = bad$k_command_len;	! Set command line buffer length.
+bad$ga_comnd_line [dsc$b_dtype] = dsc$k_dtype_t;	! Data type is text.
+bad$ga_comnd_line [dsc$b_class] = dsc$k_class_s;	! Class is fixed length string.
+bad$ga_comnd_line [dsc$a_pointer] = .dyn_buf_adr;	! Set the starting address of the dynamic buffer.
+
+bad$ga_device [dsc$w_length] = bad$k_devnam_len;	! Device specification descriptor.
+bad$ga_device [dsc$b_dtype] = dsc$k_dtype_t;		!
+bad$ga_device [dsc$b_class] = dsc$k_class_s;		!
+bad$ga_device [dsc$a_pointer] = .bad$ga_comnd_line [dsc$a_pointer] + bad$k_command_len;
+
+bad$ga_input_desc [dsc$w_length] = bad$k_input_len;	! General purpose input descriptor.
+bad$ga_input_desc [dsc$b_dtype] = dsc$k_dtype_t;	!
+bad$ga_input_desc [dsc$b_class] = dsc$k_class_s;	!
+bad$ga_input_desc [dsc$a_pointer] = .bad$ga_device [dsc$a_pointer] + bad$k_devnam_len;
+
+bad$ga_filespec [dsc$w_length] = bad$k_filename_len;	! Output file specification descriptor.
+bad$ga_filespec [dsc$b_dtype] = dsc$k_dtype_t;		!
+bad$ga_filespec [dsc$b_class] = dsc$k_class_s;		!
+bad$ga_filespec [dsc$a_pointer] = .bad$ga_input_desc [dsc$a_pointer] + bad$k_input_len;
+
+DO  BEGIN						! Get a command line and validate it!
+    LIB$GET_INPUT (bad$ga_input_desc, $descriptor (%CHAR(%X'0D',%X'0A'),'$ '));
+    bad$gl_status = CLI$DCL_PARSE (bad$ga_input_desc, analyzcmd);
+    END
+UNTIL .bad$gl_status;					! If the command syntax is ok, Return.
+
+END;    ! of GLOBAL ROUTINE bad$sta_init
+
+
+%SBTTL	'bad$validate_pack -- Set Volume Valid bit in device UCB'
+GLOBAL ROUTINE bad$validate_pack : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    Since there is no DCL (hence, no $ MOUNT command) in the Stand Alone
+!    Environment, we must manually set the Volume Valid bit in the device
+!    UCB.  This assures the IO subsystem that a pack exists in the drive
+!    and is spun up ready for action.
+!
+! Implicit Outputs:
+!
+!    The Volume Valid bit has been set.
+!
+!--
+BEGIN
+bad$gl_func = IO$_PACKACK;				! Set the Volume Valid Bit in the UCB.
+DO bad$gl_status = bad$sync_io () UNTIL .bad$gl_status;	! Wait for Drive Ready before continuing.
+END;    ! of GLOBAL ROUTINE bad$validate_pack
+
+
+%SBTTL	'bad$str_trim -- Trim string of trailing blanks, tabs and CR'
+GLOBAL ROUTINE bad$str_trim (string_desc) : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    Trim the string provided using the string routine STR$TRIM.
+!    Once the string has had the trailing blanks and tabs removed check
+!    to see if a trailing carriage return is on the line, if it is, then
+!    decrement the string count by one.
+!
+! Inputs:
+!
+!    string_desc	adr	Address of the string descriptor.
+!
+! Ouputs:
+!
+!    string_desc	adr	Address of the string descriptor.
+!
+! Side Effects:
+!
+!    If the string has a carriage return as its last character, it is
+!    removed by decrementing the length.
+!
+!--
+BEGIN
+
+LITERAL
+    cr = %X'0D';
+
+LOCAL
+    char : BYTE;
+
+MAP
+    string_desc : REF $BBLOCK;
+
+STR$TRIM (string_desc [dsc$w_length],
+	  string_desc [dsc$w_length],
+	  string_desc [dsc$w_length]);
+
+char = .(.string_desc [dsc$a_pointer] +
+	(.string_desc [dsc$w_length] - 1));
+
+IF .char EQL cr
+THEN string_desc [dsc$w_length] = .string_desc [dsc$w_length] - 1;
+
+END;    ! of GLOBAL ROUTINE bad$str_trim
+
+
+%SBTTL	'Revectored Library Routine -- LIB$GET_INPUT'
+GLOBAL ROUTINE LIB$GET_INPUT (desc, prompt, retlen) =
+!++
+!
+! Functional Description:
+!
+!    Stand Alone Environment replacement module, which simply calls a local
+!    support procedure to perform a $QIOW with a read with prompt option.
+!
+! Inputs:
+!
+!    desc	adr	address of the input buffer descriptor.
+!    prompt	adr	address of the prompt string descriptor.
+!    retlen	adr	address of a word to receive the actual string length.
+!
+! Outputs:
+!
+!    The input string has been read and its contents reside in the buffer
+!    pointed to by 'desc'.  The length field has been updated in the descriptor.
+!
+! Side Effects:
+!
+!    The buffer is initialized to all spaces prior to reading the input line.
+!
+!--
+BEGIN
+BUILTIN
+    NULLPARAMETER;
+
+MAP
+    desc : REF $BBLOCK;
+
+CH$FILL (%C' ', .desc [dsc$w_length], .desc [dsc$a_pointer]);
+
+RETURN (bad$sta_io (IO$_READPROMPT,
+		    desc [dsc$w_length],
+		    .prompt,
+		    IF NOT NULLPARAMETER (3)
+		    THEN .retlen
+		    ELSE 0));
+
+END;    ! of GLOBAL ROUTINE LIB$GET_INPUT
+
+
+%SBTTL	'SYS$CREATE -- Custom Stand Alone support procedure'
+GLOBAL ROUTINE SYS$CREATE (fab, err, suc) =
+!++
+!
+! Functional Description:
+!
+!    In the Stand Alone environment RMS does not exist, hence this routine
+!    provides a crude solution for performing the $CREATE actions.  The input
+!    arguments supplied by the caller are IGNORED.  The following actions are
+!    performed:  translate the logical name 'SYS$OUTPUT' provided by the system
+!    and assign a channel to the device.
+!
+! Inputs:
+!
+!    fab	adr	address of the FAB (ignored)
+!    err	adr	address of an error action routine (ignored)
+!    suc	adr	address of a success action routine (ignored)
+!
+! Implicit Outputs:
+!
+!    A channel is established to SYS$OUTPUT.
+!
+!--
+BEGIN
+LOCAL
+    tt_desc	: $BBLOCK [dsc$c_s_bln],		! Device name descriptor
+    tt_name	: $BBLOCK [bad$k_devnam_len + 1];	! Device name buffer
+
+IF .tt_chan EQL 0					! Has a channel already been established?
+THEN							! No, allocate a CCB to point to SYS$OUTPUT.
+    BEGIN						!
+    CH$FILL (0, dsc$c_s_bln, tt_desc);			! Initialize the descriptor.
+    tt_desc [dsc$w_length] = bad$k_devnam_len + 1;	! Length
+    tt_desc [dsc$a_pointer] = tt_name;			! Address
+
+    $TRNLOG (LOGNAM = sys$output,			! Translate SYS$OUTPUT to determine the
+	     RSLLEN = tt_desc,				! correct output device.
+	     RSLBUF = tt_desc);
+
+    $ASSIGN (DEVNAM = tt_desc, CHAN = tt_chan);		! Assign a channel to the output device.
+    END;
+
+RETURN ss$_normal;
+
+END;    ! of GLOBAL ROUTINE SYS$CREATE
+
+
+%SBTTL	'SYS$CONNECT -- Custom Stand Alone support procedure'
+GLOBAL ROUTINE SYS$CONNECT (rab, err, suc) =
+!++
+!
+! Functional Description:
+!
+!    In the Stand Alone environment RMS does not exist, hence this routine
+!    provides a crude solution for performing the $CONNECT actions.  The input
+!    arguments are IGNORED.  This routine performs only one (1) action: it
+!    returns to the caller with sucess status.
+!
+!--
+BEGIN
+RETURN ss$_normal;
+END;    ! of GLOBAL ROUTINE SYS$CONNECT
+
+
+%SBTTL	'SYS$PUT -- Custom Stand Alone support procedure'
+GLOBAL ROUTINE SYS$PUT (rab, err, suc) =
+!++
+!
+! Functional Description:
+!
+!    In the Stand Alone environment RMS does not exist, hence this routine
+!    provides a crude solution for performing the $PUT actions.  The 'rab'
+!    input argument is the only argument used, the others are IGNORED.
+!    
+!    The action taken is as follows:
+!
+!	The buffer address and size are extracted from the RAB, and placed
+!	into a local descriptor.  The size of the line is checked for a
+!	length of zero (0) indicating a blank line should be output.  If
+!	this is true, then the descriptor is pointed the a local CRLF pair
+!	and the length is set to 2 bytes.  Otherwise, a CRLF is appended
+!	to the string passed (fake RAT=CR) and the length is bumped up by
+!	2 bytes.  The string is the printed and we return status from the
+!	$QIO.
+!
+! Inputs:
+!
+!    rab	adr	address of the RAB
+!    err	adr	address of an error routine (ignored)
+!    suc	adr	address of a success routine (ignored)
+!
+! Implicit Outputs:
+!
+!    The line has been written to the output file.
+!
+!--
+BEGIN
+BUILTIN
+    PROBEW;
+
+MAP
+    rab : REF $BBLOCK;
+
+LOCAL
+    cr_lf : WORD INITIAL (%X'0D0A'),					! Local CRLR datum.
+    line_desc : $BBLOCK [dsc$c_s_bln],					! Descriptor formed from the RAB RBF and RSZ fields.
+    mode : BYTE INITIAL (prt$c_uw);					! Hardware Protection code for User Writeable.
+
+line_desc [dsc$w_length] = .rab [rab$w_rsz];				! Get the record size.
+line_desc [dsc$a_pointer]= .rab [rab$l_rbf];				! Get the record buffer address.
+
+IF .line_desc [dsc$w_length] EQL 0					! If no string is provided, then we will
+THEN									! write a blank line.
+    BEGIN
+    line_desc [dsc$a_pointer] = cr_lf;					! Address of the carriage return line feed
+    line_desc [dsc$w_length] = 2;					! String length.
+    END
+ELSE
+    IF PROBEW (mode, line_desc [dsc$w_length], .line_desc [dsc$a_pointer]) ! A string was provided, can a CRLF be appended to it?
+    THEN								! Yes, append the carriage return line feed
+        BEGIN								! onto the line and adjust the length.
+        .line_desc [dsc$a_pointer] + .line_desc [dsc$w_length] = .cr_lf;
+        line_desc [dsc$w_length] = .line_desc [dsc$w_length] + 2;
+        END;
+
+IF NOT (bad$gl_status =	bad$sta_io (IO$_WRITELBLK, line_desc))
+THEN
+    SIGNAL (bad$_writeerr, 1, sys$output, .bad$gl_status);
+
+RETURN ss$_normal;
+
+END;    ! of GLOBAL ROUTINE SYS$PUT
+
+
+%SBTTL	'SYS$CLOSE -- Custom Stand Alone support procedure'
+GLOBAL ROUTINE SYS$CLOSE (fab, err, suc) =
+!++
+!
+! Functional Description:
+!
+!    In the Stand Alone environment RMS does not exist, hence this routine
+!    provides a crude solution for performing the $CLOSE actions.  The input
+!    arguments are IGNORED.  This procedure disconnects the channel from 
+!    SYS$OUTPUT.
+!
+! Implicit Inputs:
+!
+!    tt_chan		Longword containing the channel to SYS$OUTPUT.
+!
+! Side Effects:
+!
+!    Any problems in closing the output file will be reported via
+!    a SIGNAL_STOP.
+!
+!--
+BEGIN
+IF NOT (bad$gl_status = $DASSGN (CHAN = .tt_chan))
+THEN
+    SIGNAL_STOP (bad$_closeout, 1, sys$output, .bad$gl_status);
+
+tt_chan = 0;
+
+RETURN ss$_normal;
+
+END;    ! of GLOBAL ROUTINE SYS$CLOSE
+
+
+%SBTTL	'bad$sta_io -- Stand Alone IO support procedure'
+GLOBAL ROUTINE bad$sta_io (func, desc, prompt, length) =
+!++
+!
+! Functional Description:
+!
+!    Since there is no RMS support in the Stand Alone environment, this
+!    routine handles all terminal IO functions by issuing $QIOWs.
+!
+! Inputs:
+!
+!    func	val	IO operation to perform.
+!    desc	adr	Address of the string descriptor.
+!    prompt	adr	Address of the prompt string descriptor. [OPTIONAL]
+!    length	adr	Address of a word to receive the string length. [OPTIONAL]
+!
+! Routine Value:
+!
+!    The routine value is the completion status of the $QIOW.
+!
+!    IF the $QIOW was successful but the terminating character was a ^Z,
+!    then we will return RMS$_EOF.
+!
+! Side Effects:
+!
+!    If a channel has not been established to the output device (SYS$OUTPUT),
+!    one will be created before attempting the IO operation.
+!
+!--
+BEGIN
+BUILTIN
+    NULLPARAMETER;
+
+LITERAL
+    ctrl_z = %X'1A';
+
+MAP
+    desc	: REF $BBLOCK,
+    prompt	: REF $BBLOCK;
+
+BIND
+    char = .desc [dsc$a_pointer] : BYTE;		! Check first character of the input buffer for ^Z.
+
+IF .tt_chan EQL 0					! Has a channel been established to SYS$OUTPUT?
+THEN $CREATE (FAB = sys$output);			! Calls revectored service procedure with a dummy arg.
+
+IF NOT (bad$gl_status =
+		$QIOW (	FUNC =	.func,			! Use supplied IO function.
+			CHAN =	.tt_chan,		! Direct output to SYS$OUTPUT.
+			IOSB =	.tt_iosb,		! Save the status.
+			P1 =	.desc [dsc$a_pointer],	! Buffer address.
+			P2 =	.desc [dsc$w_length],	! Buffer size.
+			P5 =	IF NULLPARAMETER (3)	! If no prompt was supplied, set the default
+				THEN 0			! of nothing, otherwise use the prompt supplied.
+				ELSE .prompt [dsc$a_pointer],
+			P6 =	IF NULLPARAMETER (3)	! 
+				THEN 0			!
+				ELSE .prompt [dsc$w_length]))
+THEN							! NOTE:  Any problems restart the image!
+    SIGNAL (IF .func EQL IO$_WRITELBLK			! Force FATAL severity, include the other
+            THEN bad$_writeerr + sts$k_severe		! arguments for consistency.
+            ELSE bad$_readerr + sts$k_severe,
+            1, sys$output, .bad$gl_status);
+
+IF .func NEQ IO$_WRITELBLK				! If we have just completed a READ function...
+THEN							! Special case the following:
+    BEGIN						! See if the first character in the buffer is
+    IF .char EQL ctrl_z					! a ^Z.  If it is, then use the RMS$_EOF status
+    THEN bad$gl_status = RMS$_EOF;			! to indicate a terminator was the first char seen.
+    IF NOT NULLPARAMETER (4)				! Was a return length requested?
+    THEN .length = .tt_iosb [1];			! Yes, copy number of bytes read from the IOSB.
+    END;
+
+RETURN .bad$gl_status;
+
+END;    ! of GLOBAL ROUTINE bad$sta_io
+
+
+%SBTTL	'Condition Handling Procedures'
+GLOBAL ROUTINE bad$handler (signal, mechanism) =
+!++
+!
+! Functional Description:
+!
+!    This routine provides the mechanism for generating and displaying
+!    error messages SIGNALled by BAD.  To generate the messages we call
+!    $PUTMSG, however, the messages are displayed by the $PUTMSG action
+!    routine 'bad$putmsg_actrtn'.
+!
+! Inputs:
+!
+!    signal	adr	Address of the Standard VMS Signal Array.
+!    mechansim	adr	Address of the Standard VMS Mechanism Array.
+!
+! Routine Value:
+!
+!    SS$_CONTINUE
+!
+! Side Effects:
+!
+!    If the severity of the message is FATAL (SEVERE), the image is restarted.
+!
+!--
+BEGIN
+MAP
+    signal	: REF $BBLOCK,				! Signal Array
+    mechanism	: REF $BBLOCK;				! Mechansim Array
+
+IF .signal [chf$l_sig_name] NEQ ss$_unwind
+THEN
+    BEGIN
+    signal [chf$l_sig_args] = .signal [chf$l_sig_args] - 2;! Strip PC and PSL from the argument list.
+    $PUTMSG (MSGVEC=.signal, ACTRTN=bad$putmsg_actrtn);	! Format and 'display' the message.
+
+    IF (.signal [chf$l_sig_name] AND sts$m_severity) EQL sts$k_severe
+    THEN
+        BEGIN
+        boo$actimage (image_name);			! Restart the image if severity was FATAL.
+        $exit ();					! If restart fails, then ungracefully exit.
+        END;
+    END;
+
+RETURN ss$_continue;					! Continue processing.
+
+END;    ! of GLOBAL ROUTINE bad$handler
+
+
+GLOBAL ROUTINE bad$putmsg_actrtn (desc) =
+!++
+!
+! Functional Description:
+!
+!    This routine simply calls 'bad$sta_io' to write the formatted
+!    signal message from $PUTMSG.  We return FALSE to inhibit $PUTMSG
+!    from attempting to write the message too (since there is no RMS
+!    support in the stand alone environment!).
+!
+! Inputs:
+!
+!    desc	adr	Address of the message string descriptor.
+!
+! Routine Value:
+!
+!    FALSE	Inhibit $PUTMSG from attempting to write the
+!		signal message also.
+!
+!--
+BEGIN
+BUILTIN
+    PROBEW;
+
+LOCAL
+    cr_lf : WORD INITIAL (%X'0D0A'),				! Local CRLR datum.
+    mode : BYTE INITIAL (prt$c_uw);				! Hardware Protection code for User Writeable.
+
+MAP
+    desc : REF $BBLOCK;						! Signal message descriptor.
+
+IF PROBEW (mode, desc [dsc$w_length], .desc [dsc$a_pointer]) 	! Can a CRLF be appended to the string?
+THEN								! Yes, append the carriage return line feed
+    BEGIN							! onto the line and adjust the length.
+    .desc [dsc$a_pointer] + .desc [dsc$w_length] = .cr_lf;
+    desc [dsc$w_length] = .desc [dsc$w_length] + 2;
+    END;
+
+bad$sta_io (IO$_WRITELBLK, .desc);				! Display the error message.
+
+RETURN FALSE;							! Inhibit $PUTMSG from duplicating the effort.
+
+END;    ! of GLOBAL ROUTINE bad$putmsg_actrtn
+
+
+ROUTINE bad$bugcheck : JSB NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    This routine is written over EXE$BUG_CHECK, in order to trap any
+!    bugcheck that might occur during execution of Stand Alone BAD.
+!
+!    EXE$BUG_CHECK is overwitten with a 'private' routine, because the
+!    console media containing the executive is not resident, hence the
+!    bugcheck code cannot be loaded.
+!
+!--
+BEGIN
+
+BUILTIN
+    HALT,
+    MFPR,
+    MTPR;
+
+LOCAL
+    msg_ptr : REF VECTOR [, BYTE],
+    char;
+
+MTPR (%REF (ipl$_power), pr$_ipl);			! No interrupts allowed!
+CON$OWNCTY();						! "Allocate" console terminal
+msg_ptr = bugcheck_msg;					! Point to the message text.
+
+DECR index FROM 14 TO 1 DO				! Set up for synchronous IO
+    BEGIN						! of the 'Bugcheck' message.
+    char = .msg_ptr[0];  msg_ptr = .msg_ptr + 1;	! Get next character
+    CON$PUTCHAR(.char);					! Output character
+    END;
+
+HALT ();						! Stop the processor!
+END;							! Note that the message text is appended to
+OWN							! this routine via PSECT manipulation.
+    bugcheck_msg 	: PSECT ($CODE$) VECTOR [14, BYTE]
+			  INITIAL (BYTE (%CHAR (%O'015', %O'012', 0, 0),
+					 'Bugcheck',
+					 %CHAR (%O'015', %O'012'))),
+    bad$bugcheck_end	: PSECT ($CODE$) VECTOR [0];
+!
+! END of ROUTINE bad$bugcheck
+!
+
+
+ROUTINE bad$install_code =
+!++
+!
+! Functional Description:
+!
+!    This routine is called to install KERNEL mode code.  We call it
+!    to overwrite EXE$BUG_CHECK with local code (bad$bugcheck).
+!
+! Implicit Inputs:
+!
+!    Code and Data resident between 'bad$bugcheck' and 'bad$bugcheck_end'.
+!
+! Implicit Outputs:
+!
+!    EXE$BUG_CHECK has been overwitten with the code specified above.
+!
+! Routine Value:
+!
+!    SS$_NORMAL
+!
+!--
+BEGIN
+
+ini$writable ();					! Make VMS kernel writeable.
+CH$MOVE (bad$bugcheck_end - bad$bugcheck, bad$bugcheck, exe$bug_check);
+ini$rdonly ();						! Reset VMS kernel back to read only.
+
+RETURN ss$_normal;
+
+END;    ! of ROUTINE bad$install_code
+
+
+END    ! of MODULE badstasys
+ELUDOM

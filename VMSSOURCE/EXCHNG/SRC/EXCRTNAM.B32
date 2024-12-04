@@ -1,0 +1,1279 @@
+MODULE	exch$rtnam				%TITLE 'RT-11 name manipulation routines'
+		(
+		IDENT = 'V04-000',
+		ADDRESSING_MODE (EXTERNAL=LONG_RELATIVE, NONEXTERNAL=WORD_RELATIVE)
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:	EXCHANGE - Foreign volume interchange facility
+!
+! ABSTRACT:	Primary action routines for DELETE, RENAME and other RT-11 name manipulation routines
+!
+! ENVIRONMENT:	VAX/VMS User mode
+!
+! AUTHOR:	CW Hobbs	 CREATION DATE: 28-Nov-1982
+!
+! MODIFIED BY:
+!
+!	V03-002	CWH3002		CW Hobbs		12-Apr-1984
+!		On a boot copy, allow an optional second parameter for
+!		compatibility with the RT11 syntax.  If present, make
+!		sure that it refers to the same device as the first parm.
+!
+!
+!--
+
+! Include files:
+!
+MACRO $module_name_string = 'exch$rtnam' %;	! The require file needs to know our module name
+REQUIRE 'SRC$:EXCREQ'				! Facility-wide require file
+    ;
+
+%SBTTL 'Module table of contents'
+
+! Module table of contents:
+!
+FORWARD ROUTINE
+	 rtnam_common,				! Common action routine for delete and rename verbs
+    exch$rtnam_copy_boot,			! Write a boot routine on an RT-11 volume
+    exch$rtnam_delete,				! Main entry routine for delete verb
+	 rtnam_delete_action,			! Secondary action routine for delete verb
+	 rtnam_init		: NOVALUE,	! Inits common to rtnam and TYPE
+	 rtnam_parse_cleanup	: NOVALUE,	! Release structures and clean up after parse
+	 rtnam_parse_next_input,		! Fetch and expand next input parameter
+    exch$rtnam_rename,				! Main entry routine for RENAME verb
+	 rtnam_rename_action			! Secondary action routine for RENAME verb
+    ;
+
+! EXCHANGE facility routines
+!
+EXTERNAL ROUTINE
+    exch$cmd_cli_get_integer,			! Get an integer value
+    exch$cmd_related_file_parse,		! Parse a file specification with a related file name
+    exch$cmd_parse_filespec,			! Parse a file specification
+    exch$cmd_unwind_cli_syntax,			! Return on undefined qualifiers
+    exch$copy_namb_to_filb	: NOVALUE,	! Copy fields from namb to the filb
+    exch$io_rt11_read,				! Read blocks from RT-11 volume
+    exch$io_rt11_write,				! Write blocks to an RT-11 volume
+    exch$moun_implied_mount,			! Do a default mount
+    exch$rt11_create_file,			! Create and connect to an RT11 file
+    exch$rt11_dircache_start	: NOVALUE,	! Start directory write caching
+    exch$rt11_dircache_stop	: NOVALUE,	! Finish write caching and flush directory
+    exch$rt11_dirseg_put,			! Write a directory segment
+    exch$rtacp_consolidate,			! Compress unnecessary entries
+    exch$rtacp_find_file,			! Find an RT11 file
+    exch$rt11_open_file,			! Connect an RT11 file
+    exch$rt11_write_cleanup	: NOVALUE,	! Complete writing to an RT-11 volume
+    exch$rt11_write_prepare	: NOVALUE,	! Prepare to write to an RT-11 volume
+    exch$util_fao_buffer,			! Format an fao string
+    exch$util_filb_allocate,			! Allocate file context block
+    exch$util_filb_release	: NOVALUE,	! Release file context block
+    exch$util_file_error,			! Tell about an rms error
+    exch$util_namb_release	: NOVALUE,	! Release name block
+    exch$util_radix50_from_ascii,		! Convert ascii to radix50
+    exch$util_rmsb_allocate,			! Allocate Files-11 control block
+    exch$util_rmsb_release	: NOVALUE,	! Release Files-11 block
+    exch$util_rt11ctx_allocate,			! Allocate RT-11 context block
+    exch$util_rt11ctx_release	: NOVALUE,	! Release RT-11 block
+    exch$util_vm_allocate			! Allocate virtual memory
+    ;
+
+! Equated symbols:
+!
+!LITERAL
+!    ;
+
+! Bound declarations:
+!
+!BIND
+!    ;
+
+GLOBAL ROUTINE rtnam_common =	%SBTTL 'rtnam_common'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Common action routine for the DELETE and RENAME verbs for RT11 only
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	Command parameters and qualifiers as returned from CLI$ routines.  Global environment ref'd by exch$a_gbl.
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	Files may be created.
+!--
+
+$dbgtrc_prefix ('rtnam_common> ');
+
+LOCAL
+    abort,
+    nosys_signalled,
+    status
+    ;
+
+BIND
+    rtnam = exch$a_gbl [excg$a_rtnam_work] : $ref_bblock	! Pointer to work area
+    ;
+
+! Init the name used for the input file default
+!
+str$copy_dx (rtnam [rtnam$q_input_sticky_name], %ASCID '');
+
+! Loop through the list of input file specifications.  Errors will be signalled.
+!
+abort = false;
+nosys_signalled = false;
+
+WHILE (status = rtnam_parse_next_input ())	! Get next input file parameter
+DO
+    BEGIN
+    LOCAL
+	nam_len,
+	typ_len,
+	tot_len
+	;
+    BIND
+	filb = rtnam [rtnam$a_inp_filb] : $ref_bblock,
+	namb = filb [filb$a_assoc_namb] : $ref_bblock,
+	volb = filb [filb$a_assoc_volb] : $ref_bblock,
+	ctx = filb [filb$a_context] : $ref_bblock,
+	nam_nam = namb [namb$q_name] : $desc_block,
+	nam_typ = namb [namb$q_type] : $desc_block
+	;
+
+    $block_check (2, .filb, filb, 547);
+    $block_check (2, .namb, namb, 548);
+    $block_check (2, .volb, volb, 549);
+    $block_check (2, .ctx, rt11ctx, 550);				! Make sure that it is what we think it is
+    $logic_check (3, (.ctx [rt11ctx$a_assoc_filb] EQL .filb), 206);
+    $logic_check (3, (.ctx [rt11ctx$a_assoc_volb] EQL .volb), 207);
+
+    ! Create the result file name in the filb
+    !
+    nam_len = .nam_nam [dsc$w_length];
+    typ_len = .nam_typ [dsc$w_length];
+    tot_len = .nam_len + .typ_len;			! Final length of both
+    filb [filb$l_result_name_len] = .volb [volb$l_vol_ident_len] + .tot_len;	! Length of volume ident
+    $logic_check (2, (.filb [filb$l_result_name_len] LEQU filb$s_result_name), 208);
+    CH$COPY (.volb [volb$l_vol_ident_len], volb [volb$t_vol_ident],			! Volume name
+		    .nam_len, .nam_nam [dsc$a_pointer], .typ_len, .nam_typ [dsc$a_pointer],
+		    0, filb$s_result_name, filb [filb$t_result_name]);
+
+    $trace_print_fao ('looking for "!AF"', .filb [filb$l_result_name_len], filb [filb$t_result_name]);
+
+    ! Need to be able to write to the volume
+    !
+    IF NOT .volb [volb$v_write]
+    THEN
+	BEGIN
+	status = (IF .rtnam [rtnam$v_delete_command] THEN exch$_nodellock ELSE exch$_norenlock);
+	$exch_signal (.status, 2, .filb [filb$l_result_name_len], filb [filb$t_result_name]);
+	abort = true;
+	END
+
+    ELSE
+	BEGIN
+
+	! Engage directory write caching on the volume
+	!
+	exch$rt11_dircache_start (.volb);
+
+	WHILE exch$rtacp_find_file (.ctx, filb [filb$t_result_name] + .volb [volb$l_vol_ident_len], .tot_len)
+	DO
+
+	    ! Two kinds of files need special treatment, so filter them before we perform any action
+	    !
+	    IF
+
+		! Files with a file type of .SYS will not be touched unless /SYSTEM has been given
+		!
+		(BEGIN
+		IF .ctx [rt11ctx$w_filetype] EQL r50_sys
+		THEN
+		    BEGIN
+
+		    ! Give a warning message the first time we pass over a .SYS file
+		    !
+		    IF	(NOT .rtnam [rtnam$v_q_system])
+		      AND
+			(NOT .nosys_signalled)
+		    THEN
+			BEGIN
+			nosys_signalled = true;
+			$exch_signal (exch$_nosysact);
+			END;
+		    .rtnam [rtnam$v_q_system]	! Block has the value of the qualifier /SYSTEM
+		    END
+		ELSE
+		    1				! File not .SYS, file is "found"
+		END)
+
+	     ! And now for the second class of file.  Both blocks must return true for the file to be "found"
+	     !
+	     AND
+
+		! Files with a file type of .BAD will not be touched by wildcard names
+		!
+		(BEGIN
+		IF .ctx [rt11ctx$w_filetype] EQL r50_bad
+		THEN
+		    BEGIN
+		    IF  .namb [namb$v_wild_name]		! If the found file was not explicitly named
+			OR					!  then skip to the next file by calling
+			.namb [namb$v_wild_type]		!  ourselves again
+		    THEN
+			0	! Wildcard, block returns false, file is not "found"
+		    ELSE
+			1	! No wildcard, block returns true, file is "found"
+		    END
+		ELSE
+		    1		! File not .BAD, file is "found"
+		END)
+
+	    ! Now the THEN clause, we have truly found this file, now work on it
+	    !
+	    THEN
+		BEGIN
+		LOCAL
+		    res_buf : $bvector [filb$s_result_name],		! A buffer in which to build the actual final name
+		    res_len;
+
+		! Create the result file name in the filb
+		!
+		nam_len = .ctx [rt11ctx$l_exp_fullname_len];
+		res_len = .volb [volb$l_vol_ident_len] + .nam_len;		! Length of volume ident plus file name
+		$logic_check (2, (.res_len LEQU filb$s_result_name), 125);
+		CH$COPY (.volb [volb$l_vol_ident_len], volb [volb$t_vol_ident],			! Volume name
+				.nam_len, ctx [rt11ctx$t_exp_fullname],
+				0, filb$s_result_name, res_buf);
+
+		$debug_print_fao ('file "!AF" exists', .res_len, res_buf);
+
+		filb [filb$v_files_found] = true;	! Remember that we have found a file, whether or not we change it
+
+		! If control/c has been hit, leave the loop now
+		!
+		IF .exch$a_gbl [excg$v_control_c]
+		THEN
+		    BEGIN
+		    $exch_signal ($info_stat_copy (exch$_canceled));
+		    abort = true;
+		    EXITLOOP;
+		    END;
+
+		! Call the appropriate secondary action routine, depending on the command
+		!
+		IF .rtnam [rtnam$v_delete_command]
+		THEN
+		    status = rtnam_delete_action (.res_len, res_buf)
+		ELSE
+		    BEGIN
+		    status = rtnam_rename_action (.res_len, res_buf);
+		    SELECTONE .status OF
+		    SET
+			[exch$_parseerr, exch$_norendev, exch$_badfilename] :
+						    abort = true;
+			[OTHERWISE] :
+						    ;
+		    TES;
+		    END;
+
+		IF .abort THEN EXITLOOP;
+		END;
+
+	! If no files were found, then scream and shout
+	!
+	IF NOT .filb [filb$v_files_found]
+	THEN
+	    BEGIN
+	    LOCAL
+		fao_desc : VECTOR [2, LONG];
+
+	    ! Turn the expanded name into a descriptor
+	    !
+	    fao_desc [0] = .filb [filb$l_result_name_len];
+	    fao_desc [1] = filb [filb$t_result_name];
+
+	    $exch_signal (exch$_filenotfound, 1, fao_desc);
+
+	    END;
+
+!???	IF .abort THEN EXITLOOP;
+	END;
+
+    rtnam_parse_cleanup ();			! Release namb, clean up after parse
+    IF .abort THEN EXITLOOP;
+    END;
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE exch$rtnam_copy_boot =	%SBTTL 'exch$rtnam_copy_boot'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Write a boot block on the RT-11 volume.
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	Command parameters and qualifiers as returned from CLI$ routines.  Global environment ref'd by exch$a_gbl.
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	Block 0 and 2-5 of the target volume will be written
+!--
+
+$dbgtrc_prefix ('rtnam_copy_boot> ');
+
+LOCAL
+    check,
+    buf : $bvector [512*5],			! five block buffer for monitor file blocks
+    status
+    ;
+
+BIND
+    rtnam = exch$a_gbl [excg$a_rtnam_work] : $ref_bblock	! Pointer to work area
+    ;
+
+! Allocate and/or initialize the work area
+!
+rtnam_init ();
+
+! Get the monitor file specification.  Errors will be signalled.
+!
+str$copy_dx (rtnam [rtnam$q_input_sticky_name], %ASCID '.SYS');	! Default file type to .SYS
+IF (status = rtnam_parse_next_input ())
+THEN
+    BEGIN
+    LOCAL
+	out_file : $desc_block,
+	out_namb : $ref_bblock,
+	nam_len,
+	typ_len,
+	tot_len
+	;
+
+    BIND
+	filb = rtnam [rtnam$a_inp_filb] : $ref_bblock,
+	namb = filb [filb$a_assoc_namb] : $ref_bblock,
+	volb = filb [filb$a_assoc_volb] : $ref_bblock,
+	ctx = filb [filb$a_context] : $ref_bblock,
+	nam_nam = namb [namb$q_name] : $desc_block,
+	nam_typ = namb [namb$q_type] : $desc_block
+	;
+
+    $block_check (2, .filb, filb, 638);
+    $block_check (2, .namb, namb, 639);
+    $block_check (2, .volb, volb, 640);
+    $block_check (2, .ctx, rt11ctx, 641);				! Make sure that it is what we think it is
+    $logic_check (3, (.ctx [rt11ctx$a_assoc_filb] EQL .filb), 273);
+    $logic_check (3, (.ctx [rt11ctx$a_assoc_volb] EQL .volb), 274);
+
+    ! See if the optional output parameter is present.  If so, verify that it refers to the same volb as
+    ! the input.  This lets us keep the syntax for COPY /BOOT compatible with RT-11.
+    !
+    $dyn_str_desc_init (out_file);
+    IF (status = exch$cmd_parse_filespec (%ASCID 'OUTPUT', 0, 0, out_file, out_namb))
+    THEN
+	BEGIN
+	REGISTER
+	    ignore,
+	    out_volb;
+	out_volb = .out_namb [namb$a_assoc_volb];
+	ignore = (0 NEQ (.out_namb [namb$l_nameflags] AND (namb$m_explicit_node OR namb$m_explicit_directory
+				  OR namb$m_explicit_name OR namb$m_explicit_type OR namb$m_explicit_version)));
+	exch$util_namb_release (.out_namb);
+	IF .out_volb NEQ .volb			! If volb addresses different it is not the same device
+	THEN
+	    BEGIN
+	    status = exch$_nocopyboot;
+	    $exch_signal (.status, 0, exch$_notsamedev);
+	    rtnam_parse_cleanup ();
+	    RETURN .status;
+	    END;
+	IF .ignore
+	THEN
+	    $exch_signal (exch$_devonly, 1, out_file);
+	END;
+
+    ! Create the result file name in the filb, concatenate name and type together
+    !
+    nam_len = .nam_nam [dsc$w_length];
+    typ_len = .nam_typ [dsc$w_length];
+    tot_len = .nam_len + .typ_len;		! Final length of both
+    filb [filb$l_result_name_len] = .volb [volb$l_vol_ident_len] + .tot_len;	! Length of volume ident
+    $logic_check (2, (.filb [filb$l_result_name_len] LEQU filb$s_result_name), 289);
+    CH$COPY (.volb [volb$l_vol_ident_len], volb [volb$t_vol_ident],			! Volume name
+		    .nam_len, .nam_nam [dsc$a_pointer], .typ_len, .nam_typ [dsc$a_pointer],
+		    0, filb$s_result_name, filb [filb$t_result_name]);
+
+    $trace_print_fao ('looking for "!AF"', .filb [filb$l_result_name_len], filb [filb$t_result_name]);
+
+    ! Need to be able to write to the volume
+    !
+    IF NOT .volb [volb$v_write]
+    THEN
+	BEGIN
+	status = exch$_nocopyboot;
+	$exch_signal (.status, 0, $warning_stat_copy (exch$_writelock),
+			2, .volb [volb$l_vol_ident_len], volb [volb$t_vol_ident]);
+	END
+
+    ! We can write, now see if we can find the monitor file
+    !
+    ELSE
+	BEGIN
+
+	IF exch$rtacp_find_file (.ctx, filb [filb$t_result_name] + .volb [volb$l_vol_ident_len], .tot_len)
+	THEN
+	    BEGIN
+
+	    ! Remember the status of the read-check bit, then force read-checking on
+	    !
+	    check = .volb [volb$v_read_check];
+	    volb [volb$v_read_check] = true;
+
+	    ! Now we can do what we came here to do, read the first 5 blocks of the monitor file
+	    !
+	    $logic_check (0, (ctx$k_buffer_blocks GEQU 5), 314);	! Need a big enough buffer for read-check
+	    status = exch$io_rt11_read (.volb, .ctx [rt11ctx$l_start_block], 5, buf [0]);
+	    volb [volb$v_read_check] = .check;	! Restore check state
+	    IF NOT .status
+	    THEN
+		RETURN .status;
+
+	    ! Remember the status of the write-check bit, then force write-checking on
+	    !
+	    check = .volb [volb$v_write_check];
+	    volb [volb$v_write_check] = true;
+
+	    ! Write the first block of the monitor file to block 0 of the volume
+	    !
+	    IF NOT (status = exch$io_rt11_write (.volb, 0, 1, buf [0]))
+	    THEN
+		BEGIN
+		volb [volb$v_write_check] = .check;	! Restore the write-checking state
+		RETURN .status;
+		END;
+
+	    ! Write the next four blocks of the monitor file to blocks 2 to 5 of the volume
+	    !
+	    status = exch$io_rt11_write (.volb, 2, 4, buf [512]);
+	    volb [volb$v_write_check] = .check;	! Restore the write-checking state
+	    IF NOT .status
+	    THEN
+		RETURN .status;
+
+	    ! Log the action if requested
+	    !
+	    IF .rtnam [rtnam$v_q_log]
+	    THEN
+		$exch_signal (exch$_copyboot, 4, .ctx [rt11ctx$l_exp_fullname_len], ctx [rt11ctx$t_exp_fullname],
+				.volb [volb$l_vol_ident_len], volb [volb$t_vol_ident]);
+	    END
+
+	! The monitor file was not found, scream and shout
+	!
+	ELSE
+	    BEGIN
+	    LOCAL
+		fao_desc : VECTOR [2, LONG];
+
+	    ! Turn the expanded name into a descriptor
+	    !
+	    fao_desc [0] = .filb [filb$l_result_name_len];
+	    fao_desc [1] = filb [filb$t_result_name];
+
+	    $exch_signal (exch$_filenotfound, 1, fao_desc);
+
+	    END;
+	END;
+
+    rtnam_parse_cleanup ();			! Release namb, clean up after parse
+    END;
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE exch$rtnam_delete =	%SBTTL 'exch$rtnam_delete'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Entry routine for the DELETE verb for RT11 only
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	Command parameters and qualifiers as returned from CLI$ routines.  Global environment ref'd by exch$a_gbl.
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	Files may be deleted.
+!--
+
+$dbgtrc_prefix ('rtnam_delete> ');
+
+LOCAL
+    rtnam : $ref_bblock				! Pointer to work area
+    ;
+
+
+! Allocate and/or initialize the work area
+!
+rtnam_init ();
+
+! Get pointers that we need.  Have to wait until work area allocated by init call
+!
+rtnam = .exch$a_gbl [excg$a_rtnam_work];		! Pointer to work area
+rtnam [rtnam$v_delete_command] = true;
+
+! Do the rest from the common routine
+!
+RETURN rtnam_common ();
+END;
+
+GLOBAL ROUTINE rtnam_delete_action (res_len, res_buf) =	%SBTTL 'rtnam_delete_action (res_len, res_buf)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Secondary action routine for the DELETE verb for RT11 only
+!
+! INPUTS:
+!
+!	res_len - length of result name
+!	res_buf - address of result name
+!
+! IMPLICIT INPUTS:
+!
+!	Command parameters and qualifiers as returned from CLI$ routines.  Global environment ref'd by exch$a_gbl.
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	Files may be deleted.
+!--
+
+$dbgtrc_prefix ('rtnam_delete_action> ');
+
+LOCAL
+    status
+    ;
+
+BIND
+    rtnam = exch$a_gbl [excg$a_rtnam_work] : $ref_bblock,	! Pointer to work area
+    filb = rtnam [rtnam$a_inp_filb] : $ref_bblock,
+    volb = filb [filb$a_assoc_volb] : $ref_bblock,
+    ctx = filb [filb$a_context] : $ref_bblock,
+    ent = ctx [rt11ctx$a_ent_address] : $ref_bblock
+    ;
+
+$block_check (2, .filb, filb, 554);
+$block_check (2, .volb, volb, 555);
+$block_check (2, .ctx, rt11ctx, 556);				! Make sure that it is what we think it is
+
+! Verify that it is ok to delete the existing file
+!
+IF .ctx [rt11ctx$v_typ_protected]	! Can't delete protected files
+THEN
+    $exch_signal_return (exch$_notdeleted, 2, .res_len, .res_buf, exch$_rtprotect)
+
+! Looks good, delete it now
+!
+ELSE
+    BEGIN
+
+    $trace_print_fao ('deleting "!AF"', .res_len, .res_buf);
+
+    ! Mark the entry as deleted
+    !
+    ent [rt11ent$b_type_byte] = rt11ent$m_typ_empty;
+
+    ! Also change the type in the context buffer, since it will be used by EXCH$RTACP_CHECK_POSITION
+    !
+    ctx [rt11ctx$b_type_byte] = rt11ent$m_typ_empty;
+
+    exch$rt11_dirseg_put (.volb, .ctx [rt11ctx$l_seg_number]);		! Write the directory segment
+
+    IF .rtnam [rtnam$v_q_log]
+    THEN
+	$exch_signal (exch$_deleted, 2, .res_len, .res_buf);
+
+    END;
+
+RETURN true;
+END;
+
+GLOBAL ROUTINE rtnam_init : NOVALUE =	%SBTTL 'rtnam_init'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Common init routine for the rtnam verbs
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	Command parameters and qualifiers as returned from CLI$ routines.  Global environment ref'd by exch$a_gbl.
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	Files may be created.
+!--
+
+$dbgtrc_prefix ('rtnam_init> ');
+
+LOCAL
+    status
+    ;
+
+BIND
+    rtnam = exch$a_gbl [excg$a_rtnam_work] : $ref_bblock	! Pointer to work area
+    ;
+
+! The COPY /BOOT command does not support /LOG or /SYSTEM.  Set up a handler to do a RETURN when we would
+! normally get the MSG$_SYNTAX error.
+!
+ENABLE
+    exch$cmd_unwind_cli_syntax;
+
+! If our pointer is null, we need to allocate and initialize the work area
+!
+IF .rtnam EQL 0
+THEN
+    BEGIN
+
+    ! Get the right sized chunk of memory
+    !
+    rtnam = exch$util_vm_allocate (exchblk$s_rtnam);
+
+    ! Set the ident fields
+    !
+    $block_init (.rtnam, rtnam);
+
+    ! Set the dynamic strings
+    !
+    $dyn_str_desc_init (rtnam [rtnam$q_input_filename]);
+    $dyn_str_desc_init (rtnam [rtnam$q_output_filename]);
+    $dyn_str_desc_init (rtnam [rtnam$q_input_sticky_name]);
+
+    END
+ELSE
+    BEGIN
+
+    ! Free the dynamic strings and the Chicago 7
+    !
+    str$free1_dx (rtnam [rtnam$q_input_filename]);
+    str$free1_dx (rtnam [rtnam$q_output_filename]);
+    str$free1_dx (rtnam [rtnam$q_input_sticky_name]);
+
+    END;
+
+! Get some confidence that our work area is valid
+!
+$block_check (2, .rtnam, rtnam, 541);
+
+! Set the last part of the block to nulls
+!
+CH$FILL (0, rtnam$k_end_zero - rtnam$k_start_zero, .rtnam + rtnam$k_start_zero);
+
+! Get the global boolean qualifiers common to all (COPY /BOOT, DELETE, RENAME) commands
+!
+rtnam [rtnam$v_q_log]		= cli$present (%ASCID 'LOG');					! global
+
+! Get global booleans common to Delete and Rename only, COPY /BOOT will unwind, so nothing that COPY/BOOT needs
+! can be past this point
+!
+rtnam [rtnam$v_q_system]	= cli$present (%ASCID 'SYSTEM');				! global
+!\ rtnam [rtnam$v_q_confirm]	= cli$present (%ASCID 'CONFIRM');				! global
+
+RETURN;
+END;
+
+GLOBAL ROUTINE rtnam_parse_cleanup : NOVALUE =	%SBTTL 'rtnam_parse_cleanup'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Clean up after a successful parse.  Release the namb and other structures.
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	rtnam$a_inp_namb field in rtnam work area
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('rtnam_parse_cleanup> ');
+
+BIND
+    rtnam = exch$a_gbl [excg$a_rtnam_work] : $ref_bblock,	! Pointer to work area
+    filb = rtnam [rtnam$a_inp_filb]	 : $ref_bblock,	! Filb for the input
+    namb = filb [filb$a_assoc_namb]	 : $ref_bblock,	! Namb for the input
+    volb = filb [filb$a_assoc_volb]	 : $ref_bblock,	! Volb for the input
+    ctx = filb [filb$a_context]		 : $ref_bblock	! Volume specific context
+    ;
+
+$debug_print_lit ('entry');
+$block_check (2, .filb, filb, 543);
+$block_check (2, .namb, namb, 544);
+$block_check (2, .volb, volb, 545);
+$block_check (2, .ctx, rt11ctx, 546);
+
+! If we have been able to write, then clean things up
+!
+IF .volb [volb$v_write]
+THEN
+    BEGIN
+
+    ! Compress unnecessary entries from the directory.  0 means not to restructure the directory.
+    !
+    exch$rtacp_consolidate (.volb, 0);
+
+    ! Turn caching off and flush any modified directory segments
+    !
+    exch$rt11_dircache_stop (.volb);
+
+    END;
+
+! Release the context block
+!
+exch$util_rt11ctx_release (.ctx);
+
+! Release the input namb
+!
+exch$util_namb_release (.namb);
+
+! Release the input filb
+!
+exch$util_filb_release (.filb);
+
+RETURN;
+END;
+
+GLOBAL ROUTINE rtnam_parse_next_input =	%SBTTL 'rtnam_parse_next_input'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Fetch the next input parameter.  Parse the filename and initialize the input file work region.
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	Command qualifier value as returned from CLI$xxx routines.  rtnam command work area.
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	Command work area receives parse info
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('rtnam_parse_next_input> ');
+
+LOCAL
+    ctx : $ref_bblock,
+    volb : $ref_bblock,
+    format,
+    status
+    ;
+
+BIND
+    rtnam = exch$a_gbl [excg$a_rtnam_work] : $ref_bblock,	! Pointer to work area
+    inp_filb = rtnam [rtnam$a_inp_filb]	 : $ref_bblock,	! Filb for the input
+    inp_namb = rtnam [rtnam$a_inp_namb]	 : $ref_bblock	! Namb for the input
+    ;
+
+
+$block_check (2, .rtnam, rtnam, 542);
+
+! Fetch the filename and a pointer to a namb
+!
+IF NOT (status = exch$cmd_parse_filespec (%ASCID 'INPUT', rtnam [rtnam$q_input_sticky_name], 0,
+				  rtnam [rtnam$q_input_filename], inp_namb))
+THEN
+    BEGIN
+    IF .status NEQ 0
+    THEN
+	$exch_signal (exch$_parseerr, 1, rtnam [rtnam$q_input_filename], .status);
+    RETURN .status;				! No more files to rtnam, or error in parse
+    END;
+$trace_print_fao ('input parameter is "!AS"', rtnam [rtnam$q_input_filename]);
+
+! If if the input potentially describes multiple files, then set the bit
+!
+IF .inp_namb [namb$v_more_files] OR .inp_namb [namb$v_wildcard]
+THEN
+    rtnam [rtnam$v_multiple_files] = true;
+
+! If a foreign device is not mounted, then perform an implied mount
+!
+IF   (.inp_namb [namb$a_assoc_volb] EQL 0)
+  AND
+     (BEGIN
+      BIND
+	dev = inp_namb [namb$l_fabdev] : $bblock;
+      .dev [dev$v_for] OR (NOT (.dev [dev$v_mnt]))
+      END)
+  AND
+     ((.inp_namb [namb$b_devclass] EQL dc$_disk)
+      OR
+      (.inp_namb [namb$b_devclass] EQL dc$_tape))
+THEN
+    BEGIN
+
+    IF NOT (status = exch$moun_implied_mount (.inp_namb))
+    THEN
+	BEGIN
+	exch$util_namb_release (.inp_namb);
+	RETURN .status;
+	END;
+    END;
+
+volb = .inp_namb [namb$a_assoc_volb];
+IF .volb NEQ 0				! If the volb is there, then the interesting format
+THEN
+    format = .volb [volb$b_vol_format]	!  is that of the volb.  Otherwise, it
+ELSE
+    format = .inp_namb [namb$b_vol_format];	!  is that of the namb.
+
+CASE .format FROM volb$k_vfmt_lobound TO volb$k_vfmt_hibound OF
+SET
+    [volb$k_vfmt_files11] :
+			BEGIN
+			LOCAL
+			    errstat;
+			IF .inp_namb [namb$v_explicit_node]
+			THEN
+			    BEGIN
+			    errstat = exch$_noremote;
+			    $exch_signal (.errstat, 1, rtnam [rtnam$q_input_filename]);
+			    END
+			ELSE
+			    BEGIN
+			    errstat = exch$_opnotperf11;
+			    $exch_signal (.errstat, 1, inp_namb [namb$q_device]);
+			    END;
+			exch$util_namb_release (.inp_namb);			! Release the bad namb
+			RETURN .errstat;
+			END;
+
+    [volb$k_vfmt_dos11] :
+			BEGIN
+			LOCAL
+			    errstat;
+			errstat = exch$_opnotperdos;
+			$exch_signal (.errstat, 1, inp_namb [namb$q_device]);
+			exch$util_namb_release (.inp_namb);			! Release the bad namb
+			RETURN .errstat;
+			END;
+
+    [volb$k_vfmt_rt11] :
+			;							! These we can do
+
+!\  [volb$k_vfmt_rtmt] :
+!\ 			BEGIN
+!\ 			LOCAL
+!\ 			    errstat;
+!\ 			errstat = exch$_opnotperrtmt;
+!\ 			$exch_signal (.errstat, 1, inp_namb [namb$q_device]);
+!\ 			exch$util_namb_release (.inp_namb);			! Release the bad namb
+!\ 			RETURN .errstat;
+!\ 			END;
+
+    [INRANGE, OUTRANGE]	:
+			$logic_check (0, (false), 238);
+TES;
+
+$logic_check (3, (.volb NEQ 0), 119);
+
+! Now copy the full name to the default name for proper stickiness
+!
+str$copy_dx (rtnam [rtnam$q_input_sticky_name], inp_namb [namb$q_fullname]);
+
+! Allocate a file block to contain the input information
+!
+inp_filb = exch$util_filb_allocate ();
+exch$copy_namb_to_filb (.inp_namb, .inp_filb);	! Copy from the namb to the filb
+
+! Put an RT-11 context block on the filb
+!
+ctx = exch$util_rt11ctx_allocate (.volb, .inp_filb);
+inp_filb [filb$a_context] = .ctx;
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE exch$rtnam_rename =	%SBTTL 'exch$rtnam_rename'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Entry routine for the RENAME verb for RT11 only
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	Command parameters and qualifiers as returned from CLI$ routines.  Global environment ref'd by exch$a_gbl.
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	Files may be renamed.
+!--
+
+$dbgtrc_prefix ('rtnam_rename> ');
+
+LOCAL
+    protect,
+    rtnam : $ref_bblock,			! pointer to work area
+    status
+    ;
+
+! Allocate and/or initialize the work area
+!
+rtnam_init ();
+
+! Get pointers that we need.  Have to wait until work area allocated by init call
+!
+rtnam = .exch$a_gbl [excg$a_rtnam_work];		! Pointer to work area
+rtnam [rtnam$v_rename_command] = true;
+
+! For /PROTECT, we need to know whether it was specified or defaulted
+!
+protect = cli$present (%ASCID 'PROTECT');
+rtnam [rtnam$v_q_protect]	   = .protect;					! Simply value of low bit
+rtnam [rtnam$v_q_protect_explicit] = ((.protect EQL cli$_present) 		! Either /PROTECT or /NOPROTECT
+					OR (.protect EQL cli$_negated));	!  must be there
+
+! Do the rest from the common routine
+!
+status = rtnam_common ();
+
+IF .rtnam [rtnam$a_out_namb] NEQ 0
+THEN
+    exch$util_namb_release (.rtnam [rtnam$a_out_namb]);			! Return the namb to the available pool
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE rtnam_rename_action (res_len, res_buf) =	%SBTTL 'rtnam_rename_action (res_len, res_buf)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Secondary action routine for the RENAME verb for RT11 only
+!
+! INPUTS:
+!
+!	res_len - length of result name
+!	res_buf - address of result name
+!
+! IMPLICIT INPUTS:
+!
+!	Command parameters and qualifiers as returned from CLI$ routines.  Global environment ref'd by exch$a_gbl.
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	Files may be renamed.
+!--
+
+$dbgtrc_prefix ('rtnam_rename_action> ');
+
+LOCAL
+    ctx2 : $ref_bblock,				! context block to look for duplicates
+    rfp : $bblock [nam$c_bln+nam$c_maxrss],	! related file parse - an RMS NAM block plus expanded string buffer
+    fin_buf : $bvector [filb$s_result_name],	! a buffer in which to build the actual final name
+    fin_len,
+    nam_len,
+    status
+    ;
+
+BIND
+    rtnam = exch$a_gbl [excg$a_rtnam_work] : $ref_bblock,	! Pointer to work area
+    out_name = rtnam [rtnam$q_output_filename] : $desc_block,
+    namb = rtnam [rtnam$a_out_namb] : $ref_bblock,
+    filb = rtnam [rtnam$a_inp_filb] : $ref_bblock,
+    volb = filb [filb$a_assoc_volb] : $ref_bblock,
+    ctx = filb [filb$a_context] : $ref_bblock,
+    ent = ctx [rt11ctx$a_ent_address] : $ref_bblock
+    ;
+
+$block_check (2, .filb, filb, 450);
+$block_check (2, .volb, volb, 460);
+$block_check (2, .ctx, rt11ctx, 444);				! Make sure that it is what we think it is
+
+! If we haven't fetched the output name, do so now.  This gives us a chance to carry the sticky device over to the
+! output name
+!
+IF NOT .rtnam [rtnam$v_out_fetched]
+THEN
+    BEGIN
+    LOCAL
+	desc : VECTOR [2, LONG];
+
+    desc [0] = .res_len;
+    desc [1] = .res_buf;
+
+    ! Fetch the desired filename and a pointer to a namb
+    !
+    IF NOT (status = exch$cmd_parse_filespec (%ASCID 'OUTPUT', desc, 0, rtnam [rtnam$q_output_filename], namb))
+    THEN
+	$exch_signal_return (exch$_parseerr, 1, rtnam [rtnam$q_output_filename], .status);
+    rtnam [rtnam$a_out_namb] = .namb;		! Save the namb pointer
+    $trace_print_fao ('output "!AS", expanded "!AS"',  rtnam [rtnam$q_output_filename], namb [namb$q_fullname]);
+
+    ! If we have been given an invalid filename, then choke
+    !
+    IF .namb [namb$v_bad_pdp_char]
+      OR
+       .namb [namb$v_rt_truncate]
+    THEN
+	$exch_signal_return (exch$_badfilename, 3, out_name, .volb [volb$l_vol_type_len], volb [volb$t_vol_type]);
+
+    rtnam [rtnam$v_out_fetched] = true;
+
+    END;
+
+! Perform a related file parse to get the final name
+!
+IF NOT (status = exch$cmd_related_file_parse (
+		.out_name [dsc$w_length], .out_name [dsc$a_pointer],		! Command line name string
+		.res_len, .res_buf,						! Related file name
+		rfp))
+THEN
+    $exch_signal_return (exch$_badfilename, 3, out_name, .volb [volb$l_vol_type_len], volb [volb$t_vol_type]);
+
+nam_len = .rfp [nam$b_name] + .rfp [nam$b_type];
+fin_len = .volb [volb$l_vol_ident_len] + .nam_len;		! Length of volume ident plus file name
+$logic_check (2, (.fin_len LEQU filb$s_result_name), 161);
+CH$COPY (.volb [volb$l_vol_ident_len], volb [volb$t_vol_ident],			! Volume name
+			    .nam_len, .rfp [nam$l_name], 0, filb$s_result_name, fin_buf);
+
+$trace_print_fao ('related "!AF", final "!AF"',  .res_len, .res_buf, .fin_len, fin_buf);
+
+! Make sure he isn't trying to move it between devices
+!
+IF .volb NEQ .namb [namb$a_assoc_volb]
+THEN
+    $exch_signal_return (exch$_norendev);
+
+! We need to make sure that the output name doesn't already exist
+!
+ctx2 = exch$util_rt11ctx_allocate (.volb, 0);	! Get a context block so we can look
+IF exch$rtacp_find_file (.ctx2, .rfp [nam$l_name], .nam_len)
+  AND
+   .ent NEQA .ctx2 [rt11ctx$a_ent_address]	! Let him rename it to the same, necessary for RENAME /PROTECT
+THEN
+    $exch_signal (exch$_norenexists, 4, .res_len, .res_buf, .fin_len, fin_buf)
+
+! Everything is ok, do the rename
+!
+ELSE
+    BEGIN
+
+    ! Convert the name to radix50 and put in into the directory buffer
+    !
+    exch$util_radix50_from_ascii (.rfp [nam$b_name], .rfp [nam$l_name],
+					rt11ctx$s_exp_name, ent [rt11ent$l_filename]);
+    exch$util_radix50_from_ascii (.rfp [nam$b_type] - 1, .rfp [nam$l_type] + 1,
+					rt11ctx$s_exp_type, ent [rt11ent$w_filetype]);
+
+    ! Also change the name in the context buffer, since it will be used by EXCH$RTACP_CHECK_POSITION
+    !
+    ctx [rt11ctx$l_filename] = .ent [rt11ent$l_filename];
+    ctx [rt11ctx$w_filetype] = .ent [rt11ent$w_filetype];
+
+    ! If a protection change was requested, do it here
+    !
+    IF .rtnam [rtnam$v_q_protect_explicit]
+    THEN
+	ent [rt11ent$v_typ_protected] = ctx [rt11ctx$v_typ_protected] = .rtnam [rtnam$v_q_protect];
+
+    ! Update the directory
+    !
+    exch$rt11_dirseg_put (.volb, .ctx [rt11ctx$l_seg_number]);		! Write the directory segment
+
+    ! Log the action if requested
+    !
+    IF .rtnam [rtnam$v_q_log]
+    THEN
+	$exch_signal (exch$_renamed, 4, .res_len, .res_buf, .fin_len, fin_buf);
+    END;
+
+! Release the context block
+!
+exch$util_rt11ctx_release (.ctx2);
+
+RETURN true;
+END;
+
+END
+ELUDOM

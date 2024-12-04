@@ -1,0 +1,78 @@
+$ !
+$ !	[ T E C O . C O M ] T E C O B L D . C O M
+$ !
+$ !	Master build procedure for TECO
+$ !
+$ GOTO 'PHASE'
+$
+$INIT:
+$ !
+$ ! Create directories
+$ !
+$ @SYSBLDCOM$:CREATEDIR
+$ EXIT
+$
+$UPDATE:
+$ !
+$ ! Create updated help source
+$ !
+$ SRCUPDATE TECOHLP.HLP
+$ EXIT
+$
+$SRCLIB:
+$ !
+$ ! Create help library
+$ !
+$ DELETE LIB$:*.HLB;*
+$ LIBRARIAN/CREATE=(BLOCKS=10,GLOBALS=0) LIB$:TECO/HELP SRC$:TECOHLP
+$ EXIT
+$
+$ASSEM:
+$ !
+$ ! Create objects and listings
+$ !
+$ DELETE OBJ$:*.OBJ;*, LIS$:*.LST;*, LIS$:*.LIS;*
+$ IF F$SEARCH("SYS$SYSTEM:MAC.EXE") .EQS. "" THEN GOTO NO_RSX_MAC
+$ @SYSBLDCOM$:FASM TECO "" NOLIB 'UPDATES'
+$ MCR PRMOBJ$:CNVOBJ OBJ$:TECO
+$ MCR PRMOBJ$:CNVOBJ OBJ$:TECOIO
+$ MCR PRMOBJ$:CNVOBJ OBJ$:SCREEN
+$ MCR PRMOBJ$:CNVOBJ OBJ$:SCRINS
+$ MCR PRMOBJ$:CNVOBJ OBJ$:SCROLL
+$ MCR PRMOBJ$:CNVOBJ OBJ$:CRTRUB
+$ EXIT
+$NO_RSX_MAC:
+$ COPY/PROT=(O:RWED) PRMOBJ$:*.OBJ OBJ$:
+$ @SYSBLDCOM$:FASM TECO TECONAT NOLIB 'UPDATES'
+$ @SYSBLDCOM$:FASM TECO TECOLBR NOLIB 'UPDATES'
+$ @SYSBLDCOM$:FASM TECO TECOCMD NOLIB 'UPDATES'
+$ EXIT
+$
+$OBJLIB:
+$ !
+$ ! Create object library
+$ !
+$ @SYSBLDCOM$:OBJLIB TECO 100 0 10 NO
+$ EXIT
+$
+$LNKLIB:
+$ !
+$ ! Null LNKLIB phase
+$ !
+$ EXIT
+$
+$LINK:
+$ !
+$ ! Create executable and map
+$ !
+$ @COM$:TECOLNK
+$ EXIT
+$
+$RESULT:
+$ !
+$ ! Copy help library, executable, and map
+$ !
+$ CPYSYSHLP LIB$:TECO.HLB
+$ CPYRESEXE EXE$:TECO.EXE
+$ CPYRESMAP MAP$:TECO.MAP
+$ EXIT

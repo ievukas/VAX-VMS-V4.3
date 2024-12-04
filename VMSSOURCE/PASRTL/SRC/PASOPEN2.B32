@@ -1,0 +1,2417 @@
+MODULE PAS$OPEN2 ( %TITLE 'OPEN procedure'
+		IDENT = '1-015'		! File: PASOPEN2.B32 Edit: SBL1015
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	Pascal Language Support
+!
+! ABSTRACT:
+!
+!	This module contains PAS$OPEN2 and PAS$$OPEN, which open a file.
+!
+! ENVIRONMENT:	User mode - AST reentrant
+!
+! AUTHOR: Steven B. Lionel, CREATION DATE: 1-April-1981
+!
+! MODIFIED BY:
+!
+! 1-001	- Original.  SBL 1-April-1981
+! 1-002 - Give ACCMETINC message if ACCESS_METHOD:=DIRECT and device
+!	  is not a random-access device.  Don't store PFV address in enable
+!	  argument until the FCB pointer is stored.  SBL 21-June-1982
+! 1-003 - In CHECK_KEY_XABS, don't assume that XAB_SUM is still linked
+!	  to the FAB.  SBL 8-July-1982
+! 1-004 - In CHECK_KEY_XABS, allow any defined, but unrecognized key type.
+!	  Don't enable prompting on spooled terminals.  SBL 20-July-1982
+! 1-005 - Copy DEV$V_RND to FCB$V_RND.  SBL 29-July-1982
+! 1-006 - Store DEV$V_FOD instead of DEV$V_RND.  Keep DEV$V_RND for
+!	  ACCESS_METHOD:=DIRECT test.  SBL 29-July-1982
+! 1-007 - Call PAS$$REMOVE_FILE from OPEN_HANDLER to deallocate FCB and
+!	  store STATUS.  QAR FT3-002  SBL 30-Aug-1982
+! 1-008 - Use FAB$W_BLS on non-disk-or-terminal devices to determine file's 
+!	  recordsize.  Correct RECORD_LENGTH check.   Remove VMS V2 variant
+!	  code.  SBL 27-Sept-1982
+! 1-009 - Remove special case for "resultant string overflow" error.  Don't
+!	  enable prompting for an input-only file.  SBL 9-Dec-1982
+! 1-010 - Add new bit FCB$V_INITIATE_PROMPT.  This is used instead of
+!	  FCB$V_PROMPT_ENABLE to determine whether a look-ahead of that file
+!	  should initiate prompts on other files.  This allows GETs from
+!	  readonly files to initiate prompting on other files.  SBL 15-Dec-1982
+! 1-011 - If reopening for prompting fails because of RMS$_RAT, go back to
+!	  no prompting.  SBL 5-Jan-1983
+! 1-012 - Allow "quiet reopen for READONLY" to occur for UNKNOWN.
+!	  SBL 10-Jan-1983
+! 1-013 - Remove PROMPT_xxx keyword recognition, since this was never
+!	  supported.  Change method of recognizing duplicate keywords to one
+!	  that is extensible past 32 codes.  Add stream recordtype support
+!	  in advance of compiler support.  SBL 17-Aug-1983
+! 1-014 - Make KEYWD_NAME_TABLE global for use by PAS$CLOSE2.  SBL 19-Aug-1983
+! 1-015 - Also set FAB$V_UPI if SHARING:=READONLY and user wants write access
+!	  to sequential file.  SBL 24-Feb-1984
+!--
+
+
+%SBTTL 'Declarations'
+!
+! PROLOGUE DEFINITIONS:
+!
+
+REQUIRE 'RTLIN:PASPROLOG';			! Linkages, externals, PSECTs, structures
+
+!+
+! Linkage definitions for internal procedures.
+!-
+
+LINKAGE
+    CALL_FILL_KEY_XABS = 
+	CALL (REGISTER=6, REGISTER=7),
+    CALL_CHECK_KEY_XABS =
+	CALL (REGISTER=6, REGISTER=7);
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+    PAS$OPEN2: NOVALUE,				! Called by compiled code
+    PAS$$OPEN: CALL_OPEN NOVALUE,		! Default OPEN called by RTL
+    PAS$$OPEN_IMPLICIT: JSB_OPEN_IMPLICIT NOVALUE,! Open INPUT and OUTPUT
+    FILL_KEY_XABS: CALL_FILL_KEY_XABS NOVALUE,	! Fill in KEY XABs
+    CHECK_KEY_XABS: CALL_CHECK_KEY_XABS NOVALUE,! Check KEY XABs
+    OPEN_HANDLER,				! Condition handler for PAS$$OPEN
+    EXIT_HANDLER: NOVALUE;			! Established by PAS$$OPEN
+
+!
+! MACROS:
+!
+!	NONE
+!
+! EQUATED SYMBOLS:
+!
+!	NONE
+!
+! FIELDS:
+!
+!	NONE
+!
+! OWN STORAGE:
+!
+
+!+
+! Declare a longword which is used as a flag to indicate whether or not
+! an exit handler has been declared.
+!-
+
+OWN
+    EXITH_DECLARED: INITIAL (0);
+
+!+
+! Declare two flags which indicate if the files INPUT and OUTPUT have ever
+! been opened.  If set, PAS$$LOOK_AHEAD will not implicitly open them.
+!-
+
+GLOBAL
+    PAS$$GV_INPUT_OPENED: BYTE INITIAL (0),
+    PAS$$GV_OUTPUT_OPENED: BYTE INITIAL (0);
+
+%SBTTL 'PAS$OPEN2 - Open a file'
+GLOBAL ROUTINE PAS$OPEN2 (			! Open a file
+	PFV: REF $PAS$PFV_FILE_VARIABLE, 	! File variable
+	KEYWORDS: VECTOR [, LONG]		! Keywords and specifiers
+    ): NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine opens a Pascal file.  This entry is called from the
+!	compiled code for the OPEN procedure.
+!
+! CALLING SEQUENCE:
+!
+!	CALL PAS$OPEN2 (PFV.mr.r [, keyword.rz.v [, keyword.rz.v ...]])
+!
+! FORMAL PARAMETERS:
+!
+!	PFV		- The Pascal File Variable (PFV) passed by reference.
+!			  The structure of the PFV is defined in PASPFV.REQ.
+!
+!	keyword		- Zero or more values representing keywords in the
+!			  OPEN procedure.  Some keywords are followed by
+!			  associated arguments and values.  See PASOPNKEY.REQ
+!			  for the keyword value definitions.
+!
+!			  If the keyword ERROR is specified, it must be first
+!			  in the list, otherwise it will be ignored.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	See PAS$$OPEN.
+!
+! SIGNALLED ERRORS:
+!
+!	See PAS$$OPEN.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	FCB: REF $PAS$FCB_CONTROL_BLOCK,	! Control block
+	PFV_ADDR: VOLATILE,			! Enable argument
+	UNWIND_ACT: VOLATILE,			! Enable argument
+	ERROR_ADDR: VOLATILE;			! Enable argument
+
+    BUILTIN
+	ACTUALCOUNT,
+	AP,
+	CALLG;
+
+    ENABLE
+	PAS$$IO_HANDLER (PFV_ADDR, UNWIND_ACT, ERROR_ADDR);
+
+    !+
+    ! Set PFV_ADDR enable argument.
+    !-
+
+    PFV_ADDR = PFV [PFV$R_PFV];
+
+    !+
+    ! If ERROR is present, it is the first keyword in the list.  See
+    ! if that is true.  If so, set enable argument to the return address.
+    !-
+
+    IF ACTUALCOUNT () GEQU 3	! At least 3 needed for PFV, keyword, value
+    THEN
+	IF .KEYWORDS [0] EQL PAS$K_ERROR	! Is it the ERROR keyword?
+	THEN
+	    ERROR_ADDR = .KEYWORDS [1];
+
+    !+
+    ! Validate and lock PFV.
+    !-
+
+    PAS$$VALIDATE_PFV (PFV [PFV$R_PFV]; FCB);
+
+    !+
+    ! Set unwind action to unlock file.
+    !-
+
+    UNWIND_ACT = PAS$K_UNWIND_UNLOCK;
+
+    !+
+    ! If the file is already open, it's an error.
+    !-
+
+    IF .PFV [PFV$V_OPEN]
+    THEN
+	$PAS$IO_ERROR (PAS$_FILALROPE,0);	! File already open
+
+    !+
+    ! Do the OPEN.
+    !-
+
+    CALLG (.AP, PAS$$OPEN);
+
+    !+
+    ! Indicate successful completion
+    ! Unlock the file variable.
+    !-
+
+    FCB [FCB$L_STATUS] = 0;
+    PFV [PFV$V_LOCK] = 0;
+
+    RETURN;
+
+    END;					! End of routine PAS$OPEN2
+
+!<BLF/PAGE>
+
+%SBTTL 'PAS$$OPEN - Open a file'
+GLOBAL ROUTINE PAS$$OPEN (			! Open a file
+	IN_PFV: REF $PAS$PFV_FILE_VARIABLE, 	! File variable
+	KEYWORDS: VECTOR [, LONG];		! Keywords and specifiers
+	FCB: REF $PAS$FCB_CONTROL_BLOCK		! File control block
+    ): CALL_OPEN NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This procedure opens the Pascal file specified by "PFV"
+!	using the attributes possibly supplied as "keyword".  PAS$$OPEN
+!	is to be called from other RTL routines only after they have tested
+!	and set PFV$V_LOCK in "PFV".
+!
+! CALLING SEQUENCE:
+!
+!	CALL PAS$$OPEN (PFV.mr.r [, keyword.rz.v [, keyword.rz.v ...]])
+!
+! FORMAL PARAMETERS:
+!
+!	PFV		- The Pascal File Variable (PFV) passed by reference.
+!			  The structure of the PFV is defined in PASPFV.REQ.
+!
+!	keyword		- Zero or more values representing keywords in the
+!			  OPEN procedure.  Some keywords are followed by
+!			  associated arguments and values.  See PASOPNKEY.REQ
+!			  for the keyword value definitions.
+!
+! IMPLICIT INPUTS:
+!
+!	The PFV$V_LOCK bit is assumed to have been tested-and-set by the caller.
+!
+! IMPLICIT OUTPUTS:
+!
+!	FCB		- The address of the File Control Block for the file
+!			  is returned in the register designated by the linkage.
+!
+!	PFV		- If the RELPFD or RELBUF bits are set in the PFV, those
+!			  self-relative addresses are resolved.
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Declares an exit handler, if not already declared.
+!
+!	The file is opened.  Internal RTL and RMS structures are allocated
+!	and initialized.  The PFV is set to indicate an opened file.
+!
+! SIGNALLED ERRORS:
+!
+!
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	PFV: REF $PAS$PFV_FILE_VARIABLE,	! Pascal File Variable
+	PFV_ADDR: VOLATILE,			! Address of PFV
+	XABKEY_ADDR: VOLATILE,			! Contains address of dynamically
+						! allocated KEY XABs.
+	XABKEY_SIZE: VOLATILE,			! Contains size in bytes of
+						! allocated KEY XABs.
+
+	XAB_FHC: $XABFHC_DECL,			! RMS FHC XAB
+	XAB_SUM: $XABSUM_DECL,			! RMS SUM XAB
+
+	USER_ACTION_BPV: REF VECTOR [2, LONG],	! USER_ACTION routine descriptor
+	USR_ORG: BYTE,				! User-specified organization
+	USR_RFM: BYTE,				! User-specified record format
+	USR_USZ: WORD,				! User-specified record size
+	FILE_TYPE: SIGNED,			! Is this INPUT, OUTPUT or neither?
+						! Values can be:
+						!	K_INPUT = -1
+						!	K_NEITHER = 0
+						!	K_OUTPUT = 1
+	RESULT_NAME_STRING: VECTOR [MAXU(NAM$C_MAXRSS,LNM$C_NAMLENGTH), BYTE];
+		    				! Resultant name string
+
+    STACKLOCAL
+	KEYWORDS_SEEN: BITVECTOR [PAS$K_OPEKEYHI+1]; ! Keep track of keywords seen
+
+    !+
+    ! PAS$$AB_KEYWD_NAME_TABLE correlates the individual keyword code values to
+    ! the names keyword.  This is used to keep track of which keywords have
+    ! been seen.
+    !-
+
+    GLOBAL
+	PAS$$AB_KEYWD_NAME_TABLE: VECTOR [PAS$K_OPEKEYHI+1, BYTE] PSECT (_PAS$CODE)
+	    PRESET (
+		[PAS$K_FILE_NAME] = PAS$K_FILE_NAME,
+		[PAS$K_DEFAULT_FILE_NAME] = PAS$K_DEFAULT_FILE_NAME,
+		[PAS$K_HISTORY_OLD] = PAS$K_HISTORY,
+		[PAS$K_HISTORY_NEW] = PAS$K_HISTORY,
+		[PAS$K_HISTORY_UNKNOWN] = PAS$K_HISTORY,
+		[PAS$K_HISTORY_READONLY] = PAS$K_HISTORY,
+		[PAS$K_RECORD_LENGTH] = PAS$K_RECORD_LENGTH,
+		[PAS$K_ACCESS_METHOD_SEQUENTIAL] = PAS$K_ACCESS_METHOD,
+		[PAS$K_ACCESS_METHOD_DIRECT] = PAS$K_ACCESS_METHOD,
+		[PAS$K_ACCESS_METHOD_KEYED] = PAS$K_ACCESS_METHOD,
+		[PAS$K_RECORD_TYPE_FIXED] = PAS$K_RECORD_TYPE,
+		[PAS$K_RECORD_TYPE_VARIABLE] = PAS$K_RECORD_TYPE,
+		[PAS$K_RECORD_TYPE_STREAM] = PAS$K_RECORD_TYPE,
+		[PAS$K_RECORD_TYPE_STREAM_CR] = PAS$K_RECORD_TYPE,
+		[PAS$K_RECORD_TYPE_STREAM_LF] = PAS$K_RECORD_TYPE,
+		[PAS$K_CARRIAGE_CONTROL_LIST] = PAS$K_CARRIAGE_CONTROL,
+		[PAS$K_CARRIAGE_CONTROL_FORTRAN] = PAS$K_CARRIAGE_CONTROL,
+		[PAS$K_CARRIAGE_CONTROL_NONE] = PAS$K_CARRIAGE_CONTROL,
+		[PAS$K_ORGANIZATION_SEQUENTIAL] = PAS$K_ORGANIZATION,
+		[PAS$K_ORGANIZATION_RELATIVE] = PAS$K_ORGANIZATION,
+		[PAS$K_ORGANIZATION_INDEXED] = PAS$K_ORGANIZATION,
+		[PAS$K_DISPOSITION_SAVE] = PAS$K_DISPOSITION,
+		[PAS$K_DISPOSITION_DELETE] = PAS$K_DISPOSITION,
+		[PAS$K_DISPOSITION_PRINT] = PAS$K_DISPOSITION,
+		[PAS$K_DISPOSITION_PRINT_DELETE] = PAS$K_DISPOSITION,
+		[PAS$K_DISPOSITION_SUBMIT] = PAS$K_DISPOSITION,
+		[PAS$K_DISPOSITION_SUBMIT_DELETE] = PAS$K_DISPOSITION,
+		[PAS$K_ERROR] = PAS$K_ERROR,
+		[PAS$K_USER_ACTION] = PAS$K_USER_ACTION,
+		[PAS$K_SHARING_NONE] = PAS$K_SHARING,
+		[PAS$K_SHARING_READONLY] = PAS$K_SHARING,
+		[PAS$K_SHARING_READWRITE] = PAS$K_SHARING);
+
+    LITERAL
+	K_INPUT = -1,				! For FILE_TYPE - file is INPUT
+	K_NEITHER = 0,				! For FILE_TYPE - neither INPUT nor OUTPUT
+	K_OUTPUT = 1;				! For FILE_TYPE - file is OUTPUT
+
+    BUILTIN
+	TESTBITCS,
+	TESTBITSC,
+	ACTUALCOUNT;
+
+    BIND
+   	RAB = FCB: REF BLOCK [, BYTE],
+	FAB = FCB: REF $PAS$FAB_FCB_STRUCT,
+	NAM = FCB: REF $PAS$NAM_FCB_STRUCT;
+
+    !+
+    ! Establish local condition handler which will close the file upon
+    ! an unwind.
+    !-
+
+    ENABLE OPEN_HANDLER (PFV_ADDR, XABKEY_ADDR, XABKEY_SIZE);
+
+    !+
+    ! Fill in local XAB blocks.
+    !-
+
+    $XABFHC_INIT (XAB=XAB_FHC, NXT=XAB_SUM);
+    $XABSUM_INIT (XAB=XAB_SUM);
+
+    !+
+    ! Move PFV argument to local PFV.
+    !-
+
+    PFV = .IN_PFV;
+
+    !+
+    ! If the PFD address is relative, resolve it.
+    !-
+
+    IF .PFV [PFV$V_RELPFD]
+    THEN
+	BEGIN
+	PFV [PFV$A_PFD] = .PFV [PFV$A_PFD] + PFV [PFV$R_PFV];
+	PFV [PFV$V_RELPFD] = 0;
+	END;
+
+    !+
+    ! If the buffer address is relative, resolve it.
+    !-
+
+    IF TESTBITSC (PFV [PFV$V_RELBUF])
+    THEN
+	PFV [PFV$A_BUFFER] = .PFV [PFV$A_BUFFER] + PFV [PFV$R_PFV];
+
+    !+
+    ! Declare exit handler if it hasn't yet been declared.
+    !-
+
+    IF TESTBITCS (EXITH_DECLARED)
+    THEN
+	BEGIN
+	!+
+	! Allocate and fill in the control descriptor block.
+	!-
+
+	LOCAL
+	    EXITH_CONTROL_BLOCK: REF VECTOR [, LONG];
+
+	EXITH_CONTROL_BLOCK = PAS$$GET_VM (PFV [PFV$R_PFV], 20); ! 5 longwords
+	EXITH_CONTROL_BLOCK [1] = EXIT_HANDLER;	! Routine address
+	EXITH_CONTROL_BLOCK [2] = 1;		! 1 additional longword
+	EXITH_CONTROL_BLOCK [3] = EXITH_CONTROL_BLOCK [4]; ! Reason for exit
+	$DCLEXH (DESBLK=EXITH_CONTROL_BLOCK [0]);	! Assume success
+	END;
+
+    !+
+    ! Set FILE_TYPE depending on whether the file is INPUT, OUTPUT or neither.
+    !-
+
+    IF PFV [PFV$R_PFV] EQLA PAS$FV_INPUT
+    THEN
+	FILE_TYPE = K_INPUT
+    ELSE IF PFV [PFV$R_PFV] EQLA PAS$FV_OUTPUT
+    THEN
+	FILE_TYPE = K_OUTPUT
+    ELSE
+	FILE_TYPE = K_NEITHER;
+
+    !+
+    ! Allocate the FCB+RAB+FAB+NAM block.  It will be zero-filled by
+    ! PAS$$GET_VM.
+    !-
+
+    FCB = PAS$$GET_VM (PFV [PFV$R_PFV], PAS$K_FILE_DYN_BLN) + FCB$K_BLN;
+
+    !+
+    ! Initialize blocks.
+    !-
+
+    RAB [RAB$B_BID] = RAB$C_BID;
+    RAB [RAB$B_BLN] = RAB$C_BLN;
+    FAB [FAB$B_BID] = FAB$C_BID;
+    FAB [FAB$B_BLN] = FAB$C_BLN;
+    NAM [NAM$B_BID] = NAM$C_BID;
+    NAM [NAM$B_BLN] = NAM$C_BLN;
+    NAM [NAM$L_ESA] = RESULT_NAME_STRING;
+    NAM [NAM$B_ESS] = NAM$C_MAXRSS;
+    NAM [NAM$L_RSA] = RESULT_NAME_STRING;
+    NAM [NAM$B_RSS] = NAM$C_MAXRSS;
+    RAB [RAB$L_FAB] = FAB [0,0,0,0];
+    FAB [FAB$L_NAM] = NAM [0,0,0,0];
+    FAB [FAB$L_XAB] = XAB_FHC;
+
+    !+
+    ! Set initial values in FCB
+    !-
+
+    FCB [FCB$A_PFV] = PFV [PFV$R_PFV];
+    
+    !+
+    ! Store FCB address in PFV and set the FCB_VALID bit.
+    !-
+
+    PFV [PFV$A_FCB] = FCB [FCB$R_FCB];
+    PFV [PFV$V_FCB_VALID] = 1;
+    PFV_ADDR = PFV [PFV$R_PFV];
+
+    !+
+    ! Get information from PFD that we need.
+    !-
+
+	BEGIN
+	LOCAL
+	    PFD: REF $PAS$PFD_FILE_DESCRIPTOR;	! Pascal File Descriptor
+
+	PFD = .PFV [PFV$A_PFD];	! Get PFD address
+	FCB [FCB$W_ATTRIB] = .PFD [PFD$W_ATTRIB];	! Set attributes
+	FCB [FCB$A_PFD] = PFD [PFD$R_PFD];		! PFD address
+    
+	!+
+	! Set the default RECORD_LENGTH.  If a TEXTFILE, it's 133.  Otherwise,
+	! its the length of the record (not including the length word for
+	! a VARYING.)
+	!-
+    
+	IF NOT .FCB [FCB$V_TEXT]
+	THEN
+	    BEGIN
+	    IF .PFD [PFD$L_LENGTH] GTRU 65535	! Component type too long?
+	    THEN
+		$PAS$IO_ERROR (PAS$_INVRECLEN,1,.PFD [PFD$L_LENGTH]);
+	    IF .FCB [FCB$V_VARYING]
+	    THEN
+		RAB [RAB$W_USZ] = .PFD [PFD$L_LENGTH] - 2	! Subtract for length word
+	    ELSE
+		RAB [RAB$W_USZ] = .PFD [PFD$L_LENGTH];
+	    END
+	ELSE
+	    RAB [RAB$W_USZ] = 133;	! Textfile
+
+	USR_USZ = .RAB [RAB$W_USZ];
+	END;
+
+
+    !+
+    ! Look through keyword list and set all specified attributes.
+    !-
+
+    KEYWORDS_SEEN <0,32> = 0;	! Indicate no keywords seen
+    KEYWORDS_SEEN <32,PAS$K_OPEKEYHI-31> = 0;
+    INCR I FROM 0 TO (ACTUALCOUNT () - 2) DO
+	BEGIN
+
+	LOCAL
+	    KEYWD_VALUE;
+
+	!+
+	! Check for valid keyword code.  If not already seen, use the
+	! keyword.
+	!-
+
+	KEYWD_VALUE = .KEYWORDS [.I];
+	IF .KEYWD_VALUE LSS PAS$K_OPEKEYLO OR .KEYWD_VALUE GTR PAS$K_OPEKEYHI
+	THEN
+	    $PAS$IO_ERROR (PAS$_INVARGPAS,0);
+
+	IF TESTBITCS (KEYWORDS_SEEN [.PAS$$AB_KEYWD_NAME_TABLE[.KEYWD_VALUE]])
+	THEN
+	    CASE .KEYWD_VALUE FROM PAS$K_OPEKEYLO TO PAS$K_OPEKEYHI OF
+		SET
+    
+		[PAS$K_FILE_NAME]:
+		    BEGIN
+		    LOCAL
+			FNS: WORD;
+		    FNS = .KEYWORDS [(I=.I+1)];	! Get string size
+		    IF .FNS GTRU 255
+		    THEN
+			$PAS$IO_ERROR (PAS$_INVFILSYN,0);
+		    FAB [FAB$B_FNS] = .FNS;
+		    FAB [FAB$L_FNA] = .KEYWORDS [(I=.I+1)];	! String address
+		    END;
+    
+		[PAS$K_DEFAULT_FILE_NAME]:
+		    BEGIN
+		    LOCAL
+			DNS: WORD;
+		    DNS = .KEYWORDS [(I=.I+1)];	! Get string size
+		    IF .DNS GTRU 255
+		    THEN
+			$PAS$IO_ERROR (PAS$_INVFILSYN,0);
+		    FAB [FAB$B_DNS] = .DNS;
+		    FAB [FAB$L_DNA] = .KEYWORDS [(I=.I+1)];	! String address	    
+		    END;
+    
+		[PAS$K_HISTORY_OLD]:
+		    BEGIN
+		    FCB [FCB$V_OLD_FILE] = 1;
+		    FAB [FAB$V_GET] = 1;
+		    FAB [FAB$V_PUT] = 1;
+		    FAB [FAB$V_TRN] = 1;
+		    FAB [FAB$V_DEL] = 1;
+		    FAB [FAB$V_UPD] = 1;
+		    END;
+    
+		[PAS$K_HISTORY_NEW]:
+		    BEGIN
+		    FAB [FAB$V_GET] = 1;
+		    FAB [FAB$V_PUT] = 1;
+		    FAB [FAB$V_TRN] = 1;
+		    FAB [FAB$V_DEL] = 1;
+		    FAB [FAB$V_UPD] = 1;
+		    END;
+    
+		[PAS$K_HISTORY_UNKNOWN]:
+		    BEGIN
+		    FAB [FAB$V_CIF] = 1;
+		    FAB [FAB$V_GET] = 1;
+		    FAB [FAB$V_PUT] = 1;
+		    FAB [FAB$V_TRN] = 1;
+		    FAB [FAB$V_DEL] = 1;
+		    FAB [FAB$V_UPD] = 1;
+		    END;
+    
+		[PAS$K_HISTORY_READONLY]:
+		    BEGIN
+		    FCB [FCB$V_OLD_FILE] = 1;	! MUST be old
+		    FCB [FCB$V_READ_ONLY] = 1;
+		    FAB [FAB$V_GET] = 1;
+		    END;
+    
+		[PAS$K_RECORD_LENGTH]:
+		    BEGIN
+		    IF .KEYWORDS [(I=.I+1)] GTRU 65535
+		    THEN
+			$PAS$IO_ERROR (PAS$_INVRECLEN,1,.KEYWORDS [.I]);
+		    USR_USZ = .KEYWORDS [.I];
+
+		    !+
+		    ! If RECORD_LENGTH specified for textfile, use it.
+		    ! Otherwise, keep it so we can give an error later if
+		    ! it doesn't match existing file's record length.
+		    !-
+
+		    IF .FCB [FCB$V_TEXT]
+		    THEN
+			RAB [RAB$W_USZ] = .USR_USZ;
+		    END;
+    
+		[PAS$K_ACCESS_METHOD_SEQUENTIAL]:
+		    BEGIN
+		    FCB [FCB$V_SEQUENTIAL] = 1;
+		    FAB [FAB$V_SQO] = 1;	! Optimize network access
+		    END;
+    
+		[PAS$K_ACCESS_METHOD_DIRECT]:
+		    BEGIN
+		    FCB [FCB$V_DIRECT] = 1;
+		    RAB [RAB$L_KBF] = FCB [FCB$L_COMPONENT];
+		    RAB [RAB$V_UIF] = 1;	! Update if record exists
+		    END;
+    
+		[PAS$K_ACCESS_METHOD_KEYED]:
+		    BEGIN
+		    FCB [FCB$V_KEYED] = 1;
+		    END;
+    
+		[PAS$K_RECORD_TYPE_FIXED]:
+		    BEGIN
+		    FAB [FAB$B_RFM] = FAB$C_FIX;
+		    END;
+    
+		[PAS$K_RECORD_TYPE_VARIABLE]:
+		    BEGIN
+		    FAB [FAB$B_RFM] = FAB$C_VAR;
+		    END;
+    
+		[PAS$K_RECORD_TYPE_STREAM]:
+		    BEGIN
+		    FAB [FAB$B_RFM] = FAB$C_STM;
+		    END;
+    
+		[PAS$K_RECORD_TYPE_STREAM_CR]:
+		    BEGIN
+		    FAB [FAB$B_RFM] = FAB$C_STMCR;
+		    END;
+    
+		[PAS$K_RECORD_TYPE_STREAM_LF]:
+		    BEGIN
+		    FAB [FAB$B_RFM] = FAB$C_STMLF;
+		    END;
+    
+		[PAS$K_CARRIAGE_CONTROL_LIST]:
+		    BEGIN
+		    FAB [FAB$V_CR] = 1;
+		    END;
+    
+		[PAS$K_CARRIAGE_CONTROL_FORTRAN]:
+		    BEGIN
+		    FAB [FAB$V_FTN] = 1;
+		    END;
+		    
+		[PAS$K_CARRIAGE_CONTROL_NONE]:
+		    ;	! Do nothing
+    
+		[PAS$K_ORGANIZATION_SEQUENTIAL]:
+		    BEGIN
+		    FAB [FAB$B_ORG] = FAB$C_SEQ;
+		    END;
+    
+		[PAS$K_ORGANIZATION_RELATIVE]:
+		    BEGIN
+		    FAB [FAB$B_ORG] = FAB$C_REL;
+		    END;
+    
+		[PAS$K_ORGANIZATION_INDEXED]:
+		    BEGIN
+		    FAB [FAB$B_ORG] = FAB$C_IDX;
+		    END;
+    
+		[PAS$K_DISPOSITION_SAVE]:
+		    BEGIN
+		    FCB [FCB$V_SAVE] = 1;
+		    END;
+    
+		[PAS$K_DISPOSITION_DELETE]:
+		    BEGIN
+		    FCB [FCB$V_DELETE] = 1;
+		    END;
+    
+		[PAS$K_DISPOSITION_PRINT]:
+		    BEGIN
+		    FCB [FCB$V_SAVE] = 1;
+		    FCB [FCB$V_PRINT] = 1;
+		    END;
+    
+		[PAS$K_DISPOSITION_PRINT_DELETE]:
+		    BEGIN
+		    FCB [FCB$V_PRINT] = 1;
+		    FCB [FCB$V_DELETE] = 1;
+		    END;
+    
+		[PAS$K_DISPOSITION_SUBMIT]:
+		    BEGIN
+		    FCB [FCB$V_SUBMIT] = 1;
+		    FCB [FCB$V_SAVE] = 1;
+		    END;
+    
+		[PAS$K_DISPOSITION_SUBMIT_DELETE]:
+		    BEGIN
+		    FCB [FCB$V_SUBMIT] = 1;
+		    FCB [FCB$V_DELETE] = 1;
+		    END;
+    
+		[PAS$K_USER_ACTION]:
+		    BEGIN
+		    USER_ACTION_BPV = .KEYWORDS [(I=.I+1)];
+		    FCB [FCB$V_USER_ACTION] = 1;
+		    END;
+    
+		[PAS$K_SHARING_NONE]:
+		    BEGIN
+		    FAB [FAB$V_NIL] = 1;
+		    END;
+    
+		[PAS$K_SHARING_READONLY]:
+		    BEGIN
+		    FAB [FAB$V_SHRGET] = 1;
+		    END;
+    
+		[PAS$K_SHARING_READWRITE]:
+		    BEGIN
+		    FAB [FAB$V_SHRPUT] = 1;
+		    FAB [FAB$V_SHRGET] = 1;
+		    FAB [FAB$V_SHRDEL] = 1;
+		    FAB [FAB$V_SHRUPD] = 1;
+		    END;
+    
+		[PAS$K_ERROR]:
+		    BEGIN
+		    !+
+		    ! The ERROR parameter, if specified, was already processed
+		    ! in PAS$OPEN2, so just ignore it here.
+		    !-
+		    I = .I + 1;	! Ignore next parameter
+		    END;
+    
+		[INRANGE,OUTRANGE]:
+		    $PAS$IO_ERROR (PAS$_INVARGPAS,0);	! Invalid argument
+
+		TES;
+
+	END;
+
+
+    !+
+    ! Apply defaults.
+    !-
+
+    !+
+    ! Default FILE_NAME
+    !-
+
+    IF NOT .KEYWORDS_SEEN [PAS$K_FILE_NAME]
+    THEN
+	BEGIN
+
+	!+
+	! If this is standard file INPUT or OUTPUT, attempt to translate
+	! PAS$INPUT or PAS$OUTPUT, respectively.  If no translation, use
+	! SYS$INPUT or SYS$OUTPUT instead.  If not INPUT or OUTPUT, use
+	! file variable name.
+	!-
+
+	IF .FILE_TYPE NEQ K_NEITHER	! neither INPUT nor OUTPUT?
+	THEN
+	    BEGIN
+
+	    LOCAL
+	    	LOGNAM_DSC: BLOCK [8, BYTE],	! Descriptor for logical name
+		RSLNAM_DSC: BLOCK [8, BYTE],	! Descriptor for resultant name
+		SUBSTITUTE_NAME;		! Address for substitute name
+		    
+	    IF .FILE_TYPE EQL K_INPUT
+	    THEN
+		BEGIN
+		LOGNAM_DSC [DSC$W_LENGTH] = %CHARCOUNT ('PAS$INPUT');
+		LOGNAM_DSC [DSC$A_POINTER] = UPLIT BYTE ('PAS$INPUT');
+		SUBSTITUTE_NAME = UPLIT BYTE ('SYS$INPUT');
+		END
+	    ELSE
+		BEGIN
+		LOGNAM_DSC [DSC$W_LENGTH] = %CHARCOUNT ('PAS$OUTPUT');
+		LOGNAM_DSC [DSC$A_POINTER] = UPLIT BYTE ('PAS$OUTPUT');
+		SUBSTITUTE_NAME = UPLIT BYTE ('SYS$OUTPUT');
+		END;
+	    LOGNAM_DSC [DSC$B_CLASS] = DSC$K_CLASS_S;
+	    LOGNAM_DSC [DSC$B_DTYPE] = DSC$K_DTYPE_T;
+	    RSLNAM_DSC [DSC$B_CLASS] = DSC$K_CLASS_S;
+	    RSLNAM_DSC [DSC$B_DTYPE] = DSC$K_DTYPE_T;
+	    RSLNAM_DSC [DSC$W_LENGTH] = LNM$C_NAMLENGTH;	! String size
+	    RSLNAM_DSC [DSC$A_POINTER] = RESULT_NAME_STRING;
+	    IF $TRNLOG (LOGNAM = LOGNAM_DSC, RSLBUF = RSLNAM_DSC) EQLU SS$_NOTRAN
+	    THEN
+		BEGIN
+		!+
+		! Do the substitution
+		!-
+		FAB [FAB$L_FNA] = .SUBSTITUTE_NAME;
+		FAB [FAB$B_FNS] = .LOGNAM_DSC [DSC$W_LENGTH]; ! Can't be > 255
+		END
+	    ELSE
+		BEGIN
+		!+
+		! Use Pascal specific name
+		!-
+		FAB [FAB$L_FNA] = .LOGNAM_DSC [DSC$A_POINTER];
+		FAB [FAB$B_FNS] = .LOGNAM_DSC [DSC$W_LENGTH]; ! Can't be >255
+		END;
+	    END;
+
+	IF .FAB [FAB$L_FNA] EQL 0	! No name given yet?
+	THEN
+	    IF .FCB [FCB$V_EXTERN]	! Filename is file variable name
+	    THEN
+		BEGIN
+		LOCAL
+		    PFD: REF $PAS$PFD_FILE_DESCRIPTOR;
+		PFD = .FCB [FCB$A_PFD];
+		FAB [FAB$B_FNS] = CH$RCHAR (PFD [PFD$T_NAME]);
+		FAB [FAB$L_FNA] = PFD [PFD$T_NAME] + 1;
+		END
+	    ELSE
+		BEGIN
+		FAB [FAB$V_TMD] = 1;	! No file name, temporary marked for delete
+		FAB [FAB$B_FNS] = %CHARCOUNT ('PASNONAME.TMP');
+		FAB [FAB$L_FNA] = UPLIT BYTE ('PASNONAME.TMP');
+		END;
+	END;
+
+    !+
+    ! Default DEFAULT_FILE_NAME
+    !-
+
+    IF (NOT .KEYWORDS_SEEN [PAS$K_DEFAULT_FILE_NAME]) AND (.FCB [FCB$V_EXTERN])
+    THEN
+	BEGIN
+	FAB [FAB$B_DNS] = %CHARCOUNT ('.DAT');
+	FAB [FAB$L_DNA] = UPLIT BYTE ('.DAT');
+	END;
+
+    !+
+    ! Default HISTORY
+    !-
+
+    IF NOT .KEYWORDS_SEEN [PAS$K_HISTORY]
+    THEN
+	BEGIN
+	!+
+	! Default is NEW
+	!-
+	FAB [FAB$V_GET] = 1;
+	FAB [FAB$V_PUT] = 1;
+	FAB [FAB$V_TRN] = 1;
+	FAB [FAB$V_DEL] = 1;
+	FAB [FAB$V_UPD] = 1;
+	END;
+
+    !+
+    ! Default ACCESS_METHOD
+    !-
+
+    IF NOT .KEYWORDS_SEEN [PAS$K_ACCESS_METHOD]
+    THEN
+	BEGIN
+	!+
+	! Default is SEQUENTIAL
+	!-
+	FCB [FCB$V_SEQUENTIAL] = 1;
+	FAB [FAB$V_SQO] = 1;	! Optimize network access
+	END
+    ELSE IF .FCB [FCB$V_TEXT] AND NOT .FCB [FCB$V_SEQUENTIAL]
+    THEN
+	$PAS$IO_ERROR (PAS$_TEXREQSEQ,0);	! Textfiles require sequential organization and access
+
+    !+
+    ! Default RECORD_TYPE
+    !-
+
+    IF NOT .KEYWORDS_SEEN [PAS$K_RECORD_TYPE]
+    THEN
+	IF .FCB [FCB$V_TEXT] OR .FCB [FCB$V_VARYING]
+	THEN
+	    FAB [FAB$B_RFM] = FAB$C_VAR
+	ELSE
+	    FAB [FAB$B_RFM] = FAB$C_FIX;
+    USR_RFM = .FAB [FAB$B_RFM];
+
+    !+
+    ! Default CARRIAGE_CONTROL
+    !-
+
+    IF NOT .KEYWORDS_SEEN [PAS$K_CARRIAGE_CONTROL]
+    THEN
+	IF .FCB [FCB$V_TEXT] OR .FCB [FCB$V_VARYING]
+	THEN
+	    FAB [FAB$V_CR] = 1;	! LIST is the default here
+
+    !+
+    ! Default DISPOSITION
+    !-
+
+    IF NOT .KEYWORDS_SEEN [PAS$K_DISPOSITION]
+    THEN
+	IF NOT .FAB [FAB$V_TMD]	! Not a temporary?
+	THEN
+	    FCB [FCB$V_SAVE] = 1;
+
+    !+
+    ! Default ORGANIZATION.
+    !-
+
+    IF NOT .KEYWORDS_SEEN [PAS$K_ORGANIZATION]
+    THEN
+	FAB [FAB$B_ORG] = FAB$C_SEQ	! SEQUENTIAL
+    ELSE IF .FCB [FCB$V_TEXT] AND (.FAB [FAB$B_ORG] NEQ FAB$C_SEQ)
+    THEN
+	$PAS$IO_ERROR (PAS$_TEXREQSEQ,0);	! Textfiles require sequential organization and access
+    USR_ORG = .FAB [FAB$B_ORG];
+
+    !+
+    ! Default SHARING
+    !-
+
+    !+
+    ! If ORGANIZATION:=SEQUENTIAL (explicitly), and if the file is shared
+    ! so that there is at least one writer, then set FAB$V_UPI.
+    !-
+
+    IF (.KEYWORDS_SEEN [PAS$K_ORGANIZATION] AND
+        (.FAB [FAB$B_ORG] EQL FAB$C_SEQ))
+    THEN
+	IF .FAB [FAB$V_SHRPUT] OR
+	    (.FAB [FAB$V_PUT] AND .FAB [FAB$V_SHRGET])
+	THEN
+	    FAB [FAB$V_UPI] = 1;
+
+    IF NOT .KEYWORDS_SEEN [PAS$K_SHARING]
+    THEN
+	IF .FCB [FCB$V_READ_ONLY]
+	THEN
+	    FAB [FAB$V_SHRGET] = 1
+	ELSE
+	    FAB [FAB$V_NIL] = 1;
+
+
+    !+
+    ! Check for conflicts
+    !+
+
+    !+
+    ! Check for incompatible access method
+    !-
+
+    IF NOT .FCB [FCB$V_OLD_FILE]
+    THEN
+	IF NOT (
+	    (.FCB [FCB$V_SEQUENTIAL]) OR
+	    (.FCB [FCB$V_DIRECT] AND
+		((.FAB [FAB$B_ORG] EQL FAB$C_REL) OR
+		((.FAB [FAB$B_ORG] EQL FAB$C_SEQ) AND (.FAB [FAB$B_RFM] EQL FAB$C_FIX)))) OR
+	    (.FCB [FCB$V_KEYED] AND
+		(.FAB [FAB$B_ORG] EQL FAB$C_IDX)))
+	THEN
+	    $PAS$IO_ERROR (PAS$_ACCMETINC,0);	! Incompatible access method
+
+    !+
+    ! Check for incompatible DISPOSITION.
+    !-
+
+    IF .FAB [FAB$V_TMD] AND
+	(.FCB [FCB$V_SAVE] OR .FCB [FCB$V_SUBMIT] OR .FCB [FCB$V_PRINT] OR
+	 .FCB [FCB$V_OLD_FILE] OR .FAB [FAB$V_CIF])
+    THEN
+	$PAS$IO_ERROR (PAS$_FILNAMREQ,0);	! File name required
+
+    !+
+    ! Check for incompatible RECORD_LENGTH.  If creating non-text file	
+    ! with fixed-length records, RECORD_LENGTH and component type must match.
+    !-
+
+    IF NOT .FCB [FCB$V_TEXT] AND NOT .FCB [FCB$V_OLD_FILE] AND
+	(.FAB [FAB$B_RFM] EQLU FAB$C_FIX) AND 
+	(.USR_USZ NEQU .RAB [RAB$W_USZ])
+    THEN
+	$PAS$IO_ERROR (PAS$_RECLENINC,0);
+
+    !+
+    ! If key descriptor block is present, allocate and fill in KEY XABs.
+    !-
+
+	BEGIN
+
+	LOCAL
+	    PFD: REF $PAS$PFD_FILE_DESCRIPTOR;	! Pascal File Descriptor
+
+	PFD = .PFV [PFV$A_PFD];
+
+	IF .PFD [PFD$A_KDB] NEQ 0
+	THEN
+	    FILL_KEY_XABS (PFV [PFV$R_PFV],
+	    		   FCB [FCB$R_FCB],
+	    		   PFD [PFD$R_PFD] + .PFD [PFD$A_KDB], ! Resolve self relative
+	    		   XAB_SUM,
+	    		   XABKEY_ADDR,
+	    		   XABKEY_SIZE);
+    
+	END;
+
+    !+
+    ! Fill in remaining fields in RMS control blocks
+    !-
+
+    FAB [FAB$V_NEF] = 1;	! Don't position to EOF
+    FAB [FAB$V_DFW] = 1;	! Deferred write speeds up Relative and Indexed
+    RAB [RAB$V_RAH] = 1;	! Read-ahead speeds up sequential
+    RAB [RAB$V_WBH] = 1;	! Write-behind speeds up sequential
+
+    !+
+    ! Set maximum record size for all but variable-length sequential files,
+    ! unless the user specified RECORD_LENGTH.
+    !-
+    IF .FAB [FAB$B_ORG] NEQ FAB$C_SEQ OR
+       .FAB [FAB$B_RFM] EQL FAB$C_FIX OR
+       .KEYWORDS_SEEN [PAS$K_RECORD_LENGTH]
+    THEN
+	FAB [FAB$W_MRS] = .USR_USZ;
+
+
+    !+
+    ! If USER_ACTION was specified, call the user routine to do the
+    ! open and connect.  Otherwise, do it here.
+    !-
+
+	BEGIN
+	LOCAL
+	    STATUS;
+
+	IF .KEYWORDS_SEEN [PAS$K_USER_ACTION]
+	THEN
+	    BEGIN
+	    LINKAGE
+		USER_ACTION_LNK = CALL (REGISTER=1,STANDARD,STANDARD,STANDARD);
+	    STATUS = USER_ACTION_LNK (.USER_ACTION_BPV [0],	! Address
+	    			      .USER_ACTION_BPV [1],	! Environment
+	    			      FAB [0,0,0,0],		! FAB address
+	    			      RAB [0,0,0,0],		! RAB address
+	    			      PFV [PFV$R_PFV]);		! PFV address
+	    END
+	ELSE
+	    BEGIN
+
+	    !+
+	    ! Open or create file.
+	    !-
+
+	    STATUS = (
+		BEGIN
+		LOCAL
+		    $$STATUS;
+		DO ($$STATUS = 
+		    (IF .FCB [FCB$V_OLD_FILE] 
+		    THEN 
+			$OPEN (FAB=FAB [0,0,0,0]) 
+		    ELSE 
+			$CREATE (FAB=FAB [0,0,0,0])))
+		    UNTIL (.$$STATUS OR (.$$STATUS NEQU RMS$_ACT));
+		.$$STATUS
+		END);
+    
+	    !+
+	    ! If we failed the open because we might not have been granted
+	    ! write permission to the file, try for just read permission.
+	    !-
+
+	    IF NOT .STATUS
+	    THEN
+		IF (.STATUS EQLU RMS$_PRV) AND 
+		   (.FCB [FCB$V_OLD_FILE] OR .FAB [FAB$V_CIF]) AND
+		    .FAB [FAB$V_PUT]	! PUT permission requested
+		THEN
+		    BEGIN
+		    !+
+		    ! This was a $OPEN and we did not get permission to
+		    ! open the file.  Set the FAC bits to just GET and
+		    ! try the $OPEN again.  It might also fail.
+		    !-
+		    FAB [FAB$B_FAC] = FAB$M_GET;! Ask for only GET access
+		    FAB [FAB$V_NIL] = 0;	! Allow other sharing
+		    FAB [FAB$V_NAM] = 1;	! Use NAM block to reopen file
+		    STATUS = (
+			BEGIN
+			LOCAL
+			    $$STATUS;
+			DO ($$STATUS = $OPEN (FAB=FAB [0,0,0,0]))
+			    UNTIL ($$STATUS NEQU RMS$_ACT);
+			.$$STATUS
+			END);
+		    END;
+
+	    !+
+	    ! If open/create succeeded, enable prompting on this file if
+	    ! it qualifies.  Then connect the record stream.
+	    !-
+    
+	    IF .STATUS
+	    THEN
+		BEGIN
+
+		!+
+		! Set FCB$V_FOD if file is on a file oriented device.  This is
+		! used by $PAS$RMS_OP to indicate that operations that fail with
+		! RMS$_ACT can be retried.
+		!-
+	    
+		IF .BLOCK [FAB [FAB$L_DEV], DEV$V_FOD;4, BYTE]
+		THEN
+		    FCB [FCB$V_FOD] = 1;
+
+		!+
+		! If file is a terminal, and if prompting hasn't been
+		! disabled, specify that look-ahead on this file will
+		! initiate prompt output on PROMPT_ENABLEd files.
+		!-
+
+		IF .FCB [FCB$V_TEXT] AND
+		   .BLOCK [FAB [FAB$L_DEV], DEV$V_TRM;4, BYTE]
+		THEN
+		    BEGIN
+		    FCB [FCB$V_INITIATE_PROMPT] = 1;
+
+		    !+
+		    ! We want to enable prompting on a file which is a terminal
+		    ! and which has the LIST (CR) carriagecontrol attribute,
+		    ! but which is not spooled and which can accept output.
+		    !-
+    
+		    IF .FAB [FAB$V_CR] AND .FAB [FAB$V_PUT] AND
+		       .BLOCK [FAB [FAB$L_DEV], DEV$V_ODV;4, BYTE] AND
+		       NOT .BLOCK [FAB [FAB$L_DEV], DEV$V_SPL;4, BYTE]
+		    THEN
+			BEGIN
+			$PAS$RMS_OP ($CLOSE (FAB=FAB [0,0,0,0]));
+			FAB [FAB$B_RAT] = FAB$M_PRN;	! Set print file format
+			FAB [FAB$B_RFM] = FAB$C_VFC;	! Set VFC format
+			FAB [FAB$B_FSZ] = 2;		! Set 2 byte control field
+			FAB [FAB$V_NAM] = 1;		! Use NAM block inputs
+			STATUS = $PAS$RMS_OP ($OPEN (FAB=FAB [0,0,0,0])); ! Reopen file
+
+			!+
+			! If $OPEN failed, assume that we can't set up this
+			! file for prompting.  Therefore, go back to CR format.
+			!-
+
+			IF NOT .STATUS
+			THEN
+			    BEGIN
+			    FAB [FAB$B_RAT] = FAB$M_CR;
+			    FAB [FAB$B_RFM] = FAB$C_VAR;
+			    FAB [FAB$B_FSZ] = 0;
+			    STATUS = $PAS$RMS_OP (
+				$OPEN (FAB=FAB [0,0,0,0]));
+			    END
+			ELSE
+			    BEGIN
+
+			    !+
+			    ! Open for prompting successful.
+			    !-
+
+			    FCB [FCB$V_PROMPT_ENABLE] = 1;
+			    RAB [RAB$L_RHB] = FCB [FCB$W_PROMPT_CC]; ! Control area
+	
+			    END;
+			END;
+		    END;
+		END;
+
+	    !+
+	    ! If the OPEN/CREATE succeeded, do the CONNECT.
+	    !-
+	    IF .STATUS
+	    THEN
+		DO (STATUS = $CONNECT (RAB=RAB [0,0,0,0]))
+		    UNTIL (.STATUS OR (.STATUS NEQU RMS$_ACT));
+	    END;
+
+	!+
+	! If open/create or connect failed, signal an error
+	!-
+
+	IF NOT .STATUS
+	THEN
+	    SELECTONE .STATUS OF
+		SET
+
+		[RMS$_FNF, RMS$_DNF, RMS$_DEV] :
+		    $PAS$IO_ERROR (PAS$_FILNOTFOU);	! File not found
+
+		[RMS$_FNM, RMS$_NOD, RMS$_DIR, RMS$_TYP, RMS$_VER, RMS$_SYN] :
+		    $PAS$IO_ERROR (PAS$_INVFILSYN);	! Invalid filename syntax
+
+		[OTHERWISE]:
+		    $PAS$IO_ERROR (PAS$_ERRDUROPE);	! Error during OPEN
+
+		TES;
+
+	END;
+
+    !+
+    ! If HISTORY := UNKNOWN has opened an existing file, indicate in the FCB
+    !-
+
+    IF .FAB [FAB$V_CIF] AND .FAB [FAB$L_STS] NEQU RMS$_CREATED
+    THEN
+	FCB [FCB$V_OLD_FILE] = 1;
+
+    !+
+    ! If we opened an existing file, get some attributes.
+    !-
+
+    IF .FCB [FCB$V_OLD_FILE]
+    THEN
+	BEGIN
+
+	!+
+	! Check organization.
+	!-
+
+	IF .KEYWORDS_SEEN [PAS$K_ORGANIZATION] AND
+	    .FAB [FAB$B_ORG] NEQ .USR_ORG
+	THEN
+	    $PAS$IO_ERROR (PAS$_ORGSPEINC,0);	! ORGANIZATION specified inconsistent
+
+	IF .FCB [FCB$V_TEXT] AND (.FAB [FAB$B_ORG] NEQ FAB$C_SEQ)
+	THEN
+	    $PAS$IO_ERROR (PAS$_TEXREQSEQ,0);	! Textfiles require sequential organization and access
+
+	!+
+	! Check recordtype.
+	!-
+
+	IF .KEYWORDS_SEEN [PAS$K_RECORD_TYPE]
+	THEN
+	    BEGIN
+	    IF .USR_RFM NEQ .FAB [FAB$B_RFM]
+	    THEN
+		IF NOT ((.USR_RFM EQL FAB$C_VAR) AND
+		    (.FAB [FAB$B_RFM] EQL FAB$C_VFC))
+		THEN
+		    $PAS$IO_ERROR (PAS$_RECTYPINC,0);	! Inconsistent record tyoe
+	    END;
+
+	!+
+	! Check record length.
+	!-
+
+	!+
+	! If not a disk or terminal, use the blocksize as the maximum recordsize
+	! (if not there already).
+	!-
+	IF (NOT .BLOCK [FAB [FAB$L_DEV], DEV$V_RND;4, BYTE]) AND
+	   (NOT .BLOCK [FAB [FAB$L_DEV], DEV$V_TRM;4, BYTE])
+	THEN
+	    IF .FAB [FAB$W_MRS] EQL 0
+	    THEN
+		FAB [FAB$W_MRS] = .FAB [FAB$W_BLS];
+
+	IF .FAB [FAB$W_MRS] NEQ 0
+	THEN
+	    IF .FAB [FAB$B_RFM] EQL FAB$C_FIX
+	    THEN
+		BEGIN
+		IF .FCB [FCB$V_TEXT] 
+		THEN
+		    BEGIN
+		    IF .KEYWORDS_SEEN [PAS$K_RECORD_LENGTH] AND
+			(.USR_USZ NEQ .FAB [FAB$W_MRS])
+		    THEN
+			$PAS$IO_ERROR (PAS$_RECLENINC,0);
+		    END
+		ELSE IF (.RAB [RAB$W_USZ] NEQ .FAB [FAB$W_MRS]) OR
+		        (.USR_USZ NEQ .FAB [FAB$W_MRS])
+		THEN
+		    $PAS$IO_ERROR (PAS$_RECLENINC,0);
+		END
+	    ELSE
+		BEGIN
+		IF .FCB [FCB$V_TEXT] OR .FCB [FCB$V_VARYING]
+		THEN
+		    BEGIN
+		    IF .KEYWORDS_SEEN [PAS$K_RECORD_LENGTH] AND
+			(.USR_USZ GTRU .FAB [FAB$W_MRS])
+		    THEN
+			$PAS$IO_ERROR (PAS$_RECLENINC,0);
+		    END
+		ELSE IF (.RAB [RAB$W_USZ] GTRU .FAB [FAB$W_MRS]) OR
+		        (.USR_USZ GTRU .FAB [FAB$W_MRS])
+		THEN
+		    $PAS$IO_ERROR (PAS$_RECLENINC,0);
+		END;
+		
+	!+
+	! If textfile, get length from existing file.
+	!-
+
+	IF .FCB [FCB$V_TEXT]
+	THEN
+	    IF .FAB [FAB$W_MRS] NEQ 0
+	    THEN
+		RAB [RAB$W_USZ] = .FAB [FAB$W_MRS]
+	    ELSE
+		BEGIN
+		IF .XAB_FHC [XAB$W_LRL] GTRU .RAB [RAB$W_USZ]
+		THEN
+		    RAB [RAB$W_USZ] = .XAB_FHC [XAB$W_LRL];
+    		END;
+
+	!+
+	! Check for incompatible access method
+	!-
+
+	IF NOT (
+	    (.FCB [FCB$V_SEQUENTIAL]) OR
+	    (.FCB [FCB$V_DIRECT] AND
+		((.FAB [FAB$B_ORG] EQL FAB$C_REL) OR
+		((.FAB [FAB$B_ORG] EQL FAB$C_SEQ) AND (.FAB [FAB$B_RFM] EQL FAB$C_FIX)))) OR
+	    (.FCB [FCB$V_KEYED] AND
+		(.FAB [FAB$B_ORG] EQL FAB$C_IDX)))
+	THEN
+	    $PAS$IO_ERROR (PAS$_ACCMETINC,0);	! Incompatible access method
+
+	END;
+
+    !+
+    ! For both old and new files, if direct access has been specified, see if
+    ! device will allow it.
+    !-
+
+    IF .FCB [FCB$V_DIRECT]
+    THEN
+	IF (NOT .BLOCK [FAB [FAB$L_DEV], DEV$V_RND;4, BYTE]) OR	 ! Random access?
+	   (.NAM [NAM$V_PPF])	! Process-permanent file?
+	THEN
+	    $PAS$IO_ERROR (PAS$_ACCMETINC,0);
+
+
+    !+
+    ! If the file is indexed organization, get information about the defined
+    ! keys.
+    !-
+
+    IF .FAB [FAB$B_ORG] EQL FAB$C_IDX
+    THEN
+	CHECK_KEY_XABS (PFV [PFV$R_PFV],
+			FCB [FCB$R_FCB],
+			XAB_SUM,
+    			XABKEY_ADDR,
+    			XABKEY_SIZE);
+
+    !+
+    ! If this is the implicit open of INPUT or OUTPUT, set the status bits to
+    ! cause an implicit RESET or REWRITE appropriately.
+    !-
+
+    IF (.FILE_TYPE EQL K_INPUT) AND NOT .PAS$$GV_INPUT_OPENED
+    THEN
+	BEGIN
+	PAS$$GV_INPUT_OPENED = 1;		! INPUT has been opened
+	PFV [PFV$V_VALID] = 0;			! File variable not valid
+	FCB [FCB$V_LAZY] = 1;			! Implicit GET on next access
+	FCB [FCB$V_INSPECTION] = 1;		! In Inspection mode
+	END
+    ELSE IF (.FILE_TYPE EQL K_OUTPUT) AND NOT .PAS$$GV_OUTPUT_OPENED
+    THEN
+	BEGIN
+	PAS$$GV_OUTPUT_OPENED = 1;		! OUTPUT has been opened
+	FCB [FCB$V_GENERATION] = 1;		! In Generation mode
+	FCB [FCB$V_EOF] = 1;			! At EOF
+	PFV [PFV$V_EOF_DEFINED] = 1;		! EOF function defined
+	PFV [PFV$V_VALID] = 1;			! File variable valid
+	PFV [PFV$V_DFB] = 0;			! File buffer undefined
+	RAB [RAB$V_TPT] = 1;			! Truncate on first $PUT
+	END
+    ELSE
+	BEGIN
+	!+
+	! User must do RESET or REWRITE before using file.
+	!-
+	PFV [PFV$V_EOF_DEFINED] = 0;		! EOF function undefined
+	PFV [PFV$V_VALID] = 1;			! File variable valid
+	PFV [PFV$V_DFB] = 0;			! File buffer undefined
+	END;
+
+    !+
+    ! Allocate the record buffer, if necessary, and fill in the UBF address.
+    !-
+
+    IF .FCB [FCB$V_TEXT]
+    THEN
+	BEGIN
+	RAB [RAB$L_UBF] = PAS$$GET_VM (PFV [PFV$R_PFV], .RAB [RAB$W_USZ]);
+	FCB [FCB$V_DYNAMIC_UBF] = 1;
+	END
+    ELSE IF .FCB [FCB$V_VARYING]
+    THEN
+	RAB [RAB$L_UBF] = .PFV [PFV$A_BUFFER] + 2
+    ELSE
+	RAB [RAB$L_UBF] = .PFV [PFV$A_BUFFER];
+
+    !+
+    ! Set up record pointers in FCB
+    !-
+
+    FCB [FCB$A_RECORD_BEG] = .RAB [RAB$L_UBF];
+    FCB [FCB$A_RECORD_CUR] = .RAB [RAB$L_UBF];
+    FCB [FCB$L_RECORD_LEN] = .RAB [RAB$W_USZ];
+    FCB [FCB$A_RECORD_END] = .FCB [FCB$A_RECORD_CUR] + .FCB [FCB$L_RECORD_LEN];
+
+    !+
+    ! If the file has no name (TMD) then zero the expanded and resultant
+    ! name strings.
+    !-
+
+    IF .FAB [FAB$V_TMD]
+    THEN
+	BEGIN
+	NAM [NAM$B_ESL] = 0;
+	NAM [NAM$B_RSL] = 0;
+	END
+
+    ELSE
+
+	!+
+	! Allocate space for the resultant name string, move the local string
+	! to the allocated one, and change the RSA pointer.
+	!-
+
+	BEGIN
+	NAM [NAM$L_RSA] = PAS$$GET_VM (PFV [PFV$R_PFV], .NAM [NAM$B_RSL]);
+	CH$MOVE (.NAM [NAM$B_RSL], RESULT_NAME_STRING, .NAM [NAM$L_RSA]);
+	FCB [FCB$V_DYNAMIC_RSN] = 1;	! Indicate dynamic resultant name
+	END;
+
+    !+
+    ! Set linelimit.
+    !-
+
+    FCB [FCB$L_LINELIMIT] = -1;	! Initially indicate infinite limit
+
+    IF .FCB [FCB$V_TEXT]	! If textfile then look at PAS$LINELIMIT
+    THEN
+	BEGIN
+	LOCAL
+	    LOGNAM_DSC: BLOCK [8, BYTE],	! Descriptor for logical name
+	    LIMIT_DSC: BLOCK [8, BYTE];		! Descriptor for limit string
+
+
+	!+
+	! Translate the logical name PAS$LINELIMIT to find a possible
+	! linelimit.
+	!-
+
+	LOGNAM_DSC [DSC$B_CLASS] = DSC$K_CLASS_S;
+	LOGNAM_DSC [DSC$B_DTYPE] = DSC$K_DTYPE_T;
+	LOGNAM_DSC [DSC$W_LENGTH] = %CHARCOUNT ('PAS$LINELIMIT');
+	LOGNAM_DSC [DSC$A_POINTER] = UPLIT BYTE ('PAS$LINELIMIT');
+	LIMIT_DSC [DSC$B_CLASS] = DSC$K_CLASS_S;
+	LIMIT_DSC [DSC$B_DTYPE] = DSC$K_DTYPE_T;
+	LIMIT_DSC [DSC$W_LENGTH] = LNM$C_NAMLENGTH;	! Maximum resultant string length
+	LIMIT_DSC [DSC$A_POINTER] = RESULT_NAME_STRING;
+
+	IF $TRNLOG (LOGNAM = LOGNAM_DSC,
+		    RSLLEN = LIMIT_DSC [DSC$W_LENGTH],	! Returned length
+		    RSLBUF = LIMIT_DSC)
+	   EQLU SS$_NORMAL	! Translation must succeed to continue
+	THEN
+	    BEGIN
+	    !+
+	    ! Try to translate string as a signed decimal number.  If
+	    ! successful, store as linelimit.  Otherwise set linelimit
+	    ! back to -1.
+	    !-
+
+	    IF NOT OTS$CVT_TI_L (LIMIT_DSC, FCB [FCB$L_LINELIMIT],
+				 4,	! Value size is 4 bytes
+				 1) 	! Ignore blanks
+	    THEN
+		FCB [FCB$L_LINELIMIT] = -1;
+	    END;
+	END;
+
+    !+
+    ! Mark XAB chain invalid.
+    !-
+
+    FAB [FAB$L_XAB] = 0;
+
+    !+
+    ! Deallocate any KEY XABs.
+    !-
+
+    IF .XABKEY_ADDR NEQ 0
+    THEN
+	PAS$$FREE_VM (.XABKEY_SIZE, XABKEY_ADDR);
+
+    !+
+    ! Mark PFV to indicate file open.
+    !-
+
+    PFV [PFV$V_OPEN] = 1;
+
+    !+
+    ! Add file to list of open files.
+    !-
+
+    PAS$$ADD_FILE (FCB [FCB$R_FCB]);
+
+    RETURN;
+
+    END;					! End of routine PAS$$OPEN
+
+!<BLF/PAGE>
+
+%SBTTL 'PAS$$OPEN_IMPLICIT - Open implicitly opened files'
+GLOBAL ROUTINE PAS$$OPEN_IMPLICIT (
+	PFV: REF $PAS$PFV_FILE_VARIABLE, 	! File variable
+	IN_FCB: REF $PAS$FCB_CONTROL_BLOCK;	! Control block
+	FCB: REF $PAS$FCB_CONTROL_BLOCK		! Output FCB
+    ): JSB_OPEN_IMPLICIT NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This procedure is called from procedures which do not
+!	accept textfiles, but have been called with a file that
+!	has its PFV$V_VALID bit clear.  So that a proper error
+!	message can be given, this procedure opens the file INPUT
+!	or OUTPUT, if that is the current file and if that file
+!	has not already been opened.
+!
+! CALLING SEQUENCE:
+!
+!	JSB_OPEN_IMPLICIT PAS$$OPEN_IMPLICIT (PFV.mr.r, IN_FCB.mr.r; 
+!				        FCB.mr.r)
+!
+! FORMAL PARAMETERS:
+!
+!	PFV		- The Pascal File Variable (PFV) for the file.
+!
+!	IN_FCB		- The File Control Block (FCB) for the file.
+!
+!	FCB		- The result FCB for the file.
+!
+! IMPLICIT INPUTS:
+!
+!	It is assumed that the caller has verified the PFV and has locked
+!	it.
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+! SIGNALLED ERRORS:
+!
+!
+!--
+
+    BEGIN
+
+    FCB = IN_FCB [FCB$R_FCB];			! Set output FCB
+
+    !+
+    ! See if the file is open.  If not, but is INPUT or OUTPUT, open it.
+    ! Otherwise, return.
+    !-
+
+    IF NOT .PFV [PFV$V_OPEN] ! Not open
+    THEN
+	BEGIN
+	IF (PFV [PFV$R_PFV] EQLA PAS$FV_INPUT) AND NOT .PAS$$GV_INPUT_OPENED
+	THEN
+	    PAS$$OPEN (PFV [PFV$R_PFV], PAS$K_HISTORY_READONLY; FCB)
+	ELSE IF (PFV [PFV$R_PFV] EQLA PAS$FV_OUTPUT) AND NOT .PAS$$GV_OUTPUT_OPENED
+	THEN
+	    PAS$$OPEN (PFV [PFV$R_PFV], PAS$K_HISTORY_NEW; FCB)
+	ELSE
+	    BEGIN
+	    !+
+	    ! If PFD or buffer address is self-relative, resolve it.
+	    !-
+
+	    IF .PFV [PFV$V_RELPFD]
+	    THEN
+		BEGIN
+		PFV [PFV$A_PFD] = .PFV [PFV$A_PFD] + PFV [PFV$R_PFV];
+		PFV [PFV$V_RELPFD] = 0;
+		END;
+
+	    IF .PFV [PFV$V_RELBUF]
+	    THEN
+		BEGIN
+		PFV [PFV$A_BUFFER] = .PFV [PFV$A_BUFFER] + PFV [PFV$R_PFV];
+		PFV [PFV$V_RELBUF] = 0;
+		END;
+
+	    END;
+	END;
+
+    RETURN;
+
+    END;					! End of routine PAS$$OPEN_IMPLICT
+
+%SBTTL 'FILL_KEY_XABS - Fill in key XABs for indexed file'
+ROUTINE FILL_KEY_XABS (
+    PFV: REF $PAS$PFV_FILE_VARIABLE,		! File variable
+    FCB: REF $PAS$FCB_CONTROL_BLOCK,		! File control block
+    KDB: REF $PAS$KDB_KEY_DESCRIPTOR,		! Key descriptor
+    XAB_SUM: REF $XABSUM_DECL,			! Summary XAB
+    XABKEY_ADDR: REF VECTOR [, LONG],		! Address of KEY XABs
+    XABKEY_SIZE: REF VECTOR [, LONG]		! Length of KEY XABs
+    ): CALL_FILL_KEY_XABS NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This procedure is called by PAS$$OPEN to allocate and fill in
+!	the KEY XABs for an indexed file.
+!
+! CALLING SEQUENCE:
+!
+!	CALL_FILL_KEY_XABS  FILL_KEY_XABS (PFV.rr.r, FCB.mr.r,
+!		KDB.rr.r, XAB_SUM.wr.r, XABKEY_ADDR.wa.r, XABKEY_SIZE.wl.r)
+!
+! FORMAL PARAMETERS:
+!
+!	PFV		- Pascal File Variable
+!
+!	FCB		- File control Block
+!
+!	KDB		- Key descriptor block.  The structure is:
+!
+!			+-----------------------+-------+
+!			|          MBZ          | Count |  <-- KDB
+!			+-------+-------+-------+-------+
+!			|  MBZ  | Size  | Dtype | Key # |
+!			+-------+-------+-------+-------+
+!			|   Byte offset into record     |
+!			+-------+-------+-------+-------+
+!			|  MBZ  | Size  | Dtype | Key # |
+!			+-------+-------+-------+-------+
+!			|   Byte offset into record     |
+!			+-------------------------------+
+!			|          ...                  |
+!
+!	XAB_SUM		- The summary XAB allocated by our caller.  The
+!			  key XABs will be chained to it.
+!
+!	XABKEY_ADDR	- Place to store address of allocated KEY XABs
+!			  so that they may be deallocated in case of an
+!			  error.
+!
+!	XABKEY_SIZE	- Place to store length of allocated KEY XABs.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+! SIGNALLED ERRORS:
+!
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	NEXT_KEY: REF $PAS$KDB_KEY_DESCRIPTOR,	! Descriptor of next key
+	XAB_KEY: REF $XABKEY_DECL,		! Key XAB
+	LAST_XAB: REF $XABKEY_DECL,		! Previous key XAB
+	LAST_KEY: SIGNED;			! Last key number
+
+    NEXT_KEY = .KDB;				! Get KDB address
+
+    !+
+    ! Allocate all the KEY XABs we need to describe the
+    ! keys.
+    !-
+
+    FCB [FCB$L_NKEYS] = .NEXT_KEY [KDB$B_COUNT];
+    XAB_SUM [XAB$B_NOK] = .NEXT_KEY [KDB$B_COUNT];	! RMS doesn't set on create
+    XABKEY_SIZE [0] = .FCB [FCB$L_NKEYS] * XAB$C_KEYLEN;
+    IF .XABKEY_SIZE [0] NEQ 0
+    THEN
+	BEGIN
+	XAB_KEY = PAS$$GET_VM (PFV [PFV$R_PFV], .XABKEY_SIZE [0]);
+	XABKEY_ADDR [0] = .XAB_KEY;	
+	END;
+    LAST_XAB = XAB_SUM [0,0,0,0];
+
+    NEXT_KEY = NEXT_KEY [4,0,0,0];	! Advance pointer over count longword.
+    LAST_KEY = -1;			! Initialize for comparison
+
+    !+
+    ! For each key, fill in the KEY XAB.
+    !-
+
+    INCR KEY_NUM FROM 0 TO .FCB [FCB$L_NKEYS] - 1 DO
+	BEGIN
+
+	XAB_KEY [XAB$B_COD] = XAB$C_KEY;
+	XAB_KEY [XAB$B_BLN] = XAB$C_KEYLEN;
+	XAB_KEY [XAB$B_REF] = .NEXT_KEY [KDB$B_KEY_NUMBER];
+
+
+	!+
+	! Ensure that the keys are in ascending order.
+	!-
+	IF .XAB_KEY [XAB$B_REF] LEQ .LAST_KEY
+	THEN
+	    $PAS$IO_ERROR (PAS$_INVARGPAS,0);
+
+	!+
+	! If this is possibly a $CREATE, make sure that the keys
+	! are in order and dense.
+	!-
+	IF NOT .FCB [FCB$V_OLD_FILE]
+	THEN
+	    IF .XAB_KEY [XAB$B_REF] NEQ .KEY_NUM
+	    THEN
+		$PAS$IO_ERROR (PAS$_INVKEYDEF,0);
+
+	IF .XAB_KEY [XAB$B_REF] NEQ 0	! Not primary key?
+	THEN
+	    XAB_KEY [XAB$B_FLG] = XAB$M_CHG+XAB$M_DUP;	! Allow changes and duplicates
+
+	IF .NEXT_KEY [KDB$B_DTYPE] EQL DSC$K_DTYPE_T		! String?
+	THEN
+	    BEGIN
+	    XAB_KEY [XAB$B_DTP] = XAB$C_STG;
+	    XAB_KEY [XAB$B_SIZ0] = .NEXT_KEY [KDB$B_SIZE];
+	    END
+	ELSE IF .NEXT_KEY [KDB$B_DTYPE] EQL DSC$K_DTYPE_BU	! Enumerated?
+	THEN
+	    BEGIN
+	    !+
+	    ! Since RMS doesn't have an unsigned byte type,
+	    ! call it a 1-byte string, which is equivalent.
+	    !-
+	    XAB_KEY [XAB$B_DTP] = XAB$C_STG;
+	    XAB_KEY [XAB$B_SIZ0] = 1;
+	    END
+	ELSE CASE .NEXT_KEY [KDB$B_DTYPE] FROM DSC$K_DTYPE_WU TO DSC$K_DTYPE_L OF
+	    SET
+	    [DSC$K_DTYPE_WU]: 
+		BEGIN
+		XAB_KEY [XAB$B_DTP] = XAB$C_BN2;
+		XAB_KEY [XAB$B_SIZ0] = 2;
+		END;
+	    [DSC$K_DTYPE_LU]: 
+		BEGIN
+		XAB_KEY [XAB$B_DTP] = XAB$C_BN4;
+		XAB_KEY [XAB$B_SIZ0] = 4;
+		END;
+	    [DSC$K_DTYPE_W]:  
+		BEGIN
+		XAB_KEY [XAB$B_DTP] = XAB$C_IN2;
+		XAB_KEY [XAB$B_SIZ0] = 2;
+		END;
+	    [DSC$K_DTYPE_L]:  
+		BEGIN
+		XAB_KEY [XAB$B_DTP] = XAB$C_IN4;
+		XAB_KEY [XAB$B_SIZ0] = 4;
+		END;
+	    [INRANGE, OUTRANGE]:
+		$PAS$IO_ERROR (PAS$_INVARGPAS,0);
+	    TES;
+
+	!+
+	! Since if the file is created, RMS doesn't fill in TKS,
+	! do it here.
+	!-
+	XAB_KEY [XAB$B_TKS] = .XAB_KEY [XAB$B_SIZ0];
+
+	IF .NEXT_KEY [KDB$L_OFFSET] GTRU 65535
+	THEN
+	    $PAS$IO_ERROR (PAS$_INVKEYDEF,0);
+	XAB_KEY [XAB$W_POS0] = .NEXT_KEY [KDB$L_OFFSET];
+
+	LAST_XAB [XAB$L_NXT] = .XAB_KEY;
+	LAST_XAB = .XAB_KEY;
+	LAST_KEY = .XAB_KEY [XAB$B_REF];
+	XAB_KEY = .XAB_KEY + XAB$C_KEYLEN;
+	NEXT_KEY = NEXT_KEY [8,0,0,0];	! Advance KDB
+	END;
+
+    RETURN;
+
+    END;					! End of routine FILL_KEY_XABS
+
+%SBTTL 'CHECK_KEY_XABS - Check key XABs for indexed file'
+ROUTINE CHECK_KEY_XABS (
+    PFV: REF $PAS$PFV_FILE_VARIABLE,		! Pascal File Variable
+    FCB: REF $PAS$FCB_CONTROL_BLOCK,		! File Control Block
+    XAB_SUM: REF $XABSUM_DECL,			! Summary XAB
+    XABKEY_ADDR: REF VECTOR [, LONG],		! Address of KEY XABs
+    XABKEY_SIZE: REF VECTOR [, LONG]		! Size of KEY XABs
+    ): CALL_CHECK_KEY_XABS NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This procedure is called by PAS$$OPEN to compare the keys that
+!	are declared in the KDB (if any) against those actually defined
+!	for the indexed file.
+!
+! CALLING SEQUENCE:
+!
+!	CALL_CHECK_KEY_XABS (PFV.rr.r, FCB.mr.r, XAB_SUM.rr.r,
+!			XABKEY_ADDR.ma.r, XABKEY_SIZE.ml.r)
+!
+! FORMAL PARAMETERS:
+!
+!	PFV		- The Pascal File Variable (PFV) for the file.
+!
+!	FCB		- The result FCB for the file.
+!
+!	XAB_SUM		- The summary XAB. If new KEY XABs are allocated
+!			  by this procedure, they are linked to XAB_SUM.
+!
+!	XABKEY_ADDR	- The address of the previously allocated KEY XABs.
+!
+!	XABKEY_SIZE	- The size of the previously allocated KEY XABs.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+! SIGNALLED ERRORS:
+!
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	PFD: REF $PAS$PFD_FILE_DESCRIPTOR,	! File descriptor
+	KDB: REF $PAS$KDB_KEY_DESCRIPTOR,	! Key descriptor block
+	XAB_KEY: REF $XABKEY_DECL,		! Pointer to KEY XAB
+	KDB_NKEYS,				! Number of keys in KDB
+	KEYTYPES: REF VECTOR [, WORD]; 		! Vector of allowable key datatypes and lengths
+
+    BIND
+	FAB = FCB: REF $PAS$FAB_FCB_STRUCT;
+
+    FCB [FCB$V_INDEXED] = 1;	! Indicate indexed organization
+
+    !+
+    ! Get number of keys defined for file.
+    !-
+
+    FCB [FCB$L_NKEYS] = .XAB_SUM [XAB$B_NOK];
+
+    !+
+    ! Get number of user-defined keys from KDB (if any).
+    !-
+
+    PFD = .PFV [PFV$A_PFD];
+    IF .PFD [PFD$A_KDB] NEQA 0	! Is there a KDB?
+    THEN
+	BEGIN
+	KDB = .PFD [PFD$A_KDB] + PFD [PFD$R_PFD];	! Get address of KDB
+	KDB_NKEYS = .KDB [KDB$B_COUNT];	! Get count
+	KDB = KDB [4,0,0,0];	! Advance to first key description
+	END
+    ELSE
+	KDB_NKEYS = 0;
+
+    !+
+    ! If the number of keys specified in the KDB doesn't match the
+    ! actual number in the file, we have to throw away the KEY XABs
+    ! we allocated, allocate the correct number, and do a $DISPLAY
+    ! to fill them in.
+    !-
+
+    IF .KDB_NKEYS NEQ .FCB [FCB$L_NKEYS]
+    THEN
+	BEGIN
+	LOCAL
+	    LAST_XAB: REF BLOCK [, BYTE];	! Previous XAB
+
+	!+
+	! Deallocate the old KEY XABs.
+	!-
+
+	IF .XABKEY_ADDR [0] NEQA 0
+	THEN
+	    PAS$$FREE_VM (.XABKEY_SIZE [0], XABKEY_ADDR [0]);
+
+	!+
+	! Allocate enough new KEY XABs.
+	!-
+
+	XABKEY_SIZE [0] = XAB$C_KEYLEN * .FCB [FCB$L_NKEYS];
+	XAB_KEY = PAS$$GET_VM (PFV [PFV$R_PFV], .XABKEY_SIZE [0]);
+	XABKEY_ADDR [0] = .XAB_KEY;
+
+	!+
+	! Fill in each KEY XAB and link it into the chain.
+	!-
+
+	LAST_XAB = .XAB_SUM;	! Link KEY XABs after SUM XAB
+
+	INCR KEY_NUM FROM 0 TO .FCB [FCB$L_NKEYS] - 1 DO
+	    BEGIN
+	    XAB_KEY [XAB$B_COD] = XAB$C_KEY;
+	    XAB_KEY [XAB$B_BLN] = XAB$C_KEYLEN;
+	    XAB_KEY [XAB$B_REF] = .KEY_NUM;
+	    LAST_XAB [XAB$L_NXT] = .XAB_KEY;	! Link in XAB
+	    LAST_XAB = .XAB_KEY;
+	    XAB_KEY = .XAB_KEY + XAB$C_KEYLEN;
+	    END;
+
+	!+
+	! Make sure that XAB_SUM is linked to the FAB.  A USER_ACTION
+	! routine may have unlinked it.
+	!-
+
+	FAB [FAB$L_XAB] = .XAB_SUM;
+
+	! Ask RMS to fill in our new XABs.
+	!-
+
+	IF NOT $PAS$RMS_OP ($DISPLAY (FAB = FAB [0,0,0,0]))
+	THEN
+	    $PAS$IO_ERROR (PAS$_ERRDUROPE);
+	END;
+
+    !+
+    ! Allocate a vector of longwords , one for each key, which will
+    ! contain a bit mask that indicates what key expression datatypes
+    ! may be used to reference that key, and the key size.  The mask
+    ! occupies the first word and the length, the second word.
+    !-
+
+    KEYTYPES = PAS$$GET_VM (PFV [PFV$R_PFV], .FCB [FCB$L_NKEYS] * 4);
+    FCB [FCB$A_KEY_TYPES] = .KEYTYPES;
+
+    !+
+    ! For each key in the file, if the KDB describes the key, make sure
+    ! it matches.  Set the KEYTYPES mask appropriately.  This mask has
+    ! 16 bits, corresponding to standard datatype codes 0-15.  (Codes
+    ! greater than 15 are not currently supported by Pascal for keys.)
+    ! If a bit for a particular datatype is set, then a key expression
+    ! of that type may be used to reference this key.  Some combinations
+    ! require a range check of the key expression value.  This is done
+    ! by PAS$FINDK.  Then set the key size in KEYTYPES.
+    !
+    ! The following table shows the allowable combinations of key value
+    ! types and file key types.  (ST1 refers to a 1-byte STG key)
+    !
+    !	      STG  ST1  BN2  BN4  IN2  IN4  other
+    !  BU     no   (1)  ok   ok   no   no   no
+    !  WU     no   (1)  ok   ok   no   no   no
+    !  LU     no   (1)  (2)  ok   no   no   no
+    !  L      no   (1)  (2)  ok   (2)  ok   no
+    !  T,Z    ok   (3)  no   no   no   no   (4)
+    !
+    ! Notes:
+    !	1.  Only if key not declared as string.  Value must
+    !	    be in range of key type.
+    !	2.  Value must be in range of key type.
+    !	3.  Only if key not declared as BU.
+    !	4.  Can't be declared in key descriptor.  Otherwise,
+    !	    treated as string.
+    !-
+
+    XAB_KEY = .XABKEY_ADDR [0];	! Get first KEY XAB
+
+    INCR KEY_NUM FROM 0 TO .FCB [FCB$L_NKEYS] - 1 DO
+	BEGIN
+
+	LOCAL
+	    KEY_DTYPE: BYTE,! Datatype of key in DSC$ codes
+	    USR_KEY;	! 1 if user defined key, otherwise 0
+
+	!+
+	! Define literal masks for the datatypes.
+	!-
+	LITERAL
+	    M_Z	 = 1^DSC$K_DTYPE_Z,
+	    M_BU = 1^DSC$K_DTYPE_BU,
+	    M_WU = 1^DSC$K_DTYPE_WU,
+	    M_LU = 1^DSC$K_DTYPE_LU,
+	    M_L	 = 1^DSC$K_DTYPE_L,
+	    M_T	 = 1^DSC$K_DTYPE_T;	    
+	
+	!+
+	! Set USR_KEY if this key is in the KDB.
+	!-
+
+	USR_KEY = 0;
+	IF .KDB_NKEYS NEQ 0
+	THEN
+	    IF .XAB_KEY [XAB$B_REF] EQL .KDB [KDB$B_KEY_NUMBER]
+	    THEN
+		USR_KEY = 1;
+
+	!+
+	! Find out what datatype the file's key is.
+	!-
+
+	CASE .XAB_KEY [XAB$B_DTP] FROM 0 TO XAB$C_MAXDTP OF
+	    SET
+
+	    [XAB$C_STG]:	! String
+		BEGIN
+		IF .USR_KEY
+		THEN
+		    IF .KDB [KDB$B_DTYPE] EQL DSC$K_DTYPE_BU
+		    THEN
+			BEGIN
+			IF .XAB_KEY [XAB$B_TKS] NEQ 1
+			THEN
+			    $PAS$IO_ERROR (PAS$_KEYDEFINC,1,.KEY_NUM);
+			KEYTYPES [0] = M_BU+M_WU+M_LU+M_L;
+			END
+		    ELSE IF .KDB [KDB$B_DTYPE] EQL DSC$K_DTYPE_T
+		    THEN
+			BEGIN
+			IF .KDB [KDB$B_SIZE] NEQ .XAB_KEY [XAB$B_TKS]
+			THEN
+			    $PAS$IO_ERROR (PAS$_KEYDEFINC,1,.KEY_NUM);
+			KEYTYPES [0] = M_T+M_Z;
+			END
+		    ELSE
+			$PAS$IO_ERROR (PAS$_KEYDEFINC,1,.KEY_NUM)
+		ELSE
+		    IF .XAB_KEY [XAB$B_TKS] EQL 1
+		    THEN
+			KEYTYPES [0] = M_BU+M_L+M_T+M_Z
+		    ELSE
+			KEYTYPES [0] = M_T+M_Z;
+		END;
+
+	    [XAB$C_IN2]:	! Word integer
+		BEGIN
+		IF .USR_KEY
+		THEN
+		    IF .KDB [KDB$B_DTYPE] NEQ DSC$K_DTYPE_W
+		    THEN
+			$PAS$IO_ERROR (PAS$_KEYDEFINC,1,.KEY_NUM);
+		KEYTYPES [0] = M_L;
+		END;
+
+	    [XAB$C_IN4]:	! Longword integer
+		BEGIN
+		IF .USR_KEY
+		THEN
+		    IF .KDB [KDB$B_DTYPE] NEQ DSC$K_DTYPE_L
+		    THEN
+			$PAS$IO_ERROR (PAS$_KEYDEFINC,1,.KEY_NUM);
+		KEYTYPES [0] = M_L;
+		END;
+
+	    [XAB$C_BN2]:	! Word unsigned
+		BEGIN
+		IF .USR_KEY
+		THEN
+		    IF .KDB [KDB$B_DTYPE] NEQ DSC$K_DTYPE_WU
+		    THEN
+			$PAS$IO_ERROR (PAS$_KEYDEFINC,1,.KEY_NUM);
+		KEYTYPES [0] = M_BU+M_WU+M_LU+M_L;
+		END;
+
+	    [XAB$C_BN4]:	! Longword unsigned
+		BEGIN
+		IF .USR_KEY
+		THEN
+		    IF .KDB [KDB$B_DTYPE] NEQ DSC$K_DTYPE_LU
+		    THEN
+			$PAS$IO_ERROR (PAS$_KEYDEFINC,1,.KEY_NUM);
+		KEYTYPES [0] = M_BU+M_WU+M_LU+M_L;
+		END;
+
+	    [INRANGE]:		! Defined by RMS, but not by PASCAL
+		BEGIN
+		!+
+		! Pascal does not support this key type.
+		! However, if the file has one, it is treated as
+		! a string.
+		!-
+		IF .USR_KEY
+		THEN
+		    $PAS$IO_ERROR (PAS$_KEYDEFINC,1,.KEY_NUM);
+		KEYTYPES [0] = M_T+M_Z;
+		END;
+
+	    [OUTRANGE]:
+		$PAS$BUGCHECK (BUG_BADKEYDTP);
+
+	    TES;
+
+	!+
+	! Check offset of key.
+	!-
+
+	IF .USR_KEY
+	THEN
+	    IF .KDB [KDB$L_OFFSET] NEQ .XAB_KEY [XAB$W_POS0]
+	    THEN
+		$PAS$IO_ERROR (PAS$_KEYDEFINC,1,.KEY_NUM);
+
+	!+
+	! Set size of key.
+	!-
+
+	KEYTYPES [1] = .XAB_KEY [XAB$B_TKS];
+
+	!+
+	! Advance KDB pointer, if any remain.
+	!-
+
+	IF .KDB_NKEYS GTR 0
+	THEN
+	    BEGIN
+	    KDB = KDB [8,0,0,0];
+	    KDB_NKEYS = .KDB_NKEYS - 1;
+	    END;
+
+	!+
+	! Advance XAB_KEY and KEYTYPES.
+	!-
+
+	XAB_KEY = .XAB_KEY [XAB$L_NXT];
+	KEYTYPES = KEYTYPES [2];
+
+	END;	! End of INCR loop
+
+    !+
+    ! If any KDB keys remain, give an error.
+    !
+		
+    IF .KDB_NKEYS GTR 0
+    THEN
+	$PAS$IO_ERROR (PAS$_KEYDEFINC,1,.KDB [KDB$B_KEY_NUMBER]);
+
+    RETURN;
+
+    END;					! End of routine CHECK_KEY_XABS
+
+%SBTTL 'OPEN_HANDLER - Close file on unwind'
+ROUTINE OPEN_HANDLER (
+    SIGNAL_ARGS: REF BLOCK [, BYTE],		! Signal arguments
+    MECHANISM_ARGS: REF BLOCK [, BYTE],		! Mechanism arguments
+    ENABLE_ARGS: REF VECTOR [, LONG]		! Enable arguments
+    ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	OPEN_HANDLER is a condition handler established by PAS$$OPEN.  It
+!	serves only to close the file which is currently being opened
+!	if an unwind occurs.
+!
+! CALLING SEQUENCE:
+!
+!	ret_status.wlc.v = OPEN_HANDLER (signal_args.rlu.r, mechanism_args.rlu.r,
+!			enable_args.rlu.r)
+!
+! FORMAL PARAMETERS:
+!
+!	SIGNAL_ARGS		- The signal arguments list
+!	MECHANISM_ARGS		- The mechanism argument list
+!	ENABLE_ARGS		- A vector of four longwords, the first of
+!				  which contains the count of remaining
+!				  longwords (3).  The remaining longwords
+!				  contain the following information:
+!				    ENABLE_ARGS [1] - Address of longword which
+!						      contains the address of the
+!						      active PFV.
+!				    ENABLE_ARGS [2] - Address of longword which
+!						      contains the address of
+!						      a block of KEY XABs to be
+!						      deallocated (if non-zero).
+!				    ENABLE_ARGS [3] - Address of longword which
+!						      contains the number of bytes
+!						      of KEY XABs to deallocate.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS:
+!
+!	SS$_RESIGNAL
+!
+! SIDE EFFECTS:
+!
+!	Closes the current file upon an unwind.
+!	Deallocates KEY XABs.
+!
+! SIGNALLED ERRORS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    !+
+    ! Check for unwinding.
+    !-
+
+    IF .SIGNAL_ARGS [CHF$L_SIG_NAME] EQL SS$_UNWIND
+    THEN
+	BEGIN
+
+	LOCAL
+	    PFV: REF $PAS$PFV_FILE_VARIABLE;	! Pascal File Variable
+
+	!+
+	! If the enable argument for the PFV address is non-zero,
+	! and if the FCB is valid, close the file and deallocate the FCB.
+	!-
+
+	PFV = ..ENABLE_ARGS [1];
+	IF PFV [PFV$R_PFV]  NEQA 0
+	THEN
+	    IF .PFV [PFV$V_FCB_VALID]
+	    THEN
+		BEGIN
+		PAS$$CLOSE (PFV [PFV$R_PFV]);		! Close the file
+		PAS$$REMOVE_FILE (.PFV [PFV$A_FCB]);	! Deallocate FCB
+		END;
+
+	!+
+	! If there are KEY XABs to deallocate, deallocate them.
+	!-
+
+	IF ..ENABLE_ARGS [2] NEQ 0
+	THEN
+	    PAS$$FREE_VM (..ENABLE_ARGS [3], .ENABLE_ARGS [2]);
+	END;
+
+    RETURN SS$_RESIGNAL;
+
+    END;					! End of routine OPEN_HANDLER
+
+!<BLF/PAGE>
+
+%SBTTL 'EXIT_HANDLER - Exit handler for file system'
+ROUTINE EXIT_HANDLER (	
+    EXIT_REASON: REF VECTOR [, LONG]		! Exit reason
+    ): NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This is the exit handler for the file system.  It is declared
+!	by PAS$$OPEN, and serves to close all open files in an orderly
+!	fashion upon image exit.
+!
+! CALLING SEQUENCE:
+!
+!	CALL EXIT_HANDLER (EXIT_REASON.rlc.r)
+!	(Called by VMS upon image exit.)
+!
+! FORMAL PARAMETERS:
+!
+!	EXIT_REASON	- The reason for the exit.  This parameter is
+!			  not used here.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Closes all open files.
+!
+! SIGNALLED ERRORS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    !+
+    ! Clear EXITH_DECLARED so that if a user exit handler opens more
+    ! files, another handler will be declared.
+    !-
+
+    EXITH_DECLARED = 0;
+
+    !+
+    ! Call PAS$$CLOSE_ALL to close all the files.
+    !-
+
+    PAS$$CLOSE_ALL ();
+
+    RETURN;
+
+    END;					! End of routine EXIT_HANDLER
+
+!<BLF/PAGE>
+
+END						! End of module PAS$OPEN2
+
+ELUDOM

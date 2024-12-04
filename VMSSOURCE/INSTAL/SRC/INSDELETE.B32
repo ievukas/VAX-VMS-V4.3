@@ -1,0 +1,965 @@
+MODULE INSDELETE (			! DELETE a KFE entry
+			IDENT = 'V04-000',
+			ADDRESSING_MODE(EXTERNAL = GENERAL)
+		 ) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  Install
+!
+! ABSTRACT:
+!
+!	This module executes the REPLACE and DELETE options on INSTALL
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system.
+!
+! AUTHOR:  Bob Grosso, April 1983
+!
+! Modified by:
+!
+!	V03-012	MSH0061		Michael S. Harvey	5-Jul-1984
+!		Add EXEONLY support.
+!
+!	V03-011	MSH0057		Michael S. Harvey	26-Jun-1984
+!		Propagate WRITEABLE attribute across REPLACE command.
+!
+!	V03-010	MSH0050		Michael S. Harvey	18-May-1984
+!		Convert match control to MATEQU before deleting global
+!		sections. This ensures that DELETE/REMOVE doesn't
+!		delete newly created global sections of the same name
+!		but with different idents. In other words, we only
+!		want to delete global sections that are likely to have
+!		been created at the time the about-to-be-deleted image
+!		was created, not any global sections of the same name
+!		that have been created since that time.
+!
+!	V03-009	MSH0027		Michael S. Harvey	6-Apr-1984
+!		Ensure that files get closed during the PURGE operation.
+!
+!	V03-008	MSH0022		Michael S. Harvey	19-Mar-1984
+!		Convert and compress directory brackets correctly.
+!
+!	V03-007	MSH0017		Michael S. Harvey	7-Mar-1984
+!		Convert FIND_KFE into a global routine for use during
+!		known file creation.
+!
+!	V03-006	MSH0003		Michael S. Harvey	27-Jan-1984
+!		Prevent crash from executing system service at elevated
+!		IPL by resetting IPL on wierd error paths, such as is
+!		done on success paths.
+!
+!	V03-005	RPG0005		Bob Grosso		08-Sep-1983
+!		Raise IPL to protect memory deallocation, so a process
+!		won't result in pool loss.
+!		Do not decrement REFCNT in WCB when deleting entry.
+!
+!	V03-004	RPG0004		Bob Grosso		16-Aug-1983
+!		Fix /REPLACE so it retains attributes.
+!		Activate REMOVE command.
+!
+!	V03-003	RPG0003		Bob Grosso		July 25, 1983
+!		Decrement entry count upon deletion.
+!		Clean up PURGE.
+!		Clean up error reporting.
+!
+!	V03-002	RPG0002		Bob Grosso		July 19, 1983
+!		Do not decrement REFCNT in WCB when deleting entry.
+!
+!	V03-001	RPG0001		Bob Grosso		July 7, 1983
+!		Take out exclusive lock when purging
+!
+!--
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:LIB';		! VAX/VMS system definitions
+
+REQUIRE	'SRC$:INSPREFIX.REQ';
+REQUIRE	'LIB$:INSDEF.R32';
+
+%SBTTL  'Declarations';
+
+LINKAGE
+    CALL_S_4 = CALL (STANDARD, REGISTER=4),		! for calling routines to execute in kernel mode,
+							! the change mode dispatcher passes PCB address in R4.
+
+    JSB_0 = JSB (REGISTER = 0),				! Deallocate paged pool
+
+    JSB_0_1_2 = JSB (REGISTER = 0; REGISTER = 1, REGISTER = 2)	! Verify I/O channel
+		: NOPRESERVE (3)
+		  NOTUSED (4,5,6,7,8,9,10,11),
+
+    JSB_G1_G2_3 = JSB (REGISTER = 3)			! Allocate memory in P1 space
+		: GLOBAL (length = 1, entry_block = 2);
+
+!
+! Table of contents
+!
+
+EXTERNAL
+    ctl$gq_allocreg,			! Memory allocation listhead
+    ctl$gl_knownfil,			! Process known file listhead queues
+    EXE$GL_KNOWN_FILES : REF BBLOCK,	! Pointer to knownfil list queues
+    SGN$GB_KFHSHSIZ;			! Number of buckets in KF hash table
+
+EXTERNAL ROUTINE
+    IOC$VERIFYCHAN : JSB_0_1_2,
+    EXE$DEAPAGED : JSB_0,
+    SYS$ASSIGN,
+    SYS$DASSGN;
+
+
+EXTERNAL LITERAL
+    INS$_EMPTYLST,			! The Known File List is empty
+    INS$_INTRNLERR,			! no known file entry found
+    INS$_NOKFEFND,			! no known file entry found during REMOVE
+    INS$_NOLIST, 			! There is no Known File list
+    INS$_REMOVED;			! Dangling entry was removed
+
+EXTERNAL
+    INS$GL_CTLMSK : BLOCK [1],		! Control flags
+    INS$GL_REPLACE_MSK : BLOCK [1],	! Control flags for REPLACE
+    INS$L_INTRNLERR,			! Pass back internal error descriptor
+    INS$GL_KFECHAN,			! Channel known image file is open on.
+    INS$G_KFENAM : $NAM_DECL,		! NAM block for the filename of the known image
+    INS$GQ_KFEPRIVS,			! Privilege mask, save it if REPLACE
+    INS$GL_KFEADR;			! Return the KFE address when it has been replaced
+
+EXTERNAL ROUTINE
+    INS$EXECUTE_IN_KRNL_WITH_W_LOCK,
+    INS$CNVRT_KF_LOCK,
+    INS$BLD_GBLSECNAM,
+    INS$CVT_DIR,
+    INS$HASH;
+
+FORWARD ROUTINE
+    INS$FIND_KFE,
+    INS_DELETE,
+    INS_PURGE,
+    PURGE,
+    DETACH_KFE,				! Remove entry from list
+    RETURN_KFE,				! Deallocate entry
+    DEALLOC_PAGED;			! Deallocate paged pool
+
+BIND
+    SGN_B_KFHSHSIZ = SGN$GB_KFHSHSIZ : BYTE;
+
+BIND
+    HSHKFE_ERR_DSC = $DESCRIPTOR (' KFE for deletion not found in hash'),
+    IMGHDR_ERR_DSC = $DESCRIPTOR (' No image header found for delete'),
+    KFD_ERR_DSC = $DESCRIPTOR (' KFD for deletion not found'),
+    KFDKFE_ERR_DSC = $DESCRIPTOR (' KFE for deletion not found in KFD list'),
+    EMPTYKFPB_ERR_DSC = $DESCRIPTOR (' Deletion from empty pointer block');
+
+%SBTTL 'INS$DELETE';
+
+GLOBAL ROUTINE  INS$DELETE =
+BEGIN
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!
+!	Delete a Known File entry.
+!	If this was the last entry for the listhead, delete it
+!
+!  EXPLICIT INPUT:
+!
+!	none
+!
+!  ROUTINE VALUE:
+!
+!    R0 = return status, low bit set for success, else error status
+!
+!---
+
+LOCAL
+    STATUS;
+
+IF .INS$GL_CTLMSK [INS$V_PROCESS] THEN RETURN TRUE;
+
+STATUS = INS$EXECUTE_IN_KRNL_WITH_W_LOCK (INS_DELETE, 0);
+RETURN .STATUS;
+END;		! Global routine INS$DELETE
+
+
+%SBTTL 'INS_DELETE';
+
+GLOBAL ROUTINE  INS_DELETE =
+BEGIN
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!
+!	Delete a Known File entry.
+!	If this was the last entry for the listhead, delete it
+!
+!  EXPLICIT INPUT:
+!
+!	none
+!
+!  IMPLICIT INPUT:
+!
+!	INS$GL_KFEADR	=	Channel on which the known file image is open
+!
+!  IMPLICIT OUTPUT:
+!
+!	INS$GL_KFEADR	=	Address of KFE, will be set to zero
+!
+!  ROUTINE VALUE:
+!
+!    R0 = return status, low bit set for success, else error status
+!
+!---
+
+LOCAL
+    HASH_INDEX,
+    KFD : REF BBLOCK,
+    KFE,
+    STATUS;
+
+!
+!   If this is a REMOVE,  i.e. We suspect there is a dangling entry,
+!   then compute which hash table bucket Known File Entry should be in.
+!   If we find the entry, remove it, else return normally.
+!
+IF .INS$GL_KFEADR EQL 0
+THEN
+    BEGIN
+    HASH_INDEX = INS$HASH (.INS$G_KFENAM [NAM$B_NAME], 
+			.INS$G_KFENAM [NAM$L_NAME], .SGN_B_KFHSHSIZ );
+
+    KFE = INS$FIND_KFE (.HASH_INDEX, INS$G_KFENAM);
+
+    IF .KFE EQL 0 THEN RETURN INS$_NOKFEFND;
+
+    INS$CNVRT_KF_LOCK (LCK$K_EXMODE);	! Convert protected read to exclusive
+					!  to lock out any image activations
+    SET_IPL (IPL$_ASTDEL);		! Block deletion of process so pool is not lost
+    STATUS = DETACH_KFE (.KFE, KFD);
+    IF .KFD NEQ 0
+    THEN
+	BEGIN
+	STATUS = DEALLOC_PAGED (.KFD);
+	END;
+
+    STATUS = RETURN_KFE (.KFE,0);
+
+    SET_IPL (0);			! reset to IPL 0
+    INS$CNVRT_KF_LOCK (LCK$K_PRMODE);	! Convert exclusive to protected read
+					!  to allow image activations
+    RETURN INS$_REMOVED;
+    END;
+    
+
+!
+!   Take out write lock and remove entry from list
+!
+INS$CNVRT_KF_LOCK (LCK$K_EXMODE);	! Convert protected read to exclusive
+					!  to lock out any image activations
+SET_IPL (IPL$_ASTDEL);			! Block deletion of process so pool is not lost
+
+STATUS = DETACH_KFE (.INS$GL_KFEADR, KFD);
+IF .STATUS 
+THEN
+    BEGIN
+    IF .KFD NEQ 0
+    THEN
+	STATUS = DEALLOC_PAGED (.KFD);
+
+    !
+    !   Clean up entry and deallocate it
+    !
+    STATUS = RETURN_KFE (.INS$GL_KFEADR,0);
+    INS$GL_KFEADR = 0;
+    END;
+
+SET_IPL (0);
+INS$CNVRT_KF_LOCK (LCK$K_PRMODE);	! Convert exclusive to protected read
+					!  to allow image activations
+
+RETURN .STATUS;
+END;		! Global routine INS_DELETE
+
+
+%SBTTL 'INS$PURGE';
+
+GLOBAL ROUTINE  INS$PURGE =
+BEGIN
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!
+!	Purge all Known File entries that are purgeable.
+!	For each that is the last entry for the listhead, delete it
+!
+!  EXPLICIT INPUT:
+!
+!	none
+!
+!  ROUTINE VALUE:
+!
+!    R0 = return status, low bit set for success, else error status
+!
+!---
+LOCAL
+    STATUS;
+
+IF .INS$GL_CTLMSK [INS$V_PROCESS] THEN RETURN TRUE;
+
+STATUS = INS$EXECUTE_IN_KRNL_WITH_W_LOCK (INS_PURGE, 0);
+RETURN .STATUS;
+END;		! Global routine INS$PURGE
+
+
+%SBTTL 'INS_PURGE';
+
+ROUTINE  INS_PURGE =
+BEGIN
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!
+!	Purge all Known File entries that are purgeable.
+!	For each that is the last entry for the listhead, delete it
+!
+!  EXPLICIT INPUT:
+!
+!	none
+!
+!  IMPLICIT INPUT:
+!
+!	INS$GL_KFEADR	=	Channel on which the known file image is open
+!
+!  IMPLICIT OUTPUT:
+!
+!	INS$GL_KFEADR	=	Address of KFE, will be set to zero
+!
+!  ROUTINE VALUE:
+!
+!    R0 = return status, low bit set for success, else error status
+!
+!---
+LOCAL
+    RET_STATUS,
+    STATUS;
+
+
+BIND
+    KFPB = EXE$GL_KNOWN_FILES : REF BBLOCK;
+
+IF .KFPB EQL 0
+THEN
+    RETURN INS$_NOLIST;
+
+IF .KFPB [KFPB$L_KFDLST] EQL 0
+THEN
+    RETURN INS$_EMPTYLST;
+
+
+STATUS = INS$CNVRT_KF_LOCK (LCK$K_EXMODE);	! Convert protected read to exclusive
+					!  to lock out any image activations
+IF NOT .STATUS THEN RETURN .STATUS;
+
+RET_STATUS = PURGE ();
+
+INS$CNVRT_KF_LOCK (LCK$K_PRMODE);	! Convert exclusive to protected read
+					!  to allow image activations
+IF NOT .STATUS THEN RETURN .STATUS;
+
+INS$GL_KFEADR = 0;
+
+RETURN .RET_STATUS;
+END;		! Global routine INS_PURGE
+
+
+%SBTTL 'PURGE';
+
+ROUTINE  PURGE =
+BEGIN
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!
+!	Purge all Known File entries that are purgeable.
+!	For each that is the last entry for the listhead, delete it
+!
+!  EXPLICIT INPUT:
+!
+!
+!---
+LOCAL
+    DEV_DSC : $BBLOCK [DSC$C_S_BLN],
+    CHAN,
+    CCB : REF $BBLOCK,
+    KFD : REF BBLOCK,
+    KFE : REF BBLOCK,
+    RET_KFE : REF BBLOCK,
+    RET_KFD,
+    STATUS;
+
+
+BIND
+    KFPB = EXE$GL_KNOWN_FILES : REF BBLOCK;
+
+KFD = .KFPB [KFPB$L_KFDLST];
+
+!
+!   Traverse the list of KFDs and access all its KFEs.
+!   The KFD is the header block which contains the Device, directory and
+!   file type which several Known File Entries (KFE) share in common.
+!
+WHILE .KFD NEQ 0 DO
+    BEGIN
+    KFE = .KFD [KFD$L_KFELIST];
+    !
+    ! Set up device string descriptor for assignment.
+    !
+    DEV_DSC [DSC$W_LENGTH] = .KFD [KFD$B_DEVLEN];
+    DEV_DSC [DSC$A_POINTER] = KFD [KFD$T_DDTSTR];
+    KFD = .KFD [KFD$L_LINK];		! Follow link now to next KFD
+    !
+    !	DELETE each KFE in the KFD's ordered list of KFEs
+    !
+    WHILE .KFE NEQ 0 DO
+	BEGIN
+	RET_KFE = .KFE;			! KFE to be deleted
+	KFE = .KFE [KFE$L_KFELINK];	! Follow link now for next one
+
+	IF NOT .RET_KFE [KFE$V_NOPURGE]
+	THEN
+	    BEGIN
+	    !
+	    ! Get ready to close the file. Do this now before the data
+	    ! structures get cleaned up at elevated IPL.
+	    !
+	    SYS$ASSIGN (DEV_DSC,CHAN,0,0);
+	    IOC$VERIFYCHAN (.CHAN; CCB);
+	    !
+	    !   Take out write lock and remove entry from list
+	    !
+	    SET_IPL (IPL$_ASTDEL);	! Block deletion of process so pool is not lost
+
+	    STATUS = DETACH_KFE (.RET_KFE, RET_KFD);
+
+	    IF NOT .STATUS
+	    THEN
+		BEGIN
+		SET_IPL (0);
+		RETURN .STATUS;
+		END;
+
+	    IF .RET_KFD NEQ 0
+	    THEN
+		BEGIN
+		STATUS = DEALLOC_PAGED (.RET_KFD);
+
+		IF NOT .STATUS
+		THEN
+		    BEGIN
+		    SET_IPL (0);
+		    RETURN .STATUS;
+		    END;
+		END;
+	
+	    !
+	    !   Clean up entry and deallocate it
+	    !
+	    STATUS = RETURN_KFE (.RET_KFE, .CCB);
+	    SET_IPL (0);
+	    !
+	    ! Now, prepare for final file closing
+	    !
+	    SYS$DASSGN (.CHAN);
+
+	    IF NOT .STATUS THEN RETURN .STATUS;
+	    END;		! If it's purgeable
+	END;			! WHILE traversing KFD's ordered KFE list
+    END;			! WHILE traversing KFD list
+
+RETURN TRUE;
+END;		! Global routine PURGE
+
+
+%SBTTL 'detach_kfe	Remove from Known File List';
+
+ROUTINE  DETACH_KFE (KFE, RET_KFD_ADR) =
+BEGIN
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!
+!	Delete a Known File entry.
+!	If this was the last entry for the listhead, delete it
+!
+!  EXPLICIT INPUT:
+!
+!	none
+!
+!  ROUTINE VALUE:
+!
+!    R0 = return status, low bit set for success, else error status
+!
+!---
+
+LOCAL
+    CMPHSHKFE : REF BBLOCK,	! KFE from hash table list to compare with
+    CMPKFE : REF BBLOCK,	! KFE from KFD to compare with
+    HSHTAB : REF VECTOR [,LONG],! Hash table
+    PRVHSHKFE : REF BBLOCK,	! Previous KFE from hash table
+    PRVKFE : REF BBLOCK,	! Previous KFE from KFD list
+    STATUS;
+
+MAP
+    KFE : REF BBLOCK;
+
+BIND
+    KFPB = EXE$GL_KNOWN_FILES : REF BBLOCK,
+    RET_KFD = .RET_KFD_ADR;
+
+IF .KFPB EQL 0 
+THEN 
+    BEGIN
+    INS$L_INTRNLERR = EMPTYKFPB_ERR_DSC;
+    RETURN INS$_INTRNLERR;
+    END;
+
+HSHTAB = .KFPB [KFPB$L_KFEHSHTAB];
+
+RET_KFD = 0;					! Anything other than zero indicates this was the last
+						! KFE in the KFD and the KFD should be deallocated
+
+PRVHSHKFE = HSHTAB [.KFE [KFE$B_HSHIDX]];	! Previous KFE
+CMPHSHKFE = .HSHTAB [.KFE [KFE$B_HSHIDX]];	! Comparison KFE
+WHILE .CMPHSHKFE NEQ 0 DO		! Single linked list ending in zero
+    BEGIN
+    IF .KFE EQL .CMPHSHKFE		! Same entry block?
+    THEN
+	BEGIN
+	LOCAL
+	   KFD : REF BBLOCK;
+
+	PRVHSHKFE [KFE$L_HSHLNK] = .KFE [KFE$L_HSHLNK]; ! Remove it
+	KFE [KFE$L_HSHLNK] = 0;	
+	PRVHSHKFE = 0;	! Mark that it was found
+	CMPHSHKFE = 0;	! Terminate traversal
+
+	KFD = .KFE [KFE$L_KFD];
+
+	!
+	!   Remove KFE from the ordered singly linked list starting in the
+	!   KFD.
+	!
+	PRVKFE = .KFD;
+	CMPKFE = .KFD [KFD$L_KFELIST];
+
+	WHILE .CMPKFE NEQ 0 DO
+	    BEGIN
+	    IF .CMPKFE EQL .KFE
+	    THEN
+		BEGIN
+		PRVKFE [KFE$L_KFELINK] = .KFE [KFE$L_KFELINK];	! Link around it.
+		KFE [KFE$L_KFELINK] = 0;	! Clean up
+		PRVKFE = 0;			! mark successful traversal
+		CMPKFE = 0;			! terminate traversal
+		END
+	    ELSE
+		BEGIN
+		PRVKFE = .CMPKFE;
+		CMPKFE = .CMPKFE [KFE$L_KFELINK];
+		END;
+	    END;		! While traversing ordered list of KFE's
+
+	!
+	!   Traversed whole list and didn't find it, something is broken.
+	!
+	IF .PRVKFE NEQ 0 
+	THEN 
+	    BEGIN
+	    INS$L_INTRNLERR = KFDKFE_ERR_DSC;
+	    RETURN INS$_INTRNLERR;
+	    END;
+
+	KFD [KFD$W_REFCNT] = .KFD [KFD$W_REFCNT] - 1;
+
+	!
+	!   If this was the only KFE off it's KFD, then disconnect the
+	!   KFD.
+	!
+	IF .KFD [KFD$W_REFCNT] EQL 0
+	THEN
+	    BEGIN
+	    LOCAL
+		PRVKFD : REF BBLOCK,
+		CMPKFD : REF BBLOCK;
+
+	    RET_KFD = .KFD;
+	    PRVKFD = KFPB [KFPB$L_KFDLST];
+	    CMPKFD = .PRVKFD;
+	    WHILE .CMPKFD NEQ 0 DO
+		BEGIN
+		IF .KFD EQL .CMPKFD	! This is it, disconnect it
+		THEN
+		    BEGIN
+		    PRVKFD [KFD$L_LINK] = .KFD [KFD$L_LINK];
+		    KFD [KFD$L_LINK] = 0;
+		    CMPKFD = 0;
+		    PRVKFD = 0;
+		    END
+		ELSE
+		    BEGIN
+		    PRVKFD = .CMPKFD;
+		    CMPKFD = .CMPKFD [KFD$L_LINK];
+		    END;
+		END;	! While traversing KFD list
+
+	    IF .PRVKFD NEQ 0 
+	    THEN
+		BEGIN 
+		INS$L_INTRNLERR = KFD_ERR_DSC;
+		RETURN INS$_INTRNLERR;
+		END;
+
+	    KFPB [KFPB$W_KFDLSTCNT] = .KFPB [KFPB$W_KFDLSTCNT] - 1;
+	    END;	! Then remove KFD
+	END
+    ELSE		! Same name, different file, keep traversing
+	BEGIN
+	PRVHSHKFE = .CMPHSHKFE;
+	CMPHSHKFE = .CMPHSHKFE [KFE$L_HSHLNK];
+	END;
+    END;			! WHILE traversing hash bucket list
+
+!
+!	Have traversed whole list.  
+!
+IF .PRVHSHKFE NEQ 0
+THEN
+    BEGIN
+    INS$L_INTRNLERR = HSHKFE_ERR_DSC;
+    RETURN INS$_INTRNLERR;	! It wasn't on the list it was supposed to be on
+    END;
+
+KFPB [KFPB$W_KFDLSTCNT] = .KFPB [KFPB$W_KFDLSTCNT] - 1;
+
+RETURN TRUE;
+END;			! routine DETACH_KFE
+
+
+%SBTTL 'return_kfe	Cleanup and deallocate entry';
+
+ROUTINE  RETURN_KFE (KFE,CCB) =
+BEGIN
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!
+!	Deallocate a Known File entry which has been removed from the list.
+!	If the file was installed /OPEN, take steps which will allow the
+!	file to be closed later.
+!
+!  EXPLICIT INPUT:
+!
+!	none
+!
+!  IMPLICIT INPUT:
+!
+!	KFE		Address of known file entry block to be returned
+!	CCB		Address of channel control block
+!
+!  ROUTINE VALUE:
+!
+!    R0 = return status, low bit set for success, else error status
+!
+!---
+
+LOCAL
+    PTR,
+    WCB : REF BBLOCK,
+    STATUS;
+
+MAP 
+    CCB : REF $BBLOCK,
+    KFE : REF BBLOCK;
+
+BIND
+    SUFFIX = UPLIT (%ASCII '_001') : VECTOR [,BYTE];
+
+IF .KFE [KFE$V_HDRRES] 
+THEN
+    BEGIN
+    BIND 
+	KFRH = .KFE [KFE$L_IMGHDR] - KFRH$C_LENGTH;
+
+    IF .KFE [KFE$L_IMGHDR] EQL 0 
+    THEN
+	BEGIN
+	INS$L_INTRNLERR = IMGHDR_ERR_DSC; 
+	RETURN INS$_INTRNLERR;
+	END;
+
+    STATUS = DEALLOC_PAGED (KFRH);
+    END;
+
+!
+!   Delete any global sections created if this was installed /SHARE
+!
+IF .KFE [KFE$V_SHARED]
+THEN
+    BEGIN
+    LOCAL
+	GBLSECNAM_DSC : BBLOCK [DSC$C_S_BLN],
+	GBLSECNAM : BBLOCK [INS$C_GBLNAMLEN];
+
+    !
+    !	Initialize
+    !
+    GBLSECNAM_DSC = 0;
+    GBLSECNAM_DSC [DSC$A_POINTER] = GBLSECNAM;
+    CH$FILL (0, INS$C_GBLNAMLEN, GBLSECNAM);
+    GBLSECNAM_DSC [DSC$W_LENGTH] = .KFE [KFE$B_FILNAMLEN] + 4;
+    PTR = CH$MOVE(.KFE [KFE$B_FILNAMLEN], KFE [KFE$T_FILNAM], GBLSECNAM);
+    CH$MOVE(4, SUFFIX, .PTR);
+
+    !
+    !   At this point, we convert the match control to be "MATEQU". This
+    !	ensures that we only delete global sections that are likely to
+    !	have been created at the time this image was installed. This avoids
+    !	the problem where a newer copy of the global section set with, most
+    !	likely, a greater minor ID from being deleted instead if the match
+    !	control in the KFE happened to be "MATLEQ", as is typical.
+    !
+    !	For instance, if the shareable image is installed twice (with
+    !	different KFDs, of course) and the global section ident for the
+    !	second image has a larger minor ID than the first, then two
+    !	different sets of global sections will be created. Now, if the
+    !	match control is set, as is typical, to be "MATLEQ", this means
+    !	that not only will the second set of global sections be referenced
+    !	for both images during image activation, but should either image
+    !	be deleted, the second set of global section will also be deleted!
+    !	This is incorrect in the case of the first image being deleted because
+    !	the first set of global sections had been created just for that image
+    !	and the second image may not be able to work with the first set of
+    !	global sections.
+    !
+    !	To make a long story short, by converting the match control to "MATEQU",
+    !	we ensure deletion of the correct set of global sections.
+
+    KFE [KFE$B_MATCHCTL] = ISD$K_MATEQU;
+
+    !
+    !   Delete all the global sections
+    !
+    INCR I FROM 1 TO .KFE [KFE$W_GBLSECCNT] DO
+	BEGIN
+	STATUS = $DGBLSC (
+	    FLAGS = SEC$M_SYSGBL,		! Deleting a system global section
+	    GSDNAM = GBLSECNAM_DSC,		! Global section name
+	    IDENT = KFE [KFE$B_MATCHCTL]	! Address of match control and ident quadword
+			);
+	INS$BLD_GBLSECNAM (GBLSECNAM_DSC);
+	END;					! For as many global sections as were created
+
+    END;		! Delete global sections
+
+IF .KFE [KFE$V_OPEN]
+THEN
+    IF .CCB EQL 0
+    THEN
+	BEGIN
+	WCB = .KFE [KFE$L_WCB];
+	WCB [WCB$W_REFCNT] = .WCB [WCB$W_REFCNT] - 1;	! Allow file to be closed
+	END
+    ELSE
+	!
+	! Jam the WCB address into the CCB so that the file can be closed later.
+	!
+	CCB [CCB$L_WIND] = .KFE [KFE$L_WCB];
+
+
+IF .INS$GL_CTLMSK [INS$V_REPLACE]
+THEN
+    !
+    !	Preserve attributes so they can be duplicated on a REPLACE
+    !
+    BEGIN
+    INS$GL_REPLACE_MSK [INS$V_OPEN] = .KFE [KFE$V_OPEN];
+    INS$GL_REPLACE_MSK [INS$V_SHARED] = .KFE [KFE$V_SHARED];
+    INS$GL_REPLACE_MSK [INS$V_PRIV] = .KFE [KFE$V_PROCPRIV];
+    CH$MOVE (8, KFE [KFE$Q_PROCPRIV], INS$GQ_KFEPRIVS);
+    INS$GL_REPLACE_MSK [INS$V_NOPURGE] = .KFE [KFE$V_NOPURGE];
+    INS$GL_REPLACE_MSK [INS$V_ACCOUNT] = .KFE [KFE$V_ACCOUNT];
+    INS$GL_REPLACE_MSK [INS$V_HDRRES] = .KFE [KFE$V_HDRRES];
+    INS$GL_REPLACE_MSK [INS$V_PROTECT] = .KFE [KFE$V_PROTECT];
+    INS$GL_REPLACE_MSK [INS$V_WRITABLE] = .KFE [KFE$V_WRITEABLE];
+    INS$GL_REPLACE_MSK [INS$V_EXEONLY] = .KFE [KFE$V_EXEONLY];
+    END;
+
+STATUS = DEALLOC_PAGED (.KFE);
+
+RETURN TRUE;
+END;		! routine RETURN_KFE
+
+
+%SBTTL 'INS$FIND_KFE	Locate KFE given name and hash bucket';
+
+GLOBAL ROUTINE  INS$FIND_KFE (HSHIDX, NAM) =
+BEGIN
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!
+!	This routine locates a KFE (if one exists) for the specified
+!	filespec.
+!
+!  EXPLICIT INPUT:
+!
+!	none
+!
+!  ROUTINE VALUE:
+!
+!    R0 = 0 if no such known file exists
+!		else, KFE address
+!
+!---
+
+LOCAL
+    CMPKFE : REF BBLOCK,
+    HSHTAB : REF VECTOR [,LONG],
+    PRVKFE : REF BBLOCK,
+    STATUS;
+
+MAP
+    NAM : REF BBLOCK;
+
+BIND
+    KFPB = EXE$GL_KNOWN_FILES : REF BBLOCK;
+
+IF .KFPB EQL 0 THEN RETURN 0;
+
+HSHTAB = .KFPB [KFPB$L_KFEHSHTAB];
+IF .HSHTAB [.HSHIDX] EQL 0 THEN RETURN 0;
+
+PRVKFE = HSHTAB [.HSHIDX];		! Previous KFE
+CMPKFE = .HSHTAB [.HSHIDX];		! Comparison KFE
+WHILE .CMPKFE NEQ 0 DO			! Single linked list ending in zero
+    BEGIN
+    CASE CH$COMPARE (.NAM [NAM$B_NAME], .NAM [NAM$L_NAME], 
+		.CMPKFE [KFE$B_FILNAMLEN], CMPKFE [KFE$T_FILNAM], %C' ')
+    FROM -1 TO 1 OF 		! Either less than, equal to, or greater than
+	SET
+
+	[-1]:	! Less than, therefore its not in the list, ERROR
+	    BEGIN
+	    RETURN 0;
+	    END;
+	    
+	[0] :	! Same file name, check if KFD is the same
+	    BEGIN
+	    LOCAL
+		DDTSTR : BBLOCK [NAM$C_MAXRSS],
+		DDT_DSC : $BBLOCK [DSC$C_S_BLN],
+		KFD : REF BBLOCK;
+
+	    KFD = .CMPKFE [KFE$L_KFD];
+	    !
+	    !	Build an ASCII string of the concatenated Device, Directory
+	    !	Type strings.
+	    !
+	    DDT_DSC [DSC$W_LENGTH] = .NAM [NAM$B_DEV] + .NAM [NAM$B_DIR] +
+			.NAM [NAM$B_TYPE];	! Length of DDT string
+
+	    DDT_DSC [DSC$A_POINTER] = DDTSTR;	! DDT string address
+
+	    DDT_DSC [DSC$A_POINTER] = CH$MOVE (.NAM [NAM$B_DEV], .NAM [NAM$L_DEV],
+					.DDT_DSC [DSC$A_POINTER]);
+	    DDT_DSC [DSC$A_POINTER] = CH$MOVE (.NAM [NAM$B_DIR], .NAM [NAM$L_DIR],
+					.DDT_DSC [DSC$A_POINTER]);
+	    DDT_DSC [DSC$A_POINTER] = CH$MOVE (.NAM [NAM$B_TYPE], .NAM [NAM$L_TYPE],
+					.DDT_DSC [DSC$A_POINTER]);
+
+	    DDT_DSC [DSC$A_POINTER] = DDTSTR;	! DDT string address
+
+	    INS$CVT_DIR (DDT_DSC);			! Convert and compress brackets
+
+	    IF CH$COMPARE (.DDT_DSC [DSC$W_LENGTH], DDTSTR,
+		.KFD [KFD$B_DDTSTRLEN], KFD [KFD$T_DDTSTR], %C' ')
+	       EQL 0 
+	    THEN 
+		RETURN .CMPKFE;		! They were the same
+
+	    !
+	    !	 Same file name, different file, keep traversing
+	    !
+	    PRVKFE = .CMPKFE;
+	    CMPKFE = .CMPKFE [KFE$L_HSHLNK];
+	    END;
+
+	[1] :	! Greater than, keep looking
+	    BEGIN
+	    PRVKFE = .CMPKFE;
+	    CMPKFE = .CMPKFE [KFE$L_HSHLNK];
+	    END;
+	TES;
+    END;			! WHILE traversing hash bucket list
+
+!
+!	Have traversed whole list and didn't find it.
+!
+RETURN 0;
+
+END;		! routine INS$FIND_KFE
+
+
+%SBTTL 'dealloc_paged  Return memory to paged pool';
+
+ROUTINE  DEALLOC_PAGED (ADR) =
+BEGIN
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!
+!	Deallocate the paged pool which is specified by ADR.
+!	Size of block to return is specified in size offset
+!	start of block.
+!
+!---
+
+LOCAL
+    STATUS;
+
+STATUS = EXE$DEAPAGED (.ADR);	! Deallocate to paged pool
+
+RETURN .STATUS;
+END;			! Routine DEALLOC_PAGED
+
+
+END		! Module insdelete
+ELUDOM

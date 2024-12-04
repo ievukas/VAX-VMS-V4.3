@@ -1,0 +1,583 @@
+%TITLE	'DECnet Ethernet Configurator Module'
+MODULE CNFINTRPT	(
+			LANGUAGE (BLISS32),
+			IDENT = 'V04-000'
+			) =
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	DECnet Configurator Module (NICONFIG)
+!
+! ABSTRACT:
+!
+!	This module contains the routines for establishing, and breaking
+!	logical links to NICONFIG.
+!
+! ENVIRONMENT:	VAX/VMS Operating System
+!
+! AUTHOR:	Bob Grosso, 	CREATION DATE:  13-Oct-1982
+!
+! MODIFIED BY:
+!
+!	V03-001	RPG0001		Bob Grosso		02-May-1983
+!		Ensure NICONFIG will die gracefully on Network Shutdown.
+!--
+BEGIN
+
+%SBTTL	'Definitions'
+
+!
+! INCLUDE FILES:
+!
+
+LIBRARY 'SYS$LIBRARY:STARLET';	! VMS common definitions
+
+LIBRARY 'SHRLIB$:NET';		! Network definitions
+
+LIBRARY 'SHRLIB$:NMALIBRY';	! NICE Code definitions
+
+REQUIRE 'LIB$:CNFDEF.R32';
+
+REQUIRE 'SRC$:CNFPREFIX.REQ';
+    
+
+!
+! BUILTIN functions
+!
+
+BUILTIN
+    INSQUE,			! INSQUE instruction
+    REMQUE;			! REMQUE instruction
+
+!
+!	Own storage
+!
+
+OWN
+    SI_IOSB :	BBLOCK [8];	! IO status block for 
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+
+	CNF$SOLICIT_INTERRUPT	: NOVALUE,	! Solicit work items
+	NET_INTERRUPT		: NOVALUE,	! Action routine to receive first SET command
+	OPEN_REQUEST_LINK	: NOVALUE,	! Open incoming request logical link
+	CNF$CLOSE_REQUEST_LINK	: NOVALUE,	! Close request logical link
+	SHUTDOWN		: NOVALUE,	! Shut down receiver gracefully
+	CNF$SOLICIT_REQUEST	: NOVALUE,	! Perform a read on the logical link
+	REQUEST_RECEIVED	: NOVALUE;	! Accept incoming request record
+
+
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL ROUTINE
+
+    ! Module CNFMAIN
+
+	CNF$EXIT,		! Clean up and exit
+	CNF$TRACE,		! Log messages to log file
+	CNF$LOG_DATA,		! Log messages to log file
+	CNF$GET_ZVM,		! Get zeroed virtual memory
+	CNF$FREE_VM,		! Free virtual memory
+
+    ! Module CNFREQUES
+
+	CNF$DISABLE_SURVEIL 	: NOVALUE,	! Discontinue surveillance on specified circuit
+	CNF$PROCESS_REQUEST	: NOVALUE,	! Parse and perform requested function
+
+    ! Module CNFWORKQ
+
+	WKQ$ADD_WORK_ITEM,	! Add work to work queue
+	WKQ$DO_WORK_ITEM;	! Add work to work queue
+
+
+EXTERNAL LITERAL
+
+	CNF$_MAILBOX,		! Mailbox error
+	CNF$_CHAN,		! Error assigning or deassigning channel
+	CNF$_LINK,		! Error on logical link
+
+	CNF$C_MAXMBXMSG,	! Maximum mailbox message size
+	CNF$C_SYNCH_EFN,	! Synchronous event flag number
+	CNF$C_ASYNCH_EFN;	! Asynchronous event flag number
+
+
+EXTERNAL
+
+	CNF$A_MBXMSG : VECTOR [,BYTE],		! Mailbox message buffer
+	CNF$W_NETCHAN : WORD,			! Channel opened to network
+	CNF$W_MBXCHAN : WORD,			! Channel to mailbox
+	CNF$B_SURVEILLANCE_SET,			! Boolean: mark if useful work is being accomplished
+	CNF$GL_LOGMASK : BITVECTOR [32],	! Logging control mask
+	CNF$GQ_CIRSURLST : VECTOR [2],		! List of circuit under surveillance
+	CNF$GQ_IRBLST : VECTOR [2];		! Listhead for incoming links
+
+
+%SBTTL	'CNF$SOLICIT_INTERRUPT   Request network interrupts for Connect requests and Shutdown '
+GLOBAL ROUTINE CNF$SOLICIT_INTERRUPT: NOVALUE =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!  Issue an asynchronous QIO on the associated mailbox
+!  for the network channel in expectation of receiving
+!  requests for connects, or Shutdown notification.
+!  Called the first time from MAIN routine in user mode 
+!  and subsequent times from NET_INTERRUPT to execute in AST mode.
+!
+! FORMAL PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	CNF$W_MBXCHAN	Channel number for mailbox
+!	CNF$A_MBXMSG	Buffer for mailbox msg
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!  Errors are signalled
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+    LOCAL
+	STATUS;
+
+    CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR('TRACE'), 
+	$DESCRIPTOR ('cnf$solicit_interrupt'));
+
+    STATUS = $QIO (
+		FUNC = IO$_READVBLK,	! Request read on mailbox
+		CHAN = .CNF$W_MBXCHAN,	! Use assigned channel
+		EFN = CNF$C_ASYNCH_EFN,	! Asynchronous Event flag number
+		IOSB = SI_IOSB,		! Interrupt request block
+		ASTADR = NET_INTERRUPT,	! AST routine to execute on read completion
+		P1 = CNF$A_MBXMSG,	! Buffer to contain mailbox message
+		P2 = CNF$C_MAXMBXMSG);	! Size maximum on mailbox message
+
+    IF NOT .STATUS 
+    THEN				! report an error
+	SIGNAL (CNF$_MAILBOX, 0, .STATUS);
+
+    RETURN;
+END;					! End routine CNF$SOLICIT_INTERRUPT
+
+%SBTTL	'net_interrupt  Process Net interrupts for Shutdown or Connect Request'
+ROUTINE NET_INTERRUPT : NOVALUE =
+ 
+!++
+!
+!  This AST routine is called when the outstanding QIO
+!  on the associated mailbox completes.  If the interrupt
+!  indicates a connect is pending, then the acceptance
+!  routine is added to the work queue.
+!
+!--
+ 
+    BEGIN
+    BIND 
+	MESSAGE_TYPE = CNF$A_MBXMSG [0] : BYTE;		! First byte contains code for message type
+
+    CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR('TRACE'), 
+	$DESCRIPTOR ('Net_Interrupt'));
+
+    !
+    !	Check message type.  If connect request, then connect and wait
+    !	for a set.  Anything else is bad news.
+    !
+    SELECTONEU .MESSAGE_TYPE OF
+    SET
+
+    [MSG$_NETSHUT]:					! Network shutting down
+
+	BEGIN
+	WKQ$ADD_WORK_ITEM(SHUTDOWN);			! Shut down receiver gracefully
+	CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR('TRACE'), 
+		$DESCRIPTOR ('Net_Interrupt - Network shutting down'));
+	RETURN;						! Do not re-issue mailbox read
+	END;
+
+
+    [MSG$_CONNECT]:					! Incoming connect request
+	BEGIN
+	LOCAL
+	    PTR,LEN,
+	    IRB:	REF BBLOCK;			! Incoming Request Block
+
+	CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR('TRACE'), 
+		$DESCRIPTOR ('Net_Interrupt - Connect request received'));
+
+	LEN = IRB$C_LENGTH;
+	CNF$GET_ZVM (LEN,IRB);				! Allocate incoming request block
+	IRB [IRB$W_SIZE] = IRB$C_LENGTH;		! Set length of block
+	PTR = 5 + .CNF$A_MBXMSG  [4];			! Get index of start of ascic data
+	IRB [IRB$B_NCBLEN] = .CNF$A_MBXMSG  [.PTR];	! Set length of NCB
+	CH$COPY (.CNF$A_MBXMSG  [.PTR], CNF$A_MBXMSG  [.PTR+1],
+		0, IRB$C_MAXNCBLEN, IRB [IRB$T_NCB]);
+        IRB [IRB$L_BNR_FLINK] = IRB [IRB$L_BNR_FLINK];	! Initialize list for Bufferred NICE Messages
+        IRB [IRB$L_BNR_BLINK] = IRB [IRB$L_BNR_FLINK];
+	INSQUE (.IRB, .CNF$GQ_IRBLST [1]);		! Insert into list
+
+	WKQ$ADD_WORK_ITEM(OPEN_REQUEST_LINK,.IRB);	! Queue the connect accept
+	END;
+
+    [OTHERWISE]:
+	BEGIN
+	CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR('TRACE *** ERROR'), 
+	    $DESCRIPTOR ('Net_Interrupt - Unprocessed Interrupt'));
+	END;
+
+    TES;
+
+    CNF$SOLICIT_INTERRUPT();				! Issue another read on mailbox
+
+    CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR('TRACE'), 
+	$DESCRIPTOR ('Net_Interrupt - Interrupt dispatched, another solicited'));
+
+    RETURN;
+    END;			! Routine net_interrupt
+
+%SBTTL	'open_request_link'
+ROUTINE OPEN_REQUEST_LINK (IRB): NOVALUE =
+
+!---
+!
+!  Open the logical link for incoming request records.
+!  Executed off the work queue.
+!
+! Inputs:
+!
+!	irb = Address of incoming request block
+!
+! Outputs:
+!
+!  routine = True if link established, false if not
+!---
+
+BEGIN
+
+MAP
+    IRB:	REF BBLOCK;			! Address of request block
+
+LOCAL
+    STATUS,
+    PTR,
+    NCB_DESC:	VECTOR [2];			! Descriptor of NCB
+
+CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR('TRACE'), 
+	$DESCRIPTOR ('open_request_link'));
+
+!
+!	Setup NCB for connect accept
+!
+
+NCB_DESC [0] = .IRB [IRB$B_NCBLEN];		! Get length of requestor ncb
+NCB_DESC [1] = IRB [IRB$T_NCB];			! and address of ncb
+
+!
+!	Get copy of NCB up to slash to enable its use in error reporting
+!
+
+PTR = CH$FIND_CH (.IRB [IRB$B_NCBLEN], IRB [IRB$T_NCB], '/');
+
+IF NOT CH$FAIL (.PTR)				! If ending slash found,
+THEN
+    IRB [IRB$B_NCBLEN] = .PTR - IRB [IRB$T_NCB]; ! then truncate rest of junk
+
+!
+!	Setup NCB for accept by zeroing optional data sent by requestor
+!
+
+(.PTR+3) <0,8> = 0;				! Zero optional data
+
+STATUS = $ASSIGN (DEVNAM = %ASCID '_NET:', 	! Get channel for incoming link
+		CHAN = IRB [IRB$W_CHAN]);
+
+IF NOT .STATUS					! If error assigning channel,
+THEN
+    BEGIN
+    SIGNAL (CNF$_CHAN, 0, .STATUS);		! then report the error
+    CNF$CLOSE_REQUEST_LINK(.IRB);		! and deallocate the storage
+    RETURN;
+    END;
+
+STATUS = $QIOW(FUNC = IO$_ACCESS,		! Accept the logical link
+		CHAN = .IRB [IRB$W_CHAN],
+		EFN = CNF$C_SYNCH_EFN,
+		IOSB = IRB [IRB$W_IOSB],	! Address of I/O status block
+		P2 = NCB_DESC);			! Address of network control block
+
+IF .STATUS					! If successfully submitted,
+THEN
+    STATUS = .IRB [IRB$W_IOSB];			! then pick up QIO final status
+
+IF NOT .STATUS					! If error starting up link
+THEN
+    BEGIN
+    SIGNAL (CNF$_LINK, 0, .STATUS);		! then report the error
+    CNF$CLOSE_REQUEST_LINK(.IRB);		! and deallocate the storage
+    RETURN;
+    END;
+
+
+CNF$SOLICIT_REQUEST (.IRB);			! Issue a QIO for an incoming request record
+
+END;						! End routine open_request_link
+
+%SBTTL 'CNF$CLOSE_REQUEST_LINK'
+GLOBAL ROUTINE CNF$CLOSE_REQUEST_LINK (IRB): NOVALUE =
+
+!---
+!
+!  Close the logical link for incoming request records.
+!
+! Inputs:
+!
+!	irb = Address of incoming request block
+!
+! Outputs:
+!
+!  None
+!
+! Value:
+!  Signal any errors
+!---
+
+BEGIN
+
+MAP
+    IRB:	REF BBLOCK;		! Address of incoming request channel
+
+LOCAL
+    FREE_BNR : REF BBLOCK,
+    LENGTH,
+    STATUS;
+
+CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR('TRACE'), 
+	$DESCRIPTOR ('CNF$CLOSE_REQUEST_LINK'));
+
+IF .IRB [IRB$W_CHAN] NEQ 0		! If channel was assigned,
+THEN
+    BEGIN
+    STATUS = $DASSGN (CHAN = .IRB [IRB$W_CHAN]); ! Deassign network channel
+
+    IF NOT .STATUS			! If error detected,
+    THEN
+	SIGNAL (CNF$_CHAN, 0, .STATUS);	! then report error
+    END;
+
+REMQUE (.IRB, STATUS);			! Remove from linked list
+
+!
+!    If there are Bufferred NICE responses in the IRB, deallocate them.
+!
+FREE_BNR = .IRB [IRB$L_BNR_FLINK];
+WHILE .FREE_BNR NEQ IRB [IRB$L_BNR_FLINK] DO
+    BEGIN
+    REMQUE (.FREE_BNR, STATUS);
+    EXECUTE (CNF$FREE_VM (FREE_BNR [BNR$W_LENGTH], FREE_BNR [BNR$L_ADDRESS]) );
+    EXECUTE (CNF$FREE_VM (%REF (BNR$C_LENGTH), FREE_BNR) );
+    FREE_BNR = .IRB [IRB$L_BNR_FLINK];
+    END;
+LENGTH = .IRB [IRB$W_SIZE];		! Get size of block
+EXECUTE (CNF$FREE_VM (LENGTH,IRB));	! Deallocate storage
+
+END;					! End routine cnf$close_request_link
+
+%SBTTL 'shutdown'
+ROUTINE SHUTDOWN: NOVALUE =
+
+!---
+!
+!  This routine is called when the network is shutting down to
+!  gracefully close all incoming links so that NICONFIG goes away quietly.
+!
+! Inputs:
+!
+!	None
+!
+! Outputs:
+!
+!	None
+!
+! Effect:
+!
+!  Disabling all surveillance will cause NICONFIG to terminate
+!---
+
+BEGIN
+
+LOCAL
+    PTR:	REF BBLOCK,		! Pointer to irb block
+    NEXT_PTR;
+
+PTR = .CNF$GQ_IRBLST;			! Start at first link context block
+WHILE .PTR NEQ CNF$GQ_IRBLST		! Until end of linked list,
+DO
+    BEGIN
+    NEXT_PTR = .PTR [IRB$L_LINK];
+    CNF$CLOSE_REQUEST_LINK(.PTR);	! Abort the incoming link
+    PTR = .NEXT_PTR;			! and link to next in chain
+    END;
+
+PTR = .CNF$GQ_CIRSURLST;		! Start at first circuit block
+WHILE .PTR NEQ CNF$GQ_CIRSURLST		! Until end of linked list,
+DO
+    BEGIN
+    CNF$DISABLE_SURVEIL (.PTR);		! and delete the circuit
+    PTR = .PTR [CIR$L_LINK];		! Link to next one
+    END;
+
+CNF$B_SURVEILLANCE_SET = FALSE;		! So it will die quietly
+
+END;					! End routine shutdown
+
+%SBTTL 'CNF$SOLICIT_REQUEST'
+GLOBAL ROUTINE CNF$SOLICIT_REQUEST (irb): NOVALUE =
+
+!---
+!
+!  This routine is called to obtain requests from the incoming 
+!  logical link.  Each incoming request is immediately queued
+!  to the disposal queue for the appropriate action.
+!  It is first called directly by OPEN_REQUEST_LINK which is executing
+!  off the work queue, and thereafter calls are placed on the work queue
+!  by the AST routine, REQUEST_RECEIVED.
+!
+! Inputs:
+!
+!	irb = Address of incoming request block
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+MAP
+    IRB:	REF BBLOCK;		! Address of incoming request block
+
+LOCAL
+    STATUS;
+
+CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR('TRACE'), 
+	$DESCRIPTOR ('cnf$solicit_request'));
+
+STATUS = $QIO(FUNC = IO$_READVBLK,	! Get request from incoming link
+		CHAN = .IRB [IRB$W_CHAN],
+		EFN = CNF$C_ASYNCH_EFN,
+		IOSB = IRB [IRB$W_IOSB],! Address of I/O status block	
+		ASTADR = REQUEST_RECEIVED,! Address of completion routine
+		ASTPRM = .IRB,		! Giving irb as routine parameter
+		P1 = IRB [IRB$T_REQUEST], ! Address of request buffer
+		P2 = IRB$C_MAXRQSTLEN);	! Length of request buffer
+
+IF NOT .STATUS				! If unsuccessful
+THEN
+    BEGIN				! Don't signal a fatal error just because 
+    IF (.STATUS NEQ SS$_LINKABORT) AND	!  the partner went away.
+       (.STATUS NEQ SS$_LINKEXIT)
+    THEN
+	SIGNAL (CNF$_LINK, 0, .STATUS);	! then report error
+
+    WKQ$ADD_WORK_ITEM( CNF$CLOSE_REQUEST_LINK, .IRB);
+    CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR('TRACE'), 
+		$DESCRIPTOR ('cnf$solicit_request  %%CNF$CLOSE_REQUEST_LINK'));
+    END;
+
+END;					! End routine cnf$solicit_request
+
+%SBTTL 'request_received'
+ROUTINE REQUEST_RECEIVED (irb): NOVALUE =
+
+!---
+!
+!  This AST routine is called when a new request has come
+!  in over the logical link.  The request is queued to the
+!  work queue.
+!
+! Inputs:
+!
+!	irb = Address of incoming request block
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+MAP
+    IRB:	REF BBLOCK;		! Address of incoming request block
+
+CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR('TRACE'), 
+	$DESCRIPTOR ('request_received'));
+
+IF NOT .IRB [IRB$W_IOSB]		! If error from QIO,
+THEN
+    BEGIN
+    IF (.IRB [IRB$W_IOSB] NEQ SS$_LINKABORT) AND
+	(.IRB [IRB$W_IOSB] NEQ SS$_LINKEXIT)
+    THEN
+	SIGNAL (CNF$_LINK, 0, .IRB [IRB$W_IOSB]); 	! then report the error
+    WKQ$ADD_WORK_ITEM( CNF$CLOSE_REQUEST_LINK, .IRB);	! close the link until re-established
+    RETURN;
+    END;
+
+!
+!	Log the contents of the incoming message
+!
+BEGIN
+LOCAL DATA_DSC : BBLOCK [DSC$C_S_BLN];
+
+DATA_DSC = 0;
+DATA_DSC [DSC$W_LENGTH] = .IRB [IRB$W_IOSB1];
+DATA_DSC [DSC$A_POINTER] = IRB [IRB$T_REQUEST];
+CNF$LOG_DATA (DBG$C_NICE, $DESCRIPTOR('NICE received'),0, DATA_DSC);
+END;
+
+WKQ$ADD_WORK_ITEM (CNF$PROCESS_REQUEST,	! Queue request
+    .IRB);
+
+END;					! End routine request_received
+
+END					! End of module CNFINTRPT
+ELUDOM

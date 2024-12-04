@@ -1,0 +1,2968 @@
+MODULE DISPATCH ( %TITLE 'Print Symbiont - main dispatch routines'
+	IDENT = 'V04-000',
+	ADDRESSING_MODE (EXTERNAL = GENERAL)
+	) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:
+!	Print Symbiont.
+!
+! ABSTRACT:
+!	This module contains the main control loop for the symbiont.
+!	PSM$DISPATCH steps through the various symbiont states and
+!	switches among the input routines.  It also calls the format
+!	and output service routines.
+!
+!	This module also contains various miscellaneous subroutines
+!	related to error handling, checkpointing, and push/pop of input
+!	routines.
+!
+! ENVIRONMENT:
+!	VAX/VMS user mode, AST-level.
+!--
+!
+! AUTHOR: G. Robert, CREATION DATE: 31-Aug-1982
+!
+! MODIFIED BY:
+!
+!	3B-011	RRB3011		Rowland R. Bradley	09-Aug-1984
+!		If aligning the file and READ_COMPLETION detects EOF
+!		then send a response to job controller.  Added the
+!		test for psm$v_align in READ_COMPLETION case of 
+!		PSM$FUNCTION_DISPATCH.
+!
+!	3B-010	RRB3010		Rowland R. Bradley	27-Jul-1984
+!		Clear the suppress_output bit and the search_for_page
+!		bit on EOF (only on file service).  Also conditionally
+!		set stop_page to -1 (only when the current service is
+!		not nested).  This fixes the symbiont hang when search 
+!		for page is past end of file and the /HEADER & /PAGES 
+!		ill interaction.
+!
+!	3B-009	GRR3009		Gregory R. Robert	25-Jul-1984
+!		Remove the global clear of the sequence bit in print
+!		control.  This fixes the problem /header interfering
+!		with line numbers.
+!
+!	3B-008	GRR3008		Gregory R. Robert	11-Jul-1984
+!		Suppress leading carriage control for first record
+!		of implied carriage control input service.  Remove
+!		code that resets accounting totals after separation pages.
+!
+!	3B-007	GRR3007		Gregory R. Robert	16-May-1984
+!		Defend against attempted CLOSE when service routine
+!		is non-existent
+!
+!	3B-006	GRR3006		Gregory R. Robert	09-May-1984
+!		Fix call interface for user filter/format routines.
+!
+!	3B-005	GRR3005		Gregory R. Robert	29-Apr-1983
+!		FT2 bugfixes plus margins.
+!
+!	3B-004	GRR3004		Gregory R. Robert	01-Sep-1983
+!		Enabled PHY_IO so that DCS escape sequences can be
+!		written PASSALL or NOFORMAT.
+!
+!	3B-003	GRR3003		Gregory R. Robert	23-Aug-1983
+!		Bugfixes, page_setup_modules, form_setup_modules,
+!		sheet_feed, symbiont initiated pause_task and stop_stream,
+!		hangup code, read and write item services
+!
+!	3B-002	GRR3002		Gregory R. Robert	03-Aug-1983
+!		Rewrite for new design.
+!
+!	3B-001	GRR3001		Gregory R. Robert	29-Jul-1983
+!		Created new module.
+!
+!
+!**
+
+LIBRARY 'SYS$LIBRARY:LIB';
+REQUIRE 'LIB$:SMBDEF';
+REQUIRE 'SRC$:SMBREQ';
+
+EXTERNAL ROUTINE
+	PSM$ALLOCATE_DSB : NOVALUE,
+	PSM$ALLOCATE_IOB : NOVALUE,
+	PSM$DEALLOCATE_DSB : NOVALUE,
+	SMB$INITIALIZE,
+	PSM$RECEIVE_MESSAGE_AST,
+	PSM$SCHEDULE_NON_AST,
+	SMB$SEND_TO_JOBCTL,
+	PSM$WAIT_FOR_NON_AST
+	;
+
+EXTERNAL
+	PSM$GL_SCBVEC	: VECTOR,		! SCB index table
+	PSM$GL_MAXBUF	,			! maximum output buffer size
+	PSM$GL_USER_CTX	,			! user context area size
+	PSM$SRV	: BLOCKVECTOR[,SRV_S_SRV, BYTE],! service routine table
+	PSM$XLATE_ALIGN	: VECTOR [,BYTE],	! MOVTUC table for X's and 9's
+	PSM$XLATE_8BIT	: VECTOR [,BYTE]	! MOVTUC table for normal print
+	;
+
+LITERAL
+	EDIT_MASK = %B '110000'			! upcase and compact spaces and tabs
+	;
+
+FORWARD ROUTINE
+	PSM$FUNCTION_DISPATCH	: NOVALUE,	! main control loop
+	PSM$REPORT	,			! async. event completion
+	PSM$INCLUDE_MODULES	,		! queues modules for insertion
+	PSM$PRINT	,			! initialization entry point
+	PSM$STORE_ERRORS	,		! store errors for latter
+
+	ABORT_TASK		: NOVALUE,	! aborts current file
+	CARRIAGE_CONTROL	,		! computes carriage control
+	ENQUEUE_CHECKPOINT	: NOVALUE,	! save a checkpoint
+	EXPAND_CONDITION_VECTOR	: NOVALUE,	! expand errors to text
+	FIND_CHECKPOINT		,		! find a checkpoint
+	GET_BUFFER		,		! get a buffer
+	HANDLER			,		! main signal handler
+	PUTMSG_ACTION		,		! $PUTMSG action routine
+	RESUME_SERVICE		: NOVALUE,	! POP input routine
+	SAVE_CHECKPOINT		: NOVALUE,	! contstruct a checkpoint
+	SCHEDULE_SERVICE	,		! schedule an input routine
+	SEARCH_FOR_STRING	,		! look for a search string
+	SUSPEND_SERVICE		: NOVALUE,	! PUSH input routine
+	STRIP_COMMA_DELIMITED_ITEM		! parse comma separated lists
+	;
+
+%SBTTL 'FUNCTION_DISPATCH - Main symbiont control loop'
+! Functional Description:
+!		Steps through symbiont states, switching among
+!		input routines and calling format/output service
+!		routines as necessary.
+!
+! Formal Parameters:
+!		Address of a SCB (stream control block)
+!
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		Asynchronous IO events may be initiated
+!--
+GLOBAL ROUTINE PSM$FUNCTION_DISPATCH (
+	SCB		: REF $BBLOCK		! stream control block address
+	) : NOVALUE =
+BEGIN
+
+LITERAL
+	FIRST_STATE		    = 0,	! Must be zero
+	START_TASK		    = FIRST_STATE,
+	FIND_WORK		    = 1,
+	OPEN			    = 2,
+	OPEN_COMPLETION		    = 3,
+	READ			    = 4,
+	READ_COMPLETION		    = 5,
+	INPUT_FILTER		    = 6,
+	INPUT_FILTER_COMPLETION	    = 7,
+	FORMAT			    = 8,
+	FORMAT_COMPLETION	    = 9,
+	OUTPUT_FILTER		    = 10,
+	OUTPUT_FILTER_COMPLETION    = 11,
+	WRITE			    = 12,
+	WRITE_COMPLETION	    = 13,
+	CLOSE			    = 14,
+	CLOSE_COMPLETION 	    = 15,
+	STOP_TASK		    = 16,
+	IDLE			    = 17,
+	RESUME			    = 18,
+	LAST_STATE		    = RESUME
+	;
+
+LITERAL
+	CONTINUE	= 1;
+
+LABEL
+	CASE_STATEMENT;
+
+! For each state specify the default next_state
+!
+OWN
+    NEXT_STATE : VECTOR [LAST_STATE + 1, BYTE]
+	PSECT (CODE) PRESET (
+	    [START_TASK]		= FIND_WORK,
+	    [FIND_WORK]			= OPEN,
+	    [OPEN]			= OPEN_COMPLETION,
+	    [OPEN_COMPLETION]		= READ,
+	    [READ]			= READ_COMPLETION,
+	    [READ_COMPLETION]		= INPUT_FILTER,
+	    [INPUT_FILTER]		= INPUT_FILTER_COMPLETION,
+	    [INPUT_FILTER_COMPLETION]   = FORMAT,
+	    [FORMAT]			= FORMAT_COMPLETION,
+	    [FORMAT_COMPLETION]		= OUTPUT_FILTER,
+	    [OUTPUT_FILTER]		= OUTPUT_FILTER_COMPLETION,
+	    [OUTPUT_FILTER_COMPLETION]  = WRITE,
+	    [WRITE]			= WRITE_COMPLETION,
+	    [WRITE_COMPLETION]		= RESUME,
+	    [CLOSE]			= CLOSE_COMPLETION,
+	    [CLOSE_COMPLETION]		= FIND_WORK,
+	    [STOP_TASK]			= IDLE,
+	    [IDLE]			= IDLE,
+	    [RESUME]			= RESUME
+	);
+
+! Specify expected errors that do not cause automatic task abort
+! on a state specific basis
+!
+OWN
+    EXPECTED_ERRORS : VECTOR [LAST_STATE + 1]
+	PSECT (CODE) PRESET (
+	    [READ_COMPLETION]		= PLIT (PSM$_EOF, RMS$_EOF),
+	    [FORMAT_COMPLETION]		= PLIT (PSM$_BUFFEROVF, PSM$_NEWPAGE,
+						PSM$_ESCAPE, PSM$_SUSPEND)
+	);
+
+
+! Advance through the symbiont states until an asynchronous service
+! returns pending, or all output buffers are in use, or a pause is
+! requested by the job controller
+!
+UNTIL .SCB[PSM$L_SERVICE_STATUS] EQL PSM$_PENDING
+DO
+    CASE_STATEMENT:
+    BEGIN
+    LOCAL SERVICE : REF $BBLOCK;	! Table entry for current input service
+    LOCAL SERVICE_STATUS;		! Status of most recent service
+    LOCAL CURRENT_STATE;		! Current symbiont state
+
+
+    ! Don't do anything unless we have or can get an output buffer
+    !
+    IF .SCB[PSM$A_IOB] EQL 0
+    THEN
+	IF NOT GET_BUFFER  (.SCB)
+	THEN
+	    RETURN;
+
+
+    ! Locate the current input service, pickup the last
+    ! service status, and initialize the next service status to success
+    !
+    SERVICE = PSM$SRV[.SCB[PSM$B_SERVICE_INDEX],0,0,0,0];
+    SERVICE_STATUS = .SCB[PSM$L_SERVICE_STATUS];
+    SCB[PSM$L_SERVICE_STATUS] = SS$_NORMAL;
+
+
+    ! Get the current state and select the next state default
+    !
+    CURRENT_STATE = .SCB[PSM$B_STATE];
+    SCB[PSM$B_STATE] = .NEXT_STATE[.CURRENT_STATE];
+
+
+    ! Report any unexpected errors
+    !
+    IF NOT .SERVICE_STATUS
+    THEN
+	BEGIN
+	BIND ERROR_LIST = .EXPECTED_ERRORS[.CURRENT_STATE] : VECTOR;
+	LOCAL EXPECTED_ERROR : INITIAL (0);
+
+	! If an expected error list is specified for the current
+	! state then loop through the list to see if the service
+	! error is expected.
+	!
+	IF ERROR_LIST NEQ 0
+	THEN
+	    INCRU ERROR_INDEX TO .ERROR_LIST[-1] - 1
+	    DO
+		IF .SERVICE_STATUS EQL .ERROR_LIST[.ERROR_INDEX]
+		THEN
+		    BEGIN
+		    EXPECTED_ERROR = 1;
+		    EXITLOOP;
+		    END;
+
+	! If an unexpected error then report it
+	!
+	IF NOT .EXPECTED_ERROR
+	THEN
+	    PSM$STORE_ERRORS (.SCB, .SERVICE_STATUS);
+	END;
+
+
+    ! Dispatch to the appropriate code
+    !
+    CASE .CURRENT_STATE FROM FIRST_STATE TO LAST_STATE OF
+	SET
+
+
+! NOTE: the usual VMS/Bliss formating conventions are altered here.
+!       Each case label begins a new page and is left justifed.
+!
+
+[RESUME]:
+BEGIN
+
+! ++
+!
+! RESUME handles positioning, searching, and alignment requests.
+! The desired starting page is reached by successive approximations
+! utilizing the POSITION_TO_KEY and REWIND service functions and the
+! SEARCH_FOR_PAGE, SEARCH_FOR_STRING and ALIGN features of the
+! symbiont
+!
+! --
+
+LOCAL CHECKPOINT : REF $BBLOCK;
+
+! Reset positioning and alignment controls
+!
+SCB[PSM$A_XLATE_TABLE] = PSM$XLATE_8BIT;
+SCB[PSM$V_ALIGN] = 0;
+SCB[PSM$V_SEARCH_FOR_PAGE] = 0;
+SCB[PSM$V_SEARCH_FOR_STRING] = 0;
+SCB[PSM$V_SUPPRESS_OUTPUT] = 0;
+
+
+! If no start page specified then default to current page
+!
+IF .SCB[PSM$L_START_PAGE] EQL 0 THEN SCB[PSM$L_START_PAGE] = .SCB[PSM$L_PAGE];
+
+
+! Look for a useable checkpoint that improves on the current page location
+!
+CHECKPOINT = FIND_CHECKPOINT (.SCB);
+IF .CHECKPOINT NEQ 0
+THEN
+    BEGIN
+    LOCAL KEY_DESC : VECTOR [2];
+
+    ! Save the checkpoint address for INPUT_FILTER_COMPLETION
+    !
+    SCB[PSM$A_CHECKPOINT] = .CHECKPOINT;
+
+
+    ! Mark the next read as offset, set the new page number
+    ! and cancel any outstanding input record
+    !
+    SCB[PSM$V_READ_OFFSET] = 1;
+    SCB[PSM$L_PAGE] = .CHECKPOINT[SMBMSG$L_PAGE];
+    SCB_SIZE_ (INPUT_RECORD) = 0;
+
+
+    ! Set up the user key descriptor
+    !
+    KEY_DESC[0] = 4;
+    KEY_DESC[1] = CHECKPOINT[SMBMSG$Q_USER_KEY];
+
+
+    ! Request random positioning
+    !
+    SCB[PSM$L_SERVICE_STATUS] = BLISS (
+	.SERVICE[SRV_A_SERVICE],	!  - current input service
+	SCB,				!  - SCB address by reference
+	SCB[PSM$R_USER_CONTEXT_AREA],	!  - user context area
+	UPLIT (PSM$K_POSITION_TO_KEY),	!  - POSITION_TO_KEY function
+	KEY_DESC,			!  - checkpoint descriptor
+	0);				!  - <not used>
+
+
+    IF .SCB[PSM$L_SERVICE_STATUS] EQL PSM$_FUNNOTSUP
+    THEN
+	CODEERR_ ;	! POSITION_TO_KEY is symetrical with GET_KEY
+
+
+    LEAVE CASE_STATEMENT;
+    END;
+
+
+! If the start page is still less than the current page then rewind
+!
+IF .SCB[PSM$L_START_PAGE] LSSU .SCB[PSM$L_PAGE]
+THEN
+    BEGIN
+
+    ! Adjust the page context and cancel any outstanding input record
+    !
+    SCB[PSM$L_PAGE] = 1;
+    SCB[PSM$L_RECORD_NUMBER] = 0;
+    SCB_SIZE_ (INPUT_RECORD) = 0;
+    SCB[PSM$L_CARCON] = 0;
+
+
+    ! Request the input service to rewind
+    !
+    SCB[PSM$L_SERVICE_STATUS] = BLISS (
+	.SERVICE[SRV_A_SERVICE],	!  - current input service
+	SCB,				!  - SCB address by reference
+	SCB[PSM$R_USER_CONTEXT_AREA],	!  - user context area
+	UPLIT (PSM$K_REWIND),		!  - REWIND function
+	0,				!  - <not used>
+	0);				!  - <not used>
+
+
+    IF .SCB[PSM$L_SERVICE_STATUS] EQL PSM$_FUNNOTSUP
+    THEN
+	CODEERR_ ;			! REWIND is a required function
+
+    LEAVE CASE_STATEMENT;
+    END;
+
+
+! If the start page is still forward of the current page then start page search
+!
+IF .SCB[PSM$L_START_PAGE] GTRU .SCB[PSM$L_PAGE]
+THEN
+    BEGIN
+    SCB[PSM$L_STOP_PAGE] = .SCB[PSM$L_START_PAGE];
+    SCB[PSM$V_SEARCH_FOR_PAGE] = 1;
+    SCB[PSM$V_SUPPRESS_OUTPUT] = 1;
+    SCB[PSM$B_STATE] = FORMAT;
+    LEAVE CASE_STATEMENT;
+    END;
+
+
+! Set the stop page for string search or in case we start printing
+!
+SCB[PSM$L_STOP_PAGE] = -1;
+IF .ITEM_PRESENT_ (LAST_PAGE)
+THEN
+    SCB[PSM$L_STOP_PAGE] = .SCB[PSM$L_LAST_PAGE] + 1;
+
+
+! Start page reached -- initiate a string search if requested
+!
+IF TESTBITSC (ITEM_PRESENT_ (SEARCH_STRING))
+THEN
+    BEGIN
+    BAS$EDIT (SCB[PSM$Q_SEARCH_STRING],SCB[PSM$Q_SEARCH_STRING], EDIT_MASK);
+    CLEAR_STRING_ (SCB[PSM$Q_SEARCH_CONTEXT]);
+    SCB[PSM$V_SEARCH_FOR_STRING] = 1;
+    SCB[PSM$V_SUPPRESS_OUTPUT] = 1;
+    SCB[PSM$B_STATE] = FORMAT;
+    LEAVE CASE_STATEMENT;
+    END;
+
+
+! Positioning complete -- check for alignment
+!
+IF TESTBITSC (ITEM_PRESENT_ (ALIGNMENT_PAGES))
+THEN
+    BEGIN
+    SCB[PSM$V_ALIGN] = 1;
+    IF .REQUEST_FLAG_ (ALIGNMENT_MASK)
+    THEN
+	SCB[PSM$A_XLATE_TABLE] = PSM$XLATE_ALIGN;
+    SCB[PSM$L_STOP_PAGE] = .SCB[PSM$L_PAGE] + .SCB[PSM$L_ALIGNMENT_PAGES];
+    SCB[PSM$B_STATE] = FORMAT;
+
+    ! (Since we don't alter SCB[PSM$L_START_PAGE] repositioning to
+    ! the current page following alignment completion is automatic).
+    !
+    LEAVE CASE_STATEMENT;
+    END;
+
+
+! Print only one page if in sheet_feed mode
+!
+IF .$BBLOCK [SCB[PSM$L_PRINT_CONTROL], SMBMSG$V_SHEET_FEED]
+THEN
+    SCB[PSM$L_STOP_PAGE] = .SCB[PSM$L_PAGE] + 1;
+
+
+! Resume complete -- tell the job controller
+!
+SMB$SEND_TO_JOBCTL (
+    SCB[PSM$L_STREAM_INDEX],		! - stream number
+    SCB[PSM$L_REQUEST_RESPONSE]);	! - responding to resume or start task
+
+
+! If pause at completion was requested then marks as pending
+!
+IF TESTBITSC (REQUEST_FLAG_ (PAUSE_COMPLETE))
+THEN
+    BEGIN
+    SCB[PSM$V_RESUME_WAIT] = 1;
+    SCB[PSM$L_SERVICE_STATUS] = PSM$_PENDING;
+    END
+ELSE
+    SCB[PSM$B_STATE] = FORMAT;
+
+END;
+
+[START_TASK]:
+BEGIN
+
+! Tell the job controller that START_TASK is complete and we
+! are now printing
+!
+SMB$SEND_TO_JOBCTL (
+    SCB[PSM$L_STREAM_INDEX],		! - stream number
+    SCB[PSM$L_REQUEST_RESPONSE]);	! - responding to start task
+
+
+! If pause at completion was requested then marks as pending
+!
+IF TESTBITSC (REQUEST_FLAG_ (PAUSE_COMPLETE))
+THEN
+    BEGIN
+    SCB[PSM$V_RESUME_WAIT] = 1;
+    SCB[PSM$L_SERVICE_STATUS] = PSM$_PENDING;
+    END;
+
+END;
+
+[FIND_WORK]:
+BEGIN
+
+! If we are stopping the stream (STOP/NEXT or STOP/RESET) then stop
+! the task
+!
+IF .SCB[PSM$V_RESET]
+THEN
+    SCB[PSM$B_STATE] = STOP_TASK
+ELSE
+    ! Otherwise look for an input service
+    !
+    IF NOT SCHEDULE_SERVICE (.SCB)
+    THEN
+	! None found, cancel sheet_feed and flush the output stream
+	!
+	BEGIN
+	$BBLOCK [SCB[PSM$L_PRINT_CONTROL], SMBMSG$V_SHEET_FEED] = 0;
+	$BBLOCK [.SCB[PSM$A_IOB],IOB_V_FLUSH_PENDING] = 1;
+	SCB[PSM$B_STATE] = OUTPUT_FILTER;
+	END;
+
+END;
+
+[OPEN]:
+BEGIN
+
+! If resuming a suspended service then continue at FORMAT
+!
+IF .BITVECTOR [SCB[PSM$L_SERVICE_OPEN], .SCB[PSM$B_SERVICE_INDEX]]
+THEN
+    BEGIN
+    SCB[PSM$B_STATE] = FORMAT;
+    LEAVE CASE_STATEMENT;
+    END;
+
+! Establish the default carriage control
+!
+SCB[PSM$L_FUNCTION_ARGUMENT] = PSM$K_CC_IMPLIED;
+
+
+! Tell the input service to OPEN
+!
+SCB[PSM$L_SERVICE_STATUS] = BLISS (
+    .SERVICE[SRV_A_SERVICE],		!  - current input service
+    SCB,				!  - SCB address by reference
+    SCB[PSM$R_USER_CONTEXT_AREA],	!  - user context area
+    UPLIT (PSM$K_OPEN),			!  - OPEN function
+    SCB[PSM$Q_FILE_SPECIFICATION],	!  - file name
+    SCB[PSM$L_FUNCTION_ARGUMENT]);	!  - receives carriage control type
+
+END;
+
+[OPEN_COMPLETION]:
+BEGIN
+
+! If the open failed then look for more work
+!
+!
+IF NOT .SERVICE_STATUS
+THEN
+    BEGIN
+    SCB[PSM$B_STATE] = FIND_WORK;
+    LEAVE CASE_STATEMENT;
+    END;
+
+
+! Mark the service OPEN and set the carriage control type
+!
+BITVECTOR [SCB[PSM$L_SERVICE_OPEN], .SCB[PSM$B_SERVICE_INDEX]] = 1;
+SCB[PSM$B_CC_TYPE] = .SCB[PSM$L_FUNCTION_ARGUMENT];
+
+! If this service is NOT a nested service then init the stop page
+! to default of -1(end of file).
+!
+IF .SCB[PSM$B_INPUT_DEPTH] LEQ 0
+THEN
+    SCB[PSM$L_STOP_PAGE] = -1;
+
+! Handle special features of main file processing including
+! checkpoint restarts, first and last page (/PAGE=(first,last))
+! and print flags (/FEED, /HEADER, /SPACE)
+!
+IF .SERVICE[SRV_B_SERVICE_TYPE] EQL SRV_K_FILE_SERVICE
+THEN
+    BEGIN
+
+    ! Set the print flags
+    !
+    SCB[PSM$L_PRINT_FLAGS] = .SCB[PSM$L_PRINT_CONTROL];
+
+    ! Set up the local top and left margins (PSM$MAIN_FORMAT
+    ! uses the global right and bottom margins because, with
+    ! /wrap, /truncate, /feed disabled they have no effect.
+    !
+    SCB[PSM$L_L_MARGIN] = .SCB[PSM$L_LEFT_MARGIN];
+    SCB[PSM$L_T_MARGIN] = .SCB[PSM$L_TOP_MARGIN];
+
+    ! Supress sequence numbers if width is too small
+    !
+    IF (.SCB[PSM$L_FORM_WIDTH] - .SCB[PSM$L_LEFT_MARGIN])
+	- .SCB[PSM$L_RIGHT_MARGIN] LSSU 8
+    THEN
+	PRINT_FLAG_ (SEQUENCED) = 0;
+
+
+    ! If restarting from a checkpoint, or if a first page was
+    ! specified, then setup so that the RESUME processing will
+    ! position to the correct page.
+    !
+    IF .ITEM_PRESENT_ (CHECKPOINT_DATA)
+    THEN
+	! Checkpoint -- save it if valid
+	BEGIN
+	BIND CKP = .SCB_ADDR_ (CHECKPOINT_DATA) : $BBLOCK;
+	IF .CKP[SMBMSG$B_CHECKPOINT_LEVEL] EQL SMBMSG$K_STRUCTURE_LEVEL
+	THEN
+	    BEGIN
+	    ENQUEUE_CHECKPOINT (.SCB, SCB[PSM$Q_CHECKPOINT_DATA]);
+	    SCB[PSM$L_START_PAGE] = .CKP[SMBMSG$L_PAGE];
+	    END
+	END
+    ELSE
+	! /PAGE=(first_page,"")
+	!
+	IF .ITEM_PRESENT_ (FIRST_PAGE)
+	THEN
+	    SCB[PSM$L_START_PAGE] = .SCB[PSM$L_FIRST_PAGE];
+
+    ! Flush the output stream -- positioning will be picked up
+    ! after flush is complete
+    !
+    $BBLOCK [.SCB[PSM$A_IOB],IOB_V_FLUSH_PENDING] = 1;
+    SCB[PSM$B_STATE] = OUTPUT_FILTER;
+    END;
+END;
+
+[READ]:
+BEGIN
+
+! Initialize the user record descriptor (dynamic)
+!
+CLEAR_STRING_ (SCB[PSM$Q_USER_RECORD]);
+
+
+! Quit if input service ended
+!
+IF .SCB[PSM$V_EOF] THEN LEAVE CASE_STATEMENT;
+
+
+! Clear the record header field and set the new_record flag
+!
+SCB[PSM$L_RECORD_HEADER] = 0;
+SCB[PSM$V_NEW_RECORD] = 1;
+
+
+! Defend against an attempt to READ a non-existent service
+!
+IF .SERVICE[SRV_A_SERVICE] EQL 0
+THEN
+    BEGIN
+    SERVICE_STATUS = PSM$_FUNNOTSUP;
+    LEAVE CASE_STATEMENT;
+    END;
+
+
+! Initiate the READ
+!
+SCB[PSM$L_SERVICE_STATUS] = BLISS (
+    .SERVICE[SRV_A_SERVICE],		!  - current input service
+    SCB,				!  - SCB address by reference
+    SCB[PSM$R_USER_CONTEXT_AREA],	!  - user context area
+    UPLIT (PSM$K_READ),			!  - READ function
+    SCB[PSM$Q_USER_RECORD],		!  - quadword to receive desc
+    SCB[PSM$L_RECORD_HEADER]);		!  - record header
+
+END;
+
+[READ_COMPLETION]:
+BEGIN
+
+! Check for exceptions
+!
+IF NOT .SERVICE_STATUS
+OR .SCB[PSM$V_EOF]
+OR .SERVICE_STATUS EQL PSM$_FUNNOTSUP
+THEN
+    BEGIN
+
+    ! Assume we will close
+    !
+    SCB[PSM$B_STATE] = CLOSE;
+
+    ! If EOF and searching for page then disable suppression and page
+    ! search.
+    !
+    IF  (.SERVICE_STATUS EQL PSM$_EOF OR .SERVICE_STATUS EQL RMS$_EOF)
+    AND (.SCB[PSM$V_SEARCH_FOR_STRING] OR .SCB[PSM$V_SEARCH_FOR_PAGE] 
+	  OR .SCB[PSM$V_ALIGN])
+    THEN
+	BEGIN
+	! Only if this is a file service EOF do we wish to stop
+	! searching
+	!
+	IF .SERVICE[SRV_B_SERVICE_TYPE] EQL SRV_K_FILE_SERVICE
+	THEN
+	    BEGIN
+	    SCB[PSM$V_SUPPRESS_OUTPUT] = 0;
+	    SCB[PSM$V_SEARCH_FOR_PAGE] = 0;
+	    END;
+
+	! If EOF encountered while searching and resuming (NOT start_task)
+	! then report it and pause the thread
+	!
+	IF .SCB[PSM$L_REQUEST_RESPONSE] EQL SMBMSG$K_RESUME_TASK
+	THEN
+	    BEGIN
+	    SMB$SEND_TO_JOBCTL (
+		SCB[PSM$L_STREAM_INDEX],	! - stream number
+		SCB[PSM$L_REQUEST_RESPONSE],	! - request response (resume)
+		0,				! - no accounting
+		0,				! - no checkpoint
+		0,				! - no device status
+		SERVICE_STATUS			! - report the error (eof)
+		);
+	    SCB[PSM$B_STATE] = RESUME;
+	    SCB[PSM$V_RESUME_WAIT] = 1;
+	    SCB[PSM$L_SERVICE_STATUS] = PSM$_PENDING;
+	    END;
+
+	LEAVE CASE_STATEMENT;
+	END;
+    END;
+
+
+
+
+! Update accounting and current record number
+!
+INCREMENT_ (ACC_DATA_ (RMS_GETS));
+INCREMENT_ (SCB[PSM$L_RECORD_NUMBER]);
+
+
+! If flush requested then mark the output buffer and contine
+! at OUTPUT_FILTER
+!
+IF .SERVICE_STATUS EQL PSM$_FLUSH
+THEN
+    BEGIN
+    $BBLOCK [.SCB[PSM$A_IOB],IOB_V_FLUSH_PENDING] = 1;
+    SCB[PSM$B_STATE] = OUTPUT_FILTER;
+    END;
+
+END;
+
+[INPUT_FILTER]:
+BEGIN
+
+! Locate the input filter
+!
+BIND FILTER = PSM$SRV[PSM$K_INPUT_FILTER,0,0,0,0] : $BBLOCK;
+
+
+! If no filter then go to filter completion
+!
+IF .FILTER[SRV_A_SERVICE] EQL 0
+THEN
+    LEAVE CASE_STATEMENT;
+
+
+! Copy the descriptor (any class) and initialize the old one (dynamic)
+!
+COPY_QUAD_ (SCB[PSM$Q_USER_RECORD], SCB[PSM$Q_INPUT_RECORD]);
+INIT_DYN_DESC_ (SCB[PSM$Q_USER_RECORD]);
+
+
+! Initiate the filter operation
+!
+SCB[PSM$L_SERVICE_STATUS] = BLISS (
+    .FILTER[SRV_A_SERVICE],		!  - input filter service
+    SCB,				!  - SCB address by reference
+    SCB[PSM$R_USER_CONTEXT_AREA],	!  - user context area
+    UPLIT (PSM$K_FORMAT),		!  - FORMAT function
+    SCB[PSM$Q_INPUT_RECORD],		!  - input record descriptor
+    SCB[PSM$L_CARCON],			!  - input carriage control
+    SCB[PSM$Q_USER_RECORD],		!  - quadword to receive descriptor
+    SCB[PSM$L_CARCON]);			!  - output carriage control
+
+END;
+
+[INPUT_FILTER_COMPLETION]:
+BEGIN
+
+! Initialize the input record descriptor (static)
+!
+STR$ANALYZE_SDESC_R1 (
+    SCB[PSM$Q_USER_RECORD]			! Input record descriptor
+    ;
+    VECTOR [SCB[PSM$Q_INPUT_RECORD],0],		! R0 -> size
+    VECTOR [SCB[PSM$Q_INPUT_RECORD],1]);	! R1 -> address
+
+
+! If the first byte of the record was used for carriage control
+! (eg. FORTRAN) then remove it from the record descriptor
+!
+IF CARRIAGE_CONTROL (.SCB) EQL PSM$K_FIRST_CHAR_USED
+THEN
+    BEGIN
+    DECREMENT_ (SCB_SIZE_ (INPUT_RECORD));
+    INCREMENT_ (SCB_ADDR_ (INPUT_RECORD));
+    END;
+
+
+! If this is an offset read (that is, one that is to begin in the
+! middle of a record) then adjust the record descriptor by the offset
+! value from the checkpoint.
+!
+IF TESTBITSC (SCB[PSM$V_READ_OFFSET])
+THEN
+    BEGIN
+    BIND CHECKPOINT = .SCB[PSM$A_CHECKPOINT] : $BBLOCK;
+    SCB_SIZE_ (INPUT_RECORD) = .SCB_SIZE_ (INPUT_RECORD)
+	- .CHECKPOINT[SMBMSG$W_OFFSET];
+    SCB_ADDR_ (INPUT_RECORD) = .SCB_ADDR_ (INPUT_RECORD)
+	+ .CHECKPOINT[SMBMSG$W_OFFSET];
+    SCB[PSM$L_CARCON] = .CHECKPOINT[SMBMSG$L_CARCON];
+    SCB[PSM$L_RECORD_NUMBER] = .CHECKPOINT[SMBMSG$L_RECORD_NUMBER];
+    END;
+
+
+END;
+
+[FORMAT]:
+BEGIN
+
+! Locate the main format routine
+!
+BIND FILTER  = PSM$SRV[PSM$K_MAIN_FORMAT,0,0,0,0] : $BBLOCK;
+
+
+! Initiate the FORMAT function
+!
+SCB[PSM$L_SERVICE_STATUS] = BLISS (
+    .FILTER[SRV_A_SERVICE],		!  - format service
+    SCB,				!  - SCB address by reference
+    SCB[PSM$R_USER_CONTEXT_AREA],	!  - user context area
+    UPLIT (PSM$K_FORMAT),		!  - FORMAT function
+    SCB[PSM$Q_INPUT_RECORD],		!  - input record descriptor
+    SCB[PSM$L_CARCON],			!  - input carriage control
+    SCB[PSM$Q_OUTPUT_BUFFER],		!  - output buffer descriptor
+    0);					!  - unused function argument
+
+END;
+
+[FORMAT_COMPLETION]:
+BEGIN
+
+! If succesfull then block multiple input records into a single
+! output buffer by continuing at READ.
+!
+IF .SERVICE_STATUS
+THEN
+    BEGIN
+    SCB[PSM$B_STATE] = READ;
+    LEAVE CASE_STATEMENT;
+    END;
+
+
+! If starting an escape sequence then mark escape in progress.
+! Insure that there are at least two bytes remaining in the output
+! buffer to allow two-byte escape sequences to be assembled.
+!
+IF .SERVICE_STATUS EQL PSM$_ESCAPE
+THEN
+    BEGIN
+    SCB[PSM$B_ESCAPE_STATE] = 0;
+    SCB[PSM$V_ESCAPE_IN_PROGRESS] = 1;
+    SCB[PSM$B_STATE] = FORMAT;
+
+    ! If there are at least two output bytes remaining then continue
+    ! at FORMAT, else write the buffer.
+    !
+    IF .SCB_SIZE_ (OUTPUT_BUFFER) GTRU 2
+    THEN
+	SCB[PSM$B_STATE] = FORMAT;
+    LEAVE CASE_STATEMENT;
+    END;
+    
+
+! See if format service requesting suspension (OSC)
+!
+IF .SERVICE_STATUS EQL PSM$_SUSPEND
+THEN
+    BEGIN
+    SUSPEND_SERVICE (.SCB);
+    SCB[PSM$B_STATE] = FIND_WORK;
+    LEAVE CASE_STATEMENT;
+    END;
+
+
+! If output buffer full then write it
+!
+IF .SERVICE_STATUS EQL PSM$_BUFFEROVF
+THEN
+    LEAVE CASE_STATEMENT;
+
+
+! Must be a new page
+!
+IF .SERVICE_STATUS NEQ PSM$_NEWPAGE THEN CODEERR_ ;
+
+
+! New page -- save a checkpoint if 32 pages have passed or if
+! we are stopping on this page
+!
+IF (.SCB[PSM$L_PAGE] AND %B '11111') EQL 0
+OR .SCB[PSM$L_PAGE] GEQU .SCB[PSM$L_STOP_PAGE]
+THEN
+    SAVE_CHECKPOINT (.SCB);
+
+
+! If we are stopping on this page then flush the output stream
+! and reset the "new page" trigger
+!
+IF .SCB[PSM$L_PAGE] GEQU .SCB[PSM$L_STOP_PAGE]
+THEN
+    BEGIN
+    $BBLOCK [.SCB[PSM$A_IOB],IOB_V_FLUSH_PENDING] = 1;
+    SCB[PSM$L_LINE] = 0;
+    LEAVE CASE_STATEMENT;
+    END;
+
+
+! Check for string search -- if the output buffer is not empty
+! then force a buffer write
+!
+IF .SCB[PSM$V_SEARCH_FOR_STRING]
+THEN
+    BEGIN
+    BIND IOB = .SCB[PSM$A_IOB] : $BBLOCK;
+    IF .SCB_SIZE_ (OUTPUT_BUFFER) NEQ .DESC_SIZE_ (IOB[IOB_Q_BUFFER])
+    THEN
+	! Reset the new page trigger and force a buffer write
+	!
+	BEGIN
+	SCB[PSM$L_LINE] = 0;
+	LEAVE CASE_STATEMENT;
+	END;
+    END;
+
+
+! Check for page headers and/or page setup
+!
+IF .PRINT_FLAG_ (PAGE_HEADER) THEN SERVICE_LIST_ (PAGE_HEADER) = 1;
+IF .SCB_SIZE_ (PAGE_SETUP_MODULES) NEQ 0
+OR .PSM$SRV[PSM$K_PAGE_SETUP, SRV_V_USER_SUPPLIED]
+THEN
+    SERVICE_LIST_ (PAGE_SETUP) = 1;
+
+
+! If page headers or setup required then suspend current input service
+! and continue at FIND_WORK.
+!
+IF .SERVICE_LIST_ (PAGE_HEADER)
+OR .SERVICE_LIST_ (PAGE_SETUP)
+THEN
+    BEGIN
+    SUSPEND_SERVICE (.SCB);
+    SCB[PSM$B_STATE] = FIND_WORK;
+    LEAVE CASE_STATEMENT;
+    END;
+
+
+! If new page with no side effects then continue at FORMAT
+! else go to next state (output_filter)
+!
+IF NOT .SCB[PSM$V_SEARCH_FOR_STRING]
+THEN
+    SCB[PSM$B_STATE] = FORMAT;
+
+END;
+
+[OUTPUT_FILTER]:
+BEGIN
+
+! Locate the output filter service, the output block, and the output record
+!
+BIND FILTER = PSM$SRV[PSM$K_OUTPUT_FILTER,0,0,0,0] : $BBLOCK;
+BIND IOB = .SCB[PSM$A_IOB] : $BBLOCK;
+BIND IOBREC = IOB[IOB_Q_RECORD] : VECTOR;
+
+
+! Clear the old record descriptor (any class) and set it to
+! the size of the blocked record buffer (static)
+!
+CLEAR_STRING_ (IOBREC);
+IOBREC[1] = .DESC_ADDR_ (IOB[IOB_Q_BUFFER]);
+IOBREC[0] = .SCB_ADDR_ (OUTPUT_BUFFER) - .DESC_ADDR_ (IOB[IOB_Q_BUFFER]);
+IF .IOBREC[0] GTRU .DESC_SIZE_ (IOB[IOB_Q_BUFFER]) THEN CODEERR_ ;
+
+
+! If no output filter then bypass service call
+!
+IF .FILTER[SRV_A_SERVICE] EQL 0
+THEN
+    LEAVE CASE_STATEMENT;
+
+
+! Copy the output record decriptor (static) and reinitialize it (dynamic)
+!
+COPY_QUAD_ (IOBREC, SCB[PSM$Q_OUTPUT_BUFFER]);
+INIT_DYN_DESC_ (IOBREC);
+
+
+! Call the output filter service
+!
+SCB[PSM$L_SERVICE_STATUS] = BLISS (
+    .FILTER[SRV_A_SERVICE],		!  - output filter service
+    SCB,				!  - SCB address by reference
+    SCB[PSM$R_USER_CONTEXT_AREA],	!  - user context area
+    UPLIT (PSM$K_FORMAT),		!  - FORMAT function
+    SCB[PSM$Q_OUTPUT_BUFFER],		!  - input to filter
+    0,					!  - unused function argument
+    IOBREC,				!  - output from filter
+    0);					!  - unused function argument
+
+END;
+
+[OUTPUT_FILTER_COMPLETION]:
+BEGIN
+
+! Locate the OUTPUT block
+!
+BIND IOB = .SCB[PSM$A_IOB] : $BBLOCK;
+
+
+! Check for string search
+!
+IF .SCB[PSM$V_SEARCH_FOR_STRING]
+THEN
+    IF SEARCH_FOR_STRING (.SCB, SCB[PSM$Q_SEARCH_STRING], IOB[IOB_Q_RECORD])
+    THEN
+	
+	! String found -- release the output buffer, set the start
+	! page, and continue at RESUME
+	!
+	BEGIN
+	INSERT_TAIL_ (.SCB[PSM$A_IOB], SCB[PSM$Q_BUFFER_QUEUE]);
+	SCB[PSM$A_IOB] = 0;
+	SCB[PSM$L_START_PAGE] = .SCB[PSM$L_PAGE];
+
+	! If sitting at top of page then we really want to restart at
+	! the previous page
+	!
+	IF .SCB[PSM$L_LINE] LEQU 1
+	AND .SCB[PSM$L_COLUMN] LEQU 1
+	AND .SCB[PSM$L_PAGE] GTRU 1
+	THEN
+	    DECREMENT_ (SCB[PSM$L_START_PAGE])
+	ELSE
+	    ! Mid-page: force RESUME to reposition by fibbing about
+	    ! current page
+	    !
+	    INCREMENT_ (SCB[PSM$L_PAGE]);
+	SCB[PSM$B_STATE] = RESUME;
+	LEAVE CASE_STATEMENT;
+	END;
+
+END;
+
+[WRITE]:
+BEGIN
+
+! Locate the output block and the output service routine
+!
+BIND IOB = .SCB[PSM$A_IOB] : $BBLOCK;
+BIND OUTPUT = PSM$SRV[PSM$K_OUTPUT,0,0,0,0] : $BBLOCK;
+
+
+! Establish the default function as WRITE
+!
+LOCAL FUNCTION : INITIAL (PSM$K_WRITE);
+
+
+! Check for /PASSALL or buffer marked passall (DCS's)
+!
+IF .PRINT_FLAG_ (PASSALL)
+OR .IOB[IOB_V_PASSALL]
+THEN
+    FUNCTION = PSM$K_WRITE_NOFORMAT;
+
+
+! Check for write suppression (searching)
+!
+IF .SCB[PSM$V_SUPPRESS_OUTPUT]
+THEN
+    FUNCTION = PSM$K_WRITE_SUPPRESSED
+ELSE
+    INCREMENT_ (ACC_DATA_ (QIO_PUTS));
+
+
+! Initiate the WRITE function
+!
+SCB[PSM$L_SERVICE_STATUS] = BLISS (
+    .OUTPUT[SRV_A_SERVICE],		!  - write service
+    SCB[PSM$A_IOB],			!  - IOB address by reference
+    SCB[PSM$R_USER_CONTEXT_AREA],	!  - user context area
+    FUNCTION,				!  - WRITE or WRITE_SUPPRESSED function
+    IOB[IOB_Q_RECORD],			!  - record desc
+    0);					!  - <not used>
+
+
+! Disconnect the IOB from the SCB
+!
+SCB[PSM$A_IOB] = 0;
+
+
+! Asynchronous?
+!
+IF .SCB[PSM$L_SERVICE_STATUS] EQL PSM$_PENDING
+THEN
+    BEGIN
+
+    ! Yes: don't wait for completion unless we are flushing the output stream
+    ! Either way, PSM$REPORT will release the IOB
+    !
+    IF NOT .IOB[IOB_V_FLUSH_PENDING]
+    THEN
+	BEGIN
+	SCB[PSM$L_SERVICE_STATUS] = SS$_NORMAL;
+	SCB[PSM$B_STATE] = FORMAT;
+        END;
+    END
+ELSE
+    BEGIN
+    ! Synchronous return; release the IOB
+    !
+    INSERT_TAIL_ (IOB[IOB_Q_QLINKS], SCB[PSM$Q_BUFFER_QUEUE]);
+
+    ! If successful, and not flushing, then continue at FORMAT
+    !
+    IF .SCB[PSM$L_SERVICE_STATUS] EQL SS$_NORMAL
+    AND NOT .IOB[IOB_V_FLUSH_PENDING]
+    THEN
+	SCB[PSM$B_STATE] = FORMAT;
+    END;
+
+END;
+
+[WRITE_COMPLETION]:
+BEGIN
+
+! If the IO failed then the error has already been stored and task abort begun,
+! continue at READ.
+!
+IF NOT .SCB[PSM$L_SERVICE_STATUS]
+THEN
+    BEGIN
+    SCB[PSM$B_STATE] = READ;
+    LEAVE CASE_STATEMENT;
+    END;
+
+
+! The write was successful -- we are here because the output stream
+! is being flushed for one of:
+!
+!	1) Last page reached (PRINT /PAGE=last)
+!	2) Job controller requested pause (STOP /QUEUE)
+!	3) A page search operation has completed
+!	4) An alignment operation has completed (START /QUEUE /ALIGN=pages)
+!	5) We are in sheet feed mode (DEFINE /FORM /SHEET_FEED)
+!
+! Respond based on why we are flushing
+!
+
+! If pausing then mark the stream pending and respond to the job controller
+!
+IF .SCB[PSM$L_REQUEST_RESPONSE] EQL SMBMSG$K_PAUSE_TASK
+THEN
+    BEGIN
+    SMB$SEND_TO_JOBCTL (
+	SCB[PSM$L_STREAM_INDEX],	! - stream number
+	SCB[PSM$L_REQUEST_RESPONSE]);	! - request response
+    SCB[PSM$V_RESUME_WAIT] = 1;
+    SCB[PSM$L_SERVICE_STATUS] = PSM$_PENDING;
+    LEAVE CASE_STATEMENT;
+    END;
+
+
+! If searching for a string then continue formatting
+!
+IF .SCB[PSM$V_SEARCH_FOR_STRING]
+THEN
+    BEGIN
+    SCB[PSM$B_STATE] = FORMAT;
+    LEAVE CASE_STATEMENT;
+    END;
+
+
+! If searching for a page or aligning then go to next state (resume)
+!
+IF .SCB[PSM$V_ALIGN]
+OR .SCB[PSM$V_SEARCH_FOR_PAGE]
+THEN
+    LEAVE CASE_STATEMENT;
+
+
+! Sheet feeding?
+!
+IF .$BBLOCK [SCB[PSM$L_PRINT_CONTROL], SMBMSG$V_SHEET_FEED]
+AND NOT .SCB[PSM$V_SUPPRESS_OUTPUT]
+THEN
+    BEGIN
+    LOCAL DEVICE_STATUS;
+    DEVICE_STATUS = .SCB[PSM$L_DEVICE_STATUS] OR SMBMSG$M_PAUSE_TASK;
+    SMB$SEND_TO_JOBCTL (
+	SCB[PSM$L_STREAM_INDEX],	! - stream number
+	UPLIT (SMBMSG$K_TASK_STATUS),	! - request response
+	0,				! - no accounting
+	0,				! - no checkpoint
+	DEVICE_STATUS			! - device status (paused)
+	);
+    SCB[PSM$V_RESUME_WAIT] = 1;
+    SCB[PSM$L_SERVICE_STATUS] = PSM$_PENDING;
+    LEAVE CASE_STATEMENT;
+    END;
+
+IF .SCB[PSM$L_SERVICE_LIST] EQL 0 THEN SCB[PSM$B_STATE] = STOP_TASK
+ELSE
+    IF .ITEM_PRESENT_ (LAST_PAGE)
+    AND .SCB[PSM$L_PAGE] GTRU .SCB[PSM$L_LAST_PAGE]
+    THEN
+	SCB[PSM$B_STATE] = CLOSE;
+
+END;
+
+[CLOSE]:
+BEGIN
+
+! Defend against an attempt to CLOSE a non-existent service
+!
+IF .SERVICE[SRV_A_SERVICE] EQL 0
+THEN
+    LEAVE CASE_STATEMENT;
+
+
+! Initiate the CLOSE function for the current input routine
+!
+SCB[PSM$L_SERVICE_STATUS] = BLISS (
+    .SERVICE[SRV_A_SERVICE],		!  - current input service
+    SCB,				!  - SCB address by reference
+    SCB[PSM$R_USER_CONTEXT_AREA],	!  - user context area
+    UPLIT (PSM$K_CLOSE),		!  - CLOSE function
+    0,					!  - <not used>
+    0);					!  - <not used>
+
+END;
+
+[CLOSE_COMPLETION]:
+BEGIN
+
+! Mark the service closed
+!
+BITVECTOR [SCB[PSM$L_SERVICE_OPEN], .SCB[PSM$B_SERVICE_INDEX]] = 0;
+
+
+! If this was a forced EOF and input was nested then pass the
+! abort flag to the next service, else clear it
+!
+IF TESTBITSC (SCB[PSM$V_EOF])
+THEN
+    IF .SCB[PSM$B_INPUT_DEPTH] NEQ 0
+    THEN
+	SCB[PSM$V_EOF] = 1;
+
+END;
+
+[STOP_TASK]:
+BEGIN
+
+! A stream is "active" if its queue is started.  It is busy if it
+! is currently processing a task.
+!
+LOCAL
+	ACTIVE_STREAMS	: INITIAL (0),		! number of active streams
+	BUSY_STREAMS	: INITIAL (0)		! number of busy streams
+	;
+
+! Clear any pending input service routines from the service list and
+! reset the busy and reset flags.
+!
+SCB[PSM$L_SERVICE_LIST] = 0;
+SCB[PSM$V_BUSY] = 0;
+SCB[PSM$V_RESET] = 0;
+
+! If the job controller did not request an abort then we respond
+! with the asynchronous TASK_COMPLETE message.  Otherwise we respond
+! with the current contents of REQUEST_RESPONSE which is presumably
+! STOP_TASK or RESET_TASK.
+!
+IF .SCB[PSM$L_REQUEST_RESPONSE] EQL SMBMSG$K_START_TASK
+OR .SCB[PSM$L_REQUEST_RESPONSE] EQL SMBMSG$K_RESUME_TASK
+THEN
+    SCB[PSM$L_REQUEST_RESPONSE] = SMBMSG$K_TASK_COMPLETE;
+
+
+! Notify the job controller
+!
+SMB$SEND_TO_JOBCTL (
+	SCB[PSM$L_STREAM_INDEX],	! - stream number
+	SCB[PSM$L_REQUEST_RESPONSE], 	! - responding to ...
+	SCB[PSM$Q_ACCOUNTING_DATA],	! - accounting data
+	0,				! - no checkpoint
+	SCB[PSM$L_DEVICE_STATUS],	! - device status
+	SCB[PSM$T_CONDITION_AREA]	! - errors if any
+	);
+
+! Now scan to see if there are any active or busy streams
+!
+INCR I TO PSM$K_MAXSTREAMS - 1
+DO
+    BEGIN
+    BIND SCBPTR  = .PSM$GL_SCBVEC [.I] : $BBLOCK;
+    IF SCBPTR NEQ 0
+    THEN
+	BEGIN
+	IF .SCBPTR[PSM$V_ACTIVE]
+	THEN
+	    INCREMENT_ (ACTIVE_STREAMS);
+	IF .SCBPTR[PSM$V_BUSY]
+	THEN
+	    INCREMENT_ (BUSY_STREAMS);
+	END
+    END;
+
+
+! If no active streams then exit
+!
+IF .ACTIVE_STREAMS EQL 0
+THEN
+    $EXIT (CODE = SS$_NORMAL OR STS$M_INHIB_MSG);
+
+
+! If no busy streams then purge the working set
+!
+IF .BUSY_STREAMS EQL 0
+THEN
+    $PURGWS (INADR=UPLIT (0, %X '7FFFFFFF'));
+
+
+END;
+
+[IDLE]:
+BEGIN
+
+! If a reset has occured then contine at STOP_TASK
+!
+IF .SCB[PSM$V_RESET]
+THEN
+    SCB[PSM$B_STATE] = STOP_TASK
+ELSE
+    RETURN;
+
+END;
+
+
+! Usual formatting conventions resume here
+!
+	TES;	! End of case table
+    END;	! End of CASE_STATEMENT block
+END;		! End of PSM$FUNCTION_DISPATCH routine
+
+%SBTTL 'COMPLETE_SERVICE - record completion for async. function'
+! Functional Description:
+!		Records completion of an asynchronous service function
+!		(one that was originally completed with PSM$_PENDING)
+!		and records the completion status.
+!
+! Formal Parameters:
+!		SMB_CONTEXT : address of a SCB or an IOB
+!		USER_STATUS : address of longword contain completion status
+!
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		SS$_NORMAL
+!
+! Side Effects:
+!		SCB updated with completions status and DISPATCH called
+!		to resume processing
+!--
+GLOBAL ROUTINE PSM$REPORT (
+	SMB_CONTEXT	: REF $LONGWORD,	! SCB or IOB address
+	USER_STATUS	: REF $LONGWORD		! Completion status
+	) =
+BEGIN
+
+! Setup parameter referencing values
+!
+PARAMETER_INDEX_ (SMB_CONTEXT, USER_STATUS);
+
+LOCAL
+	SCB		: REF $BBLOCK;
+
+! Pick up the context value
+!
+SCB = .SMB_CONTEXT[];
+
+
+! If the structure type -- if SCB then we have an SCB, else
+! we have an IOB.
+!
+IF .SCB[PSM$B_TYPE] EQL PSM$K_STRUCTURE_SCB
+THEN
+    BEGIN
+    ! SCB -- we are completing an INPUT function.  If not currently
+    ! pending then something is wrong.
+    !
+    IF .SCB[PSM$L_SERVICE_STATUS] NEQ PSM$_PENDING THEN CODEERR_ ;
+
+    ! Pick up completion status, default is normal.
+    !
+    SCB[PSM$L_SERVICE_STATUS] = SS$_NORMAL;
+    IF PARAMETER_PRESENT_ (USER_STATUS)
+    THEN
+	SCB[PSM$L_SERVICE_STATUS] = .USER_STATUS[];
+
+    ! Call function dispatch to resume processing
+    !
+    PSM$FUNCTION_DISPATCH (.SCB);
+    END
+
+ELSE
+
+    BEGIN
+    ! We have an IOB -- we are completing an asycn. output request
+    !
+    LOCAL IOB : REF $BBLOCK;
+    LOCAL OUTPUT_STATUS : INITIAL (SS$_NORMAL);
+
+    ! Locate the IOB, check its structure type, and locate the SCB
+    !
+    IOB = .SCB;
+    IF .IOB[IOB_B_TYPE] NEQ PSM$K_STRUCTURE_IOB THEN CODEERR_ ;
+    SCB = .IOB[IOB_A_CONTEXT];
+
+    ! Pick up the output completion status if specified -- default is normal
+    !
+    IF PARAMETER_PRESENT_ (USER_STATUS) THEN OUTPUT_STATUS = .USER_STATUS[];
+
+    ! If no errors ...
+    !
+    IF .OUTPUT_STATUS
+    THEN
+	BEGIN
+
+	! Update accounting
+	!
+	INCREMENT_ (SCB[PSM$L_OUTPUT_QIOS]);
+
+	! If we have a checkpoint associated with this output buffer or
+	! if we are marked as stalled ...
+	!
+	IF .IOB[IOB_V_CHECKPOINT_PENDING]
+	OR .$BBLOCK[SCB[PSM$L_DEVICE_STATUS], SMBMSG$V_STALLED]
+	THEN
+	    BEGIN
+
+	    ! Then prepare to notify the job controller
+	    !
+	    LOCAL CHECKPOINT : INITIAL (0);
+	    LOCAL CKP_DESC : VECTOR [2] PRESET ([0]=0);
+	    LOCAL REQUEST_RESPONSE : INITIAL (SMBMSG$K_TASK_STATUS);
+
+	    ! Output completion indicates we are no longer stalled
+	    !
+	    $BBLOCK [SCB[PSM$L_DEVICE_STATUS],SMBMSG$V_STALLED] = 0;
+
+	    ! If we are also pausing then set the request response
+	    ! to PAUSE_TASK.  By default it is TASK_STATUS which indicates
+	    ! an asynchronous (unexpected) message to the job controller.
+	    !
+	    IF .IOB[IOB_V_PAUSE_PENDING]
+	    THEN
+		REQUEST_RESPONSE = .SCB[PSM$L_REQUEST_RESPONSE];
+
+
+	    ! If a checkpoint is present setup a descriptor for it
+	    !
+	    IF .IOB[IOB_V_CHECKPOINT_PENDING]
+	    THEN
+		BEGIN
+		CKP_DESC[0] = SMBMSG$S_CHECKPOINT_DATA;
+		CKP_DESC[1] = IOB[IOB_T_CHECKPOINT_DATA];
+		CHECKPOINT = CKP_DESC;
+		END;
+
+	    ! Notify the job controller of one or more:
+	    !
+	    !	- we are not stalled
+	    !   - we have paused
+	    !   - here is a checkpoint update
+
+	    SMB$SEND_TO_JOBCTL (
+		SCB[PSM$L_STREAM_INDEX],	! - stream number
+		REQUEST_RESPONSE,		! - request response
+		0,				! - no accounting
+		.CHECKPOINT,			! - checkpoint or 0
+		SCB[PSM$L_DEVICE_STATUS]	! - device status
+		);
+	    END;
+	END
+    ELSE
+
+	! Store any errors other than cancel or abort
+	!
+	IF .OUTPUT_STATUS EQL SS$_CANCEL OR .OUTPUT_STATUS EQL SS$_ABORT
+	THEN
+	    1
+	ELSE
+	    PSM$STORE_ERRORS (.SCB, PSM$_WRITEERR, 1, SCB[PSM$Q_DEVICE_NAME],
+		.OUTPUT_STATUS);
+
+    ! If we are flushing the output stream (that is, suspending further
+    ! input/format operations until all pending output has been printed)
+    ! then update the service status in the SCB with the output status.
+    !
+    IF .IOB[IOB_V_FLUSH_PENDING]
+    THEN
+	SCB[PSM$L_SERVICE_STATUS] = .OUTPUT_STATUS;
+
+    ! Release the IOB
+    !
+    INSERT_TAIL_ (IOB[IOB_Q_QLINKS], SCB[PSM$Q_BUFFER_QUEUE]);
+
+    ! Call dispatch to resume processing
+    !
+    PSM$FUNCTION_DISPATCH (.SCB);
+    END;
+
+SS$_NORMAL
+
+END;
+
+%SBTTL 'INCLUDE_MODULES - queue text modules for inclusion'
+! Functional Description:
+!		Adds the specified modules to the queue of modules
+!		that are waiting to be included in the input stream
+!
+! Formal Parameters:
+!		SMB_CONTEXT	: assumed to be the SCB address
+!		MODULE_LIST	: descriptor of comma separate module list
+!
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		The modules are appended to the module list
+!--
+GLOBAL ROUTINE PSM$INCLUDE_MODULES (
+	SMB_CONTEXT	: REF $LONGWORD,	! SCB address
+	MODULE_LIST	: REF VECTOR		! Module list descriptor
+	) =
+BEGIN
+
+LOCAL SCB : REF $BBLOCK;
+
+
+! Locate the SCB
+!
+SCB = .SMB_CONTEXT[];
+
+
+! Check for empty list
+!
+IF .DESC_SIZE_ (.MODULE_LIST) EQL 0 THEN RETURN SS$_NORMAL;
+
+
+! If the pending list is non-empty then append a comma prior
+! to new modules
+!
+IF .DESC_SIZE_ (SCB[PSM$Q_MODULE_LIST]) NEQ 0
+THEN
+    STR$APPEND (SCB[PSM$Q_MODULE_LIST], %ASCID ',');
+
+
+! Append the new modules
+!
+STR$APPEND (SCB[PSM$Q_MODULE_LIST], .MODULE_LIST);
+
+SS$_NORMAL
+
+END;
+
+%SBTTL 'PRINT_SYMBIONT - initialization/main entry point for print symbiont'
+! Functional Description:
+!		Initializes the print symbiont and begins processing
+!
+! Formal Parameters:
+!		STREAMS	:	Number of streams to allow (1-16)
+!		BUFLIM	:	Maximum output buffer size to allow
+!		USER_SIZE :	User work area size to allocate
+!
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		Symbiont processing is initiated
+!--
+GLOBAL ROUTINE PSM$PRINT ( 
+	STREAMS		: REF $LONGWORD,
+	BUFLIM		: REF $WORD,
+	USER_SIZE	: REF $WORD
+	) =
+BEGIN
+
+! Setup for parameter referencing
+!
+PARAMETER_INDEX_ (STREAMS, BUFLIM, USER_SIZE);
+
+BUILTIN FP;
+
+LOCAL
+
+	ARG_DESC : $DYNAMIC_DESC,
+
+	! Privileges needed by standard symbiont
+	!
+	PRIVILEGE_MASK:	$BBLOCK[8] PRESET (
+	    [PRV$V_ALLSPOOL]	= 1,
+	    [PRV$V_LOG_IO]	= 1,
+	    [PRV$V_PHY_IO]	= 1,
+	    [PRV$V_READALL]	= 1,
+	    [PRV$V_SHARE]	= 1),
+
+	MAXSTREAMS	: INITIAL (1)
+	;
+
+! Create an item list for GETSYI call
+!
+BIND ITMLST = $ITMLST_UPLIT ((ITMCOD=SYI$_MAXBUF, BUFADR=PSM$GL_MAXBUF));
+
+
+! Establish the main signal handler
+!
+.FP = HANDLER;
+
+
+! Get the needed priv's
+!
+SIGNAL_IF_ERROR_ ($SETPRV (ENBFLG=1, PRVADR=PRIVILEGE_MASK));
+
+
+! Get the value of the sysgen parameter for maximum buffer size
+!
+SIGNAL_IF_ERROR_ ($GETSYIW (ITMLST=ITMLST));
+
+
+! Compute the maximum allowed buffer size as the smaller of the
+! system limit and the user limit, less 100 to allow for $QIO overhead
+!
+PSM$GL_MAXBUF = .PSM$GL_MAXBUF - 100;
+IF PARAMETER_PRESENT_ (BUFLIM)
+THEN
+    IF .PSM$GL_MAXBUF GTRU .BUFLIM[]
+    THEN
+	PSM$GL_MAXBUF = .BUFLIM[];
+
+
+! Store the maximum streams value supplied by the user
+!
+IF PARAMETER_PRESENT_ (STREAMS)
+THEN
+    MAXSTREAMS = .STREAMS[];
+
+
+! Store the user context area size requested by the user
+!
+IF PARAMETER_PRESENT_ (USER_SIZE)
+THEN
+    PSM$GL_USER_CTX  = .USER_SIZE[];
+
+
+! Call the SMB$ facility to initialize symbiont environment and
+! message interface to the job controller
+!
+SIGNAL_IF_ERROR_ (SMB$INITIALIZE (
+    UPLIT (SMBMSG$K_STRUCTURE_LEVEL),
+    PSM$RECEIVE_MESSAGE_AST,
+    MAXSTREAMS));
+
+
+! Purge the working set
+!
+$PURGWS (INADR=UPLIT (0, %X '7FFFFFFF'));
+
+
+! Loop forever at non-ast level, hibernating.  Nearly all symbiont activity
+! occurs at ast-level, but a few functions occur at non-ast.  If woken from
+! hibernate then look for non-ast work to do.
+!
+WHILE 1
+DO
+    BEGIN
+    PSM$WAIT_FOR_NON_AST (ARG_DESC);
+	BEGIN
+
+	! Argument list pointed to by arg_desc is a longword array of
+	! the following values:
+	!
+	!	[0]	  = SCB
+	!	[1]	  = AST routine to activate after user routine
+	!	[2]	  = AST parameter for AST routine
+	!	[3]	  = User level routine
+	!	[4]	  = User level argument count
+	!	[5]:[end] = User level argument list
+	!
+	LOCAL SCB : REF $BBLOCK;
+	BIND ARG_VECTOR = .DESC_ADDR_ (ARG_DESC) : VECTOR;
+
+	SCB = .ARG_VECTOR [0];
+	SCB[PSM$L_NON_AST_STATUS] = CALLG (ARG_VECTOR[4], .ARG_VECTOR[3]);
+
+	IF .ARG_VECTOR[1] NEQ 0
+	THEN
+	    SIGNAL_IF_ERROR_ ($DCLAST (ASTADR=.ARG_VECTOR[1],
+		ASTPRM=.ARG_VECTOR[2]));
+	END;
+    END;
+
+SS$_NORMAL
+
+END;
+
+%SBTTL 'STORE_ERRORS - store errors reported by user in SCB'
+! Functional Description:
+!		Store the vector of condition codes in the call
+!		in the SCB.
+!
+! Formal Parameters:
+!		SMB_CONTEXT	: assumed to be SCB address
+!		<8(AP)>		: begining of condition list
+!		
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		Error conditions and associcated text are stored
+!
+! Returned Value:
+!		SS$_NORMAL
+!
+! Side Effects:
+!		none
+!--
+GLOBAL ROUTINE PSM$STORE_ERRORS ( 
+	SMB_CONTEXT	: REF $LONGWORD
+	) =
+BEGIN
+
+BUILTIN	AP;
+MAP	AP : REF VECTOR;
+
+LOCAL
+	CONDITION,
+	ERRORS		: REF VECTOR,
+	INDEX		: INITIAL (0),
+	SCB		: REF $BBLOCK
+	;
+
+! Locate the SCB and condition vector area
+!
+SCB = .SMB_CONTEXT[];
+ERRORS = SCB[PSM$T_CONDITION_AREA];
+
+
+! If previous errors reported then ignore these
+!
+IF .ERRORS[0] NEQ 0 THEN RETURN SS$_NORMAL;
+
+
+! Expand the condition codes into a text message
+!
+EXPAND_CONDITION_VECTOR (.SCB, .AP[0] - 1, AP[2], SCB[PSM$Q_CONDITION_TEXT]);
+
+
+! Mark errrors to print
+!
+SERVICE_LIST_ (FILE_ERRORS) = 1;
+
+
+! Store the errors passing over FAO arguments
+!
+INCR I FROM 2 TO .AP[0]
+DO
+    BEGIN
+    CONDITION = .AP [.I];
+    IF .CONDITION NEQ 0
+    THEN
+	BEGIN
+	INCREMENT_ (INDEX);
+	IF .INDEX GTRU PSM$S_CONDITION_AREA / 4  - 1
+	THEN
+	    EXITLOOP;
+	INCREMENT_ (ERRORS[0]);
+	ERRORS[.INDEX] = .CONDITION;
+	END;
+
+    ! If this is neither an RMS nor a system message then
+    ! the low 16 bits of the next argument are an FAO count.
+    ! Skip the count argument longword, and the number of
+    ! additional longwords specified by the count.
+    !
+    IF .$BBLOCK [CONDITION,STS$V_FAC_NO] NEQ RMS$_FACILITY
+    AND .$BBLOCK [CONDITION,STS$V_FAC_NO] NEQ 0
+    AND .I LSSU .AP[0]
+    THEN
+	I = .I + .(AP[.I+1])<0,16,0> + 1;
+    END;
+
+
+! Any error initiates a task abort
+!
+ABORT_TASK (.SCB);
+
+SS$_NORMAL
+
+END;
+
+%SBTTL 'ABORT_TASK - aborts the current task'
+! Functional Description:
+!		Causes the current task to be aborted by setting abort
+!		flags and cancelling unneeded input services.
+!
+! Formal Parameters:
+!		SCB	: SCB address
+!
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		The current task is cancelled.
+!--
+ROUTINE ABORT_TASK ( 
+	SCB	: REF $BBLOCK
+	)	: NOVALUE =
+BEGIN
+
+
+! If the main input routine has been requested but not
+! yet called with open, and if the file is actually opened
+! as evidenced by FAB_VALID being set, then close the file
+! directly since the main path will not call with a CLOSE function
+!
+IF .SERVICE_LIST_ (MAIN_INPUT)
+AND .SCB[PSM$V_FAB_VALID]
+THEN
+    $CLOSE (FAB=.SCB[PSM$A_FAB]);
+
+
+! Cancel any pending main input (file printing) and file setup.
+!
+SERVICE_LIST_ (MAIN_INPUT) = 0;
+SERVICE_LIST_ (FILE_SETUP) = 0;
+
+
+! Turn on file trailer, job trailer, and/or job reset if the job controller
+! indicated they should occur on a task abort
+!
+IF .SEPARATE_FLAG_ (FILE_TRAILER_ABORT)	THEN SERVICE_LIST_ (FILE_TRAILER)  = 1;
+IF .SEPARATE_FLAG_ (JOB_TRAILER_ABORT)	THEN SERVICE_LIST_ (JOB_TRAILER)   = 1;
+IF .SEPARATE_FLAG_ (JOB_RESET_ABORT)	THEN SERVICE_LIST_ (JOB_RESET)     = 1;
+
+
+! Clear any pending input modules
+!
+CLEAR_STRING_ (SCB[PSM$Q_MODULE_LIST]);
+
+
+! Set the master EOF flag to force wind-down while poping the input
+! service routine stack
+!
+SCB[PSM$V_EOF] = 1;			
+
+END;
+
+%SBTTL 'CARRIAGE_CONTROL - compute carriage control'
+! Functional Description:
+!		Computes carriage control for input records with the
+!		assistance of the EXEC's carriage control routine.
+!
+! Formal Parameters:
+!		SCB	: SCB address
+!
+! Implicit Inputs:
+!		Carriage control type, first byte of input record,
+!		record header, form feed flags
+!
+! Implicit Outputs:
+!		PSM$L_CARCON established
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		none
+!--
+ROUTINE CARRIAGE_CONTROL ( 
+	SCB	: REF $BBLOCK
+	) =
+BEGIN
+
+! Define JSB linkage to EXEC routine
+!
+LINKAGE
+	CARRIAGE_LINKAGE = JSB (REGISTER=3):
+				PRESERVE (3)
+				NOTUSED (2,4,5,6,7,8,9,10,11);
+
+EXTERNAL ROUTINE
+	EXE$CARRIAGE:	CARRIAGE_LINKAGE NOVALUE;
+
+
+! Case on the carriage control type for this input routine
+!
+CASE .SCB[PSM$B_CC_TYPE] FROM 1 TO PSM$K_CC_MAX - 1 OF
+
+    SET
+
+    [OUTRANGE]:
+	CODEERR_ ;
+
+
+    ! Internal -- all carriage control is explicity imbedded in
+    ! the data records
+    !
+
+    [PSM$K_CC_INTERNAL]:
+	SCB[PSM$L_CARCON] = 0;
+
+
+
+    ! Implied -- generate leading <CR> and trailing <LF> for most
+    ! records with special handling for the first record from the
+    ! service and for form feeds in the first byte of a record.
+    !
+
+    [PSM$K_CC_IMPLIED]:
+	BEGIN
+
+	! Default carriage control
+	!
+	SCB[PSM$L_CARCON] = PSM$K_LF_CR;
+
+
+	! Clear leading carriage control for first record from service
+	!
+	IF .SCB[PSM$V_FIRST_RECORD]
+	THEN
+	    SCB[PSM$B_PREFIX_COUNT] = 0;
+
+
+	! Clear leading carriage control if last record was FF only
+	!
+	IF TESTBITSC (SCB[PSM$V_IMPLICIT_FORMFEED])
+	THEN
+	    SCB[PSM$B_PREFIX_COUNT] = 0;
+
+
+	! Check for form feed in first byte of record
+	!
+	IF .SCB_SIZE_ (INPUT_RECORD) GTRU 0
+	THEN
+	    IF CH$RCHAR (.SCB_ADDR_ (INPUT_RECORD)) EQL PSM$K_CHAR_FF
+	    THEN
+		BEGIN
+
+		! First byte is form feed -- clear leading carriage control
+		!
+		SCB[PSM$B_PREFIX_COUNT] = 0;
+
+		! One byte record -- clear trailing carriage control and set
+		! implicit form feed flag to clear leading carriage control
+		! for next record
+		!
+		IF .SCB_SIZE_ (INPUT_RECORD) EQL 1
+		THEN
+		    BEGIN
+		    SCB[PSM$B_POSTFIX_COUNT] = 0;
+		    SCB[PSM$V_IMPLICIT_FORMFEED] = 1;
+		    END;
+		END;
+	END;
+
+
+    ! Fortran -- first byte of the record defines carriage control
+    !
+
+    [PSM$K_CC_FORTRAN]:
+	IF .SCB_SIZE_ (INPUT_RECORD) EQL 0
+	THEN
+	    SCB[PSM$L_CARCON] = PSM$K_LF_CR
+	ELSE
+	    BEGIN
+	    SCB[PSM$L_CARCON] = CH$RCHAR (.SCB_ADDR_ (INPUT_RECORD));
+	    EXE$CARRIAGE (SCB[PSM$L_CARCON] - $BYTEOFFSET (IRP$B_CARCON));
+	    IF .SCB[PSM$B_PREFIX_CHAR] EQL 0
+	    THEN
+		SCB[PSM$B_PREFIX_CHAR] = PSM$K_CHAR_LF;
+	    IF .SCB[PSM$B_POSTFIX_CHAR] EQL 0
+	    THEN
+		SCB[PSM$B_POSTFIX_CHAR] = PSM$K_CHAR_LF;
+	    RETURN PSM$K_FIRST_CHAR_USED;
+	    END;
+
+
+
+    ! PRINT -- print file format (PRN).  Each record has a two byte
+    ! header that define carriage control.  DCL, for example, creates
+    ! PRN files.
+    !
+
+    [PSM$K_CC_PRINT]:
+	BEGIN
+	SCB[PSM$L_CARCON] = .SCB[PSM$L_RECORD_HEADER] ^ 16;
+	EXE$CARRIAGE (SCB[PSM$L_CARCON] - $BYTEOFFSET (IRP$B_CARCON));
+	IF .SCB[PSM$B_PREFIX_CHAR] EQL 0
+	THEN
+	    SCB[PSM$B_PREFIX_CHAR] = PSM$K_CHAR_LF;
+	IF .SCB[PSM$B_POSTFIX_CHAR] EQL 0
+	THEN
+	    SCB[PSM$B_POSTFIX_CHAR] = PSM$K_CHAR_LF
+	END;
+
+    TES;
+
+RETURN SS$_NORMAL;
+
+END;
+
+%SBTTL 'ENQUEUE_CHECKPOINT - add a checkpoint to the checkpoint queue'
+! Functional Description:
+!		This routine manages additions to the checkpoint queue.
+!
+! Formal Parameters:
+!		SCB	: SCB address
+!		CKP_DESC: address of the checkpoint descriptor
+!
+! Implicit Inputs:
+!		Checkpoint queue header
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		The checkpoint is enqueued.  Memory may be allocated.
+!		The queue may be flushed.
+!--
+ROUTINE ENQUEUE_CHECKPOINT ( 
+	SCB		: REF $BBLOCK,
+	CKP_DESC	: REF VECTOR
+	) : NOVALUE =
+BEGIN
+
+LOCAL
+	DSB		: REF $BBLOCK
+	;
+
+
+! If the queue has reached its maximum depth then flush it by
+! discarding every other checkpoint
+!
+IF .SCB[PSM$B_CHECKPOINT_DEPTH] GTR PSM$K_CHECKPOINT_LIMIT
+THEN
+    BEGIN
+    LOCAL FIRST_DSB	: REF $BBLOCK,
+	  TOGGLE	: INITIAL (0);
+
+
+    ! Scan the queue by removing each checkpoint.  Every other
+    ! checkpoint is requeued.
+    !
+    FIRST_DSB = .FLINK_ (SCB[PSM$Q_CHECKPOINT_QUEUE]);
+    DO
+	BEGIN
+	REMOVE_HEAD_ (DSB, SCB[PSM$Q_CHECKPOINT_QUEUE]);
+	DSB = .DSB - $BYTEOFFSET (DSB_Q_QLINKS);
+	IF .TOGGLE
+	THEN
+	    BEGIN
+	    PSM$DEALLOCATE_DSB (.DSB);
+	    DECREMENT_ (SCB[PSM$B_CHECKPOINT_DEPTH]);
+	    IF .SCB[PSM$B_CHECKPOINT_DEPTH] LSS 0 THEN CODEERR_ ;
+	    END
+	ELSE
+	    INSERT_TAIL_ (DSB[DSB_Q_QLINKS], SCB[PSM$Q_CHECKPOINT_QUEUE]);
+	INCREMENT_ (TOGGLE);
+	END
+    UNTIL
+	.FLINK_ (SCB[PSM$Q_CHECKPOINT_QUEUE]) EQL .FIRST_DSB;
+    END;
+
+
+! Allocate a dynamic string block, copy and enqueue the checkpoint
+!
+PSM$ALLOCATE_DSB (DSB);
+COPY_DX_DX_ (CKP_DESC[0], DSB[DSB_Q_DESC]);
+INSERT_TAIL_ (DSB[DSB_Q_QLINKS], SCB[PSM$Q_CHECKPOINT_QUEUE]);
+
+
+! Increment the checkpoint depth and check for coding error
+!
+INCREMENT_ (SCB[PSM$B_CHECKPOINT_DEPTH]);
+IF .SCB[PSM$B_CHECKPOINT_DEPTH] LSS 0 THEN CODEERR_ ;	! > 128
+
+SS$_NORMAL
+
+END;
+
+%SBTTL 'EXPAND_CONDITION_VECTOR - expand condition codes to text'
+! Functional Description:
+!		Expands a list of condition codes to concatenated
+!		text messages.
+!
+! Formal Parameters:
+!		SCB	: SCB address
+!		MSGCNT	: number of longwords in message vector
+!		MSGVEC	: address of message vector
+!		DESC	: address of descriptor to receive text
+!
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		none
+!--
+GLOBAL ROUTINE EXPAND_CONDITION_VECTOR ( 
+	SCB	: REF $BBLOCK,
+	MSGCNT	,
+	MSGVEC	: REF VECTOR,
+	DESC	: REF VECTOR		! Dynamic descriptor to receive message
+	)	: NOVALUE =
+BEGIN
+
+BUILTIN	AP;
+LOCAL	TEMP : VECTOR [20];
+
+
+! Create a vector with message count in front, followed by messages
+!
+TEMP[0] = .MSGCNT;
+CH$COPY (.MSGCNT * 4, .MSGVEC, 0, %ALLOCATION (TEMP) - 4, TEMP[1]);
+
+
+! Call $PUTMSG to look up text
+!
+SIGNAL_IF_ERROR_ ($PUTMSG (MSGVEC=TEMP, ACTRTN=PUTMSG_ACTION,
+	ACTPRM=.DESC));
+
+END;
+
+%SBTTL 'FIND_CHECKPOINT -- locate an appropriate checkpoint'
+! Functional Description:
+!		Searches the checkpoint queue for the closest checkpoint
+!		that preceeds the target page.
+!
+! Formal Parameters:
+!		SCB:	SCB ADDRESS
+!
+! Implicit Inputs:
+!		Checkpoint queue, start page
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		Address of checkpoint or zero
+!
+! Side Effects:
+!		none
+!--
+ROUTINE FIND_CHECKPOINT ( 
+	SCB		: REF $BBLOCK
+	) =
+BEGIN
+
+LOCAL
+	CLOSEST	: REF $BBLOCK INITIAL (0),	! Best checkpoint found
+	DSB	: REF $BBLOCK			! dynamic string block
+	;
+
+
+! Initialize the queue pointer to the first item in the queue
+!
+DSB = .FLINK_ (SCB[PSM$Q_CHECKPOINT_QUEUE]);
+
+
+! Search the queue until we return to the queue header
+!
+UNTIL .DSB EQL SCB[PSM$Q_CHECKPOINT_QUEUE]
+DO
+    BEGIN
+    BIND CKP = .DESC_ADDR_ (DSB[DSB_Q_DESC]) : $BBLOCK;
+
+    ! If this checkpoint preceeds the target page and is closer
+    ! than any other then save it
+    !
+    IF .CKP[SMBMSG$L_PAGE] LEQ .SCB[PSM$L_START_PAGE]
+    THEN
+	IF .CLOSEST EQL 0 THEN CLOSEST = CKP
+	ELSE
+	    IF .CKP[SMBMSG$L_PAGE] GTRU .CLOSEST[SMBMSG$L_PAGE]
+	    THEN
+		CLOSEST = CKP;
+
+    ! Advance to the next queue entry
+    !
+    DSB = .FLINK_ (DSB[DSB_Q_QLINKS]);
+    END;
+
+
+! Return the address of the checkpoint if a useable one was found
+!
+IF .CLOSEST NEQ 0
+THEN
+    ! If current page greater than target page,
+    ! or current page less than checkpoint page
+    !
+    IF .SCB[PSM$L_PAGE] GTRU .SCB[PSM$L_START_PAGE]
+    OR .SCB[PSM$L_PAGE] LSSU .CLOSEST[SMBMSG$L_PAGE]
+    THEN
+	.CLOSEST
+    ELSE
+	0
+ELSE
+    0
+
+END;
+
+%SBTTL 'GET_BUFFER - Get an output buffer (IOB)'
+! Functional Description:
+!		Allocates and initializes an IOB (Input/Output buffer
+!		control Block)
+!
+! Formal Parameters:
+!		SCB	: SCB address
+!
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		SS$_NORMAL if successful
+!		0 if no IOB's available
+!
+! Side Effects:
+!		Allocates and initializes the IOB queue the first
+!		time this routine is called.
+!--
+ROUTINE GET_BUFFER ( 
+	SCB	: REF $BBLOCK
+	)	=
+BEGIN
+
+LOCAL
+	IOB	: REF $BBLOCK
+	;
+
+! If their is already an IOB attached to the SCB then we are done
+!
+IF .SCB[PSM$A_IOB] NEQ 0
+THEN
+    RETURN SS$_NORMAL;
+
+
+! If the queue has never been initialized then do it
+!
+IF .FLINK_ (SCB[PSM$Q_BUFFER_QUEUE]) EQL 0
+THEN
+    BEGIN
+    INIT_QUEUE_HEADER_ (SCB[PSM$Q_BUFFER_QUEUE]);
+
+    ! Allocate as many IOB's for this SCB as specified by NUMOUTBUF
+    !
+    DECR I FROM PSM$K_NUMOUTBUF TO 1
+    DO
+	BEGIN
+	PSM$ALLOCATE_IOB (IOB, PSM$GL_MAXBUF);
+	IOB[IOB_A_CONTEXT] = .SCB;
+	INSERT_TAIL_ (IOB[IOB_Q_QLINKS], SCB[PSM$Q_BUFFER_QUEUE]);
+	END;
+    END;
+
+
+! Get an IOB, return if none available
+!
+IF REMOVE_HEAD_ (IOB, SCB[PSM$Q_BUFFER_QUEUE]) THEN RETURN 0;
+
+
+! Adjust the IOB address, clear the IOB flags, and attach the
+! IOB to the SCB.
+!
+IOB = .IOB - $BYTEOFFSET (IOB_Q_QLINKS);
+IOB[IOB_L_FLAGS] = 0;
+SCB[PSM$A_IOB] = .IOB;
+
+
+! Initialize the buffer descriptor
+!
+VECTOR [SCB[PSM$Q_OUTPUT_BUFFER], 0] = .DESC_SIZE_ (IOB[IOB_Q_BUFFER]);
+VECTOR [SCB[PSM$Q_OUTPUT_BUFFER], 1] = .DESC_ADDR_ (IOB[IOB_Q_BUFFER]);
+
+SS$_NORMAL
+
+END;
+
+%SBTTL 'HANDLER -- main signal handler'
+! Functional Description:
+!		Catches signals, inhibits text expansion, and resignals
+!
+! Formal Parameters:
+!		STANDARD SIGNAL ARGUMENTS
+!
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		none
+!--
+ROUTINE HANDLER (SIGARGS: REF BLOCK [, BYTE]) =
+
+BEGIN
+
+! Disable expansion of error condition to text
+!
+SIGARGS [CHF$L_SIG_NAME] = .SIGARGS [CHF$L_SIG_NAME] OR STS$M_INHIB_MSG;
+
+SS$_RESIGNAL
+
+END;
+
+%SBTTL 'PUTMSG_ACTION - action routine for $PUTMSG call'
+! Functional Description:
+!		Adds carraige control and appends the messages into
+!		the SCB.
+!
+! Formal Parameters:
+!		Standard $PUTMSG action routine interface
+!
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		The message text is appended to the appropriate descriptor
+!		in the SCB.
+!--
+ROUTINE PUTMSG_ACTION ( 
+	MSG_DESC	: REF $BBLOCK,
+	DYN_DESC
+	) =
+BEGIN
+
+BIND FORMAT = $DESCRIPTOR ('!/!AS',  %CHAR (PSM$K_CHAR_CR));
+
+LOCAL
+	WRK_DESC:	VECTOR [2],
+	WRK_BUFF:	VECTOR [512, BYTE]
+	;
+
+! Setup a work descriptor
+!
+WRK_DESC [0] = %ALLOCATION (WRK_BUFF);
+WRK_DESC [1] = WRK_BUFF;
+
+
+! Call FAO to add carriage control
+!
+$FAO (FORMAT, WRK_DESC, WRK_DESC, .MSG_DESC);
+
+
+! Append the resulting message to the specified descriptor
+!
+SIGNAL_IF_ERROR_ (STR$APPEND (.DYN_DESC, WRK_DESC));
+
+RETURN 0;
+
+END;
+
+%SBTTL 'RESUME_SERVICE - Resume a previously suspended service'
+! Functional Description:
+!		Resumes the input service at the top of the service
+!		stack and resets the SCB values that were in effect
+!		when the service was suspended.
+!
+! Formal Parameters:
+!		SCB	: SCB ADDRESS
+!
+! Implicit Inputs:
+!		Input service queue header
+!
+! Implicit Outputs:
+!		Context values that are preserved when a service is
+!		suspended are restored.
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		The service is popped from the input service stack.
+!--
+ROUTINE RESUME_SERVICE ( 
+	SCB	: REF $BBLOCK
+	)	: NOVALUE =
+BEGIN
+
+LOCAL
+	DSB : REF $BBLOCK
+	;
+
+! Decrement the depth and check for coding error
+!
+DECREMENT_ (SCB[PSM$B_INPUT_DEPTH]);
+IF .SCB[PSM$B_INPUT_DEPTH] LSS 0
+THEN
+    CODEERR_ ;
+
+
+! Release any dynamic memory of current stream
+!
+CLEAR_STRING_ (SCB[PSM$Q_INPUT_RECORD]);
+CLEAR_STRING_ (SCB[PSM$Q_USER_RECORD]);
+
+
+! Get the context block for the previous stream
+!
+IF REMOVE_HEAD_ (DSB, SCB[PSM$Q_INPUT_QUEUE]) THEN CODEERR_ ;
+DSB = .DSB - $BYTEOFFSET (DSB_Q_QLINKS);
+
+
+! Overlay the context area in the SCB
+!
+CH$MOVE (PSM$S_SERVICE_CONTEXT, .DESC_ADDR_ (DSB[DSB_Q_DESC]),
+    SCB[PSM$R_SERVICE_CONTEXT]);
+
+
+! Release the context block
+!
+PSM$DEALLOCATE_DSB (.DSB);
+
+END;
+
+%SBTTL 'SAVE_CHECKPOINT - Build a checkpoint item'
+! Functional Description:
+!		Builds a checkpoint item from values in the SCB and from
+!		a READ_KEY operation to the current input service.
+!
+! Formal Parameters:
+!		SCB	: SCB address
+!
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		none
+!--
+ROUTINE SAVE_CHECKPOINT ( 
+	SCB	: REF $BBLOCK
+	)	: NOVALUE =
+BEGIN
+
+LOCAL
+	CKP_DESC	: VECTOR [2],
+	KEY_DESC	: VECTOR [2] PRESET ([0]=0, [1]=0)
+	;
+
+BIND
+	IOB = .SCB[PSM$A_IOB] : $BBLOCK,		! Current output blcok
+	CKP = IOB[IOB_T_CHECKPOINT_DATA] : $BBLOCK	! Checkpoint area in IOB
+	;
+
+BEGIN
+
+! Locate the current input service
+!
+BIND SERVICE = PSM$SRV[.SCB[PSM$B_SERVICE_INDEX],0,0,0,0] : $BBLOCK;
+LOCAL FUNCTION_STATUS;
+
+
+! Call the current input service to obtain the record key
+!
+FUNCTION_STATUS = BLISS (
+    .SERVICE[SRV_A_SERVICE],		!  - current input service
+    SCB,				!  - SCB address by reference
+    SCB[PSM$R_USER_CONTEXT_AREA],	!  - user context area
+    UPLIT (PSM$K_GET_KEY),		!  - GET_KEY function
+    KEY_DESC,				!  - output key desc
+    0);					!  - <not used>
+
+! Case on the status
+!
+SELECTONEU .FUNCTION_STATUS OF
+    SET
+
+
+    ! Asynchronous read_key operations not allowed
+    !
+
+    [PSM$_PENDING]:
+	CODEERR_ ;
+
+
+    ! If not supported, then return that as our status
+    !
+
+    [PSM$_FUNNOTSUP]:
+	RETURN PSM$_FUNNOTSUP;
+
+
+    ! If errors then store them and return the error
+    !
+
+    [OTHERWISE]:
+	IF NOT .FUNCTION_STATUS
+	THEN
+	    BEGIN
+	    PSM$STORE_ERRORS (.SCB, .FUNCTION_STATUS);
+	    RETURN .FUNCTION_STATUS;
+	    END;
+    TES;
+END;
+
+! We have a key -- check the size and copy it into 
+!
+IF .KEY_DESC[0] GTRU SMBMSG$S_USER_KEY THEN CODEERR_ ;
+CH$COPY (.KEY_DESC[0], .KEY_DESC[1], 0,
+    SMBMSG$S_USER_KEY, CKP[SMBMSG$Q_USER_KEY]);
+
+
+! Build the rest of the checkpoint
+!
+CKP[SMBMSG$B_CHECKPOINT_LEVEL] = SMBMSG$K_STRUCTURE_LEVEL;
+CKP[SMBMSG$W_OFFSET] = .SCB_SIZE_ (USER_RECORD) - .SCB_SIZE_ (INPUT_RECORD);
+CKP[SMBMSG$L_CARCON] = .SCB[PSM$L_CARCON];
+CKP[SMBMSG$L_PAGE] = .SCB[PSM$L_PAGE];
+CKP[SMBMSG$L_RECORD_NUMBER] = .SCB[PSM$L_RECORD_NUMBER];
+
+
+! Mark this IOB as having a checkpoint assoicated with it.
+!
+IOB[IOB_V_CHECKPOINT_PENDING] = 1;
+
+
+! Build a descriptor of the checkpoint
+!
+CKP_DESC[0] = SMBMSG$S_CHECKPOINT_DATA;
+CKP_DESC[1] = CKP;
+
+
+! Place it in the checkpoint queue
+!
+ENQUEUE_CHECKPOINT (.SCB, CKP_DESC[0]);
+
+
+SS$_NORMAL
+
+END;
+
+%SBTTL 'SCHEDULE_SERVICE -- determine the next input service to process'
+! Functional Description:
+!		Looks for an input service to process.  The primary list
+!		of services is established by a bit vector.  Additional
+!		sources of input are page headers, page setup, included modules,
+!		and previously suspended input services.
+!
+! Formal Parameters:
+!		SCB	: SCB address
+!
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		SS$_NORMAL	- Service located
+!		PSM$_EOF	- No input services remain
+!
+! Side Effects:
+!		An input service may be dequeued from the input stack,
+!		or removed from the outstanding service list.
+!--
+
+ROUTINE SCHEDULE_SERVICE ( 
+	SCB	: REF $BBLOCK
+	)	=
+BEGIN
+
+BIND
+	LIST	= SCB[PSM$L_SERVICE_LIST] : BITVECTOR
+	;
+
+LOCAL
+	PIDX	: INITIAL (0)		! Index into service list
+	;
+
+! Reset values for new input service
+!
+SCB[PSM$L_RECORD_NUMBER] = 0;
+SCB[PSM$V_READ_OFFSET] = 0;
+SCB[PSM$V_FIRST_RECORD] = 1;
+SCB[PSM$B_SERVICE_INDEX] = 0;
+
+
+! If there are any pending modules then select the LIBRARY_INPUT service
+! to process them.
+!
+IF STRIP_COMMA_DELIMITED_ITEM (SCB[PSM$Q_MODULE_LIST], SCB[PSM$Q_MODULE_NAME])
+THEN
+    BEGIN
+    SCB[PSM$B_SERVICE_INDEX] = PSM$K_LIBRARY_INPUT;
+    RETURN SS$_NORMAL;
+    END;
+
+
+! If page setup has been requested then schedule it
+!
+IF TESTBITSC (LIST[PSM$K_PAGE_SETUP])
+THEN
+    BEGIN
+    SCB[PSM$B_SERVICE_INDEX] = PSM$K_PAGE_SETUP;
+    RETURN SS$_NORMAL;
+    END;
+
+
+! Similarily, if page header has been requested then schedule it
+!
+IF TESTBITSC (LIST[PSM$K_PAGE_HEADER])
+THEN
+    BEGIN
+    SCB[PSM$B_SERVICE_INDEX] = PSM$K_PAGE_HEADER;
+    RETURN SS$_NORMAL;
+    END;
+
+
+! If there is a suspended input service then resume it
+!
+IF .SCB[PSM$B_INPUT_DEPTH] GTRU 0
+THEN
+    BEGIN
+    RESUME_SERVICE (.SCB);
+    RETURN SS$_NORMAL;
+    END;
+
+
+! This is a brand new input service -- reset values
+!
+SCB[PSM$L_PAGE] = 1;
+SCB[PSM$L_PRINT_FLAGS] = 0;
+SCB[PSM$L_L_MARGIN] = 0;
+SCB[PSM$L_T_MARGIN] = 0;
+
+
+! Scan the service list for a pending input service
+!
+UNTIL FFS (PIDX, UPLIT (PSM$K_MAX), LIST, PIDX)	! False until list empty
+DO
+    BEGIN
+    SCB[PSM$B_SERVICE_INDEX] = .PIDX;
+    LIST[.PIDX] = 0;
+    IF .PSM$SRV[.PIDX, SRV_A_SERVICE] NEQ 0
+    THEN
+	RETURN SS$_NORMAL;
+    END;
+
+
+! No service found, return EOF
+!
+PSM$_EOF
+
+END;
+
+%SBTTL 'SEARCH_FOR_STRING - Search for a string in a buffer'
+! Functional Description:
+!		This routine looks for a search string in the current
+!		input record.  It maintains context across calls so that
+!		strings that cross record boundaries can be located.
+!
+! Formal Parameters:
+!		SCB	: SCB address
+!		KEY	: descriptor of search key
+!		TARGET	: descriptor of input record
+!
+! Implicit Inputs:
+!		SCB[PSM$Q_SEARCH_CONTEXT]	- context from last call
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		SS$_NORMAL	- the KEY was found in the TARGET
+!		0		- KEY was not found
+! Side Effects:
+!		none
+!--
+GLOBAL ROUTINE SEARCH_FOR_STRING ( 
+	SCB	: REF $BBLOCK,
+	KEY	: REF $BBLOCK,
+	TARGET	: REF $BBLOCK
+	) =
+BEGIN
+
+LOCAL	PTR;
+
+! Append the input record to the context from the last call
+!
+STR$APPEND (SCB[PSM$Q_SEARCH_CONTEXT], .TARGET);
+
+
+! Compress white space (blanks and tabs) to a single space and upcase
+!
+BAS$EDIT (SCB[PSM$Q_SEARCH_CONTEXT], SCB[PSM$Q_SEARCH_CONTEXT], EDIT_MASK);
+
+
+! Look for the key as a substring of the target
+!
+PTR = CH$FIND_SUB (
+	.SCB_SIZE_ (SEARCH_CONTEXT),	! Target appended to remainder
+	.SCB_ADDR_ (SEARCH_CONTEXT),
+	.DESC_SIZE_ (.KEY),		! Search key
+	.DESC_ADDR_ (.KEY)
+		);
+
+! Extract the last few characters of the input record as the context
+! for the next call
+!
+STR$RIGHT (
+	SCB[PSM$Q_SEARCH_CONTEXT],
+	SCB[PSM$Q_SEARCH_CONTEXT],
+	%REF (.SCB_SIZE_ (SEARCH_CONTEXT) - .DESC_SIZE_ (.KEY) + 1)
+	);
+
+
+! Return 0 if not found, SS$_normal if located
+!
+IF CH$FAIL (.PTR)
+THEN
+    0
+ELSE
+    SS$_NORMAL
+
+END;
+
+%SBTTL 'STRIP_COMMA_DELIMITED_ITEM -- remove item from comma separate list'
+! Functional Description:
+!		This routine removes one item from the front of a comma
+!		separated list.
+!
+! Formal Parameters:
+!		INPUT	: descriptor of input list
+!		OUTPUT	: removed item
+!
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		The INPUT list is rewritten with the item removed
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		none
+!--
+ROUTINE STRIP_COMMA_DELIMITED_ITEM ( 
+	INPUT	: REF $BBLOCK,
+	OUTPUT	: REF $BBLOCK
+	) =
+BEGIN
+
+LOCAL PTR;
+
+! If nothing to do then return
+!
+IF .DESC_SIZE_ (.INPUT) EQL 0 THEN RETURN 0;
+
+
+! Locate the first comma or end of string
+!
+PTR = CH$FIND_CH (.DESC_SIZE_ (.INPUT), .DESC_ADDR_ (.INPUT), %C ',');
+
+
+! If no comma found the the entire input string is the resultant item
+! and the input descriptor can be released
+!
+IF CH$FAIL (.PTR)
+THEN
+    BEGIN
+    COPY_DX_DX_ (.INPUT, .OUTPUT);
+    STR$FREE1_DX (.INPUT);
+    END
+ELSE
+    ! Comma found -- move the item from input list to output list
+    !
+    BEGIN
+    PTR = .PTR - .DESC_ADDR_ (.INPUT);
+    STR$LEFT (.OUTPUT, .INPUT, PTR);
+    PTR = .PTR + 2;
+    STR$RIGHT (.INPUT, .INPUT, PTR);
+    END;
+
+
+! Return success
+!
+SS$_NORMAL
+
+END;
+
+%SBTTL 'SUSPEND_SERVICE -- suspend the current input service'
+! Functional Description:
+!		Suspends the current input service by placing its
+!		context on an input service stack.
+!
+! Formal Parameters:
+!		SCB	: SCB address
+!
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		The current service is placed on the stack
+!--
+GLOBAL ROUTINE SUSPEND_SERVICE (
+	SCB	: REF $BBLOCK
+	) : NOVALUE =
+BEGIN
+
+LOCAL
+	DSB : REF $BBLOCK
+	;
+
+
+! Increment the stack depth and check for overflow
+!
+INCREMENT_ (SCB[PSM$B_INPUT_DEPTH]);
+IF .SCB[PSM$B_INPUT_DEPTH] GTR 15
+THEN
+    BEGIN
+    PSM$STORE_ERRORS (.SCB, PSM$_TOOMANYLEV, 1, .SCB[PSM$L_RECORD_NUMBER]);
+    RETURN;
+    END;
+
+
+! Get a Dynamic String control Block and copy the service context area into it.
+!
+PSM$ALLOCATE_DSB (DSB);
+COPY_R_DX_ (UPLIT WORD (PSM$S_SERVICE_CONTEXT), SCB[PSM$R_SERVICE_CONTEXT],
+    DSB[DSB_Q_DESC]);
+
+
+! Place it in the input queue
+!
+INSERT_HEAD_ (DSB[DSB_Q_QLINKS], SCB[PSM$Q_INPUT_QUEUE]);
+
+
+! Clear the service context area
+!
+CH$FILL (0, PSM$S_SERVICE_CONTEXT, SCB[PSM$R_SERVICE_CONTEXT]);
+
+END;
+
+END
+ELUDOM

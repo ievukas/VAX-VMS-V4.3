@@ -1,0 +1,579 @@
+MODULE DEACCS (
+		LANGUAGE (BLISS32),
+		IDENT = 'V04-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 2
+!
+! ABSTRACT:
+!
+!	This routine implements the DEACCESS function.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  6-Jan-1977  23:29
+!
+! MODIFIED BY:
+!
+!	V03-012	CDS0008		Christian D. Saether	21-Aug-1984
+!		Changes to handle stale fcbs.
+!
+!	V03-011	CDS0007		Christian D. Saether	19-Apr-1984
+!		Many changes to reflect modified access lock handling.
+!
+!	V03-010	CDS0006		Christian D. Saether	29-Dec-1983
+!		Use L_NORM linkage and BIND_COMMON macro.
+!
+!	V03-009	CDS0005		Christian D. Saether	23-Sep-1983
+!		Manually merge in ACG0343, ACG59616, STJ3109.
+!
+!	V03-008	ACG0343		Andrew C. Goldstein,	19-Jul-1983  16:46
+!		Inhibit revision date count if NORECORD is specified
+!
+!	V03-007	ACG59616	Andrew C. Goldstein,	21-Jun-1983  15:53
+!		Create common subroutine for revision and expiration dates
+!
+!	V03-006	STJ3109		Steven T. Jeffreys,	06-Jun-1983
+!		Copy FHWM from FCB to file header.
+!
+!	V03-005	CDS0004		Christian D. Saether	14-Sep-1983
+!		Modify SERIAL_FILE interface.
+!
+!	V03-004	LMP0149		L. Mark Pilant,		13-Sep-1983  11:26
+!		Correct a logic problem that caused problems during the
+!		protection check of a write attribute operation.
+!
+!	V03-003	CDS0003		Christian D. Saether	 4-May-1983
+!		Sychronize processing by FID using SERIAL_FILE.
+!
+!	V03-002	CDS0002		Christian D. Saether	21-Apr-1983
+!		Modify truncate access arbitration checks to permit
+!		cluster operation.  Possibly defer truncation or
+!		perform a deferred truncate operation.
+!
+!	V03-001	CDS0001		Christian D. Saether	 7-Apr-1983
+!		Make mark-for-delete checks work in a cluster.
+!
+!	V02-006	ACG0258		Andrew C. Goldstein,	26-Jan-1982  16:56
+!		Fix reference to RVN 1 in expiration date processing
+!
+!	V02-005	ACG0230		Andrew C. Goldstein,	23-Dec-1981  23:46
+!		Add expiration date support
+!
+!	V02-004	ACG0247		Andrew C. Goldstein,	23-Dec-1981  20:49
+!		Update revision count only if written
+!
+!	V02-003	ACG0245		Andrew C. Goldstein,	23-Dec-1981  20:48
+!		Move queueing of spool file to cleanup
+!
+!	V02-002	ACG0167		Andrew C. Goldstein,	16-Apr-1980  19:25
+!		Previous revision history moved to [F11B.SRC]F11B.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+FORWARD ROUTINE
+	SET_REVISION	: L_NORM NOVALUE, ! set revision and expiration date
+	TRUNC_HANDLER;			! handler for delayed truncate
+
+GLOBAL ROUTINE DEACCESS  : L_NORM =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine implements the DEACCESS function.
+!	If an attribute list is present, attributes are written.
+!
+! CALLING SEQUENCE:
+!	DEACCESS ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	IO_PACKET: I/O packet in process
+!	CURRENT_WINDOW: window of file
+!	PRIMARY_FCB: FCB of file
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	file deaccessed
+!	FCB may be deleted
+!	header may be modified
+!
+!--
+
+BEGIN
+
+LABEL
+	DELAY_TRUNC;			! truncation delay block
+
+LOCAL
+	DO_EXPIRE,			! flag indicating expiration to be updated
+	MODIFIED,			! flag indicating file has been modified
+	K,				! local copy of truncate lock count
+	ABD		: REF BBLOCKVECTOR [,ABD$C_LENGTH],
+	FIB		: REF BBLOCK,	! FIB
+	FCB		: REF BBLOCK,	! pointer to FCB
+	HEADER		: REF BBLOCK;	! file header
+
+BIND_COMMON;
+
+EXTERNAL ROUTINE
+	REBLD_PRIM_FCB	: L_NORM NOVALUE, ! rebuild primary fcb from header
+	BUILD_EXT_FCBS	: L_NORM NOVALUE, ! build extension fcb chain
+	CONV_ACCLOCK	: L_NORM,	! convert access lock.
+	LOCK_COUNT	: L_NORM,	! get count of granted locks.
+	SERIAL_FILE	: L_NORM,	! interlock file processing
+	TRUNC_CHECKS	: L_JSB_2ARGS NOVALUE, ! parameter checks
+	GET_FIB		: L_NORM,	! get FIB of request
+	READ_HEADER	: L_NORM,	! read file header
+	MARK_DIRTY	: L_NORM,	! mark buffer for write-back
+	WRITE_ATTRIB	: L_NORM,	! write attributes routine
+	TRUNCATE	: L_NORM,	! truncate file
+	UPDATE_FCB	: L_NORM,	! update contents of FCB
+	CHECKSUM	: L_NORM;	! compute file header checksum
+
+! Set the cleanup flags to cause the deaccess to occurr.
+! Find the buffer descriptor and FIB.
+!
+
+CLEANUP_FLAGS[CLF_ZCHANNEL] = 1;
+CLEANUP_FLAGS[CLF_DEACCESS] = 1;
+CLEANUP_FLAGS[CLF_DELWINDOW] = 1;
+
+					! pointer to buffer descriptors
+ABD = .BBLOCK [.IO_PACKET[IRP$L_SVAPTE], AIB$L_DESCRIPT];
+FIB = GET_FIB (.ABD);
+FCB = .PRIMARY_FCB;
+
+! Synchronize further file processing.
+!
+
+PRIM_LCKINDX = SERIAL_FILE (FCB [FCB$W_FID]);
+
+! Make sure irrelevant parameters are not present.
+!
+
+IF .FIB[FIB$V_EXTEND]
+THEN ERR_STATUS (SS$_BADPARAM);
+
+! If the access lock is held in NL mode, and this file is cluster
+! accessible, then set the stale flag to force rebuild of the fcbs
+! from the header(s).
+!
+
+IF .FCB [FCB$B_ACCLKMODE] EQL LCK$K_NLMODE
+    AND .FCB [FCB$L_ACCLKID] NEQ 0
+THEN
+    FCB [FCB$V_STALE] = 1;
+
+! Determine if the expiration date is to be updated, and if the file has
+! actually been modified.
+!
+
+DO_EXPIRE = .CURRENT_WINDOW[WCB$V_EXPIRE]
+	  AND NOT .FIB[FIB$V_NORECORD]
+	  AND (.CURRENT_WINDOW[WCB$L_WRITES] NEQ 0
+	      OR .CURRENT_WINDOW[WCB$L_READS] NEQ 0
+	      OR .FCB[FCB$L_EFBLK] EQL 0);
+MODIFIED =  .CURRENT_WINDOW[WCB$V_WRITE]
+	  AND NOT .FIB[FIB$V_NORECORD]
+	  AND (.CURRENT_WINDOW[WCB$L_WRITES] NEQ 0
+	      OR .IO_PACKET[IRP$W_BCNT] GTRU ABD$C_ATTRIB
+	      OR .FIB[FIB$V_TRUNC]);
+
+! If the file is accessed for write, if we must update the expiration
+! date, or if the file is marked for delete or is marked bad and this
+! is the last access, read the header.
+!
+
+IF .CURRENT_WINDOW[WCB$V_WRITE]
+OR .DO_EXPIRE
+OR ((.FCB[FCB$V_MARKDEL]
+	OR .FCB [FCB$V_DELAYTRNC]
+	OR .FCB [FCB$V_STALE]
+	OR .FCB[FCB$V_BADBLK]
+	OR .CLEANUP_FLAGS[CLF_SPOOLFILE])
+    AND .FCB[FCB$W_REFCNT] EQL 1)
+THEN
+    BEGIN
+    HEADER = READ_HEADER (0, .FCB);
+
+    IF .FCB [FCB$V_STALE]
+    THEN
+	BEGIN
+	REBLD_PRIM_FCB (.FCB, .HEADER);
+	BUILD_EXT_FCBS (.HEADER);
+	END;
+    END;
+
+! If this the last deaccess from a file marked for delete, delete the file.
+! If the file is a spool file, send it to the job controller.
+!
+
+IF .FCB[FCB$W_REFCNT] EQL 1
+THEN
+    BEGIN
+    IF .FCB[FCB$V_MARKDEL]
+    THEN
+
+! Make sure we are the only accessor left in the entire cluster.
+!
+
+	IF LOCK_COUNT (.FCB [FCB$L_ACCLKID]) EQL 1
+	THEN
+	    CLEANUP_FLAGS [CLF_DELFILE] = 1;
+
+    IF .CLEANUP_FLAGS[CLF_SPOOLFILE]
+    THEN CLEANUP_FLAGS[CLF_DOSPOOL] = 1;
+
+! If the FCB is marked bad, now set the bad block bit in the file header.
+!
+
+    IF .FCB[FCB$V_BADBLK]
+    THEN
+	BEGIN
+	HEADER[FH2$V_BADBLOCK] = 1;
+	MARK_DIRTY (.HEADER);
+	END;
+    END;
+
+! Update revision count, date, and expiration date as appropriate.
+!
+
+IF .MODIFIED
+OR .DO_EXPIRE
+THEN SET_REVISION (.HEADER, .MODIFIED);
+
+! Do deaccess processing for a write accessed file. If a deaccess lock
+! was requested on the file, set the lock bit. Then process the write
+! attributes, if any. If attributes were written, then clear the
+! lock bit.
+!
+
+IF .CURRENT_WINDOW[WCB$V_WRITE]
+THEN
+    BEGIN
+    MARK_DIRTY (.HEADER);
+
+    ! Update the FHWM in the file header.
+    !
+    !  o If the FHWM is not supported in this header, do nothing.
+    !
+    !  o If the volume FHWM attribute is disabled, then set the FHWM
+    !    to the file size + 1.  This will protect the contents of the
+    !    file should it be opened and modified some time in the future
+    !    when the volume's FHWM attribute is enabled.
+    !
+    !  o If the FCB FHWM is 0, and the file header supports FHWM, then
+    !    set the header's FHWM to the file size + 1.  This will likewise
+    !    protect the file contents.
+    !
+    !  o If the FCB FHWM is nonzero, and the file header supports FHWM, and
+    !    the volume FHWM attribute is enabled, simply copy the FCB FHWM to
+    !	 the file header.
+    !
+    ! For FHWM to be supported, the 'highwater' field in the
+    ! header must be present.  All files created on version 4
+    ! or later systems will have this characteristic.
+    !
+
+    IF  .HEADER[FH2$B_IDOFFSET] GEQU ($BYTEOFFSET(FH2$L_HIGHWATER)+4)/2
+    THEN
+	IF .CURRENT_VCB[VCB$V_NOHIGHWATER]
+	OR .FCB[FCB$L_HIGHWATER] EQL 0
+	THEN
+	    HEADER[FH2$L_HIGHWATER] = .FCB[FCB$L_FILESIZE] + 1
+	ELSE
+	    HEADER[FH2$L_HIGHWATER] = .FCB[FCB$L_HIGHWATER];
+
+
+    IF .CURRENT_WINDOW[WCB$V_DLOCK]
+    THEN HEADER[FH2$V_LOCKED] = 1;
+
+    IF .IO_PACKET[IRP$W_BCNT] GTR ABD$C_ATTRIB
+    AND .USER_STATUS[0]
+    THEN
+	BEGIN
+	WRITE_ATTRIB (.HEADER, .ABD, 0);
+	HEADER = .FILE_HEADER;
+	HEADER[FH2$V_LOCKED] = 0;
+	END;
+
+! If a truncate is requested, do it, if the file was write accessed and
+! there are not other accessors now, else delay the truncation until
+! the last reader deaccess.
+!
+
+    IF .FIB[FIB$V_TRUNC]
+	AND NOT .FCB [FCB$V_MARKDEL]
+    THEN
+	BEGIN
+	IF .CURRENT_VCB[VCB$V_NOALLOC]
+	THEN ERR_EXIT (SS$_WRITLCK);
+
+	IF .FCB [FCB$W_REFCNT] EQL 1
+	    AND LOCK_COUNT (.FCB [FCB$L_ACCLKID]) EQL 1
+	THEN
+	    BEGIN
+
+	    CHECKSUM (.HEADER);
+	    TRUNCATE (.FIB, .HEADER, .FIB [FIB$L_EXVBN]);
+	    CLEANUP_FLAGS[CLF_FIXFCB] = 0;
+	    UPDATE_FCB (.FILE_HEADER);
+	    END
+	ELSE
+	    IF .FCB [FCB$W_WCNT] EQL 1	! 1 is just us.
+		AND (.FCB [FCB$V_EXCL]	! must be a NOLOCK somewhere
+		OR .FCB [FCB$W_LCNT] NEQ 0 ! must be us
+		OR CONV_ACCLOCK (LCK$K_PWMODE, .FCB))
+						! lock will be converted back
+						! in MAKE_DEACCESS
+
+! There are other readers, but no writers, accessing the file, so we will make
+! checks to see if the truncation arguments make sense, and if so,
+! store appropriate context in the FCB so that the last reader to deaccess
+! the file will perform the truncation.
+!
+
+	    THEN
+		BEGIN
+		LOCAL
+		    TRNVBN;
+
+		TRNVBN = .FIB [FIB$L_EXVBN];
+		TRUNC_CHECKS (.FIB, .HEADER);
+
+! lock will be converted when new lock mode is calcuated and lock
+! converted in MAKE_DEACCESS.  Even if it was not converted up to
+! PW above (i.e., was already held in either), it will have to be
+! lowered because this thread means the last writer on this node is
+! going away.
+!
+
+		FCB [FCB$V_DELAYTRNC] = 1;
+		FCB [FCB$L_TRUNCVBN] = .TRNVBN;
+		FIB [FIB$L_EXVBN] = .FCB [FCB$L_FILESIZE] + 1;
+		END
+	    ELSE
+		ERR_EXIT (SS$_ACCONFLICT);
+
+	END;		! of wanted to do a truncation
+
+    END			! of was write accessed.
+
+ELSE
+DELAY_TRUNC:
+    BEGIN		! not write accessd
+
+    BUILTIN FP;
+
+    LOCAL SAVE_US1;
+
+    IF NOT .FCB [FCB$V_DELAYTRNC]
+    THEN LEAVE DELAY_TRUNC;
+
+    IF .FCB [FCB$W_REFCNT] NEQ 1
+	OR .FCB [FCB$V_MARKDEL]
+	OR .FCB [FCB$L_TRUNCVBN] EQL 0
+	OR LOCK_COUNT (.FCB [FCB$L_ACCLKID]) NEQ 1
+    THEN LEAVE DELAY_TRUNC;
+
+    SAVE_US1 = .USER_STATUS [1];
+    CHECKSUM (.HEADER);
+
+    .FP = TRUNC_HANDLER;
+    TRUNCATE (SECOND_FIB, .HEADER, .FCB [FCB$L_TRUNCVBN]);
+    .FP = 0;
+
+    USER_STATUS [1] = .SAVE_US1;
+
+    END;
+
+! Return failure to let the error cleanup do the actual deaccessing.
+!
+
+RETURN 0;
+
+END;					! end of routine DEACCESS
+
+
+ROUTINE TRUNC_HANDLER (SIGNAL, MECHANISM) =
+
+!++
+!
+!--
+
+BEGIN
+
+MAP
+	SIGNAL		: REF BBLOCK,
+	MECHANISM	: REF BBLOCK;
+
+IF .SIGNAL [CHF$L_SIG_NAME] EQL SS$_CMODUSER
+THEN
+    $UNWIND (DEPADR = MECHANISM [CHF$L_MCH_DEPTH]);
+
+SS$_RESIGNAL
+END;
+
+GLOBAL ROUTINE SET_REVISION (HEADER, MODE) : L_NORM NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine updates the revision count and date, and the
+!	expiration date in the file header as specified.
+!
+! CALLING SEQUENCE:
+!	SET_REVISION (HEADER, MODE)
+!
+! INPUT PARAMETERS:
+!	HEADER: address of file header to operate on
+!	MODE: 0 to just update expiration date
+!	      1 to set revision and expiration date
+!	      3 to do above and clear backup date
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	file header modified and marked dirty
+!
+!--
+
+BEGIN
+
+LABEL
+	CHECK_EXPIRE;			! check file expiration date
+
+MAP
+	HEADER		: REF BBLOCK,	! file header
+	MODE		: BITVECTOR;	! routine mode flags
+
+LOCAL
+	DAY_TIME	: VECTOR [2],	! time of day
+	DAY_TIME2	: VECTOR [2],	! time of day
+	UCB		: REF BBLOCK,	! UCB of RVN 1
+	PRIMARY_VCB	: REF BBLOCK,	! VCB of RVN 1
+	IDENT_AREA	: REF BBLOCK;	! header ident area
+
+BIND_COMMON;
+
+EXTERNAL ROUTINE
+	MARK_DIRTY	: L_NORM;	! mark buffer for write-back
+
+
+! Locate the ident area and check that the date fields are present.
+!
+
+IDENT_AREA = .HEADER + .HEADER[FH2$B_IDOFFSET]*2;
+IF .HEADER[FH2$B_MPOFFSET] - .HEADER[FH2$B_IDOFFSET] LSSU
+    ($BYTEOFFSET (FI2$Q_EXPDATE) + FI2$S_EXPDATE) / 2
+THEN RETURN;
+
+! Update the expiration date of the file.
+!
+
+MARK_DIRTY (.HEADER);
+CHECK_EXPIRE: BEGIN
+PRIMARY_VCB = .CURRENT_VCB;
+IF .PRIMARY_VCB[VCB$W_RVN] NEQ 0
+THEN
+    BEGIN
+    UCB = .VECTOR [CURRENT_RVT[RVT$L_UCBLST], 0];
+    IF .UCB EQL 0
+    THEN LEAVE CHECK_EXPIRE;
+    PRIMARY_VCB = .UCB[UCB$L_VCB];
+    END;
+
+$GETTIM (TIMADR = DAY_TIME);
+IF .(PRIMARY_VCB[VCB$Q_RETAINMAX]+4) NEQ 0
+THEN
+    BEGIN
+    SUBQ (PRIMARY_VCB[VCB$Q_RETAINMAX], DAY_TIME, DAY_TIME2);
+    IF CMPQ (IDENT_AREA[FI2$Q_EXPDATE], GEQ, DAY_TIME2)
+    THEN LEAVE CHECK_EXPIRE;
+    CH$MOVE (8, DAY_TIME2, IDENT_AREA[FI2$Q_EXPDATE]);
+    END;
+END;				! end of block CHECK_EXPIRE
+
+! Increment the revision count of the file if specified.
+!
+
+IF .MODE[0]
+THEN
+    BEGIN
+    IDENT_AREA[FI2$W_REVISION] = .IDENT_AREA[FI2$W_REVISION] + 1;
+    CH$MOVE (8, DAY_TIME, IDENT_AREA[FI2$Q_REVDATE]);
+    END;
+
+! Clear the backup date if requested.
+!
+
+IF .MODE[1]
+THEN
+    BEGIN
+    (IDENT_AREA[FI2$Q_BAKDATE]) = 0;
+    (IDENT_AREA[FI2$Q_BAKDATE])+4 = 0;
+    END;
+
+END;					! end of routine SET_REVISION
+
+END
+ELUDOM

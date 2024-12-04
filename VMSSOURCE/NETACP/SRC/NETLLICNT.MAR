@@ -1,0 +1,792 @@
+	.TITLE	NETLLICNT - Counter support for nodes and logical-links
+	.IDENT	'V04-000'
+	.DEFAULT DISPLACEMENT,LONG
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+; FACILITY:	NETWORK ACP
+;
+; ABSTRACT:	This module contains routines to maintain the Node counter
+;		and logical-link counter databases.
+; 
+;
+; ENVIRONMENT:	Kernel mode 
+;
+;	.SBTTL	HISTORY
+;
+; AUTHOR:	Alan D. Eldridge	13-Feb-1984
+;
+; MODIFIED BY:
+;
+;	V03-002	PRB0346		Paul Beck	9-Aug-1984  18:39
+;		Supply error message for error returns from NET$ACQUIRE_NDCOU
+;		Also, clear NDC interlock bit when transaction count in NDC is
+;		decremented, not just when it reaches zero.
+;
+;	V03-001	RNG0001			Rod Gamache	23-May-1984
+;		Add NDC interlock bit to XWB_STS to indicate when the XWB
+;		has succeeded in acquiring an NDCOU block.
+;		Log counters when a database entry is reused.
+;
+
+	;
+	;   Read and Optionally Zero Link xxx Counters
+	;
+	;	K 	= XWB_x 
+	;	XWB_x   = 0					; iff zeroing
+	;	LLI_rt	= LLI_rt + K				; iff zeroing
+	;	Return (K)
+	;
+
+	;
+	;   Read and Optionally Zero Node nnn Counters
+	;
+	;	SK  = NDC
+	;	NDC = 0						; iff zeroing
+	;	For all logical-links to node nnn do
+	;	   SK     = SK + XWB_x + LLI_rt - LLI_lz
+	;	   LLI_lz =      XWB_x + LLI_rt			; iff zeroing
+	;          End
+	;	Return (SK)
+	;
+
+	;
+	;  On IO$_DEACCESS (AR = Accounting record)
+	;
+	;	AR  = LLI_rt + XWB_x
+	;	NDC = NDC + AR
+	;
+
+	$CNFDEF
+	$EVCDEF
+	$LLIDEF
+	$NFBDEF
+	$WQEDEF
+	$XWBDEF
+	$NETSYMDEF
+
+	
+
+	CNF = CNF$C_LENGTH			; Short name for readabilty
+
+	LOGBUF_LEN = 400			; Length buffer for logging ctrs
+
+$DEFINI	NDCOU
+
+$DEF	NDCOU$Q_LINKAGE	.BLKQ 1			; Queue linkage
+$DEF	NDCOU$W_SIZE	.BLKW 1			; Structure size
+$DEF	NDCOU$B_TYPE	.BLKB 1			; Structure type
+$DEF	NDCOU$B_STS	.BLKB 1			; Status flags
+$DEF	NDCOU$L_LINK	.BLKL 1			; Hash Table linkage
+$DEF	NDCOU$W_PNA	.BLKW 1			; Remote node address
+$DEF	NDCOU$W_REFCNT	.BLKW 1			; Number of referencers
+$DEF	NDCOU$Z_NDC	.BLKB NDC$C_LENGTH	; Counter block
+	NDCOU$C_LENGTH  = .			; Total structure length
+
+$DEFEND	NDCOU
+
+
+	.PSECT	NET_LOCK_IMPURE, WRT,NOEXE,LONG	; Goto impure locked area Psect
+
+NDCOU_C_SIZE 	  = <NDCOU$C_LENGTH + ^X<F>> & ^C^X<F>	; Round up NDCOU size
+
+TEMP_Z_NDC:	    .BLKB	NDCOU_C_SIZE		; Temporary NDCOU
+
+	.PSECT	NET_IMPURE, WRT,NOEXE,QUAD	; Goto impure area Psect
+	.ALIGN	QUAD
+;
+;
+;    Define space for NDCOU blocks.  Allocate the blocks (via NET$INIT_NDCOU) 
+;    during NETACP initialization
+;
+;
+NDCOU_C_BLOCKS    =  512				; Number of NDCOU blocks
+
+;
+;
+;    Setup 'idle' and 'inactive' NDCOU queue headers.  The 'idle queue' contains
+;    absolutely unused NDCOU's.  The 'inactive queue' contains NDCOU with a zero
+;    reference count but with an assigned remote node address and which are 
+;    linked into the Hash Table
+;
+;
+NET$Q_NDCOU_IDLE:   .ADDRESS	NET$Q_NDCOU_IDLE	; Idle NDCOU's
+		    .ADDRESS	NET$Q_NDCOU_IDLE	; 
+NET$Q_NDCOU_INACT:  .ADDRESS	NET$Q_NDCOU_INACT	; Inactive NDCOU's
+		    .ADDRESS	NET$Q_NDCOU_INACT	; 
+
+;
+;
+;    Setup NDCOU Hash Table -- contains no entries at the start.
+;
+;
+HASH_C_LNG	  =  128				; Length of table
+HASH_V_LNG	  =    0				; Parameters to trim
+HASH_S_LNG	  =    7				;  the Hash Table index
+
+_VIELD	COU,0,<-					; Counter calling interface
+	<ZERO,,M>,-					; Set if zero requested
+	<HIGHIPL,,M>,-					; Set if high IPL needed
+	<,6>,-						; UNDEFINED
+	>
+
+NET$GZ_HASHT_NDCOU::   .LONG	0 [HASH_C_LNG]		; Initialize Hash Table
+
+.MACRO	HASH_NODE_ADDRESS  PARAM			; Find Hash Table addr
+
+	MOVW	PARAM,-(SP)				; Push node address
+	MOVZBL	(SP)+,PARAM				; Recover low order
+	INCB	(SP)					; Make hi order nonzero
+							; most of the time
+	MULB	(SP)+,PARAM				; Use product
+	EXTZV	#HASH_V_LNG,#HASH_S_LNG,PARAM,PARAM	; Trim to legal index
+	MOVAL	NET$GZ_HASHT_NDCOU[PARAM],PARAM		; Calc. table address
+
+.ENDM	HASH_NODE_ADDRESS
+
+.MACRO	ADDCOU	offset,base1,base2,len=L,?L		; Add counters
+
+	ADD'len	NDC$'len'_'offset'('base1'),NDC$'len'_'offset'('base2')
+	BCC	L					; Br if no carry
+	MNEG'len	#1,NDC$'len'_'offset'('base2')
+L:
+.ENDM	ADDCOU
+
+.MACRO	SUBCOU	offset,base1,base2,len=L,?L		; Subtract counters
+
+	SUB'len	NDC$'len'_'offset'('base1'),NDC$'len'_'offset'('base2')
+	BCC	L					; Br if no carry
+	MNEG'len	#1,NDC$'len'_'offset'('base2')
+L:
+.ENDM	SUBCOU
+
+
+	.PSECT	NET_CODE, NOWRT,EXE			; Goto code PSECT
+
+
+	.SBTTL	NET$INIT_NDCOU		- Initialize NDC queues
+;+
+; 
+;  This routine is called once when NETACP is started.  It fills the
+;  'idle' queue with NDCOU sized blocks
+;
+;  INPUTS:	None
+;
+;  OUTPUTS:	R0	Status returned from NET$ALLOCATE
+;
+;		All other registers are preserverd.
+;
+;-
+NET$INIT_NDCOU::			; Initialize NDC queues
+	PUSHR	#^M<R1,R2>		; Save regs
+					;
+	MOVL	#NDCOU_C_BLOCKS -	; Get length needed
+		*NDCOU_C_SIZE,R1	;
+	JSB	NET$ALLOCATE		; Go get the storage
+	BLBC	R0,30$			; If LBC, error
+	MOVL	#NDCOU_C_BLOCKS,R0	; Number of NDCOU's
+10$:	INSQUE	(R2),@NET$Q_NDCOU_IDLE+4; Insert it on the queue
+	ADDL	#NDCOU_C_SIZE,R2	; Advance to next NDCOU 
+	SOBGTR	R0,10$			; Loop
+	MOVL	#1,R0			; Say "success"
+					;
+30$:	POPR	#^M<R1,R2>		; Restore regs
+	RSB				; Done
+
+
+	.SBTTL	NET$ACQUIRE_NDCOU	- Acquire Node Counter block
+;+
+;
+;  This routine is called to gain access to a node counter block.  For instance,
+;  when an XWB (logical-link control block) is created.
+;
+;  If the block does not yet exist for that node, one is removed from the 'idle
+;  NDCOU' queue.  It is initialized and linked into the Hash Table.  
+;
+;  If the idle queue is empty, an NDCOU is removed from the front of the 
+;  'inactive NDCOU' queue.  It is removed from the Hash Table and its contents
+;  are logged ("database re-used event").  It is then zeroed and linked into the
+;  Hash Table under its new node address.
+;
+;
+;  INPUTS:	R3	XWB address
+;		R1,R0	Scratch
+;
+;  OUTPUTS:	R1	Garbage  (Actually NDCOU ptr, but higher levels should
+;				  never need to know that.)
+;		R0	Status (LBS/LBC)
+;
+;		All other registers are preserved.
+;
+;-
+NET$ACQUIRE_NDCOU::				; Acquire NDCOU block
+	PUSHR	#^M<R2,R3,R6,R8>		; Save regs
+
+	MOVL	R3,R6				; Copy XWB address
+	MOVZWL	XWB$W_REMNOD(R6),R8		; Get the remote node address
+						;
+	BSBW	NET$LOOKUP_NDCOU		; Find the NDCOU block
+	BLBC	R0,30$				; If LBC, not in hash table
+	MOVL	R2,R1				; Transfer NDCOU ptr to R1
+	;
+	;
+	;     NDCOU found in Hash Table.  If reference count is 0, then the 
+	;     NDCOU is also in the 'inactive NDCOU' queue -- remove it.
+	;
+	;
+	TSTW	NDCOU$W_REFCNT(R1)		; In 'inactive' queue ?
+	BNEQ	90$				; If NEQ, no
+	REMQUE	(R1),R1				; Else, remove it from queue
+	BRB	90$				; Take common exit
+30$:	;
+	;
+	;     Find an unused NDCOU block and link it into the Hash Table.
+	;
+	;     If there is one on the 'idle' queue, then remove it and  use it.  
+	;     Otherwise, if there is one on the 'inactive' queue, then remove
+	;     it, log it's contents, unhook it from the Hash Table, and use it.
+	;
+	;
+	MOVL	#SS$_INSFMEM,R0			; Anticipate no blocks
+	REMQUE	@NET$Q_NDCOU_IDLE,R1		; Get an idle block
+	BVC	50$				; If VC, got one
+	REMQUE	@NET$Q_NDCOU_INACT,R1		; Get the last recently used one
+	BVS	100$				; If VC none, return error
+	BSBW	LOG_NDCOU			; Log the contents
+	MOVZWL	NDCOU$W_PNA(R1),R2		; Get node address
+	BSBW	GET_HASH_ADDR			; Get Hash Table address
+	MOVL	NDCOU$L_LINK(R1),NDCOU$L_LINK(R3) ; Remove it from list
+50$:	;
+	;
+	;    Initialize the NDCOU block and link it into the Hash Table
+	;
+	;
+	PUSHR	#^M<R1,R3,R4,R5>		; Save regs
+	MOVC5	#0,(SP),#0,#NDCOU$C_LENGTH,(R1)	; Zero the block
+	POPR	#^M<R1,R3,R4,R5>		; Restore regs
+						;
+	MOVW	#NDCOU$C_LENGTH,NDCOU$W_SIZE(R1); Setup structure size
+	MOVW	R8,NDCOU$W_PNA(R1)		; Setup the node address
+	MOVL	G^EXE$GL_ABSTIM,NDCOU$Z_NDC -	; Initialize time since
+		 +NDC$L_ABS_TIM(R1)		;    last zeroed
+	MOVL	R8,R2				; Prepare for subr call
+	BSBW	GET_HASH_ADDR			; Get the table address
+	MOVL	R1,NDCOU$L_LINK(R3)		; Link new NDCOU into list
+90$:	;
+	;
+	;    Acquire NDCOU by bumping its reference count.
+	;
+	;
+	SETBIT	XWB$V_STS_NDC,XWB$W_STS(R6)	; Indicate we have our NDCOU
+	INCW	NDCOU$W_REFCNT(R1)		; Account for new reference
+	MOVL	#1,R0				; Say "success"
+						;
+100$:	POPR	#^M<R2,R3,R6,R8>		; Restore regs
+	RSB
+
+
+	.SBTTL	NET$RELEASE_NDCOU	- Release claim on NDCOU block
+;+
+;  This routine is called to cancel a reference to an NDCOU block, e.g, when
+;  an XWB (logical-link control block) is being deallocated.
+;
+;  Decrement the NDCOU reference count.  If it goes to zero, insert the NDCOU 
+;  on back of the "inactive" queue.
+;
+;
+;  INPUTS:	R3	XWB address
+;		R0	Scratch
+;
+;  OUTPUTS:	R0	Status (always LBS for now, but don't plan on it)
+;
+;		All other registers are preserved.
+;
+;-
+NET$RELEASE_NDCOU::			; Release claim on NDCOU block
+	PUSHR	#^M<R1,R2,R8>		; Save regs
+					;
+	BBCC	#XWB$V_STS_NDC,-	; Leave if NDCOU block not present
+		 XWB$W_STS(R3),100$	; ... else clear flag in XWB
+	MOVZWL	XWB$W_REMNOD(R3),R8	; Get remote node address
+	BSBW	NET$LOOKUP_NDCOU	; Find the NDCOU block
+	BLBC	R0,200$			; If LBC, not there
+	DECW	NDCOU$W_REFCNT(R2)	; One less referencer
+	BLSS	200$			; If LSS, bug
+	BNEQ	100$			; If NEQ, we're done
+	INSQUE	(R2),@NET$Q_NDCOU_INACT+4 ; Else, queue it to end of idle queue
+					;
+100$:	POPR	#^M<R1,R2,R8>		; Restore regs
+	RSB				; Done
+
+200$:	BUG_CHECK  NETNOSTATE,FATAL	; One of various bugs
+
+
+	.SBTTL	NET$FLUSH_LLI_CNT	- Flush logical-link counters
+;+
+;
+;  This routine is called when a logical-link is being deleted from the 
+;  database.  It's total counters since creation are captured and added to
+;  the associated NDCOU block.  These same counters are returned for with
+;  the expectation that the caller may write them to some account log.
+;
+;  Basically, the following algorithm is run:
+;
+;	Begin
+;	AR  = LLI_rt + XWB_x
+;	NDC = NDC + AR
+;	Return (AR)
+;	End
+;
+;
+;  INPUTS:	R10	LLI CNF pointer
+;		R6	Non-pageable block to receive counters in NDC format
+;		R5	XWB pointer
+;		R4	1 => Zero XWB counters
+;			0 => Don't zero XWB counters
+;		R3-R0	Scratch
+;
+;  OUTPUTS:	R8,R3-R0   Garbage
+;
+;		All other registers are preserved.
+;
+;-
+NET$FLUSH_LLI_CNT::			; Flush LLI/XWB counters to NDCOU
+	BBC	#XWB$V_STS_NDC,-	; Br if no NDCOU block was acquired
+		 XWB$W_STS(R5),100$
+	MOVZWL	XWB$W_REMNOD(R5),R8	; Get remote node address
+	;
+	;
+	;	AR  = LLI_rt + XWB_x
+	;
+	;
+	BSBB	NET$READ_LLI_CNT	; Fill R6 block with LLI_rt + XWB
+	;
+	;
+	;	NDC = NDC + AR
+	;
+	;
+	BSBW	NET$LOOKUP_NDCOU	; Get NDCOU block for this node
+	BLBC	R0,200$			; If LBC, bug
+	ADDL	#NDCOU$Z_NDC,R2		; Setup destination block
+	MOVL	R6,R1			; Setup source NDC block
+	CLRL	R0			; Say "don't zero, don't use high IPL"
+	BSBW	ADD_NDC			; Add counters to NDCOU block
+100$:	RSB				; Done
+
+200$:	BUG_CHECK  NETNOSTATE,FATAL
+
+
+	.SBTTL	NET$READ_LLI_CNT	- Read logical-link counters
+;+
+;
+;  This routine is called to read, and optionally clear, the counters for a
+;  single logical-link.   The XWB contains the copy of the counters since the
+;  last time they were zeroed.  Whenever the XWB counters are zeroed, they are
+;  first added to the LLI "running total" counter block so that the information
+;  is not lost either for accounting purposes or as part of the Node counters.
+;
+;  Basically, the following algorithm is run:
+;
+;	    Begin
+;	    K 	    = XWB_x 
+;	    XWB_x   = 0				; iff zeroing
+;	    LLI_rt  = LLI_rt + K		; iff zeroing
+;	    Return (K)
+;	    End
+;
+;
+;
+;  INPUTS:	R10	LLI CNF pointer
+;		R6	Non-pageable block to receive counters in NDC format
+;		R5	XWB pointer
+;		R4	1 => Zero XWB counters
+;			0 => Don't zero XWB counters
+;		R3-R0	Scratch
+;
+;  OUTPUTS:	R3-R0	Garbage
+;
+;		All other registers are preserved.
+;	
+;
+;-
+NET$READ_LLI_CNT::			; Read logical-link counters
+	MOVL	R6,R2			; Point to destination NDC
+	MOVAB	XWB$Z_NDC(R5),R1	; Point to source NDC
+	BISB3	R4,#COU_M_HIGHIPL,R0	; Merge "zero" flag with "high IPL" flag
+	;
+	;
+	;	K     = XWB_x 
+	;	XWB_x = 0		(if zeroing)
+	;
+	;
+	BSBW	COPY_NDC		; Copy source to destination
+	BLBC	R4,100$			; If LBC, XWB NDC wasn't zeroed
+	;
+	;
+	;	LLI_rt  = LLI_rt + K
+	;
+	;
+	MOVAB	CNF+LLI$Z_NDC_RT(R10),R2; Point to 'running total' NDC
+	MOVL	R6,R1			; Former XWB counter data is source NDC
+	CLRL	R0			; Clear "zero" and "high IPL" flags
+	BSBW	ADD_NDC			; Update output NDC
+100$:	MOVL	#1,R0			; Always successful
+	RSB				; Done
+
+
+	.SBTTL	NET$READ_NDI_CNT	- Read node counters
+;+
+;
+;  This routine is called to calculate, and optionally zero the traffic counters
+;  for a given remote node.  The expression (XWB_x + LLI_rt) always represents
+;  the total counters on a given link.  Thus, if a reference counter block 
+;  representing this total is maintained and updated everytime the node counters
+;  are zeroed, then it is possible to "zero" the counters with respect to the
+;  node counters without modifying the contents of the XWB.
+;
+;  Note that we cannot modify the XWB counter block in any way since that
+;  counter block is used for the Logical-link counters.
+;
+;  Basically, the following algorithm is run:
+;
+;	    Begin
+;	    SK  = NDC
+;	    NDC = 0					; iff zeroing
+;	    For all logical-links to node nnn do
+;	        Begin
+;		SK     = SK + XWB_x + LLI_rt - LLI_lz
+;		LLI_lz =      XWB_x + LLI_rt		; iff zeroing
+;       	End
+;	    Return (SK)
+;	    End
+;
+;
+;
+;  INPUTS:	R8	Remote node address
+;		R6	Non-pageable block to receive counters in NDC format
+;		R5	Scratch
+;		R4	1 => Zero XWB counters
+;			0 => Don't zero XWB counters
+;		R3-R0	Scratch
+;
+;  OUTPUTS:	R3-R1	Garbage
+;		R0	Low bit set if successful
+;			Low bit clear if no counter block was found
+;
+;		All other registers are preserved.
+;	
+;
+;-
+NET$READ_NDI_CNT::				; Read node counters
+	PUSHR	#^M<R9,R10,R11>			; Save regs
+	;
+	;
+	;    Locate associated NDCOU.  Copy and optionally zero it to
+	;    target NDCOU.
+	;
+	;
+	BSBW	NET$LOOKUP_NDCOU		; Get NDCOU for this node
+	BLBC	R0,200$				; If LBC, there is none
+	MOVAB	NDCOU$Z_NDC(R2),R1		; Point to source NDC
+	MOVL	R6,R2				; Point to destination NDC
+	MOVL	R4,R0				; Setup "zero NDC" flag
+	BSBW	COPY_NDC			; Copy source to destination
+	;
+	;
+	;    For each logical-link to the remote node, copy the counters
+	;    and optionally update the "zero reference" set in the LLI
+	;    using the formula:
+	;
+	;	SK     = SK + XWB_x + LLI_rt - LLI_lz
+	;	LLI_lz =      XWB_x + LLI_rt		; iff zeroing
+	;
+	;
+	MOVL	NET$GL_CNR_LLI,R11		; Get logical-link CNR
+	CLRL	R10				; Start at begining
+50$:	$SEARCH	eql,lli,l,pna			; Find next LLI for remote node
+	BLBC	R0,100$				; If LBC, none
+	;
+	;
+	;	TEMP = XWB_x + LLI_rt
+	;
+	;
+	MOVAB	CNF+LLI$Z_NDC_RT(R10),R2	; Point to LLI_rt
+	ADDL3	#XWB$Z_NDC,CNF+LLI$L_XWB(R10),R1; Point to XWB_x
+	MOVL	#COU_M_HIGHIPL,R0		; Say "use hi IPL, don't zero"
+	BSBW	ADD_NDC_TEMP			; Return with TEMP in R2
+	MOVL	R2,R1				; Copy TEMP to R1
+	;
+	;
+	;	SK = SK + TEMP
+	;
+	;
+	MOVL	R6,R2				; Point to SK
+	CLRL	R0				; Say "don't zero or use hi IPL"
+	BSBW	ADD_NDC				; Add TEMP to SK
+	;
+	;
+	;	SK = SK - LLI_lz
+	;
+	;
+	MOVAB	CNF+LLI$Z_NDC_LZ(R10),R1	; Point to LLI_lz
+	BSBW	SUB_NDC				; Subtract from SK
+	;
+	;
+	;	LLI_lz  =  TEMP    (i.e., XWB_x + LLI_rt)
+	;
+	;
+	BLBC	R4,50$				; If LBC, zeroing not requested
+	MOVL	R1,R2				; Point to LLI_lz as destination
+	MOVAB	TEMP_Z_NDC,R1			; Point to TEMP as source
+	BSBW	COPY_NDC			; Copy TEMP to LLI_lz
+	BRB	50$				; Loop
+						;
+100$:	MOVL	#1,R0				; Say "success"
+200$:	POPR	#^M<R9,R10,R11>			; Restore regs
+	RSB					; Done
+
+
+	.SBTTL	COPY_NDC		- Copy NDC counters
+;+
+;   This routine is called to copy the NDC counters from src to dest.
+;
+; Inputs:	R2	Non-pageable block to receive counters in NDC format
+;		R1	Source NDC counters
+;		R0	lbs => zero NDC counters
+;			lbc => don't zero NDC counters
+;			COU_V_HIGHIPL set => raise to NET$C_IPL
+;
+; Outputs:	All registers are preserved.
+;
+;-
+	.SAVE_PSECT
+	.PSECT	NET_LOCK_CODE,NOWRT,GBL
+
+COPY_NDC:				; NDC(R2)  <-  NDC(R1)
+	BBC	#COU_V_HIGHIPL,R0,70$	; Br if no need to raise IPL
+	DSBINT	#NET$C_IPL		; Else, raise IPL now
+	BSBB	70$			; Copy the counters
+	ENBINT				; Restore IPL
+	RSB				; Return
+
+70$:	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; Save registers
+	MOVC3	#NDC$C_LENGTH,(R1),(R2)	; Move the counters
+	MOVQ	(SP),R0			; Get zero indicator, source area
+	BLBC	R0,90$			; Br if we don't zero the countes
+	MOVL	G^EXE$GL_ABSTIM,(R1)+	; Else, reset the time last zeroed
+	MOVC5	#0,(SP),#0,#NDC$C_LENGTH-4,(R1) ; And zero the counters
+90$:	POPR	#^M<R0,R1,R2,R3,R4,R5>	; Restore registers
+	RSB				; Done
+
+
+	.SBTTL	ADD_NDC			- Add NDC counters in NDC format
+	.SBTTL	ADD_NDC_TEMP		- Add NDC counters & copy to temp area
+;+
+;   These routines are called to add NDC counters to a output buffer area.
+;
+; Inputs:	R2	Pointer to input counter area2
+;				Also the resultant storage area (ADD_NDC only)
+;		R1	Pointer to input counter area1
+;		R0	lbs => zero NDC counters ??? no-sense
+;			lbc => don't zero NDC counters
+;			COU_V_HIGHIPL set => raise to NET$C_IPL
+;		
+; Outputs:	R2	Pointer to temp counter area (ADD_NDC_TEMP only)
+;
+;		All other registers are preserved.
+;
+;-
+
+ADD_NDC_TEMP:				; temp <- NDC(R2)
+					; temp <- temp + NDC(R1)
+	PUSHL	R1			; Save counter area1
+	MOVL	R2,R1			; Copy area2 pointer
+	MOVAB	TEMP_Z_NDC,R2		; Get temporary storage area address
+	BSBB	COPY_NDC		; Get a copy of counter area2
+	POPL	R1			; Restore counter area1
+	BSBB	ADD_NDC			; Get NDC(R2) <- NDC(R2) + NDC(R1)
+	RSB				; Return
+	
+
+ADD_NDC:				; NDC(R2)  <-  NDC(R1) + NDC(R2)
+	BBC	#COU_V_HIGHIPL,R0,70$	; Br if no need to elevate IPL
+	DSBINT	#NET$C_IPL		; Else, raise IPL
+	BSBB	70$			; Get sum of counters
+	ENBINT				; Restore IPL
+	RSB				; Return
+
+70$:	ADDCOU	RSE,R1,R2,W		; Add resource errors
+	ADDCOU	RTO,R1,R2,W		; Add response timeouts
+	ADDCOU	CRC,R1,R2,W		; Add connects received
+	ADDCOU	CSN,R1,R2,W		; Add connects sent
+	ADDCOU	BRC,R1,R2,L		; Add bytes received
+	ADDCOU	BSN,R1,R2,L		; Add bytes sent
+	ADDCOU	PRC,R1,R2,L		; Add packets received
+	ADDCOU	PSN,R1,R2,L		; Add packets sent
+	BLBC	R0,90$			; Br if zero not requested
+					;
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; Save regs
+	MOVL	G^EXE$GL_ABSTIM,(R1)+	; Else, reset the time last zeroed
+	MOVC5	#0,(SP),#0,#NDC$C_LENGTH-4,(R1) ; And zero the counters
+	POPR	#^M<R0,R1,R2,R3,R4,R5>	; Restore regs
+					;
+90$:	RSB				; Done
+
+
+	.SBTTL	SUB_NDC			- Subtract NDC counters in NDC format
+;+
+;   This routine is called to subtract NDC counters from an output
+;   buffer area.
+;
+; Inputs:	R2	Pointer to input counter area2
+;			   Also the resultant storage area
+;		R1	Pointer to input counter area1
+;		R0	lbs => zero NDC counters ??? no-sense
+;			lbc => don't zero NDC counters
+;			COU_V_HIGHIPL set => raise to NET$C_IPL
+;		
+; Outputs:	All registers are preserved.
+;
+;-
+
+SUB_NDC:				; NDC(R2)  <-  NDC(R2) - NDC(R1)
+	BBC	#COU_V_HIGHIPL,R0,70$	; Br if no need to elevate IPL
+	DSBINT	#NET$C_IPL		; Else, raise IPL
+	BSBB	70$			; Get sum of counters
+	ENBINT				; Restore IPL
+	RSB				; Return
+
+70$:	SUBCOU	RSE,R1,R2,W		; Subtract resource errors
+	SUBCOU	RTO,R1,R2,W		; Subtract response timeouts
+	SUBCOU	CRC,R1,R2,W		; Subtract connects received
+	SUBCOU	CSN,R1,R2,W		; Subtract connects sent
+	SUBCOU	BRC,R1,R2,L		; Subtract bytes received
+	SUBCOU	BSN,R1,R2,L		; Subtract bytes sent
+	SUBCOU	PRC,R1,R2,L		; Subtract packets received
+	SUBCOU	PSN,R1,R2,L		; Subtract packets sent
+	BLBC	R0,90$			; Br if zero not requested
+					;
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; Save regs
+	MOVL	G^EXE$GL_ABSTIM,(R1)+	; Else, reset the time last zeroed
+	MOVC5	#0,(SP),#0,#NDC$C_LENGTH-4,(R1) ; And zero the counters
+	POPR	#^M<R0,R1,R2,R3,R4,R5>	; Restore regs
+					;
+90$:	RSB				; Done
+
+	.SBTTL	LOG_NDCOU		- Log NDC counters
+;+
+;  This routine logs the NDC counters before re-using the NDC counter
+;  block.
+;
+; INPUTS:	R1	NDCOU block to be re-used
+;
+; OUTPUT:	R0	Garbage
+;
+;		All other registers are preserved.
+;-
+LOG_NDCOU:
+	PUSHR	#^M<R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Save registers
+	MOVZWL	NDCOU$W_PNA(R1),R8	; Get the remote node address
+	MOVL	NET$GL_CNR_NDI,R11	; Get root of NDI database
+	JSB	NET$NDI_BY_ADD		; Find CNF for old remote node
+	BLBC	R0,90$			; Exit on error
+	MOVZWL	#LOGBUF_LEN+12,R1	; Get length of buffer
+	BSBW	NET$ALLOCATE		; Allocate a buffer from ACP pool
+	BLBC	R0,90$			; Exit on error
+	INSQUE	(R2),@NET$GQ_TMP_BUF	; Insert buffer on tmp_buf queue.
+	MOVW	R1,NDCOU$W_SIZE(R2)	; Set size of buffer
+	MOVAB	12(R2),R3		; Point to output buffer
+	$CNFFLD	ndi,s,cnt,R9		; Read counters request
+	BISW	#NET$M_CLRCNT!NET$M_LOGDBR,- ; Force counters to be logged
+		NET$GL_FLAGS		;        when read
+	JSB	NET$NDI_S_CNT		; Read & log the counters
+	BICW	#NET$M_CLRCNT!NET$M_LOGDBR,- ; Clean up flags
+		NET$GL_FLAGS
+90$:	POPR	#^M<R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Restore registers
+	RSB				; Done
+
+	.RESTORE_PSECT
+
+
+	.SBTTL	GET_HASH_ADDR		- Get the table entry address
+;+
+;
+;  INPUTS:	R3	Scratch
+;		R2	Node address
+;		R1	NDCOU address or zero if none
+;		R0	Scratch
+;
+;  OUTPUTS:	R3	Address of NDCOU$L_LINK biased ptr to the NDCOU
+;		R2	Hash Table address for entry
+;		R1	Unchanged
+;		R0	If LBS, NDCOU$L_LINK(R3) points to the R1 NDCOU
+;			If LBC, NDCOU$L_LINK(R3) contains a zero
+;
+;
+GET_HASH_ADDR:					; Get the table entry address
+	HASH_NODE_ADDRESS  R2			; Get Hash table address
+						;
+	MOVAB	-NDCOU$L_LINK(R2),R0		; Prepare for scan
+10$:	MOVL	R0,R3				; Update "previous NDCOU" ptr
+	CMPL	R1,NDCOU$L_LINK(R3)		; Is this the previous NDCOU ?
+	BEQL	90$				; If EQL yes, we're done
+	MOVL	NDCOU$L_LINK(R3),R0		; Get next entry
+	BNEQ	10$				; If NEQ, loop
+	CLRL	R0				; Say "R1 NDCOU not in list"
+	BRB	100$				; Take common exit
+90$:	MOVL	#1,R0				; Say "R1 NDCOU was in list"
+100$:	RSB					; Done
+
+
+
+	.SBTTL	NET$LOOKUP_NDCOU	- Find NDCOU in Hash Table
+;+
+;
+;  INPUTS:	R8	Remote node address
+;		R2	Scratch
+;		R0	Scratch
+;
+;  OUPUTS:	R2	NDCOU pointer
+;		R0	LBS if found
+;			LBC otherwise
+;
+;		All other registers are preserved.
+;
+;-
+NET$LOOKUP_NDCOU:			; Find NDCOU in Hash Table
+	CLRL	R0			; Assume lookup failure
+	MOVL	R8,R2			; Get remote node address
+					;
+	HASH_NODE_ADDRESS  R2		; Get Hash Table address
+					;
+	MOVAB	-NDCOU$L_LINK(R2),R2	; Prepare for scan
+10$:	MOVL	NDCOU$L_LINK(R2),R2	; Travel list
+	BEQL	100$			; If EQL, at end of list
+	CMPW	R8,NDCOU$W_PNA(R2)	; Is this it ?
+	BNEQ	10$			; If NEQ no, loop 
+	INCL	R0			; Say "NDCOU found"
+100$:	RSB				; Done
+
+
+.END

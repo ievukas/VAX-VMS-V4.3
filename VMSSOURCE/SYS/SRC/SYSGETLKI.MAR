@@ -1,0 +1,1661 @@
+	.TITLE	SYSGETLKI - GET LOCK MANAGER INFORMATION SYSTEM SERVICE
+	.IDENT	'V04-000'
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+
+;++
+; FACILITY: VMS Executive, System services.
+;
+; ABSTRACT:
+;
+;	Return system/cluster lock manager information.
+;
+; ENVIRONMENT: Kernel Mode
+;
+; AUTHOR: Rod N. Gamache,	CREATION DATE: 15-November-1982
+;
+; MODIFIED BY:
+;
+;	V03-014	RNG0014		Rod N. Gamache		3-Aug-1984
+;		Make all Lock waiting states map to LKI$C_WAITING.
+;
+;	V03-013	RNG0013		Rod N. Gamache		24-Jul-1984
+;		Stall access to lock database if cluster is re-configuring,
+;		call lock manager routine to perform stall operation.
+;
+;	V03-012	RNG0012		Rod N. Gamache		01-May-1984
+;		Restore the PCB address on successive loops through
+;		the main proccess code, when doing a wildcard search.
+;
+;	V03-011	RNG0011		Rod N. Gamache		26-Mar-1984
+;		Fix invalid REMLKID that is returned on Local copy LOCKS.
+;
+;	V03-010	RNG0010		Rod N. Gamache		21-Mar-1984
+;		Return correct EPID value, return 2 more longwords in the list
+;		items (REMLKID & remCSID). Set size of individual items in
+;		list requests.
+;		Return SS$_IVMODE on access mode violations.
+;
+;	V03-009	CWH3009		CW Hobbs		28-Feb-1984
+;		Change IPL synchronization so that $GETLKI can be called
+;		at IPL <= IPL$_ASTDEL.  This lets $GETDVI interrogate
+;		the XQP's lock value block so that $GETDVI can return
+;		the correct value for DVI$_FREEBLOCKS.
+;
+;	V03-008	RNG0008		Rod N. Gamache		05-Dec-1983
+;		Change references to LOCK STRUCTURES to reflect changes made
+;		in the Lock Manager.
+;
+;	V03-007	RNG0007		Rod N. Gamache		07-Oct-1983
+;		Fix synchronization problem caused by exec routine that
+;		lowers IPL; wrote inline code to replace exec routine.
+;
+;	V03-006	CWH3006		CW Hobbs		23-Sep-1983
+;		Fix broken branch
+;
+;	V03-005	RNG0005		Rod N. Gamache		31-Aug-1983
+;		Deliver AST's only on success.
+;		Allow EXEC mode and KERNEL mode users access to system locks.
+;		Return zero REMLKID if CSID is zero.
+;
+;	V03-004	RNG0004		Rod N. Gamache		05-Aug-1983
+;		Add REMLKID item code.
+;		Return SS$_NOMORELOCK error instead of SS$_NOMOREPROC.
+;		Add support for distributed list items (LOCKS, BLOCKEDBY
+;		and BLOCKING).
+;		Make sure user has sufficient BYCNT quota for list operations.
+;		Return proper CSID in the event the CSID of the RSB is zero.
+;
+;	V03-003	RNG0003		Rod N. Gamache		05-May-1983
+;		Return "external" PID wherever necessary. Return
+;		SS$_NOWORLD error instead of SS$_NOPRIV.
+;		Add support for distributed GETLKI.
+;
+;	V03-002	SRB0073		Steve Beckhardt		30-Mar-1983
+;		Fix broken ASSUME statement.
+;
+;	V03-001	RNG0001		Rod N. Gamache		14-Mar-1983
+;		Remove SYSNAM bit from RMOD field. Change RMOD to be a
+;		full byte. Use RMOD in RSB rather than LKB.
+;--
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+
+	$ACBDEF				; AST control block parameters
+	$CLSMSGDEF			; Cluster message offsets
+	$CLUBDEF			; Cluster block definitions
+	$DYNDEF				; dynamic memory block types
+	$IPLDEF				; interrupt priority levels
+	$JIBDEF				; define job information block
+	$LCKDEF				; defice LOCK symbols
+	$LKBDEF				; define LOCK blocks
+	$LKIDEF				; define GETLKI item identifiers
+	$PCBDEF				; define process control block
+	$PRDEF				; define processor registers
+	$PRIDEF				; define priority increment classes
+	$PRVDEF				; define process privileges
+	$PSLDEF				; processor state longword
+	$RSBDEF				; define resource blocks
+	$RSNDEF				; define resource wait codes
+	$SSDEF				; define status codes
+
+;
+; MACROS:
+;
+;
+; Macros to define entries in the item information table.
+;
+
+	.MACRO	LKBITM NAME,OFFSET,DATATYPE,LENGTH,REMLKI=K_ZERO,STRUCT=LKB
+	.=LKBTBL+<<LKI$_'NAME&^XFF>*6>
+	.WORD	'STRUCT'$'OFFSET
+	.BYTE	<<DATATYPE@5>!LENGTH>
+	.BYTE	LKI$C_'STRUCT'TYPE
+	.WORD	LIMSG$'REMLKI'
+	.ENDM	LKBITM
+
+	.MACRO	RSBITM NAME,OFFSET,DATATYPE,LENGTH,REMLKI=K_ZERO,STRUCT=RSB
+	.=RSBTBL+<<LKI$_'NAME&^XFF>*6>
+	.WORD	'STRUCT'$'OFFSET
+	.BYTE	<<DATATYPE@5>!LENGTH>
+	.BYTE	LKI$C_'STRUCT'TYPE
+	.WORD	LIMSG$'REMLKI'
+	.ENDM	RSBITM
+
+;
+; This macro defines the entries to the table of special items.
+; The items in this table must be handled by action routines 
+; before being returned.  Each entry has a word item identifier
+; followed by the address of an action routine.
+;
+
+	.MACRO	SPECIAL_ITEM NAME,ROUTINE
+	.WORD	LKI$_'NAME
+	.ADDRESS ROUTINE
+	.ENDM	SPECIAL_ITEM
+
+;
+; EQUATED SYMBOLS:
+;
+
+	MAXSTRUC = 2			; Maximum number of structures
+
+	EFN = 4				; event flag number argument
+	LKID = 8			; address of the lock ID
+	ITMLST = 12			; address of item identifiers
+	IOSB = 16			; I/O status block address
+	ASTADR = 20			; ast routine address
+	ASTPRM = 24			; ast parameter
+	RESERV = 28			; RESERVED
+
+;
+; One quadword local is left on stack for routines which may 
+; manipulate values before returning them.
+;
+
+	LOCAL_SPACE = -8
+	SAVED_IPL   = -4		; We will reference stored IPL off the frame pointer
+
+	MAX_LKB_ITEM = <LKI$_LASTLKB&^XFF>-1 ; maximum LKBTBL item number
+	MAX_RSB_ITEM = <LKI$_LASTRSB&^XFF>-1 ; maximum RSBTBL item number
+
+;
+; Data type codes (all numeric types have same code)
+;
+
+	VALUE = 0			; numeric value
+	BSTRING = 1			; blank filled string
+	CSTRING = 2			; counted ascii string
+;
+; AST control block extensions
+;
+	$DEFINI	ACB
+
+	.=ACB$L_KAST+4				;
+
+$DEF	ACB_L_DADDR	.BLKL	1		; data buffer address
+$DEF	ACB_L_EFN	.BLKL	1		; event flag number
+$DEF	ACB_L_IOSB	.BLKL	1		; completion AST routine addr
+$DEF	ACB_L_OPID	.BLKL	1		; original requester's PID
+$DEF	ACB_L_COUNT	.BLKL	1		; item descriptor count
+$DEF	ACB_L_ILIST				; item descriptor list
+
+	ACB_C_IDESC = 12			; item descriptor size
+
+	$DEFEND	ACB
+
+
+;
+; OWN STORAGE:
+;
+
+	.PSECT	WSYSGETLKI			; Non-paged PSECT
+
+
+;
+; This array contains the maximum item number for both of the item
+; data structures, indexed by structure number.
+;
+
+MAXCOUNT:
+	.BYTE	MAX_LKB_ITEM
+	.BYTE	MAX_RSB_ITEM
+
+;
+; The tables contain a word offset followed by a byte code for each item
+; followed by a byte of structure type.  The code contains the length of
+; the item in the low five bits, and the item type in the high three bits.
+; The types are value, counted string, and blank filled string.
+;
+
+LKBTBL:
+	.BLKB	6*<MAX_LKB_ITEM+1>		; define LKB table
+RSBTBL:
+	.BLKB	6*<MAX_RSB_ITEM+1>		; define RSB table
+
+	.SAVE					; save current location counter
+
+;
+; Define entries to LKBTBL
+;
+	LIMSG$K_ZERO = 0			; Define empty holder
+
+	LKBITM	PID,L_EPID,VALUE,4		; EPID of owner process
+	LKBITM	LCKREFCNT,W_REFCNT,VALUE,2	; sub-lock reference count
+	LKBITM	STATE,B_RQMODE,VALUE,3,L_STATE	; current state of lock
+	LKBITM	PARENT,L_PARENT,VALUE,4		; LOCK ID of parent lock
+	LKBITM	LOCKID,L_LKID,VALUE,4		; LOCK ID of lock
+	LKBITM	REMLKID,L_REMLKID,VALUE,4	; Remote LOCK ID of lock
+
+;
+; Define entries to RSBTBL
+;
+
+	RSBITM	RESNAM,B_RSNLEN,CSTRING,31	; resource name
+	RSBITM	RSBREFCNT,W_REFCNT,VALUE,2,L_RSBREFCNT ; sub-resource reference count
+	RSBITM	VALBLK,Q_VALBLK,BSTRING,16,Q_VALBLK ; value block
+	RSBITM	SYSTEM,L_CSID,VALUE,4		; system id of system which has
+						;  the master copy of resource
+	RSBITM	NAMSPACE,W_GROUP,VALUE,4	; resource name space
+	RSBITM	LCKCOUNT,L_GRQFL,VALUE,4,L_LCKCOUNT ; count of locks granted on resource
+	RSBITM	BLOCKEDBY,L_GRQFL,VALUE,-	; list of locks blocked by LKID
+		LKI$C_LENGTH
+	RSBITM	BLOCKING,L_WTQFL,VALUE,-	; list of locks blocking LKID
+		LKI$C_LENGTH
+	RSBITM	LOCKS,L_GRQFL,VALUE,LKI$C_LENGTH ; list of associated locks
+
+
+	.RESTORE				; restore location counter
+
+;
+; Table to define items which must be handled
+; by action routines.
+;
+
+SPECIAL:
+	SPECIAL_ITEM	PID,SPC_PID		; PID of owner process
+	SPECIAL_ITEM	STATE,SPC_STATE		; current state of lock
+	SPECIAL_ITEM	PARENT,SPC_PARENT	; LOCK ID of parent lock
+	SPECIAL_ITEM	SYSTEM,SPC_SYSTEM	; CSID of master
+	SPECIAL_ITEM	NAMSPACE,SPC_NAMSPACE	; resource name space
+	SPECIAL_ITEM	LCKCOUNT,SPC_LCKCOUNT	; count of locks granted on resource
+	SPECIAL_ITEM	BLOCKEDBY,SPC_BLOCKEDBY	; list of locks blocked by LKID
+	SPECIAL_ITEM	BLOCKING,SPC_BLOCKING	; list of locks blocking LKID
+	SPECIAL_ITEM	LOCKS,SPC_LOCKS		; list of associated locks
+	SPECIAL_ITEM	REMLKID,SPC_REMLKID	; Remote lock id
+
+SPECIAL_LEN = <.-SPECIAL>/6			; compute number of entries
+
+	.SBTTL	SYSGETLKI - GETLKI get lock manager information system service
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This service allows a process to receive information about the
+;	locks, or any process locks which it has the privilege to examine.
+;	
+; CALLING SEQUENCE:
+;
+;	CALLS/CALLG
+;
+;		Actually, this routine MUST be called through the system
+;		service dispatcher.
+;
+; INPUTS:
+;
+;	R4		PCB address of requesting process
+;
+;	EFN(AP)		number of the event flag to set when all of the
+;			requested data is valid. 
+;	LKID(AP)	address of a longword containing the process ID of the
+;			process for which the information is being requested
+;	ITMLST(AP)	address of a list of item descriptors of the form:
+;
+;		+-----------------------------+
+;		!  ITEM CODE   !  BUF. LENGTH !
+;		+-----------------------------+
+;		!      BUFFER ADDRESS         !
+;		+-----------------------------+
+;		!  ADDRESS TO RETURN LENGTH   !
+;		+-----------------------------+
+;
+;	IOSB(AP)	address of a quadword I/O status block to receive final
+;			status
+;	ASTADR(AP)	address of an AST routine to be called when all of the
+;			requested data has been supplied.
+;	ASTPRM(AP)	32 bit ast parameter
+;
+; IMPLICIT INPUTS:
+;
+;	IPL <= IPL$_ASTDEL	This allows other system services which are
+;				holding mutexes to call $GETLKI.
+;
+; OUTPUTS:
+;
+;	none
+;
+; IMPLICIT OUTPUTS:
+;
+;	none
+;
+; ROUTINE VALUE:
+;
+;	SS$_NORMAL	normal completion.
+;	SS$_ACCVIO	ITMLST can not be read by the calling access mode,
+;			or the return buffer or return length word can not
+;			be written by the calling access mode.
+;	SS$_BADPARAM	an invalid item identifier was supplied.
+;	SS$_IVLOCKID	lock id specified is not valid.
+;	SS$_BUFFEROVF	data has overflowed the user buffer.
+;	SS$_NOSYSLCK	SYSLCK privilege is needed to access this information.
+;	SS$_NOWORLD	WORLD privilege is needed to access this information.
+;	SS$_EXQUOTA	User's AST or BYTLM quota has been exceeded.
+;	SS$_INSFMEM	Insufficient non-paged dynamic memory.
+;	SS$_NOMORELOCK	No more locks on "wildcard" search operation.
+;
+; SIDE EFFECTS:
+;
+;	none
+;--
+
+	.PSECT	YEXEPAGED		; Only entry mask in this program section
+
+	.ENTRY	EXE$GETLKI,^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	JMP	EXE_GETLKI		; Transfer to real procedure
+
+	.PSECT	WSYSGETLKI
+
+EXE_GETLKI:
+	DSBINT	#IPL$_SYNCH		; Raise IPL to check lock mgr database
+	JSB	G^LCK$CHECK_STALL	; ... stall if needed (in CALLER's mode)
+	SETIPL	#IPL$_ASTDEL		; Set IPL to ASTDEL
+	MOVAL	LOCAL_SPACE(SP),SP	; Allocate local space on stack
+	CLRL	R11			; Assume no remote LOCK information
+2$:	MOVL	SCH$GL_CURPCB,R4	; Reset PCB address
+	MOVL	R11,R0			; Any remote LOCK BLOCK?
+	BEQL	3$			; Br if not, okay
+	CLRL	R11			; No more remote lock block
+	JSB	EXE$DEANONPAGED		; Else, deallocate the remote lock block
+3$:	BSBW	GETLKB			; Get LKB address of desired lock
+	BLBC	R0,17$			; Exit if invalid LKID specified
+;
+; Check for, and clear event flag
+;
+	MOVZBL	EFN(AP),R3		; Get event flag number
+	JSB	SCH$CLREF		; Clear this event flag
+	BLBC	R0,17$			; And return on errors.
+;
+; Check for, and clear possible IOSB
+;
+	MOVL	IOSB(AP),R1		; Get IOSB address
+	BEQL	5$			; Branch if none
+	IFWRT	#8,(R1),4$		; Check access to it
+	BRW	30$			; Else, return error
+4$:	CLRQ	(R1)			; Clear IOSB
+;
+; Validate AST, if present. Note R4 still has our PCB address, and R9
+; has the LKB address of the lock we want information from.
+;
+5$:	TSTL	ASTADR(AP)
+	BEQL	7$			; No AST to check.
+	TSTW	PCB$W_ASTCNT(R4)	; Is quota exceeded?
+	BLEQ	35$			; Branch if so and return error
+;
+; Check if information is contained on another system in the cluster
+;
+7$:	BSBW	GET_REMLKI		; Get remote LKI block if needed
+	BLBC	R0,17$			; Exit on error
+;
+; Loop through the item descriptor blocks, validating the requested item
+; identifiers and moving accessible items.  A zero item identifier terminates
+; the list.
+;
+; At this point:
+;
+;	R4 = PCB address
+;	R9 = LKB address
+;	R11 = Remote lock block information or zero
+;	AP = Pointer to argument list
+
+10$:	MOVL	ITMLST(AP),R5		; Get item descriptor list address
+	IFNORD	#4,(R5),30$		; Check first longword readable
+15$:	MOVZWL	(R5)+,R6		; Get buffer size
+	MOVZWL	(R5)+,R1		; Get item identifier
+	BEQL	50$			; Done if zero, take normal exit
+	IFNORD	#12,(R5),30$		; Check rest of this descriptor ...
+					; ... plus first longword of next one
+	MOVQ	(R5)+,R7		; Get buffer address and return address
+	PUSHL	R1			; Save R1 across accessibility check
+	MOVL	R7,R0			; Buffer address to R0
+	MOVL	R6,R1			; And size to R1
+	CLRL	R3			; PROBE will use PSL<PRVMOD>
+	JSB	EXE$PROBEW		; Check write accessibility of buffer
+	POPL	R1			; Restore R1 for use by CHECKITEM
+17$:	BLBC	R0,GRET			; Return error if inaccessible
+	;
+	; We will raise IPL to IPL$_SYNCH to lock down the LKB. We will
+	; have to verify that the LKB is still valid, before proceeding.
+	;
+	; The IPL will be restored by the MOVEIT routine just before copying
+	; the data to the users's buffer. This is done to allow the SPC_xxx
+	; routines to gather up any additional information that needs to be
+	; returned to the user, without verifying that the LKB address is
+	; still valid.
+	;
+	SETIPL	#IPL$_SYNCH		; Raise IPL to sync access to structures
+					;  can't reference user's process space
+	MOVZWL	LKB$L_LKID(R9),R4	; Get lock index
+	CMPL	R4,LCK$GL_MAXID		; Is the lock index still ok?
+	BGTRU	20$			; Br if no, check for error condition
+	CMPL	R9,@LCK$GL_IDTBL[R4]	; Is the lock address still the same?
+	BEQL	25$			; Br if yes, okay to proceed
+20$:	SETIPL	#IPL$_ASTDEL		; Restore the IPL on error condition
+	TSTL	@LKID(AP)		; Is this a "wildcard" search?
+	BGTR	23$			; Br if no, continue
+	BRW	2$			; Else, try for next lock
+23$:	MOVZWL	#SS$_IVLOCKID,R0	; Invalid lock id
+	BRB	GRET			; Return to user
+	;
+	; Check item code and return the info to user.
+	;
+25$:	PUSHL	R5			; Save R5 from action routines
+	BSBW	CHECKITEM		; Validate identifier and get item info.
+	BLBC	R0,40$			; Invalid item if error
+	BSBW	MOVEIT			; Move item to user
+					;  NOTE: IPL is restored to IPL$_ASTDEL
+	POPL	R5			; Restore R5
+	BLBS	R0,15$			; Back for next descriptor if ok
+	BRB	GRET			; Else, return error
+
+30$:	MOVZWL	#SS$_ACCVIO,R0		; Access violation
+	BRB	GRET
+
+35$:	MOVZWL	#SS$_EXQUOTA,R0		; AST quota exceeded
+	BRB	GRET
+
+40$:	MOVZWL	#SS$_BADPARAM,R0	; Illegal item or request
+	BRB	GRET
+
+50$:	MOVZWL	#SS$_NORMAL,R0		; Normal return
+
+;
+; Set the event flag, post the completion status, and declare a completion AST
+;
+GRET:	PUSHL	R0			; Save completion status
+	MOVL	R11,R0			; Any remote lock block?
+	BEQL	5$			; Br if not, okay
+	JSB	EXE$DEANONPAGED		; Else, deallocate the remote lock block
+5$:	SETIPL	SAVED_IPL(FP)		; Restore IPL to that on entry to service
+	MOVL	SCH$GL_CURPCB,R4	; Get PCB address
+	MOVL	PCB$L_PID(R4),R1	; Get process's PID
+	CLRL	R2			; Set null priority increment
+	MOVL	EFN(AP),R3		; Get event flag number to set
+	JSB	SCH$POSTEF		; Set the event flag
+10$:	MOVL	IOSB(AP),R1		; Get address of IOSB
+	BEQL	20$			; Branch if none
+	IFNOWRT	#8,(R1),20$		; Check if writable
+	MOVL	(SP),(R1)		; Store completion status
+20$:	MOVL	ASTADR(AP),R5		; Get address of AST routine
+	BEQL	30$			; Branch if none specified
+	BLBC	(SP),30$		; No completion AST on error!
+	MOVPSL	R4			; Get PSL
+	EXTZV	#PSL$V_PRVMOD,#PSL$S_PRVMOD,R4,R4 ; Extract previous mode
+	$DCLAST_S (R5),ASTPRM(AP),R4	; Queue the completion AST
+30$:	POPL	R0			; Restore completion status
+	RET				; And return.
+
+
+	.SBTTL	GET_REMLKI- Get remote LKI block
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Routine to get the remote LKI block if necessary.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSB
+;
+; INPUTS:
+;
+;	R4	PCB address
+;	R9	LKB address
+;	R11	ZERO
+;
+; IMPLICIT INPUTS:
+;
+;	IPL = IPL$_ASTDEL
+;
+; OUTPUTS:
+;
+;	R0	success/failure of operation + special flags
+;	R4	PCB address
+;	R9	LKB address
+;	R11	Address of remote LKI block or zero
+;
+; IMPLICIT OUTPUTS:
+;
+;	none
+;
+; SIDE EFFECTS:
+;
+;	R0-R3,R8 destroyed.
+;--
+
+	.ENABL	LSB
+GET_REMLKI:				; Get remote LKI block
+	MOVB	#1,R0			; Assume success
+	BBS	#LKB$V_MSTCPY,-		; Br if this is the master copy,
+		LKB$W_STATUS(R9),10$	;  information is local to this system
+	MOVL	LKB$L_RSB(R9),R8	; Get RSB address
+	MOVL	RSB$L_CSID(R8),R3	; Is this a process copy?
+	BEQL	10$			; Br if not, information is still local
+	SETIPL	#IPL$_SYNCH		; Raise IPL to SYNCH
+	JSB	G^LKI$SND_STDREQ	; And send request for information
+					;  to remote system
+	MOVL	SCH$GL_CURPCB,R4	; Get our PCB address
+10$:	RSB				; Return to caller
+
+	.DSABL	LSB
+
+
+	.SBTTL	CHECKITEM - Validate item identifier
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Routine to validate item identifier and return information
+;	about the item.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSB
+;
+; INPUTS:
+;
+;	R1	item identifier
+;	R9	LKB address
+;	R11	REMOTE LKI BLOCK or zero
+;
+; IMPLICIT INPUTS:
+;
+;	IPL = IPL$_SYNCH
+;
+; OUTPUTS:
+;
+;	R0	success/failure of operation + special flags
+;	R1	item identifier
+;	R2	structure number
+;	R3	item length
+;	R4	item address 
+;	R5	item type code
+;
+; IMPLICIT OUTPUTS:
+;
+;	none
+;
+; SIDE EFFECTS:
+;
+;	none
+;--
+
+CHECKITEM:
+	CLRL	R0			; Assume bad item code
+	MOVZBL	R1,R3			; Get item number
+	EXTZV	#8,#8,R1,R2		; Get structure number
+	BEQL	80$			; Error if structure number zero
+	CMPB	R2,#MAXSTRUC		; Structure number valid?
+	BGTRU	80$			; Error if not
+	CMPB	R3,MAXCOUNT-1[R2]	; Check max item values (1 origin)
+	BGTRU	80$			; Error if illegal item number
+	CASE	R2,<10$,30$>B,#1 	; Case on structure base
+	;
+	; LKB return item
+	;
+10$:	MOVL	R9,R4			; Get back LKB address
+	MOVAL	LKBTBL,R5		; Get address of LKB item table
+	BRB	40$			; Continue
+	;
+	; RSB return item
+	;
+30$:	MOVL	LKB$L_RSB(R9),R4	; Get resource block address
+	MOVAL	RSBTBL,R5		; Get address of PHD item table
+
+40$:	ASHL	#1,R3,R0		; Double item number
+	MOVAL	(R5)[R3],R3		; Compute address in item table
+	ADDL	R0,R3			;	...
+	MOVZWL	(R3)+,R5		; Get offset into data structure
+	ADDL	R5,R4			; Form complete address
+	MOVL	#1,R0			; Set successful return
+	TSTL	R11			; Is there a remote LKI block?
+	BEQL	50$			; Br if not, continue
+	TSTW	2(R3)			; Is this item in remote LKI block?
+	BEQL	50$			; Br if not
+	MOVZWL	2(R3),R4		; Else, get offset in remote LKI block
+	ADDL	R11,R4			; Form complete address
+	BBSS	#1,R0,50$		; Indicate that no special lookup needed
+50$:	EXTZV	#5,#3,(R3),R5		; Get item type code
+	EXTZV	#0,#5,(R3),R3		; Get item length
+80$:	RSB				; Return to caller
+
+
+	.SBTTL	MOVEIT - Move data to user's buffer
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Move the requested data to user buffer. Zero fill to end of buffer.
+;	Return actual data length to user.  Assumes user's buffer has
+;	been probed.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSB
+;
+; INPUTS:
+;
+;	R0	special lookup flag
+;	R1	item identifier
+;	R2	data structure number
+;	R3	item length
+;	R4	item address
+;	R5	item type code
+;	R6	user buffer length
+;	R7	user buffer address
+;	R8	address to return length
+;	R9	LKB address
+;
+; IMPLICIT INPUTS:
+;
+;	IPL = IPL$_SYNCH
+;
+; OUTPUTS:
+;
+;	none
+;
+; IMPLICIT OUTPUTS:
+;
+;	IPL = IPL$_ASTDEL
+;
+; ROUTINE VALUE:
+;
+;	SS$_NORMAL	Normal successful completion
+;	SS$_ACCVIO	Access violation on attempt to access return size
+;
+; SIDE EFFECTS:
+;
+;	Registers R1-R4 destroyed
+;--
+
+MOVEIT:
+	;
+	; Call routine to check for special conditions
+	;
+	CLRL	R10			; No buffer to deallocate - yet!
+	BBS	#1,R0,5$		; Br if no special lookup needed
+	BSBB	CHECK_SPC		; Check for special actions
+5$:	SETIPL	#IPL$_ASTDEL		; Restore IPL to ASTDEL
+	BLBC	R0,40$			; Br if error
+	;
+	; Check for counted string, and find actual length if so.
+	;
+	CMPL	#CSTRING,R5		; Is this special string?
+	BNEQ	10$			; Br if not
+	MOVZBL	(R4)+,R3		; Get length and skip length byte
+	;
+	; Move the data
+	;
+10$:	PUSHR	#^M<R3,R5>		; Save registers
+	MOVC5	R3,(R4),#0,R6,(R7)	; Move data to user's buffer, zero fill
+	POPR	#^M<R3,R5>		; Restore registers
+	TSTL	R8			; Did caller want return length?
+	BEQL	30$			; Br if not
+	IFNOWRT	#4,(R8),70$		; Br if longword not writeable
+	CMPW	R3,R6			; See how much was moved
+	BLEQ	20$			; Use valid data length if it fits
+	MOVW	R6,R3			; Else give him "too short" buffer size
+	BBSS	#31,R3,20$		; And return buffer overflow indicator
+20$:	MOVL	R3,(R8)			; Return length to user
+30$:	MOVZBL	S^#SS$_NORMAL,R0	; Set success code
+40$:	TSTL	R10			; Any pool deallocation needed?
+	BEQL	50$			; Br if no
+	PUSHR	#^M<R0,R1,R2,R3>	; Save registers
+	MOVL	R10,R0			; Get buffer address
+	JSB	EXE$DEANONPAGED		; Deallocate the pool
+	POPR	#^M<R0,R1,R2,R3>	; Save registers
+50$:	RSB				; Return to caller
+
+70$:	MOVZWL	#SS$_ACCVIO,R0		; Return error code
+	BRB	40$			; Return to caller
+
+
+	.SBTTL	SPECIAL - Handle special conditions
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	These routines handle data items which must be transformed
+;	before they are returned to the user.  Generally, some
+;	transformation is applied to the data item and the newly
+;	computed item is stored in LOCAL_SPACE on the stack.
+;	The handling routine then changes R4 to point to LOCAL_SPACE
+;	so that MOVEIT will move the item from local storage.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSB
+;
+; INPUTS:
+;
+;	R1	item identifier
+;	R3	item length
+;	R4	item address
+;	R6	user buffer length
+;	R9	LKB address
+;	R10	zero
+;
+; IMPLICIT INPUTS:
+;
+;	IPL = IPL$_SYNCH
+;
+; OUTPUTS:
+;
+;	R10	system buffer address to deallocate or zero if none
+;
+; IMPLICIT OUTPUTS:
+;
+;	none
+;
+; ROUTINE VALUE:
+;
+;	SS$_NORMAL	Normal successful completion
+;	SS$_INSFMEM	Insufficient non-paged dynamic memory
+;
+; SIDE EFFECTS:
+;
+;	none
+;--
+
+CHECK_SPC:
+	;
+	; Registers R7 and R8 are saved at this level and may be used by
+	; the action routines without being saved.  Action routines are JSB'ed
+	; to with R7 containing the address of LOCAL_SPACE on the stack.
+	;
+	MOVQ	R7,-(SP)		; Save registers
+	MOVL	#SPECIAL_LEN,R7		; Get number of table entries
+	MOVAL	SPECIAL,R8		; Get address of table
+
+10$:	CMPW	R1,(R8)+		; Does entry match item?
+	BEQL	20$			; Yes, go handle it
+	ADDL	#4,R8			; Skip handler address
+	SOBGTR	R7,10$			; Scan rest of table
+	BRB	30$			; Nothing to do, exit
+
+20$:	MOVAL	LOCAL_SPACE(FP),R7	; Load local address for action routine
+	MOVZBL	S^#SS$_NORMAL,R0	; Assume success
+	JSB	@(R8)+			; Call action routine
+
+30$:	MOVQ	(SP)+,R7		; Restore registers
+	RSB
+;+
+; Data handling routines
+;-
+
+;
+;  The PID must be returned as an EPID.
+;  The EPID field of the LKB is valid only on a master copy lock block.
+;
+; Inputs:	R4 -> LKB$L_EPID in LKB
+;		R7 -> Output longword buffer if needed for return
+;		R9 =  Address of LKB
+;
+
+SPC_PID:
+	BBS	#LKB$V_MSTCPY,-		; Br if master copy, R4 is pointing to
+		LKB$W_STATUS(R9),90$	;  a valid EPID
+	MOVL	LKB$L_PID(R9),R0	; Else, get the IPID
+	JSB	EXE$IPID_TO_EPID	; Convert to EPID
+	MOVL	R0,(R7)			; Store the EPID
+	MOVL	R7,R4			; Change the item address
+90$:	MOVZBL	S^#SS$_NORMAL,R0	; Return success
+	RSB
+	
+;
+; The lock state is a composite of several fields
+;
+
+SPC_STATE:
+	ASSUME	LKB$B_GRMODE EQ LKB$B_RQMODE+1
+	ASSUME	LKB$B_STATE EQ LKB$B_GRMODE+1
+	MOVZWL	(R4)+,(R7)		; Copy modes
+	MOVB	(R4),2(R7)		; ..and state
+	BGEQ	30$			; Br if state is okay
+	MOVB	#LKI$C_WAITING,2(R7)	; Else, map waiting states to same code
+30$:	MOVL	R7,R4			; Change the item address
+	RSB
+
+;
+; The lock's parent lock ID must be extracted from another LKB
+;
+
+SPC_PARENT:
+	CLRL	(R7)			; Assume no PARENT LKB
+	MOVL	(R4),R4			; Get address of PARENT LKB
+	BEQL	10$			; Br if none
+	MOVL	LKB$L_LKID(R4),(R7)	; Get LOCKID of owner process
+10$:	MOVL	R7,R4			; Change the item address
+	RSB
+
+;
+; The CSID of master
+;
+
+SPC_SYSTEM:
+	TSTL	(R4)			; Is CSID zero?
+	BNEQ	30$			; Br if not, CSID is okay
+	MOVL	L^CLU$GL_CLUB,R0	; Get address of cluster block
+	BEQL	20$			; Br if no cluster
+	MOVAB	CLUB$L_LOCAL_CSID(R0),R4 ; Set new item address
+20$:	MOVZBL	S^#SS$_NORMAL,R0	; Return success
+30$:	RSB
+
+;
+; The lock's resource name space is a composite
+;
+
+SPC_NAMSPACE:
+	ASSUME	RSB$B_RMOD EQ RSB$W_GROUP+2
+	EXTZV	#0,#8+16,-		; Get the group field and access mode
+		(R4),(R7)		;  3 bytes.
+	TSTW	(R4)			; Is this group 0? (ie SYSTEM resource)
+	BNEQ	10$			; Br if not, not a system resource
+	BBSS	#LKI$V_SYSNAM,(R7),10$	; Set the SYSTEM wide indicator
+10$:	MOVL	R7,R4			; Change the item address
+	RSB
+
+;
+; The lock's lock count is the sum of all locks granted on the resource.
+;
+
+SPC_LCKCOUNT:
+	CLRL	(R7)			; No locks granted yet!
+	MOVL	R4,R8			; Copy listhead address
+10$:	CMPL	(R4),R8			; Back at listhead again?
+	BEQL	20$			; Br if yes
+	INCL	(R7)			; Else, tally one more lock
+	MOVL	(R4),R4			; move down list
+	BRB	10$			; Look for more
+20$:	MOVL	R7,R4			; Change item address
+	RSB
+
+;
+; The remote lock id
+;
+
+SPC_REMLKID:
+	PUSHL	R1			; Save R1
+	MOVL	LKB$L_RSB(R9),R1	; Get RSB address
+	MOVL	RSB$L_CSID(R1),(R7)	; Is the REMLKID valid?
+	BEQL	10$			; Br if not, information is still local
+	MOVL	(R4),(R7)		; Else, return real REMLKID
+10$:	MOVL	R7,R4			; Return item address
+	POPL	R1			; Restore R1
+	RSB				; Return to caller
+
+;
+; The list of all locks being blocked by this lock.
+;
+
+SPC_BLOCKEDBY:
+	PUSHR	#^M<R1,R2>		; Save registers
+	BSBW	LKI_ALLOCATE		; Allocate a system buffer
+	BLBC	R0,50$			; Br if resource failure
+	MOVL	R4,R8			; Copy RSB wait queue listhead address
+	MOVL	R2,R4			; Copy address of system buffer data
+	BBS	#LKB$V_MSTCPY,-		; Br if this is the master copy,
+		LKB$W_STATUS(R9),10$	;  information is local to this system
+	MOVL	LKB$L_RSB(R9),R3	; Get RSB address
+	MOVL	RSB$L_CSID(R3),R3	; Is this a process copy?
+	BEQL	10$			; Br if not, information is still local
+	;
+	; Lock information is on MASTER system
+	;
+	JSB	G^LKI$SND_BLKBY		; Send request for all locks BLOCKEDBY
+					;  this lock
+	BRB	30$			; Return with status
+	;
+	; Lock information is LOCAL to this system
+	;
+10$:	BSBW	LKI$SEARCH_BLOCKEDBY	; Find all locks BLOCKEDBY this lock
+30$:	MOVW	#LKI$C_LENGTH,R3	; Return size of item
+	ASHL	#16,R3,R3		; Move to high word
+	MOVW	(R10),R3		; Get size of returned buffer
+50$:	POPR	#^M<R1,R2>		; Restore registers
+	RSB
+
+;
+; The list of all locks blocking this lock.
+;
+
+SPC_BLOCKING:
+	PUSHR	#^M<R1,R2>		; Save registers
+	BSBW	LKI_ALLOCATE		; Allocate a system buffer
+	BLBC	R0,50$			; Br if resource failure
+	MOVL	R4,R8			; Copy RSB wait queue listhead address
+	MOVL	R2,R4			; Copy address of system buffer data
+	BBS	#LKB$V_MSTCPY,-		; Br if this is the master copy,
+		LKB$W_STATUS(R9),10$	;  information is local to this system
+	MOVL	LKB$L_RSB(R9),R3	; Get RSB address
+	MOVL	RSB$L_CSID(R3),R3	; Is this a process copy?
+	BEQL	10$			; Br if not, information is still local
+	;
+	; Lock information is on MASTER system
+	;
+	JSB	G^LKI$SND_BLKING	; Send request for all locks BLOCKING
+					;  this lock
+	BRB	30$			; Return with status
+	;
+	; Lock information is LOCAL to this system
+	;
+10$:	BSBW	LKI$SEARCH_BLOCKING	; Find all locks BLOCKING this lock
+30$:	MOVW	#LKI$C_LENGTH,R3	; Return size of item
+	ASHL	#16,R3,R3		; Move to high word
+	MOVW	(R10),R3		; Get size of returned buffer
+50$:	POPR	#^M<R1,R2>		; Restore registers
+	RSB
+
+;
+; The list of all locks associated with the resource.
+;
+
+SPC_LOCKS:
+	PUSHR	#^M<R1,R2>		; Save registers, R3 & R4 are outputs
+	BSBW	LKI_ALLOCATE		; Allocate a system buffer
+	BLBC	R0,80$			; Br if failure
+	MOVL	R4,R8			; Copy listhead address
+	MOVL	R2,R4			; Set address of return buffer
+	BBS	#LKB$V_MSTCPY,-		; Br if this is the master copy,
+		LKB$W_STATUS(R9),10$	;  information is local to this system
+	MOVL	LKB$L_RSB(R9),R3	; Get RSB address
+	MOVL	RSB$L_CSID(R3),R3	; Is this a process copy?
+	BEQL	10$			; Br if not, information is still local
+	;
+	; Lock information is on MASTER system
+	;
+	JSB	G^LKI$SND_LOCKS		; Send request for all locks associated
+					;  with this lock
+	BRB	70$			; Return with status
+	;
+	; Lock information is LOCAL to this system
+	;
+10$:	MOVL	R6,R1			; Get size of buffer
+	ASSUME	RSB$L_CVTQFL EQ RSB$L_GRQFL+8
+	ASSUME	RSB$L_WTQFL EQ RSB$L_CVTQFL+8
+	MOVZBL	#3,R3			; Initialize number of queues to search
+30$:	MOVL	R8,R7			; Copy listhead address, again
+50$:	CMPL	(R7),R8			; Back at listhead again?
+	BEQL	60$			; Br if yes
+	SUBL	#LKI$C_LENGTH,R1	; Any room left in buffer?
+	BLSS	90$			; Br if not
+	MOVL	(R7),R7			; Else, move down list
+	MOVAB	-LKB$L_SQFL(R7),R7	; Point to start of LKB
+	BSBB	LOCK_INFO		; Get the lock information
+	MOVAB	LKB$L_SQFL(R7),R7	; Point back to state queue
+	BRB	50$			; Look for more
+60$:	ASSUME	RSB$L_CVTQFL EQ RSB$L_GRQFL+8
+	ASSUME	RSB$L_WTQFL EQ RSB$L_CVTQFL+8
+	ADDL	#8,R8			; Skip to next queue
+	SOBGTR	R3,30$			; Loop if more queues to search
+	MOVZBL	S^#SS$_NORMAL,R0	; Return success
+70$:	MOVW	#LKI$C_LENGTH,R3	; Return size of item
+	ASHL	#16,R3,R3		; Move to high word
+	MOVW	(R10),R3		; Get size of returned buffer
+80$:	POPR	#^M<R1,R2>		; Restore registers
+	RSB				; Return to caller
+
+90$:	MOVZWL	#SS$_BUFFEROVF,R0	; Return partial success
+	BRB	80$			; Exit
+
+;+
+; Return Lock Information
+;
+;	This routine will return the following lock information:
+;
+;		LKI$_LOCKID	- the lock's lock id
+;		LKI$_PID	- the lock's PID
+;		LKI$_SYSTEM	- the resource's system id
+;		LKI$_STATE	- the locks current state
+;		LKI$_REMLKID	- the remote lock id (Process copy LOCKID)
+;		LKI$_REMSYSTEM	- the remote system id (Process copy CSID)
+;
+; Inputs:
+;	R2 = Output buffer address
+;	R7 = LKB address
+;	R10 = Address of beginning of system buffer
+;
+; Outputs:
+;	None
+;
+; Side Effects:
+;	R0 is destroyed
+;	(R10) is increased by lock return size
+;-
+LOCK_INFO:
+	ADDW	#LKI$C_LENGTH,(R10)	; Tally return size
+	MOVL	LKB$L_LKID(R7),(R2)+	; Return the LOCKID (MASTER LOCKID)
+	;
+	;  The EPID in the LKB is valid only for a master lock block.
+	;
+	MOVL	LKB$L_EPID(R7),R0	; Get the EPID
+	BBS	#LKB$V_MSTCPY,-		; Br if master copy lock
+		LKB$W_STATUS(R7),10$	; ...EPID is valid
+	MOVL	LKB$L_PID(R7),R0	; Get the IPID
+	JSB	L^EXE$IPID_TO_EPID	; Convert to EPID
+10$:	MOVL	R0,(R2)+		; Return the EPID
+	MOVL	LKB$L_RSB(R7),R0	; Get RSB address
+	MOVL	RSB$L_CSID(R0),(R2)+	; Return the SYSTEM ID (MASTER CSID)
+	BNEQ	30$			; Br if okay
+	MOVL	L^CLU$GL_CLUB,R0	; Else, get address of cluster block
+	BEQL	30$			; Br if no cluster
+	MOVL	CLUB$L_LOCAL_CSID(R0),-4(R2) ; Return real CSID
+30$:	ASSUME	LKB$B_GRMODE EQ LKB$B_RQMODE+1
+	MOVW	LKB$B_RQMODE(R7),(R2)+	; Copy modes
+	MOVZBW	LKB$B_STATE(R7),(R2)+	; Copy current state, zero byte
+	BGEQ	40$			; Br if state is okay
+	MOVB	#LKI$C_WAITING,-2(R2)	; Else, map waiting states to same code
+40$:	;
+	;  The remote CSID and REMLKID are only valid in a master copy
+	;  lock block.
+	;
+	MOVL	LKB$L_REMLKID(R7),(R2)+	; Copy the REMLKID (PROCESS COPY LKID)
+	MOVL	LKB$L_CSID(R7),(R2)+	; Get the remote CSID (PROCESS_CPY CSID)
+	BBS	#LKB$V_MSTCPY,-		; Br if master copy
+		LKB$W_STATUS(R7),90$	; ...CSID, REMLKID are valid
+	MOVL	LKB$L_LKID(R7),-8(R2)	; Else, return the LOCKID as REMLKID
+	MOVL	L^CLU$GL_CLUB,R0	; Get the CLUB
+	BEQL	70$			; Br if none, return zero CSID
+	MOVL	CLUB$L_LOCAL_CSID(R0),R0; Else, get real CSID
+70$:	MOVL	R0,-4(R2)		; Return real CSID
+90$:	RSB
+
+
+	.SBTTL	GETLKB - Get specified Lock Block
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Routine to convert a LKID and check privileges. If a valid LKID is
+;	specified, the standard conversion routine VERIFYLOCKID is simply
+;	called.  If, however, a LKID that implies a "wildcard" LKID (-1 or 0)
+;	is specified, then the next active lock is chosen as the LKID to pass
+;	to VERIFYLOCKID which then checks the requestor's privilege to obtain
+;	information about the lock and returns the lock's LKB address.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSB
+;
+; INPUTS:
+;
+;	R4		current process PCB address
+;	LKID(AP)	address of specified LKID
+;
+; IMPLICIT INPUTS:
+;
+;	IPL <= IPL$_ASTDEL
+;
+; OUTPUTS:
+;
+;	R0	success/failure of operation
+;	R4	current process PCB address
+;	R9	specified lock's LKB address
+;
+; COMPLETION CODES:
+;
+;	SS$_NORMAL	Normal successful completion
+;	SS$_ACCVIO	Access violation on attempt to access lock id
+;	SS$_NOMORELOCK	No more locks available (on "wildcard" operations)
+;
+; SIDE EFFECTS:
+;
+;	R5 and R6 are destroyed.
+;--
+
+GETLKB:
+	CLRL	R5			; Assume not "wildcard" LKID
+	MOVL	LKID(AP),R6		; Get LKID address
+	BEQL	60$			; Br if none
+	IFNOWRT	#4,(R6),50$		; Check access to LKID
+	MOVL	(R6),R1			; Get LKID
+	BGTR	20$			; Br if standard LKID
+	;
+	; "Wildcard" type LKID specified
+	;
+	CVTWL	R1,R5			; Get LKIX (LocK IndeX) from LKID
+	BGTR	10$			; If gtr, valid LKIX
+	CLRL	R5			; Else, start with index = 1
+10$:	INCW	R5			; Increment LKIX
+	CMPW	R5,LCK$GL_MAXID		; Is LKIX in valid range?
+	BGTRU	60$			; Br if not - no more locks
+	MOVL	@LCK$GL_IDTBL[R5],R0	; Get LKB address
+	BGEQ	10$			; Br if unused slot
+	MOVL	LKB$L_LKID(R0),R1	; Get LKID from LKB
+	MOVL	R1,(R6)			; Store LKID in argument list
+	;
+	; Get LKB and check privileges
+	;
+20$:	BSBW	VERIFYLOCKID		; Get LKB address and check privileges
+	TSTW	R5			; "wildcard" type LKID specified?
+	BEQL	40$			; Br if not
+	BLBC	R0,10$			; Br if error, return only "good" ones
+	MNEGW	#1,2(R6)		; Else, set continuation context
+40$:	RSB				; Return to caller
+
+50$:	MOVZWL	#SS$_ACCVIO,R0		; Set access violation
+	BRB	40$			;
+60$:	MOVZWL	#SS$_NOMORELOCK,R0	; Set no more processes
+	BRB	40$			;
+
+
+	.SBTTL	VERIFYLOCKID - Verify lock id
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine verifies a lock id for correct process ownership
+;	and access mode and then converts it into a LKB address.
+;
+;	LKB is not locked after leaving this routine, therefore we
+;	must re-verify the LKB everytime we attempt to use it.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSB
+;
+;	Note:  IPL is raised to IPL$_SYNCH to prevent the owner of
+;	the lock from releasing the LKB/RSB in the middle of verifying
+;	its lock id.
+;
+; INPUTS:
+;
+;	R1	Lock id
+;	R4	Address of PCB
+;	R5	Zero if not a wildcard search operation
+;
+; OUTPUTS:
+;
+;	R0	Completion code
+;	R9	Address of LKB
+;
+; COMPLETION CODES:
+;
+;	SS$_NORMAL	Lock id was valid and converted to LKB address
+;	SS$_IVLOCKID	Invalid lock id
+;	SS$_IVMODE	Access mode violation on attempt to access lock
+;	SS$_NOSYSLCK	No SYSLCK privilege to access system lock
+;	SS$_NOWORLD	No WORLD privilege to access lock
+;
+; SIDE EFFECTS:
+;
+;	R0 and R1 are destroyed
+;--
+
+	ASSUME	LKB$V_MODE  EQ  0
+	ASSUME	LKB$S_MODE  EQ  2
+
+VERIFYLOCKID:
+	DSBINT	#IPL$_SYNCH		; Raise IPL to sync access to LKBs
+	MOVZWL	R1,R9			; Put lockid index in R9
+	CMPL	R9,LCK$GL_MAXID		; Is the lock id too big?
+	BGTRU	40$			; Yes
+	MOVL	@LCK$GL_IDTBL[R9],R9	; Get LKB address
+	BGEQ	40$			; Unallocated id
+	CMPL	R1,LKB$L_LKID(R9)	; Check sequence number
+	BNEQ	40$			; Not valid
+	MOVL	LKB$L_RSB(R9),R0	; Get RSB address
+	TSTW	RSB$W_GROUP(R0)		; Is this a system resource?
+	BEQL	10$			; Br if yes
+	MOVL	G^SCH$GL_CURPCB,R1	; Else, get our PCB address
+	CMPW	PCB$W_GRP(R1),-		; Do we have group access to LKB?
+		RSB$W_GROUP(R0)		; ..no privilege needed
+	BEQL	20$			; Br if our group - always allowed
+	IFNPRIV	WORLD,70$		; Br if NO privilege to access lock
+	BRB	20$			; Else, success
+10$:	MOVPSL	R0			; Get current PSL
+	EXTZV	#PSL$V_PRVMOD,-		; Extract previous mode field
+		#PSL$S_PRVMOD,R0,R0
+	ASSUME	PSL$C_KERNEL EQ 0
+	ASSUME	PSL$C_EXEC EQ 1
+	CMPB	#PSL$C_EXEC,R0		; Does the user have the right access
+					;  mode to access the LKB?
+	BGEQU	20$			; Br if yes
+	IFNPRIV	SYSLCK,60$		; Br if NO privilege to look at lock
+20$:	MOVPSL	R0			; Get current PSL
+	EXTZV	#PSL$V_PRVMOD,-		; Extract previous mode field
+		#PSL$S_PRVMOD,R0,R0
+	MOVL	LKB$L_RSB(R9),R1	; Get RSB address
+	CMPB	R0,RSB$B_RMOD(R1)	; Caller have privilege to access lock?
+	BGTRU	50$			; Br if No
+	MOVZBL	S^#SS$_NORMAL,R0	; Else, Yes - return success
+30$:	ENBINT				; Restore IPL
+	RSB
+
+40$:	MOVZWL	#SS$_IVLOCKID,R0	; Invalid lock id
+	BRB	30$			; Leave
+50$:	MOVZWL	#SS$_IVMODE,R0		; Illegal access mode
+	BRB	30$			; Leave
+60$:	MOVZWL	#SS$_NOSYSLCK,R0	; No SYSLCK privilege to access lock
+	BRB	30$			; Leave
+70$:	MOVZWL	#SS$_NOWORLD,R0		; No WORLD privilege to access lock
+	BRB	30$			; Leave
+
+
+	.SBTTL	LKI$SEARCH_BLOCKING - Search for locks blocking the current lock
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine searches for locks blocking the current lock.  A
+;	blocking lock is one in which the maximized request mode is
+;	incompatible with the requested mode (if the lock is on the
+;	waiting or conversion queue) or the granted mode (if the lock
+;	is on the granted queue).
+;
+;	For example, assume there is PR locks granted on a resource and
+;	a second user issues an EX mode request on the resource. The first
+;	lock is now BLOCKING the second lock and the first lock would be
+;	returned in list of locks BLOCKING the second lock.
+;
+;	To find BLOCKING locks it is sufficient to check all locks
+;	ahead of this lock on all queues (in th order, REQESTED,
+;	CONVERSION and then GRANTED) to see if their requested or granted
+;	modes are incompatible with this locks requested mode.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSB
+;
+; INPUTS:
+;
+;	R2	address of system buffer for storing the lock information
+;	R6	length of system buffer for storing the lock information
+;	R8	address of wait queue in RSB
+;	R9	LKB address
+;
+; IMPLICIT INPUTS:
+;
+;	IPL = IPL$_SYNCH
+;
+; OUTPUTS:
+;
+;	R0	always success!
+;
+; SIDE EFFECTS:
+;
+;	R7 is destroyed.
+;--
+
+LKI$SEARCH_BLOCKING::
+	PUSHR	#^M<R1,R2,R5,R6>	; Save registers
+	;
+	; First run through all locks waiting ahead of this lock
+	; maximizing the requested modes and checking all locks
+	; incompatible with the current "maxmode".  If this lock is
+	; on the wait queue then we do the wait queue first and
+	; the converison queue next.  If this lock is on the
+	; conversion queue then we do only the conversion queue.
+	; Later we'll do all the granted locks.
+	;
+	; If this lock is on the granted queue, we skip right to the
+	; search of the granted queue locks.
+	;
+	ASSUME	LKB$K_GRANTED  EQ  1
+	ASSUME	LKB$K_CONVERT  EQ  0
+	ASSUME	LKB$K_WAITING  EQ  -1
+	ASSUME	RSB$L_CVTQFL  EQ  RSB$L_GRQFL+8
+	ASSUME	RSB$L_WTQFL  EQ  RSB$L_CVTQFL+8
+
+	MOVZBL	LKB$B_RQMODE(R9),R5	; Get the current lock's requested mode
+	MOVL	R9,R7			; R7 will point to other LKB's
+					; in front of the one pointed to by R9
+	TSTB	LKB$B_STATE(R9)		; Which queue is lock on?	
+	BGTR	60$			; Br if granted queue
+	BLSS	10$			; Br if waiting queue
+	;
+	;   Lock is on the conversion queue
+	;
+	SUBL	#8,R8			; Point to conversion queue header
+
+10$:	MOVL	LKB$L_SQBL(R7),R7	; Get previous lock on state queue
+	CMPL	R7,R8			; Reached head of queue yet?
+	BEQL	50$			; Br if yes
+	SUBL	#LKB$L_SQFL,R7		; Back up to point at start of LKB
+	MOVZBL	LKB$B_RQMODE(R7),R0	; R0 = requested mode
+	MOVL	R5,R1			; Save old maxmode
+	;
+	; Maximize lock modes (in R0 and R5) and see if this lock (R7) is
+	; incompatible with (the previous) maxmode.  The maximization function 
+	; is a simple arithmetic maximum except if the two modes are CW and PR.
+	; In that case the maximum of CW and PR is PW.  PW is incompatible
+	; with everything either CW or PR is incompatible with.
+	;
+	CMPB	R0,R5			; Current mode greater than maxmode?
+	BEQL	35$			; Br if No, they're equal
+	BGTRU	20$			; Br if Yes, compute new maxmode
+	CMPB	R0,#LCK$K_CWMODE	; Br if No, is current mode CW?
+	BNEQ	35$			; Br if No, maxmode = R2
+	CMPB	R5,#LCK$K_PRMODE	; Br if Yes, is maxmode PR?
+	BNEQ	35$			; Br if No, maxmode = R2
+	BRB	25$			; Br if Yes, new maxmode is PW
+20$:	CMPB	R5,#LCK$K_CWMODE	; Is maxmode CW?
+	BNEQ	30$			; Br if No, maxmode = R0
+	CMPB	R0,#LCK$K_PRMODE	; Br if Yes, is current mode PR?
+	BNEQ	30$			; Br if No, maxmode = R0
+25$:	MOVB	#LCK$K_PWMODE,R5	; Have CW and PR; maxmode = PW
+	BRB	35$
+30$:	MOVB	R0,R5			; Maxmode = R0
+
+35$:	BBS	R0,-			; Branch if compatible with 
+		L^LCK$COMPAT_TBL[R1],10$;  saved maxmode
+	;
+	; Have a lock incompatible with maxmode, return the lock info.
+	;
+	SUBL	#LKI$C_LENGTH,R6	; Any room left in buffer?
+	BLSS	90$			; Br if not, leave now
+	BSBW	LOCK_INFO		; Return the lock information
+40$:	BRB	10$			; Get next lock in RSB (outer loop)
+
+50$:	;
+	; Reached the queue header.  Back up R8 to point to the previous
+	; queue header in the RSB.  If R8 is pointing to the granted
+	; queue, then we are done with this loop and we continue with
+	; the granted queue.  Otherwise, we repeat this loop for the
+	; conversion queue.
+	;
+	SUBL	#8,R8			; Back up R8 one queue header
+	MOVAB	-LKB$L_SQFL(R8),R7	; Prepare to process that queue
+	ADDL3	#RSB$L_GRQFL,-		; Get address of granted queue
+		LKB$L_RSB(R9),R0
+	CMPL	R8,R0			; Have we reached the granted queue?
+	BNEQ	40$			; Br if Not, repeat for conversion queue
+	;
+	; Now repeat a similar procedure for all locks on the granted
+	; queue whose granted mode is incompatible with the maxmode
+	; in R5.
+	;
+	BRB	70$
+
+60$:	;
+	;  Lock is initially on the granted queue.
+	;
+	SUBL	#16,R8			; Point to granted queue header
+
+70$:	MOVL	LKB$L_SQBL(R7),R7	; Get next lock in granted queue
+	CMPL	R7,R8			; Reached end of queue?
+	BEQL	90$			; Br if Yes, all done
+	SUBL	#LKB$L_SQFL,R7		; Back up to point at start of LKB
+	MOVZBL	LKB$B_GRMODE(R7),R0	; Get granted mode
+	BBS	R0,L^LCK$COMPAT_TBL[R5],70$ ; Branch if compatible
+	;
+	; Have an incompatible lock on the granted queue, return lock info.
+	;
+	SUBL	#LKI$C_LENGTH,R6	; Any room left in buffer?
+	BLSS	90$			; Br if not, leave now
+	BSBW	LOCK_INFO		; Return lock info
+	BRB	70$			; Look for more
+
+90$:	MOVZBL	#1,R0			; Success indicator
+	POPR	#^M<R1,R2,R5,R6>	; Restore registers
+	RSB
+
+
+	.SBTTL	LKI$SEARCH_BLOCKEDBY - Search for locks blockedby the current lock
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine searches for locks blocked by the current lock.
+;	A blocked lock is one which is either blocked by the current
+;	lock or is blocked by any other lock blocked by the current
+;	lock. We must start with the current lock on whatever queue
+;	it may currently be on and then maximize the requested for
+;	locks on the converting or waiting queues. All locks are checked
+;	to see if the maximized request mode is incompatible with the
+;	requested mode (if the locks is not on the granted queue).
+;
+;	For example, assume there is an EX lock granted on a resource and
+;	a two other users have issued PR requests on the resource. Now
+;	if we wish to find all locks BLOCKEDBY the first lock, then the
+;	list consists of the two locks waiting for the resource in PR
+;	mode.
+;
+;	To find BLOCKING locks it is sufficient to check all locks
+;	behing the current lock on all queues (in the order, GRANTED
+;	CONVERTING and then WAITING) to see if their requested mode
+;	is incompatible with the current lock's requested (or granted)
+;	mode. Once, we have found one blocked lock, then that lock and all
+;	locks following are also blocked.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSB
+;
+; INPUTS:
+;
+;	R2	address of system buffer for storing the lock information
+;	R6	length of system buffer for storing the lock information
+;	R8	address of wait queue in RSB
+;	R9	LKB address
+;
+; IMPLICIT INPUTS:
+;
+;	IPL = IPL$_SYNCH
+;
+; OUTPUTS:
+;
+;	R0	always success!
+;
+; SIDE EFFECTS:
+;
+;	R7 is destroyed.
+;--
+
+LKI$SEARCH_BLOCKEDBY::
+	PUSHR	#^M<R1,R2,R5,R6>	; Save registers
+	;
+	; First run through all locks waiting behind this lock
+	; maximizing the requested modes and checking all locks
+	; incompatible with the current "maxmode".  If we find a
+	; lock that is blocked by the current lock, then that lock
+	; and all the following locks are blocked. For locks that
+	; are on the granted queue we do not maximize the granted
+	; mode, for all other queues we will maximize the request mode.
+	;
+	; If this lock is not on the granted queue, we skip right to the
+	; search of the other queue locks.
+	;
+	ASSUME	LKB$K_GRANTED  EQ  1
+	ASSUME	LKB$K_CONVERT  EQ  0
+	ASSUME	LKB$K_WAITING  EQ  -1
+	ASSUME	RSB$L_CVTQFL  EQ  RSB$L_GRQFL+8
+	ASSUME	RSB$L_WTQFL  EQ  RSB$L_CVTQFL+8
+
+	MOVZBL	LKB$B_RQMODE(R9),R5	; Get the current lock's requested mode
+	MOVL	R9,R7			; R7 will point to other LKB's
+					;  after the one pointed to by R9
+	TSTB	LKB$B_STATE(R9)		; Which queue is lock on?	
+	BLSS	20$			; Br if waiting
+	BEQL	30$			; Br if converting
+	;
+	;   Lock is on the granted queue
+	;
+	MOVZBL	LKB$B_GRMODE(R9),R5	; Get the current lock's granted mode
+
+10$:	MOVL	LKB$L_SQFL(R7),R7	; Get next lock on state queue
+	CMPL	R7,R8			; Reached head of queue yet?
+	BEQL	90$			; Br if yes
+	SUBL	#LKB$L_SQFL,R7		; Back up to point at start of LKB
+	MOVZBL	LKB$B_GRMODE(R7),R0	; Get the lock's granted mode
+	BBS	R0,-			; Branch if compatible
+		L^LCK$COMPAT_TBL[R5],10$;  
+	;
+	; Have an incompatible, return the lock info. for all succeeding locks
+	;
+	BRB	120$			; Return lock info.
+
+20$:	;
+	; Lock is initially on the waiting queue.
+	;
+	ADDL	#8,R8			; Advance R8 one queue header
+30$:	;
+	; Lock is initially on the converting queue, OR we have
+	; reached the queue header. Advance R8 to point to the next
+	; queue header in the RSB.
+	;
+	ADDL	#8,R8			; Advance R8 one queue header
+	;
+	; Run thru all locks on either the converting or waiting queue
+	; lock for any locks blocked by the maxmode in R5.
+	;
+40$:	MOVL	LKB$L_SQFL(R7),R7	; Get next lock in queue
+	CMPL	R7,R8			; Reached end of queue?
+	BEQL	90$			; Br if Yes, all done
+	SUBL	#LKB$L_SQFL,R7		; Back up to point at start of LKB
+	MOVZBL	LKB$B_RQMODE(R7),R0	; Get requested mode
+	MOVL	R5,R1			; Save old maxmode
+	;
+	; Maximize lock modes (in R0 and R5) and see if this lock (R7) is
+	; incompatible with (the previous) maxmode.  The maximization function 
+	; is a simple arithmetic maximum except if the two modes are CW and PR.
+	; In that case the maximum of CW and PR is PW.  PW is incompatible
+	; with everything either CW or PR is incompatible with.
+	;
+	CMPB	R0,R5			; Current mode greater than maxmode?
+	BEQL	80$			; Br if No, they're equal
+	BGTRU	50$			; Br if Yes, compute new maxmode
+	CMPB	R0,#LCK$K_CWMODE	; Br if No, is current mode CW?
+	BNEQ	80$			; Br if No, maxmode = R2
+	CMPB	R5,#LCK$K_PRMODE	; Br if Yes, is maxmode PR?
+	BNEQ	80$			; Br if No, maxmode = R2
+	BRB	60$			; Br if Yes, new maxmode is PW
+50$:	CMPB	R5,#LCK$K_CWMODE	; Is maxmode CW?
+	BNEQ	70$			; Br if No, maxmode = R0
+	CMPB	R0,#LCK$K_PRMODE	; Br if Yes, is current mode PR?
+	BNEQ	70$			; Br if No, maxmode = R0
+60$:	MOVB	#LCK$K_PWMODE,R5	; Have CW and PR; maxmode = PW
+	BRB	80$
+70$:	MOVB	R0,R5			; Maxmode = R0
+
+80$:	BBC	R0,-			; Branch if incompatible
+		L^LCK$COMPAT_TBL[R1],120$;  with saved maxmode
+	BRB	40$			; Else, check next lock in RSB
+
+90$:	ADDL	#8,R8			; Advance R8 one queue header
+	MOVAB	-LKB$L_SQFL(R8),R7	; Prepare to process that queue
+	ADDL3	#RSB$L_WTQFL+8,-	; Get address past waiting queue
+		LKB$L_RSB(R9),R0
+	CMPL	R8,R0			; Have we done all the queues?
+	BNEQ	40$			; Br if Not, repeat for remaining queue
+
+100$:	MOVZBL	#1,R0			; Success indicator
+	POPR	#^M<R1,R2,R5,R6>	; Restore registers
+	RSB
+
+	;
+	; We have found the first incompatible lock
+	;
+120$:	SUBL	#LKI$C_LENGTH,R6	; Any room left in buffer?
+	BLSS	100$			; Br if not
+	BSBW	LOCK_INFO		; Else, return lock info.
+130$:	MOVL	LKB$L_SQFL(R7),R7	; Get next lock in queue
+	CMPL	R7,R8			; Reached end of queue?
+	BEQL	140$			; Br if Yes, skip to next queue
+	SUBL	#LKB$L_SQFL,R7		; Back up to point at start of LKB
+	BRB	120$			; Return the lock info.
+	
+140$:	ADDL	#8,R8			; Advance R8 one queue header
+	MOVAB	-LKB$L_SQFL(R8),R7	; Prepare to process that queue
+	ADDL3	#RSB$L_WTQFL+8,-	; Get address past end of queues
+		LKB$L_RSB(R9),R0
+	CMPL	R8,R0			; Have we done all queues?
+	BEQL	100$			; Br if Yes, leave
+	BRB	130$			; Else, loop thru remaining queues
+
+
+	.SBTTL	LKI_ALLOCATE - Allocate a system buffer
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine attempts to allocate a system buffer and intialize
+;	the structure type.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSB
+;
+; INPUTS:
+;
+;	R6	Size of desired buffer minus header
+;
+; IMPLICIT INPUTS:
+;
+;	IPL = IPL$_SYNCH
+;
+; OUTPUTS:
+;
+;	R0	Completion status for request
+;	R2	Address of the system buffer at data portion of buffer
+;	R10	Address of start of the system buffer
+;
+; SIDE EFFECTS:
+;
+;	none
+;--
+
+LKI_ALLOCATE:
+	PUSHR	#^M<R1,R3,R4>		; Save registers
+	MOVL	SCH$GL_CURPCB,R4	; Get PCB address
+	ADDL3	#12,R6,R1		; Compute size of system buffer
+	;
+	; NOTE: The exec routine EXE$BUFFRQUOTA cannot be called, since
+	; it will lower IPL and destroy all synchronization.
+	;
+	MOVZWL	IOC$GW_MAXBUF,R0	; Get maximum buffer size allowed
+	CMPL	R1,R0			; Is buffer too big?
+	BGTRU	20$			; Br if yes, error
+	MOVL	PCB$L_JIB(R4),R0	; Get JIB address
+	CMPL	R1,JIB$L_BYTLM(R0)	; Is BYTLM quota okay?
+	BGTRU	20$			; Br if not, error
+	CMPL	R1,JIB$L_BYTCNT(R0)	; Is BYTCNT quota okay?
+	BGTRU	20$			; Br if not, error
+	JSB	EXE$ALONONPAGED		; Try and allocate a buffer
+	BLBC	R0,30$			; Br if failed
+	MOVL	R2,R10			; Set address of buffer to deallocate
+	;
+	; Initialize structure header
+	;
+	CLRQ	(R2)+			; Zero return size, unused fields
+	MOVW	R1,(R2)+		; Set structure size
+	MOVW	#DYN$C_BUFIO,(R2)+	; Set structure type
+10$:	POPR	#^M<R1,R3,R4>		; Restore registers
+	RSB
+
+20$:	MOVZWL	#SS$_EXQUOTA,R0		; Set error return
+	BRB	10$			; Return to caller
+
+30$:	MOVZWL	#SS$_INSFMEM,R0		; Set error return
+	BRB	10$			; Return to caller
+
+
+	.END

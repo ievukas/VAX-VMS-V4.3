@@ -1,0 +1,1849 @@
+	.title  VMB_MICROVAX_I
+	.ident /V01.0-00/
+;
+;****************************************************************************
+;*									    *
+;*  Copyright (c) 1984			                                    *
+;*  by DIGITAL Equipment Corporation, Maynard, Mass.			    *
+;* 									    *
+;*  This software is furnished under a license and may be used and  copied  *
+;*  only  in  accordance  with  the  terms  of  such  license and with the  *
+;*  inclusion of the above copyright notice.  This software or  any  other  *
+;*  copies  thereof may not be provided or otherwise made available to any  *
+;*  other person.  No title to and ownership of  the  software  is  hereby  *
+;*  transferred.							    *
+;* 									    *
+;*  The information in this software is subject to change  without  notice  *
+;*  and  should  not  be  construed  as  a commitment by DIGITAL Equipment  *
+;*  Corporation.							    *
+;* 									    *
+;*  DIGITAL assumes no responsibility for the use or  reliability  of  its  *
+;*  software on equipment which is not supplied by DIGITAL.		    *
+;*									    *
+;****************************************************************************
+;
+; Facility:
+;
+;	Bootstrap ROM code for the MicroVAX I.
+;
+; Abstract:
+;
+; 	This module contains a hybrid bootstrap for VMS, ELN, diagnostics
+;	and other systems that is a combination of the other VAX hardware
+;	boot functions and VMB's traditional function. It was edited down
+;	from the VMS VMB and then enhanced to perform the priority ordered
+;	boot.
+;
+; Author: R. Heinen
+;
+; Date: July 1983
+;--
+
+	$bdtdef				;define boot driver descriptor
+	$bqodef				;define boot driver offsets
+	$btddef				;define boot device types
+	$ihddef				;define VMS image header
+	$iodef				;define I/O function codes
+	$ipldef				;ipl's
+	$ndtdef				;define adapter types
+	$prdef				;processor registers
+	$pruv1def			;processor registers for MicroVAX I
+	$rpbdef				;RPB
+	$ssdef				;define VMS status codes
+	$vmbargdef			;define VMB arguments
+
+
+;
+; define some new btd symbols
+;
+
+	btd$k_prom = 8
+	btd$k_qna = 96
+
+;************************************************************************
+
+;
+; define a macro to define boot driver names etc.
+;
+
+	.macro boot_device name,h_unit,pcsr,type,rtn,?l1
+l1:	.asciz	/name/
+	.byte	h_unit
+	.byte	type
+	.long	pcsr+phy_a_io_space
+	.long	rtn-l1
+	.endm
+
+;
+; define macros to aid with error message printing
+;
+
+	.macro	fatal_message	code
+	.if	nb,code 
+	movzwl	#ss$_'code,r0
+	.endc
+	brw	fatal_error
+	.endm
+
+	.macro	msg_def mname,txt
+	.word	ss$_'mname
+	.if	nb,<txt>
+	.word	a_'mname-.
+	.save_psect
+	.psect	$$$$10boot,byte
+last_msg = .
+a_'mname:
+	.asciz	\txt \
+	.restore_psect
+	.iff
+	.word	last_msg-.
+	.endc
+	.endm
+
+;
+; define local data structure offsets
+;
+
+;
+; define boot device desc structure
+;
+
+	$defini	bd
+bd_l_name:	.blkl	1
+bd_b_high_unit:	.blkb	1
+bd_b_type:	.blkb	1
+bd_a_csr:	.blkl	1
+bd_a_routine:	.blkl	1
+bd_s_bd:
+	$defend bd
+
+;
+; define local data constants
+;
+
+phy_a_io_space 		= ^x20000000	;physical address of I/O space
+
+;
+; define extents
+;
+
+k_max_memory_pages	= 8192		;max number of pages
+k_max_io_pages		= 127		;max pages in one I/O transfer
+
+;
+; define addresses in 64K segment
+;
+
+k_rpb_addr		= 0
+k_rom_code_addr 	= ^x200		;allow for 16K
+k_scb_addr		= ^x4200	;
+k_pfn_map_addr		= ^x4600	;2 pages
+					;stack area of three pages
+k_secondary_boot_addr	= ^x5000
+
+;
+; define MicroVAX I machine check codes used here
+;
+
+k_parity.error		= 1
+k_bus.timeout		= 2
+
+;
+; define scb vectors used here
+;
+
+scb_a_mcheck 		= 4
+scb_a_write_timeout	= ^x60
+scb_a_breakpoint	= ^x2c
+scb_a_trace_trap	= ^x28
+
+;
+; define bits in MicroVAX I switch pack
+;
+
+switch_v_QVSS		= 6		; 1 if normal, 0 if QVSS
+switch_v_disk_boot	= 7		; 1 if normal, 0 if disable disk search
+
+;
+; define MSV-11 Memory controller values
+;
+
+msv11_csr_base = ^x1440 + phy_a_io_space
+msv11_csr_parity_enable = 1
+
+;
+; define led values
+;
+
+led_memory_ok = ^xf0d
+led_boot_inprogress = ^xf0e
+led_transfer_control = ^xf0f
+
+;
+; define console halt code
+;
+
+console_halt = ^xf05
+
+	.sbttl	read write data
+
+	.psect	$$$$04boot,long
+
+;
+; strings used for file opens
+;
+
+vmsfile:				;Name of standard secondary
+	.ASCIC	/[SYS0.SYSEXE]SYSBOOT.EXE/ ;bootstrap image file.
+
+diagfile:				;Name of standard diagnostic
+	.ASCIC	/[SYS0.SYSMAINT]DIAGBOOT.EXE/ ;secondary bootstrap image.
+
+nameprompt:				;Prompt string for secondary
+	.ASCIZ	<13><10>/Bootfile:/	;boot file name.
+
+;
+; define two boot device priority lists
+;
+
+boot_device_list:
+
+	boot_device	DUA,3,<^X1468>,btd$k_uda,disk_boot
+
+no_disk_boot_device_list:
+
+	boot_device	PRA,0,<^x0000>,btd$k_prom,prom_boot
+	boot_device	XQA,0,<^X1920>,btd$k_qna,network_boot
+	.word	0			;implant a zero name
+	
+;
+; define text to correspond to ss$_ values.
+;
+
+message_header:
+	.asciz	<13><10>/%BOOT-F-ERROR, /
+
+message_base:
+
+;
+; define some ss$_ codes that are only used here
+;
+
+ss$_memerr = ^x8000
+ss$_scbint = ^x8008
+ss$_2ndint = ^x8010
+ss$_norom  = ^x8018
+
+msg_def nosuchdev,<None of the bootable devices contain a program image>
+msg_def devassign,<Device is not present>
+msg_def	nosuchfile,<Program image not found>
+msg_def filestruct,<Invalid boot device file structure>
+	msg_def	badchksum
+	msg_def badfilehdr
+	msg_def	badirectory
+msg_def filnotcntg,<Invalid program image format>
+msg_def	endoffile
+msg_def	badfilename,<Invalid filename>
+msg_def bufferovf,<Program image does not fit in available memory>
+msg_def ctrlerr,<Boot device I/O error>
+msg_def devinact,<Failed to initialize boot device>
+msg_def devoffline,<Device is offline>
+msg_def memerr,<Memory initialization error>
+msg_def scbint,<Unexpected SCB exception or machine check>
+msg_def	2ndint,<Unexpected exception after starting program image>
+msg_def norom,<No valid ROM image found>
+msg_def nosuchnode,<No response from load server>
+	.word	0			;terminate list
+
+;
+; writable data
+;
+	.ALIGN	LONG
+
+;
+; Parameter list handed from primary boot to secondary boot
+; The first location contains the argument count.  It is intended
+; that the secondary boot will know what is in the list based on
+; the argument count and the VMB version number.  This means that
+; new information should be placed at new offsets even if older
+; stuff becomes obsolete.  The VMB version number can be used to
+; totally change the argument meanings if necessary.
+;
+
+second_param:
+	fil$gq_cache	== .+vmb$q_filecache ;FILEREAD cache descriptor
+	boo$gb_systemid	== .+vmb$b_systemid  ;SCS system id
+	.long	<vmb$c_argbytcnt-4>/4	;Size of argument list
+	.rept	vmb$c_argbytcnt-4	;Reserve space for the arguments
+	.byte	0		
+	.endr
+
+file_cache_desc:			;saved cache desc
+	.long	0			;to re-init the cache after error
+	.long	0
+
+;
+; address of the RPB as a global
+;
+
+boo$gl_rpbbase::
+	.long	0
+
+;
+; machine check support
+;
+
+machine_check_continue:			;contains 0 or that address to
+	.blkl	1			;transfer to after a machine check
+
+;
+; error device name
+;
+
+boot_device_name:
+	.long	0
+	.byte	0
+
+	.sbttl	boot code
+;++
+; ROM_START
+;
+; functional description:
+;
+; This code is entered after the MicroVAX I microcode has completed its
+; restart/boot/halt sequence. It runs at IPL 31, in Kernel mode on the 
+; interrupt stack. The action is to initialize an RPB, setup a bitmap of
+; useable memory pages and load the next part of the system boot based on 
+; the input flag settings.
+;
+; If the inputs include a specific boot device name that device and only 
+; that device is booted. On the otherhand, if no specific boot device 
+; is specified then a priority ordered sequence of boot devices is tried. 
+; (In this case R0 will be 0 or contain all blanks.
+; 
+; As follows:
+;
+;	DU units 0,1,2,3
+;	Other disks
+;	ROM (See below for an explanation of how the ROM is found.)
+;	QNA
+;
+;	If none of these devices provide a bootstrap then a message is 
+;	displayed followed by a HALT.
+;
+; ROM systems are recognized by the boot memory search. A ROM system must
+; be aligned on a 4KB boundary and contain a foot print which is the same
+; as the second part of the boot block described below.
+;
+; If the boot is from a mass storage device then for each valid volume
+; that is found, the volume is searched as a Files-11 volume and then 
+; the secondary boot image is found. If the volume is not a Files-11 volume 
+; then block 0 of the volume is read and checked to see if it meets the 
+; standard for the boot block format. If not, the volume is not used and the 
+; next volume is tried unless a specific device was specified by the user.
+;
+; The boot block format is:
+;
+;			+-------+-------+-------+-------+
+;	BB+0:		|     1 |     n |     any value |
+;			+-------+-------+-------+-------+
+;			| low LBN	| High LBN	|
+;			+-------+-------+-------+-------+
+;
+; This second part is used for both the boot block and the ROM system.
+;			
+;			+-------+-------+-------+-------+
+;	BB+(2*n)+0:	|  Chk  |     k |        18(Hex)|
+;			+-------+-------+-------+-------+
+;			| any value, most likely 0	|
+;			+-------+-------+-------+-------+
+;	BB+(2*n)+8:	| size in blocks of the image   |
+;			+-------+-------+-------+-------+
+;	BB+(2*n)+12:	| load offset 			|
+;			+-------+-------+-------+-------+
+;	BB+(2*n)+16:	| offset into image to start	|
+;			+-------+-------+-------+-------+
+;	BB+(2*n)+20:	| sum of the previous three LW's|
+;			+-------+-------+-------+-------+
+;
+; The input bits in R5 can contain a bit that disables the Files-11 search.
+;
+; If a Files-11 boot is done then the file booted is either:
+;
+;	SYSBOOT.EXE - default
+;	DIAGBOOT.EXE - R5 bit setting
+;	solicited from the console
+;
+; Details of how the memory look and the register settings when the 
+; secondary bootstraps are entered are documented where the exits occur.
+;
+; inputs:
+;
+;	r0 = boot device name in ASCII or 0 if none specified
+;	r1 = switch pack settings 1 is "ON", 0 is "OFF"
+;
+;		Bit	Meaning
+;		---	-------
+;
+;		7 	Enable disk search during bootstrap 
+;
+;		6	1 if VT100/VT200 console, 0 if QVSS video option
+;
+;		4-5 	Halt action
+;		3	Console Break enabled
+;
+;		2 	Reserved
+;
+;		0-1	Console baud rate
+;
+;	R5 = software boot control flags from the /N boot command qualifier.
+;
+; 	The following bits are used by this boot ROM code:
+;
+;		Bit	Meaning
+;		---	-------
+;
+;		 3	RPB$V_BBLOCK.
+;			If set, the attempt to Files-11 boot is skipped
+;			and only the boot block type boot is done.
+;
+;		 4	RPB$V_DIAG.
+;			Diagnostic boot. Secondary bootstrap is image
+;			called [SYSMAINT]DIAGBOOT.EXE.
+;
+;		 6	RPB$V_HEADER.
+;			Image header. Takes the transfer address of the
+;			secondary bootstrap image from that file's
+;			image header. If RPB$V_HEADER is not set, 
+;			transfers control to the first byte of the
+;			secondary boot file.
+;
+;		 8	RPB$V_SOLICT.
+;			File name. Prompt for the name of a
+;			secondary bootstrap file.
+;
+;		 9	RPB$V_HALT.
+;		 	Halt before transfer. Executes a HALT
+;			instruction before transferring control to the
+;			secondary bootstrap.
+;
+;		<31:28>	RPB$V_TOPSYS
+;			Specifies the top level directory number for system
+;			disks with multiple systems
+;
+; 	The following bits are NOT used by this boot ROM code:
+;
+;		Bit	Meaning
+;		---	-------
+;
+;		 0	RPB$V_CONV.
+;			Conversational boot. At various points in the
+;			system boot procedure, the bootstrap code
+;			solicits parameters and other input from the
+;			console terminal. If the DIAG is also on, then
+;			the diagnostic supervisor should enter "MENU"
+;			mode and prompt user for devices to test.
+;
+;		 1	RPB$V_DEBUG.
+;			Debug. If this flag is set, VMS maps the code
+;			for the XDELTA debugger into the system page
+;			tables of the running system.
+;
+;		 2	RPB$V_INIBPT.
+;			Initial breakpoint. If RPB$V_DEBUG is set, VMS
+;			executes a BPT instruction immediately after
+;			enabling mapping.
+;
+;		 5	RPB$V_BOOBPT.
+;			Bootstrap breakpoint. Stops the primary
+;			and secondary bootstraps with a breakpoint
+;			instruction before testing memory.
+;
+;		 7	RPB$V_NOTEST.
+;			Memory test inhibit. Sets a bit in the PFN bit
+;			map for each page of memory present. Does not
+;			test the memory.
+;
+;		10	RPB$V_NOPFND.
+;			No PFN deletion (not implemented; intended to
+;			tell VMB not to read a file from the boot device
+;			that identifies bad or reserved memory pages,
+;			so that VMB does not mark these pages as valid
+;			in the PFN bitmap).
+;
+;		11	RPB$V_MPM.
+;			Specifies that multi-port memory is to be used
+;			for the total exec memory requirement.  No local
+;			memory is to be used.  This is for tightly-coupled
+;			multi-processing.  If the DIAG is also on, then
+;			the diagnostic supervisor enters "AUTOTEST" mode.
+;
+;		12	RPB$V_USEMPM.
+;			Specifies that multi-port memory should be used in
+;			addition to local memory, as though both were one
+;			single pool of pages.
+;
+;		13	RPB$V_MEMTEST
+;			Specifies that a more extensive algorithm be used
+;			when testing main memory for hardware uncorrectable
+;			(RDS) errors.
+;
+;		14	RPB$V_FINDMEM
+;			Requests use of MA780 memory if MS780 is insufficient
+;			for booting.  Used for 11/782 installations.
+;
+;	r10 = original PC
+;	r11 = original PSL
+;	AP = halt code
+;	SP = address of 64K memory block + 200 hex
+;
+; implicit inputs:
+;
+;	IPL is 31, interrupt stack.
+;	The first instruction of this code is at SP.
+;
+; 	All of the system's memory controllers have been 
+;	initialized to have parity error detect ON. This 
+;	means that the 64K memory block that contains this 
+;	code has correct parity. The cache is enabled and 
+;	will continue to be enabled throughout.
+;
+; When the secondary bootstrap code gains control memory will look like:
+;
+; 0	+---------------------------------------+ 
+;	+ RPB					+
+; 200	+---------------------------------------+
+;  	+ 8K of Boot Code			+
+;	+ boot driver preamble starts at 200	+
+; 4200	+---------------------------------------+ (PR$_SCBB value)
+;	+ 2 Pages of SCB			+
+; 4600	+---------------------------------------+
+;	+ 2 Pages of PFN Bit Map described by 	+
+;	+ RPB fields				+
+; 4A00	+---------------------------------------+
+;	+ available for stack (3 Pages)		+
+; 5000	+---------------------------------------+
+;	+ Secondary boot code image		+
+;	.
+;	.
+;	.
+;
+; The register contents when control is passed to the secondary
+; bootstrap are:
+;
+;	R11 = base address of RPB
+;	AP = address of the secondary boot parameter block alla VMB
+;	SP = current stack pointer
+;	PR$_SCBB = SCB address
+;--
+
+;
+; this will be the first location in the boot ROM
+;
+
+	.psect	$$$$00boot,long
+ROM_BASE:
+	brw	rom_start		;transfer control to actual code
+	.byte	6,^x80,^x81,^x82,^x83	;footprint
+
+	.psect	$$$$04boot,long		;
+
+ROM_START:
+	.default	displacement,word
+
+	.sbttl	SCB initialization and XDELTA breakpoint
+
+	mtpr	#^xf,#pr$_mcesr		;reset any machine checks
+
+;
+; setup SCB for the duration of this execution
+;
+
+	movab	k_scb_addr+1024-k_rom_code_addr(sp),r7
+					;address scb plus two pages
+	movzbl	#255,r9			;setloop count DIV 2
+10$:	moval	unfielded_scb_int+1,-(r7) ;address general error routine
+	sobgeq	r9,10$			;continue in loop
+	clrl	machine_check_continue ;init machine check continue address
+	movab	machine_check_detect+1,- ;init machine check vector
+		scb_a_mcheck(r7)	;
+	movab	write_timeout_int+1,- ;init write timeout vector
+		scb_a_write_timeout(r7);
+	mtpr	r7,#pr$_scbb		;insert scb address in PR
+
+;
+; Read the system identification processor register to discover which
+; kind of VAX is to be booted.
+;
+
+	mfpr	#pr$_sid,r8		;Read the CPU identification
+					;processor register.
+	ashl	#-pr$v_sid_type,r8,r8	;Get CPU identification code.
+	movb	r8,exe$gb_cputype	;Save processor code globally
+					;in boot driver desc table
+
+;
+; If the DEBUG flag is defined (meaning that XDELTA has been linked
+; with this primary bootstrap), set up 2 XDELTA handlers in the SCB --
+; one for breakpoints and one for tbit traps. Then initialize the
+; XDELTA breakpoint table, allocate 3 pages of stack, and, if requested,
+; execute a breakpoint before proceeding with the bootstrap.
+;
+
+	.if	df,debug
+	movab	xdt$breakpoint+1,scb_a_breakpoint(r7) ;Set up BPT handler.
+	movab	xdt$trace_trap+1,scb_a_trace_trap(r7) ;Set up TBIT handler.
+	movab	ini$brk,xdt$initial_break ;Store the initial breakpoint.
+	movl	sp,r6			;Save current top of stack.
+	movab	k_secondary_boot_addr-k_rom_code_addr(sp),sp ;Address a stack,
+					;add 1 page for the SCB
+	bbc	#rpb$v_boobpt,r5,nobrk	;If no BPT was requested in the
+					;boot flags, just proceed.
+
+;
+; Initial breakpoint.
+;
+; Current register status is as follows:
+;
+;	R0-R5	- initial input values
+;	R6	- SP value at start of ROM code
+;	R7	- address of the SCB
+;	R8	- processor identification code
+;	R9	- destroyed
+;	R10-FP	- initial input values
+;	SP	- address of a 3-page stack
+;
+; Code following the breakpoint is going to restore SP to its original
+; value. If you want to modify SP in XDELTA, modify R6 instead.
+;
+
+ini$brk::				;Debugging breakpoint.
+
+	bpt				;Stop in XDELTA.
+
+NOBRK:					;Proceed with bootstrapping.
+	movl	r6,sp			;restore stack pointer
+	.ENDC
+
+	.sbttl	rpb initialization
+;
+; initialize and address the RPB
+;
+
+	movab	k_rpb_addr-k_rom_code_addr(sp),r6 ;address rpb with temp reg
+	movq	r0,rpb$l_bootr0(r6)	;save registers
+	movq	r2,rpb$l_bootr2(r6)	;
+	movq	r4,rpb$l_bootr4(r6)	;
+	movq	r10,rpb$l_haltpc(r6)	;save halt PC and PSL
+	movl	r6,rpb$l_base(r6)	;address of RPB
+	movl	r6,boo$gl_rpbbase	;also globally
+	movl	ap,rpb$l_haltcode(r6)	;save halt code
+	clrl	rpb$l_restart(r6)	;init header fields
+	clrl	rpb$l_rstrtflg(r6)	;
+	mnegl	#1,rpb$l_chksum(r6)	;
+	movab	boo$al_vector,rpb$l_iovec(r6) ;insert address of driver
+	movc5	#0,(sp),#0,-		;init remainder of RPB
+		#rpb$c_length-rpb$l_iovecsz,rpb$l_iovecsz(r6) 
+	movl	r6,r11			;set future RPB address
+	movl	r7,rpb$l_scbb(r11)	;save scbb address in RPB
+	movb	#ndt$_ub0,rpb$b_confreg(r11) ;one Qbus on Micro-VAX I.
+	movb	#ndt$_ub0,rpb$b_bootndt(r11) ;Pretend this is UNIBUS.
+
+;
+; init the secondary bootstrap parameter block
+;
+
+	movab	second_param,ap		;load its base address
+	mnegl	#1,vmb$l_lo_pfn(ap)	;set pfn data
+	mnegl	#1,vmb$l_hi_pfn(ap)	;set pfn data
+
+;
+; address larger stack and setup free memory pointer
+;
+
+15$:	movab	k_secondary_boot_addr(r11),sp; address target for I/O
+					;and create a three page stack
+	movl	sp,r10			;copy to address of free memory
+
+	.sbttl	memory initialization
+;
+; initialize parity memory 
+;
+; allocate and init RPB PFN bit map
+;
+
+	ashl	#10,#1,rpb$q_pfnmap(r11) ;set size to 1024 bytes
+	movab	k_pfn_map_addr(r11),rpb$q_pfnmap+4(r11) ;set up pfn desc addr
+	movc5	#0,(sp),#0,rpb$q_pfnmap(r11),k_pfn_map_addr(r11) ;init to zeros
+	movab	b^5$,machine_check_continue ;setup continue address
+	movl	#k_max_memory_pages-1,r9 ;set page number of last memory page
+	bbs	#switch_v_qvss,rpb$l_bootr1(r11),3$;if set console not QVSS
+	subl	#512,r9			;else - last 256K used for QVSS video
+3$:	setipl	#^x1d-1			;lower IPL to allow write timeout
+
+;
+; sweep all of memory to set parity and establish bit map
+;
+
+5$:	movab	nxm_memory,machine_check_continue ;enable machine check 
+	clrq	r6			;set first physical address
+					;zero page count
+	movab	rpb$l_memdsc(r11),r8	;address first memory descriptor
+	clrl	(r8)			;init page count field
+	mnegl	#1,4(r8)		;set very low PFN
+
+;
+; write 0's to a page
+;
+	
+page_boundary:
+
+	ashl	#9,r7,r6		;compute page address
+
+;
+; don't write 0's in the 64k where this code is 
+;
+
+	cmpl	r11,r6			;compare addresses to find out
+	bneq	20$			;br if not in the 64KB of good memory
+	tstl	vmb$l_lo_pfn(ap)	;low pfn inited?
+	bgeq	10$			;br if yes
+	movl	r7,vmb$l_lo_pfn(ap)	;insert base of area as lowest PFN
+10$:	tstl	4(r8)			;memory desc PFN set yet?
+	bgeq	15$			;br if yes
+	movl	r7,4(r8)		;insert this low PFN
+15$:	mnegl	#1,r0			;set all bits in a register
+	insv	r0,r7,#32,k_pfn_map_addr(r11) ;enable 128 pages
+	insv	r0,r7,#32,k_pfn_map_addr+4(r11) ;of good memory
+	insv	r0,r7,#32,k_pfn_map_addr+8(r11) ;
+	insv	r0,r7,#32,k_pfn_map_addr+12(r11) ;
+	movzbl	#127,r0			;load page count in r0
+	movab	(r7)[r0],r7		;adjust PFN to last page tested
+	addl	r0,rpb$l_pfncnt(r11)	;adjust good page count < 8000
+	addl	r0,(r8)			;adjust desc size
+	brb	40$			;continue in common
+
+;
+; write and then read a single memory page
+;
+
+;
+; loop to check for correct parity and verify contents
+;
+
+20$:	clrq	(r6)			;write memory to zero
+	movl	#k_bus.timeout,r0	;initialize for error exit
+	movq	(r6)+,r1		;read memory back for parity detect
+					;first read checks for page present
+					;skip out if not present to nxm_memory
+					;skip out on parity error
+	bneq	nxm_memory		;if eql then correct read back
+					;if neq then odd case of PROM
+
+;
+; check for page cross
+;
+
+	bitw	#^x1ff,r6		;page cross?
+	bneq	20$			;br if no, keep going
+
+;
+; try to write a non-zero value and verify that it can be done
+;
+; This is to detect pages in ROM's that are all zeros
+;
+
+	movw	#63,<1@28>-4(r6)	;write memory, page is present
+					;with don't cache bit
+	cmpw	#63,<1@28>-4(r6)	;read back correct?
+	bneq	nxm_memory		;if neq then some non RAM memory
+	clrw	-4(r6)			;reset to zero
+
+;
+; page is written - parity appears correct
+;
+
+30$:	insv	#1,r7,#1,k_pfn_map_addr(r11) ;insert bit in PFN map
+	tstl	vmb$l_lo_pfn(ap)	;low pfn inited?
+	bgeq	35$			;br if yes
+	movl	r7,vmb$l_lo_pfn(ap)	;insert lowest PFN
+35$:	tstl	4(r8)			;memory desc PFN set yet?
+	bgeq	40$			;br if yes
+	movl	r7,4(r8)		;insert this low PFN
+40$:	movl	r7,vmb$l_hi_pfn(ap)	;insert highest
+	incl	(r8)			;count in current memory desc
+	incl	rpb$l_pfncnt(r11)	;count as good page
+
+;
+; come here to move to next page
+;
+
+next_page:
+
+	acbl	r9,#1,r7,page_boundary	; continue until end of memory
+
+;
+; restore IPL and setup SCB for booting
+;
+
+	setipl	#ipl$_power		;reset IPL
+	clrl	machine_check_continue	;reset machine check continue addr
+	mtpr	#Led_memory_ok,#pr$_txdb; set lights
+	brb	begin_boot
+
+;
+; come here when a page does not exist 
+;
+
+nxm_memory:				
+
+	cmpl	#k_parity.error,r0	;expected error?
+	bneq	20$			;parity is ok
+
+;
+; reset the memory controllers to clear parity error
+;
+
+	movl	#15,r1			;set loop count of controllers
+	movl	#msv11_csr_base,r2	;address base of controlller CSR's
+10$:	movw	#msv11_csr_parity_enable,(r2)+;blast all possible CSR's
+	sobgeq	r1,10$			;continue until done
+	brb	next_page		;no check for PROM needed on parity 
+					;problem
+;
+; bus timeout means non existant memory on a read, the page is not present
+;
+; But, page could be PROM memory
+;
+
+20$:	cmpl	#k_bus.timeout,r0	;expected error?
+	bneq	fatal_memory_error	;br if unexpected
+
+;
+; record holes in memory via descriptors
+;
+
+	tstl	(r8)			;this desc in use?
+	beql	next_page		;br if no, don't move to next
+	movab	<rpb$c_nmemdsc*rpb$c_memdscsiz>+rpb$l_memdsc(r11),r0
+	cmpl	r0,r8			;overrun area?
+	bneq	next_page		;br if yes
+	addl	#rpb$c_memdscsiz,r8	;address next memory desc
+	clrl	(r8)			;set count to zero
+	brb	next_page		;
+
+;
+; memory initialization error
+;
+
+fatal_memory_error:
+
+	fatal_message 	memerr
+
+;++
+; begin_boot - start the booting process
+;
+; functional description:
+;
+; This sequence is entered after the RPB and PFN bitmap are set up.
+;
+; The process of selecting a boot device and type of boot operation starts 
+; here.
+;
+; inputs:
+;
+;	r11 = address of the RPB
+;	ap = address of the secondary parameter block
+;
+;--
+
+begin_boot:
+
+;
+; If the "solicit for secondary bootstrap file" flag is not set,
+; just use a predefined file specification.
+;
+
+	bbs	#rpb$v_bblock,-		;br if not files-11 boot
+		rpb$l_bootr5(r11),-	;
+		25$			;
+	bbc	#rpb$v_solict,-		;If "solicit" flag is not
+		rpb$l_bootr5(r11),-	;set, just use a default file
+		10$			;specification.
+
+;
+; To solicit a file name, call a device-independent subroutine that
+; writes a prompt string to the console terminal, and then reads the
+; user typed file name. All device specifications are ignored.
+;
+
+	pushl	rpb$l_bootr1(r11)	;Pass options switch settings
+	pushab	rpb$t_file(r11)		;Set address of input buffer.
+	pushl	#39			;Set maximum character count.
+	pushab	nameprompt		;Set address of prompt string.
+	calls	#4,boo$readprompt	;Prompt and read string.
+	brb	25$			;Go try to read the file.
+
+;
+; If the solicit boot flag was not set, use a default file name string.
+; Usually, this file name is [SYSEXE]SYSBOOT.EXE. However, if the
+; diagnostic boot flag is set, the file name is [SYSMAINT]DIAGBOOT.EXE.
+;
+
+10$:	movab	vmsfile,r7		;Assume SYSBOOT.EXE.
+	bbc	#rpb$v_diag,-		;If the diagnostic flag is not
+		rpb$l_bootr5(r11),-	;set, SYSBOOT is correct.
+		15$
+	movab	diagfile,r7		;Otherwise, use predefined
+					;name of diagnostic boot.
+
+;
+; Copy the file name to the RPB.
+;
+
+15$:	movzbl	(r7),r0			;Size of name string
+	incl	r0			;Include the byte count character
+	movc3	r0,(r7),rpb$t_file(r11)	;Move name into RPB
+	extzv	#rpb$v_topsys,#rpb$s_topsys,-
+		rpb$l_bootr5(r11),r0 	;Value of 0-F means top level
+					;system directory "SYS0" - "SYSF"
+	cmpl	r0,#9			;0 - 9 ?
+	bleq	20$			;Branch if yes
+	addl	#<<^A/A/>-<^A/9/>-1>,r0	;Add bias to make A - F
+20$:	addb	r0,rpb$t_file+5(r11)	;Form "SYSn"
+
+;
+; extract and stabilize device name info
+;
+
+25$:	movab	boot_device_list,r7	;address descriptor list
+	bicl3	#^x80A0A0A0,rpb$l_bootr0(r11),-(sp) ;make name uppercase
+					;remove possible parity bit
+	cmpb	(sp),#^a/ /		;special non-name?
+	bgtr	35$			;br if gtr then specific device
+
+;
+; non-specific device name
+;
+
+	clrl	(sp)			;specify non name
+	bbs	#switch_v_disk_boot,-	;br if entire list is to be searched
+		rpb$l_bootr1(r11),40$	;
+	movab	no_disk_boot_device_list,r7;address alternate descriptor list
+	brb	40$			;continue
+
+;
+; specific device name
+;
+
+35$:	movl	(sp),boot_device_name	;save specified name
+	subb	#^a/0/,3(sp)		;reduce unit number 
+
+;
+; start with first entry in boot device list and try each one until a 
+; boot occurs or the list is empty
+;
+
+40$:	clrb	rpb$b_slave(r11)	;no slave or 
+	clrw	rpb$w_unit(r11)		;unit info
+	movab	k_secondary_boot_addr(r11),r10 ;set nominal load address
+	movb	bd_b_type(r7),rpb$b_devtyp(r11) ;load device type
+	tstb	(sp)			;special non-name?
+	beql	45$			;br if yes, no specific device
+	cmpzv	#0,#24,(sp),bd_l_name(r7); compare three characters for equal
+	bneq	50$			;br if no match
+	cmpb	3(sp),bd_b_high_unit(r7) ;unit in range?
+	bgtru	50$			;br if no
+	movb	3(sp),bd_b_high_unit(r7);boot specific unit only
+	movzbw	3(sp),rpb$w_unit(r11)	;
+45$:	movl	bd_l_name(r7),boot_device_name;build error device name
+	addb3	rpb$w_unit(r11),#^a/0/,boot_device_name+3;
+	jsb	@bd_a_routine(r7)[r7]	;use device specific routine
+	blbs	r0,100$			;br if success, transfer control
+	bbc	#1,r0,55$		;severe or fatal error?
+					;br if fatal error
+	tstb	(sp)			;special non-name?
+	bneq	55$			;br if specific device
+50$:	addl2	#bd_s_bd,r7 		;try next device
+	mtpr	#led_memory_ok,#pr$_txdb; tell operator
+	tstw	bd_l_name(r7)		;is there another?
+	bneq	40$			;continue if not end of list
+
+;
+; device data base search done without a match or valid boot device
+;
+
+	movzwl	#ss$_devassign,r0	;list end, specific name error
+	tstb	(sp)			;special non-name?
+	bneq	55$			;br if specific device
+	movzwl	#ss$_nosuchdev,r0	;list end, generic error
+	clrl	boot_device_name	;no specific name
+55$:	fatal_message 			;issue error in r0
+
+;
+; secondary image in place, transfer control to it
+;
+
+100$:	movab	k_secondary_boot_addr(r11),sp ;load fresh sp
+
+;
+; restore SCBB values 
+;
+
+	mtpr	#led_transfer_control,#pr$_txdb; tell user
+	movab	k_scb_addr+1024(r11),r7	;address scb plus two pages
+	movzbl	#255,r9			;setloop count DIV 2
+110$:	moval	secondary_scb_int+1,-(r7) ;address general error routine
+	sobgeq	r9,110$			;continue in loop
+
+;
+; recompute size of bitmap
+;
+
+	ashl	#-3,vmb$l_hi_pfn(ap),r0 ;get last valid PFN
+	addl3	#1,r0,rpb$q_pfnmap(r11) ;set size of map in bytes
+	movq	rpb$q_pfnmap(r11),vmb$q_pfnmap(ap);copy pfnmap desc
+
+;
+; halt system prior to entering secondary boot if requested
+;
+
+	bbc	#rpb$v_halt,-		;If boot flags don't call for
+		rpb$l_bootr5(r11),-	;halt, just transfer to new
+		120$			;bootstrap image.
+	mtpr	#console_halt,#pr$_txdb	;Otherwise, HALT.
+120$:	jmp	(r5)			;Execute JUMP.
+
+	.sbttl 	specific device boot subroutines
+;++
+; prom_boot
+;
+; functional description:
+;
+; This routine tries to boot from a PROM system image that may be in 
+; memory. Each bad page 16KB boundary is tested to see if it is readable.
+;
+; inputs:
+;
+;	r7 = address of the internal boot device description
+;	r10 = address of the secondary boot's memory
+;	r11 = RPB address
+;	ap = address of the secondary parameter block
+;
+; outputs:
+;
+;	r0 = ss$_norom - no rom present, severe error
+;
+;	or
+;
+;	r0 = 1 if success
+;	r5 = transfer address
+;
+;	r7,r11 are preserved
+;--
+
+prom_boot:
+
+;
+; cycle up through memory
+;
+
+	movab	b^20$,machine_check_continue;implant for read timeout
+	clrl	r3			;initial page address
+10$:	bbs	r3,k_pfn_map_addr(r11),20$ ;br if that boundary is not bad
+	ashl	#9,r3,r1		;compute address
+	cmpw	(r1),#^x18		;try to read that memory
+					;may machine check
+	bneq	20$			;br if not key
+	bsbw	verify_boot_block	;verify the boot block
+	blbc	r0,20$			;br if not correct
+
+;
+; PROM found, boot from it
+;
+
+	addl3	r1,16(r1),r5		;compute starting address
+
+;
+; reset machine state
+;
+
+	clrq	rpb$l_iovec(r11)	;no driver
+	rsb				;done
+
+;
+; move onto next 16KB boundary
+;
+
+20$:	acbl	#k_max_memory_pages-1,#32,r3,10$; continue until done
+	movzwl	#ss$_norom!2,r0		;set severe error code
+	clrl	machine_check_continue	;
+	rsb
+
+;++
+; network_boot
+;
+; functional description:
+;
+; This routine tries to boot from a network device
+;
+; inputs:
+;
+;	r7 = address of the internal boot device description
+;	r10 = address of the secondary boot's memory
+;	r11 = RPB address
+;	ap = address of the secondary parameter block
+;
+; outputs:
+;
+;	r0 = 1 if success
+;	r5 = transfer address
+;
+;	or
+;
+;	r0 = ss$_nosuchdev	- CSR does not exist - severe 
+;	   = ss$_bufferovf	- secondary bootstrap does not fit - fatal
+;	   = ss$_devinact	- device could not be inited - fatal
+;	   = ss$_ctrlerr	- I/O error during operation - fatal
+;	   = ss$_devoffline	- device is offline - severe
+;
+;	r7,r11 are preserved
+;--
+
+network_boot:
+
+	bsbw	validate_csr		;test CSR of device
+					;return implies success
+;
+; boot via the Ethernet
+;
+
+	moval	-(sp),r2		;address target for transfer address
+	pushab	rpb$t_file(r11)		;address to store node name
+	pushab	rpb$l_bootr3(r11)	;address to store node address
+	pushab	(r2)			;address to store transfer address
+	pushab	k_pfn_map_addr(r11)	;address of bit map
+	pushab	k_secondary_boot_addr(r11) ;buffer space
+	movab	k_secondary_boot_addr+<16*512>(r11),r3 ;image load address
+	pushab	(r3)			;image load address
+	calls	#6,boo$downline_load	;try QNA boot
+	addl3	(sp)+,r3,r5		;compute transfer address
+	blbc	r0,10$			;br if not success
+	clrq	rpb$l_iovec(r11)	;no driver
+10$:	rsb				;done
+
+;++
+; disk_boot
+;
+; functional description:
+;
+; This routine tries to boot from a disk device
+;
+; inputs:
+;
+;	r7 = address of the internal boot device description
+;	r10 = address of the secondary boot's memory
+;	r11 = RPB address
+;	ap = address of the secondary parameter block
+;
+; outputs:
+;
+;	r0 = 1 if success
+;	r5 = transfer address
+;
+;	or
+;
+;	r0 = ss$_nosuchdev	- CSR does not exist - severe
+;	   = ss$_nosuchfile	- file is not on the volume - fatal
+;	   = ss$_filnotcntg	- boot file is not contiguous - fatal
+;	   = ss$_bufferovf	- secondary bootstrap does not fit - fatal
+;	   = ss$_devinact	- device could not be inited - fatal
+;	   = ss$_ctrlerr	- I/O error during operation - fatal
+;	   = ss$_devoffline	- device is offline - severe
+;
+;	r7,r11 are preserved
+;--
+
+disk_boot:
+
+	bsbw	validate_csr		;check CSR and return if success
+
+;
+; move and initialize the disk driver
+;
+
+	movl	rpb$l_iovec(r11),r2	;address boot driver
+	movab	k_rpb_addr(r11),r9	;load move parameter
+	jsb	@bqo$l_move(r2)[r2]	;call move code
+
+;
+; try low to high units, removable first, non-removable second
+;
+; Build a mask with two sets of 8 bits. The first 8 bits are the available
+; "soft" disk units and the second 8 are the available "hard". The mask 
+; starts with rpb$w_unit to bd_b_high_unit set in each set.
+;
+
+	clrl	r8			;no units to search
+	movzwl	rpb$w_unit(r11),r6	;build the basic mask
+	movzbl	bd_b_high_unit(r7),r1	;get high 
+	subl3	r6,r1,r8		;number of units 
+	incl	r8			;plus 1
+	ashl	r8,#1,r8		;form mask
+	decl	r8			;
+	ashl	r6,r8,r8		;move to correct bit pos
+	insv	r8,#8,#8,r8		;duplicate mask
+	cmpb	r6,r1			;high = low - one unit?
+	bneq	10$			;br if yes, enter search 
+	clrb	r8			;no soft disk search
+
+;
+; select a unit from the mask
+;
+
+10$:	ffs	#0,#16,r8,r6		;get the unit number
+	bicw3	#^x8,r6,rpb$w_unit(r11)	;set unit number, less mask flag
+	addb3	#^a/0/,rpb$w_unit(r11),boot_device_name+3; new unit in name 
+
+;
+; now, init that unit on the controller
+;
+
+	movl	rpb$l_iovec(r11),r2	;address boot driver
+	movl	bqo$l_unit_init(r2),r1	;Pick up device init routine
+	beql	30$			;None
+
+;
+; init the controller and a specific unit
+;
+; it is OK for the unit to be offline but not for the controller to fail
+;
+
+	callg	(ap),(r2)[r1]		;do any necessary unit init
+	blbs	r0,20$			;br if unit is online
+
+;
+; If the unit is not online, it is a fatal error if the controller failed.
+;
+
+	cmpw	r0,#ss$_devoffline	;offline?
+	bneq	50$			;br if no, more fatal error
+	brb	35$			;continue with next unit
+
+;
+; controller is up, unit is online, make removable, non-removable tests
+;
+; success from the online is:
+;
+;	#1 unit is online, can't detect hard or soft
+;	#9 unit is online, hard disk
+;	#25 unit is online, soft disk
+;
+
+20$:	bbs	#3,r6,30$		;br if hard disk mask, try unit
+
+;
+; looking for a soft disk - can the controller can tell?
+;
+
+	bbc	#3,r0,25$		;br if not detectable soft or hard
+
+;
+; looking for a soft disk and the controller can tell
+;
+
+	bbs	#4,r0,30$		;br if soft disk flag set, try unit
+	brb	40$			;continue in common
+
+;
+; since the controller can't tell, shut off tests in soft mask
+; but do this unit anyway
+;
+
+25$:	clrb	r8			;no more soft disk tests
+
+;
+; try a boot of this unit
+;
+
+30$:	pushr	#^m<r6,r7,r8,r9>	;save context values
+	bsbb	boot_disk_unit		;try this unit
+	popr	#^m<r6,r7,r8,r9>	;restore context values
+	blbs	r0,50$			;br if success
+	bbc	#1,r0,50$		;br if fatal error
+					;continue if just severe error
+35$:	addl3	#8,r6,r1		;clear bit in both masks
+	bbcc	r1,r8,40$		;hard mask or greater 
+40$:	bbcc	r6,r8,45$		;and soft or hard
+45$:	tstw	r8			;more units?
+	bneq	10$			;br if yes
+					;exit with error status of last unit
+	bisb	#1@1,r0			;make error semi-success
+
+;
+; fixup name with real booted device and transfer control
+;
+
+50$:	rsb
+
+	.sbttl	boot a specific disk unit routine
+;++
+; boot_disk_unit
+;
+; functional description:
+;
+; This routine tries a boot of a particular disk unit. The device and
+; driver are present and verified. This routine is used for each unit on 
+; which a boot is to be tried. RPB$B_UNIT contains the unit information.
+;
+; inputs:
+;
+;	r9 = rpb address
+;	r10 = address  of the secondary boot's memory
+;	r11 = RPB address
+;	ap = address of the secondary parameter block
+;
+; outputs:
+;
+;	r0 = ss$_success
+;	r5 = transfer address
+;
+;	or
+;
+;	r0 = ss$_nosuchdev	- CSR does not exits
+;	   = ss$_nosuchfile	- file is not on the volume
+;	   = ss$_filnotcntg	- boot file is not contiguous
+;	   = ss$_bufferovf	- secondary bootstrap does not fit
+;	   = ss$_devinact	- device could not be inited
+;	   = ss$_ctrlerr	- I/O error during operation
+;	   = ss$_devoffline	- device is offline
+;
+;	r10 and r11 are preserved.
+;--
+
+boot_disk_unit:
+
+;
+; do forced boot block boot 
+;
+; If RPB$V_BBLOCK is set then read LBN 0 and transfer control to the 
+; block.
+;
+
+	bbs	#rpb$v_bblock,-		;br if direct boot block boot
+		rpb$l_bootr5(r11),80$	;
+
+;
+; init the file read cache if this is a FILES-11 boot
+;
+
+	movq	file_cache_desc,fil$gq_cache ;reload the descriptor
+	bneq	10$			;br if done
+	bsbw	boo$cache_alloc		;allocate the cache
+	movzwl	#ss$_memerr,r0		;assume no memory
+	movq	fil$gq_cache,file_cache_desc ;save the descriptor
+	beql	75$			;br if cache not allocated
+
+;
+; Call a device-independent routine, FIL$OPENFILE to locate the named
+; file on the disk.
+;
+; the cache open is where the drive is mounted so it can fail if there is
+; no physical volume
+;
+
+10$:	bsbw	boo$cache_open		;Open the FILEREAD cache
+	blbc	r0,55$			;br if error
+15$:	pushab	rpb$t_file+1(r11)	;Address of file name string.
+	movzbl	rpb$t_file(r11),-(sp)	;Character count of file name.
+	clrl	-(sp)			;Allocate scratch for channel
+					;and get adr of scratch storage
+	pushal	rpb$l_fillbn(r11)	;RPB fields that receive file
+					;statistics during OPEN.
+	pushal	(R10)			;File header buffer at end of
+					;memory.
+	pushal	512(R10)		;Index file header buffer at
+					;end of memory.
+	pushal	16(sp)			;Address in file name desc.
+	pushal	16(sp)			;Address of phony channel.
+	calls	#5,fil$openfile		;Call FILREAD to locate file.
+	addl2	#12,sp			;Clean up scratch space
+	blbs	r0,boot_file		;Branch on success.
+
+;
+; the volume is not a files-11 volume, try boot block booting, if the error
+; related to a file structure problem
+;
+
+55$:	cmpw	r0,#ss$_filestruct	;test for file structure error code
+	beql	80$			;br if that's what it is
+	cmpw	r0,#ss$_badfilehdr	;test for file structure error code
+	beql	80$			;br if that's what it is
+	cmpw	r0,#ss$_badirectory	;test for file structure error code
+	beql	80$			;br if that's what it is
+	cmpw	r0,#ss$_badchksum	;test for file structure error code
+	beql	80$			;br if that's not what it is
+	bisl	#1@1,r0			;make non-fatal
+75$:	rsb				;and go back to caller
+
+;
+; read LBN 0 as boot block
+;
+
+80$:	clrl	r8			;block to read
+	movl	#1,r9			;size to read
+	movl	r10,r6			;Start of free memory
+	bsbw	readfile		;read the block to R10
+	blbc	r0,75$			;br if error
+
+;
+; validate the boot block
+;
+
+	movzwl	#ss$_filestruct!2,r0	;set error code, semi-success
+	movzbl	2(r10),r2		;get offset to secondary id field
+	cmpb	3(r10),#1		;next field a BR instruction
+	bneq	75$			;br if no
+	movaw	(r10)[r2],r1		;address next field
+					;this must be in the same page!
+	bsbw	verify_boot_block	;check boot block
+	blbc	r0,75$			;br if not a valid block
+	rotl	#16,4(r10),r8		;get secondary image LBN
+	movl	8(r1),r9		;get image size
+	addl	12(r1),r10		;compute load address
+	addl3	r10,16(r1),r5		;compute transfer address
+	brb	readin_boot		;boot block is valid, read file 
+
+;
+; File was located successfully. Make sure that the file is contiguous.
+; The file statistics block is the following:
+;
+;	+----------------------+
+;	|     starting LBN     | (0 if file not contiguous)
+;	+----------------------+
+;	|    size in blocks    |
+;	+----------------------+
+;
+
+boot_file:				;Test for contiguity.
+	movq	rpb$l_fillbn(r11),r8	;Get file statistics.
+	tstl	r8			;Contiguous file?
+	bneq	60$			;Yes, continue.
+	movzwl	#ss$_filnotcntg,r0	;search fatal error
+	rsb
+
+;
+; If the software boot control flags indicate that that transfer
+; address of the secondary bootstrap is stored in the image file's
+; header block, read that header block. Otherwise, assume that the
+; transfer address is simply the 1st byte in the image file.
+;
+
+60$:	movl	r10,r5			;Assume no special transfer address.
+	bbc	#rpb$v_header,-		;If no header requested,
+		rpb$l_bootr5(r11),-	;then just branch past header
+		readin_boot		;reading code.
+	movl	r10,r6			;Start of free memory
+	movl	#1,r9			;Header is always only 1 block.
+	bsbb	readfile		;Read header block.
+	blbc	r0,no_fit		;br if error
+	movq	rpb$l_fillbn(r11),r8	;R8 = 1st LBN, R9 = block count
+	movq	r9,r2			;R2 = block count, R3 = hdr adr
+	bsbw	boo$image_att		;Get image attributes
+
+;
+; R1 = image header block count
+; R2 = size of file in blocks excluding symbol table and patch text
+;
+
+	movl	r1,rpb$b_hdrpgcnt(r11)	;Store image header block count
+	subl3	r1,r2,r9		;Blocks in image after header block(s)
+	addl	r1,r8			;LBN of first block beyond headr block
+	movzwl	ihd$w_activoff(r10),r1	;Get offset to image
+					;activation data in header.
+	addl	r10,r1			;Form transfer vector address.
+	movab	(r1)[r10],r5		;Get transfer address.
+
+;
+; Now read in the file. If the file is too large for the remaining
+; memory space, see if the required additional pages are usable.
+; If they are, use them.  If not issue a fatal diagnostic and HALT.
+;
+; Registers set up now are the following:
+;
+;	R5	- transfer address 
+;	R8	- starting LBN of file (after header)
+;	R9	- size of file in blocks
+;	R10	- address of 1st byte in free memory
+;	R11	- address of the RPB
+;	AP	- secondary boot argument list
+;
+
+readin_boot:
+
+	movq	rpb$q_pfnmap(r11),vmb$q_pfnmap(ap);setup bitmap desc
+	movl	r10,r6			;buffer for read
+
+;
+; Will the desired number of blocks fit in the space remaining in the
+; pre-tested 64kb of memory?  If not, check that the additional pages
+; required are usable.  If they are, then read it all, otherwise quit.
+;
+
+	bsbw	verify_image_memory	;verify pages for image
+	blbc	r0,no_fit		;br if error
+
+;
+; Now read the secondary boot code into memory
+;
+;	Calls the device-independent bootstrap QIO routine to read
+;	a file. Divides the file into pieces as large as possible, so
+;	that the read is a small number (like 1) of DMA transfers.
+;
+; Registers:
+;
+;	R5 	- secondary boot transfer address 
+;	R6	- buffer address
+;	R8	- logical block number (LBN)
+;	R9	- number of blocks in file
+;
+
+readfile:				;Read file into memory.
+	movzbl	#k_max_io_pages,r7	;Assume maximum transfer size.
+	cmpl	r7,r9			;Minimize with file size.
+	bleq	10$			;Branch if file larger than
+					;maximum transfer size.
+	movl	r9,r7			;Set to remaining file size.
+10$:					;Push arguments for QIO.
+	pushl	r11			;Push phony channel number.
+	pushl	#0			;Physical read mode.
+	movzwl	#io$_readlblk,-(sp)	;Read logical block function.
+	pushl	r8			;Starting LBN.
+	rotl	#9,r7,-(sp)		;Transfer size in bytes.
+	pushl	r6			;Buffer address
+	addl	4(sp),r6		;Update buffer address.
+	addl	r7,r8			;Update LBN.
+	calls	#6,boo$qio		;Call a bootstrap QIO routine.
+	blbc	r0,30$			;Continue on success.
+	subl	r7,r9			;Decrement blocks remaining.
+	bgtr	readfile		;Continue if not done.
+
+;
+;	R0	- status
+;	R5 	- secondary boot transfer address 
+;	R6	- buffer address updated past last byte read
+;	R8	- LBN updated to block after last block read
+;	R9	- blocks in file (reduced to number not read)
+;
+
+30$:
+no_fit:	rsb				;Return to caller when done.
+
+	.sbttl	scb interrupt routines
+;++
+; ignore_scb_int
+;
+; functional description:
+;
+; This sequence runs via an SCB vectored interrupt.
+;
+; inputs:
+;
+;	none
+;
+; outputs:
+;
+;	none
+;--
+
+	.align	long
+
+ignore_scb_int:
+	rei				;
+
+;++
+; machine_check_detect
+;
+; functional description:
+;
+; This sequence runs when it is enabled in the machine check vector.
+; The action is to alter the return address to a value in r1 and continue.
+;
+; inputs:
+;
+;	machine check stack
+;	machine_check_continue  = address of the continuation code or 0
+;
+; outputs:
+;
+;	r0 = machine check code
+;--
+
+	.align	long
+
+machine_check_detect:
+
+	mtpr	#^xff,#pr$_mcesr	;clear machine check error
+	tstl	machine_check_continue	;change return PC?
+	beql	10$			;if eql then no, unexpected
+	movl	4(sp),r0		;load reason
+	addl	(sp)+,sp		;pop stack
+	movl	machine_check_continue,(sp) ;actually change return PC
+	rei				;continue
+10$:	fatal_message	scbint
+
+;++
+; fatal_error
+;
+; functional description:
+;
+; This routine is entered when a fatal error is to be displayed.
+; The input code is a standard ss$_ value and it is matched to a text
+; string by scanning a table of longword entries. The first work of the 
+; longword is the low word of the ss$ code and the next word is the 
+; displacement to the message text.
+;
+; inputs:
+;
+;	r0 = internal error code
+;
+; outputs:
+;
+;	The boot is abandoned, the registers are restored to
+;	reflect the initial contents and the system is halted.
+;--
+
+fatal_error:
+
+	movab	rom_base,r11		;recalculate RPB address
+	bicw	#^x1ff,r11		;
+	movab	-k_rom_code_addr(r11),r11;
+	clrl	machine_check_continue	;disable error continue
+	movab	message_base,r1		;address message desc
+	bicl	#3,r0			;remove severity bits
+10$:	cmpw	(r1)+,r0		;compare code
+	beql	15$			;br if found
+	tstw	(r1)+			;advance and test for zero offset?
+	bneq	10$			;continue in not found
+	brb	20$			;if list end then no message
+15$:	cvtwl	(r1),r0			;fetch displacement from cell
+	pushl	rpb$l_bootr1(r11)	;Pass options switch settings
+	clrq	-(sp)			;no read data
+	pushab	(r1)[r0]		;address of message text
+
+;
+; output the header part followed by the input code's message
+;
+
+	pushl	rpb$l_bootr1(r11)	;Pass options switch settings
+	clrq	-(sp)			;setup header
+	pushab	message_header		;
+	calls	#4,boo$readprompt	;output header
+	calls	#4,boo$readprompt	;output message
+	pushl	rpb$l_bootr1(r11)	;Pass options switch settings
+	clrq	-(sp)			;output device name
+	pushab	boot_device_name
+	calls	#4,boo$readprompt	;
+
+;
+; reload the input registers
+;
+
+20$:	movl	rpb$l_base(r11),sp	;load sp
+	movab	^x200(sp),sp		;
+	movq	rpb$l_bootr0(r11),r0	;load r0,r1
+	movq	rpb$l_bootr2(r11),r2	;load r2,r3
+	movq	rpb$l_bootr4(r11),r4	;load r4,r5
+	movl	rpb$l_haltcode(r11),ap	;load halt code
+	movq	rpb$l_haltpc(r11),r10	;restore PC,PSL
+
+;
+; halt system, continue will restart the boot
+;
+
+25$:	mtpr	#console_halt,#pr$_txdb	;halt processor
+	brb	25$			;
+
+;++
+; validate_csr - test for present CSR
+;
+; functional description:
+;
+; This routine tests for a device CSR and returns to the caller's caller
+; if the CSR is not present. The CSR address is calculated from the base
+; CSR address and the controller number.
+;
+; inputs:
+;
+;	r7 = boot device descriptor address
+;	r11 = rpb address
+;
+; outputs:
+;
+;	return to caller implies that the device is present
+;	return to caller's caller with r0 = ss$_devassign+2
+;
+;	The RPB$L_PHYCSR value is filled in.
+;
+;	r0,r1 are destroyed
+;--
+
+validate_csr:
+
+	movab	b^10$,machine_check_continue ;chance machine check addr
+	movl	bd_a_csr(r7),r1		;get csr address
+	clrl	r0			;set present flag
+	tstw	(r1)			;test
+10$:	clrl	machine_check_continue	;zap machine check address
+	tstl	r0			;CSR present?
+	beql	20$			;continue
+	movzwl	#ss$_devassign!2,r0	;set error but semi-success
+	popl	r1			;pop return to caller
+	rsb				;done
+20$:	movl	r1,rpb$l_csrphy(r11)	;save csr address
+	mtpr	#led_boot_inprogress,#pr$_txdb; tell operator
+	rsb				; return to caller
+
+;++
+; unfielded_scb_int
+; secondary_scb_int
+;
+; functional description:
+;
+; This routine is executed if an unwanted SCB interrupt occurs during
+; booting. An error message is displayed and the system is halted.
+;
+; inputs:
+;
+;	scb interrupt stack
+;
+; outputs:
+;
+;	none
+;--
+
+	.align	long
+
+unfielded_scb_int:
+
+	fatal_message	scbint
+
+secondary_scb_int:
+	
+	fatal_message	2ndint
+
+;++
+; verify_boot_block
+;
+; functional description:
+;
+; This routine verifyes a small memory section as a boot block descriptor.
+; It is used to verify a disk boot block or a ROM id block.
+;
+;
+;			+-------+-------+-------+-------+
+;	BB+0:		|     1 |     n |     any value |
+;			+-------+-------+-------+-------+
+;			| Low LBN	| High LBN	|
+;			+-------+-------+-------+-------+
+;			
+;			+-------+-------+-------+-------+
+;	BB+(2*n)+0:	|  Chk  |     k |        18(Hex)|
+;			+-------+-------+-------+-------+
+;			| any value, most likely 0	|
+;			+-------+-------+-------+-------+
+;	BB+(2*n)+8:	| size in blocks of the image   |
+;			+-------+-------+-------+-------+
+;	BB+(2*n)+12:	| offset to load 		|
+;			+-------+-------+-------+-------+
+;	BB+(2*n)+16:	| offset into image to start	|
+;			+-------+-------+-------+-------+
+;	BB+(2*n)+20:	| sum of the previous three LW's|
+;			+-------+-------+-------+-------+
+;
+; inputs:
+;
+;	r1 = address of the block
+;
+; outputs:
+;
+;	r0 = true or false
+;	r1 = original address
+;
+;	r2 is destroyed
+;--
+
+verify_boot_block:
+
+	clrl	r0			;assume not a valid block
+	cmpw	(r1),#^x18		;VAX instruction set id?
+	bneq	10$			;br if no
+	addb3	#^x18,2(r1),r2		;get optional value
+	mcomb	r2,r2			;ones's complement it
+	cmpb	r2,3(r1)		;check check sum byte
+	bneq	10$			;continue if no match
+	addl3	8(r1),12(r1),r2		;check other words
+	addl	16(r1),r2		;get augment to load address
+	cmpl	r2,20(r1)		;match?
+	bneq	10$			;br if no
+	incl	r0			;success
+10$:	rsb
+
+; ++
+; verify_image_memory
+;
+; functional description:
+;
+; This routine checks for n contiguous pages from the established load 
+; address.
+;
+; inputs:
+;
+;	r9 = desired page count
+;	r10 = target load address 
+;	r11 = address of the RPB
+;	ap = boot argument list
+;
+
+verify_image_memory:
+
+	movzwl	#ss$_bufferovf,r0	;set error code
+	rotl	#<32-9>,r11,r2		;PFN for RPB
+	moval	127(r2),r2		;Last PFN guaranteed to be good
+	rotl	#<32-9>,r10,r1		;Starting PFN for read
+	addl	r9,r1			;Last+1 PFN needed to be good
+	brb	30$			;Zero or more iterations
+10$:	bbc	r2,@vmb$q_pfnmap+4(ap),40$ ;Branch if cannot
+					;read the entire secondary boot
+30$:	aoblss	r1,r2,10$		;Check the next page
+	movl	#1,r0			;correct
+40$:	rsb
+
+;++
+; write_timeout
+;
+; functional description:
+;
+; This sequence runs when a write timeout interrupt occurs.
+;
+; inputs:
+;
+;	PC/PSL are on the stack
+;	machine_check_continue = address to continue at or 0
+;
+; outputs:
+;
+;	r0 = error code
+;--
+
+
+	.align	long
+
+write_timeout_int:
+
+	movl	machine_check_continue,(sp) ;reset PC
+	beql	unfielded_scb_int	;unexpected error if no continue addr
+	movl	#k_bus.timeout,r0	;set code
+	rei				;done
+
+	.end	ROM_START

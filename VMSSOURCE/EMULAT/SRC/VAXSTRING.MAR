@@ -1,0 +1,2170 @@
+	.NOSHOW	CONDITIONALS
+	.IF	NOT_DEFINED	BOOT_SWITCH
+	.TITLE	VAX$STRING	VAX-11 Character String Instruction Emulation
+	.IF_FALSE
+	.TITLE	BOO$STRING	Subset Instruction Emulation for VMB and SYSBOOT
+	.ENDC
+	.IDENT	/V04-001/
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; Facility: 
+;
+;	VAX-11 Instruction Emulator
+;
+; Abstract:
+;
+;	The routines in this module emulate the VAX-11 string instructions.
+;	These procedures can be a part of an emulator package or can be
+;	called directly after the input parameters have been loaded into
+;	the architectural registers.
+;
+;	The input parameters to these routines are the registers that
+;	contain the intermediate instruction state. 
+;
+; Environment: 
+;
+;	These routines run at any access mode, at any IPL, and are AST 
+;	reentrant.
+;
+; Author: 
+;
+;	Lawrence J. Kenah	
+;
+; Creation Date:
+;
+;	16 August 1982
+;
+; Modified by:
+;
+;	V04-001	LJK0044		Lawrence J. Kenah	6-Sep-1984
+;		The backup code for MOVTC when moving in the forward direction
+;		also needs to be changed (see LJK0039) based on the relative
+;		sizes of the source and destination strings.
+;
+;	V01-005	KDM0107		Kathleen D. Morse	21-Aug-1984
+;		Fix bug in CMPC3.  Return C clear if string length is 0.
+;
+;	V01-004	LJK0039		Lawrence J. Kenah	20-Jul-1984
+;		Mofify MOVTC backup code to reflect differences in register
+;		contents when traversing strings backwards. There are two
+;		cases based on the relative sizes of source and destination.
+;
+;	V01-003	LJK0026		Lawrence J. Kenah	19-Mar-1984
+;		Final cleanup pass. Access violation handler is now called
+;		STRING_ACCVIO. Set PACK_M_ACCVIO bit in R1 before passing
+;		control to VAX$REFLECT_FAULT.
+;
+;	V01-002	LJK0011		Lawrence J. Kenah	8-Nov-1983
+;		Fix three minor bugs in MOVTC and MOVTUC. Change exception
+;		handling to reflect chenged implementation.
+;
+;	V01-001	Original	Lawrence J. Kenah	16-Aug-1982
+;--
+
+	.SUBTITLE	Miscellaneous Notes
+;+
+;	The following notes apply to most or all of the routines that appear in 
+;	this module. The comments appear here to avoid duplication in each routine.
+;
+;  1.	The VAX Architecture Standard (DEC STD 032) is the ultimate authority on
+;	the functional behavior of these routines. A summary of each instruction
+;	that is emulated appears in the Functional Description section of each
+;	routine header. 
+;
+;  2.	One design goal that affects the algorithms used is that these instructions
+;	can incur exceptions such as access violations that will be reported to
+;	users in such a way that the exception appears to have originated at the
+;	site of the reserved instruction rather than within the emulator. This
+;	constraint affects the algorithms available and dictates specific
+;	implementation decisions. 
+;
+;  3.	Each routine header contains a picture of the register usage when it is
+;	necessary to store the intermediate state of an instruction (routine) while
+;	servicing an exception. 
+;
+;	The delta-PC field is used by the condition handler jacket to these
+;	routines when it determines that an exception such as an access violation
+;	occurred in response to an explicit use of one of the reserved
+;	instructions. These routines can also be called directly with the input
+;	parameters correctly placed in registers. The delta-PC field is not used in
+;	this case. 
+;
+;	Note that the input parameters to any routine are a subset of the
+;	intermediate state picture. 
+;
+;	Fields that are not used either as input parameters or to store
+;	intermediate state are indicated thus, XXXXX. 
+;
+;  4.	In the Input Parameter list for each routine, certain register fields that
+;	are not used may be explicitly listed for one reason or another. These
+;	unused input parameters are described as IRRELEVANT. 
+;
+;  5.	In general, the final condition code settings are determined as the side
+;	effect of one of the last instructions that executes before control is
+;	passed back to the caller with an RSB. It is seldom necessary to explicitly
+;	manipulate condition codes with a BIxPSW instruction or similar means. 
+;
+;  6.	There is only a small set of exceptions that are reflected to the user in an
+;	altered fashion, with the exception PC changed from within the emulator to
+;	the site of the original entry into these routines. The instructions that
+;	generate these exceptions are all immediately preceded by a 
+;
+;		MARK_POINT	yyyy_N
+;
+;	where yyyy is the instruction name and N is a small integer. These names
+;	map directly into instruction- and context-specific routines (located at
+;	the end of this module) that put each instruction (routine) into a
+;	consistent state before passing control to a more general exception handler
+;	in a different module. 
+;-
+
+	.SUBTITLE	DECLARATIONS
+
+; Include files:
+
+	$PSLDEF				; Define bit fields in PSL
+
+	.NOCROSS			; No cross reference for these
+	.ENABLE		SUPPRESSION	; No symbol table entries either
+
+	PACK_DEF			; Stack usage for exception handling
+
+	.DISABLE	SUPPRESSION	; Turn on symbol table again
+	.CROSS				; Cross reference is OK now
+
+; Macro Definitions
+
+	.MACRO	_INCLUDE	OPCODE , BOOT_FLAG
+	.IF	NOT_DEFINED	BOOT_SWITCH
+		OPCODE'_DEF
+		INCLUDE_'OPCODE = 0
+	.IF_FALSE
+		.IF	IDENTICAL	<BOOT_FLAG> , BOOT
+			OPCODE'_DEF
+			INCLUDE_'OPCODE = 0
+		.ENDC
+	.ENDC
+	.ENDM	_INCLUDE
+
+; External declarations
+
+	.DISABLE	GLOBAL
+
+	.IF	NOT_DEFINED	BOOT_SWITCH
+	.EXTERNAL	VAX$REFLECT_FAULT
+	.ENDC
+
+; PSECT Declarations:
+
+	.DEFAULT	DISPLACEMENT , WORD
+
+	.PSECT _VAX$CODE PIC, USR, CON, REL, LCL, SHR, EXE, RD, NOWRT, LONG
+
+	BEGIN_MARK_POINT		; Set up exception mark points
+
+	.SUBTITLE	Conditional Assembly Parameters
+;+
+; Functional Description:
+;
+;	It is possible to create a subset emulator, one that emulates 
+;	specific reserved instructions. This capability is currently exploited
+;	to create a subset emulator for use by the bootstrap programs.
+;
+;	An instruction is included in the full emulator by making an entry
+;	in the following table. If the optional second parameter is present
+;	and equal to BOOT, then that instruction is included in the subset
+;	emulator used by the bootstrap code.
+;-
+
+	.NOCROSS			; No cross reference for these
+	.ENABLE		SUPPRESSION	; No symbol table entries either
+
+	_INCLUDE	MOVTC
+	_INCLUDE	MOVTUC
+	_INCLUDE	CMPC3 , BOOT
+	_INCLUDE	CMPC5 , BOOT
+	_INCLUDE	SCANC
+	_INCLUDE	SPANC
+	_INCLUDE	LOCC , BOOT
+	_INCLUDE	SKPC
+	_INCLUDE	MATCHC
+	_INCLUDE	CRC
+
+	.DISABLE	SUPPRESSION	; Turn on symbol table again
+	.CROSS				; Cross reference is OK now
+
+	.NOSHOW		CONDITIONALS
+
+	.IF	DEFINED	INCLUDE_MOVTC
+
+	.SUBTITLE	VAX$MOVTC - Move Translated Characters
+;+
+; Functional Description:
+;
+;	The source string specified by the  source  length  and  source  address
+;	operands  is translated and replaces the destination string specified by
+;	the destination length and destination address operands.  Translation is
+;	accomplished  by using each byte of the source string as an index into a
+;	256 byte table whose zeroth entry address  is  specified  by  the  table
+;	address operand.  The byte selected replaces the byte of the destination
+;	string.  If the destination string is longer than the source string, the
+;	highest  addressed  bytes  of the destination string are replaced by the
+;	fill operand.  If the destination string  is  shorter  than  the  source
+;	string,  the  highest  addressed  bytes  of  the  source  string are not
+;	translated and moved.  The operation of the  instruction  is  such  that
+;	overlap  of  the  source  and  destination  strings  does not affect the
+;	result.  If the destination string overlaps the translation  table,  the
+;	destination string is UNPREDICTABLE.
+;
+; Input Parameters:
+;
+;	The following register fields contain the same information that
+;	exists in the operands to the MOVTC instruction.
+;
+;		R0<15:0> = srclen	Length of source string
+;		R1       = srcaddr	Address of source string
+;		R2<7:0>  = fill		Fill character
+;		R3       = tbladdr	Address of 256-byte table
+;		R4<15:0> = dstlen	Length of destination string
+;		R5       = dstaddr	Address of destination string
+;
+;	In addition to the input parameters that correspond directly to
+;	operands to the MOVTC instruction, there are other input parameters 
+;	to this routine. Note that the two inixxxlen parameters are only
+;	used when the MOVTC_V_FPD bit is set in the FLAGS byte.
+;
+;		R2<15:8>  = FLAGS	Instruction-specific status
+;
+;	The contents of the FLAGS byte must be zero (MBZ) on entry to this
+;	routine from the outside world (through the emulator jacket or by
+;	a JSB call). If the initial contents of FLAGS are not zero, the
+;	actions of this routine are UNPREDICTABLE. 
+;
+;	There are two other input parameters whose contents depend on
+;	the settings of the FLAGS byte.
+;
+;	MOVTC_V_FPD bit in FLAGS is CLEAR
+;
+;		R0<31:16> = IRRELEVANT
+;		R4<31:16> = IRRELEVANT
+;
+;	MOVTC_V_FPD bit in FLAGS is SET
+;
+;		R0<31:16> = inisrclen	Initial length of source string
+;		R4<31:16> = inidstlen	Initial length of destination string
+;
+; Intermediate State:
+;
+;     31               23               15               07            00
+;    +----------------+----------------+----------------+----------------+
+;    |         initial srclen          |             srclen              | : R0
+;    +----------------+----------------+----------------+----------------+
+;    |                              srcaddr                              | : R1
+;    +----------------+----------------+----------------+----------------+
+;    |    delta-PC    |     XXXX       |     FLAGS      |      fill      | : R2
+;    +----------------+----------------+----------------+----------------+
+;    |                              tbladdr                              | : R3
+;    +----------------+----------------+----------------+----------------+
+;    |         initial dstlen          |             dstlen              | : R4
+;    +----------------+----------------+----------------+----------------+
+;    |                              dstaddr                              | : R5
+;    +----------------+----------------+----------------+----------------+
+;
+; Output Parameters:
+;
+;	Source string longer than destination string
+;
+;		R0 = Number of bytes remaining in the source string 
+;		R1 = Address of one byte beyond last byte in source string
+;			that was translated (the first untranslated byte)
+;		R2 = 0
+;		R3 = tbladdr	Address of 256-byte table
+;		R4 = 0 (Number of bytes remaining in the destination string)
+;		R5 = Address of one byte beyond end of destination string
+;
+;	Source string same size as or smaller than destination string
+;
+;		R0 = 0 (Number of bytes remaining in the source string)
+;		R1 = Address of one byte beyond end of source string
+;		R2 = 0
+;		R3 = tbladdr	Address of 256-byte table
+;		R4 = 0 (Number of bytes remaining in the destination string)
+;		R5 = Address of one byte beyond end of destination string
+;
+; Condition Codes:
+;
+;	N <- srclen LSS dstlen
+;	Z <- srclen EQL dstlen
+;	V <- 0
+;	C <- srclen LSSU dstlen
+;
+; Side Effects:
+;
+;	This routine uses up to four longwords of stack space.
+;-
+
+	.ENABLE	LOCAL_BLOCK
+
+VAX$MOVTC::
+	PUSHL	R4			; Store dstlen on stack
+	PUSHL	R0			; Store srclen on stack
+
+	ASSUME MOVTC_B_FLAGS EQ 9	; Insure that FLAGS are in R2<15:8>
+
+	BBS	#<MOVTC_V_FPD+8>,R2,5$	; Branch if instruction was interrupted
+	MOVW	(SP),2(SP)		; Set the initial srclen on stack
+	MOVW	4(SP),6(SP)		; Set the initial dstlen on stack
+5$:	PUSHL	R10			; Save R10 so it can hold handler 
+	ESTABLISH_HANDLER	-
+		STRING_ACCVIO		; Store address of condition handler
+	MOVZWL	R4,R4			; Clear unused bits of dstlen
+	BEQL	40$			; All done if zero
+	MOVZWL	R0,R0			; Clear unused bits of srclen
+	BEQL	20$			; Add fill character to destination
+	CMPL	R1,R5			; Check relative position of strings
+	BLSSU	MOVE_BACKWARD		; Perform move from end of strings
+
+; This code executes if the source string is at a LARGER virtual address
+; than the destination string. The movement takes place from the front
+; (small address end) of each string to the back (high address end).
+
+MOVE_FORWARD:
+	PUSHL	R2			; Allow R2 (fill) to be used as scratch
+	SUBL	R0,R4			; Get difference between strings
+	BGEQU	10$			; Branch if fill work to do eventually
+	MOVZWL	12(SP),R0		; Use dstlen (saved R4) as srclen (R0)
+
+	MARK_POINT	MOVTC_1
+10$:	MOVZBL	(R1)+,R2		; Get next character from source
+	MARK_POINT	MOVTC_2
+	MOVB	(R3)[R2],(R5)+		; Move translated character
+	SOBGTR	R0,10$			; Source all done?
+
+	MOVL	(SP)+,R2		; Retrieve fill character from stack
+	TSTL	R4			; Do we need to fill anything?
+	BLEQ	80$			; Skip to exit code if no fill work
+
+	MARK_POINT	MOVTC_3
+20$:	MOVB	R2,(R5)+		; Fill next character
+	SOBGTR	R4,20$			; Destination all done?
+
+; This is the common exit path. R2 is cleared to conform to its output
+; setting. The condition codes are determined by the original lengths
+; of the source and destination strings that were saved on the stack.
+
+30$:	CLRL	R2			; R2 is zero on return
+	MOVL	(SP)+,R10		; Restore saved R10
+	ASHL	#-16,(SP),(SP)		; Get initial srclen
+	ASHL	#-16,4(SP),4(SP)	; Get initial dstlen
+	CMPL	(SP)+,(SP)+		; Set condition codes
+	RSB
+
+; The following instruction is the exit path when the destination string
+; has zero length on input.
+
+40$:	MOVZWL	R0,R0			; Clear unused bits of srclen
+	BRB	30$			; Exit through common code
+
+; This code executes if the source string is at a SMALLER virtual address
+; than the destination string. The movement takes place from the back
+; (high address end) of each string to the front (low address end).
+
+MOVE_BACKWARD:
+	ADDL	R4,R5			; Point R5 one byte beyond destination
+	SUBL	R0,R4			; Get amount of fill work to do
+	BGTRU	50$			; Branch to fill loop if work to do
+	MOVZWL	8(SP),R0		; Use dstlen (saved R4) as srclen (R0)
+	BRB	60$			; Skip loop that does fill characters
+
+	MARK_POINT	MOVTC_4
+50$:	MOVB	R2,-(R5)		; Load fill characters from the back
+	SOBGTR	R4,50$			; Continue until excess all done
+
+60$:	ADDL	R0,R1			; Point R1 to "modified end" of source
+
+; Move transtaled characters from the high-address end toward the low-address 
+; end. Note that the fill character is no longer needed so that R2 is 
+; available as a scratch register.
+
+	MARK_POINT	MOVTC_5
+70$:	MOVZBL	-(R1),R2		; Get next character
+	MARK_POINT	MOVTC_6
+	MOVB	(R3)[R2],-(R5)		; Move translated character
+	SOBGTR	R0,70$			; Continue until source is exhausted
+
+; At this point, R1 points to the first character in the source string and R5
+; points to the first character in the destination string. This is the result
+; of operating on the strings from back to front (high-address end to
+; low-address end). These registers must be modified to point to the ends of
+; their respective strings. This is accomplished by using the saved original
+; lengths of the two strings. Note that at this stage of the routine, R2 is
+; no longer needed and so can be used as a scratch register. 
+
+	MOVZWL	6(SP),R2		; Get original source length
+	ADDL	R2,R1			; Point R1 to end of source string
+	MOVZWL	10(SP),R2		; Get original destination length
+	ADDL	R2,R5			; Point R5 to end of destination string
+
+; If R1 is negative, this indicates that the source string is smaller than the
+; destination. R1 must be readjusted to point to the first byte that was not
+; translated. R0, which contains zero, must be loaded with the number of bytes
+; that were not translated (the negative of the contents of R4).
+
+	TSTL	R4			; Any more work to do?
+	BEQL	30$			; Exit through common code
+	ADDL	R4,R1			; Back up R1 (R4 is negative)
+
+; The exit code for MOVE_FORWARD also comes here if the source is longer than
+; (or equal to) the destination. Note that in the case of R4 containing zero,
+; some extra work that accomplishes nothing must be done. This extra work in
+; the case of equal strings avoids two extra instructions in all cases.
+
+80$:	MNEGL	R4,R0			; Remaining source length to R0
+	CLRL	R4			; R4 is always zero on exit
+	BRB	30$			; Exit through common code
+
+	.DISABLE	LOCAL_BLOCK
+	.ENDC
+	.IF	DEFINED	INCLUDE_MOVTUC
+
+	.SUBTITLE	VAX$MOVTUC - Move Translated Until Character
+;+
+; Functional Description:
+;
+;	The source string specified by the  source  length  and  source  address
+;	operands  is translated and replaces the destination string specified by
+;	the destination length and destination address operands.  Translation is
+;	accomplished by using each byte of the source string as index into a 256
+;	byte table whose zeroth entry address is specified by the table  address
+;	operand.  The byte selected replaces the byte of the destination string.
+;	Translation continues until a translated byte is  equal  to  the  escape
+;	byte  or until the source string or destination string is exhausted.  If
+;	translation is terminated because of escape the condition code V-bit  is
+;	set;   otherwise  it is cleared.  If the destination string overlaps the
+;	table,  the  destination  string  and  registers  R0  through   R5   are
+;	UNPREDICTABLE.   If the source and destination strings overlap and their
+;	addresses are not identical, the destination  string  and  registers  R0
+;	through  R5  are  UNPREDICTABLE.   If  the source and destination string
+;	addresses are identical, the translation is performed correctly.
+;
+; Input Parameters:
+;
+;	The following register fields contain the same information that
+;	exists in the operands to the MOVTUC instruction.
+;
+;		R0<15:0> = srclen	Length of source string
+;		R1       = srcaddr	Address of source string
+;		R2<7:0>  = fill		Escape character
+;		R3       = tbladdr	Address of 256-byte table
+;		R4<15:0> = dstlen	Length of destination string
+;		R5       = dstaddr	Address of destination string
+;
+;	In addition to the input parameters that correspond directly to
+;	operands to the MOVTUC instruction, there are other input parameters 
+;	to this routine. Note that the two inixxxlen parameters are only
+;	used when the MOVTUC_V_FPD bit is set in the FLAGS byte.
+;
+;		R2<15:8>  = FLAGS	Instruction-specific status
+;
+;	The contents of the FLAGS byte must be zero (MBZ) on entry to this
+;	routine from the outside world (through the emulator jacket or by
+;	a JSB call). If the initial contents of FLAGS are not zero, the
+;	actions of this routine are UNPREDICTABLE. 
+;
+;	There are two other input parameters whose contents depend on
+;	the settings of the FLAGS byte.
+;
+;	MOVTUC_V_FPD bit in FLAGS is CLEAR
+;
+;		R0<31:16> = IRRELEVANT
+;		R4<31:16> = IRRELEVANT
+;
+;	MOVTUC_V_FPD bit in FLAGS is SET
+;
+;		R0<31:16> = inisrclen	Initial length of source string
+;		R4<31:16> = inidstlen	Initial length of destination string
+;
+; Intermediate State:
+;
+;     31               23               15               07            00
+;    +----------------+----------------+----------------+----------------+
+;    |         initial srclen          |             srclen              | : R0
+;    +----------------+----------------+----------------+----------------+
+;    |                              srcaddr                              | : R1
+;    +----------------+----------------+----------------+----------------+
+;    |    delta-PC    |     XXXX       |     FLAGS      |      esc       | : R2
+;    +----------------+----------------+----------------+----------------+
+;    |                              tbladdr                              | : R3
+;    +----------------+----------------+----------------+----------------+
+;    |         initial dstlen          |             dstlen              | : R4
+;    +----------------+----------------+----------------+----------------+
+;    |                              dstaddr                              | : R5
+;    +----------------+----------------+----------------+----------------+
+;
+; Output Parameters:
+;
+;	The final state of this instruction (routine) can exist in one of 
+;	three forms, depending on the relative lengths of the source and
+;	destination strings and whether a translated character matched the
+;	escape character.
+;
+;    1.	Some byte matched escape character 
+;
+;		R0 = Number of bytes remaining in the source string (including 
+;			the byte that caused the escape)
+;		R1 = Address of the byte that caused the escape
+;		R2 = 0
+;		R3 = tbladdr	Address of 256-byte table
+;		R4 = Number of bytes remaining in the destination string 
+;		R5 = Address of byte that would have received the translated byte
+;
+;    2.	Destination string exhausted
+;
+;		R0 = Number of bytes remaining in the source string 
+;		R1 = Address of the byte that resulted in exhaustion
+;		R2 = 0
+;		R3 = tbladdr	Address of 256-byte table
+;		R4 = 0 (Number of bytes remaining in the destination string)
+;		R5 = Address of one byte beyond end of destination string
+;
+;    3.	Source string exhausted
+;
+;		R0 = 0 (Number of bytes remaining in the source string)
+;		R5 = Address of one byte beyond end of source string
+;		R2 = 0
+;		R3 = tbladdr	Address of 256-byte table
+;		R4 = Number of bytes remaining in the destination string 
+;		R5 = Address of byte that would have received the translated byte
+;
+; Condition Codes:
+;
+;	N <- srclen LSS dstlen
+;	Z <- srclen EQL dstlen
+;	V <- set if terminated by escape
+;	C <- srclen LSSU dstlen
+;
+; Side Effects:
+;
+;	This routine uses five longwords of stack.
+;-
+
+	.ENABLE	LOCAL_BLOCK
+
+VAX$MOVTUC::
+	PUSHL	R4			; Store dstlen on stack
+	PUSHL	R0			; Store srclen on stack
+
+	ASSUME MOVTUC_B_FLAGS EQ 9	; Insure that FLAGS are in R2<15:8>
+
+	BBS	#<MOVTUC_V_FPD+8>,R2,5$	; Branch if instruction was interrupted
+	MOVW	(SP),2(SP)		; Set the initial srclen on stack
+	MOVW	4(SP),6(SP)		; Set the initial dstlen on stack
+5$:	MOVZWL	R4,R4			; Clear unused bits of dstlen
+	BEQL	50$			; Almost done if zero length
+	MOVZWL	R0,R0			; Clear unused bits of srclen
+	BEQL	40$			; Done if zero length
+	PUSHL	R10			; Save R10 so it can hold handler 
+	ESTABLISH_HANDLER	-
+		STRING_ACCVIO		; Store address of condition handler
+	PUSHL	R7			; We need some scratch registers
+	PUSHL	R6			; 
+
+; Note that all code must now exit through a code path that restores R6
+; R7, and R10 to insure that the stack is correctly aligned and that these 
+; register contents are preserved across execution of this routine.
+
+; The following initialization routine is designed to make the main loop
+; execute faster. It performs three actions.
+;
+;	R7 <- Smaller of R0 and R4 (srclen and dstlen)
+;
+;	Larger of R0 and R4 is replaced by the difference between R0 and R4.
+;
+;	Smaller of R0 and R4 is replaced by zero.
+;
+; This initializes R0 and R4 to their final states if either the source 
+; string or the destination string is exhausted. In the event that the loop
+; is terminated through the escape path, these two registers are readjusted
+; to contain the proper values as if they had each been advanced one byte
+; for each trip through the loop.
+
+	SUBL	R0,R4			; Replace R4 with (R4-R0)
+	BLSSU	10$			; Branch if srclen GTRU dstlen
+
+; Code path for srclen (R0) LEQU dstlen (R4). R4 is already correctly loaded.
+
+	MOVL	R0,R7			; Load R7 with smaller (R0)
+	CLRL	R0			; Load smaller (R0) with zero
+	BRB	20$			; Merge with common code at top of loop
+
+; Code path for srclen (R0) GTRU dstlen (R4). 
+
+10$:	MOVZWL	16(SP),R7		; Load R7 with smaller (use saved R4)
+	MNEGL	R4,R0			; Load larger (R0) with ABS(R4-R0)
+	CLRL	R4			; Load smaller (R4) with zero
+
+; The following is the main loop in this routine.
+
+	MARK_POINT	MOVTUC_1
+20$:	MOVZBL	(R1)+,R6		; Get next character from source string
+	MARK_POINT	MOVTUC_2
+	MOVZBL	(R3)[R6],R6		; Convert to translated character
+	CMPB	R2,R6			; Does it match escape character?
+	BEQL	ESCAPE			; Exit loop if yes
+	MARK_POINT	MOVTUC_3
+	MOVB	R6,(R5)+		; Move translated character to 
+					;  destination string
+	SOBGTR	R7,20$			; Shorter string exhausted?
+
+; The following exit path is taken when the shorter of the source string and
+; the destination string is exhausted
+
+30$:	MOVQ	(SP)+,R6		; Restore contents of scratch register
+	MOVL	(SP)+,R10		; Restore saved R10
+40$:	CLRL	R2			; R2 must be zero on output
+	ASHL	#-16,(SP),(SP)		; Get initial srclen
+	ASHL	#-16,4(SP),4(SP)	; Get initial dstlen
+	CMPL	(SP)+,(SP)+		; Set condition codes (V-bit always 0)
+	RSB				; Return
+
+; This code executes if the destination string has zero length. The source
+; length is set to a known state so that the common exit path can be taken.
+
+50$:	MOVZWL	R0,R0			; Clear unused bits of srclen
+	BRB	40$			; Exit through common code
+
+; This code executes if the escape character matches the entry in the
+; 256-byte table indexed by the character in the source string. Registers
+; R0 and R4 must be adjusted to indicate that neither string was exhausted.
+; The last step taken before return sets the V-bit.
+
+ESCAPE:
+	DECL	R1			; Reset R1 to correct byte in source 
+	CLRL	R2			; R2 must be zero on output
+	ADDL	R7,R0			; Adjust saved srclen
+	ADDL	R7,R4			; Adjust saved dstlen
+	MOVQ	(SP)+,R6		; Restore contents of scratch registers
+	MOVL	(SP)+,R10		; Restore saved R10
+	ASHL	#-16,(SP),(SP)		; Get initial srclen
+	ASHL	#-16,4(SP),4(SP)	; Get initial dstlen
+	CMPL	(SP)+,(SP)+		; Set condition codes (V-bit always 0)
+	BISPSW	#PSL$M_V		; Set V-bit to indicate ESCAPE
+	RSB				; Return
+
+	.DISABLE	LOCAL_BLOCK
+	.ENDC
+	.IF	DEFINED	INCLUDE_CMPC3
+
+	.SUBTITLE	VAX$CMPC3 - Compare Characters (3 Operand)
+;+
+; Functional Description:
+;
+;	The bytes of string 1 specified by the length and address 1 operands are
+;	compared  with the bytes of string 2 specified by the length and address
+;	2 operands.  Comparison proceeds until inequality is detected or all the
+;	bytes  of  the strings have been examined.  Condition codes are affected
+;	by the result of the last byte  comparison.   Two  zero  length  strings
+;	compare equal (i.e.  Z is set and N, V, and C are cleared).
+;
+; Input Parameters:
+;
+;	R0<15:0> = len		Length of character strings
+;	R1       = src1addr	Address of first character string (called S1)
+;	R3       = src2addr	Address of second character string (called S2)
+;
+; Intermediate State:
+;
+;     31               23               15               07            00
+;    +----------------+----------------+----------------+----------------+
+;    |    delta-PC    |      XXXX      |               len               | : R0
+;    +----------------+----------------+----------------+----------------+
+;    |                             src1addr                              | : R1
+;    +----------------+----------------+----------------+----------------+
+;    |                               XXXXX                               | : R2
+;    +----------------+----------------+----------------+----------------+
+;    |                             src2addr                              | : R3
+;    +----------------+----------------+----------------+----------------+
+;
+; Output Parameters:
+;
+;	Strings are IDENTICAL
+;
+;		R0 = 0
+;		R1 = Address of one byte beyond end of S1
+;		R2 = 0 (same as R0)
+;		R1 = Address of one byte beyond end of S2
+;
+;	Strings DO NOT MATCH
+;
+;		R0 = Number of bytes left in strings (including first byte
+;			that did not match)
+;		R1 = Address of nonmatching byte in S1
+;		R2 = R0
+;		R3 = Address of nonmatching byte in S2
+;
+; Condition Codes:
+;
+;	In general, the condition codes reflect whether or not the strings
+;	are considered the same or different. In the case of different
+;	strings, the condition codes reflect the result of the comparison
+;	that indicated that the strings are not equal.
+;
+;	Strings are IDENTICAL
+;
+;		N <- 0
+;		Z <- 1			; (byte in S1) EQL (byte in S2)
+;		V <- 0
+;		C <- 0
+;
+;	Strings DO NOT MATCH
+;
+;		N <- (byte in S1) LSS (byte in S2)
+;		Z <- 0			; (byte in S1) NEQ (byte in S2)
+;		V <- 0
+;		C <- (byte in S1) LSSU (byte in S2)
+;
+;	where "byte in S1" or "byte in S2" may indicate the fill character
+;
+; Side Effects:
+;
+;	This routine uses one longword of stack.
+;-
+
+VAX$CMPC3::
+	MOVZWL	R0,R0			; Clear unused bits & check for zero
+	BEQL	20$			; Simply return if zero length string
+
+	PUSHL	R10			; Save R10 so it can hold handler 
+	ESTABLISH_HANDLER	-
+		STRING_ACCVIO		; Store address of condition handler
+
+	MARK_POINT	CMPC3_1
+10$:	CMPB	(R3)+,(R1)+		; Character match?
+	BNEQ	30$			; Exit loop if different
+	SOBGTR	R0,10$
+
+; Exit path for strings IDENTICAL (R0 = 0, either on input or after loop)
+
+	MOVL	(SP)+,R10		; Restore saved R10
+20$:	CLRL	R2			; Set R2 for output value of 0
+	TSTL	R0			; Set condition codes
+	RSB				; Return point for IDENTICAL strings
+
+; Exit path when strings DO NOT MATCH
+
+30$:	MOVL	(SP)+,R10		; Restore saved R10
+	MOVL	R0,R2			; R0 and R2 are the same on exit
+	CMPB	-(R1),-(R3)		; Reset R1 and R3 and set condition codes
+	RSB				; Return point when strings DO NOT MATCH
+	.ENDC
+	.IF	DEFINED	INCLUDE_CMPC5
+
+	.SUBTITLE	VAX$CMPC5 - Compare Characters (5 Operand)
+;+
+; Functional Description:
+;
+;	The bytes of the string 1 specified  by  the  length  1  and  address  1
+;	operands  are  compared  with the bytes of the string 2 specified by the
+;	length 2 and address 2 operands.  If  one  string  is  longer  than  the
+;	other,  the shorter string is conceptually extended to the length of the
+;	longer by appending (at  higher  addresses)  bytes  equal  to  the  fill
+;	operand.   Comparison  proceeds  until inequality is detected or all the
+;	bytes of the strings have been examined.  Condition codes  are  affected
+;	by  the  result  of  the  last byte comparison.  Two zero length strings
+;	compare equal (i.e.  Z is set and N, V, and C are cleared).
+;
+; Input Parameters:
+;
+;	R0<15:0>  = len		Length of first character string (called S1)
+;	R0<23:16> = fill	Fill character that is used when strings have
+;				   different lengths
+;	R1        = addr	Address of first character string 
+;	R2<15:0>  = len		Length of second character string (called S2)
+;	R3        = addr	Address of second character string 
+;
+; Intermediate State:
+;
+;     31               23               15               07            00
+;    +----------------+----------------+----------------+----------------+
+;    |    delta-PC    |      fill      |             src1len             | : R0
+;    +----------------+----------------+----------------+----------------+
+;    |                             src1addr                              | : R1
+;    +----------------+----------------+----------------+----------------+
+;    |              XXXXX              |             src2len             | : R2
+;    +----------------+----------------+----------------+----------------+
+;    |                             src2addr                              | : R3
+;    +----------------+----------------+----------------+----------------+
+;
+; Output Parameters:
+;
+;	Strings are IDENTICAL
+;
+;		R0 = 0
+;		R1 = Address of one byte beyond end of S1
+;		R2 = 0 (same as R0)
+;		R1 = Address of one byte beyond end of S2
+;
+;	Strings DO NOT MATCH
+;
+;		R0 = Number of bytes remaining in S1 when mismatch detected
+;			(or zero if S1 exhausted before mismatch detected)
+;		R1 = Address of nonmatching byte in S1
+;		R2 = Number of bytes remaining in S2 when mismatch detected
+;			(or zero if S2 exhausted before mismatch detected)
+;		R3 = Address of nonmatching byte in S2
+;
+; Condition Codes:
+;
+;	In general, the condition codes reflect whether or not the strings
+;	are considered the same or different. In the case of different
+;	strings, the condition codes reflect the result of the comparison
+;	that indicated that the strings are not equal.
+;
+;	Strings are IDENTICAL
+;
+;		N <- 0
+;		Z <- 1			; (byte in S1) EQL (byte in S2)
+;		V <- 0
+;		C <- 0
+;
+;	Strings DO NOT MATCH
+;
+;		N <- (byte in S1) LSS (byte in S2)
+;		Z <- 0			; (byte in S1) NEQ (byte in S2)
+;		V <- 0
+;		C <- (byte in S1) LSSU (byte in S2)
+;
+;	where "byte in S1" or "byte in S2" may indicate the fill character
+;
+; Side Effects:
+;
+;	This routine uses two longwords of stack.
+;-
+
+	.ENABLE	LOCAL_BLOCK
+
+VAX$CMPC5::
+	PUSHL	R10			; Save R10 so it can hold handler 
+	ESTABLISH_HANDLER	-
+		STRING_ACCVIO		; Store address of condition handler
+	PUSHL	R4			; Save register
+	ASHL	#-16,R0,R4		; Get escape character
+	MOVZWL	R0,R0			; Clear unused bits & is S1 length zero?
+	BEQL	50$			; Branch if yes
+	MOVZWL	R2,R2			; Clear unused bits & is S2 length zero?	
+	BEQL	30$
+
+; Main loop. The following loop executes when both strings have characters
+; remaining and inequality has not yet been detected.
+
+; THE FOLLOWING LOOP IS A TARGET FOR FURTHER OPTIMIZATION IN THAT THE
+; LOOP SHOULD NOT REQUIRE TWO SOBGTR INSTRUCTIONS. NOTE, THOUGH, THAT
+; THE CURRENT UNOPTIMIZED LOOP IS EASIER TO BACK UP.
+
+	MARK_POINT	CMPC5_1
+10$:	CMPB	(R1)+,(R3)+		; Characters match?
+	BNEQ	80$			; Exit loop if bytes different
+	SOBGTR	R0,20$			; Check for S1 exhausted
+
+; The next test determines whether S2 is also exhausted.
+
+	DECL	R2			; Put R2 in step with R0
+	BNEQ	60$			; Branch if bytes remaining in S2
+
+; This is the exit path for identical strings. If we get here, then both
+; R0 and R2 are zero.  The condition codes are correctly set (by the ASHL
+; instruction) so the registers are restored with a POPR to avoid changing
+; the condition codes.
+
+IDENTICAL:
+	POPR	#^M<R4,R10>		; Restore saved registers
+	RSB				; Exit indicating IDENTICAL strings
+
+20$:	SOBGTR	R2,10$			; Check for S2 exhausted
+
+; The following loop is entered when all of S2 has been processed but
+; there are characters remaining in S1. In other words, 
+;
+;	R0 GTRU 0
+;	R2 EQL 0
+;
+; The remaining characters in S1 are compared to the fill character.
+
+	MARK_POINT	CMPC5_2
+30$:	CMPB	(R1)+,R4		; Characters match?
+	BNEQ	40$			; Exit loop if no match
+	SOBGTR	R0,30$			; Any more bytes in S1?
+
+	BRB	IDENTICAL		; Exit indicating IDENTICAL strings
+
+40$:	CMPB	-(R1),R4		; Reset R1 and set condition codes
+	BRB	NO_MATCH		; Exit indicating strings DO NOT MATCH
+
+; The following code executes if S1 has zero length on input. If S2 also
+; has zero length, the routine smply returns, indicating equal strings.
+
+50$:	MOVZWL	R2,R2			; Clear unused bits. Is S2 len also zero?
+	BEQL	IDENTICAL		; Exit indicating IDENTICAL strings
+
+; The following loop is entered when all of S1 has been processed but
+; there are characters remaining in S2. In other words, 
+;
+;	R0 EQL 0
+;	R2 GTRU 0
+;
+; The remaining characters in S2 are compared to the fill character.
+
+	MARK_POINT	CMPC5_3
+60$:	CMPB	R4,(R3)+		; Characters match?
+	BNEQ	70$			; Exit loop if no match
+	SOBGTR	R2,60$			; Any more bytes in S2?
+
+	BRB	IDENTICAL		; Exit indicating IDENTICAL strings
+
+70$:	CMPB	R4,-(R3)		; Reset R3 and set condition codes
+	BRB	NO_MATCH		; Exit indicating strings DO NOT MATCH
+
+; The following exit path is taken if both strings have characters
+; remaining and a character pair that did not match was detected.
+
+80$:	CMPB	-(R1),-(R3)		; Reset R1 and R3 and set condition codes
+NO_MATCH:				; Restore R4 and R10
+	POPR	#^M<R4,R10>		;  without changing condition codes
+	RSB				; Exit indicating strings DO NOT MATCH
+
+	.DISABLE	LOCAL_BLOCK
+	.ENDC
+	.IF	DEFINED	INCLUDE_SCANC
+
+	.SUBTITLE	VAX$SCANC - Scan Characters
+;+
+; Functional Description:
+;
+;	The bytes of the string specified by the length and address operands are
+;	successively  used  to  index  into  a 256 byte table whose zeroth entry
+;	address is specified by the table address operand.   The  byte  selected
+;	from  the table is ANDed with the mask operand.  The operation continues
+;	until the result of the AND is non-zero or all the bytes of  the  string
+;	have  been  exhausted.   If  a  non-zero  AND  result  is  detected, the
+;	condition code Z-bit is cleared;  otherwise, the Z-bit is set.
+;
+; Input Parameters:
+;
+;	R0<15:0> = len		Length of character string
+;	R1       = addr		Address of character string
+;	R2<7:0>  = mask		Mask that is ANDed with successive characters
+;	R3       = tbladdr	Address of 256-byte table
+;
+; Intermediate State:
+;
+;     31               23               15               07            00
+;    +----------------+----------------+----------------+----------------+
+;    |    delta-PC    |      XXXX      |               len               | : R0
+;    +----------------+----------------+----------------+----------------+
+;    |                               addr                                | : R1
+;    +----------------+----------------+----------------+----------------+
+;    |              XXXXX              |      XXXX      |      mask      | : R2
+;    +----------------+----------------+----------------+----------------+
+;    |                              tbladdr                              | : R3
+;    +----------------+----------------+----------------+----------------+
+;
+; Output Parameters:
+;
+;	NONZERO AND result
+;
+;		R0 = Number of bytes remaining in the string (including the byte
+;			that produced the NONZERO AND result)
+;		R1 = Address of the byte that produced the NONZERO AND result
+;		R2 = 0
+;		R3 = tbladdr	Address of 256-byte table
+;
+;	AND result always ZERO (string exhausted)
+;
+;		R0 = 0
+;		R1 = Address of one byte beyond end of string
+;		R2 = 0
+;		R3 = tbladdr	Address of 256-byte table
+;
+; Condition Codes:
+;
+;	N <- 0
+;	Z <- R0 EQL 0
+;	V <- 0
+;	C <- 0
+;
+;	The Z bit is clear if there was a NONZERO AND result.
+;	The Z bit is set if the input string is exhausted.
+;
+; Side Effects:
+;
+;	This routine uses two longwords of stack.
+;-
+
+VAX$SCANC::
+	MOVZWL	R0,R0			; Zero length string?
+	BEQL	30$			; Simply return if yes
+	PUSHL	R10			; Save R10 so it can hold handler 
+	ESTABLISH_HANDLER	-
+		STRING_ACCVIO		; Store address of condition handler
+	PUSHL	R4			; We need a scratch register
+
+	MARK_POINT	SCANC_1
+10$:	MOVZBL	(R1)+,R4		; Get next character in string
+	MARK_POINT	SCANC_2
+	BITB	R2,(R3)[R4]		; Index into table and AND with mask
+	BNEQ	40$			; Exit loop if NONZERO
+	SOBGTR	R0,10$
+
+; If we drop through the end of the loop into the following code, then
+; the input string was exhausted with no NONZERO result.
+
+20$:	POPR	#^M<R4,R10>		; Restore saved registers
+30$:	CLRL	R2			; Set R2 for output value of 0
+	TSTL	R0			; Set condition codes 
+	RSB				; Return
+
+; Exit path from loop if AND produced NONZERO result
+
+40$:	DECL	R1			; Point R1 to located character
+	BRB	20$			; Merge with common exit 
+	.ENDC
+	.IF	DEFINED	INCLUDE_SPANC
+
+	.SUBTITLE	VAX$SPANC - Span Characters
+;+
+; Functional Description:
+;
+;	The bytes of the string specified by the length and address operands are
+;	successively  used  to  index  into  a 256 byte table whose zeroth entry
+;	address is specified by the table address operand.   The  byte  selected
+;	from  the table is ANDed with the mask operand.  The operation continues
+;	until the result of the AND is zero or all the bytes of the string  have
+;	been  exhausted.   If  a zero AND result is detected, the condition code
+;	Z-bit is cleared;  otherwise, the Z-bit is set.
+;
+; Input Parameters:
+;
+;	R0<15:0> = len		Length of character string
+;	R1       = addr		Address of character string
+;	R2<7:0>  = mask		Mask that is ANDed with successive characters
+;	R3       = tbladdr	Address of 256-byte table
+;
+; Intermediate State:
+;
+;     31               23               15               07            00
+;    +----------------+----------------+----------------+----------------+
+;    |    delta-PC    |      XXXX      |               len               | : R0
+;    +----------------+----------------+----------------+----------------+
+;    |                               addr                                | : R1
+;    +----------------+----------------+----------------+----------------+
+;    |              XXXXX              |      XXXX      |      mask      | : R2
+;    +----------------+----------------+----------------+----------------+
+;    |                              tbladdr                              | : R3
+;    +----------------+----------------+----------------+----------------+
+;
+; Output Parameters:
+;
+;	ZERO AND result
+;
+;		R0 = Number of bytes remaining in the string (including the byte
+;			that produced the ZERO AND result)
+;		R1 = Address of the byte that produced the ZERO AND result
+;		R2 = 0
+;		R3 = tbladdr	Address of 256-byte table
+;
+;	AND result always NONZERO (string exhausted)
+;
+;		R0 = 0
+;		R1 = Address of one byte beyond end of string
+;		R2 = 0
+;		R3 = tbladdr	Address of 256-byte table
+;
+; Condition Codes:
+;
+;	N <- 0
+;	Z <- R0 EQL 0
+;	V <- 0
+;	C <- 0
+;
+;	The Z bit is clear if there was a ZERO AND result.
+;	The Z bit is set if the input string is exhausted.
+;
+; Side Effects:
+;
+;	This routine uses two longwords of stack.
+;-
+
+VAX$SPANC::
+	MOVZWL	R0,R0			; Clear unused bits & check for 0 length
+	BEQL	30$			; Simply return if length is zero
+	PUSHL	R10			; Save R10 so it can hold handler 
+	ESTABLISH_HANDLER	-
+		STRING_ACCVIO		; Store address of condition handler
+	PUSHL	R4			; We need a scratch register
+
+	MARK_POINT	SPANC_1
+10$:	MOVZBL	(R1)+,R4		; Get next character in string
+	MARK_POINT	SPANC_2
+	BITB	R2,(R3)[R4]		; Index into table and AND with mask
+	BEQL	40$			; Exit loop if NONZERO
+	SOBGTR	R0,10$
+
+; If we drop through the end of the loop into the following code, then
+; the input string was exhausted with no ZERO result.
+
+20$:	POPR	#^M<R4,R10>		; Restore saved registers
+30$:	CLRL	R2			; Set R2 for output value of 0
+	TSTL	R0			; Set condition codes 
+	RSB				; Return
+
+; Exit path from loop if AND produced ZERO result
+
+40$:	DECL	R1			; Point R1 to located character
+	BRB	20$			; Merge with common exit 
+	.ENDC
+	.IF	DEFINED	INCLUDE_LOCC
+
+	.SUBTITLE	VAX$LOCC - Locate Character
+;+
+; Functional Description:
+;
+;	The character operand is compared with the bytes of the string specified
+;	by the length and address operands.  Comparison continues until equality
+;	is detected or all bytes of the string have been compared.  If  equality
+;	is  detected;  the condition code Z-bit is cleared;  otherwise the Z-bit
+;	is set.
+;
+; Input Parameters:
+;
+;	R0<15:0>  = len		Length of character string
+;	R0<23:16> = char	Character to be located
+;	R1        = addr	Address of character string
+;
+; Intermediate State:
+;
+;     31               23               15               07            00
+;    +----------------+----------------+----------------+----------------+
+;    |    delta-PC    |      char      |               len               | : R0
+;    +----------------+----------------+----------------+----------------+
+;    |                               addr                                | : R1
+;    +----------------+----------------+----------------+----------------+
+;
+; Output Parameters:
+;
+;	Character Found
+;
+;		R0 = Number of bytes remaining in the string (including located one)
+;		R1 = Address of the located byte
+;
+;	Character NOT Found
+;
+;		R0 = 0
+;		R1 = Address of one byte beyond end of string
+;
+; Condition Codes:
+;
+;	N <- 0
+;	Z <- R0 EQL 0
+;	V <- 0
+;	C <- 0
+;
+;	The Z bit is clear if the character is located.
+;	The Z bit is set if the character is NOT located.
+;
+; Side Effects:
+;
+;	This routine uses two longwords of stack.
+;-
+
+VAX$LOCC::
+	PUSHL	R10			; Save R10 so it can hold handler 
+	ESTABLISH_HANDLER	-
+		STRING_ACCVIO		; Store address of condition handler
+	PUSHL	R2			; Save register
+	ASHL	#-16,R0,R2		; Get character to be located
+	MOVZWL	R0,R0			; Clear unused bits & check for 0 length
+	BEQL	20$			; Simply return if length is 0
+
+	MARK_POINT	LOCC_1
+10$:	CMPB	R2,(R1)+		; Character match?
+	BEQL	30$			; Exit loop if yes
+	SOBGTR	R0,10$
+
+; If we drop through the end of the loop into the following code, then
+; the input string was exhausted with the character NOT found.
+
+20$:	POPR	#^M<R2,R10>		; Restore saved R2 and R10
+	TSTL	R0			; Insure that C-bit is clear
+	RSB				; Return with Z-bit set
+
+; Exit path when character located
+
+30$:	DECL	R1			; Point R1 to located character
+	BRB	20$			; Join common code
+	.ENDC
+	.IF	DEFINED	INCLUDE_SKPC
+
+	.SUBTITLE	VAX$SKPC - Skip Character
+;+
+; Functional Description:
+;
+;	The character operand is compared with the bytes of the string specified
+;	by   the  length  and  address  operands.   Comparison  continues  until
+;	inequality is detected or all bytes of the string  have  been  compared.
+;	If  inequality  is  detected;   the  condition  code  Z-bit  is cleared;
+;	otherwise the Z-bit is set.
+;
+; Input Parameters:
+;
+;	R0<15:0>  = len		Length of character string
+;	R0<23:16> = char	Character to be skipped
+;	R1        = addr	Address of character string
+;
+; Intermediate State:
+;
+;     31               23               15               07            00
+;    +----------------+----------------+----------------+----------------+
+;    |    delta-PC    |      char      |               len               | : R0
+;    +----------------+----------------+----------------+----------------+
+;    |                               addr                                | : R1
+;    +----------------+----------------+----------------+----------------+
+;
+; Output Parameters:
+;
+;	Different Character Found
+;
+;		R0 = Number of bytes remaining in the string (including 
+;			unequal one)
+;		R1 = Address of the unequal byte
+;
+;	All characters in string match "char"
+;
+;		R0 = 0
+;		R1 = Address of one byte beyond end of string
+;
+; Condition Codes:
+;
+;	N <- 0
+;	Z <- R0 EQL 0
+;	V <- 0
+;	C <- 0
+;
+;	The Z bit is clear if a character different from "char" is located.
+;	The Z bit is set if the entire string is equal to "char".
+;
+; Side Effects:
+;
+;	This routine uses two longwords of stack.
+;-
+
+VAX$SKPC::
+	PUSHL	R10			; Save R10 so it can hold handler 
+	ESTABLISH_HANDLER	-
+		STRING_ACCVIO		; Store address of condition handler
+	PUSHL	R2			; Save register
+	ASHL	#-16,R0,R2		; Get character to be skipped
+	MOVZWL	R0,R0			; Clear unused bits & check for 0 length
+	BEQL	20$			; Simply return if yes
+
+	MARK_POINT	SKPC_1
+10$:	CMPB	R2,(R1)+		; Character match?
+	BNEQ	30$			; Exit loop if no
+	SOBGTR	R0,10$
+
+; If we drop through the end of the loop into the following code, then
+; the input string was exhausted with all of string equal to "char".
+
+20$:	POPR	#^M<R2,R10>		; Restore saved R2 and R10
+	TSTL	R0			; Insure that C-bit is clear
+	RSB				; Return with Z-bit set
+
+; Exit path when nonmatching character located
+
+30$:	DECL	R1			; Point R1 to located character
+	BRB	20$			; Join common code
+	.ENDC
+	.IF	DEFINED	INCLUDE_MATCHC
+
+	.SUBTITLE	VAX$MATCHC - Match Characters
+;+
+; Functional Description:
+;
+;	The source string specified by the  source  length  and  source  address
+;	operands  is  searched  for  a substring which matches the object string
+;	specified by the object length and  object  address  operands.   If  the
+;	substring  is  found, the condition code Z-bit is set;  otherwise, it is
+;	cleared.
+;
+; Input Parameters:
+;
+;	R0<15:0> = objlen	Length of object string
+;	R1       = objaddr	Address of object string 
+;	R2<15:0> = srclen	Length of source string
+;	R3       = srcaddr	Address of source string 
+;
+; Intermediate State:
+;
+;     31               23               15               07            00
+;    +----------------+----------------+----------------+----------------+
+;    |    delta-PC    |      XXXX      |             objlen              | : R0
+;    +----------------+----------------+----------------+----------------+
+;    |                              objaddr                              | : R1
+;    +----------------+----------------+----------------+----------------+
+;    |              XXXXX              |             srclen              | : R2
+;    +----------------+----------------+----------------+----------------+
+;    |                              srcaddr                              | : R3
+;    +----------------+----------------+----------------+----------------+
+;
+; Output Parameters:
+;
+;	MATCH occurred
+;
+;		R0 = 0
+;		R1 = Address of one byte beyond end of object string
+;		R2 = Number of bytes remaining in the source string
+;		R3 = Address of one byte beyond last byte matched
+;
+;	Strings DO NOT MATCH
+;
+;		R0 = objlen	Length of object string
+;		R1 = objaddr	Address of object string 
+;		R2 = 0
+;		R3 = Address of one byte beyond end of source string
+;
+; Condition Codes:
+;
+;	N <- 0
+;	Z <- R0 EQL 0
+;	V <- 0
+;	C <- 0
+;
+;	The Z bit is clear if the object does not match the source
+;	The Z bit is set if a MATCH occurred
+;
+; Side Effects:
+;
+;	This routine uses five longwords of stack for saved registers.
+;-
+
+	.ENABLE	LOCAL_BLOCK
+
+VAX$MATCHC::
+	MOVZWL	R0,R0			; Clear unused bits & check for 0 length
+	BEQL	40$			; Simply return if length is 0
+	MOVZWL	R2,R2			; Clear unused bits & check for 0 length
+	BEQL	30$			; Return with condition codes set
+					;  based on R0 GTRU 0
+	PUSHL	R10			; Save R10 so it can hold handler 
+	ESTABLISH_HANDLER	-
+		STRING_ACCVIO		; Store address of condition handler
+
+; The next set of instructions saves R4..R7 and copy R0..R3 to R4..R7
+
+	PUSHL	R7			;
+	PUSHL	R6			;
+	PUSHL	R5			;
+	PUSHL	R4			;
+	MOVQ	R0,R4			;
+	MOVQ	R2,R6			;
+
+	BRB	TOP_OF_LOOP		; Skip reset code on first pass
+
+; The following code resets the object string parameters (R0,R1) and
+; points the source string parameters (R2,R3) to the next byte. (Note 
+; that there is no explicit test for R6 going to zero. That test is
+; implicit in the CMPL R0,R2 at TOP_OF_LOOP.)
+
+; In fact, this piece of code is really two nested loops. The object string
+; is traversed for each substring in the source string. If no match occurs,
+; then the source string is advanced by one character and the inner loop is
+; traversed again.
+
+RESET_STRINGS:
+	DECL	R6			; One less byte in source string
+	INCL	R7			; ... at address one byte larger
+	MOVQ	R4,R0			; Reset object string descriptor
+	MOVQ	R6,R2			; Load new source string descriptor
+
+TOP_OF_LOOP:
+	CMPL	R0,R2			; Compare sizes of source and object
+	BGTRU	50$			; Object larger than source => NO MATCH 
+	MARK_POINT	MATCHC_1
+10$:	CMPB	(R1)+,(R3)+		; Does next character match?
+	BNEQ	RESET_STRINGS		; Exit inner loop if no match
+	SOBGTR	R0,10$			; Object exhausted?
+
+; If we drop through the loop, then a MATCH occurred. Set the correct
+; output parameters and exit. Note that R0 is equal to zero, which
+; will cause the condition codes (namely the Z-bit) to indicate a MATCH.
+
+	SUBL	R4,R2			; Subtract objlen from srclen
+
+20$:	POPR	#^M<R4,R5,R6,R7,R10>	; Restore scratch registers and R10
+
+30$:	TSTL	R0			; Set condition codes
+	RSB				; Return
+
+; This code executes if the object string is zero length.  The upper
+; 16 bits have to be cleared in R2 and then the condition codes are set
+; to indicate that a MATCH occurred.
+
+40$:	MOVZWL	R2,R2			; Clear unused bits
+	BRB	30$			; Join common code
+
+; This code executes if the strings DO NOT MATCH. The actual code state
+; that brings us here is that the object string is now larger than the
+; remaining piece of the source string, making a match impossible.
+
+50$:	CLRL	R2			; R2 contains zero in no match case
+	ADDL3	R6,R7,R3		; Point R3 to end of source string
+	BRB	20$			; Join common exit code
+
+	.DISABLE	LOCAL_BLOCK
+	.ENDC
+	.IF	DEFINED	INCLUDE_CRC
+
+	.SUBTITLE	VAX$CRC - Calculate Cyclic Redundancy Check
+;+
+; Functional Description:
+;
+;	The CRC of the  data  stream  described  by  the  string  descriptor  is
+;	calculated.   The initial CRC is given by inicrc and is normally 0 or -1
+;	unless the CRC is calculated in several steps.  The result  is  left  in
+;	R0.   If  the  polynomial  is  less  than  order-32,  the result must be
+;	extracted from the result.  The  CRC  polynomial  is  expressed  by  the
+;	contents of the 16-longword table.  
+;
+; Input Parameters:
+;
+;	R0       = inicrc	Initial CRC
+;	R1       = tbl		Address of 16-longword table
+;	R2<15:0> = strlen	Length of data stream
+;	R3       = stream	Address of data stream
+;
+; Intermediate State:
+;
+;     31               23               15               07            00
+;    +----------------+----------------+----------------+----------------+
+;    |                              inicrc                               | : R0
+;    +----------------+----------------+----------------+----------------+
+;    |                                tbl                                | : R1
+;    +----------------+----------------+----------------+----------------+
+;    |    delta-PC    |      XXXX      |             strlen              | : R2
+;    +----------------+----------------+----------------+----------------+
+;    |                              stream                               | : R3
+;    +----------------+----------------+----------------+----------------+
+;
+; Output Parameters:
+;
+;	R0 = Final CRC value
+;	R1 = 0
+;	R2 = 0
+;	R3 = Address of one byte beyond end of data stream
+;
+; Condition Codes:
+;
+;	N <- R0 LSS 0
+;	Z <- R0 EQL 0
+;	V <- 0
+;	C <- 0
+;
+;	The condition codes simply reflect the final CRC value.
+;
+; Side Effects:
+;
+;	This routine uses three longwords of stack.
+;
+; Notes:
+;
+;	Note that the main loop of this routine is slightly complicated
+;	by the need to allow the routine to be interrupted and restarted
+;	from its entry point. This requirement prevents R0 from being
+;	partially updates several times during each trip through the loop.
+;	Instead, R5 is used to record the partial modifications and R5 is
+;	copied into R0 at the last step (with the extra MOVL R5,R0).
+;-
+
+VAX$CRC::
+	MOVZWL	R2,R2			; Clear unused bits & check for 0 length
+	BEQL	20$			; All done if zero
+	PUSHL	R10			; Save R10 so it can hold handler 
+	ESTABLISH_HANDLER	-
+		STRING_ACCVIO		; Store address of condition handler
+	PUSHL	R5			; Save contents of scratch register
+	MOVL	R0,R5			; Copy inicrc to R5
+	PUSHL	R4			; Save contents of scratch register
+	CLRL	R4			; Clear it out (we only use R4<7:0>)
+
+; This is the main loop that operates on each byte in the input stream
+
+	MARK_POINT	CRC_1
+10$:	XORB2	(R3)+,R5		; Include next byte
+
+; The next three instructions are really the body of a loop that executes
+; twice on each pass through the outer loop. Rather than incur additional
+; overhead, this inner loop is expanded in line.
+
+	BICB3	#^XF0,R5,R4		; Get right 4 bits
+	EXTZV	#4,#28,R5,R5		; Shift result right 4
+	MARK_POINT	CRC_2
+	XORL2	(R1)[R4],R5		; Include table entry
+
+	BICB3	#^XF0,R5,R4		; Get right 4 bits
+	EXTZV	#4,#28,R5,R5		; Shift result right 4
+	MARK_POINT	CRC_3
+	XORL2	(R1)[R4],R5		; Include table entry
+
+	MOVL	R5,R0			; Preserve latest complete result
+
+	SOBGTR	R2,10$			; Count down loop
+
+	POPR	#^M<R4,R5,R10>		; Restore saved R4, R5, and R10
+
+20$:	CLRL	R1			; R1 must be zero on exit
+	TSTL	R0			; Determine N- and Z-bits 
+					; (Note that TSTL clears V- and C-bits)
+	RSB				; Return to caller
+	.ENDC
+	.IF	NOT_DEFINED	BOOT_SWITCH
+
+	.SUBTITLE	STRING_ACCVIO - Exception Dispatcher
+;+
+; Functional Description:
+;
+;	This routine receives control when an access violation occurs while
+;	executing within the emulator. This routine determines whether the
+;	exception occurred while accessing a source or destination string.
+;	(This check is made based on the PC of the exception.) 
+;
+;	If the PC is one that is recognized by this routine, then the state of
+;	the instruction (character counts, string addresses, and the like) are
+;	restored to a state where the instruction/routine can be restarted
+;	after the cause for the exception is eliminated. Control is then
+;	passed to a common routine that sets up the stack and the exception
+;	parameters in such a way that the instruction or routine can restart
+;	transparently. 
+;
+;	If the exception occurs at some unrecognized PC, then the exception is
+;	reflected to the user as an exception that occurred within the
+;	emulator. 
+;
+;	There are two exceptions that can occur that are not backed up to a 
+;	consistent state. 
+;
+;	    1.	If stack overflow occurs due to use of the stack by one of 
+;		the VAX$xxxxxx routines, it is unlikely that this routine 
+;		will even execute because the code that transfers control 
+;		here must first copy the parameters to the exception stack 
+;		and that operation would fail. (The failure causes control 
+;		to be transferred to VMS, where the stack expansion logic is 
+;		invoked and the routine resumed transparently.)
+;
+;	    2.	If assumptions about the address space change out from under 
+;		these routines (because an AST deleted a portion of the 
+;		address space or a similar silly thing), the handling of the 
+;		exception is UNPREDICTABLE.
+;
+; Input Parameters:
+;
+;	R0  - Value of SP when the exception occurred
+;	R1  - PC of exception
+;	R2  - Scratch
+;	R3  - Scratch
+;	R10 - Address of this routine (but that was already used so R10
+;	      can be used for a scratch register if needed)
+;
+;	00(SP) - Saved R0 (Contents of R0 when exception occurred)
+;	04(SP) - Saved R1 (Contents of R1 when exception occurred)
+;	08(SP) - Saved R2 (Contents of R2 when exception occurred)
+;	12(SP) - Saved R3 (Contents of R3 when exception occurred)
+;
+;	16(SP) - Return PC in exception dispatcher in operating system
+;
+;	20(SP) - First longword of system-specific exception data
+;	xx(SP) - First longword of system-specific exception data
+;
+;	The address of the next longword is the position of the stack when
+;	the exception occurred. This address is contained in R0 on entry
+;	to this routine.
+;
+; R0 ->	<4*<N+1> + 16>(SP) - Instruction-specific data
+;	  .                - Optional instruction-specific data
+;	  .                - Saved R10
+;	<4*<N+M> + 16>(SP) - Return PC from VAX$xxxxxx routine (M is the number
+;		             of instruction-specific longwords, including the	
+;		             saved R10. M is guaranteed greater than zero.)
+;
+; Implicit Input:
+;
+;	It is assumed that the contents of all registers (except R0 to R3)
+;	coming into this routine are unchanged from their contents when the
+;	exception occurred. (For R0 through R3, this assumption applies to the
+;	saved register contents on the top of the stack. Any modification to
+;	these registers must be made to their saved copies and not to the
+;	registers themselves.) 
+;
+;	It is further assumed that the exception PC is within the bounds of 
+;	this module. (Violation of this assumption is simply an inefficiency.)
+;
+;	Finally, the macro BEGIN_MARK_POINT should have been invoked at the
+;	beginning of this module to define the symbols 
+;
+;		MODULE_BASE
+;		PC_TABLE_BASE
+;		HANDLER_TABLE_BASE
+;		TABLE_SIZE
+;
+; Output Parameters:
+;
+;	If the exception is recognized (that is, if the exception PC is 
+;	associated with one of the mark points), control is passed to the 
+;	context-specific routine that restores the instruction state to a 
+;	uniform point from which it can be restarted.
+;
+;		R0  - Value of SP when exception occurred
+;		R1  - scratch
+;		R2  - scratch
+;		R3  - scratch
+;		R10 - scratch
+;
+;	 R0 ->	zz(SP) - Instruction-specific data begins here
+;
+;	The instruction-specific routines eventually pass control back to the
+;	host system with the following register contents.
+;
+;		R0  - Address of return PC from VAX$xxxxxx routine
+;		R1  - Byte offset from top of stack (into saved R0 through R3) 
+;		      to indicate where to store the delta-PC (if so required)
+;		R10 - Restored to its value on entry to VAX$xxxxxx
+;
+;	If the exception PC occurred somewhere else (such as a stack access), 
+;	the saved registers are restored and control is passed back to the 
+;	host system with an RSB instruction.
+;
+; Implicit Output:
+;
+;	The register contents are modified to put the intermediate state of
+;	the instruction into a consistent state from which it can be
+;	continued. Any changes to R0 through R3 are made in their saved state
+;	on the top of the stack. Any scratch registers saved by each
+;	VAX$xxxxxx routine are restored. 
+;-
+
+STRING_ACCVIO:
+	CLRL	R2			; Initialize the counter
+	PUSHAB	MODULE_BASE		; Store base address of this module
+	SUBL2	(SP)+,R1		; Get PC relative to this base
+
+10$:	CMPW	R1,PC_TABLE_BASE[R2]	; Is this the right PC?
+	BEQL	20$			; Exit loop if true
+	AOBLSS	#TABLE_SIZE,R2,10$	; Do the entire table
+
+; If we drop through the dispatching based on PC, then the exception is not 
+; one that we want to back up. We simply reflect the exception to the user.
+
+	POPR	#^M<R0,R1,R2,R3>	; Restore saved registers
+	RSB				; Let VMS reflect the exception	
+
+; The exception PC matched one of the entries in our PC table. R2 contains
+; the index into both the PC table and the handler table. R1 has served
+; its purpose and can be used as a scratch register.
+
+20$:	MOVZWL	HANDLER_TABLE_BASE[R2],R1	; Get the offset to the handler
+	JMP	MODULE_BASE[R1]		; Pass control to the handler
+
+	.SUBTITLE	Packing Routines for String Instructions
+;+
+; Functional Description:
+;
+;	These routines are used to store the intermediate state of the state
+;	of the string instructions (except MOVTC and MOVTUC) into the registers
+;	that are altered by a given instruction.
+;
+; Input Parameters:
+;
+;	R0 - Points to top of stack when exception occurred
+;
+;	See each routine- and context-specific entry point for more details.
+;
+;	In general, register contents for counters and string pointers that
+;	are naturally tracking through a string are not listed. Register
+;	contents that are out of the ordinary (different from those listed
+;	in the intermediate state pictures in each routine header) are listed.
+;
+; Output Parameters:
+;
+;	R0 - Points to return PC from VAX$xxxxxx
+;	R1 - Locates specific byte in R0..R3 that will contain the delta-PC
+;
+;	All scratch registers (including R10) that are not supposed to be
+;	altered by the routine are restored to their contents when the 
+;	routine was originally entered.
+;
+; Notes:
+;
+;	In all of the instruction-specific routines, the state of the stack
+;	will be shown as it was when the exception occurred. All offsets will
+;	be pictured relative to R0. In addition, relevant contents of R0
+;	through R3 will be listed as located in the registers themselves, even
+;	though the actual code will manipulate the saved values of these
+;	registers located on the top of the stack. 
+;
+;	The apparent arbitrary order of the instruction-specific routines is
+;	dictated by the amount of code that they can share. The most sharing
+;	occurs at the middle of the code, for instructions like CMPC5 and
+;	SCANC. The CRC routines, because they are the only routines that store
+;	the delta-PC in R2 appear first. The CMPC3 instruction has no
+;	instruction-specific code that cannot be shared with all of the other
+;	routines so it appears at the end. 
+;-
+
+	.ENABLE		LOCAL_BLOCK
+
+;+
+; CRC Packing Routine
+;
+;	R4 - Scratch
+;	R5 - Scratch
+;
+;	00(R0) - Saved R4
+;	04(R0) - Saved R5
+;	08(R0) - Saved R10
+;	12(R0) - Return PC
+;
+; If entry is at CRC_2 or CRC_3, the exception occurred after the string
+; pointer, R3, was advanced. That pointer must be backed up to achieve a
+; consistent state. 
+;-
+
+CRC_2:
+CRC_3:
+	DECL	PACK_L_SAVED_R3(SP)	; Back up string pointer
+CRC_1:
+	MOVQ	(R0)+,R4		; Restore R4 and R5
+	MOVZBL	#CRC_B_DELTA_PC,R1	; Indicate offset used to store delta-PC
+	BRB	30$			; Not much common code left but use it
+
+;+
+; MATCHC Packing Routine
+;
+;	R4<15:0> - Number of characters in object string
+;	R5       - Address of object string
+;	R6<15:0> - Number of characters remaining in source string
+;	R7       - Updated pointer into source string
+;
+;	00(R0) - Saved R4
+;	04(R0) - Saved R5
+;	08(R0) - Saved R6
+;	12(R0) - Saved R7
+;	16(R0) - Saved R10
+;	20(R0) - Return PC
+;
+; Note that the MATCHC instruction is backed up to the top of its inner loop. 
+; That is, when the instruction restarts, it will begin looking for a match
+; between the first character of the object string and the latest starting
+; character in the source string.
+;-
+
+MATCHC_1:
+	MOVQ	R4,PACK_L_SAVED_R0(SP)	; Reset object string to its beginning
+	MOVQ	R6,PACK_L_SAVED_R2(SP)	; Reset to updated start of source string
+	MOVQ	(R0)+,R4		; Restore R4 and R5
+	MOVQ	(R0)+,R6		; ... and R6 and R7
+	BRB	20$			; Exit through common code path
+
+;+
+; CMPC5 Packing Routine
+;
+;	R4<7:0> - Fill character operand
+;
+;	00(R0) - Saved R4
+;	04(R0) - Saved R10
+;	08(R0) - Return PC
+;-
+
+CMPC5_1:
+CMPC5_2:
+CMPC5_3:
+	MOVB	R4,CMPC5_B_FILL(SP)	; Pack "fill" into R0<23:16>
+	BRB	10$			; Merge with code to restore R4
+
+;+
+; SCANC and SPANC  Packing Routine
+;
+;	R4 - Scratch
+;
+;	00(R0) - Saved R4
+;	04(R0) - Saved R10
+;	08(R0) - Return PC
+; 
+; If entry is at SCANC_2 or SPANC_2, the exception occurred after the string
+; pointer, R1, was advanced. That pointer must be backed up to achieve a
+; consistent state. 
+;-
+
+SCANC_2:
+SPANC_2:
+	DECL	PACK_L_SAVED_R1(SP)	; Back up string pointer
+SCANC_1:
+SPANC_1:
+10$:	MOVL	(R0)+,R4		; Restore R4
+	BRB	20$			; Exit through common code path
+
+;+
+; LOCC and SKPC Packing Routine
+;
+;	R2<7:0> - Character operand
+;
+;	00(R0) - Saved R2
+;	04(R0) - Saved R10
+;	08(R0) - Return PC
+;-
+
+LOCC_1:
+SKPC_1:
+
+	ASSUME LOCC_B_CHAR EQ SKPC_B_CHAR 
+
+	MOVB	PACK_L_SAVED_R2(SP),LOCC_B_CHAR(SP) ; Pack "char" into R0<23:16>
+	MOVL	(R0)+,PACK_L_SAVED_R2(SP) ; Restore saved R2
+
+;+
+; CMPC3 Packing Routine
+;
+;	00(R0) - Saved R10
+;	04(R0) - Return PC
+;-
+
+	ASSUME CMPC5_B_DELTA_PC EQ CMPC3_B_DELTA_PC
+	ASSUME SCANC_B_DELTA_PC EQ CMPC3_B_DELTA_PC
+	ASSUME SPANC_B_DELTA_PC EQ CMPC3_B_DELTA_PC
+	ASSUME LOCC_B_DELTA_PC EQ CMPC3_B_DELTA_PC
+	ASSUME SKPC_B_DELTA_PC EQ CMPC3_B_DELTA_PC
+	ASSUME MATCHC_B_DELTA_PC EQ CMPC3_B_DELTA_PC
+
+CMPC3_1:
+20$:	MOVZBL	#CMPC3_B_DELTA_PC,R1	; Indicate that R0 gets delta PC
+30$:	MOVL	(R0)+,R10		; Restore saved R10
+
+	ASSUME PACK_V_FPD LE 15		; Insure that both of these bits
+	ASSUME PACK_V_FPD LE 15		;  can be contained in a word
+
+	BISW	#<PACK_M_FPD!-		; Indicate that FPD gets set
+		PACK_M_ACCVIO>,R1	; Exception is an access violation
+	BRW	VAX$REFLECT_FAULT	; Modify stack and reflect exception
+
+	.DISABLE	LOCAL_BLOCK
+
+	.SUBTITLE	Packing Routines for MOVTC and MOVTUC
+;+
+; Functional Description:
+;
+;	These routines are used to store the intermediate state of the state
+;	of the MOVTC and MOVTUC instructions into the registers R0 through R5.
+;	The main reason for keeping these two routines separate from the rest
+;	of the string instructions is that R10 is not stored directly adjacent
+;	to the return PC. This means that there is no code that can be shared
+;	with the rest of the instructions.
+;
+; Input Parameters:
+;
+;	R0 - Points to top of stack when exception occurred
+;
+;	See the context-specific entry point for more details.
+;
+; Output Parameters:
+;
+;	R0 - Points to return PC from VAX$xxxxxx
+;	R1 - Locates specific byte in R0..R3 that will contain the delta-PC
+;
+;	All scratch registers (including R10) that are not supposed to be
+;	altered by the routine are restored to their contents when the 
+;	routine was originally entered.
+;
+; Notes:
+;
+;	See the notes in the routine header for the storage routines for 
+;	the rest of the string instructions.
+;-
+
+;+
+; MOVTC Packing Routine (if moving in the FORWARD direction)
+;
+; The entry points MOVTC_1, MOVTC_2, and MOVTC_3 are used when moving the
+; string in the forward direction. If the entry is at MOVTC_2, then the
+; source and destination strings are out of synch and R1 must be adjusted
+; (decremented) to keep the two strings in step.
+;
+; In the MOVE_FORWARD routine, there is a need for a scratch register before
+; the fill character is used. R2 is used as this scratch and its original
+; contents, the fill character, are saved on the stack. The entry points 
+; MOVTC_1 and MOVTC_2 have the stack in this state.
+;
+;	R2 - Scratch
+;
+;	00(R0) - Saved R2
+;	04(R0) - Saved R10
+;	08(R0) - Saved R0 
+;		 <31:16> - Initial contents of R0
+;		 <15:00> - Contents of R0 at time of latest entry to VAX$MOVTC
+;	12(R0) - Saved R4
+;		 <31:16> - Initial contents of R4
+;		 <15:00> - Contents of R4 at time of latest entry to VAX$MOVTC
+;	16(R0) - Return PC
+;
+; If entry is at MOVTC_3, then there are no registers other than R0 and R4 
+; (and of course R10) that are saved on the stack.
+;
+;	00(R0) - Saved R10
+;	04(R0) - Saved R0 
+;		 <31:16> - Initial contents of R0
+;		 <15:00> - Contents of R0 at time of latest entry to VAX$MOVTC
+;	08(R0) - Saved R4
+;		 <31:16> - Initial contents of R4
+;		 <15:00> - Contents of R4 at time of latest entry to VAX$MOVTC
+;	12(R0) - Return PC
+;
+; The following are register contents at the time that the exception occurred.
+;
+;	R0 - Number of bytes remaining to be modified in source string
+;	R1 - Address of current byte in source string (except at MOVTC_2)
+;	R2 - Junk or fill character (if entry at MOVTC_3)
+;	R3 - Address of translation table (unchanged during execution)
+;	R4 - Signed difference between current lengths of source and destination
+;	R5 - Address of current byte in destination string 
+;
+;	R10 - Access violation handler address (so can be used as scratch)
+;
+; Note that if R4 LSSU 0, then the value of R0 represents the number of bytes
+; in the source string remaining to be modified. There are also excess bytes
+; of the source string that will be untouched by the complete execution of
+; this instruction. (In fact, at completion, R0 will contain the number of
+; unmodified bytes.)
+;
+; Note further that entry at MOVTC_3 is impossible with R4 LSSU 0 because
+; MOVTC_3 indicates that an access violation occurred while storing the
+; fill character in the destination and that can only happen when the output
+; string is longer than the input string.
+;
+; The state that must be modified before being stored depends on the sign of
+; R4, which in turn depends on which of source and destination is longer.
+;
+;	R4 GEQU 0 => srclen LEQU dstlen
+;
+;		R0 - unchanged
+;		R4 - increased by R0 (R4 <- R4 + R0)
+;
+;	R4 LSSU 0 => srclen GTRU dstlen
+;
+;		R0 - increased by negative of R4 (R0 <- R0 + ABS(R4))
+;		R4 - replaced with input value of R0 (R4 <- R0)
+;-
+
+	.ENABLE		LOCAL_BLOCK
+
+MOVTC_2:
+	DECL	PACK_L_SAVED_R1(SP)	; Back up source string 
+
+MOVTC_1:
+	MOVL	(R0)+,PACK_L_SAVED_R2(SP) ; Restore contents of saved R2
+	TSTL	R4			; R4 LSSU 0 => srclen GTRU dstlen
+	BGEQ	5$			; Branch if srclen LEQU dstlen
+	MNEGL	R4,R10			; Save absloute value of difference
+	MOVL	PACK_L_SAVED_R0(SP),R4	; Get updated dstlen     (R4 <- R0)
+	ADDL	R10,PACK_L_SAVED_R0(SP)	; ... and updated srclen (R0 <- R0 - R4)
+	BRB	10$
+
+5$:	ADDL	PACK_L_SAVED_R0(SP),R4	; Reset correct count of destination
+
+MOVTC_3:
+10$:	MOVL	(R0)+,R10		; Restore saved R10
+
+	ASSUME MOVTUC_W_INISRCLEN EQ MOVTC_W_INISRCLEN 
+
+	MOVW	2(R0),MOVTC_W_INISRCLEN(SP) ; Save high-order word of R0
+	ADDL	#4,R0			; Point R0 to saved R4
+	MOVW	R4,(R0)			; Store low order R4 in saved R4
+	MOVL	(R0)+,R4		; Restore all of R4
+
+	ASSUME MOVTUC_B_DELTA_PC EQ MOVTC_B_DELTA_PC 
+
+; Indicate that R2<31:24> gets delta-PC and cause the FPD bit to be set
+
+	MOVL	#<MOVTC_B_DELTA_PC!-	; Locate delta-PC offset
+		PACK_M_FPD!-		; Set FPD bit in exception PSL
+		PACK_M_ACCVIO>,R1	; Indicate an access violation
+
+	ASSUME MOVTUC_M_FPD EQ MOVTC_M_FPD 
+	ASSUME MOVTUC_B_FLAGS EQ MOVTC_B_FLAGS 
+
+	BISB	#MOVTC_M_FPD,MOVTC_B_FLAGS(SP)	; Set internal FPD bit
+	BRW	VAX$REFLECT_FAULT	; Reflect exception to user
+
+;+
+; MOVTC Packing Routine (if moving in the BACKWARD direction)
+;
+; The entry points MOVTC_4, MOVTC_5, and MOVTC_6 are used when moving the
+; string in the backward direction. If the entry is at MOVTC_6, then the
+; source and destination strings are out of synch and R1 must be adjusted
+; (incremented) to keep the two strings in step.
+;
+; At entry points MOVTC_5 and MOVTC_6, we must reset the source string
+; pointer, R1, to the beginning of the string because it is currently set up
+; to traverse the string from its high-address end. The details of this reset
+; operation depend on the relative lengths of the source and destination
+; strings as described below. 
+;
+; At all three entry points, we must reset the destination string
+; pointer, R5, to the beginning of the string because it is currently
+; set up to traverse the string from its high-address end.
+;
+;	00(R0) - Saved R10
+;	04(R0) - Saved R0 
+;		 <31:16> - Initial contents of R0
+;		 <15:00> - Contents of R0 at time of latest entry to VAX$MOVTC
+;	08(R0) - Saved R4
+;		 <31:16> - Initial contents of R4
+;		 <15:00> - Contents of R4 at time of latest entry to VAX$MOVTC
+;	12(R0) - Return PC
+;
+; The following are register contents at the time that the exception occurred.
+;
+;	R0 - Number of bytes remaining to be modified in source string
+;	R1 - Address of current byte in source string (except at MOVTC_6)
+;	R2 - scratch
+;	R3 - Address of translation table (unchanged during execution)
+;	R4 - Signed difference between current lengths of source and destination
+;	R5 - Address of current byte in destination string 
+;
+;	R10 - Access violation handler address (so can be used as scratch)
+;
+; Note that if R4 LSSU 0, then the value of R0 represents the number of bytes
+; in the source string remaining to be modified. There are also excess bytes
+; of the source string that will be untouched by the complete execution of
+; this instruction. (In fact, at completion, R0 will contain the number of
+; unmodified bytes.)
+;
+; Note further that entry at MOVTC_4 is impossible with R4 LSSU 0 because
+; MOVTC_4 indicates that an access violation occurred while storing the
+; fill character in the destination and that can only happen when the output
+; string is longer than the input string.
+;
+; The state that must be modified before being stored depends on the sign of
+; R4, which in turn depends on which of source and destination is longer.
+;
+;	R4 GEQU 0 => srclen LEQU dstlen
+;
+;		R0 - unchanged
+;		R1 - backed up by R0 (R1 <- R1 - R0)
+;		R4 - increased by R0 (R4 <- R4 + R0)
+;		R5 - backed up by new value of R4 (R5 <- R5 - R4)
+;
+;	R4 LSSU 0 => srclen GTRU dstlen
+;
+;		R0 - increased by negative of R4 (R0 <- R0 + ABS(R4))
+;		R1 - backed up by input value of R0 (R1 <- R1 - R0)
+;		R4 - replaced with input value of R0 (R4 <- R0)
+;		R5 - backed up by new value of R4 (R5 <- R5 - R4)
+;
+;		Note that R1 is modified before R0 is changed
+;-
+
+MOVTC_6:
+	INCL	PACK_L_SAVED_R1(SP)	; Undo last fetch from source string
+
+MOVTC_5:
+	SUBL	PACK_L_SAVED_R0(SP),PACK_L_SAVED_R1(SP)
+					; Point R1 to start of source string
+	TSTL	R4			; R4 LSSU 0 => srclen GTRU dstlen
+	BGEQ	20$			; Branch if srclen LEQU dstlen
+	MNEGL	R4,R10			; Save absloute value of difference
+	MOVL	PACK_L_SAVED_R0(SP),R4	; Get updated dstlen     (R4 <- R0)
+	ADDL	R10,PACK_L_SAVED_R0(SP)	; ... and updated srclen (R0 <- R0 - R4)
+	BRB	30$
+
+MOVTC_4:
+20$:	ADDL	PACK_L_SAVED_R0(SP),R4	; Treat two strings as having same length
+30$:	SUBL	R4,R5			; Point R5 to start of destination string
+	BRB	10$			; Join common code
+
+;+
+; MOVTUC Packing Routine 
+;
+; Note that R7 is used to count the number of remaining characters in the
+; strings. The other two counts, R0 and R4, are set to contain their final
+; values.
+;
+; If R0 was initially smaller than R4,
+;
+;	R0 - 0
+;	R4 - Difference between R4 and R0 (R4-R0)
+;	R7 - Number of characters remaining in source (shorter) string
+;
+; If R0 was initially larger than R4,
+;
+;	R0 - Difference between R0 and R4 (R0-R4)
+;	R4 - 0
+;	R7 - Number of characters remaining in destination (shorter) string
+;
+; In either case, the stack when the exception occurred looks like this.
+;
+;	R6 - Scratch
+;	R7 - Number of characters remaining in two strings
+;
+;	00(R0) - Saved R6
+;	04(R0) - Saved R7 
+;	08(R0) - Saved R10
+;	12(R0) - Saved R0 
+;		 <31:16> - Initial contents of R0
+;		 <15:00> - Contents of R0 at time of latest entry to VAX$MOVTUC
+;	16(R0) - Saved R4
+;		 <31:16> - Initial contents of R4
+;		 <15:00> - Contents of R4 at time of latest entry to VAX$MOVTUC
+;	20(R0) - Return PC
+;
+; If the entry is at MOVTUC_2 or MOVTUC_3, then the source and
+; destination strings are out of synch and R1 must be adjusted
+; (decremented) to keep the two strings in step. 
+;-
+
+MOVTUC_2:
+MOVTUC_3:
+	DECL	PACK_L_SAVED_R1(SP)	; Back up source string pointer
+
+MOVTUC_1:
+	ADDL	R7,PACK_L_SAVED_R0(SP)	; Readjust source string count
+	ADDL	R7,R4			; ... and destination string count
+	MOVQ	(R0)+,R6		; Restore saved R6 and R7
+	BRB	10$			; Join exit path shared with MOVTC
+
+	.DISABLE	LOCAL_BLOCK
+
+	.ENDC
+	END_MARK_POINT
+
+	.END

@@ -1,0 +1,238 @@
+MODULE	setclustr (
+	IDENT=	'V04-000'
+	,LANGUAGE (BLISS32),
+	ADDRESSING_MODE (EXTERNAL = GENERAL, NONEXTERNAL=LONG_RELATIVE)
+	) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!++
+!
+! FACILITY:	SET CLUSTER
+!
+! ABSTRACT:	Implement SET CLUSTER qualifiers
+!
+! AUTHOR:	Paul R. Beck
+!
+! DATE:		19-FEB-1984
+!
+! REVISION HISTORY:
+!
+!	V03-001	DAS0001		David Solomon		09-Jul-1984
+!		Fix truncation errors; make nonexternal refs LONG_RELATIVE.
+!
+!--
+
+LIBRARY	'SYS$LIBRARY:LIB';
+LIBRARY 'SYS$LIBRARY:CLIMAC.L32';       ! CLI macros
+!
+! External routines
+!
+EXTERNAL ROUTINE
+    set$validate_quorum,		! Validate and set new quorum value
+    cli$present,			! Get qualifiers
+    cli$get_value,			! Get values of qualifiers
+    lib$put_output,			! $PUT message to SYS$OUTPUT
+    lib$cvt_dtb;			! Convert ASCII to numerical
+!
+! Literal data definitions
+!
+LITERAL
+    true = 1,
+    false = 0;
+
+!
+! Declare the error messages
+!
+!  Definitions in [CLIUTL.SRC]SET.MSG
+!
+EXTERNAL LITERAL
+    set$_nocluster,			! node not in cluster
+    set$_syntax;			! syntax error
+!
+! Routines used in this module
+!
+FORWARD ROUTINE
+    set$cluster;			! Analyze qualifiers for SET CLUSTER
+!
+! Macros to generate a string with a descriptor.
+!
+MACRO
+	ASCID[]=%CHARCOUNT(%REMAINING),	! string descriptor
+    		UPLIT BYTE(%REMAINING)%;
+
+%SBTTL	'SET$CLUSTER'
+!++
+! SET$CLUSTER
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Add support for the following commands:
+!		SET CLUSTER/QUORUM=n	! set active quorum to specified value
+!	Further description of each qualifier accompanies the code implementing
+!	that qualifier.
+!
+! CALLING SEQUENCE:
+!
+!	CALL SET$CLUSTER
+!
+! FORMAL PARAMETERS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	Qualifiers are obtained through calls to the CLI.
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! COMPLETION CODES:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!--
+
+GLOBAL ROUTINE set$cluster = 
+BEGIN
+
+LOCAL
+    oldpriv		: $BBLOCK [8],			! Permanent privileges
+    desc		: $BBLOCK [dsc$c_s_bln],	! general descriptor
+    quorum		: LONG,				! /QUORUM=q value
+    new_quorum		: LONG,				! quorum value set
+    fao_buffer		: BLOCK [132,BYTE],		! buffer used with FAO
+    fao_desc		: $BBLOCK [dsc$c_s_bln],	! descriptor for same
+    output_desc		: $BBLOCK [dsc$c_s_bln],	! work descriptor for output
+    status		: LONG;				! completion status
+
+OWN
+    quorum_ctrstr	: VECTOR [2,LONG]		! FAO control string
+    			  INITIAL ( ASCID('%SET-I-QUORUM, new quorum is !UW.'));
+
+EXTERNAL
+    clu$gl_club;					! =0 if no cluster
+!
+! Verify that caller has sufficient privileges. SYSPRV, OPER and CMKRNL 
+! are required.
+!
+IF NOT (status = $SETPRV (ENBFLG = 1,		! Enable
+			  PRVADR = 0,		! No new privileges
+			  PRMFLG = 1,		! Permanent privs
+			  PRVPRV = oldpriv))	! Store current ones here
+THEN SIGNAL_STOP (.status);
+!
+! Check to see if privileges there.  If not, return error.
+!
+IF NOT .oldpriv [prv$v_oper] THEN status = SS$_NOOPER;
+IF NOT .status
+THEN
+    BEGIN
+    SIGNAL (.status);
+    RETURN false;
+    END;
+!
+! If this node is not in a cluster, there's not much point in proceeding.
+!
+IF .clu$gl_club EQL 0
+THEN
+    BEGIN
+    SIGNAL (set$_nocluster);
+    RETURN false;
+    END;
+
+%SBTTL	'	/QUORUM = q'
+
+!
+! Initialize dynamic descriptors
+!
+$init_dyndesc (desc);
+$init_dyndesc (fao_desc);
+$init_dyndesc (output_desc);
+fao_desc [dsc$w_length]  = 132;
+fao_desc [dsc$a_pointer] = fao_buffer;
+output_desc [dsc$w_length]  = 0;
+output_desc [dsc$a_pointer] = fao_buffer;
+
+status = cli$present ( %ASCID 'QUORUM' );
+IF .status
+THEN
+    BEGIN
+    !
+    ! SET CLUSTER /QUORUM = n
+    ! The value supplied will be used as a new active quorum value across
+    ! the entire cluster. It is checked against high and low limits:
+    !	V <= Q <= (2V+2)/2	! V = current active votes
+    ! and is pinned to the high or low limit as appropriate. If the value
+    ! supplied is 0, the "proper" quorum for the current cluster is
+    ! supplied: (2V+2)/2
+    !
+    IF NOT cli$get_value ( %ASCID 'QUORUM', desc )
+    THEN
+	quorum = 0
+    ELSE
+	IF (NOT lib$cvt_dtb ( .desc [dsc$w_length],
+			      .desc [dsc$a_pointer],
+			      quorum ))
+	OR (.quorum GTR 65535)
+	THEN
+	    BEGIN
+	    !
+	    ! QUORUM must be a number no larger than a word.
+	    !
+	    SIGNAL(set$_syntax, 1, desc);
+	    RETURN false;
+	    END;
+    !
+    ! The rest of the work must be done synchronized with the connection
+    ! manager.
+    !
+    status = set$validate_quorum (.quorum, new_quorum);
+    IF (.status) AND (.new_quorum NEQ 0)
+    THEN
+	!
+	! Report the quorum value which was set
+	!
+	IF $FAO ( quorum_ctrstr,		! ctrstr
+	          output_desc [dsc$w_length],	! outlen
+	      	  fao_desc,			! outbuf
+	      	  .new_quorum )			! p1 = quorum
+	THEN
+	    lib$put_output ( output_desc );
+    RETURN true;
+
+    END;
+
+RETURN true;
+END;
+
+END
+ELUDOM

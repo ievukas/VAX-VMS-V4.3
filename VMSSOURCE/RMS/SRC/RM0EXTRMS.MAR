@@ -1,0 +1,487 @@
+	$BEGIN	RM0EXTRMS,000,RM$RMS0,<CLEANUP AND RETURN ROUTINE>,<NOWRT,QUAD>
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; Facility: rms32
+;
+; Abstract:
+;		this routine performs final cleanup and sets
+;		status codes appropriately, generates user-level
+;		asts as required, and exits rms returning to
+;		the user via the exec.
+;
+; Environment:
+;		star processor running starlet exec.
+;
+; Author:	L F Laverdure,	 creation date: 5-JAN-1977
+;
+; Modified By:
+;
+;	V03-015	RAS0307		Ron Schaefer		14-May-1984
+;		Save/restore R2, R3, R4 and R5 in RMS$ECHO subroutine
+;		as required by the VMS Calling Standard.
+;
+;	V03-014	JEJ0032		J E Johnson		30-Apr-1984
+;		Use the correct form of the bit equates for the async/IO
+;		rundown test.
+;
+;	V03-013	RAS0269		Ron Schaefer		19-Mar-1984
+;		A little performance boost by re-arranging some code
+;		and branches and some instruction optimization.
+;		Cope with -1 addr from RM$STALL and
+;		give the user a CDA error.
+;
+;	V03-012	DAS0001		David Solomon		24-Jan-1984
+;		Remove code to deallocate EFN. Implement new mechanism for
+;		echoing reads from SYS$INPUT to SYS$OUTPUT (declare an AST
+;		in caller's mode here to do the $PUT, instead of returning a
+;		special status to CMODSSDSP and doing the $PUT there).
+;
+;	V03-011 DGB0002		Donald G. Blair		04-Jan-1984
+;		This routine is executed during EVERY (?) RMS operation and
+;		was found to be critical to performance.  Therefore, I've 
+;		streamlined the most common execution paths.
+;
+;	V03-010	KPL0002		Peter Lieberwirth	13-Oct-1983
+;		Use IMP$V_RUH_SYNCH to determine whether to set the asynch
+;		EFN.  RUH_SYNCH is set when the recovery unit handler needs
+;		to be notified that an RMS operation it is waiting on has
+;		completed.  The handler waits for all user RMS requests to
+;		finish at markpoint, cancel, and end, so that it can then
+;		flush buffers and journal entries.  It uses the asynch EFN
+;		to synchronize with the completion of user-inspired RMS
+;		requests.
+;
+;	V03-009	SHZ00011	Stephen H. Zalewski	1-Sep-1983
+;		Do not call RM$LOWER_LOCK for sequential gets and puts.
+;		(This is a performance enhancement).
+;
+;	V03-008	KPL0001		Peter Lieberwirth	16-Jun-1983
+;		Add support to write the AT journal record describing a
+;		record operation, if required.
+;
+;	V03-007	RAS0120		Ron Schaefer		25-Jan-1983
+;		Add support to echo SYS$INPUT to SYS$OUTPUT.
+;
+;	V03-006	KBT0365		Keith B. Thompson	6-Oct-1982
+;		Rewrite this garbage and deallocate the ifab asb with
+;		retblk since it is now a "real" rms structure
+;
+;	V03-005	KBT0330		Keith B. Thompson	10-Sep-1982
+;		Remove all S0 sharing code
+;
+;	V03-004	LJA0011		Laurie Anderson		02-Sep-1982
+;		Add support for New Context XABs.  If XABCXF or XABCXR is
+;		attached to the FAB or RAB (respectively), then fill in
+;		XAB with appropiate information.  Uses XAB_SCAN.
+;
+;	V03-003	JWH0001		Jeffrey W. Horn		01-Sep-1982
+;		Set asynch event flag always if in recovery unit
+;		handler.
+;
+;	V03-002	KBT0303		Keith B. Thompson	28-Aug-1982
+;		Reorganize psects
+;
+;	V03-001	RAS0089		Ron Schaefer	 7-Jun-1982
+;		Delete reference to incorrect $QUAD_ALIGN macro;
+;		re-arrange code to accomplish alignment.
+;
+;--
+
+
+	.SBTTL	DECLARATIONS
+
+;
+; Include Files:
+;
+
+;
+; Macros:
+;
+
+	$IFBDEF
+	$ASBDEF
+	$IRBDEF
+	$RABDEF
+	$FABDEF
+	$IMPDEF
+	$PIODEF
+	$PSLDEF
+	$RMSDEF
+
+;
+; Equated Symbols:
+;
+
+M_RUH_SYNCH	=	1@IMP$V_RUH_SYNCH
+M_IORUNDOWN	=	1@IMP$V_IORUNDOWN
+
+;
+; Own Storage:
+;
+
+
+	.SBTTL	RM$EXTRMS - EXIT RMS ROUTINE
+
+;++
+;
+; RM$EX_NOSTR
+; RM$EX_NIRAB_SHR
+; RM$EXSUC
+; RM$EXRMS
+;
+;  this routine cleans up rms structures and returns
+;  to the user via the exec. there are three entry points as follows:
+;
+;	1. rm$exsuc	exit with success
+;	2. rm$exrms	exit with status code in r0
+;	3. rm$ex_nostr	exit with status code in r0
+;			but without a valid ifab or irab
+;			(in this case ap must point to user's argument
+;			 list and r7 must contain user's mode)
+;
+;  the following functions are performed:
+;
+;	1. clear busy and restore the argument list pointer
+;	2. prefix the rms32 facility code to the status
+;	   code (16 bits) in r0 and store in sts
+;	3. generate a user level completion ast if appropriate
+;	4. re-enable rms internal asts
+;	5. return to the user via the exec (ret)
+;
+; Calling sequence:
+;
+;	entered via jump to the appropriate entry point
+;
+; Input Parameters:
+;
+;	r0	status code (unless entry at rm$exsuc)
+;		note: stv must be set already.
+;	r7	caller's mode (only if entry at rm$ex_nostr)
+;	r8	user structure addr (fab or rab)
+;	r9	internal structure addr (ifab or irab)
+;		(not an input for entry at rm$ex_nostr)
+;	r10	ifab address (if r9 is irab address)
+;	r11	impure area addr
+;	ap	arglist addr (only if entry at rm$ex_nostr)
+;
+; Implicit Inputs:
+;
+;	none
+;
+; Output Parameters:
+;
+;	r0	full 32-bit rms status code
+;
+; Implicit Outputs:
+;
+;	the busy bit for the internal structure is cleared,
+;	sts is set to the status code.
+;
+; Completion Codes:
+;
+;	standard rms
+;
+; Side Effects:
+;
+;	internal rms asts are re-enabled.
+;
+;--
+
+;++
+;
+;  although the following offsets in the code
+;  refer to the fab or ifab, the code works equally well
+;  for the rab and irab as the definitions are equivalent
+;
+;--
+
+	ASSUME	IFB$V_BUSY	EQ	IRB$V_BUSY
+	ASSUME	IFB$L_ARGLST	EQ	IRB$L_ARGLST
+	ASSUME	IFB$B_MODE	EQ	IRB$B_MODE
+	ASSUME	FAB$L_STS	EQ	RAB$L_STS
+	ASSUME	FAB$L_STV	EQ	RAB$L_STV
+
+;++
+;
+;  entry point for rm2conn and rm3conn on errors instead of
+;  to ex_nostr. the irab has been deallocated.  Also from disconnect.
+;
+;	ap = arglist addr
+;	r7 = mode
+;	r10 = ifab
+;
+;--
+
+RM$EX_NIRAB_SHR::
+	MOVL	R10,R9			; put ifab into r9
+	SSB	#IFB$V_BUSY,(R10)	; note ifab busy in case of stall
+	PUSHL	R0			; save the status
+	BSBW	RM$LOWER_LOCK		; release file lock
+	POPL	R0			; restore status
+	CSB	#IFB$V_BUSY,(R10)	; clear busy
+
+;++
+;
+;  entry point if exiting without r9 pointing to a valid internal structure
+;
+;	ap = arglist addr
+;	r7 = caller's mode
+;
+;--
+
+RM$EX_NOSTR::
+	CLRL	R9			; make sure R9 is cleared
+	BRB	SETSTS			; and finish up
+
+;++
+;
+;  entry point to return a status code of success
+;
+;--
+
+RM$EXSUC::
+	RMSSUC
+
+;++
+;
+;  entry point to clean up the internal structure
+;  by clearing busy and restoring the user's ap
+;
+;--
+
+RM$EXRMS::
+	ASSUME	<IFB$C_BID&1>	EQ  1
+	ASSUME	<IRB$C_BID&1>	EQ  0
+	ASSUME	IFB$B_BID	EQ  IRB$B_BID
+	BLBC	IFB$B_BID(R9),1$	; Branch if irab -- R10 already => ifab
+	MOVL	R9,R10			; Set R10 to ifab address
+1$:	TSTL	IFB$L_SFSB_PTR(R10)	; Are we sharing this file?
+	BEQL	3$			; No, do not bother with rm$lower_lock
+	PUSHL	R0			; save the status
+	BSBW	RM$LOWER_LOCK		; release file lock
+	POPL	R0			; restore status
+
+	ASSUME	IFB$B_BID	EQ	IRB$B_BID
+
+3$:	BBC	#IFB$V_AT,IFB$B_JNLFLG(R10),10$ ; skip if not AT journaling
+	BLBS	IFB$B_BID(R9),10$	; skip if this is an ifab
+	PUSHL	R0			; save status till now
+	JSB	RM$AT_JNL_RECORD	; write the AT journal record
+					; maintain status from AT_JNL_RECORD
+	BLBS	R0,5$			; skip if success
+	MOVL	R0,(SP)			; new status if failure 
+5$:	MOVL	(SP)+,R0		; restore status	
+
+10$:	MOVL	IFB$L_ARGLST(R9),AP	; restore user ap from ifab or irab
+	CSB	#IFB$V_BUSY,(R9)	; clear the busy flag in ifab or irab
+	MOVZBL	IFB$B_MODE(R9),R7	; get user's access mode from ifab/irab
+
+;+
+; If we are to echo SYS$INPUT to SYS$OUTPUT, then declare AST to do so.
+;-
+
+	BLBS	IFB$B_BID(R9),SETSTS	; done if IFAB
+	BBC	#IRB$V_PPF_IMAGE,(R9),-	; done if not SYS$INPUT
+		SETSTS			;
+	BBCC	#IRB$V_PPF_ECHO,(R9),-	; done if not wanted
+		SETSTS			;
+	MOVZWL	IFB$W_ECHO_ISI(R10),R4	; get basic ISI
+	BEQL	SETSTS			; done if no ISI
+	BISW3	#FAB$M_PPF_IND+-	; make into indirect isi with CCL
+		<FAB$M_CR@FAB$V_PPF_RAT>,-
+		R4,RAB$W_RFA+6(R8)	;  and store in RAB
+	PUSHL	R0			; save R0
+	$DCLAST_S -			; declare AST to do the $PUT
+		ASTADR=W^RMS$ECHO,-	;  routine address
+		ASTPRM=R8,-		;  astprm is user's RAB
+		ACMODE=R7		;  deliver in caller's mode
+	POPL	R0			; restore R0
+
+SETSTS:	SSB	#16,R0			; add rms facility code
+	MOVL	R0,FAB$L_STS(R8)	; and store in fab/rab
+	BSBW	RM$SETEXTRMS		; Call routine to fill in context XABs
+
+;+
+;  Revalidate the user's argument list and generate a user-level completion 
+;  ast if the user has included the appropriate "ERR=" or "SUC=" parameter.
+;-
+
+	IFNORD	#1,(AP),10$,R7		; skip ast if no access to arg list
+	CMPB	(AP),#2			; completion routine specified?
+	BLSSU	10$			; branch if none
+	BLBS	R0,2$			; branch if RMS operation successful
+	IFNORD	#12,(AP),7$,R7		; branch if no access to ERR argument
+	MOVAL	@8(AP),R1		; get error completion routine addr
+	BRB	5$
+2$:	BEQL	10$			; branch if just 2 params
+					; (implies no success routine)
+	IFNORD	#16,(AP),7$,R7		; branch if not readable
+	MOVAL	@12(AP),R1		; get success completion routine addr
+
+5$:	BEQL	10$			; ast addr of 0 => "don't generate ast"
+	ADDL3	#1,R1,R2		; bogus -1 addr from RM$STALL?
+	BEQL	7$			; give CDA error if so
+	$DCLAST_S	ASTADR=(R1),-
+			ASTPRM=R8,-
+			ACMODE=R7
+	BLBS	R0,9$			; branch on error
+
+7$: 	MOVL	FAB$L_STS(R8),FAB$L_STV(R8) ; register alternate error status
+	MOVL	#RMS$_CDA,FAB$L_STS(R8)	; ; store new error status
+9$:	MOVL	FAB$L_STS(R8),R0	; restore status code
+
+10$:	BBCC	#IMP$V_AST,(R11),ENBAST
+	TSTL	R9			; zero ifab/irab addr?
+	BEQL	SETIOR			; branch if yes
+
+;
+; NOTE: The above indicates that we have just deallocated the ifab
+;	or irab in $close or $disconnect.
+;	Assumes async efn must be set.
+;
+
+;+
+;  Check for setting of async event flag.
+;-
+
+	ASSUME	IRB$V_ASYNC	EQ	IFB$V_ASYNC
+	BBC	#IRB$V_ASYNC,(R9),SYNCH		; branch if not async i/o
+
+	ASSUME	IRB$V_ASYNCWAIT	EQ	IFB$V_ASYNCWAIT
+25$:	BBCC	#IRB$V_ASYNCWAIT,(R9),RETURN	; branch if no wait issued
+						; else set flag
+
+	ASSUME	IMP$C_IOREFN	EQ	IMP$C_ASYEFN
+
+SETIOR:	$SETEF_S	#IMP$C_ASYEFN		; kick off the stalled wait
+	RET	
+
+
+SYNCH:	CLRB	IRB$B_EFN(R9)			; show no efn alllocated
+
+;+
+;  return the ifab's asb (if any) as operation is now complete
+;-
+
+	ASSUME	<IFB$C_BID&1>	EQ	1
+	ASSUME	<IRB$C_BID&1>	EQ	0
+	ASSUME	IFB$B_BID	EQ	IRB$B_BID
+
+	BLBC	IRB$B_BID(R9),RETURN		; branch if not ifab
+	MOVL	IFB$L_ASBADDR(R9),R4		; get asb addr
+	BEQL	RETURN				; dont deallocate if not present
+	MOVL	R11,R3				; free space header at start
+						;  of this page
+	BSBW	RM$RETBLK			; free it up
+	CLRL	IFB$L_ASBADDR(R9)		; show no asb
+RETURN:	BITW	#M_RUH_SYNCH!M_IORUNDOWN,(R11)	; branch if i/o rundown or
+	BNEQ	SETIOR				; if synching with RU handler
+EXIT:	RET					; exit rms
+
+;+
+;  re-enable asts by clearing the ast inhibit bit
+;  and if bit already clear perform an enable asts directive
+;-
+
+ENBAST:	BBSC	#PIO$V_INHAST,@#PIO$GW_STATUS,EXIT	; Enable rms asts
+	$SETAST_S	#1				; Enable exec asts
+	MOVL	FAB$L_STS(R8),R0			; restore status code
+	RET	
+
+
+	.SBTTL	RMS$ECHO - Echo SYS$INPUT to SYS$OUTPUT
+
+;++
+;
+;	This routine echos a $GET from SYS$INPUT to SYS$OUTPUT. It is invoked
+;	as an AST routine in callers mode, declared by RM$EXRMS.
+;
+;	A RAB is constructed on the stack, and an asynchronous $PUT of the
+;	record described in the user's RAB is issued.
+;
+; Calling sequence:
+;
+;	CALLed as an AST routine
+;
+; Input Parameters:
+;
+;	4(AP)	User RAB address
+;
+; Implicit Inputs:
+;
+;	RAB$W_RFA+6	ISI to use for $PUT (w/ppf_ind set and ccl set up).
+;			Note that this is currently a spare word.
+;
+; Output Parameters:
+;
+;	none
+;
+; Implicit Outputs:
+;
+;	The record read from SYS$INPUT is echoed to SYS$OUTPUT.
+;
+; Completion Codes:
+;
+;	status of $PUT
+;
+; Side Effects:
+;
+;	none
+;
+;--
+
+	.ENTRY	RMS$ECHO,^M<R2,R3,R4,R5>
+
+;+
+; Allocate and zero a RAB on the stack.
+;-
+
+	MOVAB	-RAB$C_BLN(SP),SP	; allocate a RAB on the stack
+	MOVC5	#0,(SP),#0,-		; zero the RAB
+		#RAB$C_BLN,(SP)		;  (R1 now contains address of RAB)
+
+;+
+; Now set up RAB and do the $PUT.
+;-
+
+	ASSUME	RAB$B_BID	EQ	0
+	ASSUME	RAB$B_BLN	EQ	RAB$B_BID+1
+
+	MOVW	#<RAB$C_BID+<RAB$C_BLN@8>>,(R1) ; fill in BID and BLN
+	MOVL	4(AP),R0		; get user RAB address
+	MOVW	RAB$W_RSZ(R0),-		; copy record size
+		RAB$W_RSZ(R1)		;
+	MOVL	RAB$L_RBF(R0),-		; copy record address
+		RAB$L_RBF(R1)		;
+	MOVW	RAB$W_RFA+6(R0),-	; store PPF ISI & ccl
+		RAB$W_ISI(R1)		;
+	SSB	#RAB$V_ASY,RAB$L_ROP(R1); specify async operation
+	$PUT	RAB=R1			; echo the record to SYS$OUTPUT
+	RET				; all done - return
+
+	.END

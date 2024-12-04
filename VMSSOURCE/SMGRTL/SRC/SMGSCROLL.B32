@@ -1,0 +1,466 @@
+%TITLE 'SMG$$SCROLL_AREA - Virtual Display -- Scroll rectangular area'
+MODULE SMG$$SCROLL_AREA (
+		IDENT = '1-005'	! File: SMGSCROLL.B32 Edit: RKR1005
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	Screen Management
+!
+! ABSTRACT:
+!	The procedures in this module update and maintain the contents
+! of the in-memory representations of the virtual displays.  The data
+! areas themselves are allocated/deallocated, pasted/upasted, etc.
+! by the procedures in module SMG$DISPLAY_LINKS.  Output from these
+! virtual displays is handled by procedures in SMG$DISPLAY_OUTPUT.
+! The module SMG$DISPLAY_INPUT contains the routines that support
+! input operations on displays.
+!
+!
+!
+! ENVIRONMENT:	User mode, Shared library routines.
+!
+! AUTHOR: P. Levesque, CREATION DATE: 14-Apr-1983
+!
+! MODIFIED BY:
+!
+! 1-001	- Original.  PLL 14-Apr-1983
+! 1-002 - Fix to right scroll.  Changed a GEQ to GTR to allow scroll
+!	  from next to last column.  PLL 27-Jul-1983
+! 1-003 - STAN 31-Aug-1983, scroll line characteristics vector.
+! 1-004 - A number of changes to fix bugs and improve performance.
+!	  Move $SMG$LINEAR computations outside of loop and accomplish
+!	  equivalent variable updates via addition or subtraction within loop.
+!	  Fix some bounds checks that were accessing the wrong variable.
+!	  RKR 26-Jan-1984.
+! 1-005 - Fix to change its functionality to scroll the contents of the
+!	  scrolling rectange within the confines of the scrolling rectange,
+!	  rather than scrolling the rectangle to other parts of the virtual
+!	  display.
+!	  RKR 2-Feb-1984
+!--
+
+
+%SBTTL 'Declarations'
+!
+! SWITCHES:
+!
+
+!
+! LINKAGES:
+!
+!	NONE
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+
+    SMG$$SCROLL_AREA;			! Scroll a rectangular area
+
+!
+! INCLUDE FILES
+!
+
+REQUIRE 'RTLIN:SMGPROLOG';		! defines psects, macros, tcb,
+					!  wcb, & terminal symbols
+
+!
+! EXTERNAL REFERENCES
+!
+EXTERNAL LITERAL
+	SMG$_INVARG;
+
+!<BLF/PAGE>
+
+%SBTTL 'SMG$$SCROLL_AREA - Scroll rectangular area'
+GLOBAL ROUTINE SMG$$SCROLL_AREA (
+				DCB : REF BLOCK [,BYTE],
+				START_ROW,
+				START_COL,
+				HEIGHT,
+				WIDTH,
+				DIRECTION,
+				COUNT
+			        ) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is the heart of all routines which open up a
+!	space in the virtual display.  Data within the specified scrolling
+!	rectangle is scrolled in the specified direction by the number of
+!       units requested.  
+!
+! CALLING SEQUENCE:
+!
+!	ret_status.wlc.v = SMG$$SCROLL_AREA ( 
+!				DCB.mab.r,
+!				START_ROW.rl.v,
+!				START_COL.rl.v,
+!				HEIGHT.rl.v,
+!				WIDTH.rl.v,
+!				DIRECTION.rl.v,
+!				COUNT.rl.v
+!
+! FORMAL PARAMETERS:
+!
+!	DCB.mab.r	Address of virtual display control block.
+!			Various fields from within in this block are
+!			are interrogated and/or updated.
+!
+!	START_ROW.rl.v	Row in display where move should begin
+!
+!	START_COL.rl.v	Column in display where move should begin
+!
+!	HEIGHT.rl.v	Height of rectangular area
+!
+!	WIDTH.rl.v	Width of rectangular area
+!
+!	DIRECTION.rl.v	Direction of move, one of the following:
+!				
+!				SMG$M_UP
+!				SMG$M_DOWN
+!				SMG$M_RIGHT
+!				SMG$M_LEFT
+!
+!	COUNT.rl.v	Number of character positions to move
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS:
+!
+!	SS$_NORMAL	Normal successful completion
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+
+    BEGIN
+
+    LOCAL
+	ONE_LINE,		! number of bytes between a given column in
+				! on line of the virtual display and the same
+				! column in the next line.  Obviously, this is
+				! is equal to the number of columns in the
+				! virtual display
+
+	LOCAL_HEIGHT,		! working height
+	LOCAL_WIDTH,		! working width
+	SOURCE,			! start position of move (byte offset)
+	DEST,			! destination of move (byte offset)
+	LCV	 : REF VECTOR [,BYTE], ! addr of line characteristics vector
+	TEXT_BUF : REF VECTOR [,BYTE], ! addr of text buffer
+	ATTR_BUF : REF VECTOR [,BYTE], ! addr of attr buffer
+	CHAR_BUF : REF VECTOR [,BYTE], ! addr of char set buffer
+        BOTTOM_LINE;		! Last line in scrolling rectangle
+
+    ONE_LINE = .DCB [DCB_W_NO_COLS];
+
+!+
+! The entire display may be shuffled or a subset may be shuffled.  Ignore
+! requests to define a scrolling area that extends outside the display.
+! The assumption is that START_ROW and START_COL are within the virtual
+! display.  Code below makes sure resulting rectangle we deal with as the
+! scrolling rectangle is entirely within the virtual display.
+!-
+
+    LOCAL_HEIGHT = .HEIGHT;
+    LOCAL_WIDTH = .WIDTH;
+
+    IF (.START_ROW + .HEIGHT - 1) GTR .DCB [DCB_W_NO_ROWS]
+    THEN
+	LOCAL_HEIGHT = .DCB [DCB_W_NO_ROWS] - .START_ROW +1;
+
+    IF (.START_COL + .WIDTH - 1) GTR .ONE_LINE
+    THEN
+	LOCAL_WIDTH = .ONE_LINE - .START_COL +1;
+
+    BOTTOM_LINE = .START_ROW + .LOCAL_HEIGHT -1;
+
+!+
+! Get addresses of DCB buffers.
+!-
+
+    TEXT_BUF = .DCB [DCB_A_TEXT_BUF];
+    ATTR_BUF = .DCB [DCB_A_ATTR_BUF];
+    CHAR_BUF = .DCB [DCB_A_CHAR_SET_BUF];
+    LCV	     = .DCB [DCB_A_LINE_CHAR];
+
+!+
+! In case WIDTH is less than the entire line, the move is performed
+! line by line.  For upward moves, the low numbered lines are moved
+! first.  For downward moves, high numbered lines are moved first.
+! For sideways moves, low numbered lines will be shifted first.
+!-
+
+    CASE .DIRECTION FROM SMG$M_UP TO SMG$M_LEFT OF
+    SET
+
+    [SMG$M_UP]:
+	BEGIN
+	LOCAL
+	    DEST_LINE_NO;
+
+	DEST_LINE_NO = .START_ROW - .COUNT;		    ! Dest. row number
+        DEST = $SMG$LINEAR (.DEST_LINE_NO, .START_COL);	    ! Dest. byte offset
+	SOURCE = $SMG$LINEAR (.START_ROW, .START_COL);	    ! Source byte offset
+
+	INCR CURR_LINE FROM .START_ROW	! From 1st line of scroll rectangle to
+		       TO .BOTTOM_LINE	! last line of scroll rectangle
+	DO
+	    BEGIN			! incr loop
+	    IF .DEST_LINE_NO GEQ .START_ROW		! If within scrolling
+	    THEN					! rectangle
+		BEGIN			! perform moves
+		!+
+		! Move text, attributes, alt. char set and line characteristics
+		!-
+		$SMG$SHUFFLE (.LOCAL_WIDTH, .SOURCE, .DEST);
+		LCV [.DEST_LINE_NO] = .LCV [.CURR_LINE];
+		END;			! perform moves
+
+	    DEST_LINE_NO = .DEST_LINE_NO +1;	     ! 1 line downward
+	    DEST = .DEST + .ONE_LINE;!    ! Offset 1 line downward
+	    SOURCE = .SOURCE + .ONE_LINE; ! Offset 1 line downward
+    	    END;			! incr loop
+
+	!+
+	! Up to COUNT number of lines may have been opened up.  Blank fill them.
+	!-
+
+	SOURCE = $SMG$LINEAR ( .BOTTOM_LINE, .START_COL); ! Byte offset
+	    
+	INCR COUNTER FROM 1 TO .COUNT
+	DO
+	    BEGIN	! check for clearing needed
+	    IF .BOTTOM_LINE GEQ .START_ROW	! If still within
+	    THEN				! rectangle
+		BEGIN	! clear
+	        $SMG$BLANK_FILL_DCB (.LOCAL_WIDTH, .SOURCE);
+	        LCV [.BOTTOM_LINE] = 0;
+		END;	! clear
+
+	    SOURCE = .SOURCE - .ONE_LINE;       	! Up 1 line's worth
+	    BOTTOM_LINE = .BOTTOM_LINE - 1;		! Up 1 line
+	    END;	! check for clearing needed
+
+    	END;				! end of upward shuffle
+
+    	
+    [SMG$M_DOWN]:
+	BEGIN
+	LOCAL
+	    DEST_LINE_NO;
+
+	DEST_LINE_NO = .BOTTOM_LINE + .COUNT;		 ! Dest line number
+        DEST = $SMG$LINEAR ( .DEST_LINE_NO, .START_COL); ! Dest byte offset
+	SOURCE = $SMG$LINEAR ( .BOTTOM_LINE, .START_COL);! Source byte offset
+
+	DECR CURR_LINE FROM .BOTTOM_LINE	! From bottom line of scroll
+		       TO .START_ROW 		! rectangle to top line
+	DO
+	    BEGIN
+	    IF .DEST_LINE_NO LEQ .BOTTOM_LINE	! If still within
+	    THEN				! rectangle
+		BEGIN			! perform moves
+		!+
+		! Move text, attributes, alt. char. set and line charactistics
+		!-
+		$SMG$SHUFFLE (.LOCAL_WIDTH, .SOURCE, .DEST);
+		LCV [.DEST_LINE_NO] = .LCV [.CURR_LINE];
+		END;			! perform moves
+
+	    DEST_LINE_NO = .DEST_LINE_NO - 1;	    ! 1 line up
+	    DEST = .DEST - .ONE_LINE;               ! Offset up 1 line's work
+	    SOURCE = .SOURCE - .ONE_LINE;	    ! Source offset
+    	    END;			! end of decr loop
+
+	!+
+	! Up to COUNT number of lines may have been opened up.  Blank fill them.
+	!-
+
+	SOURCE = $SMG$LINEAR (.START_ROW, .START_COL);	    ! line offset
+	DEST_LINE_NO = .START_ROW;			    ! line number
+	INCR COUNTER FROM 1 TO .COUNT
+        DO
+	    BEGIN	! Check need to clear
+	    IF .DEST_LINE_NO LEQ .BOTTOM_LINE	! If still within
+	    THEN				! rectangle
+		BEGIN	! Clear
+	        $SMG$BLANK_FILL_DCB (.LOCAL_WIDTH, .SOURCE);
+	        LCV [.DEST_LINE_NO] = 0;
+		END;	! Clear
+
+	    SOURCE = .SOURCE + .ONE_LINE;       	! Down 1 line's worth
+	    DEST_LINE_NO = .DEST_LINE_NO + 1;		! Down 1 line
+	    END;	! Check need to clear
+    	END;				! end of downward shuffle
+
+    	
+    [SMG$M_RIGHT]:
+	BEGIN
+	LOCAL
+	    RIGHT_COL_OF_RECT,
+            DEST_COL_NO;
+
+	RIGHT_COL_OF_RECT = .START_COL + .LOCAL_WIDTH -1;
+	DEST_COL_NO = .START_COL + .COUNT;		! First col of dest.
+	SOURCE = $SMG$LINEAR ( .START_ROW, .START_COL);	! Byte offset for source
+	DEST   = $SMG$LINEAR ( .START_ROW, .DEST_COL_NO);! Byte offset for dest.
+	IF .COUNT GTR .LOCAL_WIDTH
+	THEN
+	    BEGIN	! Off of right of rectangle
+	    !+
+	    ! Starting destination column maps outside of rectangle.  Just need
+	    ! to clear source through last column of rectangle.
+	    !-
+	    INCR CURR_LINE FROM .START_ROW	! From 1st line of rectangle to
+			   TO   .BOTTOM_LINE	! last line of rectangle
+	    DO
+		BEGIN	! Incr loop
+		$SMG$BLANK_FILL_DCB ( .LOCAL_WIDTH, .SOURCE);
+		SOURCE = .SOURCE + .ONE_LINE;
+		END;	! Incr loop
+	    END		! Off of right of rectangle
+
+	ELSE
+
+	    BEGIN	! Dest. at least partially within rectangle
+	    !+
+	    ! Some movement of source text is needed.
+	    !-
+	    LOCAL
+		COLS_TO_MOVE,	! # bytes to move
+		COLS_TO_CLEAR;	! # bytes to clear
+
+	    COLS_TO_MOVE = .RIGHT_COL_OF_RECT - .DEST_COL_NO +1;
+	    COLS_TO_CLEAR = .DEST_COL_NO - .START_COL;
+
+	    INCR CURR_LINE FROM .START_ROW	! From 1st line of rect to
+			   TO   .BOTTOM_LINE	! last line
+	    DO
+		BEGIN	! Incr loop
+		!+
+		! Move text, attributes, and alternate char. set to dest.
+		! Clear source area vacated.
+		!-
+		$SMG$SHUFFLE ( .COLS_TO_MOVE, .SOURCE, .DEST);
+		$SMG$BLANK_FILL_DCB ( .COLS_TO_CLEAR, .SOURCE);
+		SOURCE = .SOURCE + .ONE_LINE; ! 1 line's worth down
+		DEST   = .DEST   + .ONE_LINE; ! 1 line's worth down
+		END;	! Incr loop
+	    END;	! Dest. at least partially within rectangle
+	END;				! end of right shuffle	
+
+ 
+    [SMG$M_LEFT]:
+	BEGIN
+	LOCAL
+	    RIGHT_COL_OF_RECT,
+            DEST_COL_NO;
+
+	DEST_COL_NO = .START_COL - .COUNT;		! First col of dest.
+	RIGHT_COL_OF_RECT = .START_COL + .LOCAL_WIDTH -1;  ! Last col of rect.
+	IF .COUNT GTR .LOCAL_WIDTH
+	THEN
+	    BEGIN	! Off off left of rectangle
+	    !+
+	    ! Starting destination column maps outside of rectangle.  Just need
+	    ! to clear source from 1st column of rectangle to last
+	    ! column of rectangle.
+	    !-
+
+	    SOURCE = $SMG$LINEAR ( .START_ROW,.START_COL);
+
+	    INCR CURR_LINE FROM .START_ROW	! From 1st line of rectangle to
+			   TO   .BOTTOM_LINE	! last line of rectangle
+	    DO
+		BEGIN	! Incr loop
+		$SMG$BLANK_FILL_DCB ( .LOCAL_WIDTH, .SOURCE);
+		SOURCE = .SOURCE + .ONE_LINE;
+		END;	! Incr loop
+	    END		! Off of left of rectangle
+
+	ELSE
+
+	    BEGIN	! Dest. at least partially within rectangle
+	    !+
+	    ! Some movement of source text is needed.
+	    !-
+	    LOCAL
+		START_OF_MOVE,	! 1st column to move
+		COLS_TO_CLEAR,	! # bytes to clear after movement
+		START_OF_CLEAR,	! byte offset for start of clear operation
+		COLS_TO_MOVE;	! # bytes to move
+
+	    COLS_TO_MOVE = .LOCAL_WIDTH - .COUNT;
+	    START_OF_MOVE = .RIGHT_COL_OF_RECT - .COLS_TO_MOVE +1;
+	    SOURCE = $SMG$LINEAR ( .START_ROW, .START_OF_MOVE);
+
+	    COLS_TO_CLEAR = .LOCAL_WIDTH - .COLS_TO_MOVE;
+	    START_OF_CLEAR = $SMG$LINEAR (.START_ROW,
+					  .START_COL + .COLS_TO_MOVE);
+
+	    DEST   = $SMG$LINEAR ( .START_ROW, .START_COL);
+
+	    INCR CURR_LINE FROM .START_ROW	! From 1st line of rect to
+			   TO   .BOTTOM_LINE	! last line
+	    DO
+		BEGIN	! Incr loop
+		!+
+		! Move text, attributes, and alternate char. set to dest.
+		! Clear source area vacated.
+		!-
+		$SMG$SHUFFLE ( .COLS_TO_MOVE, .SOURCE, .DEST);
+		$SMG$BLANK_FILL_DCB ( .COLS_TO_CLEAR, .START_OF_CLEAR);
+		START_OF_CLEAR = .START_OF_CLEAR + .ONE_LINE;
+		SOURCE = .SOURCE + .ONE_LINE; ! 1 line's worth down
+		DEST   = .DEST   + .ONE_LINE; ! 1 line's worth down
+		END;	! Incr loop
+	    END;	! Dest. at least partially within rectangle
+	END;				! end of left shuffle	
+
+
+    [INRANGE, OUTRANGE]:
+	RETURN SMG$_INVARG;		! should never get here 
+
+    TES;
+	    
+    RETURN (SS$_NORMAL);
+    END;			! End of routine SMG$$SCROLL_AREA
+!<BLF/PAGE>
+
+END			! End of module SMG$$SCROLL_AREA
+
+ELUDOM

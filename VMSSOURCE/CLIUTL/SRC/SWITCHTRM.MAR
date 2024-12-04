@@ -1,0 +1,250 @@
+	.TITLE	SWITCH_TERMINAL - Switch terminal port to or from DECNET
+	.IDENT	/V04-000/
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+
+;++
+; FACILITY: SET command 
+;
+; ABSTRACT:
+;
+;	This module supports switching a terminal port from terminal line
+;	to asynch DDCMP mode and vice versa.
+;
+; AUTHOR:
+;
+;	Meg Dumont 1-Feb-84
+;
+; MODIFIED BY:
+;
+;	V03-003	MMD0327		Meg Dumont,	31-Aug-1984  17:45
+;		Fix to clear UCB$L_FR4 field when swtiching back to a terminal
+;
+;	V03-002	MMD0319		Meg Dumont,	25-Jul-1984  15:38
+;		Fix to call IOC$VERFIYCHAN before raising our IPL.
+;
+;	V03-001	TMH0001		Tim Halvorsen		18-Mar-1984
+;		Fix to lock down code pages before executing high IPL code.
+;--
+
+
+	$ccbdef
+	$devdef
+	$ddbdef
+	$dptdef
+	$ipldef
+	$jpidef
+	$prvdef
+	$ssdef
+	$ttdef
+	$ttyucbdef
+	$ttyvecdef
+	$ttymodem
+	$ucbdef
+
+
+; temp	
+	.PSECT	SET$RWDATA,NOEXE,LONG
+
+NODRV_NAME: .ASCIC	/NODRIVER/
+
+	.PSECT	SET$CODE,NOWRT
+
+;++
+;SWITCH_TO_DDCMP
+;
+; This routine does the actual switch. First using the channel assigned
+; we find out the virtual UCB for this device. Next 
+; we check the reference count in the virtual UCB to ensure it is not 
+; owned by anyone else. It does this by subtracting 1 from the reference 
+; count field. SET TERMINAL has a channel assigned to the device so we can
+; account for one of the channels. If any other channels are assigned
+; we can not allow the switch to occur. Please note that if this truly a 
+; virtual UCB (ie. VTA0 variety), the reference count in the UCB will be 
+; greater than one and the switch will fail. We check to see if the 
+; ASYNCH DDCMP CLASS driver, NODRIVER is loaded. Next we 
+; set the appropriate fields in the UCB to point to the NODRIVER.
+; We also set the NET bit in the DEVCHAR  field to reflect that this
+; is an asycnh ddmcp line. Finally , we call the port at its
+; ABORT and RESUME entry points to ensure that there is nothing outstanding 
+; on the line.
+;
+;	INPUTS:
+;		4(ap) = Channel assigned to device
+;
+;	OUTPUTS:
+;		R0 = Status of the switch
+;			SS$_NORMAL - Switch was made
+;			SS$_IVCHAN - Invalid channel 
+;			SS$_NOSUCHDEV - NODRIVER was not loaded
+;			SS$_DEVALLOC - Device was in use no switch is made
+;
+;--
+switch_to_ddcmp::
+	.word 	0
+	pushr	#^m<r1,r2,r3,r4,r5>
+	movl	4(ap),r0			; get the channel number
+	jsb	g^ioc$verifychan		; Call to get CCB from channel
+	setipl	switch_ddcmp_ipl		; Disable for synch to IODATA BASE
+						; & lock down this code
+	cmpw	#ss$_ivchan,r0			; If eql then not proper channel
+	beql	switch_err
+	movl	ccb$l_ucb(r1),r5		; Get the virtual UCB for device
+	subw3	#1,ucb$w_refc(r5),r1		; If NEQ then channels assign
+	bneq	switch_ddcmp_err_inuse		; do not allow switch
+	movl	ucb$l_tl_phyucb(r5),r0		; Get the physical UCB
+	beql	10$				; If eql field not setup
+	movl	r0,r5
+10$:	setipl	ucb$b_dipl(r5)			; Disable device interrupts
+	movl	g^no$gl_dpt,r0			; Get the address of the Nodriver dpt
+	beql	switch_ddcmp_notloaded		; If eql driver not loaded
+	movzwl	dpt$w_vector(r0),r1		; Get the offset of the class vector atble
+	addl2	r1,r0				; Get the addr of the class vector atble
+	movl	r0,ucb$l_tt_class(r5)		; Set asynch ddcmp vector address
+	movl	class_getnxt(r0),ucb$l_tt_getnxt(r5) ; Set Asynch ddcmp getnxt
+	movl	class_putnxt(r0),ucb$l_tt_putnxt(r5) ; Set asynch ddmcp putnxt
+	movl	class_ddt(r0),ucb$l_ddt(r5)	; Set DDT address
+	clrq	ucb$q_tl_brkthru(r5)		; Clear class drivers dependant  fields
+	movl	ucb$l_ddb(r5),r1		; Get DDB
+	movl	r1,ddb$l_ddt(r1)		; Reset the DDT
+	bisw2	#dev$m_net,ucb$l_devchar(r5)	; Set that this is a network device
+	movl	ucb$l_tt_port(r5),r0		; Get port vector table
+	jsb	@port_abort(r0)			; Call abort to clear line
+	movl	ucb$l_tt_port(r5),r0		; Get port vector table
+	jsb	@port_resume(r0)		; Call resume to restart line
+	setipl	#0
+	popr	#^m<r1,r2,r3,r4,r5>
+	movzwl	#ss$_normal,r0
+	ret
+
+switch_err:
+	setipl #0
+	popr	#^m<r1,r2,r3,r4,r5>
+	ret
+
+switch_ddcmp_err_inuse:
+	setipl	#0
+	popr	#^m<r1,r2,r3,r4,r5>
+	movzwl	#ss$_devalloc,r0
+	ret
+
+switch_ddcmp_notloaded:
+	setipl	#0
+	popr	#^m<r1,r2,r3,r4,r5>
+	movzwl	#ss$_nosuchdev,r0
+	ret
+
+switch_ddcmp_ipl:				; Used to fault in code &
+	.long	ipl$_synch			; lock down pages simultaneously
+ 
+;++
+;SWITCH_TO_TERMINAL
+;
+; This routine does the actual switch. First using the channel assigned
+; we find out the virtual UCB for this device. Next 
+; we check the reference count in the virtual UCB to ensure it is not 
+; owned by anyone else. It does this by subtracting 1 from the reference 
+; count field. SET TERMINAL has a channel assigned to the device so we can
+; account for one of the channels. If any other channels are assigned
+; we can not allow the switch to occur. Please note that if this truly a 
+; virtual UCB (ie. VTA0 variety), the reference count in the UCB will be 
+; greater than one and the switch will fail. Next we 
+; set the appropriate fields in the UCB to point to the terminal class 
+; driver. We clear the NET bit in DEVCHAR to reflect that this
+; is once again a terminal. It will also call the port at its ABORT and RESUME 
+; entry ; points to ensure that there is nothing outstanding on the line. We
+; must also ensure that the terminal is put back to normal which means
+; calling the terminal class driver at its SETUP_UCB entry point to reset 
+; the CLASS dependant portion of the UCB, and calling the PORT driver at
+; its DS_TRANS entry point to ensure that the modem signals were reset properly.
+;
+;	INPUTS:
+;		4(ap) = Channel asignned to device
+;
+;	OUTPUTS:
+;		R0 = Status of the switch
+;			SS$_NORMAL - Switch was made
+;			SS$_DEVALLOC - Device was in use no switch is made
+;
+;--
+switch_to_terminal::
+	.word 	0
+	pushr	#^m<r1,r2,r3,r4,r5>
+	movl	4(ap),r0			; get the channel number
+	jsb	g^ioc$verifychan		; Call to get CCB from channel
+	setipl	switch_terminal_ipl		; Disable for synch to IODATA BASE
+						; & lock down this code
+	cmpw	#ss$_ivchan,r0			; If eql then not proper channel
+	beql	switch_err
+	movl	ccb$l_ucb(r1),r5		; Get the virtual UCB for device
+	subw3	#1,ucb$w_refc(r5),r1		; If EQL then no channels assign
+	beql	5$				; allow switch
+	brw	switch_terminal_err_inuse	; Else do not allow switch
+5$:	movl	ucb$l_tl_phyucb(r5),r0		; Get the physical UCB
+	beql	10$				; If eql field not setup
+	movl	r0,r5
+10$:	setipl	ucb$b_dipl(r5)			; Disable device interrupts
+	movl	g^tty$gl_dpt,r0			; Get the address of the TTdriver dpt
+	movzwl	dpt$w_vector(r0),r1		; Get the offset of the class vector atble
+	addl2	r1,r0				; Get the addr of the class vector atble
+	movl	r0,ucb$l_tt_class(r5)		; Set terminal class vector address
+	movl	class_getnxt(r0),ucb$l_tt_getnxt(r5) ; Set terminal class getnxt
+	movl	class_putnxt(r0),ucb$l_tt_putnxt(r5) ; Set terminal class putnxt
+	movl	class_ddt(r0),ucb$l_ddt(r5)	; Set DDT address
+	clrq	ucb$q_tl_brkthru(r5)		; Clear class drivers dependant  fields
+	clrl	ucb$l_fr4(r5)			; Clear FR4 because the class port
+						; interface uses this for fork info
+	movl	ucb$l_ddb(r5),r1		; Get DDB
+	movl	r1,ddb$l_ddt(r1)		; Reset the DDT
+	bicw2	#dev$m_net,ucb$l_devchar(r5)	; Clear no longer a network device
+	movw	ucb$w_tt_desize(r5),ucb$w_devbufsiz(r5) ; Reset page size
+	movl	ucb$l_tt_port(r5),r0		; Get port vector table
+	jsb	@port_abort(r0)			; Call abort to clear line
+	movl	ucb$l_tt_port(r5),r0		; Get port vector table
+	jsb	@port_resume(r0)		; Call resume to restart line
+	movl	ucb$l_tt_class(r5),r0		; Get the class vector table
+	jsb	@class_setup_ucb(r0)		; Reset the ucb for terminal driver
+	movl	ucb$l_tt_port(r5),r0		; Get port vector table
+	jsb	@port_set_line(r0)		; Call resume to restart line
+	bbc	#tt$v_modem,ucb$l_devdepend(r5),20$
+	movzbl	#modem$c_init,r1
+	movl	ucb$l_tt_class(r5),r0		; Get the class vector table
+	jsb	@class_ds_tran(r0)		; Reset the modem control
+20$:	setipl	#0
+	popr	#^m<r1,r2,r3,r4,r5>
+	movzwl	#ss$_normal,r0
+	ret
+
+switch_terminal_err_inuse:
+	setipl	#0
+	popr	#^m<r1,r2,r3,r4,r5>
+	movzwl	#ss$_devalloc,r0
+	ret
+
+switch_terminal_ipl:				; Used to fault in code &
+	.long	ipl$_synch			; lock down pages simultaneously
+
+	.END
+
+

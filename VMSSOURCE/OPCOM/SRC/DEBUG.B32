@@ -1,0 +1,1165 @@
+MODULE	OPC$DEBUG	(
+			 LANGUAGE (BLISS32),
+			 IDENT = 'V04-000'
+			) =
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:
+!
+!	OPCOM
+!
+! ABSTRACT:
+!
+!	This module contains routines to help with the debugging of OPCOM.
+!
+! Environment:
+!
+!	VAX/VMS operating system.
+!
+! Author:
+!
+!	CW Hobbs
+!
+! Creation date:
+!
+!	30-Jul-1983
+!
+! Revision history:
+!
+!	V03-003	CWH3169		CW Hobbs			5-May-1984
+!		Second pass for cluster-wide OPCOM:
+!		 - Take SHARE priv to make sure we can reach the terminal
+!
+!	V03-002	CWH3002		CW Hobbs		16-Sep-1983
+!		Use jacket routines for VM calls.
+!
+!--
+
+BEGIN						! Start of DEBUG
+
+LIBRARY	'SYS$LIBRARY:LIB.L32';
+LIBRARY 'LIB$:OPCOMLIB';
+
+FORWARD ROUTINE
+	DEBUG_HANDLER	: NOVALUE,
+	DUMP_ACTION	: NOVALUE,
+	DEBUG_FAO_BUFFER,
+	PRINT_MCB	: NOVALUE,
+	PRINT_NODES	: NOVALUE,
+	PRINT_NOD	: NOVALUE,
+	PRINT_OCD	: NOVALUE,
+	PRINT_RQCB	: NOVALUE,
+	PRINT_SCB	: NOVALUE,
+	PUT		: NOVALUE;
+
+EXTERNAL
+	LCL_NOD		: $ref_bblock,
+	NOD_HEAD	: VECTOR [2, LONG],
+	GLOBAL_STATUS	: BITVECTOR,
+	REQUEST_NUMBER	: LONG;			! Current request #
+
+EXTERNAL ROUTINE
+	WRITE_LOG_FILE;
+
+EXTERNAL LITERAL
+	MIN_DS_TYPE,
+	MAX_DS_TYPE;
+
+OWN
+	BRIEF,
+	FAB		: $bblock [FAB$K_BLN],	! FAB for the output file
+	RAB		: $bblock [RAB$K_BLN];	! RAB for the output file
+
+BIND
+	NULL_STRING = %ASCID '';
+
+GLOBAL ROUTINE DEBUG_HANDLER (BUFFER_DESC : $ref_bblock) : NOVALUE =
+
+!++
+! Functional description:
+!
+!	This routine sets SHARE priv and calls the actual dump routine.
+!
+! Input:
+!
+!	BUFFER_DESC : The address of a quadword buffer descriptor that
+!		      describes the buffer containing the message.
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of DEBUG_HANDLER
+
+LOCAL
+	share_priv	: $bblock [8]		! Mask for SHARE priv
+			  INITIAL (0,0);
+!
+! Get share privilege
+!
+share_priv[prv$v_share] = 1;
+$SETPRV (ENBFLG=1, PRVADR=share_priv);
+!
+! Call the routines to do the actions
+!
+DUMP_ACTION (.BUFFER_DESC);
+!
+! Remove share privilege
+!
+$SETPRV (ENBFLG=0, PRVADR=share_priv);
+
+RETURN;
+END;						! End of DEBUG_HANDLER
+
+ROUTINE DUMP_ACTION (BUFFER_DESC : $ref_bblock) : NOVALUE =
+
+!++
+! Functional description:
+!
+!	This routine appends a dump of all OPCOM data structures to the file described by the
+!	logical name OPC$DEBUG_FILE.  If this logical name does not exist, the dump is performed
+!	to OPC$DEBUG_TERMINAL.  OPC$DEBUG_TERMINAL is created as an RMS file, so it can also be
+!	a disk file.  (OPC$DEBUG_FILE is opened for append, OPC$DEBUG_TERMINAL gets a $CREATE so
+!	that a new file is created for each call.)
+!
+!
+! Input:
+!
+!	BUFFER_DESC : The address of a quadword buffer descriptor that
+!		      describes the buffer containing the message.
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	A file will be opened (created) and written.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of DUMP_ACTION
+
+OWN
+	share_priv	: $bblock [8]		! Mask for SHARE priv
+			  PRESET ([prv$v_share] = 1);
+
+LOCAL
+	rqcb		: $ref_bblock,		! RQCB data structure
+	ocd		: $ref_bblock,		! OCD data structure
+	mcb		: $ref_bblock,		! MCB data structure
+	msg		: REF VECTOR [,LONG];	! Pointer to debug command message
+
+msg = .buffer_desc [dsc$a_pointer] + opc$k_comhdrsiz;	! Init the message pointer
+brief = .msg [1];				! Second longword contains the flags
+
+! Initialize the structures needed by RMS
+!
+$fab_init (
+	fab = fab,				! Input file FAB
+	fac = put,				!  PUT access
+	fna = UPLIT BYTE ('OPC$DEBUG_FILE:'),	!  Set name addr
+	fns = 15,				!  Set name size
+	fop = cif,				!  Create it if it doesn't exist
+	org = seq,				!  Sequential organization
+	rat = cr,				!  Carriage return carriage control
+	rfm = var				!  Variable length records
+	);
+
+$rab_init (
+	rab = rab,
+	fab = fab,
+	rac = seq,				!  Sequential only
+	rop = (eof,wbh)				!  Position to EOF, write behind
+	);
+
+IF NOT ($CREATE (fab = fab))
+THEN
+    BEGIN
+    $fab_init (
+	    fab = fab,				! Input file FAB
+	    fac = put,				!  PUT access
+	    fna = UPLIT BYTE ('OPC$DEBUG_TERMINAL:'),	!  Set name addr
+	    fns = 19,				!  Set name size
+	    org = seq,				!  Sequential organization
+	    rat = cr,				!  Carriage return carriage control
+	    rfm = var				!  Variable length records
+	    );
+    IF NOT ($CREATE (fab = fab))
+    THEN
+	RETURN;
+    END;
+
+IF NOT ($CONNECT (rab = rab))
+THEN
+    RETURN;
+
+! Print the heading
+!
+put (NULL_STRING);
+IF .brief
+THEN
+    BEGIN
+    IF .global_status [GBLSTS_K_IN_VAXcluster]
+    THEN
+	put (debug_fao_buffer(%ASCID 'Current OPCOM status for !AS:      !%D', lcl_nod [nod_q_name_desc], 0))
+    ELSE
+	put (debug_fao_buffer(%ASCID 'Current OPCOM status at !%D:', 0));
+    END
+ELSE
+    BEGIN
+    IF .global_status [GBLSTS_K_IN_VAXcluster]
+    THEN
+	put (debug_fao_buffer(
+		%ASCID '<<<<<<<<<<<<<<<<< Dump of OPCOM state for !AS:  !%T >>>>>>>>>>>>>>>>>',
+		lcl_nod [nod_q_name_desc]))
+    ELSE
+	put (%ASCID    '<<<<<<<<<<<<<<<<<<<<<< Dump of OPCOM state  !%T >>>>>>>>>>>>>>>>>>>');
+    END;
+
+! Print the node information
+!
+IF .global_status [GBLSTS_K_IN_VAXcluster]
+THEN
+    print_nodes ();
+
+! Print the miscellaneous pieces of state
+!
+IF NOT .brief
+THEN
+    print_scb ();
+print_ocd ();
+
+put (NULL_STRING);
+IF NOT .brief
+THEN
+    put (%ASCID '================================= End of dump ==================================');
+
+IF NOT ($CLOSE (fab = fab))
+THEN
+    RETURN;
+
+RETURN;
+END;						! End of DUMP_ACTION
+
+GLOBAL ROUTINE debug_fao_buffer (ctrstr : REF VECTOR[2], args : VECTOR [4]) =	%SBTTL 'debug_fao_buffer'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine passes an ascii string through the FAO system service with any number of specified parameters.
+!
+! INPUTS:
+!
+!	ctrstr	Address of FAO control string descriptor
+!	args	Any number of additional arguments
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Address of formatted descriptor
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+OWN
+    desc : VECTOR [2, LONG],
+    faobuf : VECTOR [512, BYTE]
+    ;
+
+desc [0] = 512;					! Set up result descriptor
+desc [1] = faobuf;
+
+$faol (ctrstr=.ctrstr, outlen=desc, outbuf=desc, prmlst=args);
+
+RETURN desc;
+END;
+
+ROUTINE print_mcb (mcb : $ref_bblock) : NOVALUE =	%SBTTL 'print_mcb (mcb)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Format and print the contents of one MCB
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+
+IF .mcb EQL 0
+THEN
+    RETURN;
+
+IF .BRIEF
+THEN
+    BEGIN
+    IF .mcb [mcb_l_textlen] NEQ 0
+    THEN
+	put (
+	    debug_fao_buffer  (
+			%ASCID '      MCB text "!AF"',
+			.mcb [mcb_l_textlen], .mcb [mcb_l_textptr]
+			)
+	    );
+    END
+
+ELSE
+    BEGIN
+
+    put (
+	debug_fao_buffer  (
+		    %ASCID '    MCB at !XL,  l_links !XL:!XL,  w_size !UL,  b_type !UL',
+		    .mcb, .mcb [mcb_l_flink], .mcb [mcb_l_blink], .mcb [mcb_w_size],
+		    .mcb [mcb_b_type]
+		    )
+	);
+    put (
+	debug_fao_buffer  (
+		    %ASCID '      b_scope !UL,  l_seqnum !XL,  l_rqcb !XL,  l_status !XL',
+		    .mcb [mcb_b_scope], .mcb [mcb_l_seqnum], .mcb [mcb_l_rqcb],
+		    .mcb [mcb_l_status]
+		    )
+	);
+    put (
+	debug_fao_buffer  (
+		    %ASCID '      l_textlen !UL,  l_textptr !XL,  l_msgid !XL',
+		    .mcb [mcb_l_textlen], .mcb [mcb_l_textptr], .mcb [mcb_l_msgid]
+		    )
+	);
+    IF .mcb [mcb_l_textlen] NEQ 0
+    THEN
+	put (
+	    debug_fao_buffer  (
+			%ASCID '      MCB text "!AF"',
+			.mcb [mcb_l_textlen], .mcb [mcb_l_textptr]
+			)
+	    );
+    END;
+
+RETURN;
+END;
+
+ROUTINE print_nodes : NOVALUE =	%SBTTL 'print_nodes'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Format and print the contents of the node list
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	global NOD_HEAD
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	messages are printed
+!--
+
+LOCAL
+    np : $ref_bblock,	! Local pointer to nod as we look for place
+    sb : $ref_bblock,	! Local pointer to new sort block 
+    lsp : $ref_bblock,	! Local pointer to sort list as we move
+    sp : $ref_bblock,	! Local pointer to sort list as we move
+    ptr : $ref_bblock,
+    sort : $ref_bblock,
+    ocd	 : $ref_bblock,
+    status;
+
+!
+! Print the heading
+!
+put (null_string);
+IF .brief
+THEN
+    put (debug_fao_buffer(%ASCID '!12<NODES:!>  Number   State       Csid             Up since'))
+ELSE
+    put (debug_fao_buffer(%ASCID
+		    'NODES:                                                  (queue head !XL)', nod_head));
+!
+! Build a list of nodes, sorted by node name
+!
+sort = 0;					! Init sorted list to null
+ptr = .nod_head [0];
+WHILE .ptr NEQ nod_head [0]
+DO
+    BEGIN
+    IF NOT (status = OPC$GET_VM (%REF (8), sb))	! Get a new sort block
+    THEN
+	$signal_stop (.status);
+    sb [4,0,32,0] = .ptr;			! Store the nod in the new sort block
+    sp = .sort;					! List pointer to start of sorted list
+    lsp = 0;					! Last list pointer to null
+    WHILE .sp NEQ 0 DO
+	BEGIN
+	np = .sp [4,0,32,0];			! Get pointer to nod of this sort block
+	IF CH$LEQ (.ptr [nod_l_name_len], .ptr [nod_l_name_ptr],
+		    .np [nod_l_name_len],  .np [nod_l_name_ptr], 0)
+	THEN
+	    EXITLOOP;
+	lsp = .sp;				! Remember this sort block as last sort block
+	sp = .sp [0,0,32,0];			! Get pointer to next block
+	END;
+    IF .lsp EQL 0
+    THEN
+	!
+	! Last pointer zero, means we are adding first entry to list
+	!
+	BEGIN
+	sb [0,0,32,0] = .sort;			! Next pointer to zero or first in list
+	sort = .sb;				! Put it at the head of the list
+	END
+    ELSE
+	!
+	! Last pointer non-zero, sort list is non-empty
+	!
+	BEGIN
+	sb [0,0,32,0] = .lsp [0,0,32,0];	! Next pointer to zero
+	lsp [0,0,32,0] = .sb;			! Previous
+	END;
+    ptr = .ptr [nod_l_flink];
+    END;
+!
+! Now, print the sorted list
+!
+sp = .sort;
+WHILE .sp NEQ 0
+DO
+    BEGIN
+    ptr = .sp [4,0,32,0];			! Get address of nod block
+    print_nod (.ptr);
+    sb = .sp;					! Remember this as last sort block
+    sp = .sp [0,0,32,0];			! Get pointer to next block
+    IF NOT (status = OPC$FREE_VM (%REF (8), sb))	! Get a new sort block
+    THEN
+	$signal_stop (.status);
+    END;
+
+RETURN;
+END;
+
+ROUTINE print_nod (nod : $ref_bblock) : NOVALUE =	%SBTTL 'print_nod (nod)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Format and print the contents of one NOD
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+LOCAL
+    state;
+
+IF .nod EQL 0
+THEN
+    RETURN;
+
+state = (CASE .nod [nod_b_state] FROM 1 TO nod_k_state_max OF
+	 SET
+	    [nod_k_state_local] :	%ASCID 'Local';
+	    [nod_k_state_start] :	%ASCID 'Starting';
+	    [nod_k_state_active] :	%ASCID 'Active';
+	    [nod_k_state_departed] :	%ASCID 'Departed';
+	    [INRANGE,OUTRANGE] :	%ASCID 'Unknown';
+	 TES);
+
+IF .BRIEF
+THEN
+    BEGIN
+    put (
+	debug_fao_buffer  (
+		    %ASCID '!4< !>!6AS    !5UL   !8AS   !XL    !%D',
+		    nod [nod_q_name_desc], .(nod [nod_t_node_systemid])<0,16,0>,  .state,
+		    .nod [nod_l_node_csid], nod [nod_q_swincarn]
+		    )
+	);
+    END
+ELSE
+    BEGIN
+    put (
+	debug_fao_buffer  (
+		    %ASCID '  !9<"!AS",!>  number !UL,  state "!AS", csid !XL,  up since !%D',
+		    nod [nod_q_name_desc], .(nod [nod_t_node_systemid])<0,16,0>, .state,
+		    .nod [nod_l_node_csid], nod [nod_q_swincarn]
+		    )
+	);
+    put (
+	debug_fao_buffer  (
+		    %ASCID '     nod address !XL,  forward link !XL,  back link !XL',
+		    .nod, .nod [nod_l_flink], .nod [nod_l_blink]
+		    )
+	);
+    put (
+	debug_fao_buffer  (
+		    %ASCID '     Incarnation !XL,!XL,  systemid !XW,!XW,!XW',
+		    .(nod [nod_q_swincarn])<0,32,0>, .(nod [nod_q_swincarn]+4)<0,32,0>,
+		    .(nod [nod_t_node_systemid])<0,16,0>, 
+		    .(nod [nod_t_node_systemid]+2)<0,16,0>,
+		    .(nod [nod_t_node_systemid]+4)<0,16,0>
+		    )
+	);
+    END;
+
+RETURN;
+END;
+
+ROUTINE print_ocd : NOVALUE =	%SBTTL 'print_ocd'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Format and print the contents of the OCD vector
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	global OCD_VECTOR
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+LOCAL
+    rp : $ref_bblock,	! Local pointer to rqcb as we look for place
+    sb : $ref_bblock,	! Local pointer to new sort block 
+    lsp : $ref_bblock,	! Local pointer to sort list as we move
+    sp : $ref_bblock,	! Local pointer to sort list as we move
+    rqcb : $ref_bblock,
+    sort : $ref_bblock,
+    ocd	 : $ref_bblock,
+    status;
+
+EXTERNAL
+    ocd_vector : VECTOR [0];
+
+
+ocd = .ocd_vector [0];
+
+IF NOT .brief
+THEN
+    BEGIN
+
+    ! Display the OCD Vector contents
+    !
+    put (NULL_STRING);
+    put (
+	debug_fao_buffer  (
+		    %ASCID 'OCD Vector: SYSTEM !XL !1UL,  GROUP !XL !1UL,  USER !XL !1UL',
+		    .ocd_vector [0], .ocd_vector [1],		! SYSTEM ocd
+		    .ocd_vector [2], .ocd_vector [3],		! GROUP
+		    .ocd_vector [4], .ocd_vector [5]		! USER
+		    )
+	);
+
+    ! If the spare is not null, print it also
+    !
+    IF .ocd_vector [6] NEQ 0
+     OR
+       .ocd_vector [7] NEQ 0
+    THEN
+	put (
+	    debug_fao_buffer  (
+			%ASCID '  SPARE OCD Vector is not null:  spare !XL !1UL',
+			.ocd_vector [6], .ocd_vector [7]		! spare
+			)
+	    );
+
+    ! Display the contents of the OCD entries.  For now we will make the simplifying assumption that
+    ! the only OCD is the SYSTEM one.
+    !
+    put (NULL_STRING);
+    put (
+	debug_fao_buffer  (
+		    %ASCID '  OCD at !XL,  w_size !UL,  b_type !UL,  b_scope !UL,  l_seqnum !XL',
+		    .ocd, .ocd [ocd_w_size], .ocd [ocd_b_type], .ocd [ocd_b_scope], .ocd [ocd_l_seqnum]
+		    )
+	);
+    put (
+	debug_fao_buffer  (
+		    %ASCID '    l_uic !XL,  l_status !XL,  l_lcb !UL,  l_links !XL:!XL',
+		    .ocd [ocd_l_uic], .ocd [ocd_l_status], .ocd [ocd_l_lcb], .ocd [ocd_l_flink], .ocd [ocd_l_blink]
+		    )
+	);
+    put (
+	debug_fao_buffer  (
+		    %ASCID '    l_attnmasks !XL:!XL,  l_notifymasks !XL:!XL',
+		    .ocd [ocd_l_attnmask1], .ocd [ocd_l_attnmask2],
+		    .ocd [ocd_l_notifymask1], .ocd [ocd_l_notifymask2]
+		    )
+	);
+    put (
+	debug_fao_buffer  (
+		    %ASCID '    w_opercount !UL,  l_operlinks !XL:!XL (head !XL)',
+		    .ocd [ocd_w_opercount], .ocd [ocd_l_operflink], .ocd [ocd_l_operblink], ocd [ocd_l_operflink]
+		    )
+	);
+    put (
+	debug_fao_buffer  (
+		    %ASCID '    w_rqstcount !UL,  l_rqstlinks !XL:!XL (head !XL)',
+		    .ocd [ocd_w_rqstcount], .ocd [ocd_l_rqstflink], .ocd [ocd_l_rqstblink], ocd [ocd_l_rqstflink]
+		    )
+	);
+    put (
+	debug_fao_buffer  (
+		    %ASCID %STRING ('    enables: !SL !SL !SL !SL !SL !SL !SL !SL !SL !SL !SL !SL !SL !SL ',
+				'!SL !SL !SL !SL !SL !SL !SL !SL !SL !SL !SL !SL !SL !SL !SL !SL !SL !SL'),
+		    .ocd [ocd_w_enablecount (0)],  .ocd [ocd_w_enablecount (1)],  .ocd [ocd_w_enablecount (2)],
+		    .ocd [ocd_w_enablecount (3)],  .ocd [ocd_w_enablecount (4)],  .ocd [ocd_w_enablecount (5)],
+		    .ocd [ocd_w_enablecount (6)],  .ocd [ocd_w_enablecount (7)],  .ocd [ocd_w_enablecount (8)],
+		    .ocd [ocd_w_enablecount (9)],  .ocd [ocd_w_enablecount (10)], .ocd [ocd_w_enablecount (11)],
+		    .ocd [ocd_w_enablecount (12)], .ocd [ocd_w_enablecount (13)], .ocd [ocd_w_enablecount (14)],
+		    .ocd [ocd_w_enablecount (15)], .ocd [ocd_w_enablecount (16)], .ocd [ocd_w_enablecount (17)],
+		    .ocd [ocd_w_enablecount (18)], .ocd [ocd_w_enablecount (19)], .ocd [ocd_w_enablecount (20)],
+		    .ocd [ocd_w_enablecount (21)], .ocd [ocd_w_enablecount (22)], .ocd [ocd_w_enablecount (23)],
+		    .ocd [ocd_w_enablecount (24)], .ocd [ocd_w_enablecount (25)], .ocd [ocd_w_enablecount (26)],
+		    .ocd [ocd_w_enablecount (27)], .ocd [ocd_w_enablecount (28)], .ocd [ocd_w_enablecount (29)],
+		    .ocd [ocd_w_enablecount (30)], .ocd [ocd_w_enablecount (31)]
+		    )
+	);
+    END;
+
+! Display all the RQCB's hanging off this OCD
+!
+put (null_string);
+IF .brief
+THEN
+    put (debug_fao_buffer(%ASCID
+		'!12<OPERATORS:!>          Username          Ident    Enabled'))
+ELSE
+    put (debug_fao_buffer(%ASCID
+    		'OPERATORS:                                              (queue head !XL)',
+		ocd [ocd_l_operflink]));
+sort = 0;					! Init sorted list to null
+rqcb = .ocd [ocd_l_operflink];
+WHILE .rqcb NEQ ocd [ocd_l_operflink]
+DO
+    BEGIN
+    IF NOT (status = OPC$GET_VM (%REF (8), sb))	! Get a new sort block
+    THEN
+	$signal_stop (.status);
+    sb [4,0,32,0] = .rqcb;			! Store the rqcb in the new sort block
+    sp = .sort;					! List pointer to start of sorted list
+    lsp = 0;					! Last list pointer to null
+    WHILE .sp NEQ 0 DO
+	BEGIN
+	rp = .sp [4,0,32,0];			! Get pointer to rqcb of this sort block
+	IF CH$LEQ (.rqcb [rqcb_l_oper_len], .rqcb [rqcb_l_oper_ptr],
+		     .rp [rqcb_l_oper_len],   .rp [rqcb_l_oper_ptr], 0)
+	THEN
+	    EXITLOOP;
+	lsp = .sp;				! Remember this sort block as last sort block
+	sp = .sp [0,0,32,0];			! Get pointer to next block
+	END;
+    IF .lsp EQL 0
+    THEN
+	!
+	! Last pointer zero, means we are adding first entry to list
+	!
+	BEGIN
+	sb [0,0,32,0] = .sort;			! Next pointer to zero or first in list
+	sort = .sb;				! Put it at the head of the list
+	END
+    ELSE
+	!
+	! Last pointer non-zero, sort list is non-empty
+	!
+	BEGIN
+	sb [0,0,32,0] = .lsp [0,0,32,0];	! Next pointer to zero
+	lsp [0,0,32,0] = .sb;			! Previous
+	END;
+    rqcb = .rqcb [rqcb_l_flink];
+    END;
+sp = .sort;
+WHILE .sp NEQ 0
+DO
+    BEGIN
+    rqcb = .sp [4,0,32,0];			! Get address of operator rqcb
+    print_rqcb (.rqcb);				! Print the rqcb
+    sb = .sp;					! Remember this as last sort block
+    sp = .sp [0,0,32,0];			! Get pointer to next block
+    IF NOT (status = OPC$FREE_VM (%REF (8), sb))	! Get a new sort block
+    THEN
+	$signal_stop (.status);
+    END;
+
+rqcb = .ocd [ocd_l_rqstflink];
+put (null_string);
+IF .brief
+THEN
+    BEGIN
+    IF .rqcb NEQ ocd [ocd_l_rqstflink]		! Only print it if we have some requests
+    THEN
+	put (debug_fao_buffer(%ASCID
+		'!12<REQUESTS:!>    Username        Attn       Message'))
+    END
+ELSE
+    put (debug_fao_buffer(%ASCID
+		'REQUESTS:       High request !UL (!UL,!3XW)  (queue head !XL)',
+		.request_number, 
+		(IF NOT .global_status [GBLSTS_K_IN_VAXcluster]
+		 THEN .request_number
+		 ELSE (.request_number^-12)),
+		(IF NOT .global_status [GBLSTS_K_IN_VAXcluster]
+		 THEN 0
+		 ELSE .request_number<0,12,0>),
+		ocd [ocd_l_rqstflink]));
+IF .rqcb EQL ocd [ocd_l_rqstflink]
+THEN
+    put (%ASCID '  (no active requests)');
+WHILE .rqcb NEQ ocd [ocd_l_rqstflink]
+DO
+    BEGIN
+    print_rqcb (.rqcb);
+    rqcb = .rqcb [rqcb_l_flink];
+    END;
+
+RETURN;
+END;
+
+ROUTINE print_rqcb (rqcb : $ref_bblock) : NOVALUE =	%SBTTL 'print_rqcb (rqcb)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Format and print the contents of one RQCB
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+
+IF .rqcb EQL 0
+THEN
+    RETURN;
+
+IF .BRIEF
+THEN
+    BEGIN
+
+    ! Make a brief, "pretty" display of the contents of the RQCB
+    !
+    IF .rqcb [rqcb_l_oper_len] NEQ 0
+    THEN
+	put (
+	    debug_fao_buffer  (
+			%ASCID '!4< !>!16AF   !AF   !XL   !XL',
+			.rqcb [rqcb_l_oper_len], .rqcb [rqcb_l_oper_ptr], 
+			12, rqcb [rqcb_t_username],
+			.rqcb [rqcb_l_ident], 
+			.rqcb [rqcb_l_attnmask1]
+			)
+	    );
+
+    IF .rqcb [rqcb_l_text_len] NEQ 0
+    THEN
+    	BEGIN
+	REGISTER
+	    len,
+	    ptr,
+	    continued;
+	len = .rqcb [rqcb_l_text_len];
+	ptr = .rqcb [rqcb_l_text_ptr];
+	continued = (.rqcb [rqcb_l_text_len] GTR 30);
+	put (
+	    debug_fao_buffer  (
+			%ASCID '!13UL   !AF !XL  "!AF"!AF',
+			.rqcb [rqcb_l_rqstnum],
+			12, rqcb [rqcb_t_username],
+			.rqcb [rqcb_l_attnmask1],
+			MIN (.len,37), .ptr,
+			(IF .continued THEN 2 ELSE 0), UPLIT BYTE (' -')
+			)
+	    );
+	IF .continued
+	THEN
+	    BEGIN
+	    len = .len - 37;
+	    ptr = .ptr + 37;
+	    WHILE .len GTR 0
+	    DO
+		BEGIN
+		put (
+		    debug_fao_buffer  (
+				%ASCID '!16< !>"!AF"!AF',
+				MIN (.len,60), .ptr,
+				(IF (.len GTR 60) THEN 2 ELSE 0), UPLIT BYTE (' -')
+				)
+		    );
+		len = .len - 53;
+		ptr = .ptr + 53;
+		END;
+	    END;
+    	END;
+    END
+
+ELSE
+    BEGIN
+
+    ! Display the contents of the RQCB
+    !
+    put (
+	debug_fao_buffer  (
+		    %ASCID '  RQCB at !XL,  l_links !XL:!XL,  w_size !UL,  b_type !UL',
+		    .rqcb, .rqcb [rqcb_l_flink], .rqcb [rqcb_l_blink], .rqcb [rqcb_w_size],
+		    .rqcb [rqcb_b_type]
+		    )
+	);
+    put (
+	debug_fao_buffer  (
+		    %ASCID '    l_seqnum !XL,  l_ident !XL,  l_csid !XL,  l_nod !XL',
+		    .rqcb [rqcb_l_seqnum], .rqcb [rqcb_l_ident], .rqcb [rqcb_l_csid], .rqcb [rqcb_l_nod]
+		    )
+	);
+    put (
+	debug_fao_buffer  (
+		    %ASCID '    t_systemid !XL,!XW,  l_ocd !XL,  l_status !XL,  w_msgtype !UL',
+		    .rqcb [rqcb_l_systemidl], .rqcb [rqcb_w_systemidh], .rqcb [rqcb_l_ocd],
+		    .rqcb [rqcb_l_status], .rqcb [rqcb_w_msgtype]
+		    )
+	);
+    put (
+	debug_fao_buffer  (
+		    %ASCID '    w_replymbx !XW,  l_privmasks !XL:!XL,  l_senderuic !XL',
+		    .rqcb [rqcb_w_replymbx], .rqcb [rqcb_l_privmask1], .rqcb [rqcb_l_privmask2],
+		    .rqcb [rqcb_l_senderuic]
+		    )
+	);
+    put (
+	debug_fao_buffer  (
+		    %ASCID '    t_username "!AF",  t_account "!AF",  b_basepri !UL',
+		    12, rqcb [rqcb_t_username], 8, rqcb [rqcb_t_account], .rqcb [rqcb_b_basepri]
+		    )
+	);
+    put (
+	debug_fao_buffer  (
+		    %ASCID '    b_rqstcode !UL,  b_scope !UL,  l_options !XL, l_rq_options !XL',
+		    .rqcb [rqcb_b_rqstcode], .rqcb [rqcb_b_scope],
+		    .rqcb [rqcb_l_options], .rqcb [rqcb_l_rq_options]
+		    )
+	);
+    put (
+	debug_fao_buffer  (
+		    %ASCID '    l_attnmasks !XL:!XL,  l_rqstid !UL,  l_uic !XL',
+		    .rqcb [rqcb_l_attnmask1], .rqcb [rqcb_l_attnmask2], .rqcb [rqcb_l_rqstid],
+		    .rqcb [rqcb_l_uic]
+		    )
+	);
+    put (
+	debug_fao_buffer  (
+		    %ASCID '    l_mcb !XL,  l_rqstnum !UL,  w_oprsts !XW, w_mbxsize !UL',
+		    .rqcb [rqcb_l_mcb], .rqcb [rqcb_l_rqstnum], .rqcb [rqcb_w_oprsts], .rqcb [rqcb_w_mbxsize]
+		    )
+	);
+    put (
+	debug_fao_buffer  (
+		    %ASCID '    l_oper_len !UL,  l_oper_ptr !XL,  (oper) "!AF"',
+		    .rqcb [rqcb_l_oper_len], .rqcb [rqcb_l_oper_ptr], 
+		    .rqcb [rqcb_l_oper_len], .rqcb [rqcb_l_oper_ptr]
+		    )
+	);
+    put (
+	debug_fao_buffer  (
+		    %ASCID '    l_text_len !UL,  l_text_ptr !XL',
+		    .rqcb [rqcb_l_text_len], .rqcb [rqcb_l_text_ptr]
+		    )
+	);
+    IF .rqcb [rqcb_l_text_len] NEQ 0
+    THEN
+	put (
+	    debug_fao_buffer  (
+			%ASCID '        (text) "!AF"',
+			.rqcb [rqcb_l_text_len], .rqcb [rqcb_l_text_ptr]
+			)
+	    );
+    print_mcb (.rqcb [rqcb_l_mcb]);
+    END;
+
+RETURN;
+END;
+
+ROUTINE print_scb : NOVALUE =	%SBTTL 'print_scb'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Format and print the contents of the SCB
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	global SCB_TABLE
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+LOCAL
+    typ : VECTOR [4, LONG] INITIAL (%ASCID 'RQCB', %ASCID 'MCB ', %ASCID 'OCD ', %ASCID 'NOD '),
+    ptr	: $ref_bblock;
+
+EXTERNAL
+    scb_table : VECTOR [0];
+
+
+! Display the SCB entries
+!
+put (NULL_STRING);
+put (%ASCID 'SCB Table Entries:');
+put (%ASCID '   Type   Address   Block Size   LAL Count   Seqnum        Queue Links');
+
+INCR idx FROM min_ds_type TO max_ds_type
+DO
+    BEGIN
+    ptr = .scb_table [.idx-1];
+    put (
+	debug_fao_buffer  (
+		    %ASCID ' !1UL !AS   !XL  !3UL (!XW)  !3UL (!XW)  !XL  !XL:!XL',
+		    .idx, .typ [.idx-1], .ptr, .ptr [scb_w_size], .ptr [scb_w_size],
+		    .ptr [scb_w_lal_count], .ptr [scb_w_lal_count], .ptr [scb_l_seqnum],
+		    .ptr [scb_l_flink], .ptr [scb_l_blink]
+		    )
+	);
+    END;
+
+RETURN;
+END;
+
+ROUTINE put (desc : $ref_bblock) : NOVALUE =	%SBTTL 'put'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine writes one record to the output file
+!
+! INPUTS:
+!
+!	desc	String descriptor to be written
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+IF NOT .BRIEF
+THEN
+    BEGIN
+    EXTERNAL
+	logfile_rab : $bblock;
+    logfile_rab [rab$w_rsz] = .desc [dsc$w_length];
+    logfile_rab [rab$l_rbf] = .desc [dsc$a_pointer];
+    $put (rab = logfile_rab);
+    END;
+
+rab [rab$w_rsz] = .desc [dsc$w_length];
+rab [rab$l_rbf] = .desc [dsc$a_pointer];
+
+IF NOT ($PUT (rab = rab))
+THEN
+    RETURN;
+
+RETURN;
+END;
+
+END						! End of module
+ELUDOM

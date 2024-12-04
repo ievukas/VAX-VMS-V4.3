@@ -1,0 +1,869 @@
+MODULE setdir	(
+		IDENT = 'V04-000',
+    		ADDRESSING_MODE(EXTERNAL=GENERAL,
+    				NONEXTERNAL=LONG_RELATIVE)
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	Set Directory Command
+!
+! ABSTRACT:
+!
+!	This module processes the Set Directory command.
+!
+! ENVIRONMENT:
+!
+!	Vax native, privileged user mode
+!
+!--
+!
+! AUTHOR:	Gerry Smith	 	CREATION DATE: 3-Nov-1981
+!
+! MODIFIED BY:
+!
+!       V03-007 AEW0001         Anne E. Warner           6-Mar-1984
+!               Add error messages to prevent the use of search lists
+!               with devices for directories.
+!                   FILSPCSRCH - File specification contains a searchlist
+!                   NOSRCHLST  - Command does not support search lists
+!               Both are defined in SHRMSG.MSG.
+!
+!	V03-006	GAS0170		Gerry Smith		23-Aug-1983
+!		Instead of simply doing an IO$_ACCESS to get the
+!		directory's header, perform an actual open, by
+!		issuing an IO$_ACCESS OR IO$M_ACCESS, to insure
+!		proper file locking by the XQP.
+!
+!	V03-005	GAS0116		Gerry Smith		 6-Apr-1983
+!		Use the common qualifier routines.
+!
+!	V03-004	GAS0112		Gerry Smith		29-Mar-1983
+!		Fix for the new CLI interface, as well as the new
+!		command dispatcher.
+!
+!	V03-003	GAS0091		Gerry Smith		19-Oct-1982
+!		Change input request for new CLD syntax.
+!
+!	V03-002 GAS0026		Gerry Smith		18-Dec-1981
+!		Use shared message file, and lower fatal messages to
+!		simple error messages.
+!
+!	V03-001	GAS0024		Gerry Smith		14-Dec-1981
+!		Fix /LOG logic
+!
+!
+!**
+
+LIBRARY	'SYS$LIBRARY:LIB';
+LIBRARY 'SYS$LIBRARY:TPAMAC';
+
+
+FORWARD ROUTINE
+    set$directory : NOVALUE,		! Main routine for directory
+    get_quals,				! Get qualifiers and values
+    set_attributes,			! Routine to set directory attributes
+    get_dir;				! Routine to get each directory
+    
+
+EXTERNAL ROUTINE
+    cli$present,			! Determine presence of qualifier
+    cli$get_value,			! Get value of qualifier
+    lib$qual_file_parse,		! Get common qualifiers
+    lib$qual_file_match,		! See if directory matches common quals
+    lib$file_scan,			! Routine to get next directory
+    check_privilege : NOVALUE,		! Routine to check for privilege
+    search_error,			! Where to go if file search fails
+    file_error,				! Where to go if file error occurs
+    parse_uic,				! Routine for parsing UIC strings
+    lib$tparse,				! Parser
+    lib$cvt_dtb,			! Convert decimal to number
+    sys$fao;				! Formatted ASCII output
+
+!
+! Declare external data
+!
+EXTERNAL
+    setfile$flags : BITVECTOR[32],		! Qualifier flags word
+    uic_value,					! Owner UIC
+    group,					! UIC group number
+    member,					! UIC member number
+    vrsn_value,					! Version limit
+!
+! RMS structures
+!
+    file_result : VECTOR[nam$c_maxrss,BYTE],	! Resultant name string
+    file_expanded : VECTOR[nam$c_maxrss,BYTE],	! Expanded name string
+! file_rlf is in own section because it not externally defined.
+    file_nam : $BBLOCK[nam$c_bln],		! File name block
+    file_fab : $BBLOCK[fab$c_bln];		! File FAB
+
+!
+! Error messages
+!
+EXTERNAL LITERAL
+    lib$_filfaimat,			! No match for common quals
+    lib$_quipro,			! Quit processing
+    set$_facility,			! Facility code
+    set$_closeerr,			! Could not close file
+    set$_entered,			! File entered in a directory
+    set$_enterr,			! Error entering file
+    set$_modified,			! File/directory modified
+    set$_notdir,			! Not a directory
+    set$_notods2,			! Not an ODS2 structure
+    set$_readerr,			! Could not read file
+    set$_remerr,			! Could not remove file
+    set$_removed,			! Directory entry removed
+    set$_writeerr;			! Could not write to file
+
+!
+! Declare some shared messages
+!
+$SHR_MSGDEF	(SET,119,LOCAL,
+    		(syntax,	error),
+    		(openin,	error),
+    		(valerr, 	error),
+                (filspcsrch,    error),
+                (nosrchlst,     error));
+
+
+!
+! Literal data definitions
+!
+LITERAL
+    true = 1,
+    false = 0;
+
+LITERAL
+    $EQULST
+	(QUAL_,,1,1,
+	(quit,),			! quit processing
+	(log,),				! LOG bit
+	(owner,),			! OWNER_UIC bit
+	(vrsn,));			! VERSION_LIMIT bit
+
+!
+! Declare the context longword
+!
+OWN
+    file_rlf : $NAM(),
+    context;
+
+
+!
+! TPARSE table for directories
+!
+$INIT_STATE (dir_state,dir_keys);
+
+$STATE	(dirstart,
+	(tpa$_octal,,,,group));			! Get the group number
+
+$STATE	(,
+	(','));					! Get rid of the comma
+
+$STATE	(,
+	(tpa$_octal,tpa$_exit,,,member));	! Get the member number
+
+PSECT OWN = $OWN$;
+PSECT GLOBAL = $GLOBAL$;
+
+GLOBAL ROUTINE set$directory : NOVALUE =
+!++
+!
+! Functional description
+!
+!	This is the main control module for SET DIRECTORY.  It calls
+!	LIB$FILE_SCAN to perform the necessary functions on the directory
+!	specified in the call to SET.
+!
+! Calling sequence
+!
+!	CALL set$directory()
+!
+! Input parameters
+!	none
+!
+! Output parameters
+!	none
+!
+! Implicit outputs
+!	none
+!
+! Routine value
+!	none
+!
+! Side effects
+!	none
+!
+!--
+BEGIN
+
+
+LOCAL
+    status,
+    dir_desc : $BBLOCK[dsc$c_s_bln];
+
+!
+! Check that the image is running with appropriate privilege.
+!
+check_privilege();
+
+!
+! Get the common qualifiers.
+!
+status = lib$qual_file_parse(%REF(lib$m_cqf_exclude OR
+    				  lib$m_cqf_before OR
+    				  lib$m_cqf_since OR
+    				  lib$m_cqf_created OR
+    				  lib$m_cqf_modified OR
+    				  lib$m_cqf_expired OR
+    				  lib$m_cqf_backup OR
+    				  lib$m_cqf_confirm OR
+    				  lib$m_cqf_byowner),
+    			     context);
+IF NOT .status
+THEN (SIGNAL(.status); RETURN);
+
+!
+! Get the command qualifiers.
+!
+IF NOT get_quals()
+THEN RETURN;
+
+!
+! For each directory specified, find the directory and perform the
+! operations requested.
+!
+$init_dyndesc(dir_desc);		! Make the descriptor dynamic
+file_fab[fab$l_ctx] = false;		! Initialize for get_dir routine
+
+WHILE get_dir(dir_desc)
+DO
+    BEGIN
+    lib$file_scan(			! For each directory found
+		  file_fab,		! Use this fab
+		  set_attributes,	! Go here if directory found
+		  search_error)		! Or here if error
+    END;
+
+RETURN;
+END;
+
+ROUTINE get_quals =
+!++
+!
+! This routine interrogates the CLI for qualifiers and values.  If an
+! error occurs, it is signaled and control is returned with a value of
+! FALSE.
+!
+!--
+BEGIN
+
+LOCAL
+    status,
+    desc : $BBLOCK[dsc$c_s_bln];		! General descriptor
+
+$init_dyndesc(desc);				! Make it dynamic
+
+!
+! Get the simple flags first.
+!
+setfile$flags[qual_log] = cli$present(%ASCID 'LOG');
+
+!
+! /OWNER_UIC
+!
+IF cli$present(%ASCID 'OWNER_UIC')
+THEN
+    BEGIN
+    setfile$flags[qual_owner] = 1;		! If present, set bit
+!
+! If no value on /OWNER_UIC, then call GETJPI to get this process's UIC.
+!
+    IF NOT cli$get_value(%ASCID 'OWNER_UIC', desc)
+    THEN
+	BEGIN
+	LOCAL
+	    iosb : VECTOR[4,WORD];
+	status = $GETJPIW(ITMLST = UPLIT(WORD(4,jpi$_uic),
+					 uic_value,
+					 0,
+					 0),
+			   IOSB = iosb);
+	IF .status 
+	THEN status = .iosb[0];
+	IF NOT .status
+	THEN
+	    BEGIN
+	    SIGNAL(.status);
+	    RETURN false;
+	    END;
+	END
+!
+! Otherwise, assume a real UIC.  Parse the string.
+!
+    ELSE
+	BEGIN
+    	IF NOT (status = parse_uic(desc, uic_value))
+    	THEN
+	    BEGIN
+	    SIGNAL(set$_syntax, 1, desc);
+	    RETURN false;
+	    END;
+    	END;
+    END;
+
+!
+! Now for the version limit.
+!
+IF cli$present(%ASCID 'VERSION_LIMIT')
+THEN
+    BEGIN
+    setfile$flags[qual_vrsn] = 1;		! Show that /VERSION specified
+    vrsn_value = 32767;				! Set to the default
+    IF cli$get_value(%ASCID 'VERSION_LIMIT', desc)
+    THEN
+	BEGIN
+	IF NOT lib$cvt_dtb(.desc[dsc$w_length],
+			   .desc[dsc$a_pointer],
+			   vrsn_value)
+	THEN
+	    BEGIN
+	    SIGNAL(set$_syntax, 1, desc);
+	    RETURN false;
+	    END;
+	IF .vrsn_value LSS 0
+	OR .vrsn_value GTR 65535
+	THEN (SIGNAL(set$_valerr); RETURN false);
+    	END;
+    END;
+
+RETURN true;
+END;
+
+ROUTINE set_attributes (fab) =
+!++
+!
+! This is the routine that accesses the directory and sets the
+! specified attributes.  If an error occurs while attempting to set
+! the attributes, a message telling the user is issued, and any other
+! directories are processed.
+!
+!--
+BEGIN
+
+MAP
+    fab : REF $BBLOCK;			! Define the fab
+
+LOCAL
+    atr : BLOCKVECTOR[3,8,BYTE],	! Attribute control block
+    ptr,				! Pointer to attribute block
+    status,				! Status return
+    channel : WORD,			! Channel number
+    desc : $BBLOCK[dsc$c_s_bln],		! General descriptor
+    dir_desc : $BBLOCK[dsc$c_s_bln],	! Descriptor for directory
+    string : VECTOR[nam$c_maxrss,BYTE],	! String to build directory
+    fib : $BBLOCK[fib$c_extdata],	! A FIB for the QIO 
+    header : $BBLOCK[512],		! The file header
+    iosb : VECTOR[4,WORD];		! I/O status block
+
+BIND
+    recattr = header[fh2$w_recattr] : $BBLOCK[atr$s_recattr],
+
+    nam = .fab[fab$l_nam] : $BBLOCK;	! Define the name block
+
+IF .setfile$flags[qual_quit]
+THEN RETURN true;
+
+!
+! Build a descriptor to point to the directory.
+!
+CH$MOVE(.nam[nam$b_rsl],			! Move this many characters
+	.nam[nam$l_rsa],			! From the nam
+	string);				! To the temp string
+dir_desc[dsc$a_pointer] = string;		! Point to the string
+dir_desc[dsc$w_length] = .nam[nam$b_rsl];	! Fill in the size
+!
+! Move the final bracket over, to get the name of the final directory
+!
+string[.nam[nam$b_dev]
+       + .nam[nam$b_dir]
+       + .nam[nam$b_name]] = .string[.nam[nam$b_dev]
+				     + .nam[nam$b_dir]
+				     - 1] ;
+string[.nam[nam$b_dev]	
+       + .nam[nam$b_dir] - 1] = '.' ;	! Replace bracket with dot
+dir_desc[dsc$w_length] = .nam[nam$b_dev]
+			+ .nam[nam$b_dir]
+			+ .nam[nam$b_name] + 1;	! Update string length
+!
+! If the directory looks like [000000.something], get rid of the leading
+! zeroes and dot.
+!
+IF NOT CH$FAIL(status = CH$FIND_SUB(.dir_desc[dsc$w_length],
+				    .dir_desc[dsc$a_pointer],
+				    6,
+				    UPLIT('000000')))
+
+THEN
+    BEGIN
+    CH$MOVE(.dir_desc[dsc$w_length] - (.status + 7 - .dir_desc[dsc$a_pointer]),
+	    .status + 7,
+	    .status);
+    dir_desc[dsc$w_length] = .dir_desc[dsc$w_length] - 7;
+    END;
+
+!
+! Check to see if this directory file matches the requested qualifiers
+!
+status = lib$qual_file_match(context,		! Call the common qualifier routine
+    			     .fab,		! fab for directory
+    			     0,		! 
+    			     %ASCID 'Modify !AS? [N]: ',
+    			     %REF(dir_desc));
+
+IF NOT .status				! If the status is false, check
+THEN					! what kind of "error"
+    BEGIN				!
+    IF .status EQL lib$_filfaimat	! If no match, return
+    THEN RETURN true
+    ELSE IF .status EQL lib$_quipro	! If quit-right now,
+    THEN
+	BEGIN
+	setfile$flags[qual_quit] = 1;	! set a flag
+	RETURN true;			! and leave
+	END
+    ELSE				! For any other error,
+	BEGIN
+	SIGNAL(.status);		! signal it and
+	RETURN true;			! go away
+	END;
+    END;
+    
+!
+! Assign a channel to the file's device
+!
+desc[dsc$w_length] = .nam[nam$b_dev];	! Set up the descriptor
+desc[dsc$a_pointer] = .nam[nam$l_dev];	! to point to the device name
+
+IF NOT (status = $ASSIGN(
+    			DEVNAM = desc,
+    			CHAN = channel))
+THEN 
+    BEGIN
+    file_error( set$_openin,
+		.status,.fab);		! Tell user why the assign failed
+    RETURN true;			! And continue with other files
+    END;
+
+!
+! Access the directory, reading its header
+!
+desc[dsc$w_length] = fib$c_extdata;	! Re-use descriptor to point to FIB
+desc[dsc$a_pointer] = fib;
+
+CH$FILL(0,fib$c_extdata,fib);		! Zero out the FIB
+
+fib[fib$l_acctl] = fib$m_write OR	! Set up the FIB
+    		   fib$m_noread OR
+    		   fib$m_nowrite;
+
+fib[fib$w_fid_num] = .nam[nam$w_fid_num];	! Put in the file id
+fib[fib$w_fid_seq] = .nam[nam$w_fid_seq];
+fib[fib$w_fid_rvn] = .nam[nam$w_fid_rvn];
+
+atr[0,atr$w_type] = atr$c_header;		! Get the file header
+atr[0,atr$w_size] = atr$s_header;
+atr[0,atr$l_addr] = header;
+atr[1,0,0,32,0] = 0;
+
+status = $QIOW(	CHAN = .channel,		! Access the file, reading
+		FUNC = IO$_ACCESS OR IO$M_ACCESS,	! the file header
+		IOSB = iosb,
+		P1 = desc,
+		P5 = atr);
+IF .status THEN status = .iosb[0];
+IF NOT .status 					! If there was an error,
+THEN file_error(set$_readerr,.status,.fab)	! tell the user what it was
+ELSE
+    BEGIN
+!
+! Check to see that this is a directory file.  This check is only good for
+! an ODS2 volume.
+!
+    IF .header[fh2$b_struclev] EQL 2 
+    AND NOT .header[fh2$v_directory]
+    THEN
+	BEGIN
+	desc[dsc$w_length] = .nam[nam$b_rsl];
+	desc[dsc$a_pointer] = .nam[nam$l_rsa];
+	SIGNAL (set$_writeerr,				! Error writing to
+		1,
+		desc,					! This file
+		set$_notdir);				! For this reason
+	END
+    ELSE
+	BEGIN
+!
+! See what qualifiers were set.  Build the attribute control blcok
+! as we go.
+!
+	ptr = 0;			! Nothing on control block
+
+	IF .setfile$flags[qual_vrsn]
+	THEN
+	    BEGIN
+
+!
+! Change the version limit for the directory
+!
+	    atr[0,atr$w_type] = atr$c_recattr;
+	    atr[0,atr$w_size] = atr$s_recattr;
+	    atr[0,atr$l_addr] = recattr;
+	    recattr[fat$w_versions] = .vrsn_value;
+	    ptr = .ptr + 1;				! Update the pointer
+	    END;
+
+	If .setfile$flags[qual_owner]
+	THEN
+	    BEGIN
+!
+! Change the owner uic
+!
+	    atr[.ptr,atr$w_type] = atr$c_uic;
+	    atr[.ptr,atr$w_size] = atr$s_uic;
+	    atr[.ptr,atr$l_addr] = uic_value;
+	    ptr = .ptr + 1;				! Update the pointer
+	    END;
+
+!
+! Look to see if the pointer has been changed.  If yes, modify the header.
+!
+	IF .ptr NEQ 0
+	THEN
+	    BEGIN
+	    atr[.ptr,0,0,32,0] = 0;		! Put a zero at end of list
+	    status = $QIOW( CHAN = .channel,	! Make the modifications
+			    FUNC = IO$_MODIFY,
+			    IOSB = iosb,
+			    P1 = desc,
+			    P5 = atr);
+	    IF .status THEN status = .iosb[0];
+	    IF NOT .status			! If the modify failed, tell user
+	    THEN file_error(set$_writeerr,.status,.fab)
+	    ELSE
+		IF .setfile$flags[qual_log]		! If /LOG, tell user
+		THEN SIGNAL(set$_modified,1,dir_desc);
+	    $QIOW(CHAN = .channel,			! Deaccess the file
+	    	  FUNC = IO$_DEACCESS,
+		  IOSB = iosb,
+		  P1 = desc);
+	    END;				! End of header modify
+	END;					! End of qualifier scan
+!
+! Deassign the channel
+!
+    IF NOT (status = $DASSGN(CHAN = .channel))
+    THEN file_error(set$_closeerr, .status, .fab);
+    END;
+
+RETURN true;
+END;
+
+ROUTINE get_dir (dir_desc) =
+!++
+!
+! This routine is called to get each directory spec from the command line.
+! When there are no more directories, a value of FALSE is returned.
+!
+!--
+BEGIN
+
+MAP dir_desc : REF $BBLOCK;
+
+LOCAL
+    desc : $BBLOCK[dsc$c_s_bln],		! General descriptor
+    endchar : BYTE,			! End-of-directory character
+    eos,				! End of string
+    ptr,				! Pointer in string
+    str_ptr,				! Pointer to rest of string
+    str_len,				! Length of rest of string
+    temp_string : VECTOR[nam$c_maxrss,BYTE],	! The temporary string
+    temp,
+    status;
+
+IF .setfile$flags[qual_quit]
+THEN RETURN false;
+
+!
+! Check here to see if a trailing ellipse is being treated.  If so,
+! then FILE_FAB[FAB$L_CTX] will be set to TRUE, and there's no need
+! to search and see if such a trailing ellipse is present.  However,
+! if the value is set to FALSE, then get a new directory spec.
+!
+IF NOT .file_fab[fab$l_ctx]		! If not processing an ellipse
+THEN					! then get the next directory
+    BEGIN
+    IF NOT cli$get_value(%ASCID 'DIRECTORY', .dir_desc)
+    THEN RETURN false;
+
+    file_fab[fab$l_fna] = .dir_desc[dsc$a_pointer];
+    file_fab[fab$b_fns] = .dir_desc[dsc$w_length];
+
+!
+! Since this is a new entry, it must be checked for a trailing ellipse.
+!
+    CH$MOVE( .dir_desc[dsc$w_length],	! Move this many chars
+	     .dir_desc[dsc$a_pointer],	! From the CLI area
+	     temp_string);		! To the temp string
+    str_ptr = temp_string;		! Set up pointer
+    str_len = .dir_desc[dsc$w_length];	! and length.
+!
+! Look for ellipses.
+!
+    WHILE NOT CH$FAIL(temp = CH$FIND_SUB(.str_len, .str_ptr, 3, UPLIT('...')))
+    DO
+	BEGIN
+	str_ptr = .temp + 3;		! Update pointer
+	str_len = .str_len - (.temp - .str_ptr) - 3;
+	END;
+!
+! After the final ellipse, check to see if it is at the end of the
+! directory specification.  If so, then change the context field of
+! the fab, and insert an end bracket at the beginning of the ellipse.
+!
+    IF (.str_ptr EQL temp_string + .file_fab[fab$b_fns] -1)
+    THEN
+	BEGIN
+	file_fab[fab$l_ctx] = true;		! Show that there's a trailing ellipse
+	CH$WCHAR(..str_ptr, .str_ptr - 3);	! Put the end bracket in place
+	file_fab[fab$l_fna] = temp_string;	! Set up FAB fields
+	file_fab[fab$b_fns] = .str_ptr - 3 - temp_string + 1;
+	END;
+    END
+!
+! If here, then the trailing ellipse has been processed, and this is the 
+! second time thru.  Restore the original file name.
+!
+ELSE
+    BEGIN
+    file_fab[fab$l_fna] = .dir_desc[dsc$a_pointer];	! Original filename
+    file_fab[fab$b_fns] = .dir_desc[dsc$w_length];	! Original length
+    file_fab[fab$l_ctx] = false;			! Ellipse processed
+    END;
+
+!
+! Parse the input string
+!
+$NAM_INIT (NAM = file_rlf);				! Re-init the RLF
+IF (.file_nam[nam$b_dev] NEQ 0)				! If a device was
+THEN							! specified, then
+    BEGIN
+    file_fab[fab$l_dna] = .file_nam[nam$l_dev];		! Make device sticky
+    file_fab[fab$b_dns] = .file_nam[nam$b_dev];
+    END;
+IF NOT (status = $PARSE(FAB = file_fab))
+THEN
+    BEGIN
+    desc[dsc$w_length] = .file_fab[fab$b_fns];
+    desc[dsc$a_pointer] = .file_fab[fab$l_fna];
+    SIGNAL_STOP(set$_syntax,
+		1, desc, .status);
+    END;
+
+!
+! Check the parsed string for legality, i.e. nothing after the directory
+!
+IF (.file_nam[nam$b_name] NEQ 0 OR
+    .file_nam[nam$b_type] NEQ 1 OR
+    .file_nam[nam$b_ver]  NEQ 1 )
+THEN 
+    BEGIN
+    desc[dsc$w_length] = .file_fab[fab$b_fns];
+    desc[dsc$a_pointer] = .file_fab[fab$l_fna];
+    SIGNAL_STOP(set$_syntax,
+		1, desc, ss$_badirectory);
+    END;
+!
+! Check if a search list is used.  If so SIGNAL, as search lists are not
+! allowed (for devices) in this application.
+!
+IF .file_nam[nam$v_search_list] 
+THEN
+    SIGNAL_STOP(set$_filspcsrch, 1, .dir_desc, set$_nosrchlst);
+!
+! Determine what the directory terminator character was, and save it.
+!
+endchar = .(.file_nam[nam$l_dir] + .file_nam[nam$b_dir] - 1);
+
+!
+! The directory string must now be analyzed and manipulated so that the
+! final directory entry becomes a file.  First, initialize some pointers.
+!
+desc[dsc$w_length] = .file_nam[nam$b_esl] - 2;
+desc[dsc$a_pointer] = .file_nam[nam$l_esa];
+str_ptr = .desc[dsc$a_pointer];
+str_len = .desc[dsc$w_length];
+ptr = 0;
+eos = .desc[dsc$a_pointer] + .desc[dsc$w_length] -1;
+
+!
+! Look for wildcard ellipses
+!
+WHILE NOT CH$FAIL(temp = CH$FIND_SUB(.str_len, .str_ptr, 3, uplit('...')))
+DO
+    BEGIN
+!
+! Make PTR point to the beginning of the "...", and advance the string
+! pointer to the character just past the "..."
+!
+    ptr = .temp;
+    str_len = .str_len - (.temp - .str_ptr) -3;
+    str_ptr = .temp + 3;
+    END;
+
+!
+! If there was any occurrence of "...", point just past it.
+!
+IF .ptr NEQ 0 THEN ptr = .ptr + 3;
+
+!
+! Find the last directory in the specification
+!
+WHILE NOT CH$FAIL( temp = CH$FIND_CH(.str_len, .str_ptr, '.'))
+DO
+    BEGIN
+!
+! Make PTR point to the ".", and advance the string pointer to 
+! the first character after the "."
+!
+    ptr = .temp;
+    str_len = .str_len - (.temp - .str_ptr) - 1;
+    str_ptr = .temp + 1;
+    END;
+
+IF .ptr NEQ 0
+THEN
+    BEGIN
+!
+! If here, then either a trailing ellipse, or a final sub-directory
+! was specified.  If the pointer is at the bracket, then there is a 
+! trailing ellipse, in which case only a "*" is required.
+!
+    IF .ptr EQL .eos
+    THEN
+	BEGIN
+	CH$A_WCHAR('*', ptr);		! Stick an asterisk after the bracket.
+	ptr = .ptr + 1;			! Adjust the pointer.
+	END
+!
+! If the pointer is inside the bracket, then the last directory name
+! must be moved out of the brackets.
+!
+    ELSE
+	BEGIN
+!
+! Check to see if the directory is [main.sub] or [main...sub]
+!
+	IF .ptr EQLU .str_ptr
+	THEN
+	    BEGIN			! [main...sub] form
+	    str_len = .eos - .ptr;
+	    CH$MOVE(.str_len, .ptr, .ptr+1);
+	    CH$WCHAR(.endchar, .ptr);
+	    ptr = .ptr + .str_len + 1;
+	    END				! end of [main...sub] processing
+	ELSE
+	    BEGIN			! [main.sub] form
+	    str_len = .eos - .str_ptr;
+	    CH$WCHAR_A(.endchar, ptr);
+	    ptr = .ptr + .str_len;
+	    END;			! end of [main.sub] processing
+	END;
+    END					! End of non-zero pointer stuff
+ELSE
+    BEGIN
+!
+! If the pointer is still zero, then there is either a wildcard, a main
+! directory, or a [g,m] directory.  In all such cases, a main directory
+! of [000000] must be fabricated.
+!
+    status = CH$FIND_CH(.str_len, .str_ptr, ',');	! Save for later
+!
+! Move the string out seven spaces and insert "000000]"
+!
+    str_ptr = .desc[dsc$a_pointer] + .file_nam[nam$b_dev] + 1;
+    temp = CH$MOVE(.eos - .str_ptr, .str_ptr, .str_ptr + 7);
+    str_ptr = CH$MOVE(6, UPLIT('000000'), .str_ptr);
+    CH$MOVE(1, endchar, .str_ptr);
+!
+! If no comma was found, then all that is required is to update the 
+! pointer.
+!
+    IF CH$FAIL(.status) THEN ptr = .temp
+!
+! Otherwise, it's a [g,m] directory.  Convert it.
+!
+    ELSE
+	BEGIN
+
+	LOCAL tparse_block : $BBLOCK[tpa$k_length0];	! Define a TPARSE block
+
+	CH$FILL(0, tpa$k_length0, tparse_block);	! Zero it.
+	tparse_block[tpa$l_count] = tpa$k_count0;	! Fill in size
+
+	tparse_block[tpa$l_stringcnt] = .eos - .str_ptr;
+	tparse_block[tpa$l_stringptr] = .str_ptr + 7;
+	IF NOT (status = lib$tparse(tparse_block,
+				    dir_state,
+				    dir_keys))
+	THEN SIGNAL_STOP(.status)
+	ELSE
+	    BEGIN
+	    LOCAL temp_desc : $BBLOCK[dsc$c_s_bln];
+	    temp_desc[dsc$w_length] = 6;
+	    temp_desc[dsc$a_pointer] = .str_ptr + 7;
+	    IF NOT (status = SYS$FAO($descriptor('!2(3OW)'),
+				     temp_desc,
+				     temp_desc,
+				     .group,
+				     .member))
+	    THEN SIGNAL_STOP(.status)
+	    ELSE ptr = .str_ptr + 14;
+	    END;
+	END;
+    END;
+ptr = CH$MOVE(4, UPLIT('.DIR'), .ptr);
+file_fab[fab$b_fns] = .ptr - .desc[dsc$a_pointer];
+file_fab[fab$l_fna] = .desc[dsc$a_pointer];
+
+RETURN true;
+END;
+
+END
+ELUDOM

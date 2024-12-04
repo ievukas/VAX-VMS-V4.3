@@ -1,0 +1,878 @@
+%TITLE	'DECnet Ethernet Configurator Module'
+MODULE CNFMAIN	(
+		LANGUAGE (BLISS32),
+		IDENT = 'V04-000',
+		MAIN = CNF$MAIN
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	DECnet Configurator Module (NICONFIG)
+!
+! ABSTRACT:
+!
+!	This module contains the main entry for NICONFIG, which 
+!	provides the DECnet Configurator Module, as well as a
+!	few routines of general utility.
+!
+!	NICONFIG listens to the system ID messages broadcast 
+!	regularly by devices on the NI and maintains a data 
+!	base which can be queried.
+!
+!	To issue commands to NICONFIG, the user uses NCP, which 
+!	generates messages in the NICE protocol which it passes to NML.
+!	NICONFIG is started by the network in response to a 
+!	request for a logical link connection by NML.  NML then
+!	passes the NICE message, in tact, to NICONFIG for processing.
+!
+! ENVIRONMENT:	VAX/VMS Operating System
+!
+!	NICONFIG requires the following privileges for proper execution:
+!		LOG_IO, SYSNAM
+!
+! AUTHOR:	Bob Grosso, 	CREATION DATE:  13-Oct-1982
+!
+! MODIFIED BY:
+!
+!	V03-003	RPG0003		Bob Grosso		16-May-1983
+!		Correct zero virtual memory bug.
+!
+!	V03-002	RPG0002		Bob Grosso		02-May-1983
+!		Check for NETMBX and TMPMBX privileges.
+!
+!	V03-001	RPG0001		Bob Grosso		10-Mar-1983
+!		Look for require file in SRC$ directory.
+!
+!--
+
+%SBTTL	'Definitions'
+
+!
+! INCLUDE FILES:
+!
+
+LIBRARY 'SYS$LIBRARY:STARLET';		! VMS common definitions
+
+LIBRARY 'SHRLIB$:NET';			! Network definitions
+
+REQUIRE 'LIB$:CNFDEF.R32';
+
+REQUIRE 'SRC$:CNFPREFIX.REQ';		! Collection of useful macros
+					!  and literals
+!
+! BUILTIN functions
+!
+
+BUILTIN
+    INSQUE,				! INSQUE instruction
+    REMQUE;				! REMQUE instruction
+
+!
+! LITERALS
+!
+
+GLOBAL LITERAL
+
+    CNF$C_MAXMBXMSG = 124,		! Maximum size of mailbox message
+    CNF$C_SYNCH_EFN = 1,		! Synchronous event flag number
+    CNF$C_ASYNCH_EFN = 2,		! Asynchronous event flag number
+    CNF$C_STARTUP_EFN = 3;		! Event flag number for startup timer
+
+
+!
+! OWN STORAGE:
+!
+
+GLOBAL
+	CNF$GL_LOGMASK : BITVECTOR [32],! Logging control mask
+
+	CNF$GQ_CIRSURLST : VECTOR [2],	! List of circuit under surveillance
+	CNF$GQ_IRBLST : VECTOR [2],	! Listhead for incoming links
+	CNF$A_MBXMSG  			! Mailbox message buffer
+		: VECTOR [CNF$C_MAXMBXMSG, BYTE],
+	CNF$W_NETCHAN : WORD,		! Channel opened to network
+	CNF$W_MBXCHAN : WORD,		! Channel to mailbox
+	CNF$B_SURVEILLANCE_SET,		! Boolean: mark if surveillance has been set
+	CNF$B_STARTING_UP;		! Boolean: mark if still starting up
+
+OWN
+	CNF$Q_A_STARTUP_WAIT :		! ASCII wait delta time (3 minutes)
+		BBLOCK [DSC$C_S_BLN]
+		INITIAL (%CHARCOUNT ('0 00:03:00.00'),
+			UPLIT PSECT ($OWN$) (%ASCII '0 00:03:00.00')),
+		
+	CNF$Q_B_STARTUP_WAIT : VECTOR [2,LONG],	! Time in binary converted from ASCII
+	CNF$L_VM;			! Tally of virtual memory allocated
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+
+	CNF$MAIN,			! Main entry
+	CHECK_PRIVS	: NOVALUE,	! Check that NICONFIG is executing with sufficient privileges
+	INIT_LOG	: NOVALUE,	! Initialize for debug logging
+	INIT_DATA	: NOVALUE,	! Initialize data structures
+	DECLARE_OBJNAM 	: NOVALUE,	! Declare $NICONFIG to the Net
+	SET_TIME_BOMB	: NOVALUE,	! Set timer to verify a valid SET command was received
+	TIME_BOMB	: NOVALUE,	! Queue work item to abort if there are no surveillance requests
+	TERMINATE_GRACE	: NOVALUE,	! Terminate the grace period
+	CNF$TRACE	: NOVALUE,	! Log messages to log file
+	CNF$LOG_DATA	: NOVALUE,	! Log messages to log file
+	CNF$EXIT	: NOVALUE;	! Clean up and exit
+
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL ROUTINE
+
+!   Module CNFINTRPT
+
+	CNF$SOLICIT_INTERRUPT	: NOVALUE,	! Solicit work items
+
+!   Module CNFWORKQ
+
+	WKQ$ADD_WORK_ITEM,			! Add work to the work queue
+	WKQ$DO_WORK_ITEM;			! Perform work on work queue
+
+EXTERNAL ROUTINE
+
+	LIB$ASN_WTH_MBX		: ADDRESSING_MODE (GENERAL),
+	LIB$CVT_HTB		: ADDRESSING_MODE (GENERAL),
+	LIB$GET_VM		: ADDRESSING_MODE (GENERAL),
+	LIB$FREE_VM		: ADDRESSING_MODE (GENERAL),
+	LIB$PUT_OUTPUT		: ADDRESSING_MODE (GENERAL);
+
+EXTERNAL LITERAL
+
+	CNF$_GETVM,		! Allocated !UL bytes of virtual memory, total of !UL
+	CNF$_FAILFREVM,		! Failed to deallocate !UL bytes of virtual memory
+	CNF$_FAILGETVM,		! Failed to allocate !UL bytes of virtual memory
+	CNF$_FREEVM,		! Deallocated !UL bytes of virtual memory leaving !UL
+	CNF$_LOGIC,		! Program logic error, or unexpected condition
+	CNF$_LOGIO,		! NICONFIG requires LOG_IO privilege
+	CNF$_NETASN,		! Failed to declare name to network
+	CNF$_NETMBX,		! NICONFIG requires NETMBX privilege
+	CNF$_PRIV,		! Privilege error
+	CNF$_SYSNAM,		! NICONFIG requires SYSNAM privilege
+	CNF$_TMPMBX;		! NICONFIG requires TMPMBX privilege
+
+
+%SBTTL	'CNF$MAIN  Main Entry'
+GLOBAL ROUTINE CNF$MAIN =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!  This is the main entry point for the Configurator Module.
+!  It calls the initialization routines and sits in a loop 
+!  performing work from the work queue.
+!  If after the termination of the startup grace period, 
+!  no work requests have specified that NICONFIG place one
+!  or more circuits under surveillance, it will quietly go
+!  away.
+!	
+! FORMAL PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+    BEGIN
+
+    CHECK_PRIVS ();			! Ensure that NICONFIG is executing with sufficient privilege
+
+    INIT_LOG ();			! Initialize for debug logging
+
+    INIT_DATA ();			! Initialize data structures
+
+    DECLARE_OBJNAM ();
+    CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR('TRACE'), $DESCRIPTOR ('Object name declared'));
+
+    !
+    !	Issue a timer AST to wake up some in the future so that a check 
+    !	a check can be performed to ensure that useful work is being done, 
+    !	and a decision made whether or not to terminate.
+    !
+    SET_TIME_BOMB ();
+
+    CNF$SOLICIT_INTERRUPT ();		! See if anyone wants to issue a Net connect
+
+    !
+    !	So long as at least one circuit is under surveillance
+    !	or the startup grace period is in effect,
+    !	process the work queue.
+    !
+    WHILE (.CNF$B_SURVEILLANCE_SET OR .CNF$B_STARTING_UP) DO
+	BEGIN
+	$HIBER;				! ZZZzzZZZzzz  until some work comes in
+	CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR('TRACE'), $DESCRIPTOR ('Wakeup to perform work items'));
+
+	WHILE WKQ$DO_WORK_ITEM () DO	! Perform work until queue is empty
+	END;
+
+    CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR ('TRACE'),
+	$DESCRIPTOR ('Aborting --- No surveillance requested'));
+
+    CNF$EXIT (SS$_NORMAL);		! Exit sucessfully
+    RETURN SS$_NORMAL;			! Added for completeness
+    END;				! MAIN routine
+
+%SBTTL 'check_privs	Check execution privileges'
+ROUTINE CHECK_PRIVS : NOVALUE =
+ 
+!++
+!
+!  This routine verifies that NICONFIG is executing with the proper
+!  privileges.
+!
+!  Signal those privileges which are lacking.
+!
+!--
+    BEGIN
+    LOCAL
+	ABORT,
+	PRIVMASK : BBLOCK [8],
+	STATUS;
+
+    CH$FILL (0, 8, PRIVMASK);		! Initialize to zero
+    $SETPRV (PRVPRV = PRIVMASK);	! Obtain privileges set in CURPRV
+
+    ABORT = FALSE;
+
+    !
+    !	Check for the required privileges
+    !
+    IF (NOT .PRIVMASK [PRV$V_LOG_IO] OR
+	NOT .PRIVMASK [PRV$V_SYSNAM] OR
+	NOT .PRIVMASK [PRV$V_NETMBX] OR
+	NOT .PRIVMASK [PRV$V_TMPMBX])
+    THEN
+	BEGIN
+	SIGNAL (CNF$_PRIV);
+	ABORT = TRUE;
+	END;
+
+    IF NOT .PRIVMASK [PRV$V_LOG_IO]	! For reading system ID messages
+    THEN SIGNAL (CNF$_LOGIO);
+    IF NOT .PRIVMASK [PRV$V_SYSNAM]	! For declaring itself as a known object
+    THEN SIGNAL (CNF$_SYSNAM);
+    IF NOT .PRIVMASK [PRV$V_NETMBX]	! For declaring itself as a known object
+    THEN SIGNAL (CNF$_NETMBX);
+    IF NOT .PRIVMASK [PRV$V_TMPMBX]	! For declaring itself as a known object
+    THEN SIGNAL (CNF$_TMPMBX);
+
+    IF .ABORT THEN CNF$EXIT (SS$_NORMAL);	! No point in continuing
+    RETURN;
+    END;				! Routine Check_privs
+
+%SBTTL 'init_log	Initialize debug logging'
+ROUTINE INIT_LOG : NOVALUE =
+ 
+!++
+!
+!  This routine initializes the internal logging flags for NICONFIG
+!  debugging.  The logical name NICONFIG$LOG is translated to obtain 
+!  a hex number which is converted to a bit mask used to control 
+!  the type of information to be logged.
+!
+! IMPLICIT INPUTS:
+!
+!	NICONFIG$LOG logical name
+!
+! IMPLICIT OUTPUTS:
+!
+!	Fill in CNF$GL_LOGMASK
+!
+!--
+ 
+    BEGIN
+
+    LITERAL
+	RSLSIZE = 10				! Size of the result buffer
+	;
+ 
+    LOCAL
+	RSLBFR : VECTOR [RSLSIZE, BYTE],	! Buffer for the translation
+	RSLDSC : VECTOR [2]			! Descriptor for the buffer
+	;
+
+    CNF$GL_LOGMASK = 0;				! Initialize the logging mask
+    RSLDSC [0] = RSLSIZE;			! Setup the descriptor
+    RSLDSC [1] = RSLBFR;
+ 
+    IF						! We must get a translation
+	(
+	$TRNLOG					! Translate the name once
+	    (
+	    LOGNAM = %ASCID 'NICONFIG$LOG',	! This is the logical name
+	    RSLLEN = RSLDSC [0],		! Place the length here
+	    RSLBUF = RSLDSC			! Place the translation here
+	    )
+	)
+	EQL
+	SS$_NORMAL				! If a successful translation
+    THEN					! Then convert the result
+	LIB$CVT_HTB				! Convert hex to binary
+	    (
+	    .RSLDSC [0],			! Size of string
+	    .RSLDSC [1],			! Address of string
+	    CNF$GL_LOGMASK			! Address of longword result
+	    );
+    RETURN;
+    END;					! Routine Init_log
+
+%SBTTL 'init_data	Initialize data structures'
+ROUTINE INIT_DATA : NOVALUE =
+ 
+!++
+!
+!  This routine initializes the internal data structures.
+!
+!--
+    BEGIN
+    !
+    !	Initialize doubly linked list heads 
+    !
+
+    !
+    !	List of circuits
+    !
+    CNF$GQ_CIRSURLST [0] = CNF$GQ_CIRSURLST [0];
+    CNF$GQ_CIRSURLST [1] = CNF$GQ_CIRSURLST [0];
+
+    !
+    !	List of Interrupt Request Blocks
+    !
+    CNF$GQ_IRBLST [0] = CNF$GQ_IRBLST [0];
+    CNF$GQ_IRBLST [1] = CNF$GQ_IRBLST [0];
+
+    CNF$L_VM = 0;	! For logging how much virtual memory has been allocated
+    RETURN;
+    END;		! Routine Init_data
+
+%SBTTL 'declare_objnam	Declare object name to Network'
+ROUTINE DECLARE_OBJNAM : NOVALUE =
+ 
+!++
+!
+!  This routine declares its object name, $NICONFIG, to the Network
+!
+!--
+ 
+    BEGIN
+    LOCAL
+	IOSB :		BBLOCK [8],	! IO status block
+	NFB :		BBLOCK [5],	! Network function block for DECLNAME
+	NFB_DESC :	VECTOR [2],	! Descriptor of NFB
+	STATUS;
+
+    OWN					! Object name is $NICONFIG
+	OBJNAM_DESC : BBLOCK [DSC$C_S_BLN]
+		INITIAL (%CHARCOUNT ('$NICONFIG'), 
+			UPLIT PSECT ($OWN$) (%ASCII '$NICONFIG'));
+
+
+    STATUS = LIB$ASN_WTH_MBX ( %ASCID '_NET:',	! Assign channel to NETACP
+		0,0,			! mailbox MAXMSG, BUFQUO (ignored)
+		CNF$W_NETCHAN,		! Channel to NETACP
+		CNF$W_MBXCHAN);		! Channel to mailbox
+
+    IF NOT .STATUS 
+    THEN
+	BEGIN				! There was an error assigning the channel
+	CNF$EXIT (.STATUS);		! No point in continueing
+	END;
+
+    NFB [NFB$B_FCT] = NFB$C_DECLNAME;	! Set function to DECLARE NAME
+    NFB [1,0,32,0] = 0;			! When declaring a name, must be zero
+
+    NFB_DESC [0] = 5;			! Set up descriptor for NFB, size is 5 bytes
+    NFB_DESC [1] = NFB;
+
+    STATUS = $QIOW ( FUNC = IO$_ACPCONTROL,	! Request object name declaration to network    
+		CHAN = .CNF$W_NETCHAN,	! Use assigned channel
+		EFN = CNF$C_SYNCH_EFN,	! Synchronous Event flag number
+		IOSB = IOSB,		! IO status block
+		P1 = NFB_DESC,		! Network function block
+		P2 = OBJNAM_DESC);	! Object name being declared
+
+    IF .STATUS
+    THEN				! sucessful submission
+	STATUS = .IOSB [0,0,16,0];	! pick up final status
+
+    IF .STATUS EQL SS$_BADPARAM		! If object already defined
+    THEN 
+	BEGIN
+	CNF$TRACE (DBG$C_TRACE, 	! Report logic problem
+		$DESCRIPTOR('TRACE'), $DESCRIPTOR ('Object already defined') );
+	CNF$EXIT (SS$_NORMAL);	! Go away quietly
+	END;
+
+    IF NOT .STATUS 
+    THEN				! Signal an error
+	BEGIN
+	SIGNAL (CNF$_NETASN, 0, .STATUS);
+	CNF$EXIT (CNF$_NETASN);
+	END;
+
+    RETURN;
+    END;				! Routine Declare_objnam
+
+%SBTTL 'Set_time_bomb	Wait for a set command before starting surveillance'
+ROUTINE SET_TIME_BOMB : NOVALUE =
+ 
+!++
+!
+!  This routine issues a read to the mailbox and waits for a SET 
+!  command from the initiator who began execution of NICONFIG.
+!  If no command is forthcoming, NICONFIG quietly goes away.
+!
+!--
+ 
+    BEGIN
+    LOCAL
+	STATUS;
+
+    !
+    !	Issue a wait and set an AST routine to go off.
+    !	That AST routine will queue a routine to the work queue that
+    !	will end the startup 'grace' period.
+    !	Then, if no surveillance requests have been received NICONFIG
+    !	will quietly disappear, otherwise it will remain until all
+    !	surveillance is turned off.  This 'grace' period is to avoid multiple
+    !	false starts when someone does a show, realizes NICONFIG is not there
+    !	and then issues a set to start it up.
+    !
+
+    CNF$B_STARTING_UP = TRUE;
+
+    STATUS = $BINTIM (  TIMBUF = CNF$Q_A_STARTUP_WAIT,	! Convert ascii time to binary time
+			TIMADR = CNF$Q_B_STARTUP_WAIT);
+    IF NOT .STATUS THEN SIGNAL (CNF$_LOGIC, 0, .STATUS);
+
+    STATUS = $SETIMR (	EFN = CNF$C_STARTUP_EFN,	! Set the timer
+			DAYTIM = CNF$Q_B_STARTUP_WAIT,
+			ASTADR = TIME_BOMB);		! Routine to call when timer goes off
+    IF NOT .STATUS THEN SIGNAL (CNF$_LOGIC, 0, .STATUS);
+
+    CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR('TRACE'), 
+		$DESCRIPTOR ('Startup verification set'));
+
+    RETURN;
+    END;				! Routine Set_time_bomb
+
+%SBTTL	'time_bomb  Check whether startup should be aborted'
+ROUTINE TIME_BOMB : NOVALUE =
+ 
+!++
+!
+!  Queue routine to the work queue that will end 
+!  startup 'grace' period.  
+!
+!--
+ 
+    BEGIN
+    CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR ('TRACE'),
+	$DESCRIPTOR ('Time_bomb --- End of grace period'));
+
+    WKQ$ADD_WORK_ITEM (TERMINATE_GRACE);	! Terminate the startup period
+
+    RETURN TRUE;
+    END;					! Routine Time_bomb
+
+%SBTTL	'terminate_grace  Check whether startup should be aborted'
+ROUTINE TERMINATE_GRACE : NOVALUE =
+ 
+!++
+!
+!  End startup 'grace' period.  Now as soon as there are no longer any
+!  circuits under surveillance, NICONFIG will quietly go away
+!
+!--
+    BEGIN
+    CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR ('TRACE'),
+	$DESCRIPTOR ('Terminate_grace --- End of grace period'));
+
+    CNF$B_STARTING_UP = FALSE;		! Startup 'Grace' period is over
+
+    RETURN TRUE;
+    END;				! Routine Terminate_grace
+
+%SBTTL	'CNF$TRACE  Log logic trace message to the Log'
+GLOBAL ROUTINE CNF$TRACE (LOGBITNUM, HEADDSC, TRACEDSC) : NOVALUE =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!  Check the logging control mask and if the corresponding bit is set
+!  then print the special message to the log file.  The message
+!  has a header and the tracing text.
+!
+! FORMAL PARAMETERS:
+!
+!	logbitnum	Number of the logging bit to control the type of
+!			logging
+!	headdsc		Address of a descriptor of the header text
+!	tracedsc	Address of a descriptor of the trace information
+!
+! IMPLICIT INPUTS:
+!
+!	CNF$GL_LOGCONTROL
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+    BEGIN
+    BUILTIN
+	NULLPARAMETER;			! Check if parameter was passed to routine
+    MAP
+	HEADDSC		: REF BBLOCK,
+	TRACEDSC	: REF BBLOCK;
+    LITERAL
+	FAOSIZ = 256;			! The print buffer
+    LOCAL
+	FAOBUF : VECTOR [FAOSIZ, BYTE],	! Print buffer
+	FAOLST : VECTOR [8, LONG],	! List of args to $FAOL
+	OUTDSC : VECTOR [2];		! Descriptor of the output line
+ 
+!
+!	See if this text should be logged, and if not then return
+!
+
+    IF NOT .CNF$GL_LOGMASK [.LOGBITNUM]
+    THEN
+	RETURN;
+
+    OUTDSC [0] = FAOSIZ;		! Initialize the output buffer dsc
+    OUTDSC [1] = FAOBUF;
+    FAOLST [0] = .HEADDSC;		! Header text
+    IF NULLPARAMETER (3)
+    THEN
+	FAOLST [1] = 0
+    ELSE
+	FAOLST [1] = .TRACEDSC;		! Trace text dsc
+    FAOLST [2] = 0;
+
+    $FAOL				! Write the header out
+	(
+	CTRSTR = %ASCID '!/  !AS  !AS!/',
+	OUTLEN = OUTDSC [0],
+	OUTBUF = OUTDSC,
+	PRMLST = FAOLST
+	);
+
+    LIB$PUT_OUTPUT (OUTDSC);
+    RETURN;
+    END;				! Routine CNF$TRACE
+
+%SBTTL	'CNF$LOG_DATA  Print a Data Message to the Log'
+GLOBAL ROUTINE CNF$LOG_DATA (LOGBITNUM, HEADDSC, EXTRADSC, DATADSC) : NOVALUE =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!  Check the logging control mask and if the corresponding bit is set
+!  then print the special message to the log file.  The message
+!  has a header and optionally some extra text which explains the
+!  logged message.
+!
+! FORMAL PARAMETERS:
+!
+!	logbitnum	Number of the logging bit to control the type of
+!			logging
+!
+!	headdsc		Address of a descriptor of the header text
+!
+!	extradsc	Address of a descriptor of the extra text (optional)
+!
+!	datadsc		Address of a descriptor of the data to be converted
+!			and printed
+!
+! IMPLICIT INPUTS:
+!
+!	CNF$GL_LOGCONTROL
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+    BEGIN
+    MAP
+	HEADDSC		: REF BBLOCK,
+	EXTRADSC	: REF BBLOCK,
+	DATADSC 	: REF BBLOCK;
+    LITERAL
+	FAOSIZ = 256;			! The print buffer
+    LOCAL
+	FAOBUF : VECTOR [FAOSIZ, BYTE],	! Print buffer
+	FAOLST : VECTOR [100],		! List of args to $FAOL
+	OUTDSC : VECTOR [2],		! Descriptor of the output line
+	BYTES,				! Counter for bytes written
+	CTR : SIGNED,			! A random counter
+	PTR,				! A random pointer
+	ITR_CNT;			! Temporary iteration count
+ 
+!
+!	See if data should be logged, and if not then return
+!
+
+    IF NOT .CNF$GL_LOGMASK [.LOGBITNUM]
+    THEN
+	RETURN;
+
+    OUTDSC [0] = FAOSIZ;		! Initialize the output buffer dsc
+    OUTDSC [1] = FAOBUF;
+    FAOLST [0] = .HEADDSC;		! Header text
+    FAOLST [1] = .DATADSC [DSC$W_LENGTH]; ! Data length
+    FAOLST [2] =			! Extra text dsc
+        (
+	IF .EXTRADSC EQL 0
+	THEN
+	    %ASCID ''
+	ELSE
+	    .EXTRADSC
+	);
+    $FAOL				! Write the header out
+	(
+	CTRSTR = %ASCID '!/  !AS  (length = !UL bytes)!/  !AS!/',
+	OUTLEN = OUTDSC [0],
+	OUTBUF = OUTDSC,
+	PRMLST = FAOLST
+	);
+    LIB$PUT_OUTPUT (OUTDSC);
+
+    CTR = .DATADSC [DSC$W_LENGTH];		! Size of message
+    PTR = .DATADSC [DSC$A_POINTER];		! Its address
+    WHILE .CTR GTR 0 DO				! Process it all
+	BEGIN
+	OUTDSC [0] = FAOSIZ;			! Set a descriptor
+	OUTDSC [1] = FAOBUF;
+	ITR_CNT = MIN (.CTR, 20);		! Get byte count
+	FAOLST [0] = .ITR_CNT;			! Add count parameter
+	FAOLST [.ITR_CNT+1] = .ITR_CNT;		!
+	FAOLST [(.ITR_CNT+1)*2] = .ITR_CNT;
+	INCRU IDX FROM 1 TO .ITR_CNT DO		! A few bytes at a time
+	    BEGIN
+	    FAOLST [.IDX] = .(.PTR) <0, 8, 0>; 	! One for the hex
+	    FAOLST [.IDX + .ITR_CNT+1] = .(.PTR) <0, 8, 0>; ! Decimal
+	    FAOLST [2*(.IDX + .ITR_CNT)+1] = 1;	! One for character
+	    FAOLST [2*(.IDX + .ITR_CNT)+1 + 1] = .PTR;
+	    PTR = .PTR + 1;			! Next one
+	    CTR = .CTR - 1;			! One less
+	    END;
+ 
+	$FAOL					! Saviour of bored programmers
+	    (
+	    CTRSTR = %ASCID '!#(4XB)!/!#(4UB)!/   !#(4AF)!/',
+	    OUTLEN = OUTDSC [0],
+	    OUTBUF = OUTDSC,
+	    PRMLST = FAOLST
+	    );
+ 
+	LIB$PUT_OUTPUT (OUTDSC);		! Write to SYS$OUTPUT
+	END;
+    END;					! CNF$LOG_DATA
+
+%SBTTL	'CNF$EXIT  Clean up and exit'
+GLOBAL ROUTINE CNF$EXIT (STATUS) : NOVALUE =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!  Permit a graceful exit for $NICONFIG
+!
+! FORMAL PARAMETERS:
+!
+!	Status     Code to exit with.
+!
+! IMPLICIT INPUTS:
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Terminate program execution
+!
+!--
+ 
+    BEGIN
+    CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR('TRACE'), 
+		$DESCRIPTOR ('$EXIT'));
+    $EXIT (CODE= .STATUS);
+    END;			! Routine EXIT
+
+%SBTTL	'CNF$GET_ZVM  Get zeroed virtual memory'
+GLOBAL ROUTINE CNF$GET_ZVM (SIZ_ADR, ADR) =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!  This routine allocates virtual memory and zeros it.
+!  It provides a common point for reporting memory errors
+!  and logging memory usage.
+!
+! FORMAL PARAMETERS:
+!
+!	siz_adr		Longword containing the number of bytes to allocate
+!
+!	adr		Address of longword in which to return the starting 
+!			address of the allocated memory.
+!
+! IMPLICIT INPUTS:
+!
+!	CNF$GL_LOGMASK	Determine if memory usage should be logged
+!	CNF$L_VM 	Record a running tally of total memory allocated
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+ 
+    BEGIN
+    LOCAL
+	STATUS;
+
+
+    STATUS = LIB$GET_VM (.SIZ_ADR, .ADR);		! Get the memory
+    IF NOT .STATUS
+    THEN
+	BEGIN
+	SIGNAL_STOP (CNF$_FAILGETVM, 1, ..SIZ_ADR, .STATUS);	! Signal the error
+	END;
+
+    IF .CNF$GL_LOGMASK [DBG$C_VM]			! If memory logging is enabled
+    THEN
+	BEGIN
+	CNF$L_VM = .CNF$L_VM + ..SIZ_ADR;		! Tally it, 
+	SIGNAL (CNF$_GETVM, 2, ..SIZ_ADR, .CNF$L_VM);	! and report it.
+	END;
+
+    CH$FILL (0, ..SIZ_ADR, ..ADR);			! Zero it
+    RETURN TRUE;
+    END;			! Routine CNF$GET_ZVM
+
+%SBTTL	'CNF$FREE_VM  Free virtual memory'
+GLOBAL ROUTINE CNF$FREE_VM (SIZ_ADR, ADR) =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!  This routine deallocates virtual memory.
+!  It provides a common point for reporting memory errors
+!  and logging memory usage.
+!
+! FORMAL PARAMETERS:
+!
+!	siz_adr		Longword containing the number of bytes to deallocate
+!
+!	adr		Address of longword in containing the starting 
+!			address of the allocated memory.
+!
+! IMPLICIT INPUTS:
+!
+!	CNF$GL_LOGMASK	Determine if memory usage should be logged
+!	CNF$L_VM 	Record a running tally of total memory allocated
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+ 
+    BEGIN
+    LOCAL
+	STATUS;
+
+    STATUS = LIB$FREE_VM (.SIZ_ADR, .ADR);		! Deallocate it
+    IF NOT .STATUS
+    THEN
+	BEGIN						! Report any errors
+	SIGNAL (CNF$_FAILFREVM, 1, ..SIZ_ADR, .STATUS);
+	.ADR = 0;
+	RETURN .STATUS;
+	END;
+
+    IF .CNF$GL_LOGMASK [DBG$C_VM]			! If memory logging is enabled
+    THEN
+	BEGIN
+	CNF$L_VM = .CNF$L_VM - ..SIZ_ADR;		! Update tally
+	SIGNAL (CNF$_FREEVM, 2, ..SIZ_ADR, .CNF$L_VM);	! and report it.
+	END;
+
+    RETURN TRUE;
+    END;			! Routine CNF$FREE_VM
+
+END				!End of module CNFMAIN
+ELUDOM

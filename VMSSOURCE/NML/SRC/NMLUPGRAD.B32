@@ -1,0 +1,632 @@
+%TITLE	'Node File Routines for Network Management'
+MODULE NML$UPGRADE (
+		LANGUAGE (BLISS32),
+		ADDRESSING_MODE (NONEXTERNAL=GENERAL),
+		ADDRESSING_MODE (EXTERNAL=GENERAL),
+		IDENT = 'V04-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	DECnet Network Management Listener (NML)
+!
+! ABSTRACT:
+!
+!	This module contains routines which are called only during the
+!	V4.0 upgrade procedure.  The purpose of the routines is
+!		a) to convert the node database to a faster format
+!		   utilizing 4 ISAM keys.
+!		b) since we are now marketing areas, to scan all
+!		   the permanent database files which contain node numbers
+!		   and make sure that any with an area number of 0 are
+!		   given an area number.  The are number used will be
+!		   either one supplied by the customer during the upgrade,
+!		   or area 1.
+!
+! ENVIRONMENT:	VAX/VMS Operating System
+!
+! AUTHOR:	Kathy Perko	, CREATION DATE:  31-Mar-1984
+!
+! MODIFIED BY:
+!
+!--
+
+%SBTTL	'Definitions'
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+    NML$UPGRADE_PERM_DBS,		! Upgrade to V4.0 permanent databases.
+    NML_CONVERT_NODE_DB,		! Convert node database from single
+					!	key ISAM to four keyed ISAM.
+    NML_OPEN_OLD_FILE,			! Open old node database file for
+					!	conversion to 4 keyed format.
+    NML_FIX_AREA_NUMS: NOVALUE,		! Remove area 0 from node numbers in
+					!	permanent databases.
+    NML_FIX_LOGGING_REC,		! Remove area 0 from a logging database
+					!	record.
+    NML_FIX_NODE_PARAM;			! Remove area 0 from a node parameter.
+!
+! INCLUDE FILES:
+!
+
+LIBRARY 'LIB$:NMLLIB.L32';
+LIBRARY 'SHRLIB$:NMALIBRY.L32';
+LIBRARY 'SYS$LIBRARY:STARLET.L32';
+
+!
+! OWN STORAGE:
+!
+OWN
+   nml$l_area:	WORD;
+
+!
+! Declare common NML external references.
+!
+$nml_extdef;
+
+EXTERNAL
+    nml$gq_node_file_dsc: VECTOR [2];
+
+EXTERNAL LITERAL
+    nml$_nodcvterr;
+
+EXTERNAL ROUTINE
+    lib$cvt_dtb,
+    lib$get_symbol,
+    nma$closefile,
+    nma$deletefld,
+    nma$openfile,
+    nma$searchfld,
+    nma$selectfile,
+    nml$create_node_db,
+    nml$connect_node_rab,
+    nml$bld_reply,
+    nml$getnxtsrc,
+    nml$logfileop,
+    nml$logrecordop,
+    nml$matchrecord,
+    nml$openfile,
+    nml$readrecord,
+    nml$write_node_rec,
+    nml$writerecord;
+
+
+%SBTTL 'nml$upgrade_perm_dbs	Do V4.0 convertions on permanent db'
+GLOBAL ROUTINE nml$upgrade_perm_dbs =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine is called when doing a V4.0 upgrade.  The permanent
+!	database files must by upgraded in two ways:
+!		a) convert the node database to a faster format
+!		   utilizing 4 ISAM keys.
+!		b) since we are now marketing areas, scan all
+!		   the permanent database files which contain node numbers
+!		   and make sure that any with an area number of 0 are
+!		   given an area number.  The area number used will be
+!		   either one supplied by the customer during the upgrade,
+!		   or area 1.  This change involves the following files
+!		   and databases:
+!		File			Database entity		Parameters
+!		----			---------------		----------
+!		NETLOGING.DAT		NML$C_LOGGING		sink node
+!								source node
+!		NETX25.DAT		NML$C_X25_SERV_DEST	node
+!					NML$C_X25_ACCESS	node
+!		NETX29.DAT		NML$C_S29_SERV_DEST	node
+!			
+!
+! FORMAL PARAMETERS:
+!	None
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+! 	Most errors are signalled by subroutines called.
+!
+!--
+
+BEGIN
+
+LOCAL
+    status,
+    area_dsc: VECTOR [2],
+    ascii_area:	BBLOCK [16];
+
+!
+! Get the area symbol set up when interrogating the customer for the upgrade.
+! This symbol specifies the area number the customer wishes to convert his
+! network to.  It defaults to 1.
+!
+area_dsc [0] = 16;
+area_dsc [1] = ascii_area;
+status = LIB$GET_SYMBOL (UPLIT (%CHARCOUNT ('NET$AREA_NUM'),
+				UPLIT BYTE ('NET$AREA_NUM')),
+			 area_dsc,
+			 area_dsc [0]);
+IF .status THEN
+    status = LIB$CVT_DTB (.area_dsc [0],
+			  .area_dsc [1],
+			  nml$l_area);
+IF NOT .status THEN
+    nml$l_area = 1;
+!
+! Convert area 0 in the logging, and X25 and X29 Server Destination databases.
+!
+nml_fix_area_nums (nml$c_logging);    
+nml_fix_area_nums (nml$c_x25_serv_dest);    
+nml_fix_area_nums (nml$c_x25_access);    
+nml_fix_area_nums (nml$c_x29_serv_dest);    
+!
+! Convert the node database to use 4 ISAM keys.  This makes it much faster.
+!
+status = nml_convert_node_db ();
+RETURN .status;
+END;			! End of NML_UPGRADE_PERM_DBS
+
+%SBTTL 'nml_convert_node_db		Convert node permanent database file'
+ROUTINE nml_convert_node_db =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine is called if the node permanent database is opened and
+!	only has 1 ISAM key.  The old node database file had only 1 ISAM key
+!	and was too slow with large numbers of nodes in the database.  
+!	This routine converts the old node database file to the new node
+!	database format using multiple ISAM keys.  It's much faster to access.
+!
+! FORMAL PARAMETERS:
+!	None
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Failure or RMS error
+!
+!--
+
+BEGIN
+    
+OWN
+    temp_node_file_dsc : VECTOR [2]
+			INITIAL (%CHARCOUNT ('TEMP_NETNODE'),
+				 UPLIT BYTE ('TEMP_NETNODE'));
+
+LOCAL
+    status,
+    new_netnode_fab:	$FAB_DECL,
+    old_rab_addr:	REF BBLOCK,	! Address of RAB for old node database
+					!	file.
+    old_rec_dsc:	VECTOR [2],	! Descriptor of record from old file
+    new_rec:		BBLOCK [nml$k_recbflen],
+    new_rec_dsc:	VECTOR [2],
+    field_size,
+    field_addr,
+    params_len,
+    node_type,
+    key_value_dsc:	VECTOR [2],
+    fab,
+    msgsize;				! Size of signalled error message.
+
+!
+! Reopen old node permanent database file for sequential read access.  
+!
+status = nml_open_old_file (old_rab_addr);
+!
+! If the old node database was opened successfull, then create the new node
+! database file with multiple ISAM keys.
+!
+IF .status THEN
+    status = nml$create_node_db (temp_node_file_dsc, fab);
+IF .status THEN
+    status = nml$connect_node_rab ();
+IF NOT .status THEN
+    RETURN .status;
+!
+! Build new node database file from old node database file.
+!
+new_rec_dsc [1] = new_rec + nmn$k_node_keys_len;
+old_rec_dsc [1] = .nml$gq_recbfdsc [dsc$a_pointer] + nml$k_perm_keys_len;
+key_value_dsc [1] = new_rec [nmn$w_key_add];
+DO
+    BEGIN
+    !
+    ! Read a record from the old node permanent database.
+    !
+    status = $GET (RAB = .old_rab_addr);
+    IF .status THEN
+	BEGIN
+	old_rec_dsc [0] = .old_rab_addr [rab$w_rsz] - nml$k_perm_keys_len;
+	!
+	! The two of the keys for the new file are the node address and name.
+	! Both these keys are also NICE parameters.  The routine that writes
+	! the record to the node file fixes the key values for these two
+	! keys.
+	!
+	! Another key in the new node database is the node type.  The
+	! three node types are executor node, remote node, and loop node.
+	! The write routine must be given the node entity type to determine
+	! this key value, since it isn't a NICE parameter.
+	!
+	field_addr = 0;
+	IF nma$searchfld (old_rec_dsc,
+			    nml$c_key_exe,
+			    field_size,
+			    field_addr) THEN
+	    BEGIN
+	    node_type = nml$c_executor;
+	    !
+	    ! Get rid of the executor's OWNER field from the parameters,
+	    ! since it isn't a real NICE parameter.  (For the other node
+	    ! records, the OWNER is a valid NICE parameter.)
+	    !
+	    nma$deletefld (old_rec_dsc, nml$c_key_exe);
+	    END
+	ELSE
+	    BEGIN
+	    node_type = nml$c_node;
+	    !
+	    ! If there is not node address and it's got a circuit parameter (NLI),
+	    ! then it's a loop node.
+	    !
+	    field_addr = 0;
+	    status = nma$searchfld (old_rec_dsc,
+				    nma$c_pcno_add,
+				    key_value_dsc [0],
+				    field_addr);
+	    !
+	    ! If there is no address for the node, it must be a loopnode.
+	    ! Loopnodes always have a circuit (NLI) parameter.
+	    !
+	    IF (NOT .status) AND
+	       (status = nma$searchfld (old_rec_dsc,
+					nma$c_pcno_nli,
+					field_size,
+					field_addr)) THEN
+		node_type = nml$c_loopnode;
+	    IF NOT .status THEN
+		RETURN .status;
+	    END;
+	!
+	! Move the node parameters from the old record to the new one, putting
+	! them right behind the keys.
+	!
+	CH$MOVE (.old_rec_dsc [0], .old_rec_dsc [1],
+				new_rec [nmn$a_nod_params]);
+	!
+	! The record descriptors to not include the keys.  So the new record
+	! length is the same as the old record's length - the data length.
+	!
+	new_rec_dsc [0] = .old_rec_dsc [0];
+	!
+	! If node numbers are in area 0, fix them.
+	!
+	nml_fix_node_param (nma$c_pcno_add, new_rec_dsc);
+	nml_fix_node_param (nma$c_pcno_iho, new_rec_dsc);
+	!
+	! Write the record to the new node database file.
+	!
+	status = nml$write_node_rec ( nmn$c_put_rec,	! Add a new node
+				      .node_type,	! for node type key
+				      new_rec_dsc);	! Record to write
+	END;
+    END
+UNTIL NOT .status;
+!
+! Close the old permanent database node file (may it rest in peace).
+!			
+nma$closefile (nma$c_opn_node);
+!
+! Now, close the new temporary node file, rename it to it's permanent name,
+! and delete any old versions of the temporary node file that may have
+! been left around if the system crashed while the conversion was being
+! done.
+!
+status = $CLOSE (FAB = .fab);
+$FAB_INIT (FAB = new_netnode_fab,
+	   DNM = 'SYS$SYSTEM:.DAT',
+	   FNA = .nml$gq_node_file_dsc [1],
+	   FNS = .nml$gq_node_file_dsc [0]
+	   );
+IF .status THEN
+    status = $RENAME (OLDFAB = .fab,
+		      NEWFAB = new_netnode_fab);
+IF .status EQL rms$_suc THEN
+    nml$logfileop (dbg$c_fileio,
+		   nma$c_opn_node,
+		   $ASCID ('file converted'));
+IF NOT .status THEN
+    BEGIN
+    !
+    ! Signal to send error message to NCP.
+    !
+    nml$ab_msgblock [msb$l_flags] =	msb$m_det_fld OR
+					msb$m_msg_fld OR
+					msb$m_sysm_fld OR
+					msb$m_msg2_fld;
+    nml$ab_msgblock [msb$b_code] = nma$c_sts_fio;      ! Add error code
+    nml$ab_msgblock [msb$w_detail] = nma$c_fopdtl_pdb; ! Add file id code
+    nml$ab_msgblock [msb$l_text] = nml$_nodcvterr;
+    nml$ab_msgblock [msb$l_text2] = .status;
+
+    nml$bld_reply (nml$ab_msgblock, msgsize);
+    $signal_msg (nml$ab_sndbuffer, .msgsize);
+
+    END;
+
+RETURN nml$_sts_suc
+END;		! of 		nml_convert_node_db
+
+%SBTTL 'nml_open_old_file	Open old node database for conversion'
+ROUTINE nml_open_old_file (rab_addr) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine is called when creating a new node database file.  It
+!	opens the old node database file for sequential access.
+!
+! FORMAL PARAMETERS:
+!	rab_addr	Address of RAB returned for use when reading records
+!			from the file.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!	Failure or RMS error
+!
+!--
+
+BEGIN
+    
+LOCAL
+    rab:	REF BBLOCK,
+    status,
+    file_dsc:	REF BBLOCK;
+
+status = nma$openfile (nma$c_opn_node, nma$c_opn_ac_ro);
+!
+! If the old node database file was successfully opened, change
+! the RAB to get the file's records sequentially.
+!
+IF .status THEN
+    BEGIN
+    status = nma$selectfile (nma$c_opn_node, file_dsc);
+    rab = .file_dsc [12, 0, 32, 0];
+    rab [rab$b_rac] = rab$c_seq;
+    !
+    ! Set up the RABs input buffer fields.
+    !
+    rab [rab$w_usz] = .nml$gq_recbfdsc [dsc$w_length];
+    rab [rab$l_ubf] = .nml$gq_recbfdsc [dsc$a_pointer];
+    !
+    ! Return RAB address to calling routine.
+    !
+    .rab_addr = .rab;
+    END;
+RETURN .status;
+END;		! of    nml_open_old_file
+
+%SBTTL 'nml_fix_area_nums	Convert permanent db area 0 to valid area'
+ROUTINE nml_fix_area_nums (entity) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine is called when doing a V4.0 upgrade.  It scans all
+!	permanent database files (except the node database) containing node
+!	numbers.  Each node number which has an area number of 0 is given
+!	an area number supplied by the customer or 1.
+!
+! FORMAL PARAMETERS:
+!	entity	NML entity type which has a node number in it's database.
+!		This parameter can be one of the following:
+!			nml$c_logging
+!			nml$c_x25_serv_dest
+!			nml$c_x29_serv_dest
+!			
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!--
+
+BEGIN
+    
+LOCAL
+    fid,			! File id of permanent database file
+    owner,			! Entity record owner field id
+    convert_routine,		! Conversion routine for entity
+    param_id,			! NMA parameter id for node parameter to fix.
+    recdsc: VECTOR [2],		! Descriptor of permanent database record
+				!	being converted.
+    key;			! Key of current file record.
+
+SELECTONEU .entity OF
+    SET
+    [nml$c_logging]:
+	BEGIN
+	convert_routine = nml_fix_logging_rec;
+	param_id = nma$c_pclo_sin;
+	END;
+    [nml$c_x25_serv_dest,
+     nml$c_x29_serv_dest]:
+	BEGIN
+	convert_routine = nml_fix_node_param;
+	param_id = nma$c_pcxs_nod;
+	END;
+    [nml$c_x25_access]:
+	BEGIN
+	convert_routine = nml_fix_node_param;
+	param_id = nma$c_pcxa_nod;
+	END;
+    TES;
+fid = .nml$ab_entitydata [.entity, eit$b_fileid];
+owner = .nml$ab_entitydata [.entity, eit$w_key];
+!
+! First open the permanent database file to convert.  If it doesn't exist,
+! there's nothing to do.
+!
+nml$openfile (.fid, nma$c_opn_ac_rw);
+key = 0;
+!
+! Read a record for the entity.  The logging and X25/9 Server Destination
+! databases are both in database files which contain entries for several
+! entities.  The owner field distinguishes them.
+!
+WHILE nml$matchrecord (.fid,
+			nml$gq_recbfdsc,
+			key,
+			.owner, 0, 0,
+			0, 0, 0,		! No qualifier
+			recdsc) DO
+    BEGIN
+    !
+    ! Check the record to see if it contains any node addresss, and, if it
+    ! does, convert them.  The convert_routine will return success if it
+    ! found any node addresses, in which case, write the updated record
+    ! back to the permanent database file.
+    !
+    IF (.convert_routine) (.param_id, recdsc) THEN
+	nml$writerecord (.fid, .entity, key, recdsc, 0);
+    key = .key + 1;
+    END;
+END;			! End of NML_FIX_AREA_NUMS
+
+%SBTTL 'nml_fix_logging_rec	Upgrade V4.0 logging database'
+ROUTINE nml_fix_logging_rec (param_id, recdsc) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine is called as part of the V4.0 upgrade.  It finds node
+!	numbers in the logging database, and, if they have an area number of
+!	0, converts them to an area number supplied by the customer during
+!	the upgrade. (Area 0 is for Phase III nodes only).  Node numbers
+!	occur in the logging database in two places.  As sink nodes and as
+!	event sources.  Both fields are in th EFI (Event Filter) database.
+!
+! INPUTS:
+!	PARAM_ID	NMA id for node parameter to convert.
+!	RECDSC		Address of descriptor of a logging database record.
+!--
+
+BEGIN
+
+LOCAL
+    fldlen,
+    event_blk_dsc	: VECTOR [2],
+    source_blk		: REF BBLOCK,
+    node_addr_changed;
+
+!
+! Find the sink node in the database record.  This should always succeed.
+!
+node_addr_changed = nml_fix_node_param (.param_id,
+					.recdsc);
+!
+! Find the event parameter.  This should always succeed as well.
+!
+event_blk_dsc [1] = 0;
+IF nma$searchfld (.recdsc,
+		  nma$c_pclo_eve,
+		  event_blk_dsc [0],
+		  event_blk_dsc [1]) THEN
+    BEGIN
+    source_blk = 0;
+    !
+    ! Examine each of the source blocks in the event block.  If any
+    ! have a source type = node, check the node address for area 0.
+    ! If it's area 0 and not the executor node, give the area number
+    ! the customer requested.
+    !
+    WHILE nml$getnxtsrc (event_blk_dsc, source_blk) DO
+	BEGIN
+	IF .source_blk [src$b_srctype] EQL nma$c_ent_nod THEN
+	    BEGIN
+	    BIND
+		source_node = source_blk [src$w_nodadr] : BBLOCK;
+
+	    IF .source_node [nma$v_area] EQL 0 AND
+	       .source_node [nma$w_node] NEQ 0 THEN
+		BEGIN
+		source_node [nma$v_area] = .nml$l_area;
+		node_addr_changed = true;
+		END;
+	    END;
+	END;
+    END;
+
+RETURN .node_addr_changed;
+END;			! End of NML_FIX_LOGGING_REC
+
+%SBTTL 'nml_fix_node_param	Upgrade V4.0 node param in perm database'
+ROUTINE nml_fix_node_param (param_id, recdsc) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine is called as part of the V4.0 upgrade.  It finds node
+!	numbers in the X25 and X26 Server databases, and, if they have an
+!	area number of 0, converts them to an area number supplied by the
+!	customer during the upgrade.  (Area 0 is for Phase III nodes only).
+!
+! INPUTS:
+!	PARAM_ID	NMA id for node parameter to convert.
+!	RECDSC		Descriptor of the database record to scan for
+!			param_id.
+!--
+
+BEGIN
+
+LOCAL
+    node_len,
+    node_addr: REF BBLOCK,
+    node_addr_changed;
+
+node_addr_changed = false;
+!
+! See if there's a node in the X25 or X29 Server Destination database record.
+!
+node_addr = 0;
+IF nma$searchfld (.recdsc,
+		  .param_id,
+		  node_len,
+		  node_addr) THEN
+    BEGIN
+    IF .node_addr [nma$v_area] EQL 0 AND
+       .node_addr [nma$w_node] NEQ 0 THEN
+	BEGIN
+	node_addr [nma$v_area] = .nml$l_area;
+	node_addr_changed = true;
+	END;
+    END;
+
+RETURN .node_addr_changed;
+END;			! End of NML_FIX_NODE_PARAM
+
+END					! End of module
+
+ELUDOM

@@ -1,0 +1,1588 @@
+MODULE	exch$rtacp				%TITLE 'RT11 directory routines'
+		(
+		IDENT = 'V04-000',
+		ADDRESSING_MODE (EXTERNAL=LONG_RELATIVE, NONEXTERNAL=WORD_RELATIVE)
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:	EXCHANGE - Foreign volume interchange facility
+!
+! ABSTRACT:	RT-11 directory manipulation routines
+!
+! ENVIRONMENT:	VAX/VMS User mode
+!
+! AUTHOR:	CW Hobbs		CREATION DATE: 29-Nov-1982
+!
+! MODIFIED BY:
+!
+!	V03-002	CWH3002		CW Hobbs		12-Apr-1984
+!		If the directory shows a device larger than the actual
+!		device, then print a warning and write lock the volume.
+!
+!
+!--
+
+! Include files:
+!
+MACRO $module_name_string = 'exch$rtacp' %;	! The require file needs to know our module name
+REQUIRE 'SRC$:EXCREQ'				! Facility-wide require file
+    ;
+
+%SBTTL 'Module table of contents'
+
+! Module table of contents:
+!
+FORWARD ROUTINE
+    exch$rtacp_check_position	: NOVALUE,	! Find directory entry if it has moved
+    exch$rtacp_clean_directory	: NOVALUE,	! Shuffle and/or split directories as needed
+    exch$rtacp_consolidate,			! Compress directory structure
+    exch$rtacp_find_empty_area,			! Find free space
+    exch$rtacp_find_file,			! RT-11 directory search routine
+    exch$rtacp_next_entry,			! Retrieve next entry from RT-11 directory
+    exch$rtacp_verify_directory			! Verify directory structure and compute volume size
+    ;
+
+! EXCHANGE facility routines
+!
+EXTERNAL ROUTINE
+    exch$cmd_fetch_recfmt_implied : NOVALUE,	! Get or assume the value for /RECORD_FORMAT
+    exch$cmd_match_filename,			! Compare expanded file names for match
+    exch$io_rt11_read,				! Read blocks from a random access device
+    exch$io_rt11_write,			! Write blocks to a random access device
+    exch$pdp_flush_write_buffer,		! Flush any records waiting in the write buffer
+    exch$pdp_get,				! Get functions for small PDP record structure
+    exch$pdp_put,				! Put functions for small PDP record structure
+    exch$rt11_dirseg_flush,			! Write out directory segments
+    exch$rt11_dirseg_get,			! Return pointer to specific directory segment
+    exch$rt11_dirseg_get_nochk	: jsb_r1r2,	! Return pointer to directory segment without checking
+    exch$rt11_dirseg_put,			! Write a specific directory segment
+    exch$rt11_expand_filename,			! Convert directory entry to ASCII filename
+    exch$util_fao_buffer,			! Do an FAO conversion
+    exch$util_radix50_from_ascii,		! Convert characters to Radix-50 from Ascii
+    exch$util_radix50_to_ascii,			! Convert characters from Radix-50 to Ascii
+    exch$util_rt11ctx_allocate,			! Get an RT-11 context block
+    exch$util_rt11ctx_release	: NOVALUE,	! Give it back
+    exch$util_vm_allocate,			! Get some virtual memory
+    exch$util_vm_allocate_zeroed,		! Get some virtual memory, initialized to zero
+    exch$util_vm_release			! Return some virtual memory
+    ;
+
+! Equated symbols:
+!
+!LITERAL
+!    ;
+
+! Bound declarations:
+!
+!BIND
+!    ;
+
+GLOBAL ROUTINE exch$rtacp_check_position (ctx : $ref_bblock) : NOVALUE =	%SBTTL 'exch$rtacp_check_position (ctx)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Check that the directory entry described in the context block is at the correct position.  Several events
+!	might have caused the directory to be rearranged, such as the creation of a file since the context was
+!	found.  If the entry has moved, find it and set the pointers to the new position.
+!
+! INPUT/OUTPUT:
+!
+!	ctx - pointer to block describing the directory context
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('exch$rtacp_check_position> ');
+
+LOCAL
+    seg : $ref_bblock,				! a pointer to the current directory segment
+    ctx2 : $ref_bblock,				! a pointer to a second context in case we need to scan
+    flags
+    ;
+
+BIND
+    volb = ctx [rt11ctx$a_assoc_volb]	: $ref_bblock
+    ;
+
+$block_check (2, .ctx, rt11ctx, 443);
+$block_check (2, .volb, volb, 445);
+$logic_check (5, (exch$rtacp_verify_directory (.volb)), 182);
+
+
+! We need to check to make sure that the number of segments has not been lowered.  If so, our entry address might
+! be sitting in the hyperspace beyond the segments in use.  Hence, grab a pointer to the root segment.
+!
+seg = exch$rt11_dirseg_get_nochk (.volb, 1);
+$logic_check (2, (.seg NEQ 0), 147);
+
+! Check to see if the entry position info is correct, if so we can simply return
+!
+IF  .ctx [rt11ctx$l_seg_number] LEQU .seg [rt11hdr$w_high_seg]
+  AND
+    CH$EQL (rt11ctx$s_entry, ctx [rt11ctx$t_entry], rt11ctx$s_entry, .ctx [rt11ctx$a_ent_address])
+THEN
+    RETURN;
+
+$trace_print_lit ('looking for new position');
+
+! Get a context block for the search
+!
+ctx2 = exch$util_rt11ctx_allocate (.volb, 0);
+
+! Loop through all the segments in the directory looking for this file entry
+!
+flags = rtnxt$m_permanent OR rtnxt$m_empty OR rtnxt$m_tentative OR rtnxt$m_skip_check OR rtnxt$m_skip_expand;
+WHILE exch$rtacp_next_entry (.ctx2, .flags) NEQ 0
+DO
+    BEGIN
+
+    IF CH$EQL (rt11ctx$s_entry, ctx [rt11ctx$t_entry], rt11ctx$s_entry, ctx2 [rt11ctx$t_entry])
+    THEN
+	BEGIN
+
+	$trace_print_fao ('Relocated "!AF"', .ctx [rt11ctx$l_exp_fullname_len], ctx [rt11ctx$t_exp_fullname]);
+
+	! If the file has moved we are in deep trouble
+	!
+	$logic_check (3, (.ctx [rt11ctx$l_start_block] EQL .ctx2 [rt11ctx$l_start_block]), 120);
+
+	! Put the new position info into the context block
+	!
+	ctx [rt11ctx$l_seg_number]  = .ctx2 [rt11ctx$l_seg_number];
+	ctx [rt11ctx$a_seg_address] = .ctx2 [rt11ctx$a_seg_address];
+	ctx [rt11ctx$a_ent_address] = .ctx2 [rt11ctx$a_ent_address];
+
+	! Give the extra context back
+	!
+	exch$util_rt11ctx_release (.ctx2);
+
+	RETURN;
+	END;
+
+    END;
+
+$logic_check (0, (false), 121);			! We should have found it
+
+RETURN;
+END;
+
+GLOBAL ROUTINE exch$rtacp_clean_directory (volb : $ref_bblock, 	%SBTTL 'exch$rtacp_clean_directory (volb, ent_cnt, ent_len)'
+						ent_cnt, ent_len) : NOVALUE =
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is used like the RT-11 segment split logic, i.e. it makes room for a directory entry.  Instead
+!	of a simple segment split, it may restructure the entire directory.  It will add or remove segments in
+!	the chain to produce a directory with approximately the same number of active entries in each segment.
+!
+!	This routine assumes that it has been called from exch$rtacp_consolidate.  It assumes that every directory
+!	segment contains only valid directory entries and is terminated by an end-segment marker.  It does not 
+!	require that unnecessary entries (see exch$rtacp_consolidate) be removed.
+!
+! INPUTS:
+!
+!	volb    - pointer to volb which has been connected to the RT-11 device
+!	ent_cnt - number of entries in the directory
+!	ent_len - length of a single entry, including extra bytes
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	all error conditions are fatal
+!--
+
+$dbgtrc_prefix ('exch$rtacp_clean_directory> ');
+
+LOCAL
+    seg : $ref_bblock,				! a pointer to the current directory segment
+    cur : $ref_bblock,				! a pointer to the current directory entry
+    dir2 : $ref_bblock,				! a pointer to an area where we will assemble a clean directory
+    seg2 : $ref_bblock,				! a pointer to the current segment in the clean directory area
+    cur2 : $ref_bblock,				! a pointer to the current entry in the clean directory area
+    ctx : $ref_bblock,				! a pointer a context block for looping through the dirty dire
+    ent2_cnt,					! count of entries in the current clean segment
+    seg2_num,					! current segment number in the clean directory
+    seg_cnt,					! number of segments for the cleaned directory
+    ent_per_seg,				! goal for number of entries per segment
+    max_ent_per_seg,				! max number of entries per segment
+    flags					! local for our flags to exch$rtacp_next_entry
+    ;
+
+$debug_print_lit ('entry');
+
+$block_check (2, .volb, volb, 533);
+$logic_check (4, (exch$rtacp_verify_directory (.volb)), 183);
+
+
+seg = exch$rt11_dirseg_get (.volb, 1);				! Get the pointer to the dirty root segment
+$logic_check (2, (.seg NEQ 0), 151);
+
+! Figure out the maximum number of file entries which can fit into a single segment
+!
+max_ent_per_seg =  (rt11$k_dirseglen -		! Length of entire segment
+		    rt11hdr$k_length -		!  less the length of the segment header
+		    2)				!  less two bytes for the end-of-segment marker
+		    /  .ent_len;		! Divided by the length of a single entry
+
+$trace_print_fao ('desired entries !UL, max_ent_per_seg !UL', .ent_cnt, .max_ent_per_seg);
+
+! Determine how many segments we need to leave two free entries per segment.  This gives the final segment count.
+!
+ent_per_seg = .max_ent_per_seg - 2;		! Leave room for two entries in each segment
+seg_cnt = (.ent_cnt / .ent_per_seg) +		! Need one extra segment if not even division
+	(IF ((.ent_cnt MOD .ent_per_seg) NEQ 0) THEN 1 ELSE 0);
+IF .seg_cnt GTRU .seg [rt11hdr$w_num_segs]
+THEN
+    seg_cnt = .seg [rt11hdr$w_num_segs];	! We know that we can be at most one over the limit
+
+! Using the final segment count, now try to evenly distribute the entries around the segments.  This gives the 
+! final entries per segment count.
+!
+ent_per_seg = (.ent_cnt / .seg_cnt) +		! Need one extra entry if not even division
+	(IF ((.ent_cnt MOD .seg_cnt) NEQ 0) THEN 1 ELSE 0);
+$logic_check (4, (.ent_per_seg LEQU .max_ent_per_seg), 180);
+
+$trace_print_fao ('final segs !UL, goal ent_per_seg !UL', .seg_cnt, .ent_per_seg);
+
+! Grab a chunk of memory which will be used to build a clean copy of the directory.  We haven't modified anything
+! yet, so there will be no problem with corrupting anything if this allocate fails (it will SIGNAL_STOP).
+!
+dir2 = exch$util_vm_allocate_zeroed (.seg_cnt * rt11$k_dirseglen);
+
+! OK, our new directory will contain .SEG_CNT segments each containing .ENT_PER_SEG entries, with possibly fewer
+! entries in the last segment.  Start building a clean copy of the directory.
+!
+
+! Set the segment header for the root segment.  rt11hdr$w_high_seg won't be set until later
+!
+seg2 = .dir2;							! Get the pointer to the clean root segment
+seg2 [rt11hdr$w_num_segs] = .seg [rt11hdr$w_num_segs];		! Haven't changed the total number of segs
+seg2 [rt11hdr$w_next_seg] = (IF .seg_cnt EQL 1 THEN 0 ELSE 2);	! We will link them in order
+seg2 [rt11hdr$w_extra_bytes] = .seg [rt11hdr$w_extra_bytes];	! This stays the same
+seg2 [rt11hdr$w_start_block] = .seg [rt11hdr$w_start_block];	! Same now, but may not be for other segments
+
+! Set up the control variables for the transfer loop
+!
+seg2_num = 1;					! First segment in the clean directory
+cur2 = .seg2 + rt11hdr$k_length;		! Point at the first available entry position in the clean
+ent2_cnt = 0;					! No entries in the clean directory
+
+ctx = exch$util_rt11ctx_allocate (.volb, 0);	! Get a context block for the search
+
+! Loop through all the segments in the dirty directory, transferring entries to the clean directory
+!
+flags = rtnxt$m_permanent OR rtnxt$m_empty OR rtnxt$m_tentative OR rtnxt$m_skip_check OR rtnxt$m_skip_expand;
+WHILE (cur = exch$rtacp_next_entry (.ctx, .flags)) NEQ 0
+DO
+    BEGIN
+
+    CASE .cur [rt11ent$v_type] FROM 0 TO rt11ent$m_typ_end_segment OF
+    SET
+
+    [INRANGE, OUTRANGE] :				! We had better give up before something happens
+	    $logic_check (0, (false), 153);
+
+    [rt11ent$m_typ_tentative, rt11ent$m_typ_empty, rt11ent$m_typ_permanent] :
+	    BEGIN
+
+	    ! If we have filled this clean segment, then start a new segment before we do any moves
+	    !
+	    IF  (.ent2_cnt GEQU .ent_per_seg)
+	    THEN
+		BEGIN
+
+		! Set the end-of-segment marker in the current clean segment
+		!
+		$logic_check (3, (.cur2 LSSU .seg2 + rt11$k_dirseglen), 157);	! We need room for marker
+		cur2 [rt11ent$b_type_byte] = rt11ent$m_typ_end_segment;
+
+		! Reset the pointers and counters for the clean segment
+		!
+		ent2_cnt = 0;							! No entries yet
+		seg2_num = .seg2_num + 1;					! Adding one more segment
+		$logic_check (3, (.seg2_num LEQU .seg_cnt), 158);			!  which had better be OK
+		seg2 = .seg2 + rt11$k_dirseglen;				! Move to the new segment
+		cur2 = .seg2 + rt11hdr$k_length;				! First entry in the seg
+
+		! Initialize the segment header for the new segment
+		!
+		seg2 [rt11hdr$w_num_segs] = .seg [rt11hdr$w_num_segs];	! Same total # of segs
+		seg2 [rt11hdr$w_next_seg] = (IF .seg2_num EQL .seg_cnt	! We will link them in order
+					     THEN 0 ELSE .seg2_num+1);	!  marking the end with a 0
+		seg2 [rt11hdr$w_extra_bytes] = .seg [rt11hdr$w_extra_bytes];! This stays the same
+		seg2 [rt11hdr$w_start_block] = .ctx [rt11ctx$l_start_block];! First file starts here
+
+		END;
+
+	    ! Transfer this entry to the clean segment
+	    !
+	    CH$MOVE (.ent_len, .cur, .cur2);
+
+	    ! Bump the clean segment pointers
+	    !
+	    cur2 = .cur2 + .ent_len;	! Move the entry pointer
+	    ent2_cnt = .ent2_cnt + 1;	! Adjust the entry count for this segment
+	    ent_cnt = .ent_cnt - 1;		! Adjust the total entries remaining count, just a check
+
+	    END;
+    TES;
+    END;
+
+exch$util_rt11ctx_release (.ctx);		! Give the context block back
+
+! Set the end-of-segment marker in the final clean segment
+!
+$logic_check (3, (.cur2 LSSU .seg2 + rt11$k_dirseglen), 159);	! We need room for marker
+cur2 [rt11ent$b_type_byte] = rt11ent$m_typ_end_segment;
+$logic_check (3, ((.ent_cnt EQL 0)), 160);			! Make sure we moved everybody
+
+! Set the directory header info in the first and final segments
+!
+seg2 [rt11hdr$w_next_seg] = 0;			! Last segment is end of chain
+dir2 [rt11hdr$w_high_seg] = .seg2_num;		! Last segment is highest segment in use
+
+!?? need to deal with the following situation (most likely to occur when /EXTRA=119):
+!??  attempting to completely fill each segment (e.g. seg_cnt=31 and ent_per_seg=4), however we end up
+!??  filling 23 segs with 4, the 24th seg gets 3, we quit but the insert fails because only one entry available
+!??  in segment.  
+!?? (If seg2_num<seg_cnt and <2 free entries in last segment split the last segment into 2?
+!??  This doesn't help if free space is in an earlier segment unless you squeeze)
+
+! Now that we have a clean "duplicate" of the directory, make it the real directory and update things on disk.
+! Since it is possible (in fact likely as the volume gets full) that some of the "clean" directory segments are
+! identical to "dirty" ones, we will compare each of the segments before moving and updating them.
+!
+seg2 = .dir2;					! Get the pointer to the clean root segment
+
+INCRU num FROM 1 TO .seg2_num
+DO
+    BEGIN
+
+    ! Compare the dirty segment with the clean one
+    !
+    IF CH$NEQ (rt11$k_dirseglen, .seg, rt11$k_dirseglen, .seg2)
+    THEN
+	BEGIN
+
+	CH$MOVE (rt11$k_dirseglen, .seg2, .seg);	! Move the clean segment on top of the dirty segment
+	exch$rt11_dirseg_put (.volb, .num);		! Now write the segment to disk
+
+	END;
+
+    ! Move our segment pointers
+    !
+    seg = .seg + rt11$k_dirseglen;
+    seg2 = .seg2 + rt11$k_dirseglen;
+
+    END;
+
+! Return the memory for the duplicate directory
+!
+exch$util_vm_release ((.seg_cnt * rt11$k_dirseglen), .dir2);
+
+! Check the new directory out
+!
+$logic_check (3, (exch$rtacp_verify_directory (.volb)), 184);
+
+! Now, consolidate again.  This is necessary because we might have adjacent empty entries which can be collapsed.
+! We give the "2" flag to prevent another clean which would result in a recursive loop.
+!
+exch$rtacp_consolidate (.volb, 2);
+
+RETURN;
+END;
+
+GLOBAL ROUTINE exch$rtacp_consolidate (volb : $ref_bblock, clean) =	%SBTTL 'exch$rtacp_consolidate (volb, clean)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Make a pass to compress the directory.  The following types of entries are unnecessary:
+!
+!		Multiple consecutive empty entries
+!		Tentative entries
+!		Empties of length 0 following a permanent entry
+!
+! INPUTS:
+!
+!	volb   - pointer to volb which has been connected to the RT-11 device
+!	clean  - flag telling whether to restructure the directory, with the following meanings:
+!			0 - don't force a restructure, but allow it if find segment with single entry
+!			1 - force a restructure regardless
+!			2 - don't allow a restructure
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true if succeeded, false or error status if failed
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('exch$rtacp_consolidate> ');
+
+LOCAL
+    seg : $ref_bblock,				! a pointer to the current directory segment
+    cur : $ref_bblock,				! a pointer to the current directory entry
+    prv : $ref_bblock,				! a pointer to the previous directory entry
+    segment_modified : BITVECTOR [32],		! bits to say whether we need to write out directory segments
+    seg_num,					! current segment number
+    end_segment_seen,				! we have seen an end of segment marker
+    segment_with_single_entry_seen,		! a segment was consolidated to a single entry
+    ent_len,					! length of a single directory entry
+    ent_cnt					! number of entries in the segment
+    ;
+
+BIND
+    modified_segments = segment_modified	! map a longword onto the bitvector
+    ;
+
+$trace_print_fao ('entry');
+
+$block_check (2, .volb, volb, 551);
+$logic_check (4, (exch$rtacp_verify_directory (.volb)), 211);
+
+! Set up some initial conditions
+!
+modified_segments = 0;				! No directory segments have been modified, clear all bits
+ent_cnt = 0;					! No entries yet
+segment_with_single_entry_seen = false;		! No segment was consolidated to a single entry
+
+! Scan the directory, compressing unnecessary file entries
+!
+! Start with the first directory segment
+!
+seg_num = 1;
+
+! Loop through all the segments in the directory
+!
+WHILE .seg_num NEQ 0
+DO
+    BEGIN
+
+    ! Get a pointer to the current segment
+    !
+    seg = exch$rt11_dirseg_get (.volb, .seg_num);
+    $logic_check (2, (.seg NEQ 0), 152);
+    ent_len = rt11ent$k_length + .seg [rt11hdr$w_extra_bytes];
+
+    ! Get a pointer to the first directory entry, delete it if it is tentative
+    !
+    prv = .seg + rt11hdr$k_length;
+    IF (.prv [rt11ent$v_type] EQL rt11ent$m_typ_tentative)
+    THEN
+	BEGIN
+	segment_modified [.seg_num] = true;
+	prv [rt11ent$b_type_byte] = rt11ent$m_typ_empty;	! Zap whole byte to clear protect bit
+	END;
+
+    ! We've taken care of the first entry, now starting with the second scan the rest of this segment.  If either
+    ! of the first two entries is the end marker we don't need to scan
+    !
+    cur = .prv + .ent_len;			! Add the length of one entry
+    IF	(.prv [rt11ent$v_type] NEQ rt11ent$m_typ_end_segment)
+      AND
+	(.cur [rt11ent$v_type] NEQ rt11ent$m_typ_end_segment)
+    THEN
+	BEGIN
+	end_segment_seen = false;
+	WHILE (.cur LSSU (.seg + rt11$k_dirseglen))
+	DO
+	    BEGIN
+
+	    ! If tentative, turn it into an empty before we move forward
+	    !
+	    IF (.cur [rt11ent$v_type] EQL rt11ent$m_typ_tentative)
+	    THEN
+		BEGIN
+		segment_modified [.seg_num] = true;
+		cur [rt11ent$b_type_byte] = rt11ent$m_typ_empty;	! Zap whole byte to clear protect bit
+		END;
+
+	    ! Advance our count
+	    !
+	    CASE .cur [rt11ent$v_type] FROM 0 TO rt11ent$m_typ_end_segment OF
+	    SET
+	    [rt11ent$m_typ_tentative] :
+		    $logic_check (0, (false), 148);
+
+	    [rt11ent$m_typ_permanent] :
+		    ;
+
+	    [rt11ent$m_typ_empty] :
+		    BEGIN
+
+		    ! If the previous entry is permanent and the size of this empty is zero we can get rid of this
+		    ! entry.
+		    !
+		    IF	(.prv [rt11ent$v_type] EQL rt11ent$m_typ_permanent)
+		      AND
+			(.cur [rt11ent$w_blocks] EQL 0)
+		    THEN
+			BEGIN
+			LOCAL
+			    sl;			! Length of directory to slide down one entry
+
+			! Slide the rest of the segment down one entry
+			!
+			sl = rt11$k_dirseglen - .ent_len - (.cur - .seg);	! Length of segment remaining
+			CH$MOVE (.sl, .cur + .ent_len, .cur);			
+			segment_modified [.seg_num] = true;
+			cur = .cur - .ent_len;	! Back up so that next pass sees the slid down entry
+			END
+
+		    ! Or if the previous entry is also empty we can combine these two into a single empty entry
+		    !
+		    ELSE IF (.prv [rt11ent$v_type] EQL rt11ent$m_typ_empty)
+		    THEN
+			BEGIN
+			LOCAL
+			    sl;			! Length of directory to slide down one entry
+
+			! Add the size of this empty to the previous empty, plus count it in the total
+			!
+			prv [rt11ent$w_blocks] = .prv [rt11ent$w_blocks] + .cur [rt11ent$w_blocks];
+
+			! Slide the rest of the segment down one entry
+			!
+			sl = rt11$k_dirseglen - .ent_len - (.cur - .seg);	! Length of segment remaining
+			CH$MOVE (.sl, .cur + .ent_len, .cur);			
+			segment_modified [.seg_num] = true;			! Remember that we have changed it
+			cur = .cur - .ent_len;	! Back up so that next pass sees the slid down entry
+			END;
+		    END;
+
+	    [rt11ent$m_typ_end_segment] :
+		    BEGIN
+		    end_segment_seen = true;
+		    EXITLOOP;
+		    END;
+
+	    ! Volumes with corrupted directories should have been write-locked when the directory was verified
+	    ! during mount.  Therefore we must assume an I/O error or programming error within EXCHANGE has
+	    ! corrupted this directory.
+	    !
+	    [INRANGE, OUTRANGE] :				! We had better give up before something happens
+		    BEGIN
+		    exch$rt11_dirseg_flush (.volb, .modified_segments);	! Write out any changes up til now
+		    $exch_signal_stop (exch$_rt11_baddirect, 2, .volb [volb$l_vol_ident_len], volb [volb$t_vol_ident]);
+		    END;
+
+	    TES;
+
+	    ! Make the current the previous entry and skip to the next
+	    !
+	    prv = .cur;
+	    cur = .cur + .ent_len;
+
+	    END;
+
+	! Volumes with corrupted directories should have been write-locked when the directory was verified
+	! during mount.  Therefore we must assume an I/O error or programming error within EXCHANGE has
+	! corrupted this directory.
+	!
+	IF NOT (.end_segment_seen)
+	THEN
+	    BEGIN
+	    exch$rt11_dirseg_flush (.volb, .modified_segments);	! Write out any changes up til now
+	    $exch_signal_stop (exch$_rt11_baddirect, 2, .volb [volb$l_vol_ident_len], volb [volb$t_vol_ident]);
+	    END;
+	END;
+
+    ! Count the number of entries.  CUR points to the end marker.
+    !
+    (BEGIN LOCAL cnt_this_seg;
+    cnt_this_seg = (.cur - (.seg + rt11hdr$k_length)) / .ent_len;	! Divide space used by length of entry
+    ent_cnt = .ent_cnt + .cnt_this_seg;					! Divide space by length
+    IF .cnt_this_seg EQL 1						! This segment has a single entry
+    THEN
+	segment_with_single_entry_seen = true;
+    END);
+    $logic_check (4, (((.cur - (.seg + rt11hdr$k_length)) MOD .ent_len) EQL 0), 150);	! Better be even
+
+    ! Skip to the next segment
+    !
+    seg_num = .seg [rt11hdr$w_next_seg];
+
+    END;
+
+! Now that we are done, write out any of the segments that we have modified
+!
+exch$rt11_dirseg_flush (.volb, .modified_segments);
+
+$logic_check (3, (exch$rtacp_verify_directory (.volb)), 191);
+
+! Now clean it up if one of the flags is set
+!
+IF (.clean EQL 1)
+  OR
+   (.segment_with_single_entry_seen
+   AND
+    .ent_cnt GTRU 1				! Avoid recursive loops when down to one entry
+   AND
+    .clean NEQ 2)				! Even then, don't clean if it has been prohibited
+THEN
+    exch$rtacp_clean_directory (.volb, .ent_cnt, .ent_len);
+
+RETURN true;
+END;
+
+GLOBAL ROUTINE exch$rtacp_find_empty_area (ctx : $ref_bblock, 	%SBTTL 'exch$rtacp_find_empty_area (ctx, blocks, start)'
+						blocks, start) =
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	First, have EXCH$RT11_CONSOLIDATE make a pass to compress the directory.  
+!
+!	Second, make a pass to prepare to enter a new file.  The BLOCKS parameter gives the size of the area which
+!	is needed.  We will return the address of the first empty area which is as close to this size as we can
+!	get.  We will also put a zero-length empty area after this area so that the rt-11 close routine can simply
+!	move any excess blocks into the second entry.
+!
+! INPUTS:
+!
+!	ctx    - pointer to rt11 context block
+!	blocks - number of blocks needed, 0 means largest possible entry
+!	start  - pbn of block to start allocation (blocks parameter ignored if start <> 0)
+!	(dummy) - this routine will call itself a second time if it is unable to satisfy the request.  Recursive
+!		  calls are flagged with a 4th dummy parameter, ACTUALCOUNT () is examined to prevent loops
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true if able to find a suitable empty area, false or error status if failed
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('exch$rtacp_find_empty_area> ');
+
+LOCAL
+    seg : $ref_bblock,				! a pointer to the current directory segment
+    cur : $ref_bblock,				! a pointer to the current directory entry
+    exact_match,				! found an entry of exactly the correct length
+    ent_len,					! length of a single directory entry
+    flags,					! a temporary for the flags mask
+    mat_ent : $ref_bblock,			! address of current match
+    mat_blk,					! start pbn of current match
+    mat_len,					! size of current match
+    mat_seg,					! segment number containing the match
+    recursive,					! flag that we have been called from here
+    status
+    ;
+
+BIND
+    volb = ctx [rt11ctx$a_assoc_volb] : $ref_bblock
+    ;
+
+BUILTIN
+    ACTUALCOUNT
+    ;
+
+
+$trace_print_fao ('entry - ctx !XL,  blocks !UL,  start !UL', .ctx, .blocks, .start);
+
+$block_check (2, .ctx, rt11ctx, 535);
+$block_check (2, .volb, volb, 530);
+
+! Set up some initial conditions
+!
+ctx [rt11ctx$a_ent_address] = 0;		! Set the output to an invalid address
+ctx [rt11ctx$l_seg_number] = 0;			! Reset to scan from the start of the directory
+mat_len = 0;					! No length of any matched entry
+recursive = (IF ACTUALCOUNT () EQL 4 THEN 1 ELSE 0);
+
+! Compress the directory into a known, clean state.  Consolidate will do any verification we need.  The second
+! parameter determines whether a directory restructuring should take place.
+!
+IF NOT (status = exch$rtacp_consolidate (.volb, .recursive))
+THEN
+    RETURN .status;
+
+! Loop through all the segments in the directory
+!
+exact_match = false;				! We haven't seen an empty entry of exactly the correct size
+flags = rtnxt$m_empty OR rtnxt$m_skip_check OR rtnxt$m_skip_expand;
+WHILE ((cur = exch$rtacp_next_entry (.ctx, .flags)) NEQ 0)
+DO
+    BEGIN
+    LOCAL
+	len;
+
+    len = .cur [rt11ent$w_blocks];	! Put the length into a local for speed
+
+    ! If we are looking for a particular start block, see if this empty area contains the start
+    !
+    IF .start NEQ 0
+    THEN
+	BEGIN
+	IF .start LSSU .ctx [rt11ctx$l_start_block]
+	THEN
+	    RETURN exch$_stnotavail			! Already past the block, we will never find it
+	ELSE
+	    BEGIN
+	    IF .start LEQU (.len + .ctx [rt11ctx$l_start_block])	! Requested block inside this area
+	    THEN
+		BEGIN
+		exact_match = true;			! Set the flag to stop scanning
+
+		! Save the entry as a match.  Note that this and the following three saves are written
+		! so that the optimizer can collapse them into a single segment of object code.
+		!
+		mat_len = .len;				! Save the length of this entry,
+		mat_ent = .cur;				!  its address,
+		mat_seg = .ctx [rt11ctx$l_seg_number];	!  its segment number,
+		mat_blk = .ctx [rt11ctx$l_start_block];	!  and the pbn where the free space starts
+		END;
+	    END;
+	END
+
+    ! We are looking for any old empty area, see if the size is appropriate
+    !
+    ELSE IF .len GEQU .blocks		! If this length is a candidate, then examine it more closely
+    THEN
+	BEGIN
+
+	IF .blocks EQL 0		! Block=0 means look for the biggest free space
+	THEN
+	    BEGIN
+	    IF .len GTRU .mat_len		! Bigger than what we've seen so far
+	    THEN
+		BEGIN
+
+		! Save the entry as a match.  Note that all 4 saves can be collapsed by the optimizer.
+		!
+		mat_len = .len;				! Save the length of this entry,
+		mat_ent = .cur;				!  its address,
+		mat_seg = .ctx [rt11ctx$l_seg_number];	!  its segment number,
+		mat_blk = .ctx [rt11ctx$l_start_block];	!  and the pbn where the free space starts
+		END;
+	    END
+	ELSE			! Block<>0 means look for a close match
+	    BEGIN
+	    IF .len EQL .blocks		! Exactly what we are looking for
+	    THEN
+		BEGIN
+
+		! Save the entry as a match.  Note that all 4 saves can be collapsed by the optimizer.
+		!
+		exact_match = true;			! Set the flag to stop scanning
+		mat_len = .len;				! Save the length of this entry,
+		mat_ent = .cur;				!  its address,
+		mat_seg = .ctx [rt11ctx$l_seg_number];	!  its segment number,
+		mat_blk = .ctx [rt11ctx$l_start_block];	!  and the pbn where the free space starts
+		END
+	    ELSE IF ((.len LSSU .mat_len)	! Closer to correct than the previous match
+		      OR (.mat_len EQL 0))	!  or no previous match
+	    THEN
+		BEGIN
+
+		! Save the entry as a match.  Note that all 4 saves can be collapsed by the optimizer.
+		!
+		mat_len = .len;				! Save the length of this entry,
+		mat_ent = .cur;				!  its address,
+		mat_seg = .ctx [rt11ctx$l_seg_number];	!  its segment number,
+		mat_blk = .ctx [rt11ctx$l_start_block];	!  and the pbn where the free space starts
+		END;
+	    END;
+	END;
+
+    ! If we have seen an exact match we can stop scanning this segment
+    !
+    IF .exact_match THEN EXITLOOP;
+
+    END;
+
+! Now put a zero-length entry after the matched entry and set the return values
+!
+IF .mat_len NEQ 0				! Means that we found one
+THEN
+    BEGIN
+    LOCAL
+	eos : $ref_bblock,			! End of segment entry
+	emp : $ref_bblock,			! Entry to be turned into a zero-length empty
+	sl;					! Length of directory to slide up one entry
+
+    ! Get a pointer to the segment containing the match, return if error
+    !
+    seg = exch$rt11_dirseg_get (.volb, .mat_seg);
+    $logic_check (2, (.seg NEQ 0), 155);
+    ent_len = rt11ent$k_length + .seg [rt11hdr$w_extra_bytes];
+
+    ! Find the end of the segment.  We verified that one exists in the first scan.
+    !
+    eos = .mat_ent;				! Point to the matched entry
+    WHILE 1
+    DO
+	BEGIN
+	eos = .eos + .ent_len;			! Advance to the next entry
+	$logic_check (1, (.eos LSSU (.seg + rt11$k_dirseglen)), 144);	! It can't loop forever, can it?
+	IF .eos [rt11ent$v_type] EQL rt11ent$m_typ_end_segment
+	THEN
+	    EXITLOOP;
+	END;
+
+    ! If we are looking for a specific block, we might need to split the current empty into two entries, the
+    ! second of which will start on the requested block.
+    !
+    IF .start NEQ 0				! /START_BLOCK has been requested
+      AND
+       .start NEQ .mat_blk			! We are lucky, it already begins on exactly the right block
+    THEN
+	BEGIN
+
+	! Make sure that there is room to add two more entries to this segment.  If not, signal a full directory.
+	!
+	IF ((.eos+2 + (2*.ent_len)) GEQU (.seg + rt11$k_dirseglen))
+	THEN
+	    BEGIN
+	    IF .recursive						! If we have already tried it a second time
+	    THEN							!  then cleaning didn't help and we should
+		RETURN exch$_rt11_overflow				!  return an error.  Otherwise, call this
+	    ELSE							!  routine again with a dummy parameter to
+		RETURN exch$rtacp_find_empty_area (.ctx, .blocks, .start, 0); !  flag the call as recursive
+	    END;
+
+	! Slide the rest of the segment up one entry and split the empty entry
+	!
+	emp = .mat_ent;						! Point to the matched entry (will become an empty)
+	sl = .eos+2 - .emp;					! Length of segment between empty and end
+	CH$MOVE (.sl, .emp, .emp + .ent_len);			! Slide rest of segment up
+	mat_ent = .mat_ent + .ent_len;				! Move the pointer to the matched entry
+	eos = .eos + .ent_len;					! Move the pointer to the end of the segment
+	CH$FILL (0, rt11ent$k_length, .emp);			! Set all fields of empty entry to null
+	emp [rt11ent$b_type_byte] = rt11ent$m_typ_empty;	! Set to an empty entry
+	sl = .start - .mat_blk;					! Get number of blocks to put in the empty
+	emp [rt11ent$w_blocks] = .sl;				! Set the size of the new empty
+	mat_ent [rt11ent$w_blocks] = .mat_ent [rt11ent$w_blocks] - .sl;	! Subtract the blocks from the matched entry
+	mat_blk = .mat_blk + .sl;				! Move the starting block
+
+	END;
+
+    ! Make sure that there is room to add one more entry to this segment.  If not, signal a full directory
+    !
+    IF ((.eos+2 + .ent_len) GEQU (.seg + rt11$k_dirseglen))
+    THEN
+	BEGIN
+	IF .recursive							! If we have already tried it a second time
+	THEN								!  then cleaning didn't help and we should
+	    status = exch$_rt11_overflow				!  return an error.  Otherwise, call this
+	ELSE								!  routine again with a dummy parameter to
+	    RETURN exch$rtacp_find_empty_area (.ctx, .blocks, .start, 0); !  flag the call as recursive
+	END
+
+    ELSE
+	BEGIN
+
+	! Slide the rest of the segment up one entry and make the empty entry
+	!
+	emp = .mat_ent + .ent_len;				! Point to one past the matched entry
+	sl = .eos+2 - .emp;					! Length of segment between empty and end
+	CH$MOVE (.sl, .emp, .emp + .ent_len);			! Slide rest of segment up
+	CH$FILL (0, rt11ent$k_length, .emp);			! Set all fields of entry to null
+	emp [rt11ent$b_type_byte] = rt11ent$m_typ_empty;	! Zap whole byte to clear protect bit
+
+	! Put the info in the context block
+	!
+	ctx [rt11ctx$l_start_block] = .mat_blk;				! Copy the pbn where the file starts
+	ctx [rt11ctx$l_seg_number]  = .mat_seg;				! The segment number
+	ctx [rt11ctx$a_seg_address] = .seg;				! The address of the start of the segment
+	ctx [rt11ctx$a_ent_address] = .mat_ent;				! The address of the entry
+	CH$MOVE (rt11ctx$s_entry, .mat_ent, ctx [rt11ctx$t_entry]);	! And the entry itself
+
+	exch$rt11_dirseg_put (.volb, .mat_seg);			! Save the changes
+	status = true;
+	END;
+    END
+
+! Either no free space at all (.blocks = 0) or none as large as requested
+!
+ELSE
+    BEGIN
+    IF .start NEQ 0				! If specific start block was requested, then it was past the
+    THEN					!  end of the volume (or contained in last entry in directory)
+	status = exch$_stnotavail
+    ELSE IF .blocks EQL 0			! If blocks requested is 0, then there was no space anyplace and
+    THEN					!  we should return a volume full error
+	status = exch$_volume_full
+    ELSE
+	BEGIN
+	IF .recursive							! If we have already tried it a second time
+	THEN								!  then cleaning didn't help and we should
+	    status = exch$_volume_full					!  return an error.  Otherwise, call this
+	ELSE								!  routine again with a dummy parameter to
+	    RETURN exch$rtacp_find_empty_area (.ctx, .blocks, .start, 0);!  flag the call as recursive
+	END;
+    END;
+
+$logic_check (2, (exch$rtacp_verify_directory (.volb)), 192);
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE exch$rtacp_find_file (ctx : $ref_bblock, name, name_len) =	%SBTTL 'exch$rtacp_find_file (ctx, name, name_len)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Search an RT-11 directory for a specific file
+!
+! INPUT:
+!
+!	ctx	 - pointer to an RT11CTX structure
+!	name	 - pointer to the start of the file name for which to search
+!	name_len - length of the name
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	ctx	 - if a file is found, the context block will describe it
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true if able to find the file, false otherwise
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+$dbgtrc_prefix ('rtacp_find_file> ');
+
+BIND
+    volb = ctx [rt11ctx$a_assoc_volb]	: $ref_bblock
+    ;
+
+$block_check (2, .volb, volb, 557);
+$debug_print_fao ('entry - ctx !XL,  name "!AF"', .ctx, .name_len, .name);
+
+! Loop through the directory looking for permanent files
+!
+WHILE exch$rtacp_next_entry (.ctx, rtnxt$m_permanent) NEQ 0
+DO
+
+    ! Check to see if the this filename matches the one we are looking for.  If so, simply return true.
+    !
+    IF exch$cmd_match_filename (.ctx [rt11ctx$l_exp_fullname_len], ctx [rt11ctx$t_exp_fullname], .name_len, .name)
+    THEN
+	RETURN true;
+
+RETURN false;					! Made it through without a match, return false
+END;
+
+GLOBAL ROUTINE exch$rtacp_next_entry (ctx : $ref_bblock, flags : $bblock) =	%SBTTL 'exch$rtacp_next_entry (ctx, flags)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Return the next entry from an RT-11 directory
+!
+! INPUT:
+!
+!	ctx   - pointer to an RT11CTX structure
+!	flags - a structure of bits with the following meanings:
+!
+!			  flags [rtnxt$v_permanent]	- return the address of the next permanent entry
+!			  flags [rtnxt$v_empty]		- return the address of the next empty entry
+!			  flags [rtnxt$v_tentative]	- return the address of the next tentative entry
+!			  flags [rtnxt$v_unknown]	- return the address of the next entry with invalid type
+!			  flags [rtnxt$v_skip_check]	- skip the check for a moved entry
+!			  flags [rtnxt$v_skip_expand]	- skip expanding the radix-50 name to ascii
+!
+! More than one flag can be set if more than one type of entry is desired.  The end-of-segment entry can not be 
+! returned, but the caller can examine the [rt11ctx$l_seg_number] and interpret a change as an implicit eos.
+!
+! IMPLICIT INPUTS:
+!
+!	anything we can find hanging off the context block
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	the context block is updated with context necessary for wildcard processing
+!
+! ROUTINE VALUE:
+!
+!	address of the next entry, 0 if no more entries of the desired type
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('rtacp_next_entry> ');
+
+LOCAL
+    get_dirseg,
+    start_block,
+    seg_num,
+    seg : $ref_bblock,				! a pointer to the current directory segment
+    ent : $ref_bblock				! a pointer to the current directory entry
+    ;
+
+BIND
+    volb = ctx [rt11ctx$a_assoc_volb]	: $ref_bblock
+    ;
+
+$debug_print_fao ('entry - ctx !XL', .ctx);
+$block_check (2, .ctx, rt11ctx, 552);
+$block_check (2, .volb, volb, 553);
+$logic_check (5, (exch$rtacp_verify_directory (.volb)), 212);
+
+! If the context segment number is null, then we are starting from scratch to find the file
+!
+IF .ctx [rt11ctx$l_seg_number] EQL 0
+THEN
+    BEGIN
+
+    ! Start with the first directory segment
+    !
+    seg_num = 1;
+
+    ! Set flag that we must read a directory segment pointer
+    !
+    get_dirseg = true;
+
+    END
+
+! If non-null, we are doing a subsequent lookup in a wildcard search
+!
+ELSE
+    BEGIN
+
+    ! Check that the directory entry positions are still good.  The entry might have moved - if so reposition to
+    ! the new location.  The skip_check option cannot be used if there is any possibility of any directory
+    ! modifications between calls.
+    !
+    IF NOT (.flags [rtnxt$v_skip_check])
+    THEN
+	exch$rtacp_check_position (.ctx);
+
+    ! Get the segment, entry, and start block, and adjust to point to the next entry
+    !
+    seg = .ctx [rt11ctx$a_seg_address];		! Get our seg from the context block
+    ent = .ctx [rt11ctx$a_ent_address];		! Get the entry from the context block too
+    seg_num = .ctx [rt11ctx$l_seg_number];	! Get the segment number
+    start_block = 				! Add length of current entry
+		.ctx [rt11ctx$l_start_block] + .ent [rt11ent$w_blocks];
+    ent = .ent + rt11ent$k_length 		! Skip the pointer to the next entry
+		+ .seg [rt11hdr$w_extra_bytes];
+    ctx [rt11ctx$a_ent_address] = .ent;		! Save it in the context block too
+
+    ! Clear the flag, we don't need to read a directory segment pointer right now
+    !
+    get_dirseg = false;
+
+    END;
+
+! Loop through the directory looking for this file
+!
+WHILE .seg_num NEQ 0
+DO
+    BEGIN
+
+    IF .get_dirseg
+    THEN
+	BEGIN
+
+	! Get a pointer to the current segment
+	!
+	seg = exch$rt11_dirseg_get (.volb, .seg_num);
+	$logic_check (2, (.seg NEQ 0), 156);
+	start_block = .seg [rt11hdr$w_start_block];	! Fetch the pbn where the first file in this segment starts
+	ent = .seg + rt11hdr$k_length;			! Get a pointer to the first directory entry
+
+	END;
+
+    get_dirseg = true;				! We always want to get additional segs
+
+    WHILE (.ent LSSU (.seg + rt11$k_dirseglen))
+    DO
+	BEGIN
+
+	! Process the entry depending on its type
+	!
+	CASE .ent [rt11ent$v_type] FROM 0 TO rt11ent$m_typ_end_segment OF
+	SET
+
+	[rt11ent$m_typ_permanent] :
+
+		BEGIN
+
+		IF .flags [rtnxt$v_permanent]
+		THEN
+		    BEGIN
+
+		    ! Copy the standard portion of the entry to the context block
+		    !
+		    CH$MOVE (rt11ent$k_length, .ent, ctx [rt11ctx$t_entry]);
+
+		    ! Expand the directory entry filename information into the context block
+		    !
+		    IF NOT (.flags [rtnxt$v_skip_expand])
+		    THEN
+			exch$rt11_expand_filename (.ctx);
+
+		    $debug_print_fao ('Found "!AF!AF"', .volb [volb$l_vol_ident_len], volb [volb$t_vol_ident],
+						.ctx [rt11ctx$l_exp_fullname_len], ctx [rt11ctx$t_exp_fullname]);
+
+		    ! Save the directory position in the context block
+		    !
+		    ctx [rt11ctx$l_start_block] = .start_block;
+		    ctx [rt11ctx$l_seg_number]  = .seg_num;
+		    ctx [rt11ctx$a_seg_address] = .seg;
+		    ctx [rt11ctx$a_ent_address] = .ent;
+
+		    RETURN .ent;
+		    END;
+
+		start_block = .start_block + .ent [rt11ent$w_blocks];
+
+		END;
+
+	[rt11ent$m_typ_tentative] :
+
+		BEGIN
+
+		IF .flags [rtnxt$v_tentative]
+		THEN
+		    BEGIN
+
+		    ! Copy the standard portion of the entry to the context block
+		    !
+		    CH$MOVE (rt11ent$k_length, .ent, ctx [rt11ctx$t_entry]);
+
+		    ! Expand the directory entry filename information into the context block
+		    !
+		    IF NOT (.flags [rtnxt$v_skip_expand])
+		    THEN
+			exch$rt11_expand_filename (.ctx);
+
+		    $debug_print_fao ('Found "!AF!AF"', .volb [volb$l_vol_ident_len], volb [volb$t_vol_ident],
+						.ctx [rt11ctx$l_exp_fullname_len], ctx [rt11ctx$t_exp_fullname]);
+
+		    ! Save the directory position in the context block
+		    !
+		    ctx [rt11ctx$l_start_block] = .start_block;
+		    ctx [rt11ctx$l_seg_number]  = .seg_num;
+		    ctx [rt11ctx$a_seg_address] = .seg;
+		    ctx [rt11ctx$a_ent_address] = .ent;
+
+		    RETURN .ent;
+		    END;
+
+		start_block = .start_block + .ent [rt11ent$w_blocks];
+
+		END;
+
+	[rt11ent$m_typ_empty] :
+
+		BEGIN
+
+		IF .flags [rtnxt$v_empty]
+		THEN
+		    BEGIN
+
+		    ! Copy the standard portion of the entry to the context block
+		    !
+		    CH$MOVE (rt11ent$k_length, .ent, ctx [rt11ctx$t_entry]);
+
+		    ! Expand the directory entry filename information into the context block
+		    !
+		    IF NOT (.flags [rtnxt$v_skip_expand])
+		    THEN
+			exch$rt11_expand_filename (.ctx);
+
+		    $debug_print_fao ('Found "!AF!AF"', .volb [volb$l_vol_ident_len], volb [volb$t_vol_ident],
+						.ctx [rt11ctx$l_exp_fullname_len], ctx [rt11ctx$t_exp_fullname]);
+
+		    ! Save the directory position in the context block
+		    !
+		    ctx [rt11ctx$l_start_block] = .start_block;
+		    ctx [rt11ctx$l_seg_number]  = .seg_num;
+		    ctx [rt11ctx$a_seg_address] = .seg;
+		    ctx [rt11ctx$a_ent_address] = .ent;
+
+		    RETURN .ent;
+		    END;
+
+		start_block = .start_block + .ent [rt11ent$w_blocks];
+
+		END;
+
+	[INRANGE, OUTRANGE] :
+
+		BEGIN
+
+		IF .flags [rtnxt$v_unknown]
+		THEN
+		    BEGIN
+
+		    ! Copy the standard portion of the entry to the context block
+		    !
+		    CH$MOVE (rt11ent$k_length, .ent, ctx [rt11ctx$t_entry]);
+
+		    ! Expand the directory entry filename information into the context block
+		    !
+		    IF NOT (.flags [rtnxt$v_skip_expand])
+		    THEN
+			exch$rt11_expand_filename (.ctx);
+
+		    $debug_print_fao ('Found "!AF!AF"', .volb [volb$l_vol_ident_len], volb [volb$t_vol_ident],
+						.ctx [rt11ctx$l_exp_fullname_len], ctx [rt11ctx$t_exp_fullname]);
+
+		    ! Save the directory position in the context block
+		    !
+		    ctx [rt11ctx$l_start_block] = .start_block;
+		    ctx [rt11ctx$l_seg_number]  = .seg_num;
+		    ctx [rt11ctx$a_seg_address] = .seg;
+		    ctx [rt11ctx$a_ent_address] = .ent;
+
+		    RETURN .ent;
+		    END;
+
+		start_block = .start_block + .ent [rt11ent$w_blocks];
+
+		END;
+
+	[rt11ent$m_typ_end_segment] :
+
+		EXITLOOP;
+
+	TES;
+
+	! Skip to the next entry
+	!
+	ent = .ent + rt11ent$k_length + .seg [rt11hdr$w_extra_bytes];
+
+	END;
+
+    ! Skip to the next segment
+    !
+    seg_num = .seg [rt11hdr$w_next_seg];
+
+    END;
+
+! Mark the context with an invalid segment number to prevent recycling through the directory
+!
+ctx [rt11ctx$l_seg_number] = -1;
+
+RETURN 0;
+END;
+
+GLOBAL ROUTINE exch$rtacp_verify_directory (volb : $ref_bblock) =	%SBTTL 'exch$rtacp_verify_directory (volb)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Traverse the directory and check it for validity.  We also count the number of blocks.
+!
+! INPUTS:
+!
+!	volb - pointer to volb which has been connected to the RT-11 device
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	blocks - address of longword to receive number of blocks
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true if valid, false if not
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('exch$rtacp_verify_directory> ');
+
+LOCAL
+    rtv : $ref_bblock,				! a pointer to the rt11 volb extension
+    seg : $ref_bblock,				! a pointer to the current directory segment
+    ent : $ref_bblock,				! a pointer to the current directory entry
+    sum_blocks,					! running block count
+    unknowns,					! count of unknown directory entries
+    seg_num,
+    end_segment_seen,
+    missing_end,
+    status
+    ;
+
+$debug_print_lit ('entry');
+
+$block_check (2, .volb, volb, 470);
+
+! Assume that we will find a bad directory
+!
+status = 0;
+unknowns = false;				! Clear the unknown entry flag
+missing_end = 0;
+
+! Get the pointer to our volb extension and to the root segment
+!
+rtv = .volb [volb$a_vfmt_specific];
+$block_check (2, .rtv, rt11, 471);
+seg = rtv [rt11$t_block_0] + (512 * rt11$k_root_block);
+
+! Start with the first directory segment
+!
+seg_num = 1;
+
+! Assume that the files will start after the last segment
+!
+sum_blocks = rt11$k_root_block + (2 * .seg [rt11hdr$w_num_segs]);
+$debug_print_fao ('number of segments !UL', .seg [rt11hdr$w_num_segs]);
+
+! Loop through all the segments in the directory
+!
+WHILE .seg_num NEQ 0
+DO
+    BEGIN
+
+    ! Get a pointer to the current segment
+    !
+    seg = exch$rt11_dirseg_get (.volb, .seg_num);
+    IF .seg EQL 0
+    THEN
+	RETURN false;
+
+    ! If the current segment start block is not what we expect, signal and use new value
+    !
+    $debug_print_fao ('expected block !UL, actual block !UL', .sum_blocks, .seg [rt11hdr$w_start_block]);
+    IF (.sum_blocks NEQ .seg [rt11hdr$w_start_block])
+    THEN
+	BEGIN
+	$exch_signal (exch$_rt11_stblock);
+	sum_blocks = .seg [rt11hdr$w_start_block];
+	END;
+
+    ! Get a pointer to the first directory entry, then loop
+    !
+    ent = .seg + rt11hdr$k_length;
+    end_segment_seen = false;
+    WHILE (.ent LSSU (.seg + rt11$k_dirseglen))
+    DO
+	BEGIN
+
+	! Advance our count
+	!
+	CASE .ent [rt11ent$v_type] FROM 0 TO rt11ent$m_typ_end_segment OF
+	SET
+	[rt11ent$m_typ_tentative, rt11ent$m_typ_empty, rt11ent$m_typ_permanent] :
+		BEGIN
+		$debug_print_fao ('entry type !XB, size !UL', .ent [rt11ent$b_type_byte], .ent [rt11ent$w_blocks]);
+		sum_blocks = .sum_blocks + .ent [rt11ent$w_blocks];
+		END;
+	[rt11ent$m_typ_end_segment] :
+		BEGIN
+		end_segment_seen = true;
+		EXITLOOP;
+		END;
+	[INRANGE, OUTRANGE] :
+		BEGIN
+		unknowns = true;
+		$debug_print_fao ('(unknown) entry type !XB, size !UL', .ent [rt11ent$b_type_byte], .ent [rt11ent$w_blocks]);
+		sum_blocks = .sum_blocks + .ent [rt11ent$w_blocks];
+		END;
+	TES;
+
+	! Skip to the next entry
+	!
+	ent = .ent + rt11ent$k_length + .seg [rt11hdr$w_extra_bytes];
+
+	END;
+
+    ! Holler if we didn't see the end segment
+    !
+    IF NOT (.end_segment_seen)
+    THEN
+	missing_end = true;
+
+    ! Skip to the next segment
+    !
+    seg_num = .seg [rt11hdr$w_next_seg];
+
+    END;
+
+! Assume now that we have found a valid directory
+!
+status = true;
+
+! If we saw any bad entries, signal and write lock the volume
+!
+IF .unknowns OR .missing_end			! Unknown format of some entries or missing marker
+THEN
+    BEGIN
+    LOCAL
+	sig_stat;
+
+    sig_stat = (IF .unknowns THEN exch$_rt11_unkent ELSE exch$_rt11_noend);	! Get the proper signal name
+
+    ! Signal if this is the first verify, or if we have write access
+    !
+    IF	NOT .volb [volb$v_verified]
+      OR
+	.volb [volb$v_write]
+    THEN
+	$exch_signal (.sig_stat, 0, exch$_rt11_errlock);
+
+    ! Fail the directory validation this is not the first and we have write access
+    !
+    IF	.volb [volb$v_verified]
+      AND
+	.volb [volb$v_write]
+    THEN
+	status = false;
+
+    volb [volb$v_write] = false;		! Force a write lock
+    END;
+
+! Check if the block count is what we expected
+!
+$debug_print_fao ('volmaxblock !UL, sum_blocks !UL', .volb [volb$l_volmaxblock], .sum_blocks);
+IF .volb [volb$l_volmaxblock] NEQ .sum_blocks
+THEN
+    BEGIN
+
+    ! If the volume is larger than the device there is no hope
+    !
+    $debug_print_fao ('devmaxblock !UL, sum_blocks !UL', .volb [volb$l_devmaxblock], .sum_blocks);
+    IF .sum_blocks GTRU .volb [volb$l_devmaxblock]
+    THEN
+	BEGIN
+	$exch_signal (exch$_rt11_dirsize, 4, .volb [volb$l_vol_ident_len], volb [volb$t_vol_ident],
+			.sum_blocks, .volb [volb$l_devmaxblock], exch$_rt11_errlock);
+	volb [volb$v_write] = false;
+	END;
+
+    ! If this is the first time that the directory has been verified, store
+    ! the calculated value as the real value.
+    !
+    IF NOT .volb [volb$v_verified]
+    THEN
+	BEGIN
+	$logic_check (3, (.volb [volb$l_volmaxblock] EQL .volb [volb$l_devmaxblock]), 190);
+	volb [volb$l_volmaxblock] = .sum_blocks;
+	END
+
+    ! Otherwise, we have corrupted the directory since we started
+    ! 
+    ELSE
+	$logic_check (0, (false), 316);
+    END;
+
+! Set the verification flag
+!
+volb [volb$v_verified] = true;
+
+RETURN .status;
+END;
+
+END
+ELUDOM

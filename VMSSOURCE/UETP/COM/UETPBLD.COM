@@ -1,0 +1,112 @@
+$ !
+$ !	[ U E T P . C O M ] U E T P B L D . C O M
+$ !
+$ !	Assumes [UETP] and definitions for LIB$:, LIS$:, SRC$:,
+$ !			EXE$:, MAP$:, OBJ$:
+$ !		PRMOBJ$: for data files, etc., not rebuilt
+$ !		or dependent on VMS versions.
+$ !		LIBD$:[SYSTST.OBJ] for SYSTST.MLB
+$ !
+$ !
+$ GOTO 'PHASE'
+$
+$INIT:
+$ !
+$ !	Create the Directories
+$ !
+$ @SYSBLDCOM$:CREATEDIR
+$ EXIT
+$
+$UPDATE:
+$ !
+$ !	Create updated data file sources.
+$ !
+$ SRCUPDATE UETPMSG.MSG
+$ PUTSYSMSG SRC$:UETPMSG.MSG			! Insert in SYSMSG.TLB
+$ SRCUPDATE SYSTSTMAC.MAR
+$ SRCUPDATE UETUNT.SDL
+$ SRCUPDATE UETIDBDEF.SDL
+$ SRCUPDATE TCNTRLDEF.SDL
+$ EXIT
+$
+$SRCLIB:
+$ !
+$ !	Delete and re-create the macro and bliss libraries
+$ !
+$ DELSHRLIB LIB$:UETP.MLB
+$ DELETE LIB$:UETPMSG.MAR;*, UETPMSG.R32;*, UETUNT.MAR;*, UETUNT.R32;*, -
+	UETIDBDEF.MAR;*, UETIDBDEF.R32;*, UETPMSG.SDL;*
+$ MESSAGE/SDL=SRC$:UETPMSG/NOOBJ SRC$:UETPMSG
+$ SDL/VMS/COPYRIGHT SRC$:UETPMSG/LANG=(MACRO=LIB$,BLISS=LIB$)
+$ SDL/VMS/COPYRIGHT SRC$:UETUNT/LANG=(MACRO=LIB$,BLISS=LIB$)
+$ SDL/VMS/COPYRIGHT SRC$:UETIDBDEF/LANG=(MACRO=LIB$,BLISS=LIB$)
+$ SDL/VMS/COPYRIGHT SRC$:TCNTRLDEF/LANG=(MACRO=LIB$,BLISS=LIB$)
+$ LIB/MAC/CREATE LIB$:UETP -
+	SRC$:SYSTSTMAC, LIB$:UETPMSG, LIB$:UETUNT, LIB$:UETIDBDEF, -
+	LIB$:TCNTRLDEF
+$ CPYSHRLIB LIB$:UETP.MLB
+$
+$ DELETE LIB$:UETP.REQ;*
+$ COPY LIB$:UETPMSG.R32, LIB$:UETUNT.R32, LIB$:UETIDBDEF.R32 -
+	LIB$:UETP.REQ
+$
+$ DELETE LIB$:UETP.L32;*
+$ BLISS/NOLIST/LIBRARY=LIB$:UETP LIB$:UETP.REQ
+$ CPYSHRLIB LIB$:UETP.L32
+$
+$ EXIT
+$
+$ASSEM:
+$ !
+$ !	PURGE and recreate the OBJ's and LIS's
+$ !
+$ PURGE OBJ$:*.OBJ, LIS$:*.LIS
+$ @SYSBLDCOM$:FASM 'FACNAM "" N 'UPDATES
+$ EXIT
+$
+$OBJLIB:
+$ !
+$ ! 	Create object library from object modules.
+$ !
+$ IF F$SEARCH("OBJ$:*.OBJ") .EQS. "" THEN EXIT
+$ IF F$SEARCH("OBJ$:LIBRIS.AOK") .NES. "" THEN GOTO VMSOBJLIB
+$ LIB/CREATE=(BLOCKS=350,GLOBALS=500) LIB$:UETP OBJ$:*.OBJ
+$ IF .NOT. $STATUS THEN EXIT $STATUS
+$ PURGE LIB$:UETP.OLB
+$ IF CPYOLB THEN CPYRESOBJ LIB$:UETP.OLB
+$ CREATE OBJ$:LIBRIS.AOK
+$VMSOBJLIB:
+$ DELETE OBJ$:*.OBJ;*
+$ DELETE OBJ$:LIBRIS.AOK;*
+$ EXIT
+$
+$LNKLIB:
+$ !
+$ ! Null LNKLIB phase
+$ !
+$ EXIT
+$
+$LINK:
+$ !
+$ !	Delete map and image files, then re-create EXE$:*.EXE
+$ !			and MAP$:*.MAP files.
+$ !
+$ @COM$:UETPLNK
+$ EXIT
+$
+$RESULT:
+$ !
+$ ! Copy the .EXE and data files to the SYSTEST area
+$ !
+$ CPYRES LIBD$:[SYSTEST] EXE$:*.EXE
+$ CPYRES LIBD$:[SYSTEST] MSRC$:*.COM
+$ CPYRES LIBD$:[SYSTEST] MSRC$:*.CLD
+$ CPYRES LIBD$:[SYSTEST] PRMOBJ$:*.DAT,UETRSXFOR.EXE,*.PIP
+$ !
+$ !	Build the concatenated listing RESLIS$:UETP.LSS
+$ !
+$ CPYRESLIS LIS$:*.LIS UETP.LSS
+$ !
+$ !	Copy MAP files to a UETP system area
+$ !
+$ CPYRESMAP MAP$:*.MAP

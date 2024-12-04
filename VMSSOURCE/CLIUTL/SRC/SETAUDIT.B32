@@ -1,0 +1,705 @@
+MODULE setaudit ( IDENT = 'V04-000',
+		ADDRESSING_MODE (EXTERNAL = GENERAL, NONEXTERNAL=LONG_RELATIVE)
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  SET Command
+!
+! ABSTRACT:
+!
+!	This module implements the DCL command SET AUDIT.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system, user and kernel mode
+!
+! AUTHOR:  Gerry Smith				29-Jun-1983
+!
+! Modified by:
+!
+!	V03-007	DAS0001		David Solomon		09-Jul-1984
+!		Fix truncation errors; make nonexternal refs LONG_RELATIVE.
+!
+!	V03-006	RSH0104		R. Scott Hanna		17-Feb-1984
+!		Fix field test 1 problems, comment out journaling code
+!		and make changes due to new layout of $NSAEVTDEF.
+!
+!	V03-005	RSH0101		R. Scott Hanna		05-Feb-1984
+!		Temporarily disable SET AUDIT.
+!
+!	V03-004	MKL0208		Mary Kay Lyons		30-Nov-1983
+!		Change ITMLST in CRENWV call to LSTADR.
+!
+!	V03-003	GAS0176		Gerry Smith		30-Aug-1983
+!		Add more comments.  Also remove some of the kludges that
+!		were  necessary to make journal calls work.
+!
+!	V03-002	GAS0173		Gerry Smith		26-Aug-1983
+!		Remove reference to (now) non-existent literal.  sigh...
+!
+!	V03-001	GAS0171		Gerry Smith		24-Aug-1983
+!		Remove reference to mailbox and terminal I/O, add
+!		interactive and remote login/out.
+!
+!--
+
+!
+! Include files
+!
+LIBRARY 'SYS$LIBRARY:LIB';			! VAX/VMS common definitions
+
+!
+! Define some flag bits.  THE FIRST TWO BIT POSITIONS MUST NOT CHANGE.
+!
+!MACRO
+!    v_enable	= 0%,				! /ENABLE
+!    v_disable	= 1%,				! /DISABLE
+!    v_alarm	= 2%,				! /ALARM
+!    v_journal	= 3%,				! /JOURNAL
+!    v_log	= 4%,				! /LOG
+!    v_new	= 5%;				! /NEW_VERSION
+
+LITERAL
+    num_sys_events	= 3,
+    num_loginout_events	= 4,
+    num_loginout_types	= 8,
+    num_file_events	= 8,
+    num_access_types	= 6,
+
+    arm$m_all		= arm$m_control OR
+			  arm$m_delete OR
+			  arm$m_execute OR
+			  arm$m_read OR
+			  arm$m_write,
+
+    nsa$m_evt_log_all	= nsa$m_evt_log_bat OR
+			  nsa$m_evt_log_det OR
+			  nsa$m_evt_log_dia OR
+			  nsa$m_evt_log_loc OR
+			  nsa$m_evt_log_net OR
+			  nsa$m_evt_log_rem OR
+			  nsa$m_evt_log_sub;
+
+!
+! Declare some storage for tables
+!
+OWN
+    option_string 	: VECTOR[2]			! ASCII storage for
+			  INITIAL(%ASCID 'ENABLE',	! qualifiers
+				  %ASCID 'DISABLE'),
+
+    sys_events		: VECTOR[num_sys_events]	! System events
+			  INITIAL(%ASCID '.ACL',
+				  %ASCID '.AUTHORIZATION',
+				  %ASCID '.MOUNT'),
+
+    sys_bits 		: VECTOR[num_sys_events]	! System event bit masks
+			  INITIAL(nsa$m_evt_acl,
+				  nsa$m_evt_uaf,
+				  nsa$m_evt_mount),
+!
+! loginout_events must be in the same order as the corresponding bytes in $NSAEVTDEF
+!
+    loginout_events 	: VECTOR[num_loginout_events]	! Loginout events
+	    		   INITIAL(%ASCID '.BREAKIN',
+	    		   	   %ASCID '.LOGIN',
+	    		   	   %ASCID '.LOGFAILURE',
+	    			   %ASCID '.LOGOUT'),
+
+    loginout_types	: VECTOR[num_loginout_types]	! Types of login/logout
+			  INITIAL(%ASCID '.ALL',
+				  %ASCID '.DETACHED',
+	    			  %ASCID '.DIALUP',
+	    			  %ASCID '.LOCAL',
+	    			  %ASCID '.NETWORK',
+				  %ASCID '.REMOTE',
+				  %ASCID '.BATCH',
+	    			  %ASCID '.SUBPROCESS'),
+
+    loginout_bits	: VECTOR [num_loginout_types] ! Loginout bit masks
+			  INITIAL(nsa$m_evt_log_all,
+				  nsa$m_evt_log_det,
+				  nsa$m_evt_log_dia,
+				  nsa$m_evt_log_loc,
+				  nsa$m_evt_log_net,
+				  nsa$m_evt_log_rem,
+				  nsa$m_evt_log_bat,
+				  nsa$m_evt_log_sub),
+!
+! file_events must be in the same order as the corresponding longwords in $NSAEVTDEF
+!
+    file_events		: VECTOR[num_file_events]	! File access events
+	    		  INITIAL(%ASCID '.FAILURE',
+	    		          %ASCID '.SUCCESS',
+	    		          %ASCID '.SYSPRV',
+	    		          %ASCID '.BYPASS',
+	    		          %ASCID '.UPGRADE',
+	    		          %ASCID '.DOWNGRADE',
+	    		          %ASCID '.GRPPRV',
+	    		          %ASCID '.READALL'),
+
+    access_types	: VECTOR[num_access_types]	! File access types
+			  INITIAL(%ASCID '.ALL',
+				  %ASCID '.CONTROL',
+				  %ASCID '.DELETE',
+				  %ASCID '.EXECUTE',
+				  %ASCID '.READ',
+				  %ASCID '.WRITE'),
+		  
+    access_bits		: VECTOR[num_access_types]	! File access bit masks
+			  INITIAL(arm$m_all,
+				  arm$m_control,
+				  arm$m_delete,
+				  arm$m_execute,
+				  arm$m_read,
+				  arm$m_write);
+
+!
+! Table of contents
+!
+
+FORWARD ROUTINE
+    set$audit	: NOVALUE,		! Main module of SET AUDIT
+    get_values	: NOVALUE,		! Parse ENABLE/DISABLE list
+    set_bits	: NOVALUE;		! Set alarm/journal bits
+!   start_journal,			! Start a journal
+!   new_version,			! Make a new version of the journal file
+!   create_journal;			! Create a new journal
+
+!
+! External routines
+!
+EXTERNAL ROUTINE
+    str$concat,				! Make a string
+    cli$get_value,			! Get value from CLI
+    cli$present;			! See if qualifier is present
+
+!
+! Declare literals defined elsewhere
+!
+!EXTERNAL LITERAL
+!   set$_jnlaccerr,			! Error accessing journal
+!   set$_jnlerr,			! Error creating journal
+!   set$_newjnl,			! Journal successfully created
+!   set$_jnlsysdev,			! Using SYS$SYSDEVICE for journal
+!   set$_vrsnerr,			! Error creating new version
+!   set$_newvrsn;			! New version created
+
+!
+! Declare the shared messages
+!
+!$SHR_MSGDEF (SET, 119, LOCAL,
+!	    (syntax, error));
+
+!
+! Declare some cells in the exec
+!
+EXTERNAL
+    ctl$gq_procpriv : $BBLOCK,
+!   nsa$gr_journvec,
+    nsa$gr_alarmvec;
+
+
+GLOBAL ROUTINE set$audit : NOVALUE =
+BEGIN
+
+!++
+! Functional description
+!
+!	This is the routine for the SET AUDIT command.  It is called
+!	from the SET command processor,	and enables/disables security
+!	alarms and security journals, for various event classes.  In
+!	addition, a new journal file may be created.
+!
+! Inputs
+!	None
+!
+! Outputs
+!	None
+!
+!----
+
+LOCAL
+!   status,
+!   chan : WORD,
+    arglist : VECTOR[3],
+    mask : VECTOR[2*nsa$k_evt_length,BYTE] ! Enable/disable flags
+	   VOLATILE,
+!   disk : $BBLOCK[dsc$c_s_bln],	! Journal device name
+    flags : BITVECTOR[8] 		! Flags to tell what we're doing
+    	    INITIAL(BYTE(0));
+
+!
+! See if the user has the SECURITY privilege.
+!
+IF NOT .ctl$gq_procpriv[prv$v_security]
+THEN
+    BEGIN
+    SIGNAL(ss$_nosecurity);
+    RETURN;
+    END;
+
+!
+! See if logging is required.   Also check for  /ALARM or /JOURNAL
+!
+!IF cli$present(%ASCID 'LOG')
+!THEN flags[v_log] = 1;
+
+!IF cli$present(%ASCID 'ALARM')
+!THEN flags[v_alarm] = 1;
+
+!IF cli$present(%ASCID 'JOURNAL')
+!THEN flags[v_journal] = 1;
+
+!IF cli$present(%ASCID 'NEW_VERSION')
+!THEN flags[v_new] = 1;
+
+!$init_dyndesc(disk);
+!cli$get_value(%ASCID 'DEVICE_NAME', disk);
+
+
+!
+! See if anything is to be enabled or disabled.
+!
+CH$FILL(0, %ALLOCATION(mask), mask);		! Zero the masks
+
+INCR i FROM 0 TO 1 DO				! Loop thru, once for enable,
+    BEGIN					! once for disable.
+    IF cli$present(.option_string[.i])		! If something to do,
+    THEN 
+	BEGIN
+	flags[.i] = 1;				! set a bit saying so, and
+	get_values(.option_string[.i], 		! call routine to put new values
+    		   mask[.i*nsa$k_evt_length])	! in the appropriate mask.
+	END;
+    END;
+
+!
+! If something is supposed to be enabled/disabled, go do it.
+!
+!IF .flags[v_enable] 				! See why ENABLE and
+!OR .flags[v_disable] 				! DISABLE are first in the
+!THEN						! bit list?
+!   BEGIN					! If something is supposed
+    arglist[0] = 2;				! to be set/cleared, set 
+    arglist[1] = mask;				! up the argument list
+    arglist[2] = flags;				! and call the routine
+    $CMKRNL(ROUTIN = set_bits, ARGLST = arglist); ! to do the bit tweaking.
+!   END;
+
+!
+! If /JOURNAL, then start/create the journal.
+!
+!IF NOT .flags[v_journal]		! If not a journal,
+!THEN RETURN;				! leave.
+!IF NOT (.flags[v_enable] 		! If not either
+!    	OR .flags[v_new])		! enabling or new_version,
+!THEN RETURN;				! leave.
+!arglist[0] = 1;				! Otherwise set up the
+!arglist[1] = chan;			! argument list and
+!status = $CMEXEC(ROUTIN = start_journal,! call the routine to 
+!    		 ARGLST = arglist);	! start the journal.
+
+!
+! If there was an error trying to start the journal, tell the
+! user and attempt to create a new one.
+!
+!IF NOT .status
+!THEN
+!    BEGIN
+!    SIGNAL(set$_jnlaccerr, 0,		! Error trying to start journal
+!	   .status);			! and here's why
+!    SIGNAL(set$_jnlsysdev);		! and that we'll try on SYS$SYSDEVICE
+!    arglist[0] = 2;
+!    arglist[1] = chan;
+!    arglist[2] = disk;
+!    status = $CMEXEC(ROUTIN = create_journal,
+!    		     ARGLST = arglist);
+
+!
+! If we can't create a journal on SYS$SYSDEVICE, give up.
+!
+!    IF NOT .status
+!    THEN SIGNAL(set$_jnlerr, 0,
+!    		.status)
+!    ELSE IF .flags[v_log]
+!    THEN SIGNAL(set$_newjnl);
+!    END;
+
+!
+! If /NEW_VERSION was requested, try that.
+!
+!IF .flags[v_new]
+!THEN
+!    BEGIN
+!    LOCAL
+!	arglist : VECTOR[3];
+!    arglist[0] = 2;
+!    arglist[1] = chan;
+!    arglist[2] = disk;
+!    status = $CMEXEC(ROUTIN = new_version,
+!		     ARGLST = arglist);
+!    IF NOT .status
+!    THEN SIGNAL(set$_vrsnerr, 0,
+!		.status)
+!    ELSE IF .flags[v_log]
+!    THEN SIGNAL(set$_newvrsn);
+!    END;
+
+RETURN;
+END;
+
+ROUTINE get_values (option, mask) : NOVALUE =
+BEGIN
+
+!+++
+!
+! Given an ASCII descriptor and a set of masks, decipher the
+! string into an audit class, and set the appropriate bits in the
+! masks
+!
+! Inputs:
+!	mask - address of mask area
+!	option - address of ASCII descriptor
+!
+! Outputs:
+!	mask - will have a bit set.
+!
+!---
+
+MAP
+    mask : REF $BBLOCK;				! The mask is a byte block 
+
+BIND						! Locate stuff within the mask:
+    sys = mask[nsa$l_evt_sys],			! The simple system bits,
+    loginout = mask[nsa$b_evt_logb] : VECTOR[4,BYTE],	! Loginout bits
+    file_access = mask[nsa$l_evt_failure] : VECTOR;	! File access vector
+
+LOCAL
+    all		: BYTE INITIAL (0),
+    file_all	: BYTE INITIAL (0),
+    string	: $BBLOCK[dsc$c_s_bln],
+    desc	: $BBLOCK[dsc$c_s_bln];
+
+$init_dyndesc(desc);				! Get a couple of
+$init_dyndesc(string);				! dynamic descriptors
+
+str$concat(desc, .option, %ASCID '.ALL');
+IF cli$present(desc) THEN all = 1;
+
+!
+! system events
+!
+
+INCR i FROM 0 TO num_sys_events-1 DO
+    BEGIN
+    str$concat(desc, .option, .sys_events[.i]);
+    IF .all OR cli$present(desc) THEN sys = .sys OR .sys_bits[.i];
+    END;
+
+!
+! Loginout events
+!
+
+INCR i FROM 0 TO num_loginout_events-1 DO
+    BEGIN
+    str$concat(desc, .option, .loginout_events[.i]);
+    IF .all OR cli$present(desc) 
+    THEN 
+	BEGIN
+	INCR j FROM 0 TO num_loginout_types-1 DO
+	    BEGIN
+	    IF (.i EQLU 0) AND (.j EQLU 6) THEN EXITLOOP;
+	    str$concat(desc, .option, .loginout_events[.i], .loginout_types[.j]);
+	    IF .all OR cli$present(desc)
+	    THEN
+		loginout[.i] = .loginout[.i] OR .loginout_bits[.j];
+	    END;
+	END;
+    END;
+loginout[0] = .loginout[0] AND NOT (nsa$m_evt_log_bat OR nsa$m_evt_log_sub);
+
+!
+! file access events
+!
+
+str$concat(desc, .option, %ASCID '.FILE_ACCESS', %ASCID '.ALL');
+IF cli$present(desc) THEN file_all = 1;
+
+INCR i FROM 0 TO num_file_events-1 DO
+    BEGIN
+    str$concat(desc, .option, %ASCID '.FILE_ACCESS', .file_events[.i]);
+    IF .all OR .file_all OR cli$present(desc)
+    THEN
+	BEGIN
+	INCR j FROM 0 TO num_access_types-1 DO
+	    BEGIN
+	    str$concat(desc, .option, %ASCID '.FILE_ACCESS', .file_events[.i], .access_types[.j]);
+	    IF .all OR .file_all OR cli$present(desc) 
+	    THEN
+		file_access[.i] = .file_access[.i] OR .access_bits[.j];
+	    END;
+	IF .file_access[.i] EQLU 0 THEN file_access[.i] = .access_bits[0];
+	END;
+    END;
+!
+! Upgrade and Downgrade not implemented yet so make sure that ALL has not
+! turned them on.
+!
+file_access[4] = 0;
+file_access[5] = 0;
+END;
+
+ROUTINE set_bits (mask, flags) : NOVALUE =
+BEGIN
+
+!+++
+!
+! Reset the bits for either security alarms, or security journaling.
+!
+! Inputs:
+!	mask - address of vector of bits to enable and disable
+!	flags - address of flags (alarm, journal)
+!
+! Outputs:
+!	None.  The auditing bits are set.
+!
+!---
+
+MAP
+    mask : REF VECTOR[,BYTE],
+    flags : REF BITVECTOR;
+
+BIND
+    enab = mask[0] : VECTOR[,BYTE],
+    disab = mask[nsa$k_evt_length] : VECTOR[,BYTE];
+
+LOCAL
+    bits : REF VECTOR[,BYTE];
+
+!
+! Determine whether to modify the journal or alarm bits.
+!
+!IF .flags[v_alarm] 
+!THEN bits = nsa$gr_alarmvec
+!ELSE bits = nsa$gr_journvec;
+bits = nsa$gr_alarmvec;
+
+!
+! Step through the vector in SYSCOMMON and enable bits.
+!
+INCR i FROM 0 TO nsa$k_evt_length-1 DO
+    bits[.i] = (.bits[.i] OR .enab[.i]) AND NOT .disab[.i];
+
+RETURN;
+END;
+!
+!ROUTINE start_journal (chan) =
+!BEGIN
+
+!+++
+!
+! Attempt to assign a channel to the journal.
+!
+! Inputs:
+!	chan - address of word to store channel number
+!
+! Outputs:
+!	chan - will be filled in.
+!
+!---
+
+!MAP
+!    chan : REF VECTOR[,WORD];
+
+!RETURN $ASSJNL(CHAN   = chan[0],		! Try to assign a channel,
+!    	       JNLTYP = dt$_atjnl,		! perhaps causing the journal
+!    	       ACMODE = UPLIT BYTE(jsb$c_exec),	! to get started on the 
+!    	       JNLNAM = %ASCID 'SECURITY');	! system.
+
+!END;
+!
+!ROUTINE create_journal (chan, disk) =
+!BEGIN
+
+!+++
+!
+! Try to create a journal.
+!
+! Inputs:
+!	chan - address of word, where to put channel number
+!	disk - address of descriptor for device to journal to
+!
+! Outputs:
+!	chan - will be filled in.
+!
+!---
+
+!MAP
+!    chan : REF VECTOR[,WORD],
+!    disk : REF $BBLOCK;
+
+!LOCAL
+!    device_list : VECTOR[3],
+!    data : $BBLOCK[jsb$c_length];
+
+!
+! Set up the list of descriptors pointing to the device(s) on which the
+! journal file resides.
+!
+!IF .disk[dsc$w_length] NEQ 0			! If there's a valid 
+!THEN						! device specified by the
+!    BEGIN					! user, transfer the length
+!    device_list[0] = .disk[dsc$w_length];	! and address to DEVICE_LIST.
+!    device_list[1] = .disk[dsc$a_pointer];
+!    END
+!ELSE 							! Otherwise, use
+!    BEGIN						! SYS$SYSDEVICE.
+!    device_list[0] = %CHARCOUNT('SYS$SYSDEVICE');
+!    device_list[1] = UPLIT BYTE ('SYS$SYSDEVICE');
+!    END;
+!device_list[2] = 0;				! Zero-terminate the list
+
+
+!
+! Set up the Journal Specification Block, which contains all the 
+! information about the journal to be opened/created.
+!
+!CH$FILL(0, jsb$c_length, data);			! Initialize
+!data[jsb$w_jnlnamlen] = %CHARCOUNT('SECURITY');	! Journal name is 8 bytes,
+!data[jsb$l_jnlnam] = UPLIT BYTE('SECURITY');	! name is "SECURITY"
+!data[jsb$b_jnltyp] = jsb$c_at;			! AT journal
+!data[jsb$b_jnldev] = jsb$c_disk;		! always a disk journal
+!data[jsb$w_maxsiz] = nsa$s_idt_record_buf;	! and can be this big
+!data[jsb$w_filext] = 10;			! extend size
+!data[jsb$w_bufsiz] = 1;				! (Do this to stop crashing)
+!data[jsb$b_acmode] = jsb$c_exec;		! do everything from EXEC
+!data[jsb$w_prot] = %B'1101110111001100';	! Protection=(S:RW,O:RW,G:W,W:W)
+!data[jsb$l_uic] = %X'00010004';			! Owner = [1,4]
+!data[jsb$l_flags] = jsb$m_known			! Known journal, and create a
+!		    OR jsb$m_cif;		! journal file if not there
+!data[jsb$b_copies] = 1;				! Only one copy of the file
+!data[jsb$l_prinamdes] = device_list;		! Disk names here
+
+!RETURN $CREJNL(CHAN   = chan[0],		! Give it a try.
+!    	       FLAGS  = cjf$m_read,
+!    	       ACMODE = UPLIT BYTE(jsb$c_exec),
+!	       JSB    = data);
+
+!END;
+!
+!ROUTINE new_version (chan, disk) = 
+!BEGIN
+
+!+++
+!
+! Create a new version of the journal file.
+!
+! Inputs:
+!	chan - address of channel to use
+!	disk - address of device descriptor, telling what device to
+!	       locate the new file.
+!
+! Outputs:
+!	None.
+!
+!---
+
+!MAP
+!    chan : REF VECTOR[,WORD],
+!    disk : REF $BBLOCK;
+
+!LOCAL
+!    item_list : VECTOR[12],
+!    curdev_len,
+!    curdev : VECTOR[10];
+
+!
+! Get the current device name.
+!
+!BEGIN
+!LOCAL
+!    status,					! Declare these here,
+!    list : $ITMLST_DECL(ITEMS = 1);		! because they're temporary.
+
+!$ITMLST_INIT(ITMLST = list,			! Set up this list,
+!	    (ITMCOD = cji$_fildsknam,		! want device name
+!	     BUFADR = curdev,			! store it here,
+!	     BUFSIZ = %ALLOCATION(curdev),	! up to this big,
+!	     RETLEN = curdev_len)		! actual size returned here.
+!    	    );
+!IF NOT (status = $GETCJI(ITMLST = list,		! Do it.
+!	    		 CHAN   = .chan[0]))	! If a problem,
+!THEN RETURN .status;				! stop now.
+!END;
+
+
+!
+! The $CRENWV service takes as its argument a list of itemlist addresses.
+! Set that up now.
+!
+!item_list[0] = item_list[2];			! Point to "real" itemlist
+!item_list[1] = 0;				! Zero-terminate.
+
+!
+! The journaling facility uses a pseudo-itemlist, which actually looks more
+! like a descriptor list.  In the first longword is the itemcode and the
+! length of the item; the second longword contains the address of the item.
+! This list must be zero-terminated as well.  In all cases, we want to list
+! the current device name, and the "close this file" flag.
+!
+!item_list[2] = (cnv$_flags^16) OR 4;		! Flags are a longword
+!item_list[3] = UPLIT (cnv$m_close);		! and say "close the file"
+
+!item_list[4] = (cnv$_curdevnam^16) OR .curdev_len;	! Current devname
+!item_list[5] = curdev;
+
+!
+! If the user wants the journal file on a different device, then put that
+! item in the list, followed by the zero terminator.
+!
+!IF .disk[dsc$w_length] NEQ 0			! If to a different disk,
+!THEN						! put that item in.
+!    BEGIN
+!    item_list[6] = (cnv$_newdevnam^16) OR .disk[dsc$w_length];
+!    item_list[7] = .disk[dsc$a_pointer];
+!    item_list[8] = 0;
+!    END
+
+!
+! Otherwise, simply zero-terminate the list.
+!
+!ELSE item_list[6] = 0;
+
+!RETURN $CRENWV(CHAN   = .chan[0],		! Do it.
+!    	       LSTADR = item_list);
+
+!END;
+!
+END
+ELUDOM

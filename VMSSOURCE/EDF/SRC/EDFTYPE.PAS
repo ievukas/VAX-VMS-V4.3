@@ -1,0 +1,473 @@
+	[ IDENT ('V04-000'),
+{ ++
+ ****************************************************************************
+ *									    *
+ *  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+ *  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+ *  ALL RIGHTS RESERVED.						    *
+ * 									    *
+ *  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+ *  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+ *  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+ *  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+ *  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+ *  TRANSFERRED.							    *
+ * 									    *
+ *  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+ *  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+ *  CORPORATION.							    *
+ * 									    *
+ *  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+ *  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+ * 									    *
+ *									    *
+ ****************************************************************************
+
+
+
+
+
+FACILITY:	VAX/VMS EDF (EDIT/FDL) UTILITY
+
+ABSTRACT:	This facility is used to create, modify, and optimize
+		FDL specification files.
+
+ENVIRONMENT:	NATIVE/USER MODE
+
+AUTHOR:		Ken F. Henderson Jr.
+
+CREATION DATE:	27-Mar-1981
+
+MODIFIED BY:
+
+		V03-007	KFH0007		Ken Henderson		10 Sep 1983
+			Support for named UICs.
+
+		V03-006	KFH0006		Ken Henderson		 8 Aug 1983
+			Changes for seperate compilation.
+
+		V03-005	KFH0005		Ken Henderson		30 Jul 1983
+			Added DEFERRED_WRITE.
+
+		V03-004	KFH0004		Ken Henderson		26 Apr 1983
+			Added STRING22.
+
+		V03-003	KFH0003		Ken Henderson		14 Apr 1983
+			Added LEVEL1_RECORD_COUNT.
+
+		V03-002	KFH0002		Ken Henderson		31 Jan 1983
+			Changed reference of FDL$TYPE to
+			FDL3$TYPE.
+
+		V03-001	KFH0001		Ken Henderson		8 Sept 1982
+			Removed some definitions no longer
+			needed after database reorganization.
+
+-- }
+
+ENVIRONMENT ('LIB$:EDFTYPE'),
+INHERIT (
+'LIB$:EDFCONST',
+'SHRLIB$:FDLPARDEF'
+)]
+
+MODULE EDFTYPE;
+
+TYPE
+
+    { +
+    ************************************************************************
+    * THE ORDERRING OF THE ELEMENTS IN 'PRIMARY_TYPE' AND 'SECONDARY_TYPE' *
+    * MUST BE IDENTICAL TO THE ORDERRING OF ELEMENTS IN THE FILE           *
+    * "<FDL.SRC>FDLPARDEF.SDL"  !!!                                        *
+    ************************************************************************
+    - }
+
+
+    { +
+    These are the Primary Attributes.
+    - }
+    PRIMARY_TYPE = (
+		    DUMMY_PRIMARY$,
+
+		    ACCESS,
+		    ACL,
+		    ANALYSIS_OF_AREA,
+		    ANALYSIS_OF_KEY,
+		    AREA,
+		    CONNECT,
+		    DATE,
+		    FILE$,
+		    IDENT,
+		    JOURNAL,
+		    KEY,
+		    RECORD$,
+		    SHARING,
+		    SYSTEM,
+		    TITLE
+		    );
+
+    { +
+    These are the Secondary Attributes.
+    - }
+    SECONDARY_TYPE = (
+
+{ RESERVE 0 }	    DUMMY_SECONDARY$,
+
+{ ACCESS PRIMARY }
+
+		    BLOCK_IO$,
+		    DELETE$,
+		    GET$,
+		    PUT$,
+		    RECORD_IO$,
+		    TRUNCATE$,
+		    UPDATE$,
+
+{ ACL PRIMARY }
+
+		    ENTRY,
+
+{ ANALYSIS_OF_AREA PRIMARY }
+
+		    RECLAIMED_SPACE,
+
+{ ANALYSIS_OF_KEY PRIMARY }
+
+		    DATA_FILL$,
+		    DATA_KEY_COMPRESSION$,
+		    DATA_RECORD_COMPRESSION$,
+		    DATA_RECORD_COUNT,
+		    DATA_SPACE_OCCUPIED,
+		    DELETIONS,
+		    DEPTH,
+		    DUPLICATES_PER_SIDR,
+		    INDEX_COMPRESSION$,
+		    INDEX_FILL$,
+		    INDEX_SPACE_OCCUPIED,
+		    LEVEL1_RECORD_COUNT,
+		    MEAN_DATA_LENGTH,
+		    MEAN_INDEX_LENGTH,
+		    RANDOM_ACCESSES,
+		    RANDOM_INSERTS,
+		    SEQUENTIAL_ACCESSES,
+
+{ AREA PRIMARY }
+
+		    ALLOCATION$,
+		    BEST_TRY_CONTIGUOUS$,
+		    BUCKET_SIZE$,
+		    CONTIGUOUS$,
+		    EXACT_POSITIONING$,
+		    EXTENSION$,
+		    POSITION$,
+		    VOLUME$,
+
+{ CONNECT PRIMARY }
+
+		    ASYNCHRONOUS,
+		    BLOCK_IO,
+		    BUCKET_CODE,
+		    CONTEXT,
+		    END_OF_FILE,
+		    FILL_BUCKETS,
+		    FAST_DELETE,
+		    KEY_OF_REFERENCE,
+		    KEY_GREATER_EQUAL,
+		    KEY_GREATER_THAN,
+		    KEY_LIMIT,
+		    LOCATE_MODE,
+		    LOCK_ON_READ,
+		    LOCK_ON_WRITE,
+		    MANUAL_UNLOCKING,
+		    MULTIBLOCK_COUNT,
+		    MULTIBUFFER_COUNT,
+		    NOLOCK,
+		    NONEXISTENT_RECORD,
+		    READ_AHEAD,
+		    READ_REGARDLESS,
+		    TIMEOUT_ENABLE,
+		    TIMEOUT_PERIOD,
+		    TRUNCATE_ON_PUT,
+		    TT_CANCEL_CONTROL_O,
+		    TT_UPCASE_INPUT,
+		    TT_PROMPT,
+		    TT_PURGE_TYPE_AHEAD,
+		    TT_READ_NOECHO,
+		    TT_READ_NOFILTER,
+		    UPDATE_IF,
+		    WAIT_FOR_RECORD,
+		    WRITE_BEHIND,
+
+{ DATE PRIMARY }
+
+		    BACKUP$,
+		    CREATION$,
+		    EXPIRATION$,
+		    REVISION$,
+
+{ FILE PRIMARY }
+
+		    ALLOCATION,
+		    BEST_TRY_CONTIGUOUS,
+		    BUCKET_SIZE,
+		    CLUSTER_SIZE,
+		    CONTEXT$,
+		    CONTIGUOUS,
+		    CREATE_IF,
+		    DEFAULT_NAME,
+		    DEFERRED_WRITE,
+		    DELETE_ON_CLOSE,
+		    DIRECTORY_ENTRY,
+		    ERASE_ON_DELETE,
+		    EXTENSION,
+		    GLOBAL_BUFFER_COUNT,
+		    MT_BLOCK_SIZE,
+		    MT_CURRENT_POSITION,
+		    MT_NOT_EOF,
+		    MT_PROTECTION,
+		    MT_OPEN_REWIND,
+		    MT_CLOSE_REWIND,
+		    MAX_RECORD_NUMBER,
+		    MAXIMIZE_VERSION,
+		    NAME,
+		    NOBACKUP,
+		    NON_FILE_STRUCTURED,
+		    OUTPUT_FILE_PARSE,
+		    ORGANIZATION,
+		    OWNER,
+		    PRINT_ON_CLOSE,
+		    PROTECTION,
+		    READ_CHECK,
+		    REVISION,
+		    SEQUENTIAL_ONLY,
+		    SUBMIT_ON_CLOSE,
+		    SUPERSEDE,
+		    TEMPORARY,
+		    TRUNCATE_ON_CLOSE,
+		    USER_FILE_OPEN,
+		    WINDOW_SIZE,
+		    WRITE_CHECK,
+
+{ JOURNALING PRIMARY }
+
+		    AFTER_IMAGE,
+		    AFTER_NAME,
+		    AUDIT_TRAIL,
+		    AUDIT_NAME,
+		    BEFORE_IMAGE,
+		    BEFORE_NAME,
+		    RECOVERY_UNIT,
+
+{ KEY PRIMARY }
+
+		    CHANGES,
+		    DATA_AREA,
+		    DATA_FILL,
+		    DATA_KEY_COMPRESSION,
+		    DATA_RECORD_COMPRESSION,
+		    DUPLICATES,
+		    INDEX_AREA,
+		    INDEX_COMPRESSION,
+		    INDEX_FILL,
+		    LEVEL1_INDEX_AREA,
+		    NAME$,
+		    NULL_KEY,
+		    NULL_VALUE,
+		    PROLOGUE,
+		    SEG_LENGTH,
+		    SEG_POSITION,
+		    SEG_TYPE,
+
+{ RECORD PRIMARY }
+
+		    BLOCK_SPAN,
+		    CARRIAGE_CONTROL,
+		    CONTROL_FIELD_SIZE,
+		    FORMAT,
+		    SIZE,
+
+{ SHARING PRIMARY }
+
+		    DELETE,
+		    GET,
+		    MULTISTREAM,
+		    PROHIBIT,
+		    PUT,
+		    UPDATE,
+		    USER_INTERLOCK,
+
+{ SYSTEM PRIMARY }
+
+		    DEVICE,
+		    SOURCE,
+		    TARGET
+
+		    );
+
+    LINE_OBJECT_TYPE = (
+    		    PRI,
+		    SEC,
+		    COM
+		    );
+
+    SUB1	= 1..1;
+    SUB2	= 1..2;
+    SUB3	= 1..3;
+    SUB4	= 1..4;
+    SUB5	= 1..5;
+    SUB6	= 1..6;
+    SUB7	= 1..7;
+    SUB8	= 1..8;
+    SUB9	= 1..9;
+    SUB10	= 1..10;
+    SUB11	= 1..11;
+    SUB12	= 1..12;
+    SUB13	= 1..13;
+    SUB14	= 1..14;
+    SUB15	= 1..15;
+    SUB16	= 1..16;
+    SUB17	= 1..17;
+    SUB18	= 1..18;
+    SUB19	= 1..19;
+    SUB20	= 1..20;
+    SUB22	= 1..22;
+    SUB24	= 1..24;
+    SUB25	= 1..25;
+    SUB26	= 1..26;
+    SUB28	= 1..28;
+    SUB30	= 1..30;
+    SUB31	= 1..31;
+    SUB32	= 1..32;
+    SUB35	= 1..35;
+    SUB40	= 1..40;
+    SUB41	= 1..41;
+    SUB45	= 1..45;
+    SUB47	= 1..47;
+    SUB80	= 1..80;
+    SUB132	= 1..132;
+    SUB255	= 1..255;
+
+    BYTE	= 0..255;
+    $WORD	= [WORD] -32768..32767;
+    WORD	= 0..65535;
+    LONG	= INTEGER;
+    QUADWORD	= PACKED ARRAY [0..7] OF BYTE;
+    FID		= ARRAY [0..2] OF LONG;
+    QD_SWITCH	= (QWORD,DWORD);
+
+    XY_PLOT_TYPE = ARRAY [0..12, 0..31] OF BYTE;
+    XY_ARRAY_TYPE = ARRAY [0..12, 0..(BKT$C_MAXBKTSIZ-1)] OF BYTE;
+
+    STRING1	= PACKED ARRAY [SUB1] OF CHAR;
+    STRING2	= PACKED ARRAY [SUB2] OF CHAR;
+    STRING3	= PACKED ARRAY [SUB3] OF CHAR;
+    STRING4	= PACKED ARRAY [SUB4] OF CHAR;
+    STRING5	= PACKED ARRAY [SUB5] OF CHAR;
+    STRING6	= PACKED ARRAY [SUB6] OF CHAR;
+    STRING7	= PACKED ARRAY [SUB7] OF CHAR;
+    STRING8	= PACKED ARRAY [SUB8] OF CHAR;
+    STRING9	= PACKED ARRAY [SUB9] OF CHAR;
+    STRING10	= PACKED ARRAY [SUB10] OF CHAR;
+    STRING11	= PACKED ARRAY [SUB11] OF CHAR;
+    STRING12	= PACKED ARRAY [SUB12] OF CHAR;
+    STRING13	= PACKED ARRAY [SUB13] OF CHAR;
+    STRING14	= PACKED ARRAY [SUB14] OF CHAR;
+    STRING15	= PACKED ARRAY [SUB15] OF CHAR;
+    STRING16	= PACKED ARRAY [SUB16] OF CHAR;
+    STRING17	= PACKED ARRAY [SUB17] OF CHAR;
+    STRING18	= PACKED ARRAY [SUB18] OF CHAR;
+    STRING19	= PACKED ARRAY [SUB19] OF CHAR;
+    STRING20	= PACKED ARRAY [SUB20] OF CHAR;
+    STRING22	= PACKED ARRAY [SUB22] OF CHAR;
+    STRING24	= PACKED ARRAY [SUB24] OF CHAR;
+    STRING25	= PACKED ARRAY [SUB25] OF CHAR;
+    STRING26	= PACKED ARRAY [SUB26] OF CHAR;
+    STRING28	= PACKED ARRAY [SUB28] OF CHAR;
+    STRING30	= PACKED ARRAY [SUB30] OF CHAR;
+    STRING31	= PACKED ARRAY [SUB31] OF CHAR;
+    STRING32	= PACKED ARRAY [SUB32] OF CHAR;
+    STRING35	= PACKED ARRAY [SUB35] OF CHAR;
+    STRING40	= PACKED ARRAY [SUB40] OF CHAR;
+    STRING41	= PACKED ARRAY [SUB41] OF CHAR;
+    STRING45	= PACKED ARRAY [SUB45] OF CHAR;
+    STRING47	= PACKED ARRAY [SUB47] OF CHAR;
+    STRING80	= PACKED ARRAY [SUB80] OF CHAR;
+    STRING132	= PACKED ARRAY [SUB132] OF CHAR;
+    STRING255	= PACKED ARRAY [SUB255] OF CHAR;
+
+    DESCRIPTOR	= PACKED RECORD
+		    DSC$W_LENGTH	: WORD;
+		    DSC$B_DTYPE		: BYTE;
+		    DSC$B_CLASS		: BYTE;
+		    DSC$A_POINTER	: [UNSAFE]^STRING255;
+		END;
+
+    CTRL_ARRAY	= [VOLATILE] PACKED ARRAY [0..31] OF BOOLEAN;
+
+    LINE_OBJECT	= RECORD
+		    OBJECT_TYPE		: LINE_OBJECT_TYPE;
+		    FORE		: ^LINE_OBJECT;
+		    BACK		: ^LINE_OBJECT;
+		    COMMENT		: DESCRIPTOR;
+		    STRING		: DESCRIPTOR;
+		    PRIMARY		: PRIMARY_TYPE;
+		    PRINUM		: LONG;
+		    SECONDARY		: SECONDARY_TYPE;
+		    SECNUM		: LONG;
+		    QUALIFIER		: LONG;
+		    NUMBER		: LONG;
+		    SWITCH		: BOOLEAN;
+		    OWNER_UIC		: LONG;
+		    PROT_MASK		: CTRL_ARRAY;
+		    FID1		: LONG;
+		    FID2		: LONG;
+		    FID3		: LONG;
+		END;
+
+    STRING_PTR	= ^STRING255;
+    DESCRIPTOR_PTR = ^DESCRIPTOR;
+
+    FAB_PTR	= ^INTEGER;
+    FDL_PTR	= ^INTEGER;
+    LONG_PTR	= ^LONG;
+    PRI_PTR	= ^PRIMARY_TYPE;
+    SEC_PTR	= ^SECONDARY_TYPE;
+    BOOLE_PTR	= ^BOOLEAN;
+    STR24_PTR	= ^STRING24;
+
+    SIGARR	= ARRAY [0..9] OF INTEGER;	{ cond handling signal array }
+    MECHARR	= ARRAY [0..4] OF INTEGER;	{ cond handling mechanism array }
+
+    QTAB_ENTRY	= RECORD
+		    ANSWER_CLASS	: INTEGER;
+		    DEFAULT_OK		: BOOLEAN;
+		    DEFAULT		: INTEGER;
+		    LOW_BOUND		: INTEGER;
+		    HIGH_BOUND		: INTEGER;
+		    KEY_TABLE		: INTEGER;
+		    STATE_TABLE		: INTEGER;
+		END;
+
+    FDL_TYPE	= [VOLATILE] ARRAY [0..FDL$K_BLOCK_END] OF LONG;
+    TEMP_VARYING = VARYING [EDF$K_TEMP_VARYING_SIZE] OF CHAR;
+
+(*+                                                                         *)
+(* FDL CALL INTERFACE CONTROL FLAGS                                         *)
+(*-                                                                         *)
+ 
+	$BIT1 = [BIT(1),UNSAFE] BOOLEAN;
+
+	FDL2$TYPE = RECORD CASE INTEGER OF
+	1: (FDL$_FDLDEF_BITS : [BYTE(1)] RECORD END;
+	    );
+	2: (FDL$V_SIGNAL : [POS(0)] $BIT1; (* SIGNAL ERRORS, DON'T RETURN   *)
+	    FDL$V_FDL_STRING : [POS(1)] $BIT1; (* MAIN FDL SPEC IS A CHAR STRING *)
+	    FDL$V_DEFAULT_STRING : [POS(2)] $BIT1; (* DEFAULT FDL SPEC IS A CHAR STRING *)
+	    FDL$V_FULL_OUTPUT : [POS(3)] $BIT1; (* PRODUCE A 'COMPLETE' FDL SPEC *)
+	    FDL$V_$CALLBACK : [POS(4)] $BIT1; (* USED BY EDF ON INPUT (DEC ONLY) *)
+	    )
+	END;
+
+END.
+{      End of file SRC$:EDFTYPE.PAS      }

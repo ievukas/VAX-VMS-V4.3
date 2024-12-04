@@ -1,0 +1,949 @@
+%TITLE 'Network Service MOP line I/O modules'
+MODULE MOMMOPLIO (
+		LANGUAGE (BLISS32),
+		ADDRESSING_MODE (NONEXTERNAL=LONG_RELATIVE),
+		ADDRESSING_MODE (EXTERNAL=LONG_RELATIVE),
+		IDENT = 'V04-000'
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:  DECnet-VAX Network Management Maintenance Operations Module (MOM)
+!
+! ABSTRACT:
+!	This module contains routines to handle I/O for MOP
+!	functions.
+!
+! ENVIRONMENT:  VAX/VMS Operating System
+!
+! AUTHOR:  Kathy Perko
+!
+! CREATION DATE:  11-Jan-1983
+!
+! MODIFIED BY:
+!	V03-005	MKP0005		Kathy Perko		30-May-1984
+!		Eliminate echo parameter from SETMODE QIO to NI driver.
+!		This is because, if the target device is a QNA, the echo
+!		option is not implemented.
+!
+!	V03-004	MKP0004		Kathy Perko		29-April-1984
+!		When sending and receiving MOP messages, the receive NI
+!		address is currently never alternated between the hardware
+!		and DECnet address.  Fix it so that it will be if the CIB
+!		is marked "alternate".  Also, get rid of Request ID stuff.
+!		It'll just slow things down.
+!
+!	V03-003	MKP0003		Kathy Perko		11-Feb-1984
+!		Use NI Remote Console protocol for boot message instead of
+!		NI Load/dump protocol.
+!		Use system ID message to get target's NI address instead of
+!		alternately trying the hardware and the DECnet NI addresses.
+!
+!	V03-002	MKP0002		Kathy Perko		12-Sept-1983
+!		If area routing is turned off, use a physical address
+!		with an area number of one instead of zero.
+!
+!	V03-001	MKP0001		Kathy Perko		8-May-1983
+!		Change check on read completion status and quit
+!		trying to send to target if it's anything except SS$_TIMEOUT.
+!
+!--
+
+
+%SBTTL 'Declarations'
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+    mom$mopopen		: NOVALUE,
+    mom$mopsetsubstate	: NOVALUE,
+    mom$init_CIB	: NOVALUE,
+    mom$set_NI_addr	: NOVALUE,
+    mom$mopsndrcv,
+    mom_mop_receive,
+    mom$mop_receive_qiow,
+    mom$mopsend,
+    mom_mapmoperrors;
+
+!
+! INCLUDE FILES:
+!
+
+LIBRARY 'LIB$:MOMLIB.L32';
+LIBRARY 'SHRLIB$:NMALIBRY.L32';
+LIBRARY 'SYS$LIBRARY:STARLET.L32';
+
+!
+! EQUATED SYMBOLS:
+!
+
+LITERAL
+    mom$k_moprcvefn = 1,		! MOP receive event flag
+    mom$m_moprcvefn = 1 ^ mom$k_moprcvefn,
+    mom$k_mopsndefn = 2,		! MOP send event flag
+    mom$m_mopsndefn = 1 ^ mom$k_mopsndefn,
+    mom$k_moptimefn = 3,		! MOP I/O timer event flag
+    mom$m_moptimefn = 1 ^ mom$k_moptimefn;
+
+
+!
+! EXTERNAL REFERENCES:
+!
+
+$mom_externals;
+
+EXTERNAL
+    mom$gq_timeout:	VECTOR [0],
+    mom$gq_dle_namdsc:	REF VECTOR;
+
+EXTERNAL ROUTINE
+    mom$bld_reply,
+    mom$debug_msg,
+    mom$debug_qio,
+    mom$debug_txt;
+
+
+%SBTTL 'mom$mopopen  Open a circuit for MOP mode access'
+GLOBAL ROUTINE mom$mopopen (mop_channel) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine opens a channel to a circuit for service operations
+!	via a request to NETACP.
+!
+! INPUTS:
+!
+!	MOP_CHANNEL = Address at which to return channel over which MOP QIOs
+!		are to be done.
+!
+! OUTPUTS:
+!
+!	Success/failure of operation.
+!
+!	MOM$GQ_TIMEOUT	Timer for MOP I/O has been set up.
+!	MOP_CHANNEL = Address for returning channel for which all MOP I/O
+!		is initialized.
+!--
+
+BEGIN
+
+LOCAL
+    retry_count,
+    iosb	: $IOSB,
+    circuit_dsc : VECTOR [2],
+    status;
+
+!
+! Save the service timer (specified in Msec).
+!
+mom$gq_timeout [0] = -10 * 1000 * .mom$ab_service_data [svd$gk_pcli_sti,
+						svd$l_param];
+!
+! Assign a channel to NET for use in controlling and accessing the circuit.
+!
+status = $ASSIGN (CHAN = .mop_channel,
+	          DEVNAM = mom$gq_dle_namdsc);
+mom_mapmoperrors (.status, 0, mom$signal);
+
+!
+! Request use of the circuit for MOP functions.  This request causes
+! NETACP to allow Service to issue QIOs directly to the circuit - not a
+! normal thing, since NETDRIVER is normally the only DECnet module
+! which does this.
+!
+circuit_dsc [0] = .mom$ab_service_data [svd$gk_pcno_sli, svd$b_string_len];
+circuit_dsc [1] = mom$ab_service_data [svd$gk_pcno_sli, svd$t_string];
+!
+! Get NETACP to put the service device into a state where Service can
+! issue QIOs to it.  Issue the QIO to tell NETACP the circuit is needed
+! for a service function.  Do 3 retries.
+!
+retry_count = 3;
+WHILE true DO
+    BEGIN
+    retry_count = .retry_count - 1;
+    status = $QIOW (CHAN = ..mop_channel,
+			FUNC = io$_access,
+			IOSB = iosb,
+			P1 = circuit_dsc);
+    mom$debug_qio (dbg$c_mopio, .status, iosb, 0, circuit_dsc,
+			0, 0, $ASCID ('IO$_ACCESS QIO on MOP channel'));
+    IF (NOT .status) OR (NOT .iosb [ios$w_status])
+    THEN
+	BEGIN
+	IF .retry_count LEQ 0 THEN
+	    mom_mapmoperrors (.status, iosb, mom$signal);
+	END
+    ELSE
+	EXITLOOP;
+    END;
+!
+! Check to see if the circuit is an NI circuit.
+!
+IF .iosb[ios$l_info] THEN
+    mom$gl_service_flags [mom$v_ni_circ] = true;
+!
+! Set the circuit substate to -AUTOSERVICE.
+!
+IF .mom$gl_service_flags [mom$v_autoservice] THEN
+    mom$mopsetsubstate (nma$c_linss_ase,
+				 ..mop_channel);
+END;				! End of MOM$MOPOPEN
+
+%SBTTL 'mom$mopsetsubstate  Set the circuit substate'
+GLOBAL ROUTINE mom$mopsetsubstate (substate, mop_chan) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine modifies the substate of a circuit that has been opened
+!	for service operations.
+!
+! INPUTS:
+!
+!	SUBSTATE	New circuit substate code.
+!
+!	MOP_CHAN	Channel for MOP circuit control has been initialized.
+!
+! OUTPUTS:
+!
+!	Success/failure of operation.
+!--
+
+BEGIN
+
+LOCAL
+    iosb   : $iosb,
+    status;
+
+
+status = $QIOW (CHAN = .mop_chan,	! Channel
+		FUNC = io$_setmode,     ! Modify substate function
+		IOSB = iosb,	  	! Address of I/O status block
+		P4   = substate);	! New substate value
+mom$debug_qio (dbg$c_mopio, .status, iosb, 0, 0, substate, 0,
+			$ASCID ('Set circuit substate'));
+
+mom_mapmoperrors (.status, iosb, mom$signal)
+
+END;				! End of MOM$MOPSETSUBSTATE
+
+%SBTTL 'mom$init_CIB     Initialize Channel Information Block'
+GLOBAL ROUTINE mom$init_CIB (CIB,
+				function,
+				phys_addr_svd,
+				node_addr_svd,
+				hardware_addr_svd) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine is called when setting up to perform a maintenance
+!	operation.  It initializes the Channel Information Block (CIB),
+!	which is used to control establishing the connection with the
+!	target.
+!
+! INPUTS:
+!	CIB	= Address of CIB to initialize.
+!	FUNCTION = load, dump, trigger, or test (NICE function code)
+!	PHYS_ADDR_SVD = Index of SVD entry containing the NI physical
+!		address to  connect to (not always used).
+!	NODE_ADDR_SVD = Index of SVD entry containing the node address to
+!		connect to (not always used).
+!	HARDWARE_ADDR_SVD = Index of SVD entry containing the NI hardware
+!		address to connect to (not always used).
+!
+! IMPLICIT INPUTS:
+!
+! OUTPUTS:
+!	Channel Information Block is initialized.
+!--
+
+BEGIN
+
+MAP
+    CIB: REF BBLOCK;
+
+!
+! P2 parameter buffer for SETMODE to NI driver (XXDRIVER).
+!
+OWN
+    p2_buffer: BBLOCK [cib$s_setmode_p2_buf] ALIGN (0)
+		INITIAL (WORD (nma$c_pcli_bus), LONG (0),
+		    WORD (nma$c_pcli_pad), LONG (0),
+		    WORD (nma$c_pcli_dch), LONG (nma$c_state_off),
+		    WORD (nma$c_pcli_crc), LONG (nma$c_state_on),
+		    WORD (nma$c_pcli_pty), LONG (0),
+		    WORD (nma$c_pcli_con), LONG (nma$c_lincn_nor),
+		    WORD (nma$c_pcli_acc), LONG (nma$c_acc_lim),
+		    WORD (nma$c_pcli_des), WORD (8),
+		    WORD (nma$c_linmc_set),REP 3 OF WORD (0)),
+    in_case_eko: BBLOCK [8];
+		
+CIB [cib$w_flags] = 0;
+CIB [cib$l_retry_cnt] = 5;
+!
+! Most of the CIB fields are necessary for NI circuits only.  Point to point
+! circuits (like DMCs) don't need as much.
+!
+IF NOT .mom$gl_service_flags [mom$v_ni_circ] THEN
+    CIB [cib$v_target_addr_fixed] = true
+ELSE
+    BEGIN
+    !
+    ! Build P2 buffer containing the parameters to set up the NI for the
+    ! maintenance operation.
+    !
+    CH$MOVE (cib$s_setmode_p2_buf,
+	    P2_buffer,
+	    CIB [cib$t_setmode_p2_buf]);
+    !
+    ! Set up the NI protocol type and padding to give the NI driver.  The NI has
+    ! the capability to run several protocols at once.  MOM will set it up to
+    ! run the Load/Dump, the Remote Console, or the Loopback protocol.  Padding
+    ! on means the NI driver will add a word of count to a buffer when it
+    ! transmits it.  Loop messages use a skip field instead.
+    !
+    IF .function EQL nma$c_fnc_tes THEN
+	BEGIN
+	CIB [cib$l_p2_protocol] = mom$k_loop_ni_prot;
+	CIB [cib$l_p2_padding] = nma$c_state_off;
+	CIB [cib$l_p2_buf_siz] = 1500;
+	END
+    ELSE
+	BEGIN
+	IF .function EQL nma$c_fnc_tri THEN
+	    CIB [cib$l_p2_protocol] = mom$k_console_ni_prot
+	ELSE
+	    CIB [cib$l_p2_protocol] = mom$k_loadump_ni_prot;
+	CIB [cib$l_p2_padding] = nma$c_state_on;
+	CIB [cib$l_p2_buf_siz] = 1498;		 ! Leave room for padding.
+	END;
+    !
+    ! Set up the NI address for the target.  
+    !
+    IF .mom$ab_service_data [.phys_addr_svd, svd$v_msg_param] THEN
+	!
+	! If there was a Physical Address specified in the NICE command
+	! (operservice) or it's autoservice (and the target's physical address
+	! was in the NI header), do the operation to that address on the NI.
+	!
+	BEGIN
+	CH$MOVE (mom$k_ni_addr_length,
+		mom$ab_service_data [.phys_addr_svd, svd$t_string],
+		CIB [cib$t_ni_phys_addr]);
+	CIB [cib$v_target_addr_fixed] = true;
+	END
+    ELSE
+	!
+	! This operation does not have a Physical Address supplied.  In
+	! this case, if the hardware address is available, set up to alternate
+	! trying the target's hardware NI address and it's HIORD NI address
+	! (the DEC NI prefix concatenated with the node's address).
+	!
+	BEGIN
+	CIB [cib$l_ni_hiord_pref] = mom$k_ni_prefix;
+	CIB [cib$w_ni_hiord_node] = .mom$ab_service_data [.node_addr_svd,
+								svd$l_param];
+	!
+	! Initialize the SVD physical address to something.
+	!
+	CH$MOVE (mom$k_ni_addr_length,
+		CIB [cib$t_ni_hiord_addr],
+		mom$ab_service_data [.phys_addr_svd, svd$t_string]);
+	mom$ab_service_data [.phys_addr_svd, svd$b_string_len] =
+						mom$k_ni_addr_length;
+	IF .mom$ab_service_data [.hardware_addr_svd, svd$b_string_len]
+								NEQ 0 THEN
+	    BEGIN
+	    CH$MOVE (mom$k_ni_addr_length,
+		    mom$ab_service_data [.hardware_addr_svd, svd$t_string],
+		    CIB [cib$t_ni_hardwr_addr]);
+	    CIB [cib$v_target_addr_fixed] = false;
+	    !
+	    ! When attempting to establish communication with the target, try
+	    ! the HIORD address first.
+	    !
+	    CH$MOVE (mom$k_ni_addr_length,
+		    CIB [cib$t_ni_hardwr_addr],
+		    CIB [cib$t_ni_phys_addr]);
+	    END
+	ELSE
+	!
+	! If there is no hardware address in the volatile database, simply try
+	! communicating with the target using the HIORD NI address.
+	!
+	    BEGIN
+	    CH$MOVE (mom$k_ni_addr_length,
+		    CIB [cib$t_ni_hiord_addr],
+		    CIB [cib$t_ni_phys_addr]);
+	    CIB [cib$v_target_addr_fixed] = true;
+	    END
+	END;
+    !
+    ! Issue the SETMODE to tell the NI driver what protocol and NI address
+    ! I want to use.  The NI address set up will be the one to try first.
+    !
+    mom$set_NI_addr (.CIB);
+    END;
+END;				! End of mom$init_CIB
+
+%SBTTL 'mom$set_NI_addr     Tell NI driver targets NI address'
+GLOBAL ROUTINE mom$set_NI_addr (CIB) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine is called when setting up to perform a maintenance
+!	operation over an NI circuit.  It tells the NI driver what
+!	protocol and destination NI address (among other things) to use
+!	when transmitting and receiving MOP messages.
+!
+! INPUTS:
+!	CIB	= Address of Channel Information Block.  This contains the
+!		  NI addresses to try, and a prebuilt P2 buffer to give
+!		  the NI driver.
+!
+! IMPLICIT INPUTS:
+!
+! OUTPUTS:
+!--
+
+BEGIN
+
+MAP
+    CIB: REF BBLOCK;
+
+LOCAL
+    p2_dsc: VECTOR [2],
+    iosb: $iosb,
+    status;
+
+p2_dsc [0] = cib$s_setmode_p2_buf;
+p2_dsc [1] = CIB [cib$t_setmode_p2_buf];
+
+IF (NOT .CIB [cib$v_target_addr_fixed]) THEN
+    !
+    ! If the operation wasn't requested with a specific NI physical address,
+    ! then alternately retry the hardware address from the volatile
+    ! database and the NI HIORD address (the DEC NI prefix concatenated
+    ! with the node number.)  This is done because the target's UNA responds
+    ! to it's hardware address after it's been powered up, but when DECnet
+    ! is started up, it will change the NI address that the UNA responds to
+    ! to the HIORD address.  After a crash, the target's UNA will still be
+    ! running the DECnet NI address.  Since there is no way to tell which
+    ! one the target is currently answering to, alternately try both.
+    !
+    BEGIN
+    IF CH$EQL (mom$k_ni_addr_length,
+		CIB [cib$t_ni_hiord_addr],
+		mom$k_ni_addr_length,
+		CIB [cib$t_ni_phys_addr], 0) THEN
+	CH$MOVE (mom$k_ni_addr_length,
+		CIB [cib$t_ni_hardwr_addr],
+		CIB [cib$t_ni_phys_addr])
+    ELSE
+	CH$MOVE (mom$k_ni_addr_length,
+		CIB [cib$t_ni_hiord_addr],
+		CIB [cib$t_ni_phys_addr]);
+    END;
+
+status = $QIOW (CHAN = .CIB [cib$l_chan],
+		FUNC = io$_setmode OR io$m_ctrl,
+		IOSB = iosb,
+		P2 = p2_dsc,
+		P3 = CIB [cib$t_ni_phys_addr]);
+mom$debug_qio (dbg$c_mopio,
+		.status,
+		iosb, 0, p2_dsc, CIB [cib$t_ni_phys_addr], 0,
+		$ASCID ('IO$_SETMODE QIO on MOP channel'));
+!
+! If the SETMODE didn't work, get out.
+!
+mom_mapmoperrors (.status, iosb, mom$signal);
+
+END;				! End of mom$set_NI_addr
+
+%SBTTL 'mom$mopsndrcv     Send and receive a MOP mode message'
+GLOBAL ROUTINE mom$mopsndrcv (send_CIB, xmit_msg_dsc,
+			   rcv_CIB, recv_buf_dsc, recv_msg_len,
+			   skip_msg_dsc) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine performs a transmit operation followed by a receive
+!	operation.  Actually, the receive is issued before the transmit
+!	to insure that a buffer is available for the receive.
+!
+! INPUTS:
+!
+!	SEND_CIB = Information Block for channel to transmit MOP message on.
+!	XMIT_MSG_DSC = Addres of descriptor of data to be transmitted.
+!	RCV_CIB = Information Block for channel to receive response MOP
+!			message on.
+!	RECV_BUF_DSC	Address of descriptor of receive buffer.
+!	RECV_MSG_LEN	Address of word to contain length of received data.
+!	SKIP_MSG_DSC  = Address of descriptor of received message to skip. 
+!			On the NI, a node requesting a Program Load sends it
+!			repeatedly until a response is received from a host.
+!			This means that there could be more than one Progam
+!			Load request backed up by the time the MOM sends it's
+!			response.  So, skip over these until the real response
+!			is received.
+!			Set to -1 if this routine should skip over all received
+!			messages which were sent to the multicast NI address.
+!
+! IMPLICIT INPUTS:
+!	The channel to the target has been opened, and, if it's a NI circuit,
+!	initted for the first attempted destination address.
+!
+! OUTPUTS:
+!
+!	Success/failure of operation.
+!--
+
+BEGIN
+
+MAP
+    send_CIB	 : REF BBLOCK,
+    rcv_CIB	 : REF BBLOCK,
+    xmit_msg_dsc : REF VECTOR,
+    recv_buf_dsc : REF VECTOR,
+    skip_msg_dsc : REF VECTOR;
+
+OWN
+    iosb   : $IOSB,
+    ni_header : BBLOCK [nih$k_ni_header_len];
+
+LOCAL
+    retry,
+    status,
+    rstatus,
+    skip_msg_max,
+    eflags;
+
+!
+! Post a receive for the response MOP message before sending the MOP message
+! which the response will be for.
+!
+rstatus = mom_mop_receive (.rcv_CIB [cib$l_chan], .recv_buf_dsc, iosb, ni_header);
+IF NOT .rstatus THEN
+    RETURN mom_mapmoperrors (.rstatus, 0, mom$nosignal);
+skip_msg_max = 20;
+retry = .send_CIB [cib$l_retry_cnt];
+
+WHILE .retry GTR 0 DO
+    BEGIN
+    !
+    ! Transmit the MOP message to the target load, loop, or dump node.
+    !
+    status = mom$mopsend (.send_CIB,
+			  .xmit_msg_dsc [1],
+			  .xmit_msg_dsc [0]);
+    IF NOT .status THEN
+	EXITLOOP;
+    !
+    ! Issue a read for a response from the target, and then wait for the
+    ! or a timeout, whichever comes first.  
+    !
+    WHILE true DO
+	BEGIN
+	!
+	! Start the timer for the response MOP message just sent.
+	!
+	$SETIMR (EFN    = mom$k_moptimefn,
+		DAYTIM = mom$gq_timeout);
+	$WFLOR (EFN  = 0,
+		MASK = mom$m_moptimefn OR mom$m_moprcvefn);
+	!
+	! If the timer expired then return an error.  If the receive
+	! completed then check it.
+	!
+	$READEF (EFN   = 0,
+		STATE = eflags);
+	IF .eflags <mom$k_moptimefn,1> THEN
+	    BEGIN
+	    mom$debug_txt (dbg$c_mopio,
+			   $ASCID ('QIO to MOP channel has timed out'));
+	    status = ss$_timeout;
+	    EXITLOOP;
+	    END
+	ELSE
+	    !
+	    ! The receive did not time out.  Check to see if it completed
+	    ! with an error.
+	    !
+	    BEGIN
+	    $CANTIM ();
+	    mom$debug_qio (dbg$c_mopio, .rstatus, iosb, 0, 0, 0, 0,
+			   $ASCID ('MOP receive completion status'));
+	    status = .iosb [ios$w_status];
+	    (.recv_msg_len)<0,16> = .iosb [ios$w_count];
+	    !
+	    ! If the receive completion status was bad or the received
+	    ! message was 0 bytes in length, retransmit the send MOP message.
+	    ! The latter check is for point-to-point lines.
+	    !
+	    IF (NOT .status) OR
+	       .(.recv_msg_len)<0,16> EQL 0 THEN
+		EXITLOOP;
+	    IF .status THEN
+		BEGIN
+		!
+		! A response was received from the target, so the correct NI
+		! address is in use.
+		!
+		send_CIB [cib$v_target_addr_fixed] = true;
+		rcv_CIB [cib$v_target_addr_fixed] = true;
+		mom$debug_msg (	dbg$c_mopio,
+				.recv_buf_dsc [1],
+			        .(.recv_msg_len)<0,16>,
+			        $ASCID ('MOP message received'));
+		!
+		! On NI links, at the beginning of each program load
+		! (secondary, tertiary, or operating system), there is a chance
+		! that the load or dump request has been retransmitted.  If
+		! so, throw it away, and issue another read.  The caller can
+		! specify either a specific message to skip or that multicasts
+		! be skipped.
+		!
+		IF .skip_msg_dsc EQL 0 THEN
+		    EXITLOOP
+		ELSE
+		    BEGIN
+		    IF .skip_msg_dsc GTR 0 THEN
+			BEGIN
+		        IF CH$NEQ (.skip_msg_dsc [0], .skip_msg_dsc [1],
+				   .skip_msg_dsc [0], .recv_buf_dsc [1], 0) THEN
+			    EXITLOOP;
+			END
+		    ELSE
+			!
+			! Skip over multicasts.
+			!
+			IF NOT .ni_header [nih$b_multicast] THEN
+			    EXITLOOP;
+		    END;
+		END;
+	    skip_msg_max = .skip_msg_max - 1;
+	    !
+	    ! Just in case I'm skipping a message that the target is
+	    ! retransmitting over and over, limit the number of skipped
+	    ! messages.
+	    !
+	    IF .skip_msg_max EQL 0 THEN
+		BEGIN
+		status = ss$_timeout;
+		EXITLOOP;
+		END;
+	    rstatus = mom_mop_receive (.rcv_CIB [cib$l_chan],
+					.recv_buf_dsc,
+					iosb,
+					ni_header);
+	    IF NOT .rstatus THEN
+		RETURN mom_mapmoperrors (.rstatus, 0, mom$nosignal);
+	    END;
+	END;
+    IF .status NEQ ss$_timeout THEN
+	EXITLOOP;
+    !
+    ! Decrement the retry count and retry the I/O.
+    !
+    retry = .retry - 1;
+    !
+    ! For circuit loop tests, if the NI address of the target is not
+    ! already known, set up to try an alternate one.  The HIORD and
+    ! hardware addresses for the target are alternately retried.
+    !
+    IF .mom$gl_service_flags [mom$v_ni_circ] AND
+       .retry GTR 0 THEN
+	BEGIN
+	IF NOT .send_CIB [cib$v_target_addr_fixed] THEN
+	    mom$set_NI_addr (.send_CIB);
+	IF .send_CIB NEQ .rcv_CIB AND
+	   NOT .rcv_CIB [cib$v_target_addr_fixed] THEN
+	    mom$set_NI_addr (.rcv_CIB);
+	END;
+    END;
+!
+! Check the NI header to see if the MOP message was sent to the
+! NI multicast address (meaning that any NI node enabled for multicast
+! can respond to the message.)
+!
+IF .mom$gl_service_flags [mom$v_ni_circ] AND
+   .status THEN
+    BEGIN
+    IF .ni_header [nih$b_multicast] THEN
+	mom$gl_service_flags [mom$v_ni_multicast] = true
+    ELSE
+	mom$gl_service_flags [mom$v_ni_multicast] = false;
+    END;
+!
+! If no response was received from the target node, cancel the I/Os
+! on the MOP channels.  The only time the send channel isn't the same
+! as the receive channel is for loop with assist on the Ethernet.
+!
+IF .retry LEQ 0 THEN
+    BEGIN
+    $CANCEL (CHAN = .send_CIB [cib$l_chan]);
+    IF .send_CIB [cib$l_chan] NEQ .rcv_CIB [cib$l_chan] THEN
+	$CANCEL (CHAN = .rcv_CIB [cib$l_chan]);
+    END;
+RETURN mom_mapmoperrors (.status, 0, mom$nosignal)
+
+END;				! End of mom$mopsndrcv
+
+%SBTTL 'mom_mop_receive    Receive a MOP mode message'
+ROUTINE mom_mop_receive (mop_rcv_chan,
+				recv_buf_dsc,
+				iosb,
+				ni_header_addr) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine is called to issue a QIO receive on the MOP channel
+!
+! INPUTS:
+!	MOP_RCV_CHAN = QIO channel to issue receive on.
+!	RECV_BUF_DSC	= Address of descriptor of receive message buffer.
+!	IOSB		= Address of IOSB.
+!	NI_HEADER_ADDR  = Address of buffer in which to return NI header.
+!
+! OUTPUTS:
+!	Success/failure of operation.
+!--
+BEGIN
+
+MAP
+    recv_buf_dsc: REF VECTOR;
+
+LOCAL
+    retry,
+    rstatus;
+
+retry = 3;
+WHILE .retry GTR 0 DO
+    BEGIN
+    rstatus = $QIO (EFN  = mom$k_moprcvefn,
+		   CHAN = .mop_rcv_chan,
+		   FUNC = io$_readvblk,
+		   IOSB = .iosb,
+		   P1   = .recv_buf_dsc [1],
+		   P2   = .recv_buf_dsc [0],
+		   P5 	= .ni_header_addr);
+    IF NOT .rstatus THEN
+	mom$debug_qio (dbg$c_mopio, .rstatus, 0, 0, 0, 0, 0,
+		   $ASCID ('MOP receive completion status'))
+    ELSE
+	EXITLOOP;
+    retry = .retry - 1;
+    END;
+RETURN .rstatus;
+END;			! of  mom_mop_receive
+
+%SBTTL 'mom$mop_receive_qiow     Receive and wait for a MOP mode message'
+GLOBAL ROUTINE mom$mop_receive_qiow (mop_rcv_chan,
+					mop_msg_dsc,
+					ni_header_addr) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine performs a receive operation on the specified MOP
+!	channel. This is currently used only to get the MOP message which
+!	causes SERVICE to be started for an autoservice function.
+!
+! INPUTS:
+!	MOP_RCV_CHAN = Channel to receive response MOP message on.
+!	MOP_MSG_DSC	Address of descriptor of receive buffer.
+!	NI_HEADER_ADDR - Address at which to put NI header which was
+!		received with the MOP message.  Used to determine if
+!		a MOP message was multicast.
+!
+! OUTPUTS:
+!	If the QIO does not complete successfully, the first longword of
+!		the MOP message descriptor is set to zero.
+!--
+
+BEGIN
+
+MAP
+    mop_msg_dsc: REF VECTOR;
+
+OWN
+    iosb   : $iosb;
+
+LOCAL
+    rstatus;
+
+rstatus = $QIOW (EFN  = mom$k_moprcvefn,
+		CHAN = .mop_rcv_chan,
+		FUNC = io$_readvblk OR io$m_now,
+		IOSB = iosb,
+		P1   = .mop_msg_dsc [1],
+		P2   = .mop_msg_dsc [0],
+		P5   = .ni_header_addr);
+IF NOT .rstatus THEN
+    mom$debug_qio (dbg$c_mopio, .rstatus, iosb, 0, 0, 0, 0,
+		   $ASCID ('MOP receive completion status'));
+
+!
+! Check to see ef the receive completed with an error.
+!
+IF .rstatus THEN
+    BEGIN
+    mom$debug_qio (dbg$c_mopio, .rstatus, iosb, 0, 0, 0, 0,
+		   $ASCID ('MOP receive completion status'));
+    rstatus = .iosb [ios$w_status];
+    IF .rstatus THEN
+	BEGIN
+	mop_msg_dsc [0] = .iosb [ios$w_count];
+	mom$debug_msg (	dbg$c_mopio,
+			.mop_msg_dsc [1],
+		        .mop_msg_dsc [0],
+		        $ASCID ('MOP message received'));
+	END;
+    END;
+IF NOT .rstatus THEN
+    mop_msg_dsc [0] = 0;
+
+RETURN .rstatus;
+END;				! End of mom$mop_receive_qiow
+
+%SBTTL 'mom$mopsend  Send a MOP mode message'
+GLOBAL ROUTINE mom$mopsend (send_CIB, adr, len) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine transmits a single MOP message.
+!
+! INPUTS:
+!
+!	SEND_CIB = Informaton Block of channel over which to transmit MOP message
+!	ADR = Address of data to be transmitted.
+!	LEN = Length in bytes of data to be transmitted.
+!
+! OUTPUTS:
+!
+!	Success/failure of operation.
+!--
+
+BEGIN
+
+MAP
+    send_CIB : REF BBLOCK;
+
+LOCAL
+    iosb   : $iosb,
+    wstatus;
+
+mom$debug_msg (	dbg$c_mopio,
+		.adr,
+		.len,
+		$ASCID ('Transmitting MOP message'));
+wstatus = $QIOW (EFN  = mom$k_mopsndefn,
+		   CHAN = .send_CIB [cib$l_chan],
+		   FUNC = io$_writevblk,
+		   IOSB = iosb,
+		   P1   = .adr,
+		   P2   = .len);
+
+!
+! Dump the transmit's completion status to the debug log.  
+!
+mom$debug_qio (dbg$c_mopio, .wstatus, iosb, 0, 0, 0, 0,
+		$ASCID ('MOP transmit completion status'));
+RETURN mom_mapmoperrors (.wstatus, iosb, mom$nosignal)
+
+END;				! End of MOM$MOPSEND
+
+%SBTTL 'mom_mapmoperrors      Map MOP error codes'
+ROUTINE mom_mapmoperrors (code, iosb, signal_flag) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine sets up the message block information for MOP errors.
+!
+! INPUTS:
+!
+!	CODE		QIO status code.
+!	IOSB		Address of I/O status block.
+!	SIGNAL_FLAG	Indicates whether or not to signal if there is
+!			an error.  0 = don't signal, 1 = signal.
+!
+! OUTPUTS:
+!
+!	If an error is indicated, the appropriate NICE message information
+!	is stored in the message block (MOM$AB_MSGBLOCK).
+!
+!	The actual status of the operation is returned.  The status
+!	comes from either the value in R0 or the value in the I/O status
+!	block.
+!--
+
+BEGIN
+
+MAP
+    iosb : REF $IOSB;
+
+LOCAL
+    status,
+    msgsize;
+
+status = .code;
+
+IF .code THEN
+    IF .iosb NEQA 0 THEN
+	status = .iosb [ios$w_status];
+
+IF NOT .status THEN
+    SELECTONEU .status OF
+	SET
+	[OTHERWISE]:
+	    BEGIN
+
+	    mom$ab_msgblock [msb$l_flags] = msb$m_msg_fld;
+	    mom$ab_msgblock [msb$b_code] = nma$c_sts_lco;
+	    mom$ab_msgblock [msb$l_text] = .status;
+	    IF .signal_flag THEN
+		BEGIN
+		mom$bld_reply (mom$ab_msgblock, msgsize);
+		$signal_msg (mom$ab_nice_xmit_buf, .msgsize);
+		END;
+	    END;
+	TES;
+
+RETURN .status
+
+END;				! End of mom_mapmoperrors
+
+END					! End of module
+
+ELUDOM
+

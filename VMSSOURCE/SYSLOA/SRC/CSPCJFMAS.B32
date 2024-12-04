@@ -1,0 +1,1315 @@
+MODULE	CSPCJFMAS
+		(IDENT=	'V04-000'
+		,LANGUAGE (BLISS32)
+		,ADDRESSING_MODE (EXTERNAL= GENERAL)
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!++
+!
+! FACILITY:	Action routine for Common Journal Facility executing in
+!		Cluster Server Process
+!
+! ABSTRACT:	Remaster journals when one or more nodes have been removed
+!		from a VAXcluster
+!
+! AUTHOR:	Paul R. Beck
+!
+! DATE:		 27-JUN-1983 		Last Edit:  9-SEP-1983 17:30:12 
+!
+! REVISION HISTORY:
+!
+!	V03-004	ADE0001		Alan D. Eldridge	10-Feb-1984
+!		Change module name.  Rename CSP$GQ_GRANTQ to CSP$GQ_RESUME.
+!
+!	V03-003	PRB0250		Paul Beck	9-Sep-1983  18:32
+!		Fix various problems relating to levels of .indirection. 
+!		Correct calling of cluster failover resumption routine.
+!
+!	V03-002	PRB0xxx	Paul Beck		 15-AUG-1983 15:20
+!		Fix various problems with levels of indirection.
+!
+!	V03-001	PRB0234	Paul Beck		 1-AUG-1983 15:20
+!		Fix bug in calculating size of journal name,
+!		remove reference to JNLRM$B_JNLTYP.
+!
+!--
+
+%SBTTL	'Local definitions and macros'
+!
+! Require files:
+!
+!LIBRARY
+!    'SYS$LIBRARY:LIB';			! define system services (in JNLPREFIX)
+
+SWITCHES LIST (NOSOURCE);		! don't print out REQUIRE files
+
+REQUIRE
+    'SHRLIB$:JNLPREFIX';
+REQUIRE
+    'SHRLIB$:CSPDEF';
+
+SWITCHES LIST (SOURCE);
+!
+! Linkages used
+!
+LINKAGE
+    JSB_2		= JSB (REGISTER=2),
+    ALONONPAGED		= JSB (REGISTER=1; REGISTER=2): NOPRESERVE(0,1,3),
+    DEANONPAGED		= JSB (REGISTER=0): NOPRESERVE(0,1,2,3);
+!
+! Declare forward routines
+!
+FORWARD ROUTINE
+    REMASTER_CHAIN,				! remaster jnls of one type
+    RESUME_FAILOVER,				! issue QIO to resume failover sequence
+    RESTART_BASE	: NOVALUE,		! reschedule base thread
+    TEST_DEVICE,				! verify accessibility of jnl home device
+    REMASTER_JOURNAL,				! remaster single journal
+    REMASTER_CONTROL,				! remaster control journal
+    CALL_RCP		: NOVALUE,		! send request to RCP for RU journal
+    RELOCK_CHAIN	: NOVALUE,		! convert lock on chain to exmode
+    FREE_CHAIN		: NOVALUE,		! convert lock on chain to null
+    MUMBLE;
+!
+! Declare external routines
+!
+EXTERNAL ROUTINE
+    LIB$GET_VM, LIB$FREE_VM,			! RTL allocation routines
+    LIB$GET_EF, LIB$FREE_EF,			! RTL event flag routines
+    SYS$ENQ, SYS$DEQ,				! lock manager system services
+    EXE$ALONONPAGED	: ALONONPAGED,		! allocate nonpaged pool
+    EXE$DEANONPAGED	: DEANONPAGED,		! deallocated nonpaged pool
+    CJF$ASSJNL,					! assign journal
+    CJF$DEASJNL,				! deassign journal
+    CJF$ALLJDR,					! allocate journal drive
+    CJF$DEALJDR,				! deallocate journal drive
+    CJF$RECOVERW,				! issue recover request to RCP
+    CJF$LOCK_PROTO,				! lock prototype UCB
+    CJF$CREJNL,					! create journal
+    LOCK_IODB		: NOVALUE,		! lock I/O database
+    UNLOCK_IODB		: NOVALUE,		! unlock I/O database
+    DELETE_IODB		: NOVALUE,		! delete UCB-related CJF structures
+    DELETE_UCB		: NOVALUE,		! delete CJF UCB.
+    CREATE_RUDEV,				! create device name of RU jnl
+    CSP$$RESUME,				! async AST address within CSP
+    CSP$$END_CONTEXT,				! kill current thread and reschedule
+    CSP$$WAIT,					! asynch wait within CSP
+    CSP$$FORK,					! create new thread
+    CJF$RESUME_FAILOVER	: NOVALUE;		! resume failover sequence
+!
+! External variables.
+!
+EXTERNAL
+    CSP$GQ_RESUME,				! scheduler queue
+    CSP$GL_CURCTX,				! current context
+    CSP$GL_BASE_FP,				! frame ptr for scheduler call
+    RESUME_ADDRESS,				! addr at which to resume failover
+    FAILOVER_ID;				! ID of most recent failover sequence
+!
+! Own storage accessible to all callers and all routines in this module.
+!
+OWN
+    LOCAL_EFN		: BYTE,			! event flag for this routine
+    UCBQ		: VECTOR [2,LONG]	! queue of UCB clones
+    			  INITIAL (UCBQ, UCBQ),
+    UCBMASTERQ		: VECTOR [2,LONG]	! queue of locally mastered RU UCBs
+    			  INITIAL (UCBMASTERQ, UCBMASTERQ),
+    CALLED_COUNT	: INITIAL ( 0 ),	! # times this routine called
+    REMASTERING		: BYTE INITIAL ( 0 );	! flag: failover in progress
+
+LITERAL
+    !
+    ! Define size of JSB plus maximal device name descriptor list.
+    !
+    JSB_LENGTH		= JSB$C_LENGTH + (JNL$C_MAX_COPIES*8) + 4;
+!
+! Macro to restart remastering loop at the top.
+!
+MACRO	RESTART_REMASTER_LOOP =
+    BEGIN
+    LOCAL_CALLED_COUNT = .CALLED_COUNT;
+    LEAVE REMASTER_LOOP;
+    END; % ;
+!
+! Macro to issue call with arguments from kernel mode.
+!
+MACRO	KRNL_CALL (K_ROUTINE) =
+    BEGIN
+    EXTERNAL ROUTINE
+	SYS$CMKRNL   : ADDRESSING_MODE (ABSOLUTE);
+    BUILTIN SP ;
+    
+    SYS$CMKRNL (K_ROUTINE , .SP , %LENGTH - 1
+		%IF %LENGTH GTR 1 %THEN , %REMAINING %FI)
+    END%;
+!
+! *********** temps ***********
+!
+%IF NOT %DECLARED (CJF$M_FAILOVER) 
+%THEN 
+    EXTERNAL LITERAL CJF$M_FAILOVER; 
+%FI
+%IF NOT %DECLARED (IO$M_GETMINFO) 
+%THEN 
+    EXTERNAL LITERAL IO$M_GETMINFO; 
+%FI
+
+%SBTTL	'CSP$CJFREMASTER - remaster journals in a VAXcluster'
+!++
+! CSP$CJFREMASTER
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine is an action routine running in the context of the
+! 	Cluster Server Process (CSP). It is invoked from the Journal Driver
+!	when JNLDRIVER is notified that a cluster failover is in progress
+!	("cluster failover" is the removal of one or more nodes from a running
+!	VAXcluster). Note that unlike many CSP action routines, this routine is
+!	invoked in the same node as the driver; it runs in the CSP in order to
+!	provide a process context in which to remaster journals. The JNLACP is
+!	not used to provide this process context so that the remastering code
+!	can conveniently call normal CJF services (which result in JNLACP 
+!	activity) without making the JNLACP multithreaded.
+!
+!	Journals may need to be remastered following a node failure in a cluster
+!	because that node may have been master to one or more cluster-wide
+!	journals in use from other nodes. If the journal file is accessible from
+!	another node, that node may remaster the journal.
+!
+!	The function of the routine is to try to become the master of any
+!	journals which are currently unmastered and available. All nodes in the
+!	cluster attempt to do this; the lock manager is used to keep them honest.
+!	The order of events is:
+!		0.	Note that when this routine is entered, the VAXcluster
+!			in the middle of the failover festivities. Locks from
+!			the failed node(s) have been deleted, and most locking
+!			activity is permitted; however, "protected" locks 
+!			(LCK$V_PROTECT) are still being stalled to allow the RCP
+!			to reestablish locks from Recovery Units in the failed
+!			node(s). (Ref steps 1-3)
+!		1.	Obtain the journal master lock (CJF$MASTER) to lock out
+!			any journal startup code on nodes just starting up.
+!		2.	Remaster Recovery Unit Journals. This involves obtaining
+!			a lock on the first unmastered RU journal we can,
+!			remastering it (if it's accessible), releasing the lock,
+!			and trying for the next. The loop continues until all
+!			unmastered RU Journals are either mastered or marked
+!			"unavailable".
+!		3.	Invoke the Recovery Control Process once for each
+!			Recovery Unit Journal mastered locally. The RCP will
+!			reestablish locks for those Recovery Units not marked
+!			completed from nodes not in the cluster.
+!		4.	"Resume" the Failover table.
+!		5.	Remaster Control Journals so that journal devices are
+!			reallocated as necessary.
+!		6.	Remaster AI, BI, and AT Journals.
+!		7.	Release the Journaling Master Lock.
+! CALLING SEQUENCE:
+!	MOVAL	CSD,R2
+!	JSB	CSP$CJFREMASTER
+! FORMAL PARAMETERS:
+!	P1	= address of CSD structure identifying the calling parameters.
+!		  No parameters are required; just being invoked is sufficient.
+! COMPLETION CODES:
+!
+!--
+GLOBAL ROUTINE CSP$CJFREMASTER ( CSD: REF BLOCK [,BYTE] ): JSB_2 = 
+BEGIN
+!
+! Local storage
+!
+LOCAL
+    STATUS,					! completion status
+    RU_STATUS,					! ...
+    CL_STATUS,					! ...
+    AI_STATUS,					! ...
+    BI_STATUS,					! ...
+    AT_STATUS,					! ...
+    LOCAL_CALLED_COUNT	: LONG,			! impure copy of CALLED_COUNT
+    HOME_CONTEXT	: REF BLOCK [,BYTE],	! address of context block for this thread
+    MASTER_LKSB		: VECTOR [2,LONG];	! lock status block
+
+LABEL
+    REMASTER_LOOP;
+
+HOME_CONTEXT = .CSP$GL_CURCTX;
+CALLED_COUNT = .CALLED_COUNT + 1;
+!
+! Always save the lastest failover ID and sequence resume address. These
+! reside with the routine CJF$RESUME_FAILOVER. If a new failover sequence has
+! started we don't want to resume an old one... These values are filled in by
+! the journal driver when it is first called from the failover sequence.
+!
+RESUME_ADDRESS = .CSD [CSD$L_P1];
+FAILOVER_ID = .CSD [CSD$L_P2];
+!
+! Bail out if somebody is currently in the throes of remastering journals.
+!
+IF NOT .REMASTERING THEN REMASTERING = 1 ELSE RETURN SS$_NORMAL;
+LOCAL_CALLED_COUNT = .CALLED_COUNT;
+!
+! Get an event flag for synchronous waits in kernel mode.
+!
+LIB$GET_EF (LOCAL_EFN);
+!
+! Get the CJF master lock (from Kernel mode)
+!
+STATUS = KRNL_CALL ( SYS$ENQ, 
+		     0,				! EFN
+		     LCK$K_CWMODE,		! LKMODE = concurrent write lock
+		     HOME_CONTEXT [CLX$Q_IOSB], ! LKSB = lock status block
+		     LCK$M_SYSTEM, 		! FLAGS  = system-wide lock
+		     %ASCID 'CJF$MASTER',	! RESNAM = name of lock
+		     0,				! PARID  = no parent
+		     CSP$$RESUME,		! ASTADR = completion AST in CSP
+		     .HOME_CONTEXT,		! ASTPRM = allows CSP to resume us
+		     0,				! BLKAST = no blocking AST
+		     PSL$C_KERNEL,		! ACMODE = kernel mode lock
+		     0);			! reserved parameter
+IF .STATUS THEN CSP$$WAIT();
+STATUS = .HOME_CONTEXT [CLX$W_IOSB_STAT];
+IF NOT .STATUS THEN MUMBLE();			! why can't we get it?
+!
+! 			*** TOP OF LOOP ***
+!
+! We do the entire process in a loop, making sure that if any journals become
+! unmastered while we're here (i.e. a second failover), we catch them.
+! This implies a couple of caveats:
+!	1.	We "get out" when we've made a pass wherein NO unmastered
+!		journals not marked "unavailable" were seen.
+!	2.	This "no unmastered journals" final pass must be made such
+!		that NO CSP WAITS ARE DONE (fully synchronous). Otherwise we
+!		might miss something (and a new call to CSP$CJFREMASTER would
+!		just exit because we have REMASTERING set).
+!	3.	Because of the special nature of the handling of RU journals,
+!		we look for unmastered RU journals at a higher rate than
+!		the "peon" journals (AI/BI/AT/CL).
+WHILE 1
+DO
+
+REMASTER_LOOP:
+
+    BEGIN
+    !
+    ! Remaster Recovery Unit journals and call RCP for each locally mastered RUJ.
+    !
+    RU_STATUS = 0;
+    UNTIL .RU_STATUS EQL SS$_NOSUCHDEV
+    DO
+	RU_STATUS = KRNL_CALL ( REMASTER_CHAIN,  DT$_RUJNL );
+    !
+    ! Resume the failover table. This tells the Cluster connection manager to
+    ! continue executing those steps required to complete the failover. In particular,
+    ! full locking will once more be permitted.
+    !
+    KRNL_CALL ( CJF$RESUME_FAILOVER );
+    !
+    ! Remaster control journals and reallocate journal devices.
+    !
+    CL_STATUS = 0;
+    UNTIL .CL_STATUS EQL SS$_NOSUCHDEV
+    DO
+	CL_STATUS = KRNL_CALL ( REMASTER_CHAIN,  DT$_CLJNL );
+    !
+    ! If any new requests have been seen, restart from the top immediately.
+    !
+    IF .CALLED_COUNT NEQ .LOCAL_CALLED_COUNT THEN RESTART_REMASTER_LOOP;
+    !
+    ! Remaster AI journals.
+    !
+    AI_STATUS = KRNL_CALL ( REMASTER_CHAIN,  DT$_AIJNL );
+    !
+    ! If any new requests have been seen, restart from the top immediately.
+    !
+    IF .CALLED_COUNT NEQ .LOCAL_CALLED_COUNT THEN RESTART_REMASTER_LOOP;
+    !
+    ! Remaster BI journals.
+    !
+    BI_STATUS = KRNL_CALL ( REMASTER_CHAIN,  DT$_BIJNL );
+    !
+    ! If any new requests have been seen, restart from the top immediately.
+    !
+    IF .CALLED_COUNT NEQ .LOCAL_CALLED_COUNT THEN RESTART_REMASTER_LOOP;
+    !
+    ! Remaster AT journals.
+    !
+    AT_STATUS = KRNL_CALL ( REMASTER_CHAIN,  DT$_ATJNL );
+    !
+    ! If any new requests have been seen, restart from the top immediately.
+    !
+    IF .CALLED_COUNT NEQ .LOCAL_CALLED_COUNT THEN RESTART_REMASTER_LOOP;
+    !
+    ! See if we did anything this pass. If not, we're done.
+    !
+    IF (.RU_STATUS EQL SS$_NOSUCHDEV)			! no RUJs this pass
+	AND (.CL_STATUS EQL SS$_NOSUCHDEV)		! no control jnls this pass
+	AND (.AI_STATUS EQL SS$_NOSUCHDEV)		! no AIJs this pass
+	AND (.BI_STATUS EQL SS$_NOSUCHDEV)		! no BIJs this pass
+	AND (.AT_STATUS EQL SS$_NOSUCHDEV)		! no ATJs this pass
+    THEN
+	!
+	! No attempts were made to remaster any journals this pass.
+	! Ergo, we're done.
+	!
+	EXITLOOP;
+    END;					! WHILE 1
+!
+! Reset the mutex.
+!
+LIB$FREE_EF (LOCAL_EFN);
+REMASTERING = 0;
+!
+! Release the lock
+!
+    BEGIN
+    BIND
+	LOCK_ID = HOME_CONTEXT [CLX$Q_IOSB] + 4;
+    KRNL_CALL ( SYS$DEQ, .LOCK_ID, 0, PSL$C_KERNEL, 0 );
+    END;
+!
+! That's it.
+!
+RETURN SS$_NORMAL;
+END;
+
+%SBTTL	'REMASTER_CHAIN - remaster journals of one type'
+!++
+! REMASTER_CHAIN
+!
+! FUNCTIONAL DESCRIPTION:
+!	Keep trying to remaster journals of the specified type
+!	until all journals of this type are either remastered by someone
+!	or are known to be unavailable. We operate primarily off a copy of
+!	the UCB chain to keep the I/O data base unlocked and know that
+!	we're safe since while we're remastering, no new journals (and hence
+!	no new UCBs) can show up.
+! CALLING SEQUENCE:
+!	STATUS	= KRNL_CALL REMASTER_CHAIN ( JNLTYP );
+! FORMAL PARAMETERS:
+!	JNLTYP	= value of journal type to be remastered.
+! COMPLETION CODES:
+!	SS$_NORMAL	= one or more journal was touched (an attempt was made,
+!			  whether successful or not, to remaster it)
+!	SS$_NOSUCHDEV	= no available, unmastered journals were found
+!--
+ROUTINE REMASTER_CHAIN ( JNLTYP ) =
+BEGIN
+LOCAL
+    STATUS,					! completion status
+    PROTO_UCB		: REF BLOCK [,BYTE],	! addr of UCB0 for this chain
+    UCB			: REF BLOCK [,BYTE],	! addr of individual UCB
+    LOC_UCB		: REF BLOCK [,BYTE],	! addr of copied UCB
+    LKSB		: VECTOR [2,LONG],	! lock status block for proto lock
+    JNL_LKSB		: VECTOR [2,LONG],	! lock status block for journal lock
+    JNL_LOCKNAME	: BLOCK [8,BYTE]	! descriptor of lock name
+    			  PRESET ( [DSC$W_LENGTH]  = 0,
+    				   [DSC$B_DTYPE]   = 0,
+    				   [DSC$B_CLASS]   = 0,
+    				   [DSC$A_POINTER] = 0),
+    DELETE_LOCAL_UCB	: BYTE INITIAL (0),	! flag
+    UNAVAILABLE		: BYTE,			! flag
+    SOMETHING_DONE	: BYTE INITIAL (0),	! flag: suitable journal found
+    NEXT_UCB		: LONG,			! pointer to next UCB
+    ALLOC_SIZE		: LONG;			! allocation size
+
+BIND
+    PROTO_LOCK_ID	= LKSB [ 1 ];		! lock ID for UCB chain lock
+LABEL
+    PROCESS_UCB;
+BUILTIN
+    INSQUE,REMQUE;
+!
+! First, lock the I/O data base and this UCB chain
+!
+STATUS = CJF$LOCK_PROTO ( .JNLTYP,		! define which chain to lock
+			  LCK$K_EXMODE,		! we want an exclusive lock
+			  PROTO_UCB,		! return the addr of the base UCB
+			  PROTO_LOCK_ID );	! return the lock ID
+IF NOT .STATUS THEN MUMBLE();
+UNLOCK_IODB();
+!
+! Make a copy of each unmastered UCB in this chain while we have everything 
+! locked up. Keep a backpointer to the real UCB in UCB$L_LINK.
+!
+UCB = .PROTO_UCB;
+UNTIL (UCB = .UCB [UCB$L_LINK]) EQL 0
+DO
+    BEGIN
+    BIND
+	UCB_DEVCHAR = UCB [UCB$L_DEVCHAR]: BLOCK [4,BYTE]; ! "available" flag in this longword
+
+    IF (.UCB [UCB$V_JNL_UNMAST]) AND (.UCB_DEVCHAR [DEV$V_AVL])
+    THEN
+	BEGIN
+	!
+	! This UCB is unmastered and not marked unavailable. Copy it.
+	!
+	SOMETHING_DONE = 1;
+	EXE$ALONONPAGED ( UCB$C_JNL_LENGTH; LOC_UCB );
+	CH$MOVE ( UCB$C_JNL_LENGTH, .UCB, .LOC_UCB );
+	LOC_UCB [UCB$L_LINK] = .UCB;
+	INSQUE ( .LOC_UCB, UCBQ );
+	END;
+    END;
+!
+! Rather than releasing the lock on the proto UCB, we downgrade it to a
+! null lock so we can use it as the parent lock for Journal Locks.
+!
+FREE_CHAIN ( LKSB );
+!
+! Start an "endless loop" which is only exited when we recognize that all
+! journals in this UCB chain have either been remastered (by us or somebody
+! else), or marked unavailable.
+!
+LOC_UCB = UCBQ;				! init "this UCB" pointer
+WHILE 1 
+DO
+    BEGIN
+    !
+    ! For each journal in he list, attempt to remaster.
+    ! First, we must get the lock for the journal. If we can't get the lock,
+    ! we move on to the next journal in the list. When we run out of journals,
+    ! we try again! Eventually (it sez here) all journals will have been taken
+    ! care of.
+    !
+    ! If the queue is empty, we're done (we've run out of journals).
+    !
+    IF .UCBQ EQL UCBQ THEN EXITLOOP;
+    IF .LOC_UCB EQL UCBQ THEN LOC_UCB = ..LOC_UCB;
+
+PROCESS_UCB:
+
+	BEGIN
+	!
+	! The journal lock consists of the journal name (as found in the
+	! UCB), zero-filled as needed, with the UCB chain lock as its parent.
+	!
+	LOCAL
+	    NAME_SIZE	: BYTE; 			! length of journal name
+
+	NAME_SIZE = .LOC_UCB [UCB$T_JNL_NAM];
+	IF (.NAME_SIZE EQL 0) THEN NAME_SIZE = UCB$S_JNL_NAM;
+	DELETE_LOCAL_UCB = 0;
+	UNAVAILABLE = 0;
+	NEXT_UCB = ..LOC_UCB;
+	CH$FILL ( 0, UCB$S_JNL_NAM - .NAME_SIZE, LOC_UCB [UCB$B_JNL_NAM] + .NAME_SIZE );
+	JNL_LOCKNAME [DSC$W_LENGTH] = UCB$S_JNL_NAM;
+	JNL_LOCKNAME [DSC$A_POINTER] = LOC_UCB [UCB$T_JNL_NAM];
+	STATUS = $ENQ ( LKMODE	= LCK$K_PWMODE,		! protected write lock
+			LKSB	= JNL_LKSB,		! lock status block
+			FLAGS	= LCK$M_NOQUEUE OR LCK$M_SYSTEM, ! now or not at all
+			RESNAM	= JNL_LOCKNAME,		! name of lock
+			PARID	= .PROTO_LOCK_ID );	! parent = proto
+	IF NOT .STATUS THEN LEAVE PROCESS_UCB WITH (DELETE_LOCAL_UCB = 0);
+	!
+	! We got the lock.
+	!
+	! Now, try to remaster the journal. First, however, double-check
+	! the real UCB to see if someone else mastered it first. (As long
+	! as we have the journal lock, they won't.)
+	!
+	RELOCK_CHAIN ( LKSB );
+	UCB = .LOC_UCB [UCB$L_LINK];
+	STATUS = .UCB [UCB$V_JNL_UNMAST];
+	!
+	! We have the information we want (in STATUS): release the chain.
+	!
+	FREE_CHAIN ( LKSB );
+	!
+	! If it's no longer unmastered, go on to the next UCB
+	!
+	IF NOT .STATUS THEN LEAVE PROCESS_UCB WITH (DELETE_LOCAL_UCB = 1);
+	!
+	! It's still unmastered. Here, we try to remaster it.
+	!
+	SELECTONE .JNLTYP OF
+	    SET
+	    [DT$_AIJNL, DT$_BIJNL, DT$_ATJNL, DT$_RUJNL]:
+		IF NOT REMASTER_JOURNAL ( .LOC_UCB, LKSB )
+		THEN
+		    LEAVE PROCESS_UCB WITH (UNAVAILABLE = 1);
+	    [DT$_CLJNL]:
+		BEGIN
+		REMASTER_CONTROL ( .LOC_UCB, LKSB );
+		DELETE_LOCAL_UCB = 1;
+		END;
+	    TES;
+	END;					! PROCESS_UCB
+    !
+    ! Release the journal lock
+    !
+    $DEQ ( LKID = .JNL_LKSB [ 1 ] );
+    !
+    ! Mark journal unavailable if requested
+    !
+    UCB = .LOC_UCB [UCB$L_LINK];
+    IF .UNAVAILABLE
+    THEN
+	BEGIN
+	BIND
+	    UCB_DEVCHAR = UCB [UCB$L_DEVCHAR]: BLOCK [4,BYTE];
+	!
+	! First, get the lock exclusively again.
+	!
+	RELOCK_CHAIN ( LKSB );
+	!
+	! Mark the UCB unavailable.
+	!
+	UCB_DEVCHAR [DEV$V_AVL] = 0;
+	!
+	! Release chain lock
+	!
+	FREE_CHAIN ( LKSB );
+	DELETE_LOCAL_UCB = 1;
+	END;
+    !
+    ! Get rid of the UCB if needed.
+    !
+    IF .DELETE_LOCAL_UCB
+    THEN
+	BEGIN
+	REMQUE ( .LOC_UCB, LOC_UCB );
+	EXE$DEANONPAGED ( .LOC_UCB );
+	END;
+    !
+    ! Get pointer to next local UCB and continue.
+    !
+    LOC_UCB = .NEXT_UCB;
+    END;					! While 1
+!
+! Call the RCP for each journal mastered by this node.
+!
+IF .JNLTYP EQL DT$_RUJNL
+THEN
+    BEGIN
+    LOC_UCB = UCBMASTERQ;
+    UNTIL (LOC_UCB = .LOC_UCB) EQL UCBMASTERQ
+    DO
+	CALL_RCP ( .LOC_UCB );
+    END;
+!
+! Release our local allocations.
+!
+UNTIL REMQUE ( .UCBQ, UCB ) DO EXE$DEANONPAGED ( .UCB );
+UNTIL REMQUE ( .UCBMASTERQ, UCB ) DO EXE$DEANONPAGED ( .UCB );
+!
+! Release the chain lock for real.
+!
+$DEQ ( LKID = .LKSB [ 1 ] );
+!
+! Done
+!
+RETURN (IF .SOMETHING_DONE THEN SS$_NORMAL ELSE SS$_NOSUCHDEV);
+END;
+
+%SBTTL	'REMASTER_JOURNAL - try to remaster AI, BI, AT, RU journal'
+!++
+! REMASTER_JOURNAL
+!
+! FUNCTIONAL DESCRIPTION:
+!	Try to remaster this journal with the following steps:
+!	1.  Issue request to the driver to collect information about this
+!	    journal from other nodes in the cluster
+!	2.  Test accessibility of the device on which the journal file resides.
+!	3.  Create a JSB structure from the information in the Remaster Block
+!	    associated with this journal's UCB
+!	4.  Issue a Create Journal service to effect the remastering operation.
+!	5.  If successful, move the local copy of the UCB to the queue of
+!	    locally mastered journals. This is only done if we're dealing with
+!	    a Recovery Unit journal.
+!	THIS ROUTINE RUNS IN KERNEL MODE.
+! CALLING SEQUENCE:
+!	STATUS	= REMASTER_JOURNAL ( LOC_UCB, LKSB );
+! FORMAL PARAMETERS:
+!	LOC_UCB	= address of local copy of journal's UCB.
+!	LKSB	= address of lock status block for the chain lock
+! COMPLETION CODES:
+!	0	= We didn't remaster this journal
+!	1	= We did remaster this journal
+!--
+ROUTINE REMASTER_JOURNAL ( LOC_UCB: REF BLOCK [,BYTE], LKSB: VECTOR [2,LONG] ) =
+BEGIN
+
+LITERAL
+    DEVNAM_LENGTH	= 15;
+
+LOCAL
+    JSB			: BLOCK [JSB$C_LENGTH,BYTE], ! internal JSB
+    CHANNEL		: WORD,			! channel to journal device
+    LOCAL_IOSB		: VECTOR [2,LONG],	! I/O status block
+    DDB			: REF BLOCK [,BYTE],	! device data block
+    UCB			: REF BLOCK [,BYTE],	! actual UCB for this journal
+    FAO_BUFFER		: BLOCK [DEVNAM_LENGTH,BYTE], ! build 'CJxuuuu' here
+    JNL_DEVNAM		: BLOCK [8,BYTE]
+    			  PRESET ( [DSC$W_LENGTH]  = DEVNAM_LENGTH,
+    				   [DSC$B_DTYPE]   = 0,
+    				   [DSC$B_CLASS]   = 0,
+    				   [DSC$A_POINTER] = FAO_BUFFER),
+    JNLRM		: REF BLOCK [,BYTE],	! remaster block
+    DEVNAM		: REF BLOCK [,BYTE],	! pointer into remaster block
+    DEVNAM_LIST		: BLOCK [((CJF$C_MAXCOPIES+1)*8),BYTE], ! device name descriptor list
+    DEVNAM_DESC		: REF BLOCK [,BYTE],	! pointer into DEVNAM_LIST
+    STATUS		: LONG;
+!
+! First get a channel to the journal. We don't need (or want) a "journal
+! channel" using $ASSJNL, since that assumes a mastered journal. So we
+! must first create the name of the journal device from the structures
+! we already have at hand.
+!
+! *** NOTE *** We will access the I/O database to read the DDB, which
+! shouldn't either move or change, so we're not locking it.
+!
+DDB = .LOC_UCB [UCB$L_DDB];
+!
+! Create the device name. Note that JNL_DEVNAM [DSC$W_LENGTH] gets
+! re-initialized every time the subroutine is entered, so we can change
+! it at will here (by using it with "outlen").
+!
+$FAO (  %ASCID '!AC!UW',			! ctrstr
+	JNL_DEVNAM [DSC$W_LENGTH],		! outlen
+	JNL_DEVNAM,				! outbuf
+	DDB [DDB$T_NAME],			! p1
+	.LOC_UCB [UCB$W_UNIT] );		! p2
+!
+! Get the channel.
+!
+IF NOT $ASSIGN ( CHAN = CHANNEL, DEVNAM = JNL_DEVNAM ) THEN RETURN 0;
+!
+! Ask the driver to collect information from other
+! nodes in the cluster so that it can become master
+! of the journal.
+!
+STATUS = $QIOW( CHAN	= .CHANNEL,
+		FUNC	= IO$_SNDJNLMSG OR IO$M_GETMINFO,
+		IOSB	= LOCAL_IOSB,
+    		EFN	= .LOCAL_EFN );
+STATUS = .LOCAL_IOSB;
+$DASSGN ( CHAN = .CHANNEL );
+!
+! See if it worked.
+!
+IF NOT .STATUS THEN RETURN 0;
+!
+! We have accumulated all the data from other nodes needed to be master of
+! this journal with the exception of write buffers etc. Next, see if we have
+! access to the device on which the journal file exists. 
+! 
+IF NOT TEST_DEVICE ( .LOC_UCB ) THEN RETURN 0;
+!
+! We have access to the device. Now create the journal with this node as its
+! master. To do this, we first create a JSB from the information in the JNLRM
+! structure. 
+!
+! Start out with a zeroed JSB
+!
+CH$FILL ( 0, JSB_LENGTH, JSB );
+!
+! Fill in what we can; the rest defaults.
+!
+JNLRM = .LOC_UCB [UCB$L_JNL_RMBLK];
+JSB [JSB$W_JNLNAMLEN] = .(LOC_UCB [UCB$T_JNL_NAM])<0,8>;
+JSB [JSB$L_JNLNAM] = LOC_UCB [UCB$B_JNL_NAM];
+JSB [JSB$B_JNLTYP] = .LOC_UCB [UCB$B_DEVTYPE];
+JSB [JSB$B_JNLDEV] = (IF .JNLRM [JNLRM$V_TAPJNL] THEN JSB$C_TAPE ELSE JSB$C_DISK);
+JSB [JSB$L_MASK] = .LOC_UCB [UCB$L_JNL_MASK];
+JSB [JSB$V_TMPFIL] = .JNLRM [JNLRM$V_TMPFIL];
+JSB [JSB$V_DIFACP] = .JNLRM [JNLRM$V_DIFACP];
+JSB [JSB$W_ACPNAMLEN] = .JNLRM [JNLRM$W_ACPNAMLEN];
+JSB [JSB$L_ACPNAM] = JNLRM [JNLRM$W_ACPNAMOFF] + .JNLRM [JNLRM$W_ACPNAMOFF];
+JSB [JSB$B_COPIES] = .JNLRM [JNLRM$B_COPIES];
+JSB [JSB$L_PRINAMDES] = DEVNAM_LIST;
+JSB [JSB$V_REMASTER] = 1;
+!
+! Zero the descriptor list (including a terminating zero).
+!
+CH$FILL ( 0, (CJF$C_MAXCOPIES*8)+4, DEVNAM_LIST );
+IF .JNLRM [JNLRM$V_DSKJNL]
+THEN
+    INCR INDEX FROM 0 TO .JNLRM [JNLRM$B_COPIES] - 1
+    DO
+	BEGIN
+	!
+	! For disk-based journals, we need to create the descriptor list
+	! of disk device names.
+	!
+	DEVNAM = .JNLRM + JNLRM$K_DSKJNLLST + (.INDEX*JNLRM$K_DSKENTLEN);
+	DEVNAM_DESC = DEVNAM_LIST + (.INDEX*8);
+	DEVNAM_DESC [DSC$B_DTYPE] = DSC$K_DTYPE_T;
+	DEVNAM_DESC [DSC$B_CLASS] = DSC$K_CLASS_S;	
+	DEVNAM_DESC [DSC$W_LENGTH] = .DEVNAM [JNLRM$W_DEVNAMLEN];
+	DEVNAM_DESC [DSC$A_POINTER] = .DEVNAM [JNLRM$W_DEVNAMOFF] + DEVNAM [JNLRM$W_DEVNAMOFF];
+	!
+	! Do anything with JNLRM$W_FILVEROFF/LEN ?
+	!
+	MUMBLE();
+
+	END;
+IF .JNLRM [JNLRM$V_TAPJNL]
+THEN
+    BEGIN
+    !
+    ! For tape-based journals, we need to supply the name of the tape
+    ! journal group.
+    !
+    DEVNAM_LIST [DSC$B_DTYPE] = DSC$K_DTYPE_T;
+    DEVNAM_LIST [DSC$B_CLASS] = DSC$K_CLASS_S;	
+    DEVNAM_LIST [DSC$W_LENGTH] = .JNLRM [JNLRM$W_TAPGRPLEN];
+    DEVNAM_LIST [DSC$A_POINTER] = .JNLRM [JNLRM$W_TAPGRPOFF] + JNLRM [JNLRM$W_TAPGRPOFF];
+    END;
+!
+! JSB is hereby created
+! Now create the journal with this node as its master.
+!
+STATUS = CJF$CREJNL ( CHANNEL, JSB );
+IF NOT .STATUS THEN RETURN 0;
+!
+! Successfully remastered lock. Move the UCB copy to the master list.
+!
+REMQUE ( .LOC_UCB, LOC_UCB );
+INSQUE ( .LOC_UCB, UCBMASTERQ );
+!
+! Deallocate the remaster block, if any.
+!
+RELOCK_CHAIN ( .LKSB );
+UCB = .LOC_UCB [UCB$L_LINK];
+UCB [UCB$L_JNL_RMBLK] = 0;
+EXE$DEANONPAGED ( .JNLRM );
+FREE_CHAIN ( .LKSB );
+RETURN 1;
+END;
+
+%SBTTL	'REMASTER_CONTROL - remaster control journal/reallocate/mount for jnling'
+!++
+! REMASTER_CONTROL
+!
+! FUNCTIONAL DESCRIPTION:
+!	For a particular control journal, walk through the list of allocated
+!	devices and perform the necessary allocate/mount functions to make
+!	them available for journaling.
+!	THIS ROUTINE RUNS IN KERNEL MODE.
+! CALLING SEQUENCE:
+!	STATUS = REMASTER_CONTROL ( LOC_UCB, LKSB );
+! FORMAL PARAMETERS:
+!	LOC_UCB = address of local copy of this control journal's UCB
+!	LKSB	= address of lock status block for the chain lock
+! COMPLETION CODES:
+!	1	= success
+!--
+ROUTINE REMASTER_CONTROL ( LOC_UCB: REF BLOCK [,BYTE], LKSB: VECTOR [2,LONG] ) =
+BEGIN
+!
+! Remastering a control journal.
+!
+!
+! Get ADBs from Allocated Device List for this control journal and, if the
+! device indicated is "not allocated" and "not mounted", issue an $ALLJDR
+! service to allocate the journal device.
+!
+! As each ADB is processed, get rid of it by setting the flag ADB$V_PURGED.
+! Here, "processed" means either successfully allocating and /or mounting, or
+! discovering that somebody beat us to it. No locks are used at this level to
+! arbitrate access to these devices, since that is handled properly by ALLOC
+! and MOUNT anyway. 
+!
+LOCAL
+    ADL		: REF BLOCK [,BYTE],		! allocated device list
+    LOC_ADL	: REF BLOCK [,BYTE],		! local copy of ADL
+    ADB		: REF BLOCK [,BYTE],		! current alloc dev block
+    ADL_LINK,					! addr of link from previous ADL
+    UCB		: REF BLOCK [,BYTE],		! addr of actual UCB
+    DEVICE_NAME	: BLOCK [8,BYTE]		! descriptor of device name
+    		  PRESET ( [DSC$W_LENGTH] = 0,
+    			   [DSC$B_DTYPE]  = 0,
+    			   [DSC$B_CLASS]  = 0),
+    STATUS	: LONG;
+
+LABEL
+    ADB_LIST;					! block defines linked ADBs
+!
+! Lock the chain so we can get the ADL
+!
+RELOCK_CHAIN ( .LKSB );
+!
+! Make a copy of this ADL and all extensions thereto, and
+! mark all the ADBs in the list "purged" while we're about
+! it. They will be reused if and when we manage to allocate
+! some of these devices.
+!
+UCB = .LOC_UCB [UCB$L_LINK];
+ADL = .UCB [UCB$L_JNL_ADL];
+ADL_LINK = LOC_UCB [UCB$L_JNL_ADL];
+WHILE 1 DO
+    BEGIN
+    !
+    ! Process single ADL...copy the whole thing into a
+    ! buffer and point to it from our copy of the UCB.
+    !
+    STATUS = EXE$ALONONPAGED ( .ADL [ADL$W_SIZE]; LOC_ADL );
+    CH$MOVE ( .ADL [ADL$W_SIZE], .ADL, .LOC_ADL );
+    !
+    ! If first ADL, set up pointer from the UCB.
+    ! If multiple ADLs, set up link in the duplicate copy.
+    !
+    .ADL_LINK = .LOC_ADL;
+    !
+    ! Mark all ADBs for this ADL available.
+    !
+    ADB = .ADL + .ADL [ADL$W_FSTADB];
+    INCR COUNT FROM 1 TO .ADL [ADL$W_ADBCNT]
+    DO
+	BEGIN
+	ADB [ADB$V_PURGED] = 1;
+	ADB = .ADB + ADB$K_LENGTH;
+	END;
+    !
+    ! Next ADL (if any)...
+    !
+    IF (ADL = .ADL [ADL$L_LINK]) EQL 0
+    THEN
+	!
+	! If no extension, we're done
+	!
+	EXITLOOP
+    ELSE
+	!
+	! Repeat the process with the next ADL. Keep track
+	! of where the forward link needs to go.
+	!
+	ADL_LINK = LOC_ADL [ADL$L_LINK];
+    END;				! WHILE 1 DO
+!
+! At this point we have made a copy of each ADL for this control journal, and
+! linked them to our copy of that UCB. We have also marked all the ADBs for
+! this control journal as unused (purged) so they can be reused. We can release
+! the UCB chain. Locking from here forward will be based on normal allocate
+! and mount protocols. 
+!
+UCB [UCB$V_JNL_UNMAST] = 0;
+FREE_CHAIN ( .LKSB );
+!
+! Walk through our copies of the ADLs and reallocate/remount those devices
+! listed.
+!
+LOC_ADL = .LOC_UCB [UCB$L_JNL_ADL];
+WHILE 1 DO
+    BEGIN
+    !
+    ! Process one ADL.
+    !
+    ADB = .LOC_ADL + .LOC_ADL [ADL$W_FSTADB];
+    INCR COUNT FROM 1 TO .LOC_ADL [ADL$W_ADBCNT]
+    DO 
+	BEGIN
+	!
+	! Process one ADB.
+	!
+	LOCAL
+	    ADB_STATUS		: LONG,		! "got whole vol set" or nay
+	    FIRST_ADB		: LONG;		! first ADB of vol set
+
+	FIRST_ADB = .ADB;
+	ADB_STATUS = 1;				! assume success
+	IF (.ADB [ADB$V_MOUNTED]) AND (NOT .ADB [ADB$V_PURGED])
+	THEN
+
+ADB_LIST:
+
+	    BEGIN
+	    UNTIL .ADB EQL 0
+	    DO
+		BEGIN
+		!
+		! This ADB is active. Allocate the device. If linked with
+		! other ADBs, allocate them as well.
+		!
+		DEVICE_NAME [DSC$W_LENGTH] = .ADB [ADB$B_NAMELEN];
+		DEVICE_NAME [DSC$A_POINTER] = ADB [ADB$B_DEVNAM];
+		STATUS = CJF$ALLJDR ( DEVICE_NAME );
+		IF NOT .STATUS THEN LEAVE ADB_LIST WITH ADB_STATUS = 0;
+		ADB [ADB$V_PURGED] = 1;
+		!
+		! Get next ADB in this volume set, if any.
+		!
+		ADB = .ADB [ADB$L_LINK];
+		END;
+	    END;			! ADB_LIST block
+	!
+	! Done walking one list of linked ADBs. See if we were successful
+	! with all devices therein.
+	!
+	ADB = .FIRST_ADB;
+	IF NOT .ADB_STATUS
+	THEN
+	    !
+	    ! We couldn't allocate all devices in this ADB list. We should
+	    ! deallocate those which were allocated, so someone else has a
+	    ! chance. Those which were allocated successfully will have
+	    ! the PURGED bit set; we deallocate these, and set the PURGED bit
+	    ! in the rest.
+	    !
+	    UNTIL .ADB EQL 0
+	    DO
+		BEGIN
+		IF .ADB [ADB$V_PURGED]
+		THEN
+		    BEGIN
+		    DEVICE_NAME [DSC$W_LENGTH] = .ADB [ADB$B_NAMELEN];
+		    DEVICE_NAME [DSC$A_POINTER] = ADB [ADB$B_DEVNAM];
+		    CJF$DEALJDR ( DEVICE_NAME );
+		    END
+		ELSE
+		    ADB [ADB$V_PURGED] = 1;
+		ADB = .ADB [ADB$L_LINK];
+		END;
+	!
+	! Next ADB.
+	!
+	ADB = .FIRST_ADB + ADB$K_LENGTH;
+	END;					! Process ADB
+    !
+    ! Proceed with the next ADL, if any.
+    !
+    IF (LOC_ADL = .LOC_ADL [ADL$L_LINK]) EQL 0 THEN EXITLOOP;
+    END;					! Process ADL
+!
+! Done handling this control journal. Deallocate the memory we allocated for
+! our copies of the ADLs. 
+!
+LOC_ADL = .LOC_UCB [UCB$L_JNL_ADL];
+UNTIL .LOC_ADL EQL 0
+DO
+    BEGIN
+    ADL = .LOC_ADL [ADL$L_LINK];
+    EXE$DEANONPAGED ( .LOC_ADL );
+    LOC_ADL = .ADL;
+    END;
+!
+! Delete the control journal itself.
+!
+RELOCK_CHAIN ( .LKSB );
+UCB = .LOC_UCB [UCB$L_LINK];
+DELETE_IODB ( .UCB );
+IF .UCB [UCB$W_REFC] NEQ 0
+THEN
+    UCB [UCB$V_DELETEUCB] = 1
+ELSE
+    DELETE_UCB ( .UCB );
+FREE_CHAIN ( .LKSB );
+!
+! That's all
+!
+RETURN 1;
+END;			! Process control journal
+
+%SBTTL	'TEST_DEVICE - test accessibility of journal file device'
+!++
+! TEST_DEVICE
+!
+! FUNCTIONAL DESCRIPTION:
+!	Determine if the device on which this journal's journal file
+!	exists can be accessed from this node. We do this be testing to
+!	see if we can do a GETDVI on the device.
+!	THIS ROUTINE RUNS IN KERNEL MODE.
+! CALLING SEQUENCE:
+!	STATUS = TEST_DEVICE ( LOCAL_UCB );
+! FORMAL PARAMETERS:
+!	LOCAL_UCB	= copy of the journal's actual UCB.
+! IMPLICIT PARAMETERS:
+!	I/O data base
+!	JNLRM array pointed by the UCB.
+! COMPLETION CODES:
+!	SS$_NORMAL if the device is accessible
+!--
+ROUTINE TEST_DEVICE ( LOC_UCB : REF BLOCK [,BYTE] ) =
+BEGIN
+FIELD ITEM_LIST =
+    SET
+    ITMLST$W_BUFLEN	= [0,0,16,0],		! item list buffer length
+    ITMLST$W_CODE	= [2,0,16,0],		! item list item code
+    ITMLST$A_POINTER	= [4,0,32,0],		! item list buffer address
+    ITMLST$A_RETLEN	= [8,0,32,0],		! item list return length address
+    ITMLST$L_TERMZERO	= [12,0,32,0]		! terminating zero for item list
+    TES;
+LOCAL
+    DEVICE_NAME		: BLOCK [8,BYTE]	! descriptor of device name
+    			  PRESET ( [DSC$W_LENGTH] = 0,
+    				   [DSC$B_DTYPE]  = 0,
+    				   [DSC$B_CLASS]  = 0),
+    DEVICE_STRING	: BLOCK [16,BYTE],	! actual device name string
+    CLUSTER_DEVNAM_STR	: BLOCK [16,BYTE],	! array to receive name from GETDVI
+    CLUSTER_DEVNAM	: BLOCK [8,BYTE]	! descriptor of returned name
+    			  PRESET ( [DSC$W_LENGTH] = 0,
+    				   [DSC$B_DTYPE]  = 0,
+    				   [DSC$B_CLASS]  = 0),
+    ITMLST		: BLOCK [4*4,BYTE]	! item list to receive cluster devnam
+		   	  FIELD ( ITEM_LIST )
+    			  PRESET ( [ITMLST$W_BUFLEN]   = 16,
+				   [ITMLST$W_CODE]     = DVI$_FULLDEVNAM,
+				   [ITMLST$L_TERMZERO] = 0 ),
+    JNLRM		: REF BLOCK [,BYTE],	! addr of remaster block
+    UCB			: REF BLOCK [,BYTE],	! actual UCB for this journal
+    LOCAL_IOSB		: VECTOR [2,LONG],	! local i/o status block
+    STATUS;
+
+CLUSTER_DEVNAM [DSC$A_POINTER] = CLUSTER_DEVNAM_STR;
+ITMLST [ITMLST$A_POINTER] = CLUSTER_DEVNAM_STR;
+ITMLST [ITMLST$A_RETLEN] = CLUSTER_DEVNAM;
+!
+! First, we pick up a copy of the remaster block.
+!
+UCB = .LOC_UCB [UCB$L_LINK];
+JNLRM = .UCB [UCB$L_JNL_RMBLK];
+!
+! Now create a descriptor to the device name.
+!
+SELECTONE 1 OF
+    SET
+    [.JNLRM [JNLRM$V_DSKJNL] ]:
+	BEGIN
+	!
+	! We have a disk journal.
+	!
+	LOCAL
+	    JNLRM_DEVICE	: REF BLOCK [,BYTE];
+	JNLRM_DEVICE = .JNLRM + JNLRM$K_DSKJNLLST;
+	DEVICE_NAME [DSC$W_LENGTH] = .JNLRM_DEVICE [JNLRM$W_DEVNAMLEN];	
+	DEVICE_NAME [DSC$A_POINTER] = .JNLRM + .JNLRM_DEVICE [JNLRM$W_DEVNAMOFF];	
+	END;
+    [.JNLRM [JNLRM$V_TAPJNL] ]:
+	BEGIN
+	!
+	! We have a tape journal.
+	!
+	MUMBLE();
+	END;
+    TES;
+!
+! Get the information about the device.
+!
+STATUS = $GETDVIW( DEVNAM = DEVICE_NAME,
+    		   ITMLST = ITMLST,
+		   IOSB	  = LOCAL_IOSB,
+    		   EFN	  = .LOCAL_EFN );
+STATUS = .LOCAL_IOSB;
+!
+! Do we need to do anything with the name?
+!
+RETURN .STATUS;
+END;
+
+%SBTTL	'RELOCK_CHAIN - convert chain lock to exclusive'
+!++
+! RELOCK_CHAIN
+!
+! FUNCTIONAL DESCRIPTION:
+!	Common routine to convert the lock on the UCB chain indicated
+!	by the accompanying lock status block from Null to Exclusive mode.
+!		*** NOTE *** 
+!	THIS ROUTINE RUNS IN KERNEL MODE.
+! CALLING SEQUENCE:
+!	RELOCK_CHAIN ( LKSB );
+! FORMAL PARAMETERS:
+!	LKSB	= address of lock status block for this UCB chain.
+! COMPLETION CODES:
+!
+!--
+ROUTINE RELOCK_CHAIN ( LKSB: VECTOR [2,LONG] ): NOVALUE =
+BEGIN
+$ENQW ( LKMODE = LCK$K_EXMODE,		! exclusive lock
+	LKSB   = .LKSB,			! specify which lock
+	FLAGS  = LCK$M_CONVERT,		! lock conversion
+	EFN    = .LOCAL_EFN );
+RETURN;
+END;
+
+%SBTTL	'FREE_CHAIN'
+!++
+! FREE_CHAIN
+!
+! FUNCTIONAL DESCRIPTION:
+!	Converts lock indicated by LKSB to null.
+!		*** NOTE ***
+!	THIS ROUTINE RUNS IN KERNEL MODE.
+! CALLING SEQUENCE:
+!	FREE_CHAIN ( LKSB );
+! FORMAL PARAMETERS:
+!	LKSB	= address of lock status block for the indicated lock.
+! COMPLETION CODES:
+!
+!--
+ROUTINE FREE_CHAIN ( LKSB: VECTOR [2,LONG] ): NOVALUE =
+BEGIN
+IF NOT $ENQ ( LKMODE	= LCK$K_NLMODE,
+	      LKSB	= .LKSB,
+	      FLAGS	= LCK$M_NOQUEUE OR LCK$M_CONVERT )
+THEN
+    MUMBLE ();
+RETURN;
+END;
+
+%SBTTL	'RESTART_BASE - reschedule suspended base thread'
+!++
+! RESTART_BASE
+!
+! FUNCTIONAL DESCRIPTION:
+!	If this is the Nth pass through this routine for the
+!	indicated mutex, reschedule the indicated base context.
+! CALLING SEQUENCE:
+!	RESTART_BASE ( COUNTER, CONTEXT, N )
+! FORMAL PARAMETERS:
+!	COUNTER = address of allocated byte to count passes
+!	CONTEXT	= address of context block to reschedule if this is Nth pass
+!	N	= number of passes before rescheduling CONTEXT
+! COMPLETION CODES:
+!
+!--
+ROUTINE RESTART_BASE ( COUNTER, CONTEXT, N ): NOVALUE =
+BEGIN
+LOCAL
+    OWN_CONTEXT;
+BUILTIN
+    INSQUE,REMQUE;
+EXTERNAL
+    CSP$GQ_RESUME;
+
+.COUNTER = ..COUNTER + 1;
+IF ..COUNTER EQL N
+THEN
+    BEGIN
+    REMQUE ( ..CONTEXT, OWN_CONTEXT );
+    INSQUE ( .OWN_CONTEXT, .(CSP$GQ_RESUME+4) );
+    END;
+RETURN
+END;
+
+%SBTTL	'CSP$$END_CONTEXT '
+!++
+! CSP$$END_CONTEXT 
+!
+! FUNCTIONAL DESCRIPTION:
+!	Terminate current thread, return to scheduler.
+! CALLING SEQUENCE:
+!	CSP$$END_CONTEXT
+! FORMAL PARAMETERS:
+!	None
+! IMPLICIT PARAMETERS:
+!	CSP$GL_CURCTX is address of current context block
+!	CSP$GL_BASE_FP is address of scheduler's call frame
+! COMPLETION CODES:
+!
+!--
+GLOBAL ROUTINE CSP$$END_CONTEXT =
+BEGIN
+LOCAL
+    CONTEXT;					! address of own context
+BUILTIN
+    FP;
+
+CONTEXT = .CSP$GL_CURCTX;			! get own context block
+CSP$GL_CURCTX = 0;				! no current context anymore
+LIB$FREE_VM ( UPLIT(CLX$K_LENGTH), CONTEXT );	! free the data structure
+FP = .CSP$GL_BASE_FP;				! fake the stack...
+RETURN SS$_NORMAL;				! ...and return to the scheduler's caller
+
+END;
+
+
+%SBTTL	'CALL_RCP'
+!++
+! CALL_RCP
+!
+! FUNCTIONAL DESCRIPTION:
+!	Call the RCP on behalf of one newly remastered Recovery Unit journal.
+!	The RCP will reacquire locks for any Recovery Units on this journal for
+!	nodes no longer in the VAXcluster.
+!	THIS ROUTINE RUNS IN KERNEL MODE.
+! CALLING SEQUENCE:
+!	CALL_RCP ( .UCB );
+! FORMAL PARAMETERS:
+!	UCB	= address of local copy of UCB for the Recovery Unit journal
+! COMPLETION CODES:
+!
+!--
+ROUTINE CALL_RCP ( UCB: REF BLOCK [,BYTE] ): NOVALUE =
+BEGIN
+LITERAL
+    DEVNAM_LEN	= 16;					! length of devnam str
+LOCAL
+    RODB	: BLOCK [RODB$K_LENGTH+4,BYTE],		! Object descriptor
+    RODBA	: BLOCK [RODBA$K_LENGTH+4,BYTE],	! Object attributes
+    DEVNAM_STR	: BLOCK [DEVNAM_LEN,BYTE],		! Device name string
+    DEVNAM	: BLOCK [8,BYTE]			! Device name desc
+		  PRESET ( [DSC$W_LENGTH]  = DEVNAM_LEN,
+			   [DSC$B_DTYPE]   = 0,
+			   [DSC$B_CLASS]   = 0,
+    			   [DSC$A_POINTER] = DEVNAM_STR ),
+    JNLNAM	: BLOCK [8,BYTE]			! Journal name desc
+		  PRESET ( [DSC$W_LENGTH] = 0,
+			   [DSC$B_DTYPE]  = 0,
+			   [DSC$B_CLASS]  = 0),
+    LOCAL_IOSB	: VECTOR [2,LONG],			! local I/O status block
+    STATUS	: LONG;
+!
+! Initialize fixed fields.
+!
+RODB [RODB$B_TYPE] = RODB$K_RUJNL;
+RODB [RODB$B_COUNT] = 1;
+RODB [RODB$W_SIZE] = 0;
+RODB [RODB$A_POINTER] = RODBA;
+RODB + RODB$K_LENGTH = 0;
+RODBA [RODBA$B_TYPE] = RODBA$K_RUJDEVNAM;
+RODBA + RODBA$K_LENGTH = 0;
+!
+! Create a descriptor of the journal's home device name. For this, we use
+! a common routine from CJF.
+!
+JNLNAM [DSC$W_LENGTH] = .UCB [UCB$T_JNL_NAM];
+JNLNAM [DSC$A_POINTER] = UCB [UCB$B_JNL_NAM];
+STATUS = CREATE_RUDEV ( JNLNAM, DEVNAM );
+IF NOT .STATUS THEN RETURN .STATUS;
+!
+! Fill in the device name in the RODBA
+!
+RODBA [RODBA$W_SIZE] = .DEVNAM [DSC$W_LENGTH];
+RODBA [RODBA$A_POINTER] = .DEVNAM [DSC$A_POINTER];
+!
+! Call the RCP to process all failed Recovery Units from this RU journal.
+!
+STATUS = CJF$RECOVERW( CJF$M_FAILOVER,		! func
+    		       RODB,			! object
+		       0,			! fltlst
+		       0,			! acmode
+		       .LOCAL_EFN,		! efn
+		       LOCAL_IOSB );		! IOSB
+
+IF .STATUS THEN STATUS = .LOCAL_IOSB;
+RETURN .STATUS;
+END;
+
+ROUTINE MUMBLE = RETURN 1;
+ROUTINE RESUME_FAILOVER = RETURN 1;
+
+END
+ELUDOM

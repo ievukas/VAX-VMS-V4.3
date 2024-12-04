@@ -1,0 +1,1963 @@
+MODULE	exch$cmd				%TITLE 'Command parsing utility routines'
+		(
+		IDENT = 'V04-000',
+		ADDRESSING_MODE (EXTERNAL=LONG_RELATIVE, NONEXTERNAL=WORD_RELATIVE)
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:	EXCHANGE - Foreign volume interchange facility
+!
+! ABSTRACT:	Command processing utility routines
+!
+! ENVIRONMENT:	VAX/VMS User mode
+!
+! AUTHOR:	CW Hobbs		CREATION DATE: 16-July-1982
+!
+! MODIFIED BY:
+!
+!	V03-002	CWH3002		CW Hobbs		4-Mar-1984
+!		Add EXCH$CMD_PARSE_NULL_FILE routine, and call it after $PARSE in
+!		EXCH$CMD_PARSE_FILESPEC to make sure that RMS releases all file
+!		context.  Also, change EXCH$CMD_RELATED_FILE_PARSE to us NAM$V_SYNCHK
+!		syntax check only option so that null file parse will not be needed.
+!		During several operations EXCHANGE was leaving extra channels around
+!		because channels were being saved by the $PARSE calls.  Fix to give
+!		BADPAD error when bogus radix specifier is given.
+!
+!
+!--
+
+! Include files:
+!
+MACRO $module_name_string = 'exch$cmd' %;	! The require file needs to know our module name
+REQUIRE 'SRC$:EXCREQ'
+    ;
+
+%SBTTL 'Module table of contents'
+
+! Module table of contents:
+!
+FORWARD ROUTINE
+    exch$cmd_cli_get_integer,			! Get integer value from CLI
+	 cmd_convert_uic : NOVALUE,		! Convert UIC format directory to binary pieces
+    exch$cmd_fetch_rec_format,			! Get /RECORD_FORMAT qualifier
+    exch$cmd_fetch_recfmt_implied : NOVALUE,	! Assume record format from file type
+    exch$cmd_fetch_vol_format,			! Get /VOLUME_FORMAT qualifier external entry
+	 cmd_fetch_volfmt_explicit,		! Get /VOLUME_FORMAT qualifier when explicit
+	 cmd_fetch_volfmt_implied,		! Assume volume format from device characteristics
+    exch$cmd_namb_clone,			! Make a duplicate of a filled in namb
+	 cmd_namb_fab_copy : NOVALUE,		! Copy from RMS control block to NAMB block
+    exch$cmd_match_filename,			! Compare actual and target filenames
+    exch$cmd_parse_filespec,			! Fill out a name block for a file parameter
+    exch$cmd_parse_null_file : NOVALUE,		! Parse the null string to release RMS channel
+    exch$cmd_related_file_fixup	: NOVALUE,	! Fixup the name block for an RT-11 magtape file name
+    exch$cmd_related_file_parse,		! Fill out a name block for a file parameter
+    exch$cmd_unwind_cli_syntax			! Look for MSG$_SYNTAX signal
+    ;
+
+! EXCHANGE facility routines
+!
+EXTERNAL ROUTINE
+    exch$main_exit,				! Exit routine for end-of-file
+    exch$util_file_error,			! Signal RMS error
+    exch$util_find_mounted_volb,		! Checked for mounted volume.
+    exch$util_namb_allocate,			! Allocate a name block
+    exch$util_namb_release : NOVALUE,		! Release a name block
+    exch$util_up_case : NOVALUE jsb_r1r2r3	! Convert string to uppercase
+    ;
+
+! Equated symbols:
+!
+!LITERAL
+!    ;
+
+! Bound declarations:
+!
+BIND
+    ascid_recfmt_pad	= %ASCID 'RECORD_FORMAT.PAD'
+    ;
+
+GLOBAL ROUTINE exch$cmd_cli_get_integer (qual_desc : $ref_bblock, ret_value, negflg) = %SBTTL 'exch$cmd_cli_get_integer'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine fetches an integer value for the qualifier described by the input parameter.  The value is
+!	converted to an integer and returned as the second parameter.
+!
+! INPUTS:
+!
+!	qual_desc  -  the address of a string descriptor for the qualifier name
+!	negflg	   -  (optional) negative values OK if true, negatives not ok if false or missing
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	ret_value  -  the address of a longword to receive the converted value.  Value is zero if not present or
+!		      if an error occurs
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true if able to convert and return value, -1 if not present, error code if error in conversion or value
+!
+! SIDE EFFECTS:
+!
+!	errors will be signalled
+!--
+
+LOCAL
+    value,
+    status,
+    tmp_desc	: $desc_block			! String to get the ascii text
+    ;
+
+BUILTIN
+    ACTUALCOUNT;				! Count of input parameters
+
+
+! Start by setting our return value to zero
+!
+.ret_value = 0;
+
+! Return -1 if the qualifier is not present
+!
+IF NOT cli$present (.qual_desc)
+THEN
+    RETURN -1;
+
+! Get the ascii string for the value
+!
+$dyn_str_desc_init (tmp_desc);			! Set up the desc to the null dynamic string
+IF NOT (status = cli$get_value (.qual_desc, tmp_desc))
+THEN
+    $exch_signal_return ($warning_stat (status));	! Tell about the error
+
+! Convert the text string to a 32-bit integer
+!
+IF NOT (status = ots$cvt_ti_l (tmp_desc, value))
+THEN
+    $exch_signal_return (exch$_badvalue, 1, tmp_desc, .status);
+
+! We can't have negative values unless negflg is present and true
+!
+IF .value LSS 0
+THEN
+    BEGIN
+
+    IF ACTUALCOUNT() LEQ 2			! Negflg wasn't specified
+    THEN
+	$exch_signal_return (exch$_badvalue, 1, tmp_desc);
+
+    IF NOT .negflg				! Negflg is false
+    THEN
+	$exch_signal_return (exch$_badvalue, 1, tmp_desc);
+
+    END;
+
+IF NOT (status = str$free1_dx (tmp_desc))	! Release the dynamic string, should never fail
+THEN
+    $exch_signal_stop (.status);
+
+.ret_value = .value;				! Pass the value back to the calling routine.
+
+RETURN true;
+END;
+
+GLOBAL ROUTINE cmd_convert_uic (fabb : $ref_bblock, namb : $ref_bblock) : NOVALUE =	%SBTTL 'cmd_convert_uic (fabb, namb)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine converts the ASCII uic format directory to binary values, which are then stored in the
+!	namb.
+!
+! INPUTS:
+!
+!	fabb - the address of an RMS FAB, assumed to have a nam block
+!	namb - address of the created name block
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	True if success, warning status code if unable to parse the parameter
+!
+! SIDE EFFECTS:
+!
+!	$NAMB block is filled with file name information
+!--
+
+$dbgtrc_prefix ('cmd_convert_uic> ');
+
+LOCAL
+    comma,
+    len,
+    buf : REF VECTOR [ ,BYTE],
+    glen,
+    gbuf : REF VECTOR [ ,BYTE],
+    mlen,
+    mbuf : REF VECTOR [ ,BYTE],
+    value,
+    tmp_desc	: $desc_block			! String to get the ascii text
+    ;
+
+BIND
+    nam = .fabb [fab$l_nam] 	: $bblock	! Address of the name block
+    ;
+
+$debug_print_lit ('entry');
+
+! Copy the directory string length and address into locals
+!
+len = .nam [nam$b_dir];
+buf = .nam [nam$l_dir];
+
+! We assume that the directory is of the format <grp,mem> or [grp,mem], test these assumptions
+!
+$logic_check (2, (.len GEQU 5), 275);
+$logic_check (2, ((.buf [0] EQL %C '<') OR (.buf [0] EQL %C '[')), 276);
+$logic_check (2, ((.buf [.len-1] EQL %C '>') OR (.buf [.len-1] EQL %C ']')), 277);
+
+! Find the comma
+!
+comma = CH$FIND_CH (.len, .buf, %C ',');
+$logic_check (2, (.comma NEQ 0), 278);
+
+! Derive the address and length of the group and member strings
+!
+gbuf = .buf + 1;				! Skip past the open bracket
+glen = .comma - .gbuf;				! Length of group is easy
+mbuf = .comma + 1;				! Member starts one past the comma
+mlen = (.len + .buf - 1) - .mbuf;		! Member length is a little harder.
+
+! RMS doesn't set the directory bits if the device is non-directory, so we must do it too.
+!
+IF ((.mlen EQL 1) AND (.mbuf [0] EQL %C '*')) THEN namb [namb$v_wild_member] = true;
+IF ((.glen EQL 1) AND (.gbuf [0] EQL %C '*')) THEN namb [namb$v_wild_group]  = true;
+
+! Convert the text strings to a 32-bit integers, then store as bytes
+!
+IF NOT .namb [namb$v_wild_member]
+THEN
+    BEGIN
+    LOCAL
+	status;
+    $stat_str_desc_init (tmp_desc, .mlen, .mbuf);
+    IF NOT (status = ots$cvt_to_l (tmp_desc, value))
+    THEN
+	$exch_signal_stop (.status);
+    namb [namb$b_uic_member] = .value;
+    END;
+IF NOT .namb [namb$v_wild_group]
+THEN
+    BEGIN
+    LOCAL
+	status;
+    $stat_str_desc_init (tmp_desc, .glen, .gbuf);
+    IF NOT (status = ots$cvt_to_l (tmp_desc, value))
+    THEN
+	$exch_signal_stop (.status);
+    namb [namb$b_uic_group] = .value;
+    END;
+
+$debug_print_fao ('Input "!AF":  group "!AF", member "!AF"', .len, .buf, .glen, .gbuf, .mlen, .mbuf);
+$debug_print_fao ('octal grp !OB mem !OB, wild_grp !UL  wild_mem !UL', 
+			.namb [namb$b_uic_group], .namb [namb$b_uic_member],
+			.namb [namb$v_wild_group], .namb [namb$v_wild_member]);
+
+RETURN;
+END;
+
+GLOBAL ROUTINE exch$cmd_fetch_rec_format (namb : $ref_bblock) =	%SBTTL 'exch$cmd_fetch_rec_format (namb)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine retrieves the /RECORD_FORMAT qualifier for the current file (i.e. the last CLI$GET_VALUE
+!	for a filename establishes current).
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	command language interpreter callbacks will retrieve command line information
+!
+! OUTPUTS:
+!
+!	namb      - record format status will be inserted into the namb
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	True if success, bad status code if any error (not present is success)
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('cmd_fetch_rec_format> ');
+
+REGISTER
+    rec_format,
+    status
+    ;
+
+! We should get a MSG$_SYNTAX error if /RECORD_FORMAT is not allowed on the current parameter.  Simulate a return
+! by unwinding if we see it.
+!
+ENABLE
+    exch$cmd_unwind_cli_syntax;
+
+$block_check (2, .namb, namb, 400);		! It would be nice to know now if the input is something else
+
+namb [namb$b_rec_format] = filb$k_rfmt_invalid;	! Assume that there is no /REC
+namb [namb$b_car_control] = filb$k_cctl_cr;	! Also assume normal carriage-return carriage control
+
+! Nothing to do if the qualifier wasn't specified
+!
+IF cli$present (%ASCID 'RECORD_FORMAT')
+THEN
+    BEGIN
+
+    namb [namb$v_rfmt_explicit] = true;		! Remember that we were given a value explicitly
+    rec_format = filb$k_rfmt_invalid;		! Init to the impossible value (0)
+
+    ! Convert the keyword presence to the symbolic representation of the qualifier keyword for real record formats
+    !
+    IF cli$present (%ASCID 'RECORD_FORMAT.BINARY')
+    THEN
+	rec_format = filb$k_rfmt_binary;
+
+    IF cli$present (%ASCID 'RECORD_FORMAT.FIXED')
+    THEN
+	BEGIN
+
+	rec_format = filb$k_rfmt_fixed;		! Save the format code
+
+	! Status will be -1 (suc) if not present, error if present but bad value
+	!
+	IF NOT (status = exch$cmd_cli_get_integer (%ASCID 'RECORD_FORMAT.FIXED', namb [namb$l_fixed_len]))
+	THEN
+	    RETURN .status;
+
+	! If the record is not specified, default the record length to 512
+	!
+	IF .namb [namb$l_fixed_len] EQL 0
+	THEN
+	    namb [namb$l_fixed_len] = 512;
+
+	! If the record is too long, scream and shout
+	!
+	IF .namb [namb$l_fixed_len] GTRU filb$s_record_buffer
+	THEN
+	    $exch_signal_return (exch$_notvallen, 1, .namb [namb$l_fixed_len]);
+
+	END;
+
+
+    IF cli$present (%ASCID 'RECORD_FORMAT.STREAM')
+    THEN
+	rec_format = filb$k_rfmt_stream;		! Set the primary format
+
+    ! Get the pad character
+    !
+    IF cli$present (ascid_recfmt_pad)
+    THEN
+	BEGIN
+	LOCAL
+	    tmp_desc : $desc_block;
+	$dyn_str_desc_init (tmp_desc);
+	IF NOT (status = cli$get_value (ascid_recfmt_pad, tmp_desc))
+	THEN
+	    RETURN .status;
+	IF .tmp_desc [dsc$w_length] EQL 1
+	THEN
+	    namb [namb$b_pad_char] = CH$RCHAR (.tmp_desc [dsc$a_pointer])
+	ELSE
+	    BEGIN
+	    LOCAL
+		char,
+		value;
+	    IF .tmp_desc [dsc$w_length] LSS 3
+	    THEN
+		RETURN exch$_badpad;
+	    tmp_desc [dsc$w_length] = .tmp_desc [dsc$w_length] - 2;
+	    char = CH$RCHAR_A (tmp_desc [dsc$a_pointer]);
+	    IF .char NEQ %C'%'
+	    THEN
+		RETURN exch$_badpad;
+	    char = CH$RCHAR_A (tmp_desc [dsc$a_pointer]);
+	    SELECTONE .char OF
+	    SET
+		[%C'D'] :	status = ots$cvt_ti_l (tmp_desc, value);
+		[%C'O'] :	status = ots$cvt_to_l (tmp_desc, value);
+		[%C'X'] :	status = ots$cvt_tz_l (tmp_desc, value);
+		[OTHERWISE] :	RETURN exch$_badpad;
+	    TES;
+	    IF NOT .status
+	    THEN
+		RETURN .status;
+	    namb [namb$b_pad_char] = .value;
+	    END;
+	END;
+
+    ! If we have seen a valid record format, then store the final info in the namb
+    !
+    IF .rec_format NEQ filb$k_rfmt_invalid
+    THEN
+	namb [namb$b_rec_format] = .rec_format;	! store the final value
+
+    END;
+
+! Get the transfer mode qualifier
+!
+IF cli$present (%ASCID 'TRANSFER_MODE.AUTOMATIC')	! Usual case
+THEN
+    namb [namb$b_transfer_mode] = filb$k_xfrm_automatic
+ELSE IF cli$present (%ASCID 'TRANSFER_MODE.BLOCK')
+THEN
+    namb [namb$b_transfer_mode] = filb$k_xfrm_block
+ELSE IF cli$present (%ASCID 'TRANSFER_MODE.RECORD')
+THEN
+    namb [namb$b_transfer_mode] = filb$k_xfrm_record;
+
+! Look for the carriage control, again we will unwind if it isn't allowed
+!
+(BEGIN LOCAL temp;
+temp = cli$present (%ASCID 'CARRIAGE_CONTROL');
+namb [namb$v_cctl_explicit] = ((.temp EQL cli$_locpres) OR (.temp EQL cli$_locneg));
+$debug_print_fao ('temp !XL, cctl_expl !UL', .temp, .namb [namb$v_cctl_explicit]);
+
+! IF cli$present (%ASCID 'CARRIAGE_CONTROL.CARRIAGE_RETURN')	! This is the default, as set at entry above
+! THEN
+!    namb [namb$b_car_control] = filb$k_cctl_cr;
+
+IF cli$present (%ASCID 'CARRIAGE_CONTROL.FORTRAN')
+THEN
+    namb [namb$b_car_control] = filb$k_cctl_fortran;
+
+IF cli$present (%ASCID 'CARRIAGE_CONTROL.NONE')
+ OR
+   (NOT .temp)
+THEN
+    namb [namb$b_car_control] = filb$k_cctl_none;
+END);
+
+RETURN true;
+END;
+
+GLOBAL ROUTINE exch$cmd_fetch_recfmt_implied (filb : $ref_bblock, 	%SBTTL 'exch$cmd_fetch_recfmt_implied (filb, type)'
+						type : $ref_bvector) : NOVALUE =
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine sets the correct /RECORD_FORMAT qualifier for the current file based on the record format in
+!	the namb and the file type string.
+!
+! INPUTS:
+!
+!	filb	- pointer to file structure
+!	type	- address of the three letter file type string
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	filb$b_rec_format is set, along with other associated bits
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('cmd_fetch_recfmt_implied> ');
+
+REGISTER
+    rec_format
+    ;
+
+BIND
+    namb = filb [filb$a_assoc_namb] : $ref_bblock,
+    volb = filb [filb$a_assoc_volb] : $ref_bblock
+    ;
+
+$debug_print_lit ('entry');
+$block_check (2, .filb, filb, 401);
+$block_check (2, .namb, namb, 402);
+$block_check_if_nonzero (2, .volb, volb, 403);
+
+! Copy everything from the namb to the filb
+!
+filb [filb$v_rfmt_explicit]	= .namb [namb$v_rfmt_explicit];
+filb [filb$v_cctl_explicit]	= .namb [namb$v_cctl_explicit];
+
+filb [filb$b_car_control]	= .namb [namb$b_car_control];
+filb [filb$b_rec_format]	= .namb [namb$b_rec_format];
+filb [filb$b_transfer_mode]	= .namb [namb$b_transfer_mode];
+filb [filb$l_fixed_len]		= .namb [namb$l_fixed_len];
+filb [filb$b_pad_char]		= .namb [namb$b_pad_char];
+
+! If the record format is valid, then we are done
+!
+IF .filb [filb$b_rec_format] NEQ filb$k_rfmt_invalid
+THEN
+    RETURN;
+
+! Assume a record format based on the volume format and file type string
+!
+!
+CASE .namb [namb$b_vol_format] FROM volb$k_vfmt_lobound TO volb$k_vfmt_hibound OF
+SET
+    [volb$k_vfmt_dos11, volb$k_vfmt_rt11] :	!\ , volb$k_vfmt_rtmt] :
+	BEGIN
+	SELECTONE true
+	OF
+	   SET
+
+	       [CH$EQL (3, UPLIT BYTE ('OBJ'), 3, type [0])  OR
+		CH$EQL (3, UPLIT BYTE ('STB'), 3, type [0])  OR
+		CH$EQL (3, UPLIT BYTE ('BIN'), 3, type [0])  OR
+		CH$EQL (3, UPLIT BYTE ('LDA'), 3, type [0]) ] :
+
+		    filb [filb$b_rec_format] = filb$k_rfmt_binary;
+
+	       [CH$EQL (3, UPLIT BYTE ('EXE'), 3, type [0])  OR
+		CH$EQL (2, UPLIT BYTE ( 'LB'), 2, type [1])  OR
+		CH$EQL (3, UPLIT BYTE ('SAV'), 3, type [0])  OR
+		CH$EQL (3, UPLIT BYTE ('SML'), 3, type [0])  OR
+		CH$EQL (3, UPLIT BYTE ('SYS'), 3, type [0])  OR
+		CH$EQL (3, UPLIT BYTE ('TSK'), 3, type [0]) ] :
+
+		    BEGIN
+		    filb [filb$b_rec_format] = filb$k_rfmt_fixed;
+		    filb [filb$l_fixed_len] = 512;
+		    END;
+
+	   [OTHERWISE] :
+
+		    filb [filb$b_rec_format]  = filb$k_rfmt_stream;
+
+	   TES;
+
+	END;
+    [OUTRANGE,INRANGE]		: $logic_check (0, (false), 229);
+TES;
+
+RETURN;
+END;
+
+GLOBAL ROUTINE exch$cmd_fetch_vol_format (namb : $ref_bblock) =	%SBTTL 'exch$cmd_fetch_vol_format (namb)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine determines the /VOLUME_FORMAT for the current file (i.e. the last CLI$GET_VALUE for a filename
+!	establishes current).  Control is dispatched to one of two sub-routines depending on whether an explicit
+!	/VOLUME_FORMAT is present or whether volume format should be assumed from the device characteristics.
+!
+! INPUTS:
+!
+!	namb	- pointer to name structure
+!
+! IMPLICIT INPUTS:
+!
+!	command language interpreter callbacks will retrieve command line information
+!
+! OUTPUTS:
+!
+!	namb      - volume format status will be inserted into the namb
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	True if success, bad status code if any error (not present is success)
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('cmd_fetch_vol_format> ');
+
+! We should get a MSG$_SYNTAX error if /VOLUME_FORMAT is not allowed on the current parameter.  Simulate a return
+! by unwinding if we see it.  The return status (from this routine) will be -1 (success) if the unwind occurs.
+!
+ENABLE
+    exch$cmd_unwind_cli_syntax;
+
+$block_check (2, .namb, namb, 404);		! It would be nice to know now if the input is something else
+
+! If the qualifier is specified, then return the explicit value
+!
+IF cli$present (%ASCID 'VOLUME_FORMAT')
+THEN
+    RETURN cmd_fetch_volfmt_explicit (.namb)	! Decode and check the explicit qualifier
+ELSE
+    RETURN cmd_fetch_volfmt_implied (.namb);	! Imply volume format from the device
+
+END;
+
+GLOBAL ROUTINE cmd_fetch_volfmt_explicit (namb : $ref_bblock) =	%SBTTL 'cmd_fetch_volfmt_explicit (namb)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine retrieves the /VOLUME_FORMAT qualifier for the current file (i.e. the last CLI$GET_VALUE
+!	for a filename establishes current).
+!
+! INPUTS:
+!
+!	namb	- pointer to name structure
+!
+! IMPLICIT INPUTS:
+!
+!	command language interpreter callbacks will retrieve command line information
+!
+! OUTPUTS:
+!
+!	namb      - volume format status will be inserted into the namb
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	True if success, bad status code if any error
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('cmd_fetch_volfmt_explicit> ');
+
+REGISTER
+    vol_format
+    ;
+
+$debug_print_lit ('entry> ');
+
+namb [namb$v_vfmt_explicit] = true;		! Remember that we were given a value explicitly
+
+! Convert the keyword presence to the symbolic representation of the qualifier keyword for real volume formats
+!
+vol_format = (SELECTONE cli$_locpres OF
+	      SET
+		[cli$present (%ASCID 'VOLUME_FORMAT.DOS11')] :	    volb$k_vfmt_dos11;
+		[cli$present (%ASCID 'VOLUME_FORMAT.FILES11')] :    volb$k_vfmt_files11;
+		[cli$present (%ASCID 'VOLUME_FORMAT.RT11')] :	    BEGIN
+								    !\  IF .namb [namb$b_devclass] EQL dc$_disk
+								    !\  THEN
+								    volb$k_vfmt_rt11
+								    !\  ELSE IF .namb [namb$b_devclass] EQL dc$_tape
+								    !\  THEN
+								    !\  	vol_format = volb$k_vfmt_rtmt;
+								    END;
+		[OTHERWISE] :					    $logic_check (0, (false), 308);
+	      TES);
+
+! Now we do a cheat.  We will compare our explicit volume format with the implied value, if they are
+! different the explicit value is wrong!  A more involved test will be necessary when/if EXCHANGE
+! supports more than the current set of volume formats.
+!
+cmd_fetch_volfmt_implied (.namb);
+IF .namb [namb$b_vol_format] NEQ .vol_format
+THEN
+    RETURN exch$_invvolfmt;
+
+RETURN true;
+END;
+
+GLOBAL ROUTINE cmd_fetch_volfmt_implied (namb : $ref_bblock) =	%SBTTL 'cmd_fetch_volfmt_implied (namb)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine establishes the default /VOLUME_FORMAT qualifier for the current file based on the device
+!	type and characteristics.
+!
+! INPUTS:
+!
+!	namb	- pointer to name structure
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	namb      - volume format status will be inserted into the namb
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	True if success, bad status code if any error (not present is success)
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('cmd_fetch_volfmt_implied> ');
+
+REGISTER
+    vol_format
+    ;
+
+BIND
+    dev = namb [namb$l_fabdev] : $bblock	! Device characteristics
+    ;
+
+$trace_print_lit ('entry');
+
+vol_format = volb$k_vfmt_invalid;		!?? assume invalid volume type
+
+! Determine the characteristics of a disk
+!
+IF .namb [namb$b_devclass] EQL dc$_disk
+THEN
+    BEGIN
+
+    $logic_check (2, (.dev [dev$v_dir] AND .dev [dev$v_fod] AND .dev [dev$v_shr]), 100);
+
+    IF   .dev [dev$v_for]
+      OR (NOT (.dev [dev$v_mnt]))
+    THEN
+	vol_format = volb$k_vfmt_rt11
+    ELSE IF .dev [dev$v_mnt]
+    THEN
+	vol_format = volb$k_vfmt_files11
+    ELSE
+	$logic_check (0, (false), 230);	! shouldn't be any other choices
+
+    END
+
+! Determine the characteristics for a tape
+!
+ELSE IF .namb [namb$b_devclass] EQL dc$_tape
+THEN
+    BEGIN
+
+    $logic_check (2, (.dev [dev$v_sqd] AND .dev [dev$v_fod]), 101);
+
+    IF   .dev [dev$v_for]
+      OR (NOT (.dev [dev$v_mnt]))
+    THEN
+	vol_format = volb$k_vfmt_dos11
+    ELSE IF .dev [dev$v_mnt]
+    THEN
+	BEGIN
+	$logic_check (2, (.dev [dev$v_dir] AND .dev [dev$v_sdi]), 102);
+	vol_format = volb$k_vfmt_files11;
+	END
+    ELSE
+	$logic_check (0, (false), 231);
+
+    END
+
+! Device is neither disk nor tape.  !?? Assume it is Files-11 (term, lp, etc)
+!
+ELSE
+    vol_format = volb$k_vfmt_files11;
+
+namb [namb$b_vol_format] = .vol_format;		! store the final value
+
+RETURN true;
+END;
+
+GLOBAL ROUTINE exch$cmd_match_filename (len_fil, adr_fil, len_trg, adr_trg) =	%SBTTL 'exch$cmd_match_filename'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine compares an RT-11 or DOS-11 filename (result string) with a target filename.  The target
+!	filename may contain the wildcard characters "*" and "%".
+!
+! INPUTS:
+!
+!	len_fil - Length of filename string
+!	adr_fil - Address of filename string
+!	len_trg - Length of target filename string
+!	adr_trg - Address of target filename string
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	True (1) if the target name includes the filename, False (0) otherwise
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('cmd_match_filename> ');
+
+REGISTER
+    lenf = 2,					! Remaining length of filename
+    adrf = 3,					! Current address in filename
+    lent = 4,					! Remaining length of filename
+    adrt = 5,					! Current address in filename
+    chf  = 6 : BYTE,				! The character from the filename
+    cht  = 7 : BYTE				! The character from target
+    ;
+
+
+! Move the inputs into registers
+!
+lenf = .len_fil;
+adrf = .adr_fil;
+lent = .len_trg;
+adrt = .adr_trg;
+
+! Scan through all the characters in the target
+!
+DECR k FROM .lent-1 TO 0
+DO
+    BEGIN
+    lent = .lent-1;				! Decrement target length
+    cht = CH$RCHAR_A(adrt);			! Fetch char and bump pointer
+
+    IF .cht EQL '*'				! Found a wildcard in target
+    THEN
+	BEGIN
+	IF .lent EQL 0				! Wildcard at end of target string
+	THEN					!  matches everything, return a
+	    RETURN true;			!  match
+	DECR i FROM .lenf-1 TO 0		! Look through rest of filename
+	DO
+	    BEGIN
+	    IF exch$cmd_match_filename (.lenf, .adrf, .lent, .adrt)	! Recursively
+	    THEN				!  examine rest of filename from this
+		RETURN true;			!  point in target, return true if found
+	    lenf = .lenf-1;			! Advance one character in the filename
+	    adrf = .adrf+1;			!  and repeat recursive call
+	    END;
+	RETURN false;				! We did not match from wildcard
+	END
+    ELSE					! No wildcard in target
+	BEGIN
+	lenf = .lenf-1;				! Decrement the input string
+	IF .lenf LSS 0				! If we have exhausted the
+	THEN					!  filename string then we did not
+	    RETURN false;			!  match and we can return false
+	chf = CH$RCHAR_A (adrf);		! Get filename char and bump pointer
+	IF NOT (				! If none of the successful tests
+		   (.cht EQL .chf)		! Did we match?
+		OR (.cht EQL '%')		! Single character wildcard
+	       )
+	THEN					! We did not match in any way, therefore
+	    RETURN false;			!  we can return false from here.
+	END;
+    END;
+
+IF .lenf EQL 0 THEN RETURN true;		! Matched so far, filename exhausted
+
+RETURN false;					! More characters in filename, no match
+
+END;
+
+GLOBAL ROUTINE exch$cmd_namb_clone (in_namb : $ref_bblock) =	%SBTTL 'cmd_namb_clone (in_namb)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine makes a copy of an EXCHANGE structure $NAMB.
+!
+! INPUTS:
+!
+!	in_namb - address of the created name block
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Address of a duplicate namb
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('cmd_namb_clone> ');
+
+LOCAL
+    out_namb	: $ref_bblock			! Pointer to the new namb
+    ;
+
+
+$block_check (2, .in_namb, namb, 405);
+
+! Get a new namb
+!
+out_namb = exch$util_namb_allocate ();
+
+! Make copies of the dynamic strings
+!
+str$copy_dx (out_namb [namb$q_input],      in_namb [namb$q_input]);	! Copy the input name
+str$copy_dx (out_namb [namb$q_fullname],   in_namb [namb$q_fullname]);	! Copy the final, fully expanded name
+str$copy_dx (out_namb [namb$q_expanded],   in_namb [namb$q_expanded]);	! Make a copy of the expanded name
+str$copy_dx (out_namb [namb$q_result],     in_namb [namb$q_result]);	! Copy the result name
+str$copy_dx (out_namb [namb$q_device_dvi], in_namb [namb$q_device_dvi]);! Copy the canonical device name
+
+!+
+! Now we need to get a little smarter.  The namb contains lengths and addresses inside the expanded or result
+! string for the rest of the filename components.  The safest way is to make new dynamic strings for each of
+! these components.  This will result in some small pieces of unrecoverable garbage when this namb is reused, but
+! it won't be significant.
+!-
+$dyn_str_desc_init (out_namb [namb$q_node]);		! Node name descriptor
+str$copy_dx (out_namb [namb$q_node], in_namb [namb$q_node]);
+$dyn_str_desc_init (out_namb [namb$q_device]);		! Device name descriptor
+str$copy_dx (out_namb [namb$q_device], in_namb [namb$q_device]);
+$dyn_str_desc_init (out_namb [namb$q_directory]);	! Directory name descriptor
+str$copy_dx (out_namb [namb$q_directory], in_namb [namb$q_directory]);
+$dyn_str_desc_init (out_namb [namb$q_name]);		! Name name descriptor
+str$copy_dx (out_namb [namb$q_name], in_namb [namb$q_name]);
+$dyn_str_desc_init (out_namb [namb$q_type]);		! Type name descriptor
+str$copy_dx (out_namb [namb$q_type], in_namb [namb$q_type]);
+$dyn_str_desc_init (out_namb [namb$q_version]);		! Version name descriptor
+str$copy_dx (out_namb [namb$q_version], in_namb [namb$q_version]);
+
+! Copy the last part of the block exactly
+!
+CH$MOVE (exchblk$s_namb - namb$k_start_zero, .in_namb + namb$k_start_zero, .out_namb + namb$k_start_zero);
+
+$debug_print_fao ('"!AS" "!AS" "!AS" "!AS" "!AS" "!AS" "!AS"',
+	out_namb [namb$q_node], out_namb [namb$q_device], out_namb [namb$q_directory],
+	out_namb [namb$q_name], out_namb [namb$q_type], out_namb [namb$q_version], out_namb [namb$q_device_dvi]);
+
+RETURN .out_namb;
+END;
+
+GLOBAL ROUTINE cmd_namb_fab_copy (fabb : $ref_bblock, namb : $ref_bblock) : NOVALUE =	%SBTTL 'cmd_namb_fab_copy (fabb, namb)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine copies information from a fab (and its nam block) to a namb.
+!
+! INPUTS:
+!
+!	fabb - the address of an RMS FAB, assumed to have a nam block
+!	namb - address of the created name block
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	True if success, warning status code if unable to parse the parameter
+!
+! SIDE EFFECTS:
+!
+!	$NAMB block is filled with file name information
+!--
+
+$dbgtrc_prefix ('cmd_namb_fab_copy> ');
+
+LOCAL
+    offset,
+    len,
+    buf,
+    tmp_desc	: $desc_block
+    ;
+
+BIND
+    inp_desc = namb [namb$q_input]	: $desc_block,	! A descriptor for the input file name      (dynamic)
+    ful_desc = namb [namb$q_fullname]	: $desc_block,	! A descriptor for the full file name		"
+    exp_desc = namb [namb$q_expanded]	: $desc_block,	! A descriptor for the expanded file name	"
+    res_desc = namb [namb$q_result]	: $desc_block,	! A descriptor for the result file name		"
+    dvi_desc = namb [namb$q_device_dvi]	: $desc_block,	! A descriptor for the full device name		"
+    nod_desc = namb [namb$q_node]	: $desc_block,	! A descriptor for the node name 	(point to exp str)
+    dev_desc = namb [namb$q_device]	: $desc_block,	! A descriptor for the device name		"
+    dir_desc = namb [namb$q_directory]	: $desc_block,	! A descriptor for the directory name		"
+    nam_desc = namb [namb$q_name]	: $desc_block,	! A descriptor for the name name		"
+    typ_desc = namb [namb$q_type]	: $desc_block,	! A descriptor for the type name		"
+    ver_desc = namb [namb$q_version]	: $desc_block,	! A descriptor for the version number		"
+    nam      = .fabb [fab$l_nam] 	: $bblock	! Address of the name block
+    ;
+
+$debug_print_lit ('entry');
+$block_check (2, .namb, namb, 406);
+$logic_check (2, (nam NEQ 0), 103);
+
+
+! Copy the DEV characteristics from the fab to the namb
+!
+namb [namb$l_fabdev] = .fabb [fab$l_dev];
+
+! Set some flags based on the file name status bits from the RMS name
+!
+namb [namb$v_wildcard]		= .nam [nam$v_wildcard];	! Inclusive OR of all the RMS wildcard bits
+namb [namb$v_wild_name]		= .nam [nam$v_wild_name];	! File name contains a wildcard
+namb [namb$v_wild_type]		= .nam [nam$v_wild_type];	! File type contains a wildcard
+namb [namb$v_wild_version]	= .nam [nam$v_wild_ver];	! File version contains a wildcard
+namb [namb$v_wild_group]	= .nam [nam$v_wild_grp];	! Group number is a wildcard
+namb [namb$v_wild_member]	= .nam [nam$v_wild_mbr];	! Member number is a wildcard
+
+namb [namb$v_rooted_directory]	= .nam [nam$v_root_dir];	! Device contains root directory
+namb [namb$v_concealed_device]	= .nam [nam$v_cncl_dev];	! Device is a concealed device
+
+namb [namb$v_explicit_node]	= .nam [nam$v_node];		! Node name is present
+namb [namb$v_explicit_device]	= .nam [nam$v_exp_dev];		! Device is explicit
+namb [namb$v_explicit_directory]= .nam [nam$v_exp_dir];		! Directory is explicit
+namb [namb$v_explicit_name]	= .nam [nam$v_exp_name];	! Name is explicit
+namb [namb$v_explicit_type]	= .nam [nam$v_exp_type];	! Type is explicit
+namb [namb$v_explicit_version]	= .nam [nam$v_exp_ver];		! Version number is explicit
+
+! RMS doesn't set the GRP_MBR bit if the device is not directory structured, do it for them
+!
+IF .nam [nam$b_dir] NEQ 0
+THEN
+    nam [nam$v_grp_mbr] = (CH$FIND_CH (.nam [nam$b_dir], .nam [nam$l_dir], %C ',') NEQ 0);
+$debug_print_fao ('grp_mbr bit = !UL', .nam [nam$v_grp_mbr]);
+IF (namb [namb$v_uic_directory]	= .nam [nam$v_grp_mbr])		! Directory is in [GROUP,MEMBER] format
+THEN
+    cmd_convert_uic (.fabb, .namb);				! Also store it in binary format
+
+! Make a copy of the input file name, copy from fab to a dynamic string
+!
+$stat_str_desc_init (tmp_desc, .fabb [fab$b_fns], .fabb [fab$l_fna]);	! Set class, type, length and pointer fields
+str$copy_dx (inp_desc, tmp_desc);					! Copy to dynamic string
+
+! Make a copy of the expanded name, copy from nam to a dynamic string
+!
+$str_desc_set (tmp_desc, .nam [nam$b_esl], .nam [nam$l_esa]);		! Set length and pointer fields only
+str$copy_dx (exp_desc, tmp_desc);					! Copy to dynamic string
+
+! Make a copy of the result name, copy from nam to a dynamic string
+!
+$str_desc_set (tmp_desc, .nam [nam$b_rsl], .nam [nam$l_rsa]);		! Set length and pointer fields only
+str$copy_dx (res_desc, tmp_desc);					! Copy to dynamic string
+
+! Make a copy of the final name.  This is the result name if present, expanded if not.  If the expanded name
+! is not present, all bets are off.
+!
+BEGIN
+    REGISTER
+	final_len, final_adr;
+    IF .nam [nam$b_rsl] GTRU 0
+    THEN
+	BEGIN
+	final_len = .nam [nam$b_rsl];
+	final_adr = .nam [nam$l_rsa];
+	END
+    ELSE IF .nam [nam$b_esl] GTRU 0
+    THEN
+	BEGIN
+	final_len = .nam [nam$b_esl];
+	final_adr = .nam [nam$l_esa];
+	END
+    ELSE
+	$logic_check (0, (false), 232);
+
+    $str_desc_set (tmp_desc, .final_len, .final_adr);	! Set length and pointer fields only
+    END;
+str$copy_dx (ful_desc, tmp_desc);			! Copy to dynamic string
+
+! Make a copy of the canonical device name, copy from nam to a dynamic string
+!
+BEGIN							! The DVI field is a counted string, so we
+    BIND						!  must trick BLISS into thinking the first
+	len = nam [nam$t_dvi]	  : BYTE,		!  byte is the length field and the second
+	adr = nam [nam$t_dvi] + 1 : $bvector;		!  byte is the string itself
+    $str_desc_set (tmp_desc, .len, adr);		! Set length and pointer fields only
+END;
+str$copy_dx (dvi_desc, tmp_desc);			! Copy to dynamic string
+
+!+
+! Now we need to get a little smarter.  The nam block contains lengths and addresses inside the expanded or result
+! string for the rest of the filename components.  Since we have made a copy of this string, we must convert the
+! nam block addresses to addresses inside our copy.  This is a simple matter of arithmetic.  We must also
+! initialize all these as static strings, so here we go:
+!-
+IF .nam [nam$b_rsl] GTRU 0			! Is the result string available?
+THEN
+    offset = .res_desc [dsc$a_pointer] - .nam [nam$l_rsa]	! Compute our offset
+ELSE
+    offset = .exp_desc [dsc$a_pointer] - .nam [nam$l_esa];	! Compute our offset
+
+$stat_str_desc_init (nod_desc, .nam [nam$b_node], (.nam [nam$l_node] + .offset));	! Node name descriptor
+$stat_str_desc_init (dev_desc, .nam [nam$b_dev],  (.nam [nam$l_dev]  + .offset));	! Device name descriptor
+$stat_str_desc_init (dir_desc, .nam [nam$b_dir],  (.nam [nam$l_dir]  + .offset));	! Directory name descriptor
+$stat_str_desc_init (nam_desc, .nam [nam$b_name], (.nam [nam$l_name] + .offset));	! Name name descriptor
+$stat_str_desc_init (typ_desc, .nam [nam$b_type], (.nam [nam$l_type] + .offset));	! Type name descriptor
+$stat_str_desc_init (ver_desc, .nam [nam$b_ver],  (.nam [nam$l_ver]  + .offset));	! Version name descriptor
+
+! Check now to make sure that we can use this as one of our foreign names, look first at the length
+!
+IF  .nam [nam$b_type] GTRU 4			! If the type is longer than three (includes the ".")
+  OR
+    .nam [nam$b_name] GTRU 9			!  or the name is longer than 9
+THEN
+    BEGIN					!  then we need to truncate DOS and RT output names
+    namb [namb$v_dos_truncate] = true;
+    namb [namb$v_rt_truncate] = true;
+    END
+ELSE IF .nam [nam$b_name] GTRU 6		! If the name is longer than 6 we need to truncate RT
+THEN
+    namb [namb$v_rt_truncate] = true;
+
+! Now look for characters which cannot be put into the other file names
+!
+len = .nam [nam$b_type] - 1;			! Do the file type first, adjust for the "."
+buf = .nam [nam$l_type] + 1;
+WHILE .len GTR 0
+DO
+    BEGIN
+    REGISTER
+	char : BYTE;
+    char = CH$RCHAR_A (buf);
+    SELECTONE .char OF
+    SET
+	['A' TO 'Z', '0' TO '9', '*', '%'] :	;				! Valid chars plus wildcards
+	[OTHERWISE] :				namb [namb$v_bad_pdp_char] = true;
+    TES;
+    len = .len - 1;
+    END;
+
+len = .nam [nam$b_name];			! Do the file name next
+buf = .nam [nam$l_name];
+WHILE .len GTR 0
+DO
+    BEGIN
+    REGISTER
+	char : BYTE;
+    char = CH$RCHAR_A (buf);
+    SELECTONE .char OF
+    SET
+	['A' TO 'Z', '0' TO '9', '*', '%'] :	;				! Valid chars plus wildcards
+	[OTHERWISE] :				namb [namb$v_bad_pdp_char] = true;
+    TES;
+    len = .len - 1;
+    END;
+
+$debug_print_fao ('"!AS" "!AS" "!AS" "!AS" "!AS" "!AS" "!AS"',
+	nod_desc, dev_desc, dir_desc, nam_desc, typ_desc, ver_desc, dvi_desc);
+
+RETURN;
+END;
+
+GLOBAL ROUTINE exch$cmd_parse_filespec (para_name : $ref_bblock,	%SBTTL 'exch$cmd_parse_filespec'
+			default_desc : $ref_bblock, prsopt : $bblock, name_desc : $ref_bblock, namb : $ref_bblock) =
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine parses a file name parameter into its component parts.  The output is a filled name block.
+!
+! INPUTS:
+!
+!	para_name    - the descriptor for the name of the parameter to be given to CLI$GET_VALUE
+!	default_desc - a default name to supply fields missing in the above name.  File name stickiness
+!			can be achieved by using a previously returned name as the new default.
+!	prsopt       - flags for parse options
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	name_desc - the address of a dynamic string descriptor, will receive the name from CLI$GET_VALUE
+!	namb      - address of the created name block
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	True if success, bad status code if unable to parse the parameter, zero if no more parameters
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('cmd_parse_filespec> ');
+
+LOCAL
+    fab		: $bblock [fab$k_bln],		! FAB for the RMS parse
+    nam		: $bblock [nam$k_bln],		! NAM for the RMS parse
+    ebuf	: $bblock [nam$c_maxrss],	! Expanded name buffer for the RMS parse
+    namb_ptr	: $ref_bblock,			! Local pointer for the newly created block
+    cli_status,					! Status from CLI$GET_VALUE
+    prs_status,					! Status from RMS parse
+    status,					! Status from other things
+    dev_item	: VECTOR [10, LONG],		! Item list for $GETDVI
+    dev_desc	: $desc_block,			! Name string for $GETDVI
+    devnam	: $bvector [16],		! Name buffer
+    devnamlen	: WORD				! Returned length of name
+    ;
+
+BIND
+    nam_dvilen = nam [nam$t_dvi] : BYTE,	! DVI name is counted string
+    nam_dvibuf = nam [nam$t_dvi]+1 : $bvector
+    ;
+
+$trace_print_lit ('entry');
+
+! Set the returned name structure to the null pointer
+!
+.namb = 0;
+
+! Get the string from the CLI.  Note that we must get the parameter in this routine so that our later calls to
+! get the values of /RECORD_FORMAT and /VOLUME_FORMAT will get the correct placement (local).
+!
+IF .prsopt [prsopt$v_no_get_value]		! If the no_get_value option is requested, simply copy the
+THEN						!  input parameter name to the output string.  Note that we
+    str$copy_dx (.name_desc, .para_name)	!  can not guarantee proper /RECORD and /VOLUME placement.
+ELSE
+    BEGIN
+    IF NOT (cli_status = cli$get_value (.para_name, .name_desc))
+    THEN
+	RETURN 0;
+    END;
+
+! Initialize the structures needed by RMS PARSE routine
+!
+$fab_init (
+	fab = fab,				! Input file FAB
+	fna = .name_desc [dsc$a_pointer],	!  Set name addr
+	fns = .name_desc [dsc$w_length],	!  Set name size
+	nam = nam);				!  Name block
+
+$nam_init (
+	nam = nam,				! File name block
+	esa = ebuf,				!  Expanded name buffer addr
+	ess = nam$c_maxrss);			!  Expanded name size
+!?	nop = synchk);				!  Syntax check only (needs some more work to use)
+
+! If a default name has been supplied, pass it on to the parse routine as the default
+!
+IF .default_desc NEQ 0
+THEN
+    BEGIN
+    fab [fab$b_dns] = .default_desc [dsc$w_length];
+    fab [fab$l_dna] = .default_desc [dsc$a_pointer];
+    END;
+
+! Now let RMS do the dirty work for us
+!
+$debug_print_lit ('fab before parse   <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<');
+$check_call (5, exch$dbg_fab_dump, fab);	! Dump the fab
+prs_status = $parse (FAB = fab);		! Parse the file spec
+exch$cmd_parse_null_file (fab);			! And parse the null
+$trace_print_lit ('fab after parse    >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>');
+$check_call (4, exch$dbg_fab_dump, fab);	! Dump the fab
+$check_call (4, exch$dbg_fab_name_print, fab);	! Print name block information
+$check_call (4, exch$dbg_fab_dev_print, fab);	! Print device information
+
+! If we don't have an expanded name we exit with the error
+!
+IF .nam [nam$b_esl] EQL 0
+THEN
+    RETURN .prs_status;
+
+!
+! If we got an RMS$_DNR (device not ready or not mounted) error, then the device exists.  Get its real name
+! and put the real name into the DVI field of the nam block.  Also grab the device characteristics and stick into
+! the fab.
+!
+IF .prs_status EQL rms$_dnr
+THEN
+    BEGIN
+
+    ! Initialize the device name descriptor from the result name
+    !
+    $logic_check (2, (.nam [nam$b_dev] NEQ 0), 104);
+    $stat_str_desc_init (dev_desc, .nam [nam$b_dev],  .nam [nam$l_dev]);
+
+    ! Initialize the item list for the $GETDVI
+    !
+    %IF switch_variant GEQ 3 %THEN devnamlen = 0; %FI	! Suppress uninit reference message while debugging
+    dev_item [0] = (dvi$_fulldevnam^16 OR 16);	! Canonical device name	(Note: RMS uses FULLDEVNAM in $parse)
+    dev_item [1] = devnam;			! Buffer for name
+    dev_item [2] = devnamlen;			! Returned length
+    dev_item [3] = (dvi$_devchar^16 OR 4);	! Device characteristics
+    dev_item [4] = fab [fab$l_dev];		! Plop it right into the fab
+    dev_item [5] = 0;				! Don't need returned length
+    dev_item [6] = 0;				! End of list
+
+    ! Get the device information
+    !
+    IF NOT (status = $getdviw (efn=0, devnam=dev_desc, itmlst=dev_item))
+    THEN
+	$exch_signal_stop (exch$_accessfail, 1, dev_desc, .status);
+
+    ! Copy the name to the nam block, it will look like $PARSE put it there
+    !
+    $logic_check (2, (.devnamlen LEQU nam$s_dvi-1), 105);
+    nam_dvilen = .devnamlen - 1;		! Copy the length to the counted string
+    CH$MOVE (.nam_dvilen, devnam, nam_dvibuf);	! And copy the bytes (minus the final ":")
+    $trace_print_fao ('dnr, fetched device "!AF"', .nam_dvilen, devnam);
+
+    END;
+
+! Get a pointer to a name block
+!
+namb_ptr = exch$util_namb_allocate ();
+
+! Now copy everything over to the name block and return the pointer
+!
+cmd_namb_fab_copy (fab, .namb_ptr);
+
+$trace_print_fao ('Namb for input "!AS", full "!AS", device "!AS"',
+	namb_ptr [namb$q_input], namb_ptr [namb$q_fullname], namb_ptr [namb$q_device_dvi]);
+
+BEGIN	! scope "devdvidsc"
+    BIND
+	devdvidsc = namb_ptr [namb$q_device_dvi] : $desc_block;
+
+    IF .devdvidsc [dsc$w_length] GTR 0
+    THEN
+	BEGIN
+	LOCAL
+	    devclass,
+	    devtype;
+
+	! Init the item list for a $GETDVI to get the device class
+	!
+	%IF switch_variant GEQ 3 %THEN devclass = devtype = 0; %FI	! Suppress uninit reference message while debugging
+	dev_item [0] = (dvi$_devclass^16 OR 4);		! Device class (a DC$_xxx symbol)
+	dev_item [1] = devclass;			! Buffer for value
+	dev_item [2] = 0;				! Returned length not important
+	dev_item [3] = (dvi$_devtype^16 OR 4);		! Device type (a DT$_xxx symbol)
+	dev_item [4] = devtype;
+	dev_item [5] = 0;
+	dev_item [6] = (dvi$_devchar^16 OR 4);		! Device characteristics
+	dev_item [7] = namb_ptr [namb$l_fabdev];	! Plop it right into the namb
+	dev_item [8] = 0;
+	dev_item [9] = 0;				! End of list
+
+	! Get the device information
+	!
+	IF NOT (status = $getdviw (efn=0, devnam=namb_ptr [namb$q_device_dvi], itmlst=dev_item))
+	THEN
+	    $exch_signal_stop (exch$_accessfail, 1, namb_ptr [namb$q_device_dvi], .status);
+	namb_ptr [namb$b_devclass] = .devclass;	! Store the value into the namb
+	namb_ptr [namb$b_devtype] = .devtype;	! Store the value into the namb
+
+	$trace_print_fao ('class !UL, type !UL', .devclass, .devtype);
+	END;
+END;	! scope "devdvilen"
+
+! Grab volume and record format info.  Note that we will get positional or local values for this parameter only.
+!
+IF NOT (status = exch$cmd_fetch_rec_format (.namb_ptr))
+THEN
+    BEGIN
+    exch$util_namb_release (.namb_ptr);
+    RETURN .status;
+    END;
+
+IF NOT (status = exch$cmd_fetch_vol_format (.namb_ptr))
+THEN
+    BEGIN
+    exch$util_namb_release (.namb_ptr);
+    RETURN .status;
+    END;
+
+! Produce an ident string for the volume
+!
+BEGIN
+    LOCAL
+	ident : $bvector [namb$s_vol_ident];
+    BIND
+	dev = namb_ptr [namb$q_device] : $desc_block,		! Device string
+	dvi = namb_ptr [namb$q_device_dvi] : $desc_block;	! Canonical name
+
+    ! If the device name parsed by RMS is known to us (has been MOUNTed), then the final vol_ident is
+    ! that device name.  A reference to a previously mounted virtual device will succeed here.
+    !
+    CH$COPY (.dev [dsc$w_length], .dev [dsc$a_pointer], 0, namb$s_vol_ident, ident);	! Make a zero-padded string
+    namb_ptr [namb$a_assoc_volb] = exch$util_find_mounted_volb (ident);			! Look at mounted volumes
+    $trace_print_fao ('first try, ident "!AF", volb !XL', .dev [dsc$w_length], ident, .namb_ptr [namb$a_assoc_volb]);
+
+    ! If we have been given an address, then the ident is the correct name as it stands
+    !
+    IF .namb_ptr [namb$a_assoc_volb] NEQ 0			
+    THEN
+	BEGIN
+
+	! Copy the namb ident to the volume ident field
+	!
+	CH$MOVE (namb$s_vol_ident, ident, namb_ptr [namb$t_vol_ident]);
+	namb_ptr [namb$l_vol_ident_len] = .dev [dsc$w_length];
+	status = 1;
+
+	END
+
+    ! The device isn't mounted, did RMS find an unconcealed canonical device name for a non-virtual mount?
+    ! The virtual device parse option is only used when a virtual device is first mounted.  It is used to
+    ! prevent the virtual device "R:" from being interpreted as "_RTA0:", and "DM:" from turning into "_DMA0:".
+    ! On subsequent references to the virtual device we will get a match from the scan for mounted volumes,
+    ! and will not have to treat virtual device names as being special.
+    !
+    ELSE IF  (((.dvi [dsc$w_length] NEQ 0) AND (NOT .namb_ptr [namb$v_concealed_device]))
+	   AND
+	     (NOT .prsopt [prsopt$v_virtual_device]))
+    THEN
+	BEGIN
+	BIND
+	    last = (.dvi [dsc$w_length] + namb_ptr [namb$t_vol_ident]) : BYTE;
+
+	! Copy the canonical device name to the ident field, adding a colon
+	!
+	CH$MOVE (.dvi [dsc$w_length], .dvi [dsc$a_pointer], namb_ptr [namb$t_vol_ident]);
+	last = %C ':';
+	namb_ptr [namb$l_vol_ident_len] = .dvi [dsc$w_length] + 1;
+	status = 1;
+	$trace_print_fao ('canonical name, ident "!AF"', .namb_ptr [namb$l_vol_ident_len], namb_ptr [namb$t_vol_ident]);
+
+	END
+
+    ! No canonical name, is there any device name at all?
+    !
+    ELSE IF .dev [dsc$w_length] NEQ 0
+	THEN
+	BEGIN
+
+	! Copy the parsed device name to the ident field
+	!
+	CH$MOVE (.dev [dsc$w_length], .dev [dsc$a_pointer], namb_ptr [namb$t_vol_ident]);
+	namb_ptr [namb$l_vol_ident_len] = .dev [dsc$w_length];
+	status = 1;
+	$trace_print_fao ('parsed device name, ident "!AF"', .namb_ptr [namb$l_vol_ident_len], namb_ptr [namb$t_vol_ident]);
+
+	END
+
+    ! Wow - nothing at all
+    !
+    ELSE
+	status = 0;
+END;
+
+! If we don't have a mounted volb address, then try again to see if our final ident is mounted
+!
+IF .namb_ptr [namb$a_assoc_volb] EQL 0
+THEN
+    namb_ptr [namb$a_assoc_volb] = exch$util_find_mounted_volb (namb_ptr [namb$t_vol_ident]);
+$trace_print_fao ('second check for volb, !XL', .namb_ptr [namb$a_assoc_volb]);
+
+! Let the user know if we are ignoring pieces of the file name
+!
+IF .namb_ptr [namb$a_assoc_volb] NEQ 0
+THEN
+    BEGIN
+    BIND
+	volb = namb_ptr [namb$a_assoc_volb] : $ref_bblock;
+
+    ! RT-11 files have neither version numbers or directories
+    !
+    IF .volb [volb$b_vol_format] EQL volb$k_vfmt_rt11
+    THEN
+	BEGIN
+	IF .namb_ptr [namb$v_explicit_directory]
+	THEN
+	    $exch_signal (exch$_ignore_dire);
+	IF .namb_ptr [namb$v_explicit_version]
+	THEN
+	    $exch_signal (exch$_ignore_vers);
+	END;
+
+    ! DOS-11 files do not have version numbers
+    !
+    IF .volb [volb$b_vol_format] EQL volb$k_vfmt_dos11
+    THEN
+	BEGIN
+	IF .namb_ptr [namb$v_explicit_version]
+	THEN
+	    $exch_signal (exch$_ignore_vers);
+	END;
+    END;
+
+! If we have more files then set the more files flag
+!
+IF .cli_status EQL cli$_comma				! Separated by a comma
+ OR
+   .cli_status EQL cli$_concat				! Or by a plus sign
+THEN
+     namb_ptr [namb$v_more_files] = true;
+
+$trace_print_fao ('id "!AF" volb !XL parse !XL "!AS" "!AS" "!AS" "!AS" "!AS"  "!AS"',
+	.namb_ptr [namb$l_vol_ident_len], namb_ptr [namb$t_vol_ident],
+	.namb_ptr [namb$a_assoc_volb], .prs_status,
+	namb_ptr [namb$q_node],  namb_ptr [namb$q_device],  namb_ptr [namb$q_directory],
+	namb_ptr [namb$q_name],  namb_ptr [namb$q_type],    namb_ptr [namb$q_version]);
+
+! Return the pointer and the result status
+!
+.namb = .namb_ptr;
+RETURN .status;
+END;
+
+GLOBAL ROUTINE exch$cmd_parse_null_file (infab : $ref_bblock) : NOVALUE =	%SBTTL 'exch$cmd_parse_null_file'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine makes a copy of the input fab (and nam block, if present).  All name fields are set to
+!	zero, and a $parse is done.  This causes RMS to deassign all context for the fab.
+!
+! INPUTS:
+!
+!	infab - address of fab
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	RMS internal context released
+!--
+
+$dbgtrc_prefix ('cmd_parse_null_file> ');
+
+LOCAL
+    fab		: $bblock [fab$k_bln],		! FAB for the RMS parse
+    nam		: $bblock [nam$k_bln]		! NAM for the file name
+    ;
+
+! 
+! Copy the input fab to the local and zero the file name lengths
+!
+CH$MOVE (fab$k_bln, .infab, fab);		! Copy to local
+fab [fab$b_fns] = 0;				! File name size to zero
+fab [fab$b_dns] = 0;				! Default name size to zero
+
+!
+! If a nam block is present on the input, set up a local nam block
+!
+IF .fab [fab$l_nam] NEQ 0
+THEN
+    BEGIN
+    CH$MOVE (nam$k_bln, .fab [fab$l_nam], nam);	! Copy the old nam block
+    nam [nam$v_svctx] = 0;			! Clear the save context bit
+    nam [nam$v_synchk] = 1;			! Syntax check only
+    nam [nam$b_esl] = 0;			! No expanded string
+    nam [nam$b_ess] = 0;			! No expanded string buffer
+    nam [nam$b_rsl] = 0;			! No result string
+    nam [nam$b_rss] = 0;			! No result string buffer
+    nam [nam$l_rlf] = 0;			! No related file nam
+    fab [fab$l_nam] = nam;			! Point the fab at this one
+    END;
+
+!
+! Now do the dummy parse
+!
+$parse (FAB = fab);				! Parse the null name
+
+RETURN;
+END;
+
+GLOBAL ROUTINE exch$cmd_related_file_fixup (nam : $ref_bblock) : NOVALUE =	%SBTTL 'exch$cmd_related_file_fixup (nam)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called when exch$cmd_related_file_parse finds that the related file name is a quoted
+!	file spec (NAM$V_QUOTED set).  It attempts to determine if the filename is from an RT-11 magtape, in
+!	which case it converts the quoted file spec into a normal file spec by removing the quotes and embedded
+!	spaces.  If the quoted name is not an RT-11 filespec, no action is taken.
+!
+! INPUTS:
+!
+!	nam - address of an RMS NAM block containing the quoted file name in the expanded string buffer
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	nam - expanded string is modified in place, NAM$B_ESL is adjusted for the new length.  Other nam fields
+!	      are not corrected
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('cmd_related_file_fixup> ');
+
+LOCAL
+    il,
+    skipped,					! Count of characters skipped
+    ip : $ref_bvector,				! Input pointer to name
+    op : $ref_bvector,
+    dots
+    ;
+
+$trace_print_fao ('expanded "!AF", quoted name {!AF}, type {!AF}, ver {!AF}',
+			.nam [nam$b_esl], .nam [nam$l_esa], .nam [nam$b_name], .nam [nam$l_name],
+			.nam [nam$b_type], .nam [nam$l_type], .nam [nam$b_ver], .nam [nam$l_ver]);
+
+! Get length and address of the file NAME, without the quotes
+!
+il = .nam [nam$b_name] - 2;
+IF .il LEQ 0
+THEN
+    RETURN;					! Can't be RT-11 if it is zero length
+IF .nam [nam$b_type] NEQ 1			! Type field should also be length of one
+THEN
+    RETURN;
+op = .nam [nam$l_name];
+ip = .op + 1;
+
+! Check that the name contains the proper set of characters
+!
+dots = 0;					! Assume no periods in the name
+INCR p FROM 0 TO .il-1
+DO
+    SELECTONE .ip [.p] OF
+    SET
+	['A' TO 'Z', '0' TO '9', ' '] :	;			! Alphanumerics and spaces are ok
+	['.'] :				dots = .dots + 1;	! Count the period
+	[OTHERWISE] :			RETURN;			! Can't be RT-11 file name
+    TES;
+
+! We can only have zero or one periods in the name
+!
+IF .dots GTRU 1
+THEN
+    RETURN;
+
+! Shuffle the name, skipping any spaces
+!
+skipped = 3;					! Init to the two quotes being skipped plus type
+INCR p FROM 0 to .il-1
+DO
+    BEGIN
+    REGISTER
+	char;
+    char = CH$RCHAR_A (ip);			! Grab the character
+    IF .char EQL ' '
+    THEN
+	skipped = .skipped + 1			! Bump count if space
+    ELSE
+	CH$WCHAR_A (.char, op);			! Otherwise copy to output
+    END;
+nam [nam$b_esl] = .nam [nam$b_esl] - .skipped;	! Store the new length
+
+! Now slide the remaining field (VERSION) over
+!
+CH$MOVE (.nam [nam$b_ver], .nam [nam$l_ver], .op);
+
+$trace_print_fao ('modified name "!AF"', .nam [nam$b_esl], .nam [nam$l_esa]);
+
+RETURN;
+END;
+
+GLOBAL ROUTINE exch$cmd_related_file_parse (fil_len, fil_buf : $ref_bvector,	%SBTTL 'exch$cmd_related_file_parse'
+				rlf_len, rlf_buf : $ref_bvector, nam : $ref_bblock) =
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine produces a file name for an output file by doing an RMS file parse to combine the
+!	requested name (fil_len:fil_buf) with the related name (rlf_len:rlf_buf).  The output is placed in
+!	a block which is an RMS NAM block (size NAM$C_BLN) immediately followed by the expanded string buffer
+!	(size NAM$C_MAXRSS).
+!
+! INPUTS:
+!
+!	fil_len - length of the requested name, possibly containing wildcards
+!	fil_buf - address of     "
+!	rlf_len - length of the related file name
+!	rlf_buf - address of     "
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	nam - address of an RMS NAM block and expanded string buffer
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	True if success, bad status code if unable to perform the operation
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('cmd_related_file_parse> ');
+
+LOCAL
+    fab		: $bblock [fab$k_bln],		! FAB for the RMS parse
+    rlf_nam	: $bblock [nam$k_bln],		! NAM for the related file name
+    rbuf	: $bblock [nam$c_maxrss],	! Buffer for the related file name
+    status					! Status from the $parse
+    ;
+
+$trace_print_fao ('input name "!AF", related name "!AF"', .fil_len, .fil_buf, .rlf_len, .rlf_buf);
+
+! Perform a $PARSE to create an RMS nam block for the related file name
+!
+$fab_init (
+	fab = fab,				! Input file FAB
+	fna = .rlf_buf,				!  Set related name addr
+	fns = .rlf_len,				!  Set related name size
+	nam = rlf_nam);				!  Name block
+$nam_init (
+	nam = rlf_nam,				! File name block
+	esa = rbuf,				!  Result name buffer addr
+	ess = nam$c_maxrss,			!  Result name buffer size
+	nop = synchk);				!  Syntax check only 
+
+! Parse the input related file name into the nam block
+!
+$debug_print_lit ('fab before related parse (input)   <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<');
+$check_call (5, exch$dbg_fab_dump, fab);	! Dump the fab
+status = $parse (FAB = fab);			! Parse the related name
+$debug_print_lit ('fab after related parse (input)   >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>');
+$check_call (5, exch$dbg_fab_dump, fab);	! Dump the fab
+IF .rlf_nam [nam$b_esl] EQL 0			! It shouldn't be possible to get this serious an error since the
+THEN						!  related file name has already been through a $parse
+    $exch_signal_stop (.status);
+
+! If the related name is a quoted string, see if it could be a quoted RT-11 magtape file name
+!
+IF .rlf_nam [nam$v_quoted]
+THEN
+    exch$cmd_related_file_fixup (rlf_nam);
+
+! Move the final related file name from the expanded string to the result string area of the related nam block
+!
+rlf_nam [nam$b_rsl] = .rlf_nam [nam$b_esl];	!  Result name length
+rlf_nam [nam$l_rsa] = .rlf_nam [nam$l_esa];	!  Result name length
+$trace_print_fao ('related name after first parse "!AF"', .rlf_nam [nam$b_rsl], .rlf_nam [nam$l_rsa]);
+
+! Initialize the structures needed by RMS $PARSE routine
+!
+$fab_init (
+	fab = fab,				! Input file FAB
+	dna = UPLIT BYTE (';*'),		!  Default is version so that we can maximize
+	dns = 2,				!  Default name size is two
+	fna = .fil_buf,				!  Set name addr
+	fns = .fil_len,				!  Set name size
+	fop = <OFP>,				!  Output file parse
+	nam = .nam);				!  Name block
+
+$nam_init (
+	nam = .nam,				! File name block
+	esa = .nam+nam$c_bln,			!  Expanded name buffer addr
+	ess = nam$c_maxrss,			!  Expanded name size
+	rlf = rlf_nam,				!  Related name
+	nop = synchk);				!  Syntax check only 
+
+! Now let RMS do the dirty work for us
+!
+$trace_print_lit ('fab before related parse    <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<');
+$check_call (4, exch$dbg_fab_dump, fab);	! Dump the fab
+status = $parse (FAB = fab);			! Parse the file spec
+$trace_print_lit ('fab after related parse    >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>');
+$check_call (4, exch$dbg_fab_dump, fab);	! Dump the fab
+$check_call (5, exch$dbg_fab_name_print, fab);	! Print name block information
+
+! If we don't have an expanded name we exit with the error
+!
+IF .nam [nam$b_esl] EQL 0
+THEN
+    RETURN .status;
+
+$trace_print_fao ('final result name "!AF"', .nam [nam$b_esl], .nam [nam$l_esa]);
+
+RETURN true;
+END;
+
+GLOBAL ROUTINE exch$cmd_unwind_cli_syntax (sig : $ref_bblock, mech : $ref_bblock) =	%SBTTL 'exch$cmd_unwind_cli_syntax'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine intercepts the signal MSG$_SYNTAX.  This is used by several routines to terminate
+!	processing when a qualifier is not defined for the particular parameter.
+!
+! INPUTS:
+!
+!	sig  - signal argument list
+!	mech - mechanism argument list
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	SS$_UNWIND if signal was MSG$_SYNTAX, otherwise SS$_RESIGNAL.
+!
+! SIDE EFFECTS:
+!
+!	If we unwind, the control flow will return as if a RETURN had been made from the enabling routine
+!--
+$dbgtrc_prefix ('cmd_unwind_cli_syntax> ');
+
+LOCAL
+    status
+    ;
+
+! If the signal name is what we are looking for, then do a default VMS unwind
+!
+IF .sig [chf$l_sig_name] EQL msg$_syntax	! DCL CLI error message (sinful knowlege of what DCL does!)
+THEN
+    BEGIN
+    $debug_print_lit ('unwinding');
+    mech [chf$l_mch_savr0] = -1;		! Flag R0 so that we will know msg$_syntax occurred
+    IF NOT (status = $unwind ())
+    THEN
+	$exch_signal_stop (.status);
+    END;
+
+RETURN ss$_resignal;
+END;
+
+END
+ELUDOM

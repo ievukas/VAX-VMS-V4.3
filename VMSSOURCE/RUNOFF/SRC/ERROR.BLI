@@ -1,0 +1,896 @@
+%TITLE 'Field (error) message requests from other modules'
+MODULE error (	IDENT = 'V04-000'
+		%BLISS32[, ADDRESSING_MODE (EXTERNAL    = LONG_RELATIVE,
+					    NONEXTERNAL = LONG_RELATIVE)]
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!++
+! FACILITY:	 DSR (Digital Standard RUNOFF) / DSRPLUS
+!
+! ABSTRACT:
+!
+!	This module generates messages (generally errors) for RUNOFF.
+!	These messages are edited at the time the routine is called to
+!	allow inclusion of various information necessary in the
+!	diagnostic.  The details of this editing are described below.
+!
+! ENVIRONMENT:	Transportable
+!
+! AUTHOR:	D. Knight	CREATION DATE:	June 1978
+!
+
+
+%SBTTL 'Revision History'
+!
+! MODIFIED BY:
+!
+!	014	KAD00014	Keith Dawson	3-May-1983
+!		Support suppression on counting new error messages: RNFPC2, 
+!		  PC3, PC4, PC5, CRU, CR1, CR2).
+!
+!	013	KAD00013	Keith Dawson	11-Apr-1983
+!		Support new termination messages (RNFPC2, PC3, PC4, PC5) for 
+!		  information written to the .BRN file (and for DSRPLUS cross-
+!		  referencing, also read from the input .BRN file). The support 
+!		  here is the addition of two new %chars:
+!
+!			%A ==> spec of old (input) .BRN file
+!			%B ==> spec of new (output) .BRN file
+!
+!	012	RER00012	Ron Randall	07-Mar-1983
+!		Global edit of all modules. Updated module names, idents,
+!		copyright dates. Changed require files to BLISS library.
+!
+!--
+
+
+%SBTTL 'Module Level Declarations'
+
+!
+! TABLE OF CONTENTS:
+!
+FORWARD ROUTINE
+	erm:	NOVALUE,	! Error message writer
+	erma:	NOVALUE,	! Report error, text of command, & where found
+	ermb:	NOVALUE,	! Report error, input text line, & where found
+	erme:	NOVALUE,	! Report error extended (w/secondary message)
+	erml:	NOVALUE,	! Report error & where in the text it was found
+	ermn:	NOVALUE,	! Report error with numeric param & where found
+	erms:	NOVALUE,	! Report error with string param & where found
+	putmsg:	NOVALUE,	! Miscellaneous messages writer
+	scnmsg,			! Do text insertion.
+	report_secondary_message;! Fetch and report secondary error message
+
+!
+! INCLUDE FILES:
+!
+LIBRARY 'NXPORT:XPORT';			! XPORT Library
+REQUIRE 'REQ:RNODEF';			! RUNOFF variant definitions
+
+%IF DSRPLUS %THEN
+LIBRARY 'REQ:DPLLIB';			! DSRPLUS BLISS Library
+%ELSE
+LIBRARY 'REQ:DSRLIB';			! DSR BLISS Library
+%FI
+
+!
+! OWN STORAGE:
+!
+LITERAL	work_buffer_size = 500;
+
+OWN
+    work_buffer : 				! Module wide character buffer
+	VECTOR [CH$ALLOCATION (work_buffer_size)],
+    work_desc : $STR_DESCRIPTOR (		!   & associated string desc.
+			 CLASS=FIXED
+			,STRING = (work_buffer_size
+				  ,CH$PTR (work_buffer) ) );
+OWN
+    w_buffer1 : 				! Module wide character buffer
+	VECTOR [CH$ALLOCATION (130)],
+    w_desc1 : $STR_DESCRIPTOR (			!   & associated string desc.
+			CLASS=FIXED
+			,STRING = (130
+			,CH$PTR(w_buffer1)));
+
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL
+	gca:	gca_definition,
+	ira:	fixed_string,
+	irac:	irac_definition,
+	msgtxt:	VECTOR,		! Vector of CH$PTRs to RUNOFF's messages.
+	pagen:	page_definition,
+	phan:	phan_definition,
+	rnoiob: REF $XPO_IOB (),! Output file (document being built)
+%IF DSRPLUS %THEN
+	brniob: $XPO_IOB (),! Input .BRN file
+%FI
+	brnoob: $XPO_IOB (),! Output .BRN file
+	semcod,			! Secondary error message code
+	ttoiob:	$XPO_IOB (),	! Standard messages (TTY: usually)
+	tteiob:	$XPO_IOB ();	! Standard error unit (TTY: usually)
+
+EXTERNAL LITERAL			!Error messages
+	rnfloc;	! I - on output page %P; on input line %C of page %I of file "%F"
+
+EXTERNAL ROUTINE
+	endcmt,			! Skip to end of comment
+	pacbas,			! Convert binary to specified base
+	pacpag,			! Convert page number to ASCII
+	pacstr,			! Move ASCII characters.
+
+%IF %BLISS(BLISS32) %THEN
+	sys$getmsg,		! System routine to fetch message text
+	emsg;			! Error message handler for VMS
+%ELSE
+	xpo$xmsg;		! XPORT's routine to fetch its msg. text
+%FI
+
+
+%SBTTL 'ERMA -- add DIRECTIVE and location to error message'
+GLOBAL ROUTINE erma (error,position) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine contains a sequence of code that is commonly used
+!	for handling errors.
+!
+!	If the POSITION parameter is TRUE, it calls ENDCMT to
+!	position to the end of the erroneous command.  Then it passes
+!	to ERM the specified error message (ERROR), and the start and
+!	length of the string to be inserted into the error message. 
+!	Note that this call on ERM does not depend on the value of POSITION.
+!
+!	Finally, it calls ERM to output the error message indicating
+!	where in the input and output files the error occurred.
+!
+!	It is by no means necessary to call ERM only via ERMA.  ERMA is
+!	simply a collection of commonly used code and is here for the
+!	sake of convenience.
+!
+! FORMAL PARAMETERS:
+!
+!	ERROR - Address of desired error diagnostic. Passed to ERM.
+!	POSITION - If TRUE, ERMA positions to the end of the
+!		   command before issuing the second call on ERM.
+!
+! IMPLICIT INPUTS:
+!
+!	RNFLOC	- An error message stating where error occurred
+!	GCA_COM_START - A ch$ptr to the start of the command
+!	FS_NEXT (IRA)  - A ch$ptr to the character after the last one
+!		        in the command
+!
+! IMPLICIT OUTPUTS:	None
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:	None
+!
+! SIDE EFFECTS:		None
+!--
+
+    BEGIN
+
+    IF  .position
+    THEN
+	endcmt ();	! Position to end of command.
+
+    erm (.error, .gca_com_start, CH$DIFF (.fs_next (ira), .gca_com_start));
+    erm (rnfloc, 0, 0);
+    END;		! End of ERMA
+
+
+%SBTTL 'ERMB -- add input text & location to error message'
+GLOBAL ROUTINE ermb (error,position) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine contains a sequence of code that is commonly used
+!	for handling errors.
+!
+!	Processing is like ERMA except that the entire input line is
+!	displayed rather than just a command.
+!
+!	If the POSITION parameter is TRUE, it calls ENDCMT to
+!	position to the end of the erroneous command.  It always passes
+!	to ERM the specified error message (ERROR), and the start and
+!	length of the string to be inserted into the error message. 
+!	Note that this call on ERM does not depend on the value of POSITION.
+!
+!	Finally, it calls ERM to output the error message indicating
+!	where in the input and output files the error occurred.
+!
+! FORMAL PARAMETERS:
+!
+!	ERROR - Address of desired error diagnostic. Passed to ERM.
+!	POSITION - If TRUE, ERMA positions to the end of the
+!		   command before issuing the second call on ERM.
+!
+! IMPLICIT INPUTS:
+!
+!	RNFLOC	- An error message stating where error occurred
+!	FS_START (IRA)	- A ch$ptr to the start of the input line.
+!	FS_MAXSIZE (IRA)	- The total size of the input line.
+!
+! IMPLICIT OUTPUTS:	None
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:	None
+!
+! SIDE EFFECTS:		None
+!--
+
+    BEGIN
+
+    IF .position
+    THEN
+	endcmt ();	! Position to end of command.
+
+    erm (.error, .fs_start (ira), .fs_maxsize (ira));
+    erm (rnfloc, 0, 0);
+    END;		! End of ERMB
+
+
+%SBTTL 'ERME -- report message w/secondary message'
+GLOBAL ROUTINE erme (error, arg, len, msgcode) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine will report the message as passed and then print a second
+!	informational line based on the passed message code (msgcode).
+!
+! FORMAL PARAMETERS:
+!
+!	ERROR -   Address of desired error diagnostic. Passed to ERM.
+!	ARG -     A CH$PTR to the string to be output.
+!	LEN -     The length of the string.
+!	MSGCODE - Error message code for the secondary error message.
+!
+! IMPLICIT INPUTS:	None
+!
+! IMPLICIT OUTPUTS:	None
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:	None
+!
+! SIDE EFFECTS:		None
+!--
+
+    BEGIN
+    erm (.error, .arg, .len);
+    report_secondary_message (.msgcode);
+    END;		! End of ERMS
+
+
+%SBTTL 'ERML -- add location to error message without additional data'
+GLOBAL ROUTINE erml (error) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine contains a sequence of code that is commonly used
+!	for handling errors.
+!
+!	ERML is just a shortcut for the following calls:
+!		ERM (.ERROR, 0, 0);
+!		ERM (RNFLOC, 0, 0);
+!	In other words, it saves code.
+!
+!
+! FORMAL PARAMETERS:
+!
+!	ERROR - Address of desired error diagnostic. Passed to ERM.
+!
+! IMPLICIT INPUTS:
+!
+!	RNFLOC	- An error message stating where error occurred
+!
+! IMPLICIT OUTPUTS:	None
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:	None
+!
+! SIDE EFFECTS:		None
+!--
+
+    BEGIN
+    erm (.error, 0, 0);
+    erm (rnfloc, 0, 0);
+    END;		! End of ERML
+
+
+%SBTTL 'ERMN -- add location to error message w/numeric data'
+GLOBAL ROUTINE ermn (error, arg) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine contains a sequence of code that is commonly used
+!	for handling errors.
+!
+!	The code is straightforward.  It is mainly a code-saver.
+!
+!
+! FORMAL PARAMETERS:
+!
+!	ERROR - Address of desired error diagnostic. Passed to ERM.
+!	ARG -   A number to be output.
+!
+! IMPLICIT INPUTS:
+!
+!	RNFLOC	- An error message stating where error occurred
+!
+! IMPLICIT OUTPUTS:	None
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:	None
+!
+! SIDE EFFECTS:		None
+!--
+
+    BEGIN
+    erm (.error, .arg, 0);
+    erm (rnfloc, 0, 0);
+    END;		! End of ERMN
+
+
+%SBTTL 'ERMS -- add location to error message w/string data'
+GLOBAL ROUTINE erms (error, arg, len) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine contains a sequence of code that is commonly used
+!	for handling errors.
+!
+!	The code is straightforward.  It is mainly a code-saver.
+!
+!
+! FORMAL PARAMETERS:
+!
+!	ERROR - Address of desired error diagnostic. Passed to ERM.
+!	ARG -   A CH$PTR to the string to be output.
+!	LEN -   The length of the string.
+!
+! IMPLICIT INPUTS:
+!
+!	RNFLOC	- An error message stating where error occurred
+!
+! IMPLICIT OUTPUTS:	None
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:	None
+!
+! SIDE EFFECTS:		None
+!--
+
+    BEGIN
+    erm (.error, .arg, .len);
+    erm (rnfloc, 0, 0);
+    END;		! End of ERMS
+
+
+%SBTTL 'ERM -- funnel message to appropriate error output mechinism'
+GLOBAL ROUTINE erm (error, arg, len) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine generates and prints the requested error diagnostic.
+!	The first routine argument points to an error string consisting of
+!	a string intermixed with special formatting flags which cause special
+!	actions to happen to the string when a flag is encountered.
+!	The routine SCNMSG is called to expand the error message
+!	before it is output.
+!
+! FORMAL PARAMETERS:
+!
+!	ERROR - Pointer to the desired error diagnostic.
+!	ARG - Contains a value if it is to be used with %N;
+!	      contains a pointer to a string if it is to be used with %S.
+!	LEN - Unused with %N, Contains the string length for %S.
+!
+!	All parameters are "pass through" parameters for SCNMSG.
+!
+! IMPLICIT INPUTS:	None
+!
+! IMPLICIT OUTPUTS:
+!
+!	GCA_FEHLER	- Set to TRUE to indicate an error occurred
+!	GCA_ERRCNT	- Count of lines of error messages
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:	None
+!
+! SIDE EFFECTS:		None
+!--
+
+    BEGIN
+    EXTERNAL LITERAL			!Error messages previously undeclaired
+	rnfbak,	! I - See command on input line %C of page %I of file "%S"
+	rnferd,	! I - DSR(PLUS) Version %V: %N diagnostic message%X reported
+	rnfmrc,	! W - Another %N crossed margin or bad right indent attempt%X detected and accumulated.  Now being reported
+	rnfned,	! I - DSR(PLUS) Version %V: No errors detected
+	rnfnic,	! W - Another %N negative indent%X detected and accumulated. Now being reported
+	rnfpc1,	! I - Illegal message:  rnfpc1
+	rnfpct,	! I - %N page%X written to "%O"
+	rnfstr,	! I - "%S"
+%IF DSRPLUS %THEN
+	rnfpc4,	! %N cross-reference record%X written to %B
+	rnfpc5,	! %N cross-reference record%X read from %A
+	rnfcru,	! One or more forward cross-references could not be resolved
+	rnfcr1,	! Run DSRPLUS again if you need them correct
+	rnfcr2,	! Or run DSRPLUS/DEBUG to see which one(s) changed
+%FI
+	rnfpc2,	! %N indexing record%X written to %B
+	rnfpc3;	! %N table-of-contents record%X written to %B
+
+    LITERAL	e_number_mask	= %X'7FF8';
+
+    LOCAL
+	line_cnt,				!Size of output line
+	e_number,				!error number
+	status;					!Status code returned by XPORT
+
+%IF %BLISS(BLISS32) %THEN
+    ! Initialize message string descriptor:
+    work_desc [str$b_dtype] = str$k_dtype_t;	! ASCII text (8-bit)
+    work_desc [str$b_class] = str$k_class_f;	! Scalar, String Descriptor
+    work_desc [str$a_pointer] = work_buffer [0];	! First byte of char. buffer
+%FI
+
+    e_number = (.error AND e_number_mask)/8;
+
+    !Count every real error message
+    IF (    .error NEQ rnfbak
+	AND .error NEQ rnferd
+	AND .error NEQ rnfloc
+	AND .error NEQ rnfmrc	! The parameter passed will be added in later.
+	AND .error NEQ rnfnic	! The parameter passed will be added in later.
+	AND .error NEQ rnfned
+	AND .error NEQ rnfpct
+	AND .error NEQ rnfpc1
+	AND .error NEQ rnfpc2
+	AND .error NEQ rnfpc3
+%IF DSRPLUS %THEN
+	AND .error NEQ rnfpc4
+	AND .error NEQ rnfpc5
+	AND .error NEQ rnfcru
+	AND .error NEQ rnfcr1
+	AND .error NEQ rnfcr2
+%FI
+	AND .error NEQ rnfstr  )
+	THEN
+	    BEGIN
+	    gca_fehler	= true;
+	    gca_errcnt	= .gca_errcnt + 1;
+	    END;
+
+    IF (    .error EQL rnfmrc	! These two messages display an accumulated
+	OR  .error EQL rnfnic ) ! count of errors previously unreported.
+	THEN			!   Add their count to total counter.
+	    gca_errcnt  = .gca_errcnt + .arg;
+
+    line_cnt = scnmsg (CH$PTR (work_buffer), .msgtxt [.e_number], .arg, .len);
+
+%IF %BLISS(BLISS32) %THEN
+    work_desc [str$h_length] = .line_cnt;	! Put message length into descriptor
+%FI
+
+    !The line is now packed correctly, so output it to the requested places.
+    CASE .gca_err_dir FROM report_err_none TO report_err_both OF
+	SET
+	[report_err_none]:	  0;	!Don't bother to output the message
+
+	[report_err_file]:
+		BEGIN		!Report error in output file
+
+%IF NOT %BLISS(BLISS32) %THEN
+		status = $XPO_PUT (IOB    = .rnoiob
+				  ,string = (.line_cnt, CH$PTR (work_buffer)) );
+
+		! Add carriage control information to the end of error message
+		status = $XPO_PUT  (IOB = .rnoiob
+				   ,STRING = (2, CH$PTR (UPLIT (%STRING (%CHAR (
+						     %O'15' ,%O'12'))))) );
+%ELSE
+		status = emsg (.error, work_desc, true);
+%FI
+
+		END;
+
+	[report_err_std]:
+
+		BEGIN		! Report error on standard error log
+
+%IF NOT %BLISS(BLISS32) %THEN
+		status = $XPO_PUT( IOB = tteiob
+				  ,STRING = (.line_cnt, CH$PTR (work_buffer)) );
+%ELSE
+		status = emsg (.error, work_desc, false);
+%FI
+
+		END;
+
+	[report_err_both]:
+		BEGIN		! Report error both places -- output file first
+
+%IF NOT %BLISS(BLISS32) %THEN
+		status = $XPO_PUT (IOB = .rnoiob
+				  ,STRING = (.line_cnt, CH$PTR (work_buffer)));
+
+		!Add carriage control information to the end of error message
+		status = $XPO_PUT  (IOB = .rnoiob
+				   ,STRING = (2, CH$PTR (UPLIT (%STRING (%CHAR(
+						    %O'15', %O'12'))))));
+		!Report error on standard error log
+		status = $XPO_PUT (IOB = tteiob
+				  ,STRING = (.line_cnt, CH$PTR (work_buffer)));
+%ELSE
+		status = emsg (.error, work_desc, true);
+%FI
+
+		END;
+
+	TES;
+
+    END;			!End of ERM
+
+
+%SBTTL 'PUTMSG -- funnel message to appropriate output mechinism'
+GLOBAL ROUTINE putmsg (message, arg, len) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine generates and prints the requested message.
+!	The first routine argument points to a string consisting of
+!	a string intermixed with special formatting flags which cause special
+!	actions to happen to the string when a flag is encountered.
+!	The routine SCNMSG is called to expand the message
+!	before it is output.
+!
+! FORMAL PARAMETERS:
+!
+!	MESSAGE - Pointer to the desired message.
+!	ARG - Contains a value, if it is to be used with %N,
+!	      contains a pointer to a string if it is to be used with %S.
+!	LEN - Unused with %N, Contains the string length for %S.
+!
+!	All parameters are "pass through" parameters for SCNMSG.
+!
+! IMPLICIT INPUTS:	None
+!
+! IMPLICIT OUTPUTS:	None
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:	None
+!
+! SIDE EFFECTS:		None
+!--
+
+    BEGIN
+    LITERAL
+	e_number_mask	= %X'7FF8';
+    LOCAL
+	line_cnt,				!Size of output line
+	e_number,				!error number
+	status;					!Status code returned by XPORT
+
+%IF %BLISS(BLISS32) %THEN
+    ! Initialize message string descriptor:
+
+    work_desc [str$b_dtype] = str$k_dtype_t;	! ASCII text (8-bit)
+    work_desc [str$b_class] = str$k_class_f;	! Scalar, String Descriptor
+    work_desc [str$a_pointer] = work_buffer [0];	! First byte of char. buffer
+%FI
+
+    e_number = (.message AND e_number_mask) / 8;
+    line_cnt = scnmsg (CH$PTR (work_buffer), .msgtxt [.e_number], .arg, .len);
+
+%IF %BLISS(BLISS32) %THEN
+    work_desc [str$h_length] = .line_cnt;	! Put message length into descriptor
+%FI
+
+    !The line is now packed correctly, so output it to the terminal
+
+%IF NOT %BLISS(BLISS32) %THEN
+    status = $XPO_PUT (IOB = ttoiob	!Standard message device (usually TTY:)
+		      ,STRING = (.line_cnt, CH$PTR (work_buffer)));
+%ELSE
+    status = 	emsg (.message, work_desc, false);
+%FI
+
+    END;			!End of PUTMSG
+
+
+%SBTTL 'SCNMSG -- fill in missing arguments in message string'
+ROUTINE scnmsg (line, message, arg, len) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine expands the specified message. The first routine
+!	argument is a ch$ptr to a work area where the expanded message is
+!	written to. The second routine argument points to a string consisting 
+!	of a string intermixed with special formatting flags which cause special
+!	actions to happen to the string when a flag is encountered. The legal
+!	flags in the string are: 
+!
+!		%S - Using the second and third call arguments place the
+!		     specified string at this point.
+!		%N - Using the second argument only, place the specified
+!		     decimal number at this point.
+!		%P - Insert the Current Output Page.
+!		%L - Insert the Current Output Line.
+!		%I - Insert the input page number.
+!		%C - Insert the input sequence number.
+!		%F - Insert the name of the current input file.
+!		%O - Insert the name of the output file.
+!		%A - Insert the name of the old (input) .BRN file.
+!		%B - Insert the name of the new (output) .BRN file.
+!		%V - Insert the program version number
+!		%X - Insert "s" if %N is other then 1.
+!
+!	More than one of the above arguments can occur in a message,
+!	except that %S and %N are mutually exclusive and cannot occur
+!	in the same message.
+!
+!	An illegal flag will be interpreted as plaintext.
+!
+! FORMAL PARAMETERS:
+!
+!	LINE - Ch$ptr to where the message is to be built up
+!	MESSAGE - Pointer to the desired message (unexpanded).
+!	ARG - Contains a value, if it is to be used with %N,
+!	      contains a pointer to a string if it is to be used with %S.
+!	LEN - Unused with %N, Contains the string length for %S.
+!
+! IMPLICIT INPUTS:
+!
+!	PAGEN		- Output Page number
+!	PHAN_LINES_TP	- Output Line number
+!	IRAC_IPAGEN	- Input page number
+!	IRAC_ISEQN	- input line count
+!	IRAC_FSPECP	- Pointer to Input file name string
+!	IRAC_FSPECC	- Length of Input file name string
+!
+! IMPLICIT OUTPUTS:	None
+!
+! ROUTINE VALUE:
+!
+!	Returns the number of characters in the expanded message.
+!
+! SIDE EFFECTS:		None
+!--
+
+    BEGIN
+    LOCAL
+	line_cnt,				!Size of output line
+	line_ptr,				!String pointer to output line
+	strg_cnt,				!Size of input line
+	strg_ptr;				!String pointer to input line
+
+    !Set up for processing
+    line_ptr=.line;
+    line_cnt=0;
+    strg_ptr=.message;
+
+    !Get input line size (length of orginial error message string)
+    strg_cnt = CH$RCHAR_A (strg_ptr);
+
+    !Now process the entire input string
+    INCR i FROM 1 TO .strg_cnt DO
+	BEGIN
+	LOCAL
+	    character;
+
+	character = CH$RCHAR_A (strg_ptr);
+
+	IF .character NEQ %C'%'
+	THEN
+	    BEGIN		! Normal text characters are packed directly
+	    CH$WCHAR_A (.character, line_ptr);
+	    line_cnt = .line_cnt + 1
+	    END
+	ELSE
+	    BEGIN		! Special case flag handling goes on here
+	    character = CH$RCHAR_A (strg_ptr);
+	    i=.i+1;
+
+	    !Process all of the alternatives
+	    SELECTONE .character OF
+		SET
+
+%IF DSRPLUS %THEN
+		[%C'A']:	! Input .BRN File Specification
+		    BEGIN
+		    BIND
+			file_spec_descr = brniob [iob$t_resultant] : $STR_DESCRIPTOR ();
+
+		    line_cnt =  .line_cnt +
+				pacstr (.file_spec_descr [str$a_pointer]
+				       ,.file_spec_descr [str$h_length]
+				       ,line_ptr);
+		    END;
+%FI
+		[%C'B']:	! Output .BRN File Specification
+		    BEGIN
+		    BIND
+			file_spec_descr = brnoob [iob$t_resultant] : $STR_DESCRIPTOR ();
+
+		    line_cnt =  .line_cnt +
+				pacstr (.file_spec_descr [str$a_pointer]
+				       ,.file_spec_descr [str$h_length]
+				       ,line_ptr);
+		    END;
+
+		[%C'C']:	! Input Sequence Number
+		    line_cnt = .line_cnt+pacbas (.irac_iseqn, line_ptr, 10);
+
+		[%C'F']:	! Current Input File Name
+		    line_cnt = .line_cnt + pacstr (.irac_fspecp
+						  ,.irac_fspecc
+						  ,line_ptr);
+
+		[%C'O']:	! Output File Specification
+		    BEGIN
+		    BIND
+			file_spec_descr = rnoiob [iob$t_resultant] : $STR_DESCRIPTOR ();
+
+		    line_cnt =  .line_cnt +
+				pacstr (.file_spec_descr [str$a_pointer]
+				       ,.file_spec_descr [str$h_length]
+				       ,line_ptr);
+		    END;
+
+		[%C'I']:	! Input Page Number
+		    line_cnt = .line_cnt + pacbas (.irac_ipagen, line_ptr, 10);
+
+		[%C'L']:	! Output Line Number
+		    line_cnt = .line_cnt + pacbas (.phan_lines_tp, line_ptr, 10);
+
+		[%C'N']:	! Numeric passed argument
+		    line_cnt = .line_cnt + pacbas (.arg, line_ptr, 10);
+
+		[%C'P']:	! Current Output Page Number
+		    line_cnt = .line_cnt + pacpag (pagen, line_ptr);
+
+		[%C'S']:	! String passed argument
+
+		    ! In no case insert more than 100 characters.
+		    !		 (Defensive coding.)
+
+		    line_cnt = .line_cnt + pacstr (.arg
+						  ,MIN (100, .len)
+						  ,line_ptr);
+
+		[%C'V']:	! Insert version number of program
+		    BEGIN
+		    EXTERNAL
+			rnovrl,		! Length of version number string
+			rnovrp;		! CH$PTR to string
+
+		    line_cnt = .line_cnt + pacstr (.rnovrp, .rnovrl, line_ptr);
+		    END;
+
+		[%C'X']:	! Insert an "s" if %N was other then 1.
+		    IF .arg NEQ 1 
+		    THEN
+			BEGIN
+			CH$WCHAR_A (%C's', line_ptr);
+			line_cnt=.line_cnt+1
+			END;
+
+		[OTHERWISE]:	! Unrecognized flag, treat as text
+		    BEGIN
+		    CH$WCHAR_A (%C'%',line_ptr);
+		    CH$WCHAR_A (.character, line_ptr);
+		    line_cnt = .line_cnt+2
+		    END;
+
+		TES
+
+	    END
+
+	END;
+
+    RETURN .line_cnt;
+    END;			!End of SCNMSG
+
+
+%SBTTL 'REPORT_SECONDARY_MESSAGE -- if present, get and output it'
+ROUTINE report_secondary_message (msgcode) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	If the MSGCODE is nonzero, it identifies an error message.  Capture
+!	that error message and report it using a call to ERM.
+!
+!	This secondary error message handler was implemented to get the
+!	detailed reason for issuing the following error messages:
+!
+!	    RNFCOB, RNFCOF, RNFCOI, RNFCOO, RNFCOR, RNFCOT, or RNFCOX.
+!
+! FORMAL PARAMETERS:
+!
+!	MSGCODE - An error message code.  For the time being, we assume it's
+!		  within the scope of XPORTs error messages.
+!
+! IMPLICIT INPUTS:	None
+!
+! IMPLICIT OUTPUTS:	None
+!
+! ROUTINE VALUE:
+!
+!	Returns TRUE if the message was there and reported.
+!	Returns FALSE if the code was zero or otherwise not reported.
+!
+! SIDE EFFECTS:		None
+!--
+
+    BEGIN
+    EXTERNAL LITERAL
+	rnfstr;	! I - "%S"
+
+    ! Initialize message string descriptor:
+    w_desc1 [str$b_dtype] = str$k_dtype_t;	! ASCII text (8-bit)
+    w_desc1 [str$b_class] = str$k_class_f;	! Fixed (Scalar) String Descriptor
+    w_desc1 [str$a_pointer] = w_buffer1 [0];	! First byte of char. buffer
+    w_desc1 [str$h_length] = 130;		! Size of buffer
+
+    IF .msgcode NEQ 0 
+    THEN	! If there is at least something in the code,
+	BEGIN			! attempt to capture the message and report it.
+
+%IF %BLISS(BLISS32) %THEN
+	sys$getmsg  (.msgcode
+		    ,w_desc1 [str$h_length]
+		    ,w_desc1
+		    ,1
+		    ,0		);
+
+%ELSE
+	XPO$XMSG (.msgcode, w_desc1 );  	! Get message from XPORT
+%FI
+
+	erm (RNFSTR, .w_desc1 [str$a_pointer], .w_desc1 [str$h_length]);
+	RETURN TRUE;				! Return code indicating that a
+	END
+    ELSE
+	RETURN FALSE;				! Return code indicating that a
+						! message has NOT been output.
+    END;			!End of SCNMSG
+
+END				!End of module
+ELUDOM

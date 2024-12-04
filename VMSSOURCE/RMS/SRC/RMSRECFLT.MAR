@@ -1,0 +1,532 @@
+	.TITLE	RMSRECFLT RMS Recovery Filters
+	.IDENT	/V04-000/
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+
+;
+;++
+; Facility: RMS32 Recovery
+;
+; Abstract:
+;
+;		This module contains all the code necessary to allocate,
+;		init, and declare all the filters for RMS recovery.
+;
+;
+; Environment:
+;
+;		Star processor running Starlet exec.  This routine is to be
+;		merged into the RCP (Recovery Control Process) to handle
+;		RMS Recovery operations.  This routine never executes outside
+;		the context of the RCP.
+;
+;		This routine must be PIC since it will be merged into the
+;		address space of the RCP.
+;
+; Author: 	Peter Lieberwirth	 Creation Date: 14-Nov-1982
+;
+; Modified By:
+;
+;	V01-010	KPL0010		Peter Lieberwirth	29-Jan-1983
+;		Add journal filter for journal name (if necessary) correctly.
+;		Add RMS facilty filter in VOL and FILE.  Castrate FILE and VOL
+;		until RMS fills in mapping entry properly.
+;
+;	V01-009	KPL0009		Peter Lieberwirth	13-Jan-1983
+;		First pass at better error handling.  Better treatment of
+;		MAPSEQ for BI and CLOSE.
+;
+;	V01-008	KPL0008		Peter Lieberwirth	 6-Jan-1983
+;		XAB output length of journal name is AIL or BIL, not AIS
+;		or BIS (these are input).  Fix bug in INI_MAP_FILTER.
+;		Change JFCB$C_BINARY to JFCB$C_STRING.
+;
+;	V01-007	KPL0007		Peter Lieberwirth	 6-Jan-1983
+;		Re-instate V01-005, which V01-006 managed to lose somehow.
+;		(I wonder what else bad happened?)
+;
+;	V01-006	KPL0005		Peter Lieberwirth	28-Dec-1982
+;		Clean up for support of RUJNL.  Fix code if no JNL
+;		exists in file header.  (Not error, maybe specified
+;		by RODBA.)
+;
+;	V01-005	KPL0004		Peter Lieberwirth	14-Dec-1982
+;		Change XAB journaling flags to a word.
+;
+;	V01-004	KPL0003		Peter Lieberwirth	30-Nov-1982
+;		Clean up some code and commentary, fix register usage.
+;		Use improved interface to GET_BUFF.
+;
+;	V01-003	KPL0002		Peter Lieberwirth	18-Nov-1982
+;		Fix typo.
+;
+;	V01-002	KPL0001		Peter Lieberwirth	18-Nov-1982
+;		Add $CJFDEF for RCP definitions.
+;
+;--
+
+;++
+;	Filter:  A filter is used to tell the RCP what journal entries to
+;	return to the recovery routine.  The filter set up at START time
+;	is used to find all the mapping entries for this file (described by
+;	VOLUME LABEL and FILENAME).  The filter is comprised of the following
+;	components:
+;
+;	1. a zero-terminated filter list that points to the filters.
+;	   In the RMSFILE case, the filter list exists in the ROF that
+;	   is pointed to by the RRB.  There is one entry in the filter list
+;	   for each RMSFILE.  Each entry in the filter list points to a
+;	   filter.
+;
+;	2. a set of filters.  One filter is pointed to by one
+;	   entry in the filter list.  Each RMSFILE filter has two components,
+;	   one that describes the volume label, and one that describes the
+;	   file name.  The filter points to a filter element containing
+;	   the volume label, and it points to a filter element containing
+;	   the filename.  Each VOLUME filter has one component, which
+;	   describes the volume label.
+;
+;	3. two filter elements for RMSFILE, both contained in the RFB.
+;	   one filter element for VOLUME, contained within the RODBA.	
+;
+;	   The first word in each RMSFILE element is the offset in the
+;	   RMS journal entry of the corresponding field: either volume
+;	   label or file name.  The second word contains the length of
+;	   the field in the RMS journal entry.
+;
+;	   Then, the actual volume name or filename is present.
+;
+; RMSFILE Filter:
+;
+; ***********************************
+; *	type	!     size	    *
+; ***********************************
+; *	address of volume label	    *
+; ***********************************
+; *	type	!     size	    *
+; ***********************************
+; *	address of filename	    *
+; ***********************************
+; *		0		    *
+; ***********************************
+;
+; Volume Filter:
+;
+; *******************************************
+; *         filter address                  * (points to longword type and size)
+; *******************************************
+; *    filter list zero terminator	    *
+; *******************************************
+; *       TYPE        *       SIZE          *
+; *******************************************
+; *         filter buffer address           *  (points to journal name in XAB)
+; *******************************************
+;--
+
+.SUBTITLE Declarations
+
+;
+; Include Files
+;
+
+;
+; Macros
+;
+
+	$CJFDEF		; RCP arguement definitions
+	$JFCBDEF	; journal definitions, including filter types
+	$ROFDEF		; RMS recovery filter
+	$RRPDEF		; recovery control packet definitions
+	$RODBDEF	; RCP recoverable object descriptor block definitions
+	$JENDEF		; RCP journal entry offsets
+	$RJRDEF		; RMS journal entry format
+	$RIMPDEF	; RMS recovery impure storage definition
+	$RMSRDEF	; RMS operations
+	$RRBDEF		; rms recovery block
+	$RFBDEF		; rms recovery file block
+	$RVBDEF		; rms recovery volume block
+	$RLOGDEF	; rms recovery logging
+	$RFTLDEF	; rms recovery error codes
+	$FABDEF		; fab definitions
+	$RABDEF		; rab definitions
+	$XABJNLDEF	; journal xab definitions
+
+	.PSECT	REC_CODE,EXE,NOWRT,PIC
+
+.SUBTITLE INI_VOL_FILTER
+
+;++
+;
+; INI_VOL_FILTER
+;
+;	Initialize a volume filter.
+;
+;	If volume recovery, the volume label is in the RVB.
+;	If file recovery, the volume label is in the RFB.
+;
+; Input:
+;	r2 - points to filter
+;	r8 - points to RFB, or RVB
+;	r9 - points to rodba
+;
+;	r3 - must be preserved
+;	r6 - must be preserved
+;
+; Output:
+;	r2 - updated past volume filter
+;
+; Side Effects:
+;	Volume filter initialized.
+;
+;--
+
+INI_VOL_FILTER::
+
+	brw	20$
+
+	BBS	#RRB$V_VOLUME,-		; branch if volume recovery
+		RRB$W_FLAGS(R11),10$	;
+
+; must be file recovery
+; put volume label in filter
+;
+	MOVW	RFB$W_VOL_SIZ(R8),(R2)	; size of volume name
+	ADDW2	#2,(R2)+		; count filter length + offset
+	MOVZBW	#JFCB$C_STRING,(R2)+	; type of filter
+
+	MOVAL	RFB$W_VOL_OFF(R8),-	; put address of filter buffer for
+		(R2)+ 			; volume label in filter element
+	BRB	20$			; go exit with success
+10$:					; must be volume recovery
+
+; put volume label in filter
+;
+	MOVW	RVB$W_VOL_SIZ(R8),(R2)	; put size in filter
+	ADDW2	#2,(R2)+		; count filter length and offset
+	MOVZBW	#JFCB$C_STRING,(R2)+	; type of filter
+	MOVAL	RVB$W_VOL_OFF(R8),-	; put pointer to volume label in filter
+		(R2)+	
+
+20$:	MOVL	#1,R0			; success
+30$:	RSB				; return to caller
+
+.SUBTITLE INI_FILE_FILTER
+
+;++
+;
+; INI_FILE_FILTER
+;
+;	This routine inits a filter describing a file name.
+;
+;	If volume recovery, then no filter needs to be declared because the
+;	combination of volume label filter and mapping filter will be enough
+;	to get all journal records.  Same with RUJNL recovery.
+;
+;	If file recovery, then the RFB has all the right stuff.
+;
+; Inputs:
+;	r8 - rfb
+;	r2 - pointer to filter
+;
+;	r3,r6 - must be preserved
+;
+; Outputs:
+;	r2 - updated
+;
+; Side effects:
+;	File filter initialized.
+;
+;--
+
+INI_FILE_FILTER::
+
+	brw	20$
+
+	BBS	#RRB$V_VOLUME,-		; branch if volume recovery
+		RRB$W_FLAGS(R11),20$	;
+	BBS	#RRB$V_RUJNL,-		; branch if RUJNL recovery
+		RRB$W_FLAGS(R11),20$	;
+
+; must be file recovery
+; 
+; put filename in filter
+;
+	MOVW	RFB$W_FIL_SIZ(R8),(R2)	; size of file name
+	ADDW2	#2,(R2)+		; count filter length + offset
+	MOVZBW	#JFCB$C_STRING,(R2)+	; type of filter
+	MOVAL	RFB$W_FIL_OFF(R8),-	; put address of filter buffer for
+		(R2)+ 			; file name in filter element
+
+20$:					; must be volume recovery
+30$:	MOVL	#1,R0			; say success
+	RSB				; and return
+
+.SUBTITLE INI_RMS_FILTER
+
+;++
+; INI_RMS_FILTER
+;
+;	Initialize a filter to specify RMS written entries only.
+;
+; Inputs:
+;	r11 - rrb
+;	r2 - pointer to filter
+;
+;	r3,r6 - must be preserved
+;
+; Outputs:
+;	r2 - updated
+;
+; Side effects:
+;	RMS filter initialized.
+;
+;--
+
+INI_RMS_FILTER::
+
+	MOVW	#2,(R2)+		; move in size of facility code
+	MOVW	#JFCB$C_FACCODE,(R2)+	; tell CJF its a facility code
+	MOVAL	RRB$L_RMS_FAC(R11),(R2)+; and point the filter at it
+
+	MOVL	#1,R0			; success
+	RSB				; return to caller
+
+.SUBTITLE INI_MAP_FILTER
+
+;++
+; INI_MAP_FILTER
+;
+;	Allocate and initialize a filter to specify the mapping sequence number
+;	from an RMS journaling entry.  Then, every journal entry with that
+;	MAPSEQ will be passed to this routine.  This has the effect of mapping
+;	the large tag "volume label/file name" into a four-byte sequence number.
+;
+;	Only the OPEN or CLOSE file operation writes a journal entry containing
+;	this large tag.  Subsequent operations need only specify the four-byte
+;	mapping tag.
+;
+; Inputs:
+;
+;	ap  - to get address of rcp journal entry
+;	r8  - has rfb
+;	r9  - has rjr
+;
+; Outputs:
+;
+;	r0  - status
+;	filter for mapping sequence number is declared to the RCP
+;
+; Side effects:
+;
+;	r1,r2 used.
+;--
+
+INI_MAP_FILTER::
+
+	MOVZBL	#<ROF$C_MAPSEQLEN-ROF$C_OVHD>,R1 ; size of excess over common
+					         ; overhead
+	BSBW	RM$RR_ALL_ROF		; get a filter
+	BLBC	R0,20$			; get out on error
+
+	MOVL	RFB$L_FILTERS(R8),-	; link this filter into list off RFB
+		ROF$L_NXT(R2)		;
+	MOVL	R2,RFB$L_FILTERS(R8)	; point RFB at filter
+					;
+	BBSS	#ROF$V_MAPSEQ,-		; indicate this filter is mapping a
+		ROF$W_FLAGS(R2),10$	; sequence number
+10$:					;
+
+;
+; fill in filter list, which points to filter element descriptor.  the filter
+; list and the filter element are both contained within the ROF
+;
+	MOVAL	ROF$L_FILT_ELEM(R2),-	; address of element descriptor in list
+		ROF$L_FILT_LIST(R2)	;
+					;
+;
+; fill in filter element, which has type, size, and address of actual filter
+;
+	MOVW	#12,ROF$W_SIZE(R2)	; three longwords comprise the actual
+					; filter
+	MOVW	#JFCB$C_STRING,-	; the type of the filter is STRING
+		ROF$W_TYPE(R2)		;
+	MOVAL	ROF$L_FILT_BUFF(R2),-	; the filter element points to the
+		ROF$L_ADDRESS(R2)	; buffer which actually has the filter
+					;
+;
+; Fill in the actual filter, the first word in the filter is the offset in the
+; journal record of the sequence number, the second word is the size of the
+; sequence number (4 bytes), and the second longword is actually the sequence
+; number.  Note that these two longwords are adjacent early in the ROF.
+;
+	ASSUME	ROF$L_MAPSEQ EQ ROF$L_FILT_BUFF+4
+
+	MOVW	#RJR$L_MAPSEQ,-		; offset = RJR$L_MAPSEQ
+		ROF$W_M_OFFSET(R2)	;
+	MOVW	#4,ROF$W_M_SIZE(R2)	; mapping sequence number is 4 bytes
+					;
+	MOVL	RJR$L_MAPSEQ(R9),-	; use mapseq number from rjr if present
+		ROF$L_MAPSEQ(R2)	;
+	BNEQ	15$			; got one
+	MOVL	RCPARG$_JEN(AP),R1	; get RCP journal entry address
+	MOVL	JEN$L_SEQNO(R1),-	; fill in the mapping sequence number
+		ROF$L_MAPSEQ(R2)	;
+15$:					;
+	MOVAL	ROF$L_FILT_LIST(R2),R1	; get address of filter list
+	BSBW	ADD_FILTER		; go add the filter
+20$:	RSB				; and return
+
+.SUBTITLE ADD_JNL_FILTER
+
+;++
+;
+; ADD_JNL_FILTER
+;
+;	This routine tells the RCP what journal is to be used to recover a
+;	particular RMSFILE.  Note that the file
+;	being opened, at least in the AI recovery case, is not necessarily
+;	the file that was originally journaled.  The new file may not be
+;	marked for journaling at all, or may be marked for journaling to
+;	a different journal.
+;
+;	If a journal was specified in input, the file header is not
+;	interrogated.
+;
+; Inputs:
+;	r8  - RFB for JNLXAB
+;	r10 - RRP for FORWARD or BACKWARD flag
+;
+;	r6  - must be preserved
+;
+; Outputs:
+;	r0  - status
+;
+; Side Effects:
+;	journal filter allocated, filled in, and declared to RCP.
+;
+;--
+
+ADD_JNL_FILTER::
+
+	MOVL	R6,-(SP)		; save R6
+
+	MOVZWL	#RODBA$K_JNLNAME,R1	; look for input journal name
+	BSBW	FIND_RODBA		; go get it
+	BLBS	R0,10$			; return if found
+	MOVL	RFB$L_JNLXAB(R8),R6	; get address of JNLXAB
+	BBC	#RRP$V_FORWARD,-	; branch if roll-back
+		RRP$W_FLAGS(R10),30$	;
+
+; Must be roll-forward recovery.
+;
+	BBC	#XAB$V_AI,-		; error if recovery request is
+		XAB$W_JOP(R6),10$	; roll-forward and file is not AI
+	MOVL	XAB$L_AIA(R6),R5	; get address of journal name
+	MOVZBL	XAB$B_AIL(R6),R4	; get size of journal name string
+	BRB	40$			; join common code
+
+10$:	BRW	42$			; branch aid
+
+30$:					;
+
+; Must be roll-backward recovery.
+;
+	BBC	#XAB$V_BI,-		; error if recovery request is
+		XAB$W_JOP(R6),10$	; roll-backward and file is not BI
+	MOVL	XAB$L_BIA(R6),R5	; get address of journal name
+	MOVZBL	XAB$B_BIL(R6),R4	; get size of journal name string
+
+40$:					; common add journal filter code
+
+; r4 contains size of journal name string
+; r5 contains address of journal name string
+;
+; allocate and init buffer for journal filter
+;
+	MOVZBL	#<4+4+8>,R1		; size is as above
+	JSB	RM$RR_GET_BUFF		; allocate a buffer big enough
+	BLBC	R0,45$			; get out on error
+	MOVL	R2,R1			; save address of filter list
+	MOVAL	8(R2),(R2)+		; init filter address
+	CLRL	(R2)+			; terminate filter list of one element
+	MOVZBW	R4,(R2)+		; fill in SIZE of journal name
+	MOVZBW	#JFCB$C_JOURNAL,(R2)+	; TYPE of filter is journal
+	MOVL	R5,(R2)			; fill in address of journal name string
+
+	BSBW	ADD_FILTER		; go add the filter (tell RCP)
+42$:	MOVL	(SP)+,R6		; restore R6 for caller
+	RSB				; to caller
+
+45$:	BRW	NODME			; error branch aid
+
+.SUBTITLE ADD_FILTER
+
+;++
+; ADD_FILTER
+;
+;	This routine calls back the RCP to specify a filter.
+;
+; Inputs:
+;	r1 - address of filter list to add
+;
+; Outputs:
+;	r0 - status
+;
+; Status:
+;	on success, filter added
+;--
+
+ADD_FILTER::
+
+	MOVL	R1,-(SP)		; push address of filter list
+	MOVZBL	#RCP$K_FADD,-(SP)	; tell RCP to add filter
+	CALLS	#2,@RCPARG$_CALLBAK(AP)	; add the filter
+	RSB				; return to caller
+
+.SUBTITLE DELETE_FILTER
+
+;++
+; DELETE_FILTER
+;
+;	This routine is used to delete a filter from the RCP.  It is the inverse
+;	of ADD_FILTER (above).  (THIS ROUTINE IS CURRENTLY NEVER CALLED.)
+;
+; Inputs:
+;	r1 - address of filter list to delete
+;
+; Outputs:
+;	r0 - status
+;
+; Side effects:
+;	filter deleted
+;--
+
+DELETE_FILTER::
+
+	MOVL	R1,-(SP)		; push address of filter list to delete
+	MOVZWL	#RCP$K_FDEL,-(SP)	; tell RCP to delete this sucker
+	CALLS	#2,@RCPARG$_CALLBAK(AP)	; delete the filter
+	RSB				; return to caller
+
+	.END

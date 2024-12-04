@@ -1,0 +1,466 @@
+MODULE main		(IDENT='V04-000',
+			MAIN=CDU$MAIN,
+			ADDRESSING_MODE(EXTERNAL=GENERAL))
+= BEGIN
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! Facility:	Command Definition Utility, Main Module
+!
+! Abstract:	This module contains the main routines for the Command
+!		Definition Utility, formerly known as the Command Language
+!		Editor.  The CDU is responsible for maintaining CLI Tables,
+!		which are images or object files containing the internal
+!		representation of DCL or MCR commands.  The primary
+!		component of the CDU is a compiler which reads Command
+!		Language Definition (CLD) files and compiles them into the
+!		internal format.  Other features allow the deletion and
+!		extraction of information from DCL Tables, plus other
+!		goodies.
+!
+!		Special thanks goes to Tim Halvorsen, who wrote the
+!		original CDU.  It has been rewritten to make it a bit more
+!		flexible and easy to maintain, particularly in light of all
+!		the enhancements in VMS V4.
+!
+! Environment:	Native, User mode.  The following privileges are required:
+!
+!			CMEXEC		For fooling with P1 space.
+!
+! Author:	Paul C. Anagnostopoulos
+! Creation:	18 January 1983
+!
+! Modifications:
+!--
+
+
+library 'sys$library:lib';
+require 'cdureq';
+
+!	T A B L E   O F   C O N T E N T S
+!	---------   ---   ---------------
+
+forward routine
+	cdu$main,
+	cdu$delete_mode: novalue,
+	cdu$object_mode: novalue,
+	cdu$replace_mode: novalue,
+	cdu$symbols_mode: novalue,
+	cdu$report_rms_error: novalue;
+
+
+!	E X T E R N A L   R E F E R E N C E S
+!	---------------   -------------------
+
+external routine
+	cdu$cld,
+	cdu$close_symbol_table_file,
+	cdu$delete_verb_name,
+	cdu$free_all_nodes,
+	cdu$generate_table_blocks,
+	cdu$open_next_cld,
+	cdu$prepare_input_table,
+	cdu$prepare_listing_file,
+	cdu$prepare_new_table,
+	cdu$prepare_object_file,
+	cdu$report_listing_trailer,
+	cdu$write_object_file,
+	cdu$write_output_table,
+	cdu$write_symbol_table_file,
+	cli$get_value,
+	cli$present,
+	str$trim;
+
+external
+	cdu$gl_cld_errors: long;
+
+!	G L O B A L   D A T A
+!	-----------   -------
+
+! The following item specifies the facility string to be used in object files
+! or any other files we create.
+
+global bind
+	cdu$facility_string = dtext('VAX/VMS Command Definition Utility (V4-001)'): descriptor;
+
+!++
+! Description:	This is the main routine of the Command Definition Utility.
+!		It is responsible for determining which operating mode the
+!		user has requested and invoking a routine for that mode.
+!
+! Parameters:	None.
+!
+! Returns:	Most severe status encountered during execution.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$main
+= BEGIN
+
+own
+	worst_status: long initial(msg(cdu$_success));
+
+! The following routine is the global condition handler.  Its purpose is to
+! save the worst status that is signalled during the execution of the CDU.
+! It is this status that is returned to DCL.
+
+ROUTINE condition_handler(signal_vector: ref vector[,long])
+= BEGIN
+
+bind
+	status = signal_vector[1]: long;
+own
+	severity_map: vector[8,byte] initial(byte(2,0,3,1,4,4,4,4));
+
+if .severity_map[.status<0,3,0>] gtru .severity_map[.worst_status<0,3,0>] then
+	worst_status = .status;
+
+return false;
+
+END;
+
+! Main routine.
+! Establish a global condition handler to save the worst status that is
+! signalled.
+
+enable
+	condition_handler;
+
+! Determine which operating mode the user wants.  This is specified by a
+! major qualifier on the SET COMMAND command, of which /REPLACE is the default.
+
+if cli$present(dtext('DELETE')) then
+	cdu$delete_mode()
+else if cli$present(dtext('OBJECT')) then
+	cdu$object_mode()
+else if cli$present(dtext('SYMBOLS')) then
+	cdu$symbols_mode()
+else
+	cdu$replace_mode();
+
+! Return the worst status that was signalled, with the inhibit flag set.
+
+return .worst_status + sts$m_inhib_msg;
+
+END;
+
+!++
+! Description:	This routine handles /DELETE mode, in which the user wants
+!		to remove one or more verb names from the CLI table.  We
+!		retrieve the list of verb names and delete them from the
+!		table, reporting any errors.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$delete_mode		: novalue
+= BEGIN
+
+local
+	status: long;
+
+
+! Call a routine to prepare the input CLI table for modification.
+
+cdu$prepare_input_table();
+
+! Loop through the list of verb names to be deleted.
+
+loop (
+
+	! We need a buffer with descriptor to get a verb name.
+
+	with_dbuffer(verb_name,32,
+
+		! Get the next verb name in the list.  Quit if there aren't
+		! any more.
+
+		status = cli$get_value(dtext('DELETE'),verb_name);
+		if not .status then exitloop;
+		str$trim(verb_name,verb_name,verb_name);
+
+		! Call a routine to delete the verb name from the table.
+
+		status = cdu$delete_verb_name(verb_name);
+		check(.status, msg(cdu$_nosuchverb),1,verb_name);
+	);
+);
+
+! Write out the modified CLI table.
+
+cdu$write_output_table();
+
+return;
+
+END;
+
+!++
+! Description:	This routine handles /OBJECT mode, in which the user wants
+!		to compile an object file representing one CLD file.  The
+!		CLD file is compiled and the resulting table blocks are
+!		written into an object file.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$object_mode		: novalue
+= BEGIN
+
+local
+	cld_fab: pointer,
+	first_cld: boolean initial(true);
+
+
+! Call a routine to set up a new, empty CLI table.  Commands defined in the
+! CLD file will be added to this table.
+
+cdu$prepare_new_table();
+
+! Open the CLD file.  If there isn't one, forget it.
+
+cld_fab = cdu$open_next_cld();
+if .cld_fab eqla 0 then
+	return;
+
+! Prepare the object file to receive the table blocks.
+
+cdu$prepare_object_file(.cld_fab);
+
+! Prepare the listing file, if any, to receive the listing.
+
+cdu$prepare_listing_file(.cld_fab);
+
+! Parse the CLD file into an intermediate representation.
+
+cdu$cld();
+
+! If no syntax errors were discovered, then generate all of the CLI
+! table blocks from the intermediate representation.
+
+if .cdu$gl_cld_errors eqlu 0 then
+	cdu$generate_table_blocks();
+
+! If no errors of any kind were discovered, then write the object file.
+
+if .cdu$gl_cld_errors eqlu 0 then
+	cdu$write_object_file();
+
+! Finish up the listing file.
+
+cdu$report_listing_trailer();
+
+return;
+
+END;
+
+!++
+! Description:	This routine handles /REPLACE mode, which is the fundamental
+!		mode by which a user adds or replaces command definitions.
+!		We compile a set of CLD files and add/replace the
+!		definitions to an existing CLI table specified by the user.
+!		When compilation is complete, we create a new CLI table
+!		with all the resulting definitions.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$replace_mode		: novalue
+= BEGIN
+
+local
+	cld_fab: pointer,
+	errors: boolean initial(false);
+
+
+! Call a routine to prepare the input CLI table for modification.
+
+cdu$prepare_input_table();
+
+! Sit in a loop to compile each CLD file.  Open each file in turn, quiting
+! when we run out of files.
+
+while (cld_fab = cdu$open_next_cld()) neqa 0 do (
+
+	! Prepare the listing file, if any, to receive the listing.
+
+	cdu$prepare_listing_file(.cld_fab);
+
+	! Parse the CLD file into its intermediate representation.
+
+	cdu$cld();
+
+	! If no syntax errors were discovered, then generate all of the CLI
+	! table blocks from the intermediate representation.
+
+	if .cdu$gl_cld_errors eqlu 0 then
+		cdu$generate_table_blocks();
+
+	! Remember if any errors occurred, so we won't write the new table.
+
+	if .cdu$gl_cld_errors nequ 0 then
+		errors = true;
+
+	! Clear away the intermediate representation to prepare for the
+	! next CLD file.
+
+	cdu$free_all_nodes();
+
+	! Finish up the listing file.
+
+	cdu$report_listing_trailer();
+);
+
+! If no errors were discovered, then write out the new CLI table.
+
+if not .errors then
+	cdu$write_output_table();
+
+return;
+
+END;
+
+!++
+! Description:	This routine handles /SYMBOLS mode, in which the user wants to
+!		generate a symbol table file from a set of CLD files.  The
+!		symbol table file is needed when commands make use of the
+!		old CLI interface.  The symbols define the qualifier and
+!		keyword numbers for use with the old CLI callbacks.
+!
+!		In this mode, no CLI table blocks are generated.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$symbols_mode		: novalue
+= BEGIN
+
+local
+	symbols_written: boolean initial(false);
+
+
+! Sit in a loop to compile each CLD file.  Open each file in turn, quiting
+! when we run out of files.
+
+while cdu$open_next_cld() neqa 0 do (
+
+	! Parse the CLD file into an intermediate representation.
+
+	cdu$cld();
+
+	! If no syntax errors were discovered, then add the symbols from
+	! this CLD to the symbol table file.
+
+	if .cdu$gl_cld_errors eqlu 0 then (
+		cdu$write_symbol_table_file();
+		symbols_written = true;
+	);
+
+	! Clear away the intermediate representation to prepare for the
+	! next CLD file.
+
+	cdu$free_all_nodes();
+);
+
+! Close out the symbol table file if we ever wrote any.
+
+if .symbols_written then
+	cdu$close_symbol_table_file();
+
+return;
+
+END;
+
+!++
+! Description:	This routine is called to report an error from an RMS
+!		operation.
+!		
+! Parameters:	message		By value, a message status code used for the
+!				first line of the message.  It is assumed
+!				to take a single !AS $FAO argument, the file
+!				spec.
+!		rms_block	By reference, a FAB or RAB which contains
+!				the error status code.
+!
+! Returns:	Nothing.
+!
+! Notes:	This routine assumes that all FABs have associated NAM
+!		blocks.
+!--
+
+GLOBAL ROUTINE cdu$report_rms_error(message: long,
+				    rms_block: pointer)		: novalue
+= BEGIN
+
+local
+	fab: pointer,
+	nam: pointer,
+	file_spec: descriptor;
+
+
+! Pick up a pointer to the FAB and NAM blocks.
+
+fab = (if .rms_block[fab$b_bid] eqlu fab$c_bid then .rms_block else .rms_block[rab$l_fab]);
+nam = .fab[fab$l_nam];
+
+! We need to find a file spec which can be included in the first message
+! line.  Use the one which is most complete.
+
+if .nam[nam$b_rsl] nequ 0 then
+	build_descriptor(file_spec, .nam[nam$b_rsl],.nam[nam$l_rsa])
+else if .nam[nam$b_esl] nequ 0 then
+	build_descriptor(file_spec, .nam[nam$b_esl],.nam[nam$l_esa])
+else
+	build_descriptor(file_spec, .fab[fab$b_fns],.fab[fab$l_fna]);
+str$trim(file_spec,file_spec,file_spec);
+
+! Signal the error stored in the RMS block.
+
+if .rms_block[fab$b_bid] eqlu fab$c_bid then
+	signal(.message,1,file_spec, .rms_block[fab$l_sts],.rms_block[fab$l_stv])
+else
+	signal(.message,1,file_spec, .rms_block[rab$l_sts],.rms_block[rab$l_stv]);
+
+return;
+
+END;
+END
+ELUDOM

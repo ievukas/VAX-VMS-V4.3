@@ -1,0 +1,519 @@
+MODULE network_server (IDENT = 'V04-000',
+			MAIN = network_server,
+			ADDRESSING_MODE(EXTERNAL=GENERAL)) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  DECnet
+!
+! ABSTRACT:
+!
+!	This program is used to enable a process to wait for an incoming
+!	DECnet logical link connection, and then accept the logical link
+!	request by invoking the correct procedure using CLI CHAIN.  This
+!	is used to allow a single process to handle many logical link
+!	requests, and reduce the overhead involved in process creation.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system. unprivileged user mode,
+!
+! AUTHOR:  Tim Halvorsen, June 1982
+!
+! Modified by:
+!
+!	V03-004	PRB0337		Paul Beck	27-Jun-1984  16:33
+!		Change default timeout from 1 minute to 5 minutes.
+!
+!	V003	TMH0003		Tim Halvorsen	07-Apr-1983
+!		Add support for direct execution of an object image,
+!		if the object filespec contains an explicit ".EXE".
+!
+!	V002	TMH0002		Tim Halvorsen	24-Feb-1983
+!		Add support for EPIDs by using the IPID returned
+!		by DECLSERV to index the SPI database, rather than
+!		using the EPID returned by GETJPI.
+!
+!	V001	TMH0001		Tim Halvorsen	 7-Feb-1983
+!		Add code to display where each connect request comes
+!		from (by displaying the NCB), so that .LOG files can
+!		be more easily read.
+!--
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:STARLET';		! VAX/VMS common definitions
+
+LIBRARY 'SHRLIB$:NET';			! NETACP control QIO definitions
+
+!
+! Table of contents
+!
+
+FORWARD ROUTINE
+    network_server,			! Main routine
+    timeout_ast:	NOVALUE,	! Timeout AST
+    issue_mailbox_read:	NOVALUE,	! Issue network mailbox read
+    net_interrupt:	NOVALUE,	! Mailbox attention AST
+    fao_buffer;				! Invoke FAO and return descriptor
+
+!
+! Literals
+!
+
+LITERAL
+    true = 1,
+    false = 0;
+
+!
+! Macros
+!
+
+MACRO
+    fao(string) =
+	fao_buffer(%ASCID string
+	%IF %LENGTH GTR 1 %THEN ,%REMAINING %FI)%,
+
+    write_line(string) =
+	LIB$PUT_OUTPUT(fao(string
+	%IF %LENGTH GTR 1 %THEN ,%REMAINING %FI))%,
+
+    signal_if_error(command) =
+	BEGIN
+	LOCAL
+	    status;
+
+	status = command;
+	IF NOT .status
+	THEN
+	    BEGIN
+	    SIGNAL(.status);
+	    RETURN .status OR sts$m_inhib_msg;
+	    END;
+	END%;
+
+!
+! Own storage
+!
+
+LITERAL
+    mbx_maxmsg = 128;			! Maximum size of mailbox message
+
+OWN
+    net_channel: WORD,			! Channel to ACP
+    mbx_channel: WORD,			! Channel to assoc. mailbox
+    mbx_message: VECTOR [mbx_maxmsg,BYTE], ! Mailbox input buffer
+    mbx_iosb:	$BBLOCK [8];		! I/O status block for mailbox
+
+!
+! External routines
+!
+
+EXTERNAL ROUTINE
+    lib$asn_wth_mbx,			! Assign with assoc. mailbox
+    lib$set_logical,			! Define supervisor mode logical name
+    lib$run_program,			! Chain to another program
+    lib$do_command,			! Chain a CLI command string
+    lib$put_output,			! Write to SYS$OUTPUT
+    str$concat;				! Concatenate strings together
+
+ROUTINE network_server =
+
+!---
+!
+!	This routine is the entry point to the program
+!
+! Inputs:
+!
+!	None
+!
+! Outputs:
+!
+!	Routine value = status code
+!---
+
+BEGIN
+
+LOCAL
+    nfb:	$BBLOCK [nfb$c_length+20*4],	! Network function block
+						! (room for 20 field requests)
+    nfb_desc:	VECTOR [2]		! Descriptor of NFB
+		INITIAL(nfb$c_length + 3*4),
+    iosb:	$BBLOCK [8],		! I/O status block
+    time_buf:	VECTOR [128,BYTE],	! Buffer for timeout specifier
+    time_desc:	VECTOR [2]		! Descriptor of timeout specifier
+		INITIAL(128),
+    delta_time:	VECTOR [2],		! Binary time quadword
+    buffer:	VECTOR [64],		! Return buffer
+    buffer_desc: VECTOR [2]		! Descriptor of above buffer
+		INITIAL(256),
+    keys:	$BBLOCK [4+4+nfb$c_ctx_size], ! Buffer for search key & context
+    key_desc:	VECTOR [2]		! Descriptor of above buffer
+		INITIAL(4+4+nfb$c_ctx_size),
+    ptr:	REF $BBLOCK,		! Pointer into return buffer
+    cmd_desc:	$BBLOCK [8]		! Command string
+		PRESET ([dsc$b_class] = dsc$k_class_d,
+			[dsc$w_length] = 0,
+			[dsc$a_pointer] = 0),
+    ncb_desc:	VECTOR [2],		! Descriptor of NCB
+    ascii_ncb_desc: VECTOR [2],		! Descriptor of ASCII portion of NCB
+    filespec:	VECTOR [2],		! Descriptor of procedure filespec
+    prcnam:	VECTOR [2],		! Descriptor of process name
+    ipid,				! Our IPID
+    epid,				! Our EPID
+    item_list:	$BBLOCK [10*4]
+		PRESET ([0,0,16,0] = 4,
+			[2,0,16,0] = jpi$_pid,
+			[8,0,32,0] = 0,
+			[12,0,32,0] = 0),
+    status;
+
+BIND
+    default_time = %ASCID '0 00:05:00': $BBLOCK;
+
+!
+! Initialize some stack local variables with dynamic pointers
+!
+
+nfb_desc [1] = nfb;
+time_desc [1] = time_buf;
+buffer_desc [1] = buffer;
+key_desc [1] = keys;
+item_list [4,0,32,0] = epid;
+
+!
+! Get our own EPID for later lookup of our server parameters
+!
+
+signal_if_error(
+    $GETJPI(ITMLST = item_list));	! Get our EPID
+
+!
+! Assign a channel to the network ACP
+!
+
+signal_if_error(
+    LIB$ASN_WTH_MBX(%ASCID '_NET:',	! Assign channel to NETACP
+			0,0,		! mailbox MAXMSG,BUFQUO
+			net_channel,	! Channel to NETACP
+			mbx_channel));	! Channel to mailbox
+
+!
+! Issue a read on the associated mailbox, so that we can receive
+! notification of network broadcast messages.  This is done so that
+! we can detect the network shutting down.
+!
+
+issue_mailbox_read();			! Issue mailbox read
+
+!
+! Set our process name to something which indicates that we are a network
+! server waiting for work.  This has the effect of wiping out the previous
+! process name set by the previous connect to this process.
+!
+
+prcnam [0] = .buffer_desc [0];		! Make descriptor of scratch buffer
+prcnam [1] = .buffer_desc [1];
+
+$FAO(%ASCID 'SERVER_!XW',		! Generate a unique process name
+	prcnam,				! Output buffer descriptor
+	prcnam [0],			! Place to return length
+	.epid);				! Use last 4 digits of EPID
+
+$SETPRN(PRCNAM = prcnam);		! Set our process name
+					! (ignore any errors)
+
+!
+! Schedule a timer, so that if the following QIO does not complete within
+! a reasonable amount of time, we can go away (since there was no work to do).
+!
+
+status = $TRNLOG(LOGNAM = %ASCID 'NETSERVER$TIMEOUT', ! Get timeout value
+		RSLBUF = time_desc,
+		RSLLEN = time_desc [0]);
+
+IF .status NEQ ss$_normal		! If not explicitly specified,
+THEN
+    BEGIN
+    time_desc [0] = .default_time [dsc$w_length];
+    time_desc [1] = .default_time [dsc$a_pointer];
+    END;
+    
+signal_if_error(
+    $BINTIM(TIMBUF = time_desc,		! Translate time specifier to binary
+	    TIMADR = delta_time));
+
+signal_if_error(
+    $SETIMR(DAYTIM = delta_time,	! Start timer
+	    ASTADR = timeout_ast));	! Address of AST routine
+
+!
+! Tell NETACP that we are available for a connect request.  The QIOW
+! will complete when a connect has been assigned to us.
+!
+
+CH$FILL(0,nfb$c_length,nfb);		! Pre-zero NFB fields
+nfb [nfb$b_fct] = nfb$c_declserv;	! Tell NETACP we are available for work
+
+status = $QIOW(FUNC = IO$_ACPCONTROL,	! Issue control function
+		CHAN = .net_channel,
+		IOSB = iosb,
+		P1 = nfb_desc);		! Address of NFB descriptor
+
+IF NOT .status				! If error detected,
+    OR NOT (status = .iosb [0,0,16,0])
+THEN
+    IF .status EQL ss$_abort		! If we timed out,
+    THEN
+	BEGIN
+	$DASSGN(CHAN = .net_channel);	! Deassign the ACP channel
+	RETURN sts$k_severe OR sts$m_inhib_msg; ! Return "fatal" from program
+	END
+    ELSE
+	BEGIN
+	SIGNAL(.status);		! else signal the error
+	$DASSGN(CHAN = .net_channel);	! Deassign the ACP channel
+	RETURN true;
+	END;
+
+ipid = .iosb [4,0,32,0];		! Get our IPID returned by DECLSERV
+
+CH$FILL(0,nfb$c_length,nfb);		! Pre-zero NFB fields
+
+nfb [nfb$b_fct] = nfb$c_fc_show;	! Request "show" function
+nfb [nfb$b_database] = nfb$c_db_spi;	! of server process database
+nfb [nfb$l_srch_key] = nfb$c_spi_pid;	! for our process
+nfb [nfb$b_oper] = nfb$c_op_eql;	! by checking if field EQL P2 value
+
+CH$MOVE(4*4, UPLIT LONG(		! Request the following fields:
+		nfb$c_spi_ncb,		! Network connect block
+		nfb$c_spi_sfi,		! Procedure filespec
+		nfb$c_spi_pnm,		! Process name
+		nfb$c_endoflist),
+    		nfb [nfb$l_fldid]);
+
+keys [0,0,32,0] = 0;			! Zero count of fields in P4 (unused)
+keys [4,0,32,0] = .ipid;		! Search value = our IPID
+keys [8,0,16,0] = 0;			! Context area = at beginning
+
+status = $QIOW(FUNC = IO$_ACPCONTROL,	! Issue control function
+		CHAN = .net_channel,
+		IOSB = iosb,
+		P1 = nfb_desc,		! Address of NDB descriptor
+		P2 = key_desc,		! Address of key buffer descriptor
+		P4 = buffer_desc);	! Address of return buffer descriptor
+
+IF NOT .status			! If error detected,
+    OR NOT (status = .iosb [0,0,16,0])
+THEN
+    BEGIN
+    SIGNAL(.status);			! then stop looping
+    $DASSGN(CHAN = .net_channel);	! Deassign the ACP channel
+    RETURN true;
+    END;
+
+ptr = buffer [0];			! Point to first string in buffer
+
+ncb_desc [0] = .ptr [0,0,16,0];		! Construct descriptor of NCB
+ncb_desc [1] = .ptr + 2;
+ptr = .ptr + 2 + .ptr [0,0,16,0];	! Skip by string in buffer
+
+filespec [0] = .ptr [0,0,16,0];		! Construct descriptor of procedure
+filespec [1] = .ptr + 2;
+ptr = .ptr + 2 + .ptr [0,0,16,0];	! Skip by string in buffer
+
+prcnam [0] = .ptr [0,0,16,0];		! Construct descriptor of process name
+prcnam [1] = .ptr + 2;
+ptr = .ptr + 2 + .ptr [0,0,16,0];	! Skip by string in buffer
+
+ptr = CH$FIND_CH(.ncb_desc [0], .ncb_desc [1], '/');
+
+ascii_ncb_desc [0] = .ptr - .ncb_desc [1];
+ascii_ncb_desc [1] = .ncb_desc [1];
+
+write_line('');
+write_line('        --------------------------------------------------------');
+write_line('');
+write_line('        Connect request received at !%D', 0);
+write_line('            from remote process !AS"', ascii_ncb_desc);
+write_line('            for object "!AS"', filespec);
+write_line('');
+write_line('        --------------------------------------------------------');
+write_line('');
+
+signal_if_error(
+    $SETPRN(PRCNAM = prcnam));		! Set our process name
+
+signal_if_error(
+    LIB$SET_LOGICAL(%ASCID 'SYS$NET',	! Define SYS$NET to NCB
+		ncb_desc));
+
+cmd_desc [dsc$b_class] = dsc$k_class_d;	! Create dynamic string descriptor
+cmd_desc [dsc$a_pointer] = 0;		! Indicate no dynamic string yet
+signal_if_error(
+    STR$CONCAT(cmd_desc,		! Create "@filespec" command
+		%ASCID '@',filespec));
+
+IF NOT CH$FAIL(CH$FIND_SUB(		! If .EXE found in filespec,
+		.filespec [0], .filespec [1],
+		4, UPLIT BYTE('.EXE')))
+THEN
+    signal_if_error(
+	LIB$RUN_PROGRAM(filespec))	! Chain to program (EXIT AND CHAIN)
+ELSE
+    signal_if_error(
+	LIB$DO_COMMAND(cmd_desc));	! Else, chain to command line
+
+!
+! Do not put any code after this point.  Both LIB$RUN_PROGRAM and
+! LIB$DO_COMMAND do not return, then cause immediately program exit.
+! The only way we get here is if they fail.
+!
+
+RETURN true;				! Return successfully
+
+END;
+
+ROUTINE timeout_ast: NOVALUE =
+
+!--
+!
+!	This AST is called when our timer has expired.  Since the
+!	DCLSERV QIO has not completed in the required amount of time,
+!	we assume that there are no more requests to be handled by this
+!	process, and we go away.  This is done by cancelling the DECLSERV
+!	QIO.
+!
+! Inputs:
+!
+!	net_channel = Network channel which has DECLSERV pending.
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+$CANCEL(CHAN = .net_channel);		! Cancel the DECLSERV QIO
+
+END;
+
+ROUTINE issue_mailbox_read: NOVALUE =
+
+!---
+!
+!	Issue an asynchronous QIO on the associated mailbox
+!	for the network channel waiting for broadcast messages.
+!
+! Inputs:
+!
+!	mbx_channel = Channel number for mailbox
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+LOCAL
+    status;
+
+signal_if_error(
+    $QIO(FUNC = IO$_READVBLK,		! Issue read on mailbox
+	CHAN = .mbx_channel,
+	EFN = 1,
+	IOSB = mbx_iosb,
+	ASTADR = net_interrupt,
+	P1 = mbx_message,
+	P2 = mbx_maxmsg));
+
+END;
+
+ROUTINE net_interrupt: NOVALUE =
+
+!---
+!
+!	This AST routine is called when the outstanding QIO
+!	on the associated mailbox completes.  If the interrupt
+!	indicates that the network is going down, then make us
+!	go away by canceling any I/O on the network channel
+!	(most likely a pending DECLSERV).
+!
+! Inputs:
+!
+!	mbx_message = Mailbox message
+!	net_channel = Channel to network ACP
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+IF .mbx_message [0] EQL msg$_netshut	! If network shutting down,
+THEN
+    BEGIN
+    $DASSGN(CHAN = .net_channel);	! Cancel any pending DECLSERV I/O
+    net_channel = 0;			! Mark channel no longer active
+    RETURN;				! Do not re-issue mailbox read
+    END;
+
+issue_mailbox_read();			! Issue another read on mailbox
+
+END;
+
+ROUTINE fao_buffer (ctrstr,args) =
+BEGIN
+
+!---
+!
+!	This routine passes an ascii string through the FAO
+!	system service with any number of specified parameters.
+!
+!---
+
+OWN
+    desc :	VECTOR[2],		! Result descriptor
+    buf :	VECTOR[512,BYTE];	! Output buffer
+
+MAP
+    ctrstr :	REF VECTOR[2],
+    args :	VECTOR[4];
+
+desc[0] = 512;				! Set up result descriptor
+desc[1] = buf;
+$faol(ctrstr=.ctrstr,outlen=desc,outbuf=desc,prmlst=args);
+RETURN desc;
+END;
+
+END
+ELUDOM

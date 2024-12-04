@@ -1,0 +1,794 @@
+MODULE parse1		(IDENT='V04-000',
+			ADDRESSING_MODE(EXTERNAL=GENERAL))
+= BEGIN
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! Facility:	Command Definition Utility, CLD Parser Module 1
+!
+! Abstract:	This module is one of a few modules that implements the
+!		parser for CLD files.  This parser translates the CLD source
+!		language into an intermediate representation composed of
+!		nodes linked in a directed graph.
+!
+! Environment:	Standard CDU environment.
+!
+! Author:	Paul C. Anagnostopoulos
+! Creation:	30 November 1982
+!
+! Modifications:
+!
+!	V04-001	BLS0270		Benn Schreiber		 9-FEB-1984
+!		Correct IMAGE statement when image name is not quoted.
+!
+!--
+
+
+library 'sys$library:lib';
+require 'clitabdef';
+require 'cdureq';
+
+!	T A B L E   O F   C O N T E N T S
+!	---------   ---   ---------------
+
+forward routine
+	cdu$cld: novalue,
+	cdu$statement,
+	cdu$define_verb,
+	cdu$define_syntax,
+	cdu$define_type,
+	cdu$v_s_clause;
+
+!	E X T E R N A L   R E F E R E N C E S
+!	---------------   -------------------
+
+external routine
+	cdu$bool_expr,
+	cdu$check_for_children,
+	cdu$cli_flag,
+	cdu$create_node,
+	cdu$get_next_token,
+	cdu$lookup_child,
+	cdu$param_clause,
+	cdu$qual_clause,
+	cdu$report_syntax_error,
+	cdu$token_must_be,
+	cdu$type_clause,
+	cli$present;
+
+external
+	cdu$gl_token_class: long,
+	cdu$gq_token: descriptor;
+
+!	G L O B A L   D A T A
+!	-----------   -------
+
+! The following items contains the address of the root node of the
+! intermediate representation.  This node must be available to all other
+! modules.
+
+global
+	cdu$gl_root_node: ref node;
+
+!	O V E R A L L   S T R U C T U R E
+!	-------------   -----------------
+
+! This is a recursive descent compiler.  That means that the source language,
+! as contained in CLD files, is compiled by routines which recognize certain
+! subsets of the language and call other such routine to recognize the rest
+! of the language.  Routines may be invoked recursively when the syntax
+! is recursive.
+!
+! The language is assumed to be LL(1), which means it is parsed from left
+! to right and each construct can be recognized by inspecting only its
+! first token, with no backtracking.  It is not strictly LL(1), but the
+! exceptions aren't too bad.
+!
+! The complete syntax for CLD files is presented below.  Terminals are
+! shown in upper case, while nonterminals are shown in lower case.  There
+! is a parsing routine for each nonterminal.  This routine is responsible
+! for pulling all tokens for its construct from the file, and creating
+! one or more nodes which are the intermediate representation of the construct.
+!
+! The lexical and syntactic portions of the CDU are based primarily on work
+! done by A. Davie and R. Morrison, described in their book "Recursive Descent
+! Compiling".
+!
+! The intermediate representation of the file is composed of a set of nodes
+! linked together as a directed graph.  Each node represents a single semantic
+! entity, with any subordinate entities as its children.  Children are
+! linked together in a sister chain, as opposed to having an array of
+! child pointers in the node.  The right-hand side of the syntax description
+! shows how the syntax is mapped into nodes.
+
+!	S Y N T A X   F O R   C L D   F I L E S
+!	-----------   -----   -----   ---------
+
+! NONTERMINAL		SYNTAX						INTERMEDIATE REPRESENTATION
+!
+! cld ::=		{[,] statement}+				node with children
+!
+! statement ::=		IDENT h-string |				node with string
+!			MODULE symbol |					node with symbol
+!			define-verb |
+!			define-syntax |
+!			define-type
+!
+! define-verb ::=	DEFINE VERB symbol {[,] v-s-clause}*		node with symbol, children
+!
+! define-syntax ::=	DEFINE SYNTAX symbol {[,] v-s-clause}*		node with symbol, children
+!
+! define-type ::=	DEFINE TYPE symbol {[,] type-clause}*		node with symbol, children
+!
+! v-s-clause ::=	CLIFLAGS ( cli-flag {, cli-flag}* ) |		node with children
+!			CLIROUTINE symbol |				node with symbol
+!			DISALLOW bool-expr |				node with child
+!			NODISALLOWS |					node
+!			IMAGE h-string |				node with string
+!			OUTPUTS ( symbol {,symbol}* ) |			node with children
+!			PARAMETER Pn {[,] param-clause}* |		node with symbol, children
+!			NOPARAMETERS |					node
+!			PREFIX symbol |					node with symbol
+!			QUALIFIER symbol {[,] qual-clause}* |		node with symbol, children
+!			NOQUALIFIERS |					node
+!			ROUTINE symbol |				node with symbol
+!			SYNONYM symbol					node with symbol
+!
+! param-clause ::=	PROMPT [=] {symbol | string} |			node with string
+!			common_clause
+!
+! qual-clause ::=	BATCH |						node
+!			NEGATABLE |					node
+!			NONNEGATABLE |					node
+!			PLACEMENT [=] {GLOBAL | LOCAL | POSITIONAL} |	node with symbol
+!			common_clause
+!
+! type-clause ::=	KEYWORD symbol {[,] keyword-clause}* |		node with symbol, children
+!			PREFIX symbol					node with symbol
+!
+! keyword-clause ::=	NEGATABLE |					node
+!			NONNEGATABLE |					node
+!			common_clause
+!
+! common-clause ::=	CLIFLAGS ( cli-flag {, cli-flag}* ) |		node with children
+!			DEFAULT |					node
+!			LABEL [=] symbol |				node with symbol
+!			SYNTAX [=] symbol |				node with symbol
+!			VALUE [( value_clause {, value_clause}* )]	node with children
+!
+! value-clause ::=	CONCATENATE |					node
+!			NOCONCATENATE					node
+!			DEFAULT [=] {h-string |				node with children
+!					( string {, string}* )} |
+!			IMPCAT |					node
+!			LIST |						node
+!			REQUIRED |					node
+!			TYPE [=] {builtin-type | symbol}		node with code or symbol
+!
+! builtin-type ::=	one of a set of symbols beginning with $
+!
+! cli-flag ::=		ABBREVIATE |					nodes
+!			FOREIGN |
+!			IMMEDIATE |
+!			MCRIGNORE |
+!			MCROPTDELIM |
+!			MCRPARSE |
+!			NOSTATUS
+!
+! bool-expr ::=		bool-term {OR bool-term}*			node with children
+!
+! bool-term ::=		bool-factor {AND bool-factor}*			node with children
+!
+! bool-factor ::=	( bool-expr ) |					bool-expr node
+!			ANY2 ( path {, path}* ) |			node with children
+!			NOT path |					node with child
+!			path
+!
+! path ::=		[< symbol >] symbol {. symbol}*			node with children
+!
+! string ::=		" anything-but-quote* "
+! symbol ::=		{$ | 0-9 | A-Z | _ | a-z}+
+! h-string ::=		string |
+!			anything-but-open-close-comma-equal-eol+
+!
+!
+! NOTES:
+!	Equal signs are optional in cases where they were documented
+!	in the V3.0 documentation.
+!	There is no provision for recognizing a number as a separate token.
+
+!++
+! Description:	This parsing routine recognizes the distinguished nonterminal
+!		"cld", which represents the entire CLD file.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$cld		: novalue
+= BEGIN
+
+local
+	statement: ref node,
+	last_statement: ref node;
+
+
+! Create a root node for the tree.
+
+cdu$gl_root_node = cdu$create_node(node_k_root);
+
+! Loop once for each statement in the CLD file.
+
+cdu$get_next_token();
+until token_is(tkn_k_eof) do (
+
+	! Statements may be separated with commas.
+
+	skip_optional_token(tkn_k_comma);
+
+	! We must have another statement.  Parse it and link its node
+	! onto the end of the statement list.
+
+	statement = cdu$statement(.cdu$gl_root_node);
+	link_parent_to_child(cdu$gl_root_node,statement,last_statement);
+);
+
+return;
+
+END;
+
+!++
+! Description:	This parsing routine recognizes a "statement", which is any
+!		of the major types of definitions that appear in a CLD.
+!
+! Parameters:	parent		By reference, parent node of this constuct.
+!
+! Returns:	The top-level node representing the statement.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$statement(parent: ref node)
+= BEGIN
+
+local
+	statement: ref node;
+
+
+! Determine which kind of statement we have.
+
+if token_is(tkn_k_symbol,'IDENT') then (
+
+	! The IDENT statement supplies a string to be stashed in the object
+	! file.  It conflicts with any existing statement.
+
+	if cdu$check_for_children(.parent,node_k_ident) then
+		cdu$report_syntax_error(msg(cdu$_dupident));
+
+	! The next token is the string.  Save it in a node.
+
+	cdu$get_next_token(tkn_k_h_string);
+	statement = cdu$create_node(node_k_ident,.cdu$gq_token[len],.cdu$gq_token[ptr]);
+	cdu$token_must_be(tkn_k_string);
+	return .statement;
+);
+
+if token_is(tkn_k_symbol,'MODULE') then (
+
+	! The MODULE statement supplies a symbol to be used as the name of the
+	! CLD object module.  It conflicts with any existing statement.
+
+	if cdu$check_for_children(.parent,node_k_module) then
+		cdu$report_syntax_error(msg(cdu$_dupmodule));
+
+	! The next token is the symbol.  Save it in a node.
+
+	cdu$get_next_token();
+	statement = cdu$create_node(node_k_module,.cdu$gq_token[len],.cdu$gq_token[ptr]);
+	cdu$token_must_be(tkn_k_symbol);
+	return .statement;
+);
+
+! We must have a DEFINE statement.  Get the next token and see what kind
+! of a DEFINE it is.  The appropriate syntax routine is called and returns
+! the top-level node representing the statement.
+
+cdu$token_must_be(tkn_k_symbol,ctext('DEFINE'));
+if token_is(tkn_k_symbol,'VERB') then
+	statement = cdu$define_verb(.parent)
+else if token_is(tkn_k_symbol,'SYNTAX') then
+	statement = cdu$define_syntax(.parent)
+else if token_is(tkn_k_symbol,'TYPE') then
+	statement = cdu$define_type(.parent)
+else (
+	cdu$report_syntax_error(msg(cdu$_invdefine));
+	return cdu$create_node(node_k_error);
+);
+
+! If there is already a definition with the same name, then we have a conflict.
+! Tell the user about it.
+
+if cdu$lookup_child(.parent,.statement[node_w_type],
+		    .statement[node_b_text_length],statement[node_t_text]) neqa 0 then
+	cdu$report_syntax_error(msg(cdu$_dupdef),1,statement[node_b_text_length]);
+return .statement;
+	
+END;
+
+!++
+! Description:	This parsing routine recognizes the "define-verb" construct,
+!		which is used to define a new DCL verb.
+!
+! Parameters:	parent		By reference, parent node of this constuct.
+!
+! Returns:	By reference, the top-level node of the statement.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$define_verb(parent: ref node)
+= BEGIN
+
+local
+	statement: ref node,
+	clause: ref node,
+	last_clause: ref node;
+
+
+! The next token must be the name of the verb.  Create anode to represent the
+! statement and put the name in it.
+
+cdu$get_next_token();
+statement = cdu$create_node(node_k_define_verb,.cdu$gq_token[len],.cdu$gq_token[ptr]);
+cdu$token_must_be(tkn_k_symbol);
+
+! Now we have a sequence of clauses which describe the verb.
+
+loop (
+	! The clauses may be separated by commas.
+
+	skip_optional_token(tkn_k_comma);
+
+	! Parse a clause.  If there weren't any more, then we are done.
+	! Otherwise link the clause node on to the end of the clause chain.
+
+	clause = cdu$v_s_clause(.statement);
+	if .clause eqla 0 then exitloop;
+	link_parent_to_child(statement,clause,last_clause);
+);
+
+return .statement;
+
+END;
+
+!++
+! Description:	This parsing routine recognizes the "define-syntax" construct,
+!		which is used to alter the syntax of a command based on the
+!		presence of some qualifier.
+!
+! Parameters:	parent		By reference, parent node of this constuct.
+!
+! Returns:	By reference, the top-level node of the statement.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$define_syntax(parent: ref node)
+= BEGIN
+
+local
+	statement: ref node,
+	clause: ref node,
+	last_clause: ref node;
+
+
+! The next token must be the name of the syntax definition.  Create a node to
+! represent the statement and put the name in it.
+
+cdu$get_next_token();
+statement = cdu$create_node(node_k_define_syntax,.cdu$gq_token[len],.cdu$gq_token[ptr]);
+cdu$token_must_be(tkn_k_symbol);
+
+! Now we have a sequence of clauses which describe the new syntax.
+
+loop (
+	! The clauses may be separated by commas.
+
+	skip_optional_token(tkn_k_comma);
+
+	! Parse a clause.  If there weren't any more, then we are done.
+	! Otherwise link the clause node on to the end of the clause chain.
+
+	clause = cdu$v_s_clause(.statement);
+	if .clause eqla 0 then exitloop;
+	link_parent_to_child(statement,clause,last_clause);
+);
+
+return .statement;
+
+END;
+
+!++
+! Description:	This parsing routine recognizes the "define-type" construct,
+!		which is used to define a set of keywords which some
+!		qualifier can take as values.
+!
+! Parameters:	parent		By reference, parent node of this constuct.
+!
+! Returns:	By reference, the top-level node of the statement.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$define_type(parent: ref node)
+= BEGIN
+
+local
+	statement: ref node,
+	clause: ref node,
+	last_clause: ref node;
+
+
+! The next token must be the name of the type definition.  Create a node to
+! represent the statement and put the name in it.
+
+cdu$get_next_token();
+statement = cdu$create_node(node_k_define_type,.cdu$gq_token[len],.cdu$gq_token[ptr]);
+cdu$token_must_be(tkn_k_symbol);
+
+! Now we have a sequence of clauses which describe the type keywords.
+
+loop (
+	! The clauses may be separated by commas.
+
+	skip_optional_token(tkn_k_comma);
+
+	! Parse a clause.  If there weren't any more, then we are done.
+	! Otherwise link the clause node on to the end of the clause chain.
+
+	clause = cdu$type_clause(.statement);
+	if .clause eqla 0 then exitloop;
+	link_parent_to_child(statement,clause,last_clause);
+);
+
+! A type definition must include at least one keyword.
+
+if not cdu$check_for_children(.statement,node_k_keyword) then
+	cdu$report_syntax_error(msg(cdu$_reqkey),1,statement[node_b_text_length]);
+return .statement;
+
+END;
+
+!++
+! Description:	This syntax routine recognizes the "v-s-clause" construct,
+!		which are the clauses used to describe a verb or syntax
+!		definition.
+!
+! Parameters:	parent		By reference, parent node of this constuct.
+!
+! Returns:	The top-level node representing the clause, or zero if
+!		there is no clause we recognize.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$v_s_clause(parent: ref node)
+= BEGIN
+
+local
+	clause: ref node,
+	item: ref node,
+	last_item: ref node;
+
+
+! Determine which kind of clause we have.
+
+if token_is(tkn_k_symbol,'CLIFLAGS') then (
+
+	! We have a CLIFLAGS clause.  Create a parent node for the flags.
+
+	clause = cdu$create_node(node_k_cliflags);
+	cdu$get_next_token();
+
+	! We have a parenthesized list of CLI flags.
+	! Eat the open parenthesis.  Then sit in a loop which recognizes at
+	! least one item, along with any others separated by commas.  Finally,
+	! eat the close parenthesis.  All of the items are chained as children
+	! of the clause.
+
+	cdu$token_must_be(tkn_k_open_paren);
+	loop (
+		item = cdu$cli_flag(.clause);
+		link_parent_to_child(clause,item,last_item);
+		if not token_is(tkn_k_comma) then exitloop;
+		cdu$get_next_token();
+	);
+	cdu$token_must_be(tkn_k_close_paren);
+	return .clause;
+);
+
+if token_is(tkn_k_symbol,'CLIROUTINE') then (
+
+	! We have a CLIROUTINE clause.  It conflicts with any existing
+	! CLIROUTINE, IMAGE, or ROUTINE clause.
+
+	if cdu$check_for_children(.parent,node_k_cliroutine,node_k_image,node_k_routine) then
+		cdu$report_syntax_error(msg(cdu$_confroutimg));
+
+	! Next we have a symbol which is the name of an internal CLI
+	! routine that processes the command.  Create a node with the
+	! symbol.
+
+	cdu$get_next_token();
+	clause = cdu$create_node(node_k_cliroutine,.cdu$gq_token[len],.cdu$gq_token[ptr]);
+	cdu$token_must_be(tkn_k_symbol);
+	return .clause;
+);
+
+if token_is(tkn_k_symbol,'DISALLOW') then (
+
+	! We have a DISALLOW clause.  It conflicts with any existing
+	! NODISALLOWS clause.
+
+	if cdu$check_for_children(.parent,node_k_nodisallows) then
+		cdu$report_syntax_error(msg(cdu$_confnodis));
+
+	! Create a node for the clause.
+
+	clause = cdu$create_node(node_k_disallow);
+	cdu$get_next_token();
+
+	! We now have a boolean expression.  Chain it on to the parent node.
+
+	clause[node_l_child] = cdu$bool_expr();
+	return .clause;
+);
+
+if token_is(tkn_k_symbol,'NODISALLOWS') then (
+
+	! We have a NODISALLOWS clause.  It is represented by a node.
+	! This clause conflicts with any existing DISALLOW clause.
+
+	if cdu$check_for_children(.parent,node_k_disallow) then
+		cdu$report_syntax_error(msg(cdu$_confdis));
+
+	cdu$get_next_token();
+	return cdu$create_node(node_k_nodisallows);
+);
+
+if token_is(tkn_k_symbol,'IMAGE') then (
+
+	! We have an IMAGE clause.  It conflicts with any existing
+	! CLIROUTINE, IMAGE, or ROUTINE clause.
+
+	if cdu$check_for_children(.parent,node_k_cliroutine,node_k_image,node_k_routine) then
+		cdu$report_syntax_error(msg(cdu$_confroutimg));
+
+	! Now we have a string or an h-string which is the spec of the image
+	! to be activated for this command.
+
+	cdu$get_next_token(tkn_k_h_string);
+
+	! Strip trailing blanks and tabs
+
+	while ch$rchar(.cdu$gq_token[ptr]+.cdu$gq_token[len]-1) EQL %C' '
+	    or ch$rchar(.cdu$gq_token[ptr]+.cdu$gq_token[len]-1) EQL %C'	'
+	    do cdu$gq_token[len] = .cdu$gq_token[len] - 1;
+	clause = cdu$create_node(node_k_image,.cdu$gq_token[len],.cdu$gq_token[ptr]);
+
+	! Make sure the string isn't too long.
+
+	if .clause[node_b_text_length] gtru cmd_k_max_image-1 then
+		cdu$report_syntax_error(msg(cdu$_imagelen),1,cmd_k_max_image-1);
+
+	cdu$token_must_be(tkn_k_string);
+	return .clause;
+);
+
+if token_is(tkn_k_symbol,'OUTPUTS') then (
+
+	! We have an OUTPUTS clause.  It conflicts with an existing clause.
+
+	if cdu$check_for_children(.parent,node_k_outputs) then
+		cdu$report_syntax_error(msg(cdu$_confoutputs));
+
+	! Create a node to represent the clause.
+
+	clause = cdu$create_node(node_k_outputs);
+	cdu$get_next_token();
+
+	! We have a parenthesized list of output items.
+	! Eat the open parenthesis.  Then sit in a loop which recognizes at
+	! least one item, along with any others separated by commas.  Finally,
+	! eat the close parenthesis.  All of the items are chained as children
+	! of the clause.
+
+	cdu$token_must_be(tkn_k_open_paren);
+	loop (
+		item = cdu$create_node(node_k_outputs_item,.cdu$gq_token[len],.cdu$gq_token[ptr]);
+		cdu$token_must_be(tkn_k_symbol);
+		link_parent_to_child(clause,item,last_item);
+		if not token_is(tkn_k_comma) then exitloop;
+		cdu$get_next_token();
+	);
+	cdu$token_must_be(tkn_k_close_paren);
+	return .clause;
+);
+
+if token_is(tkn_k_symbol,'PARAMETER') then (
+
+	! We have a PARAMETER definition.  It conflicts with any existing
+	! NOPARAMETERS clause.
+
+	if cdu$check_for_children(.parent,node_k_noparameters) then
+		cdu$report_syntax_error(msg(cdu$_confnoparm));
+
+	! The first thing is the parameter name.  Create a node for it.
+
+	cdu$get_next_token();
+	clause = cdu$create_node(node_k_parameter,.cdu$gq_token[len],.cdu$gq_token[ptr]);
+
+	! Ensure that the parameter name is in the form Pn.
+
+	(bind
+		 name = .cdu$gq_token[ptr]: vector[,byte];
+
+	if .cdu$gq_token[len] nequ 2 or
+	   .name[0] nequ 'P' or
+	   .name[1] lssu '1' or .name[1] gtru '0'+cmd_k_max_parms then
+		cdu$report_syntax_error(msg(cdu$_invparm));
+	);
+	cdu$token_must_be(tkn_k_symbol);
+
+	! We have a list of parameter definition clauses.  Each is optionally
+	! preceded by a comma.  All of the items are chained as children of the
+	! main parameter clause.
+
+	loop (
+		skip_optional_token(tkn_k_comma);
+		item = cdu$param_clause(.clause);
+		if .item eqla 0 then exitloop;
+		link_parent_to_child(clause,item,last_item);
+	);
+
+	return .clause;
+);
+
+if token_is(tkn_k_symbol,'NOPARAMETERS') then (
+
+	! We have a NOPARAMETERS clause.  It is represented by a node.
+	! This clause conflicts with any existing PARAMETER clause.
+
+	if cdu$check_for_children(.parent,node_k_parameter) then
+		cdu$report_syntax_error(msg(cdu$_confparm));
+
+	cdu$get_next_token();
+	return cdu$create_node(node_k_noparameters);
+);
+
+if token_is(tkn_k_symbol,'PREFIX') then (
+
+	! We have an PREFIX clause.  It conflicts with any existing clause.
+
+	if cdu$check_for_children(.parent,node_k_prefix) then
+		cdu$report_syntax_error(msg(cdu$_dupprefix));
+
+	! Now we have a symbol which is the prefix.  Create a node and put
+	! the symbol in it.
+
+	cdu$get_next_token();
+	clause = cdu$create_node(node_k_prefix,.cdu$gq_token[len],.cdu$gq_token[ptr]);
+	cdu$token_must_be(tkn_k_symbol);
+	return .clause;
+);
+
+if token_is(tkn_k_symbol,'QUALIFIER') then (
+
+	! We have a QUALIFIER definition.  It conflicts with any existing
+	! NOQUALIFIERS clause.
+
+	if cdu$check_for_children(.parent,node_k_noqualifiers) then
+		cdu$report_syntax_error(msg(cdu$_confnoqual));
+
+	! The next item is the name of the qualifier.  Create a node for it.
+
+	cdu$get_next_token();
+	clause = cdu$create_node(node_k_qualifier,.cdu$gq_token[len],.cdu$gq_token[ptr]);
+
+	! The definition also conflicts with any existing definition of the
+	! same name.  However, we can't check for this in V4 because of
+	! layered products with the ZZZZ qualifier placeholder hacks in
+	! their CLDs (VMS' fault, not theirs).
+
+!	if cdu$lookup_child(.parent,node_k_qualifier,
+!			    .clause[node_b_text_length],clause[node_t_text]) neqa 0 then
+!		cdu$report_syntax_error(msg(cdu$_dupqual),1,clause[node_b_text_length]);
+	cdu$token_must_be(tkn_k_symbol);
+
+	! We have a list of qualifier definition clauses.  Each is optionally
+	! preceded by a comma.  All of the items are chained as children of the
+	! main qualifier clause.
+
+	loop (
+		skip_optional_token(tkn_k_comma);
+		item = cdu$qual_clause(.clause);
+		if .item eqla 0 then exitloop;
+		link_parent_to_child(clause,item,last_item);
+	);
+
+	return .clause;
+);
+
+if token_is(tkn_k_symbol,'NOQUALIFIERS') then (
+
+	! We have a NOQUALIFIERS clause.  It is represented by a node.
+	! This clause conflicts with any existing QUALIFIER clause.
+
+	if cdu$check_for_children(.parent,node_k_qualifier) then
+		cdu$report_syntax_error(msg(cdu$_confqual));
+
+	cdu$get_next_token();
+	return cdu$create_node(node_k_noqualifiers);
+);
+
+if token_is(tkn_k_symbol,'ROUTINE') then (
+
+	! We have an ROUTINE clause.  It conflicts with any existing
+	! CLIROUTINE, IMAGE, or ROUTINE clause.
+
+	if cdu$check_for_children(.parent,node_k_cliroutine,node_k_image,node_k_routine) then
+		cdu$report_syntax_error(msg(cdu$_confroutimg));
+
+	! Next we have a symbol which is the name of the user routine which
+	! can process this command.  Create a node containing the symbol.
+
+	cdu$get_next_token();
+	clause = cdu$create_node(node_k_routine,.cdu$gq_token[len],.cdu$gq_token[ptr]);
+	cdu$token_must_be(tkn_k_symbol);
+	return .clause;
+);
+
+if token_is(tkn_k_symbol,'SYNONYM') then (
+
+	! We have a SYNONYM clause.  It specifies a symbol which is a synonym
+	! for the verb name.  Create a node containing the symbol.
+
+	cdu$get_next_token();
+	clause = cdu$create_node(node_k_synonym,.cdu$gq_token[len],.cdu$gq_token[ptr]);
+	cdu$token_must_be(tkn_k_symbol);
+	return .clause;
+);
+
+! We don't have a clause that we understand, so there probably aren't any more.
+
+return 0;
+
+END;
+
+END
+ELUDOM

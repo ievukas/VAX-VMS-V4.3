@@ -1,0 +1,332 @@
+MODULE showusers (IDENT = 'V04-000',
+	ADDRESSING_MODE (EXTERNAL = GENERAL)) =
+BEGIN
+!
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!
+!++
+!
+! FACILITY:  SHOW utility
+!
+! ABSTRACT:
+!	This module contains the option routine for SHOW USERS.
+!
+! ENVIRONMENT:
+!	VAX native, user mode.
+!
+! AUTHOR:  Gerry Smith		 CREATION DATE:  25-Jun-1982
+!
+! MODIFIED BY:
+!
+!	V03-008	MHB0120		Mark Bramhall	 6-Apr-1984
+!		Fix for the case of no interactive users.
+!
+!	V03-007	MHB0114		Mark Bramhall	20-Mar-1984
+!		Remove underscores from terminal names.
+!
+!	V03-006	MHB0103		Mark Bramhall	29-Feb-1984
+!		Add physical terminal name for virtual terminals.
+!
+!	V03-005	MHB0101		Mark Bramhall	 2-Feb-1984
+!		Add "(Disconnected)" to the display line for
+!		disconnected processes.
+!
+!	V04-004	PDG0001		Peter D Gilbert	04-Nov-1983
+!		Don't request 0 bytes ffrom LIB$GET_VM.
+!		Also, check for overflowing the allocated memory.
+!	V03-003	GAS0150		Gerry Smith	28-Jun-1983
+!		Well, there's more than one way to skin a cat.  
+!		Rearrange the display, and order by username.
+!		Also, increase the terminal length, to accomodate
+!		the increasing size of terminal names.
+!
+!	V03-002	GAS0106		Gerry Smith	12-Mar-1983
+!		For devices with unit numbers greater than one
+!		digit, correct the sorting method so that they
+!		are displayed after devices with one-digit numbers.
+!
+!	V03-001	GAS00102			17-Jan-1983
+!		Fix display of PIDs.
+!
+!--
+
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:LIB';		! VAX/VMS system definitions
+REQUIRE 'SRC$:SHOWDEF';			! Get SHOW definitions
+
+MACRO
+    list$w_length = 0,0,16,0%,
+    list$w_item	  = 2,0,16,0%,
+    list$l_buff   = 4,0,32,0%,
+    list$l_rlen   = 8,0,32,0%,
+    zero	  = 0,0,32,0%;
+
+!
+! Table of contents
+!
+
+FORWARD ROUTINE
+    show$users : NOVALUE;
+
+EXTERNAL
+    sys$gw_ijobcnt;
+
+EXTERNAL LITERAL
+    show$_nosuchuser;
+
+EXTERNAL ROUTINE
+    cli$get_value,
+    show$write_line : NOVALUE,
+    lib$get_vm;
+
+
+GLOBAL ROUTINE show$users : NOVALUE  =
+BEGIN
+
+!---
+!
+! This routine performs the SHOW USERS function.  Using $GETJPIW, data on
+! all the interactive users is gathered and displayed.  This routine runs
+! in user mode, but needs WORLD privilege in order to get all users.
+!
+!---
+
+LOCAL
+    status,					! General status return
+    maxusers,					! Maximum interactive users
+    index,					! Pointer to current process data
+    pid_context,				! "Wildcard PID" context
+    tt_phydevnam_buf : VECTOR[15,BYTE],		! Physical device name buffer
+    tt_phydevnam_len,				!  and its length
+    arglist : VECTOR[9],			! Argument list
+    username : REF BLOCKVECTOR[,12,BYTE],
+    user_len : REF VECTOR,
+    terminal : REF BLOCKVECTOR[,1+15,BYTE],
+    term_len : REF VECTOR,
+    procname : REF BLOCKVECTOR[,15,BYTE],
+    proc_len : REF VECTOR,
+    pid : REF VECTOR,
+    devchar2 : $BBLOCK[4],
+    user_desc : $BBLOCK[dsc$c_s_bln],
+    jpilist : BLOCKVECTOR[5,12,BYTE];
+
+!
+! See if there was a specific username to search for
+!
+$init_dyndesc(user_desc);	! Initialize dynamic descriptor
+cli$get_value(%ASCID 'USERNAME', user_desc);
+
+!
+! Get the current number of interactive jobs, add 20 percent, and a few extra,
+! and use that for the maximum number of users.
+!
+maxusers = .sys$gw_ijobcnt + (.sys$gw_ijobcnt/5) + 4;
+
+!
+! Based on the maximum number of users, go allocate space to store info
+! about them.  This is based on there being
+!	12 bytes per username
+!	16 bytes per terminal name
+!	15 bytes per process name
+!	(4 bytes per length) for each of the above
+!	 4 bytes per PID
+!      ----
+!       59 bytes per interactive process
+
+IF NOT (status = LIB$GET_VM( %REF(.maxusers*60), pid))
+THEN SIGNAL_STOP(show$_insvirmem, 0, .status);
+
+!
+! Assign the starting locations for each block
+!
+
+user_len = pid[.maxusers];
+term_len = user_len[.maxusers];
+proc_len = term_len[.maxusers];
+username = proc_len[.maxusers];
+terminal = username[.maxusers,zero];
+procname = terminal[.maxusers,zero];
+
+!
+! Set up the $GETJPI item list, and initialize the block pointer and 
+! Process ID context.
+!
+
+jpilist[0,list$w_length] = 12;			! Username
+jpilist[0,list$w_item] = jpi$_username;
+
+jpilist[1,list$w_length] = 15;			! Terminal name
+jpilist[1,list$w_item] = jpi$_terminal;
+
+jpilist[2,list$w_length] = 15;			! Process name
+jpilist[2,list$w_item] = jpi$_prcnam;
+
+jpilist[3,list$w_length] = 4;			! Process ID
+jpilist[3,list$w_item] = jpi$_pid;
+
+jpilist[4,0,0,32,0] = 0;			! Zero longword to end list
+
+index = 0;					! Pointer to blocks
+pid_context = -1;				! Initialize the pid
+
+!
+! Loop thru all processes on system, gathering data about the interactive
+! ones.
+!
+
+DO
+    BEGIN
+
+    LOCAL
+	iosb : VECTOR[2];				! Final status from $GETJPI
+	
+    jpilist[0,list$l_buff] = username[.index, zero];	! Point to next block
+    jpilist[0,list$l_rlen] = user_len[.index];		! of user data
+    terminal[.index, zero] = '_';
+    jpilist[1,list$l_buff] = terminal[.index, zero] + 1;
+    jpilist[1,list$l_rlen] = term_len[.index];
+    jpilist[2,list$l_buff] = procname[.index, zero];
+    jpilist[2,list$l_rlen] = proc_len[.index];
+    jpilist[3,list$l_buff] = pid[.index];
+    jpilist[3,list$l_rlen] = 0;
+
+    status = $GETJPIW(PIDADR = pid_context,	! Get info on next process
+		      ITMLST = jpilist,
+		      IOSB = iosb);
+
+    IF .status THEN status = .(iosb[0])<0,16>;	! Get final status
+    IF .status					! If status is good
+    AND (.term_len[.index] NEQ 0)		! and this is an interactive user
+    AND						! and either
+	BEGIN					! no username was specified
+	IF .user_desc[dsc$w_length] EQL 0	! or the usernames match
+	THEN true
+	ELSE CH$EQL(.user_desc[dsc$w_length], .user_desc[dsc$a_pointer],
+		    .user_desc[dsc$w_length], username[.index, zero])
+	END
+    THEN index = .index + 1;			! then accept this process for display
+    END
+UNTIL .status EQL SS$_NOMOREPROC or .index geq .maxusers;
+
+!
+! Check to see if the user was found.  If not, signal and go away.
+!
+IF .user_desc[dsc$w_length] NEQ 0
+AND .index LEQ 0
+THEN (SIGNAL(show$_nosuchuser, 1, user_desc); RETURN);
+
+!
+! Make a heading showing the date and total number of users
+!
+show$write_line(%ASCID '!10< !>VAX/VMS Interactive Users!/!11< !>!%D',
+		%REF(0),
+		%ASCID '!4< !>Total number of interactive users = !ZW',
+		%REF(.sys$gw_ijobcnt));
+
+!
+! Exit now if nothing to display
+!
+IF .index LEQ 0
+THEN RETURN;
+
+!
+! Make a heading for displayed information
+!
+show$write_line(%ASCID '!/ Username     Process Name      PID     Terminal',
+		0);
+
+!
+! Set up $GETDVI item list for "disconnected" process checking.
+!
+jpilist[0,list$w_length] = 4;
+jpilist[0,list$w_item] = dvi$_devchar2;
+jpilist[0,list$l_buff] = devchar2;
+jpilist[0,list$l_rlen] = 0;
+jpilist[1,list$w_length] = 15;
+jpilist[1,list$w_item] = dvi$_tt_phydevnam;
+jpilist[1,list$l_buff] = tt_phydevnam_buf;
+jpilist[1,list$l_rlen] = tt_phydevnam_len;
+jpilist[2,zero] = 0;
+tt_phydevnam_len = 0;
+
+!
+! Print all the entries, in username order.
+!
+INCR j FROM 0 TO .index-1 DO
+    BEGIN
+    LOCAL
+	p;					! Pointer to "lowest" username
+
+    p = 0;					! Use first username
+    INCR i FROM 1 TO .index-1			! Go thru all the usernames
+    DO
+	IF CH$LSS(.user_len[.i], username[.i,zero], 
+		  .user_len[.p], username[.p,zero])
+	THEN p = .i;
+
+    arglist[0] = .user_len[.p];
+    arglist[1] = username[.p,zero];
+    arglist[2] = .proc_len[.p];
+    arglist[3] = procname[.p,zero];
+    arglist[4] = .pid[.p];
+    arglist[5] = .term_len[.p] + 1;
+    arglist[6] = terminal[.p,zero];
+    arglist[7] = 0;
+    arglist[8] = tt_phydevnam_buf + 1;
+
+    IF $GETDVIW(devnam = arglist[5], itmlst = jpilist)
+    THEN
+	IF .devchar2[dev$v_det]
+	OR .tt_phydevnam_len EQL 0
+	THEN
+	    BEGIN
+	    arglist[7] = 12;
+	    arglist[8] = UPLIT BYTE ('Disconnected');
+	    END
+	ELSE
+	    IF CH$NEQ(.tt_phydevnam_len, tt_phydevnam_buf,
+		      .arglist[5], .arglist[6])
+	    THEN
+		arglist[7] = .tt_phydevnam_len - 1;
+
+    arglist[5] = .arglist[5] - 1;
+    arglist[6] = .arglist[6] + 1;
+
+    show$write_line(%ASCID ' !12AF !15AF !XL  !15AF!AF',
+		    arglist);
+
+    CH$FILL(-1, 12, username[.p,zero]);
+    END;
+
+RETURN true;
+END;
+
+END
+ELUDOM

@@ -1,0 +1,730 @@
+MODULE shodev (IDENT = 'V04-000',
+		  ADDRESSING_MODE (EXTERNAL = GENERAL)) =
+
+BEGIN
+!
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!
+!++
+!
+! FACILITY:  SHOW utility
+!
+! ABSTRACT:
+!	This module contains the main routines for the SHOW commands which
+!	deal with devices, i.e. SHOW DEVICES, SHOW TERMINAL, SHOW MAGTAPE,
+!	and SHOW PRINTER.  
+!
+! ENVIRONMENT:
+!	VAX native, user mode.
+!
+! AUTHOR:  Gerry Smith		 CREATION DATE:  28-Jul-1982
+!
+! MODIFIED BY:
+!
+!	V03-010	AEW0002			Anne E. Warner  10-Jul-1984
+!		Add the call to SHOW$MSCP for when the qualifier
+!		/SERVED is issued.  This is the request for the
+!		display of MSCP served devices which is separate from
+!		the rest of the SHOW DEVICE code so all this code
+!		does is call the MSCP code when the qualifier is present
+!
+!	V03-009	CWH3009			CW Hobbs	12-Apr-1984
+!		Add another check for NOSUCHDEV, and add an extra
+!		blank line for full displays.
+!
+!	V03-008	CWH3008			CW Hobbs	3-Mar-1984
+!		Add two routines to sort the device scratch blocks into
+!		a list sorted by device name.  Change the display loops
+!		to follow the list.
+!
+!       V03-007 AEW0001                 Anne E. Warner   7-Mar-1984
+!               Fix SHOW DEVICE/WINDOWS so that it automatically sets
+!               the /FILES flag and gets to SHOW$FILES module for processing.
+!
+!	V03-006	CWH3006			CW Hobbs	28-Feb-1984
+!		Increase virtual buffer so that approximately 1200 devices
+!		can be displayed.  Change device name parsing logic so that
+!		allocation class names (e.g. $255$DUA) are accepted.  Some
+!		other minor cleanups related to dual-path support.
+!
+!	V03-005	GAS0181			Gerry Smith	19-Sep-1983
+!		Make it possible for JCP to call the routines necessary
+!		to display journals just as SHOW does.
+!
+!	V03-004	GAS0114			Gerry Smith	 1-Apr-1983
+!		Change the display for long device names, so that no
+!		special logic is required at this point.
+!
+!	V03-003	GAS0110			Gerry Smith	28-Feb-1983
+!		Add support for cluster devices.
+!
+!	V03-002	GAS0107			Gerry Smith	11-Feb-1983
+!		Add support for journals.
+!
+!	V03-001	GAS00104		Gerry Smith	17-Jan-1983
+!		Always initialize the device descriptor and unit number.
+!
+!--
+
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:LIB';		! VAX/VMS system definitions
+REQUIRE 'SRC$:SHOWDEF';			! SHOW common definitions
+REQUIRE	'SRC$:SHODEVDEF';		! SHOW DEVICES common definitions
+
+
+!
+! Macro to set up two associated tables.  The first table is a list of
+! device types. The second table is a corresponding list of addresses 
+! of device-specific display routines.
+!
+! If a new device type is to be added, all that is required in this 
+! macro is to add one line of code, the device type and the corresponding
+! display routine name.  You must also write the display routine.
+!
+MACRO
+
+    device_type [devtype, disprout] = devtype%,
+
+    display_routine [devtype, disprout] = %NAME(disprout)%,
+
+    make_table (name) = 
+	LITERAL device_table_length = (%LENGTH - 1)/2;
+	EXTERNAL ROUTINE display_routine(%REMAINING);
+	OWN
+	    device_table : VECTOR[device_table_length,BYTE]
+	    INITIAL (BYTE (device_type(%REMAINING))),
+
+	    routine_table : VECTOR[device_table_length]
+	    INITIAL (display_routine(%REMAINING));%;
+
+
+!
+! Set up a table of all device types which have a specific display routine, 
+! and another table pointing to the address of the display routine each.
+!
+make_table (dummy,
+	    dc$_disk,		display_disk,
+	    dc$_tape,		display_magtape,
+	    dc$_term,		display_terminal,
+	    dc$_journal,	display_journal,
+	    dc$_lp,		display_printer);
+
+!
+! Table of contents
+!
+FORWARD ROUTINE
+    show$devices : NOVALUE,
+    show$printer : NOVALUE,
+    show$magtape : NOVALUE,
+    show_device : NOVALUE,
+    sort_devices : NOVALUE,
+    insert_device : NOVALUE,
+    parse_device;
+
+EXTERNAL ROUTINE
+    cli$get_value,
+    cli$present,
+    lib$get_vm,
+    ots$cvt_ti_l,
+    io_scan,
+    show$files,
+    show$mscp,
+    display_brief : NOVALUE,
+    display_general : NOVALUE,
+    show$write_line : NOVALUE;
+
+EXTERNAL LITERAL cli$_negated;
+
+EXTERNAL
+    kernel_accvio : VECTOR [4, LONG];
+
+GLOBAL ROUTINE show$devices : NOVALUE =
+BEGIN
+
+!---
+!
+! This is the main routine for SHOW DEVICES.  It collects the specific 
+! qualifiers and then goes to the common SHOW_DEVICE subroutine.
+!
+!---
+
+LOCAL
+    status,					! General status return
+    flags : $BBLOCK[4] INITIAL(0);		! Options longword
+
+IF (flags[devi$v_served] = cli$present(%ASCID 'SERVED'))
+THEN					! If SHOW DEVICE/SERVED requested
+    BEGIN				! execute the routine to display
+    show$mscp();			! information about MSCP-Served
+    RETURN;				! devices since it is totally different
+    END;				! from the rest of the SHOW DEVICE code
+!
+! Collect the qualifiers.
+!
+flags[devi$v_allocated] = cli$present(%ASCID 'ALLOCATED');
+flags[devi$v_full] = cli$present(%ASCID 'FULL');
+flags[devi$v_mounted] = cli$present(%ASCID 'MOUNTED');
+
+flags[devi$v_files] = cli$present(%ASCID 'FILES');
+IF (flags[devi$v_windows] = cli$present(%ASCID 'WINDOWS'))
+THEN
+   flags[devi$v_files] = 1;
+
+IF .flags[devi$v_files]
+THEN
+    BEGIN
+    flags[devi$v_system] = (status = cli$present(%ASCID 'SYSTEM'));
+    flags[devi$v_user] = (.status EQL cli$_negated);
+    IF NOT (.flags[devi$v_system] OR	! If neither /SYSTEM or 
+	    .flags[devi$v_user])	! /NOSYSTEM, get both
+    THEN flags[devi$v_system] = flags[devi$v_user] = 1;
+    END;
+
+
+show_device(flags);			! Go actually do the work.
+
+RETURN;
+END;
+
+GLOBAL ROUTINE show$printer : NOVALUE =
+BEGIN
+
+!---
+!
+! This is the dummy routine that gets dispatched to by the SHOW dispatcher.
+! It sets the /FULL and /PRINTER bits in FLAGS and calls SHOW_DEVICE.
+!
+!---
+
+LOCAL flags : $BBLOCK[4] INITIAL(0);
+
+flags[devi$v_full] = flags[devi$v_printer] = true;
+show_device(flags);
+
+RETURN;
+END;
+
+GLOBAL ROUTINE show$magtape : NOVALUE =
+BEGIN
+
+!---
+!
+! This is the dummy routine that gets dispatched to by the SHOW dispatcher.
+! It sets the /TAPE and /FULL bits in FLAGS and calls SHOW_DEVICE.
+!
+!---
+
+LOCAL flags : $BBLOCK[4] INITIAL(0);
+
+flags[devi$v_full] = flags[devi$v_tape] = true;
+show_device(flags);
+
+RETURN;
+END;
+
+GLOBAL ROUTINE show_device (flags, journal) : NOVALUE =
+BEGIN
+
+!---
+!
+! This is the common routine that all the other routines feed into.  It
+! obtains a device name, if any is specified.  The device name is parsed, 
+! virtual memory is then expanded, and appropriate routines are called in 
+! kernel mode to collect the data.  Upon return from the kernel mode routines,
+! the common output routine is called.
+!
+! Inputs:
+!	flags - address of control flags.
+!	journal - optional, used only by JCP to pass the name of the 
+!		  journal.
+!
+!---
+
+BUILTIN 
+    actualcount;
+
+MAP flags : REF $BBLOCK;
+
+LOCAL
+    status,					! General status return
+    unit : VOLATILE,				! Unit number of parsed device
+    node : VECTOR[sb$s_nodename+1,BYTE],	! Node string
+    device : VECTOR[log$c_namlength+1,BYTE],	! Device string
+    device_desc : $BBLOCK[dsc$c_s_bln],		! Device descriptor
+    data : REF VECTOR,				! Address of scratch area
+    arglst : VECTOR[7];				! Argument list for $CMKRNL
+    
+!
+! Initialize the ASCIC strings, the unit number, and the device descriptor
+!
+node[0] = device[0] = 0;			! Nothing in strings yet
+unit = -1;					! No unit number yet
+$init_dyndesc(device_desc);			! Set up the device descriptor
+
+!
+! If from JCP, set up the device descriptor.
+!
+IF actualcount() EQL 2
+THEN
+    BEGIN
+    MAP journal : REF $BBLOCK;
+    device_desc[dsc$w_length] = .journal[dsc$w_length];
+    device_desc[dsc$a_pointer] = .journal[dsc$a_pointer];
+    END
+
+!
+! Otherwise, just a normal path.
+!
+ELSE
+    BEGIN
+
+!
+! If no device name is specified, then certain defaults may take effect.
+! SHOW TERMINAL uses SYS$COMMAND, and SHOW DEV/FILES uses SYS$DISK.
+!
+    IF NOT cli$get_value(%ASCID 'DEVICE', device_desc)
+    THEN
+	BEGIN
+	IF .flags[devi$v_term]			! If SHOW TERMINAL and none
+	THEN					! specified, use SYS$COMMAND
+	    BEGIN
+	    device_desc[dsc$w_length] = %CHARCOUNT ('SYS$COMMAND');
+	    device_desc[dsc$a_pointer] = UPLIT BYTE ('SYS$COMMAND');
+	    END
+	ELSE IF .flags[devi$v_files]		! If SHOW DEV/FILES and no disk
+	THEN					! then use SYS$DISK
+	    BEGIN
+	    device_desc[dsc$w_length] = %CHARCOUNT ('SYS$DISK');
+	    device_desc[dsc$a_pointer] = UPLIT BYTE ('SYS$DISK');
+	    END;
+	END;
+    END;
+
+!
+! If SHOW DEVICE/FILES was specified, make a major detour, and simply call
+! the SHOWFILES module.  SHOW FILES is just too different from the way that
+! the rest of SHOW DEVICES works to try to thread it in.
+!
+IF .flags[devi$v_files]
+THEN
+    BEGIN
+    status = show$files(device_desc, .flags);
+    IF NOT .status
+    THEN SIGNAL(.STATUS);
+    RETURN;
+    END;
+
+!
+! If, after all this rigamarole, there is actually a device name to parse,
+! then go ahead and do it.
+!
+IF .device_desc[dsc$w_length] NEQ 0
+THEN
+    BEGIN
+    IF NOT (status = parse_device(device_desc,		! Pass device as input
+    				  node,			! Get node part
+				  device,		! Get DDB part
+				  unit,			! Get unit number
+				  .flags))		! possibly set flag bits
+    THEN (SIGNAL(.status);RETURN);			! Go away if error.
+    END;
+
+!
+! Grab a large chunk of space, to put the information about the device(s).
+!
+IF NOT (status = lib$get_vm(%REF(512*512), data))
+THEN (SIGNAL(.status); RETURN);
+
+data[0] = 512*512;				! Store the size of the segment
+
+!
+! Now get information on the device(s) requested.
+!
+arglst[0] = 5;
+arglst[1] = node;
+arglst[2] = device;
+arglst[3] = .unit;
+arglst[4] = .flags;
+arglst[5] = .data;
+status = $CMKRNL(ROUTIN = io_scan,
+		 ARGLST = arglst);
+IF NOT .status
+THEN
+    BEGIN
+    IF .status EQL ss$_accvio
+    THEN SIGNAL(.status, .kernel_accvio[0], .kernel_accvio[1], .kernel_accvio[2], .kernel_accvio[3], 0)
+    ELSE SIGNAL(.status);
+    RETURN;
+    END;
+
+!
+! Sort the devices so that the displays are cleaner
+!
+sort_devices(data[0]);
+
+!
+! Print the information.  The method that is used is very dumb, but it works.
+! The scratch area is scanned repeatedly, once for each device class.  If a
+! particular device gets printed, its D_V_DISPLAYED bit is set.
+!
+! Then, all the devices that didn't get printed in the device-specific scan
+! get printed in a general format. 
+!
+BEGIN
+LOCAL
+    scratch : REF $BBLOCK;
+
+flags[devi$v_displayed] = 0;			! Assume that no devices will be found
+!
+! Go thru each device type.
+!
+INCR index FROM 0 TO device_table_length - 1 DO
+    BEGIN
+    flags[devi$v_header] = 1;			! Print a header the first time
+    scratch = .data[0];				! Point to head of device list
+    WHILE .scratch NEQ 0 DO			! Go thru all the devices
+	BEGIN					! a device class at a time
+	IF .scratch[d_b_devclass] EQLU .device_table[.index]
+	THEN
+	    BEGIN
+	    IF (.flags[devi$v_full])		! IF /FULL, do dev-specific output
+	    THEN (.routine_table[.index])(.scratch, .flags)
+	    ELSE display_brief (.scratch, .flags);	! Otherwise use the general output routine.
+	    scratch[d_v_displayed] = 1;		! So we don't re-print this device.
+	    END;
+	scratch = .scratch[d_l_ucb];		! Get to next device.
+	END;
+    END;
+
+!
+! Now to print the general-device stuff.
+!
+flags[devi$v_header] = true;			! Get a heading
+scratch = .data[0];				! Back to the head of the list
+WHILE .scratch NEQ 0 DO
+    BEGIN
+    IF NOT .scratch[d_v_displayed]
+    THEN
+	BEGIN
+	IF (.flags[devi$v_full])		! IF /FULL, do dev-specific output
+	THEN display_general(.scratch, .flags)
+	ELSE display_brief (.scratch, .flags);	! Otherwise use the general output routine.
+	scratch[d_v_displayed] = 1;		! So we don't re-print this device.
+	END;
+    scratch = .scratch[d_l_ucb];		! Get to next device.
+    END;
+END;
+
+!
+! If nobody managed to set the displayed bit, then we saw no devices
+!
+IF NOT .flags[devi$v_displayed]
+THEN
+    SIGNAL(SS$_NOSUCHDEV)
+
+ELSE IF .flags[devi$v_full]
+THEN
+    show$write_line(%ASCID '', flags);
+
+RETURN;
+END;
+
+ROUTINE sort_devices (data : REF VECTOR [, LONG]) : NOVALUE =
+BEGIN
+
+!---
+!
+! This routine links the scratch areas into a sorted list.  The sort key is
+! the device name.  A special key field is used, since if the device name
+! per se were to be used we would see DUA10: before DUA2:.
+!
+!---
+
+LOCAL
+    scratch : REF $BBLOCK,			! Address of current entry in scratch area
+    len;					! Length of device name
+
+data[0] = 0;					! Use the first longword as the list head
+scratch = data[1];				! Point to start of scratch area
+WHILE .scratch[d_t_device] NEQ 0 DO		! Go thru all the devices (name[0,0,8,0] = 0 marks the end)
+    BEGIN
+    BIND
+	dev = scratch[d_t_device] : VECTOR [, BYTE];
+    len = .scratch[d_b_devlen]-1;		! Get the total length without the colon
+    DECR i FROM (.len-1) TO 0			! Adjust length for 0:n-1 index and scan backwards 
+    DO						! through the string, looking for the last
+	BEGIN					! non-digit in the string.  This trims the unit number.
+	IF .dev[.i] GTR %C'9' OR .dev[.i] LSS %C'0'
+	THEN EXITLOOP;				! Non-digit, done with this one
+	len = .len - 1;				! Found a digit, shorten the string
+	END;
+    CH$MOVE(.len, dev, scratch[d_t_sort_name]);	! Move the node/controller to the sort field
+    insert_device(.scratch, data[0]);		! Insert it in the list
+    IF .scratch[d_b_devclass] EQLU dc$_journal	! Skip over the journal device
+    THEN scratch = .scratch + d_k_length;
+    scratch = .scratch + d_k_length;		! Get the next device.
+    END;
+
+RETURN;
+END;
+
+ROUTINE insert_device (new : REF $BBLOCK, head : REF $BBLOCK) : NOVALUE =
+BEGIN
+
+!---
+!
+! This routine inserts the input device into the list of sorted device
+! scratch blocks, using the D_L_UCB field as the link.
+!
+! Inputs:
+!	new - address of device to be added
+!
+!---
+
+LOCAL
+    nxt : REF $BBLOCK,				! Pointer to next device block
+    prv : REF $BBLOCK;				! Pointer to last device block
+
+$ASSUME ($BYTEOFFSET(d_l_ucb), EQL, 0);		! Only works if UCB is the first field
+prv = head[d_l_ucb];				! Previous starts out as the head
+nxt = .head[d_l_ucb];				! Next starts as the first one
+
+WHILE 1						! Use EXITLOOP as a structured GOTO
+DO
+    BEGIN
+    IF .nxt EQL 0				! At the end of the list, insert it here
+    THEN
+	BEGIN					! (identical blocks, compiler with combine into one)
+	prv[d_l_ucb] = .new;			! Point last block at this one
+	new[d_l_ucb] = .nxt;			! Point this block at the next
+	EXITLOOP;
+	END;
+    IF CH$GTR(d_s_sort_name, nxt[d_t_sort_name],! If next is greater than the new, insert it here
+	      d_s_sort_name, new[d_t_sort_name])
+    THEN
+	BEGIN
+	prv[d_l_ucb] = .new;			! Point last block at this one
+	new[d_l_ucb] = .nxt;			! Point this block at the next
+	EXITLOOP;
+	END;
+    prv = .nxt;					! Move to the next block
+    nxt = .nxt[d_l_ucb];
+    END;
+
+RETURN;
+END;
+
+ROUTINE parse_device (device_desc, node, device, unit, flags) =
+BEGIN
+
+!---
+!
+! This routine takes the device specified in DEVICE_DESC and returns
+! a device string and a unit number.  The method used is to first translate
+! the passed string up to 10 times, and then to parse the final, resultant
+! string, breaking it into a unit number (possibly) and a DDB part.
+!
+! Inputs
+!	DEVICE_DESC - address of a descriptor holding the actual string specified
+!
+! Outputs
+!	NODE        - address of ASCIC to hold the node name or allocation class
+!	DEVICE      - address of ASCIC string to hold the DDB name
+!	UNIT        - address of a longword to hold the unit number
+!
+!---
+
+MAP
+    node : REF VECTOR[,BYTE],
+    device : REF VECTOR[,BYTE],
+    flags : REF $BBLOCK,
+    device_desc : REF $BBLOCK;
+
+LOCAL
+    status,
+    exp,
+    ptr,
+    temp,
+    temp_unit,
+    in_desc : VECTOR[2],
+    out_desc : VECTOR[2],
+    in_buff : VECTOR[log$c_namlength,BYTE],
+    out_buff : VECTOR[log$c_namlength,BYTE];
+
+
+!
+! Transfer the initial string to IN_DESC, and set up the descriptors for the 
+! iterative translations.
+!
+in_desc[0] = .device_desc[dsc$w_length];	! Use passed length
+in_desc[1] = in_buff;				! point to local buffer
+out_desc[0] = log$c_namlength;			! Set up the result descriptor
+out_desc[1] = out_buff;				! to be max size
+CH$MOVE(.device_desc[dsc$w_length],		! Move original string to
+	.device_desc[dsc$a_pointer],		! the local buffer.
+	in_buff);
+
+!
+! Translate the device name, up to 10 times.
+!
+INCR index FROM 1 TO 10 DO
+    BEGIN
+    ptr = CH$FIND_CH(.in_desc[0], .in_desc[1], ':');
+    IF NOT CH$FAIL(.ptr)
+    THEN in_desc[0] = .ptr - .in_desc[1];	! Get rid of colons +...
+
+    status = $TRNLOG(LOGNAM = in_desc,		! Try to translate
+		     RSLBUF = out_desc,
+		     RSLLEN = out_desc);
+    IF NOT .status 				! If an error, then exit
+    THEN RETURN .status;
+
+    temp = 0;					! Before continuing with the
+    IF CH$RCHAR(.out_desc[1]) EQL %X'1B'	! translation, see if this is
+    AND CH$RCHAR(.out_desc[1] + 1) EQL 0	! a process-permanent file.
+    AND .out_desc[0] - 4 GTR 0			! If so, then strip the first
+    THEN temp = 4				! four bytes (PPF info).
+    ELSE IF CH$RCHAR(.out_desc[1]) EQL '_'	! Also check and remove one or
+    THEN					! two underscores.
+	BEGIN
+	temp = 1;
+	IF CH$RCHAR(.out_desc[1] + 1) EQL '_'
+	THEN temp = 2;
+	END;
+    IF .temp NEQ 0				! If there were any characters
+    THEN					! to remove, then do so now.
+	BEGIN
+	CH$MOVE(.out_desc[0] - .temp,
+		.out_desc[1] + .temp,
+		.out_desc[1]);
+	out_desc[0] = .out_desc[0] - .temp;
+	END;
+
+    ptr = .in_desc[1];				! Rearrange the pointers
+    in_desc[0] = .out_desc[0];			! so that we continue to
+    in_desc[1] = .out_desc[1];			! translate.
+    IF .status EQL SS$_NOTRAN			! If no more translation,
+    THEN EXITLOOP;				! then go parse the string
+    out_desc[0] = log$c_namlength;
+    out_desc[1] = .ptr;
+    END;
+
+!
+! See if there is an SCS nodename or an allocation class on the front of the name.
+! If an SCS nodename, remove it and place the SCS node into NODE as an ASCIC string.
+! If an allocation class, remove it and place it in NODE[1:4] as an integer, and
+! set a flag so that we will know that it is an integer.
+!
+temp = CH$FIND_CH(.in_desc[0], .in_desc[1], '$');
+IF NOT CH$FAIL(.temp)				! If there is an SCS node,
+THEN
+    BEGIN
+    IF .temp EQL .in_desc[1]			! Leading "$" should be an allocation name
+    THEN
+	BEGIN
+	LOCAL
+	    alld : VECTOR [2, LONG];		! Descriptor for allocation class string
+	in_desc[0] = .in_desc[0] - 1;		! Remove the first "$" from the front
+	in_desc[1] = .in_desc[1] + 1;
+	temp = CH$FIND_CH(.in_desc[0],		! Find the second "$" in the name, the one
+			  .in_desc[1], '$');	! that separates allocation class from device
+	IF CH$FAIL(.temp)			! If there is a "$" on the front, we'd better have
+	THEN RETURN SS$_IVDEVNAM;		! another one
+	alld [0] = .temp - .in_desc[1];		! Calculate length of allocation class
+	alld [1] = .in_desc[1];			! And fill in the address
+	IF NOT OTS$CVT_TI_L (alld, node[0])	! Convert to an integer and store in node
+	THEN RETURN SS$_IVDEVNAM;		! Couldn't convert it, can't be valid
+	flags[devi$v_allocls] = 1;		! Let them know it is an allocation class name
+	in_desc[0] = .in_desc[0] - .alld[0] - 1;! Calculate new length and
+	in_desc[1] = .in_desc[1] + .alld[0] + 1;! new position of string
+	END
+    ELSE
+	BEGIN
+	node[0] = .temp - .in_desc[1]; 		! Calculate NODE count
+	CH$MOVE(.node[0],			! Put the node in NODE,
+		.in_desc[1],			! without the "$"
+		node[1]);
+	in_desc[0] = .in_desc[0] - .node[0] - 1;! Calculate new length and
+	in_desc[1] = .in_desc[1] + .node[0] + 1;! new position of string
+	END;
+    END;
+
+!
+! At this point we should have a physical device name, or else some fragment
+! of a device name.  This fragment needs to be parsed into a unit number and
+! a device type.  The simplest approach to take is to go backward, from the 
+! end of the string, and locate the first non-numerical character.  
+!
+IF .in_desc[0] EQL 0				! If no more, then
+THEN RETURN 1;					! stop now.
+
+exp = 1;
+temp = -1;
+temp_unit = 0;
+DECR index FROM .in_desc[0] - 1 TO 0 DO
+    BEGIN
+    LOCAL
+    	char : BYTE;				! Temp character
+
+    char = CH$RCHAR(.in_desc[1] + .index);	! Get a character
+    IF .char GTR '9'				! See if it's a number
+    OR .char LSS '0'
+    THEN (temp = .index; EXITLOOP)		! If not, then exit
+    ELSE					! If a number, add it
+	BEGIN					! in to the unit number
+	temp_unit = .temp_unit + ((.char - '0') * .exp);
+	exp = .exp * 10;
+	END;
+    END;
+
+IF .temp EQL -1					! If nothing but numbers,
+THEN RETURN SS$_IVDEVNAM;			! return invalid device name.
+
+!
+! TEMP points to the character just before the unit number.  Copy
+! the string up to TEMP to the ASCID string, DEVICE.
+!
+CH$MOVE(.temp + 1,			! Copy the device part
+	.in_desc[1],			! of the translated name
+	device[1]);			! to DEVICE
+device[0] = .temp + 1;			! and put in the count
+
+!
+! If TEMP is not positioned at the last character of the string,
+! then there is a unit number to get.
+!
+IF .temp+1 LSS .in_desc[0]
+THEN .unit = .temp_unit;
+
+RETURN 1;
+END;
+
+END
+ELUDOM

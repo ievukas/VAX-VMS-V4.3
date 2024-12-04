@@ -1,0 +1,435 @@
+MODULE SSIK (IDENT = 'V04-000') =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  VAX/VMS System Service Call Monitor
+!
+! ABSTRACT:
+!
+!	This module makes a copy of System Service vector in P0 space,
+!	then modifies the System Service vector JSB into intercept code.
+!
+!	SSI.B32 is split into 2 portions: SSIK.B32 is strictly running
+!	in kernel mode to do the setup, SSIU.B32 is running in user
+!	mode only.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system, CMKRNL privilege required.
+!
+! AUTHOR:  David Thiel, 30-Dec-1981
+!
+! Modified by:
+!
+!	   Ping Sager,  19-Sep-1983
+!
+!--
+
+!
+! Include files
+!
+LIBRARY 'SYS$LIBRARY:LIB.L32';		! VAX/VMS common definitions
+REQUIRE 'SRC$:SSIDEF.REQ';		! Definitions for SSI 
+
+
+!
+! Table of contents
+!
+FORWARD ROUTINE
+    ssik_start,				! Main routine
+    make_p0_space,			! Allocate save/data/code area in P0
+    ssik_setup;				! Establish intercept
+
+GLOBAL
+    ssv_munged_flag: INITIAL(0),	! Set to TRUE when we actually
+    					!   change the system service vector.
+    base : REF BBLOCK,			! Address of system service vector 
+    intercept : REF VECTOR [, BYTE],	! Address of saved system vector,
+    					!   data, code area in P0
+    range : VECTOR [2, LONG];		! Pages allocated in P0
+    					!   (maps in ISSH.MAR)
+
+! This portion (SSIK.B32) of the SSI.B32 is stictly running in kernel mode, 
+! and we are not intercepting anything in kernel mode.  So there is no
+! need to have this flag to indicate this program is running.  This flag
+! is set to indicate the other part (SSIU.B32) is running which runs in
+! user mode.
+!
+EXTERNAL				! Flag set to indicate (SSIU.B32) is 
+    ssi_running_flag;			! running
+
+OWN
+    					! Variables (good for testing usage)
+    l_base,				! (resident) copy of base 
+    l_intercept,			! (resident) copy of intercept 
+    l_tvl,				! (resident) copy of pointer
+    range1 : VECTOR [2, LONG],		! Maps in data area in range
+    range2 : VECTOR [2, LONG];		! Created virtual space over system
+    					!   service vector
+
+!
+! External routines
+!
+EXTERNAL ROUTINE
+    SSI_USSK : ADDRESSING_MODE (GENERAL),
+    sys$cretva : ADDRESSING_MODE (ABSOLUTE),	! Create virtual address space
+    sys$qiow : ADDRESSING_MODE (ABSOLUTE),	! Base of transfer vector
+    sys$rundwn : ADDRESSING_MODE (ABSOLUTE),	! Rundown
+    issh_entry,					! Intercept code entry (ISSH)
+    reset_ssv;					! Clean up the mess
+
+EXTERNAL LITERAL
+    issh_vec_length;			! Length of monitor code (ISSH)
+
+EXTERNAL
+    ctl$gl_ctlbasva : ADDRESSING_MODE (ABSOLUTE),! Not used, if set, P0
+    					! won't go away after image rundown
+    issh_data_beg,			! Begin data area (template)
+    issh_data_end,			! End data area (template)
+    issh_prio_mask,			! Mask to control the calling of the
+    					!  user routines
+    issh_vec_base,			! ISSH base address
+    issh_running_flag,			! Contain pointer to ssi_running_flag
+    					!  in P0
+    issh_stack,				! Local stack in P0 to keep track
+    					!  which user routine is active
+    					!  at the moment
+    issh_stkptr,			! Pointer to the above local stack
+    ssi_table : VECTOR [, LONG];	! Configuration SS data table
+
+
+GLOBAL ROUTINE ssik_start (RUNDWN_ADDR) =
+
+!---
+!
+! Function:
+!
+!	This is the main routine of the VAX/VMS System Service
+!	Monitor.  It calls appropriate actions.
+!
+! Inputs:
+!
+!	RUNDWN_ADDR : This address only can be rundown system index.
+!		
+! Outputs:
+!
+!	Worst status encountered.
+!
+!---
+
+    BEGIN
+
+    BUILTIN FP;
+
+    LOCAL
+        prio_mask: REF VECTOR[,BYTE],		! Current mask value after set
+    	status;					! Return status
+
+    
+    ! Check for rundown case.  The only way for this case to show up:
+    ! SYS$RUNDWN is called when image exits and intercept system service
+    ! is setup.  We simply put SSV back, and delete P0 space.
+    !
+    ! Note: next line is temporary, for I use the last 4 longwords in
+    ! SSV itself to store some values.
+    intercept = .(SYS$QIOW + sgn$c_sysvecpgs * 512 - 4);
+    IF .rundwn_addr EQL SYS$RUNDWN
+    THEN
+    	BEGIN
+        IF .intercept EQL 0 THEN RETURN 0;	! Can't be possible.
+        status = reset_ssv();			! Call routine to Clean up.
+        RETURN .status;				! Return Status. (Actually
+    	END;					!  status is always 1).
+
+
+    ! If this code is first time called, sets up the intercept, else simply
+    ! returns.
+    !
+    IF .intercept NEQ 0 THEN RETURN ss$_normal;
+
+
+    ! P0 space has not been set up by anyone yet.  Grap some space.
+    ! Set up SSV.
+    !
+    base = sys$qiow;
+    status = make_p0_space();
+    IF .status THEN status = ssik_setup();
+    IF NOT .status THEN RETURN .status;
+    
+
+    ! Now that we have modified the system service vector, set the global flag
+    ! which indicates that the system service vector has been modified. This
+    ! flag gets cleared in RESETSSI.
+    !
+    ssv_munged_flag = 1;
+
+
+    ! Initialize current mask to 0.  (Assume nothing is active at
+    ! this moment.
+    !
+    prio_mask = .intercept + issh_prio_mask - issh_vec_base;
+    .prio_mask = 0;
+    RETURN ss$_normal;
+    END;
+
+ROUTINE make_p0_space =
+
+!---
+!
+! Function:
+!
+!	Create a save area for intercepting system services in P0
+!	space.  
+!
+! Inputs:
+!
+!	None.
+!
+! Outputs:
+!
+!	status is returned.
+!
+!---
+
+    BEGIN
+
+    BIND
+    	exp_size = (issh_vec_length+%X'1FF') ^ -9;
+    					! ISSH.MAR code side
+
+    LOCAL
+	status;				! Return status
+
+
+    ! Create a save area to save the system vector, data area, and code
+    ! in P0 space.
+    !
+    status = $EXPREG (
+    	PAGCNT = exp_size,		! pages to create
+    	REGION = 0,			! P0 region
+    	ACMODE = psl$c_kernel,		! kernel mode to own pages
+    	RETADR = range);		! range of allocated addresses
+    IF NOT .status THEN RETURN .status;
+
+
+    ! Map in from ISSH.MAR.
+    !
+    CH$MOVE (issh_vec_length, issh_vec_base, .range[0]);
+
+
+    ! Set protection to saved area.
+    !
+    status = $SETPRT (
+    	INADR = range,			! pages to protect
+    	PROT = prt$c_urkw);		! kernal writable, others can read
+    IF NOT .status THEN RETURN .status;
+
+
+    ! Mapped in data area and control area.
+    !
+    range1 [0] = .range [0] + issh_data_beg - issh_vec_base;
+    range1 [1] = .range [0] + issh_data_end - issh_vec_base - 1;
+
+
+    ! Set protection to data area.
+    !
+    status = $SETPRT (
+    	INADR = range1,			! pages to protect
+    	PROT = prt$c_uw);		! everybody can access data pages
+    IF NOT .status THEN RETURN .status;
+
+
+    ! Set the pointer to saved area in P0 space.
+    !
+    intercept = .range [0];
+    RETURN ss$_normal;
+
+    END;
+
+
+ROUTINE ssik_setup : PSECT (lkcode_1) =
+
+!---
+!
+! Function:
+!
+!	Setup System Service Intercept.  Vector to be intercepted is
+!	in base, save/data area is in intercept.
+!
+! Inputs:
+!
+!	Entry point address of this routine.
+!
+! Outputs:
+!
+!	status is returned.
+!
+!---
+
+    BEGIN
+
+    LOCAL
+    	old_stat,			! Old AST enable status
+    	status,				! Return status
+    	temp_vec: VECTOR[2];		! Parameter for $SETPRT
+
+    BIND
+	tvl = base [sgn$c_sysvecpgs * 512, 0, 0, 0] : BBLOCK FIELD (tvb);
+
+
+    l_base = .base;			! SSV base address
+    l_intercept = .intercept;		! Copied SSV base address
+    l_tvl = tvl;			! End of SSV
+
+
+    ! Save original system vector in saved area.  Disable AST first.
+    !
+    return_if_error (old_stat = $SETAST (ENBFLG = 0));
+    CH$MOVE (sgn$c_sysvecpgs*512, .l_base, .l_intercept);
+
+
+    ! Create virtual memory over the original system vector and copy
+    ! the original contents back into it.
+    !
+    range2 [0] = .l_base;
+    range2 [1] = .l_base + sgn$c_sysvecpgs*512 - 1;
+    status = (sys$cretva + (%X'80000000' - sys$qiow)) (
+	range2,			! inadr
+	range2,			! retadr
+	0);			! acmode?
+
+    IF NOT .status 
+    THEN 
+        BEGIN
+
+
+        ! Enable AST.
+    	!
+    	IF .old_stat EQL ss$_wasset
+    	THEN
+    	    return_if_error ($SETAST (ENBFLG = 1));
+
+    	RETURN .status;
+    	END;
+
+
+    ! restore original contents of save/data area
+    !
+    CH$MOVE (sgn$c_sysvecpgs*512, .l_intercept, .l_base);
+
+
+    ! Set protection.
+    !
+    status = $SETPRT (
+	INADR = range2,			! pages to protect
+	PROT = prt$c_urkw);		! kernal writable, others can read
+
+    IF NOT .status 
+    THEN 
+    	BEGIN
+
+
+        ! Enable AST.
+    	!
+    	IF .old_stat EQL ss$_wasset
+    	THEN
+    	    return_if_error ($SETAST (ENBFLG = 1));
+
+     	RETURN .status;
+    	END;
+
+
+    ! Initialize local stack in P0.
+    ! Stack pointer is 1 (points to the 1st element on stack), 
+    ! stack value is 0 (nothing is active at the moment).
+    !
+    .l_intercept + issh_stkptr - issh_vec_base = 1;
+    .l_intercept + issh_stack - issh_vec_base = 0;
+
+
+    ! Make the running flag user-writable.
+    !
+    temp_vec[0] = ssi_running_flag;
+    temp_vec[1] = ssi_running_flag;
+    return_if_error ($SETPRT (INADR = temp_vec, PROT = prt$c_uw));
+
+
+    ! Set up the running flag.  If this flag is set, means that SSIU.B32
+    ! is running so won't intercept any system service from that program.
+    ! Otherwise, go ahead to intercept.  For SSIU.B32 is running in user
+    ! mode, which is the only mode we intercept.
+    !
+    .l_intercept + issh_running_flag - issh_vec_base = ssi_running_flag;
+
+
+    ! Set up 3 pointers at the end of the System Service Vector.
+    !   - A pointer to the saved system service vector in P0.
+    !   - A pointer to the saved intercept code entry point.
+    !   - Address of the user defined system service.
+    !
+    tvl [ptr] = .l_intercept;
+    tvl [pg0] = .l_intercept + issh_entry - issh_vec_base;
+    tvl [pg1] = SSI_USSK;
+    
+    DECR i FROM (.ssi_table[-1])/2 -1 TO 0 DO
+    	BEGIN
+    	BIND
+	    p = ssi_table [.i*2] : VECTOR [, LONG],
+	    t = .l_base + .p [1] : BBLOCK;
+
+
+    	! Verify it is in System space.
+    	!
+    	IF .p [1] GEQU %X'800'
+    	THEN
+    	    0
+
+    	ELSE 
+
+
+	    ! CALLS/CALLG intercepted at entry
+	    !
+    	    BEGIN
+	    t [2, 0, 8, 0] = op$_jsb;	! JSB
+    	    t [3, 0, 8, 0] = %X'DF';	! @W^ addressing mode
+    	    t [4, 0, 16, 0] = tvl [pg0] - t [6, 0, 8, 0];
+	    END;
+    	END;				! End of DECR.
+
+
+    ! Enable AST.
+    !
+    IF .old_stat EQL ss$_wasset
+    THEN
+    	return_if_error ($SETAST (ENBFLG = 1));
+
+    RETURN ss$_normal;
+
+    END;
+
+END
+ELUDOM

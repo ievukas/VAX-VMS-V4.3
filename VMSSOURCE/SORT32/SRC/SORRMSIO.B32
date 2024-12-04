@@ -1,0 +1,1001 @@
+MODULE SOR$RMS_IO (
+		IDENT = 'V04-000'	! File: SORRMSIO.B32 Edit: PDG3026
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+!
+! FACILITY:	VAX-11 SORT/MERGE
+!
+! ABSTRACT:
+!
+!	This module contains RMS I/O support.
+!
+! ENVIRONMENT:	VAX/VMS user mode
+!
+! AUTHOR: Peter D Gilbert, CREATION DATE: 07-Jan-1982
+!
+! MODIFIED BY:
+!
+!	T03-015		Original
+!	T03-016	Set the OFP FOP flag.  Also, if the output file cannot be in
+!		print file format, clear the PRN flag.  PDG 13-Dec-1982
+!	T03-017	Set COM_MINVFC before calling callback routine in SOR$$OPEN.
+!		PDG 20-Dec-1982
+!	T03-018	Added protection XAB.  PDG 30-Dec-1982
+!	T03-019	Don't allocate UBF unless there are files.  3-Feb-1983
+!	T03-020	Don't allow FAB$C_IDX on the $CREATE.  PDG 3-Mar-1983
+!	T03-021	Slight change to file protection.  PDG 11-May-1983
+!	T03-022	Recover on RMS$_FLK errors on input.  PDG 19-May-1983
+!	T03-023	Allow RMS to default protection, then add extra restrictions.
+!		PDG 5-Aug-1983
+!	T03-024	Law of excluded middle mishap.  Non-fixed-format files are
+!		varying.  PDG 15-Aug-1983
+!	T03-025	SOR$$BEST_FILE_NAME assumes NAM$B_RSL and NAM$B_ESL are zero
+!		before the OPEN or CREATE.  PDG 10-Nov-1983
+!	T03-026	Also set the UPI bit on second $OPEN attempt.  PDG 9-Apr-1984
+!--
+
+LIBRARY	'SYS$LIBRARY:STARLET';
+REQUIRE	'SRC$:COM';
+
+FORWARD ROUTINE
+    CALC_LRL:		CAL_CTXREG,		! Calc longest record length
+    SOR$$OPEN:		CAL_CTXREG,		! Open input and output files
+    SOR$$RFA_ACCESS:	NOVALUE CAL_ACCESS;	! Access a record by RFA
+
+EXTERNAL ROUTINE
+    SOR$$BEST_FILE_NAME:CAL_CTXREG NOVALUE,
+    SOR$$ALLOCATE:	CAL_CTXREG,		! Allocate storage
+    SOR$$ERROR;					! Issue error diagnostics
+
+ROUTINE CALC_LRL
+	(
+	FAB:	REF BLOCK[,BYTE],
+	FHC:	REF BLOCK[,BYTE]
+	):	CAL_CTXREG =
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine calculates the longest record length of a file
+!	based on the information in the FAB and XABs.
+!	Note that for VFC format files, this does not include the VFC area.
+!
+! FORMAL PARAMETERS:
+!
+!	FAB.ra.v	Pointer to FAB
+!	FHC.ra.v	Pointer to XABFHC
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	The largest record length for this file.  If it can't
+!	be determined from the FAB and XAB, returns zero.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+    BEGIN
+    LITERAL
+	BKS_OVER=	24;		! Bucket overhead for indexed file.
+
+    LOCAL
+	LRL;				! Best guess at longest record length.
+
+
+
+    ! Determine the length of the longest record in the file (not including the
+    ! VFC area.
+    !
+    ! The LRL value does not include the VFC area, unless the file is relative.
+    ! The MRS includes the VFC area.
+    ! The BKS and BLS include the VFC area.
+    !
+    IF .FHC[XAB$W_LRL] NEQ 0
+    THEN
+	BEGIN
+	LRL = .FHC[XAB$W_LRL];
+	IF .FAB[FAB$B_ORG] EQL FAB$C_REL
+	THEN
+	    LRL = .LRL - .FAB[FAB$B_FSZ];
+	END
+    ELIF
+	.FAB[FAB$W_MRS] NEQ 0
+    THEN
+	LRL = .FAB[FAB$W_MRS] - .FAB[FAB$B_FSZ]
+    ELIF
+	.FAB[FAB$B_BKS] NEQ 0
+    THEN
+	LRL = (.FAB[FAB$B_BKS] * COM_K_BPERBLOCK) - BKS_OVER
+    ELSE
+	LRL = .FAB[FAB$W_BLS];
+
+
+    RETURN .LRL;				! Return calculated value.
+    END;
+
+GLOBAL ROUTINE SOR$$OPEN
+	(
+	LRL_OUT_RTN,		! Routine to calculate COM_LRL_OUT
+	LRL_OUT_PRM		! Parameter to LRL_OUT_RTN
+	): CAL_CTXREG =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine opens the input file(s) and the output file.
+!	It also verifies some attributes of the files.
+!
+!	Note that the input files are not opened in PASS_FILES.  We delay
+!	opening them until after the user has been able to specify whether
+!	errors are to be signalled or returned.
+!
+! FORMAL PARAMETERS:
+!
+!	CTX		Longword pointing to work area (passed in COM_REG_CTX)
+!
+! IMPLICIT INPUTS:
+!
+!	The DDBs for the files have been initialized.
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	Status code.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CTX =	COM_REG_CTX:	REF CTX_BLOCK;
+    LOCAL
+	DDB:	REF DDB_BLOCK,		! Pointer to DDB for output file
+	LRL,				! Longest record length
+	TOT_ALQ,			! Total allocation quantity
+	FAB:	$FAB_DECL,		! FAB block
+	NAM:	$NAM_DECL VOLATILE,	! NAM block
+	FNA:	BLOCK[NAM$C_MAXRSS, BYTE],	! File name string area
+	FHC:	BLOCK[XAB$C_FHCLEN, BYTE],	! File header control block
+	XABPRO:	$XABPRO_DECL,			! XAB for file protection
+	PRO:	WORD,				! Protection
+	STATUS;			! Status
+    LOCAL
+	WAS_IDX;
+
+
+    ! Initialize the longest record length
+    !
+    LRL = 0;				! Start the maximum low
+
+
+    ! Initialize the accumulative input file allocation, using the default
+    ! for no input files.
+    !
+    TOT_ALQ = 0;
+    IF .CTX[COM_NUM_FILES] EQL 0 THEN TOT_ALQ = DEF_FILE_ALLOC;
+
+
+    ! If the output file is in VFC format, it's FSZ value is computed by:
+    !	If user specified FSZ,	then the user-specified FSZ
+    !	Otherwise,		the FSZ of the first input file
+    !	    (if the FSZ of the first input file is 0, RMS will default to 2)
+    !
+    ! The storage we require in an internal format node for the VFC area is:
+    !	For Record sorts: Min( Max(input-FSZ), Max(output-FSZ) )
+    !	Non-Record sorts: 0 (we don't need the VFC area, or we get it later)
+    ! If there are no input (output) files, the corresponding FSZ equals 0.
+    ! This value is computed in CTX[COM_MINVFC].
+    !
+    ! The size of the storage we must allocate to hold the VFC area is:
+    !	If Max(input-FSZ) = 0,	then 0 (and no storage allocated)
+    !	If Max(output-FSZ) = 0,	then 0 (and no storage allocated)
+    !	Otherwise,		Max( Max(input-FSZ), Max(output-FSZ) )
+    ! This value is computed in CTX[COM_MAXVFC].
+    !
+    ! The calculations are done as follows:
+    !	Compute Max(input-FSZ) into CTX[COM_MAXVFC]
+    !
+    CTX[COM_MAXVFC] = 0;		! Start the maximum low
+
+
+    ! Initialize the FAB (file access block), the NAM (name block), and
+    ! the FHC XAB (file header control extended attributes block).
+    !
+    $FAB_INIT(
+	FAB = FAB[BASE_],		! FAB block
+	NAM = NAM[BASE_],		! NAM block
+	XAB = FHC[BASE_],		! FHC block
+!	FNA				! File name area	(set below)
+!	FNS				! File name area size	(set below)
+	FAC = GET,			! File access
+	SHR = GET,			! Sharing
+	DNA = UPLIT BYTE(STR_DEF_EXT),	! Default extension is .DAT
+	DNS = %CHARCOUNT(STR_DEF_EXT),	! Default extension is .DAT
+	RFM = VAR,			! Needed if no input files
+	RAT = CR);			! Record attributes
+    IF .CTX[COM_SORT_TYPE] NEQ TYP_K_TAG
+    THEN
+	FAB[FAB$L_FOP] = FAB$M_SQO;	! Sequential access only if not tag
+    $NAM_INIT(
+	NAM = NAM[BASE_],		! NAM block
+	ESS = %ALLOCATION(FNA),		! Expanded name string size
+	ESA = FNA[BASE_],		! Expanded name string area
+	RSS = %ALLOCATION(FNA),		! Resultant name string size
+	RSA = FNA[BASE_]);		! Resultant name string area
+    $XABFHC_INIT(
+	XAB = FHC[BASE_],		! XABFHC block
+	NXT = XABPRO[BASE_]);
+    PRO = 0;				! No protection restrictions yet
+
+    ! Loop for each input file
+    !
+    DDB = .CTX[COM_INP_DDB];			! Point to first DDB
+    DECR I FROM .CTX[COM_NUM_FILES]-1 TO 0 DO
+	BEGIN
+	LOCAL
+	    T;
+
+	! Advance to next DDB.
+	! The first input file is opened last, so the output file will use
+	! the file characteristics of the first input file.
+	!
+	DDB = .DDB[DDB_NEXT];
+	IF DDB[BASE_] EQL 0 THEN DDB = .CTX[COM_INP_DDB];
+
+	$XABPRO_INIT(XAB = XABPRO[BASE_]);
+
+	!+
+	!
+	! The following information is needed:
+	!
+	! FAB$B_RFM	Record format
+	! FAB$B_FSZ	Length of the VFC area
+	! FAB$L_ALQ	File allocation
+	! FAB		$OPEN, $CLOSE
+	! RAB		$GET
+	! RAB		Accessing the file by RFA for tag sorts
+	! NAM$B_RSL	Resultant file name string length
+	! NAM$L_RSA	Resultant file name string address
+	! FHCXAB	Used to calculate the LRL
+	!
+	! Thus, much of the storage may be reclaimed.
+	!
+	!-
+
+	! Actually open the input file
+	!
+	NAM[NAM$B_RSL] = 0;
+	NAM[NAM$B_ESL] = 0;
+	FAB[FAB$W_IFI] = 0;
+	FAB[FAB$B_FNS] = .VECTOR[ DDB[DDB_NAME], 0 ];
+	FAB[FAB$L_FNA] = .VECTOR[ DDB[DDB_NAME], 1 ];
+	STATUS = $OPEN(FAB = FAB[BASE_]);
+
+
+	! Get the best file name string available
+	!
+	SOR$$BEST_FILE_NAME(FAB[BASE_], DDB[DDB_NAME]);
+
+	IF .FAB[FAB$L_STS] EQL RMS$_FLK
+	THEN
+	    BEGIN
+	    FAB[FAB$B_SHR] = FAB$M_PUT OR FAB$M_GET OR FAB$M_DEL OR FAB$M_UPD
+				OR FAB$M_UPI;
+	    FAB[FAB$V_NAM] = TRUE;
+	    FAB[FAB$B_FNS] = .VECTOR[ DDB[DDB_NAME], 0 ];
+	    FAB[FAB$L_FNA] = .VECTOR[ DDB[DDB_NAME], 1 ];
+	    IF $OPEN(FAB = FAB[BASE_])
+	    THEN
+		BEGIN
+		SOR$$ERROR(
+		    SOR$_SHR_OPENIN AND NOT STS$M_SEVERITY OR STS$K_WARNING,
+		    1, DDB[DDB_NAME], RMS$_FLK, 0);
+		END;
+	    FAB[FAB$B_SHR] = FAB$M_GET;
+	    FAB[FAB$V_NAM] = FALSE;
+	    END;
+
+	IF NOT .FAB[FAB$L_STS]
+	THEN
+	    RETURN SOR$$ERROR(SOR$_SHR_OPENIN, 1, DDB[DDB_NAME],
+		    .FAB[FAB$L_STS], .FAB[FAB$L_STV]);
+
+
+	! If this is not a VFC format file, clear the FSZ field
+	!
+	IF .FAB[FAB$B_RFM] NEQ FAB$C_VFC
+	THEN
+	    FAB[FAB$B_FSZ] = 0;
+
+
+	! Calculate largest record length
+	!
+	T = CALC_LRL(FAB[BASE_], FHC[BASE_]);
+	IF .LRL EQL 0
+	THEN
+	    LRL = .T			! First time here, just use length
+	ELIF
+	    .T NEQ .LRL
+	THEN
+	    BEGIN
+	    IF .T GTRU .LRL THEN LRL = .T;
+	    CTX[COM_VAR] = TRUE;	! Variable length records
+	    END;
+
+
+	! Check for VFC format input files.
+	!
+	IF .CTX[COM_MAXVFC] LSSU .FAB[FAB$B_FSZ]
+	THEN
+	    CTX[COM_MAXVFC] = .FAB[FAB$B_FSZ];	! Maximize COM_MAXVFC
+
+
+	! Most files are varying in length
+	!
+	IF  .FAB[FAB$B_RFM] NEQ FAB$C_FIX
+	THEN
+	    CTX[COM_VAR] = TRUE;		! Variable-length records
+
+
+	! Get the allocation quantity
+	! Note that we naively ignore the complexities of indexed files.
+	!
+	IF .BLOCK[ FAB[FAB$L_DEV], DEV$V_RND; ,BYTE]
+	THEN
+	    BEGIN
+	    !
+	    ! FHC[XAB$L_EBK] should be a better estimate than FAB[FAB$L_ALQ]
+	    !
+	    TOT_ALQ = .TOT_ALQ + .FHC[XAB$L_EBK];
+	    END
+	ELSE
+	    BEGIN
+	    !
+	    ! The input file is not on a random access device.
+	    !
+	    LOCAL
+		ALQ;
+	    IF .CTX[COM_SORT_TYPE] NEQ TYP_K_RECORD
+	    THEN
+		RETURN SOR$_BAD_TYPE;	! Only random access devices have RFAs
+	    IF (ALQ = .FHC[XAB$L_EBK]) EQL 0 THEN
+	    IF (ALQ = .FAB[FAB$L_ALQ]) EQL 0 THEN
+	    IF .BLOCK[ FAB[FAB$L_DEV], DEV$V_TRM; ,BYTE] THEN
+		ALQ = DEF_TRM_ALLOC
+	    ELSE
+	        ALQ = DEF_FILE_ALLOC;
+	    TOT_ALQ = .TOT_ALQ + .ALQ;
+	    END;
+
+
+	$RAB_INIT(
+	    RAB = DDB[DDB_RAB+BASE_],
+	    FAB = FAB[BASE_],
+!	    MBC			! May be set below
+!	    MBF			! Set below
+	    RAC = SEQ,
+!	    RHB =		! Allocated later
+	    ROP = <RAH,LOC,MAS>);
+
+
+	! If organization is sequential and the device is disk use MBC and MBF
+	! if there are more than 8 blocks available.  Otherwise use MBF = 2.
+	!
+	! ??? Is this the best way to calculate these values?
+	!
+	IF .FAB[FAB$B_ORG] NEQ FAB$C_SEQ OR
+	    .BLOCK[ FAB[FAB$L_DEV], DEV$V_SQD; ,BYTE] OR
+	    NOT .BLOCK[ FAB[FAB$L_DEV], DEV$V_RND; ,BYTE]
+	THEN
+	    DDB[DDB_RAB+RAB$B_MBF] = MAX_MBF
+	ELSE
+	    BEGIN
+	    DDB[DDB_RAB+RAB$B_MBC] = MAX_MBC;
+	    DDB[DDB_RAB+RAB$B_MBF] = MAX_MBF;
+	    END;
+
+	! Connect the RAB to the FAB
+	!
+	STATUS = $CONNECT(RAB = DDB[DDB_RAB+BASE_]);
+	IF NOT .STATUS
+	THEN
+	    RETURN SOR$$ERROR(SOR$_SHR_OPENIN, 1, DDB[DDB_NAME],
+		    .DDB[DDB_RAB+RAB$L_STS], .DDB[DDB_RAB+RAB$L_STV]);
+
+	! Make the protection even more prohibitive,
+	!
+	PRO = .PRO OR .XABPRO[XAB$W_PRO];
+
+	! Save the IFI and FOP
+	!
+	DDB[DDB_IFI] = .FAB[FAB$W_IFI];
+	DDB[DDB_FOP] = .FAB[FAB$L_FOP];
+	END;
+
+
+    ! Store the LRL value into the common context area.
+    ! If the LRL was specified by the user, use that.
+    ! If the LRL was not specified, use the value from the input files.
+    ! Check the value of the LRL.
+    ! Note that we do allow a calculated LRL to be zero.
+    !
+    IF .CTX[COM_LRL] NEQ 0			! Did the user specify a value?
+    THEN
+	0					! Yes, leave it alone
+    ELSE
+	BEGIN
+	CTX[COM_LRL] = .LRL;			! No, use our value
+	IF .LRL GTRU MAX_REFSIZE
+	THEN
+	    RETURN SOR$$ERROR(SOR$_LRL_MISS);
+	END;
+
+
+    ! Allocate space for the user buffer, and set the UBF and USZ.
+    !
+    IF .CTX[COM_NUM_FILES] NEQ 0
+    THEN
+	BEGIN
+	LOCAL
+	    USZ,
+	    UBF:	REF BLOCK;
+	USZ = .CTX[COM_LRL];	! + .CTX[COM_MAXVFC];
+	UBF = SOR$$ALLOCATE(.USZ);
+	DDB = .CTX[COM_INP_DDB];
+	DECR I FROM .CTX[COM_NUM_FILES]-1 TO 0 DO
+	    BEGIN
+	    DDB[DDB_RAB+RAB$W_USZ] = .USZ;
+	    DDB[DDB_RAB+RAB$L_UBF] = UBF[BASE_];
+	    DDB = .DDB[DDB_NEXT];
+	    END;
+	END;
+
+
+    ! Figure the number of blocks needed to store all the input records.
+    !
+    IF .CTX[COM_FILE_ALLOC] NEQ 0
+    THEN
+	0				! User told us; assume he knows best
+    ELSE
+	CTX[COM_FILE_ALLOC] = .TOT_ALQ;	! Use the input file allocation
+
+
+    ! If no output file is specified, update the VFC values appropriately.
+    !
+    DDB = .CTX[COM_OUT_DDB];
+    IF DDB[BASE_] EQL 0
+    THEN
+	BEGIN
+	!
+	! Max(output-FSZ) = 0
+	! CTX[COM_MINVFC] = Min( Max(input-FSZ), Max(output-FSZ) ) = 0
+	! CTX[COM_MAXVFC] = 0	(no storage needed for this)
+	!
+	CTX[COM_MINVFC] = CTX[COM_MAXVFC] = 0;
+	END;
+
+    ! The size we need in internal nodes, COM_MINVFC, may be needed by the
+    ! the routine we are about to call.  Set it pessimisticly (since we don't
+    ! know about the output file yet).
+    !
+    CTX[COM_MINVFC] = .CTX[COM_MAXVFC];
+
+
+    ! Now that we know the longest input record length, set the largest output
+    ! record length.  Record reformatting, and the sort process determine the
+    ! output record length, so call a routine to calculate COM_LRL_OUT.
+    !
+    STATUS = CAL_CTXREG(.LRL_OUT_RTN, .LRL_OUT_PRM);
+    IF NOT .STATUS THEN RETURN .STATUS;
+
+
+    !+
+    !
+    ! The only fields in the context area that are set or modified below are:
+    ! COM_LRL_OUT, COM_MINVFC, and COM_MAXVFC
+    !
+    ! COM_LRL_OUT may be modified to hold the maximum record size for fixed
+    ! format output files, so that, if a record length occurs when writing a
+    ! record, we have a correct length that can be used.
+    !
+    !-
+
+
+    ! If no output file is specified, return now.
+    !
+    IF DDB[BASE_] EQL 0 THEN RETURN SS$_NORMAL;
+
+!+
+!
+! Fall through here only if an output file was specified
+!
+! The following values (computed above) are used:
+!	LRL	Longest record length
+!	TOT_ALQ	Total input file allocation
+!	VFC	Size of fixed portion of VFC records
+!-
+
+    ! Initialize the FAB for output
+    !
+    FAB[FAB$W_IFI] = 0;
+    FAB[FAB$B_FAC] = FAB$M_PUT;
+    FAB[FAB$B_SHR] = FAB$M_NIL;
+    FAB[FAB$B_FNS] = .VECTOR[ DDB[DDB_NAME], 0 ];
+    FAB[FAB$L_FNA] = .VECTOR[ DDB[DDB_NAME], 1 ];
+    FHC[XAB$W_LRL] = 0;
+
+    ! Set the output file protection, requesting that RMS tell us what it used.
+    !
+    $XABPRO_INIT(XAB = XABPRO[BASE_]);
+    XABPRO[XAB$W_PRO] = -1;
+
+    ! Initialize the Record Access Block
+    !
+    $RAB_INIT(
+	RAB = DDB[DDB_RAB+BASE_],
+	FAB = FAB[BASE_],
+!	MBC		! May be set below
+!	MBF		! Set below
+	RAC = SEQ,
+!	RHB		! Allocated later
+	ROP = <WBH,MAS>);
+    IF .CTX[COM_LOAD_FILL] THEN DDB[DDB_RAB+RAB$V_LOA] = TRUE;
+
+
+    ! The ALQ field is used to preallocate a file when it is created.
+    ! This saves on the number of extends needed when creating the file,
+    ! and helps ensure that sufficient space will be available for the
+    ! output file.  However, this may decrease the amount of space available
+    ! for work files, and may be inaccurate due to record selection, or INDEX
+    ! or ADDRESS sorts.
+    !
+    %IF TUN_K_OUT_PREALL
+    %THEN
+	FAB[FAB$L_ALQ] = .TOT_ALQ;
+    %FI
+
+
+    ! Default the maximum record size now, and allow the user to override it.
+    !
+    ! Delay opening the output file until the keys, et.al have been processed,
+    ! because of record reformatting.
+    !
+    FAB[FAB$W_MRS] = %X'FFFF';		! Indicate MRS is uninitialized
+
+
+    ! If address or index sort, default organization to sequential and record
+    ! format to fixed.  Allow RMS to default block and bucket size.
+    ! The longest output record length was calculated by the LRL_OUT_RTN.
+    !
+    IF ONEOF_(.CTX[COM_SORT_TYPE], BMSK_(TYP_K_ADDRESS,TYP_K_INDEX))
+    THEN
+	BEGIN
+	FAB[FAB$B_ORG] = FAB$C_SEQ;		! Sequential organization
+	FAB[FAB$B_RFM] = FAB$C_FIX;		! Fixed length records
+	FAB[FAB$B_RAT] = FAB$M_CR;		! So we can look at it
+	END;
+
+
+    ! Set file options.
+    ! By default, we want to trucate at the end of file, unless the user
+    ! has explicitly specified an output file allocation, or if the user
+    ! has specified file options to be used.
+    ! TEF = truncate at end of file
+    !
+    FAB[FAB$L_FOP] = .FAB[FAB$L_FOP] OR FAB$M_TEF;
+
+
+    ! Copy user-specified output file options into the FAB.
+    !
+    IF .CTX[COM_PASS_FILES] NEQ 0
+    THEN
+	BEGIN
+	LOCAL
+	    P:	REF VECTOR;
+	P = .CTX[COM_PASS_FILES];
+	IF .(.P)<1,1> THEN FAB[FAB$B_ORG] = .P[1];
+	IF .(.P)<2,1> THEN FAB[FAB$B_RFM] = .P[2];
+	IF .(.P)<3,1> THEN FAB[FAB$B_BKS] = .P[3];
+	IF .(.P)<4,1> THEN FAB[FAB$W_BLS] = .P[4];
+	IF .(.P)<5,1> THEN FAB[FAB$W_MRS] = .P[5];
+	IF .(.P)<6,1> THEN BEGIN
+			   FAB[FAB$L_ALQ] = .P[6];
+			   FAB[FAB$V_TEF] = FALSE;
+			   END;
+	IF .(.P)<7,1> THEN FAB[FAB$L_FOP] = .P[7];
+	IF .(.P)<8,1> THEN FAB[FAB$B_FSZ] = .P[8];
+	END;
+
+
+    ! Set other file options.
+    ! We want to use deferred writes, regardless of what the user specified.
+    ! DFW = deferred write
+    ! SQO = sequential access only
+    ! OFP = output file parse
+    !
+    FAB[FAB$L_FOP] = .FAB[FAB$L_FOP] OR FAB$M_DFW OR FAB$M_SQO OR FAB$M_OFP;
+
+
+    ! If the user did not specify an MRS value, default it as needed.
+    !
+    IF .FAB[FAB$W_MRS] EQL %X'FFFF'
+    THEN
+	BEGIN
+
+	! If relative or fixed format, we must set MRS.
+	!
+	! Remember that MRS includes the length of the VFC area
+	!
+	IF .FAB[FAB$B_ORG] EQL FAB$C_REL OR .FAB[FAB$B_RFM] EQL FAB$C_FIX
+	THEN
+	    BEGIN
+	    LOCAL
+		FSZ;
+	    FAB[FAB$W_MRS] = .CTX[COM_LRL_OUT];
+	    FSZ = .FAB[FAB$B_FSZ];
+	    IF .FSZ EQL 0 THEN FSZ = 2;		! RMS default
+	    IF .FAB[FAB$B_RFM] EQL FAB$C_VFC
+	    THEN
+		FAB[FAB$W_MRS] = .FAB[FAB$W_MRS] + .FSZ;
+	    END
+	ELSE
+	    FAB[FAB$W_MRS] = 0;
+
+	END;
+
+    WAS_IDX = FALSE;
+    IF .FAB[FAB$B_ORG] EQL FAB$C_IDX
+    THEN
+	BEGIN
+	IF NOT .FAB[FAB$V_CIF]
+	THEN
+	    BEGIN
+	    !
+	    ! We seem to be creating an indexed output file.
+	    ! Complain and change the organization.
+	    !
+	    SOR$$ERROR(SOR$_IND_OVR AND NOT STS$M_SEVERITY OR STS$K_WARNING);
+	    END
+	ELSE
+	    BEGIN
+	    !
+	    ! Remember that the caller expects to overlay an indexed file.
+	    ! Default the organization.  If the file is created (and is not
+	    ! indexed), complain.
+	    !
+	    WAS_IDX = TRUE;
+	    END;
+
+	! Default the organization
+	!
+	FAB[FAB$B_ORG] = 0;
+	END;
+
+
+    ! Print file format files must be VFC with FSZ of at least 2
+    !
+    IF .FAB[FAB$B_RFM] NEQ FAB$C_VFC OR .FAB[FAB$B_FSZ] LSS 2
+    THEN
+	FAB[FAB$V_PRN] = FALSE;
+
+
+    ! Create the output file
+    !
+    BEGIN
+    LOCAL
+	ONAM:	$NAM_DECL;
+
+    $NAM_INIT(
+	NAM = ONAM[BASE_],		! NAM block
+	ESS = %ALLOCATION(FNA),		! Expanded name string size
+	ESA = FNA[BASE_],		! Expanded name string area
+	RSS = %ALLOCATION(FNA),		! Resultant name string size
+	RSA = FNA[BASE_]);		! Resultant name string area
+
+    FAB[FAB$L_NAM] = ONAM[BASE_];
+
+
+    ! Use the first input file as a related file name string
+    !
+    IF .CTX[COM_NUM_FILES] NEQ 0
+    THEN
+	BEGIN
+	ONAM[NAM$L_RLF] = NAM[BASE_];
+	FAB[FAB$B_DNS] = 0;		! Get rid of the default name string
+	FAB[FAB$L_DNA] = 0;		! Get rid of the default name string
+	END;
+
+    ! Create the output file.
+    !
+    ! Note that we are unwilling to do many checks on the file attributes,
+    ! since RMS is good at doing that.  Also, any checks that are done should
+    ! be done after the create, since the specified file attributes may not be
+    ! the same as the actual attributes (due to the CIF option, and defaults).
+    !
+    STATUS = $CREATE(FAB = FAB[BASE_]);
+
+    ! Get the best file name string available.
+    !
+    SOR$$BEST_FILE_NAME(FAB[BASE_], DDB[DDB_NAME]);
+
+    END;
+
+
+    IF .WAS_IDX AND .FAB[FAB$L_STS] EQL RMS$_CREATED
+    THEN
+	BEGIN
+	!
+	! Oops.  We created a sequential file instead of an indexed file.
+	! Inform the caller.
+	!
+	SOR$$ERROR(SOR$_IND_OVR AND NOT STS$M_SEVERITY OR STS$K_WARNING);
+	END;
+
+
+    IF NOT .FAB[FAB$L_STS]
+    THEN
+	RETURN SOR$$ERROR(SOR$_SHR_OPENOUT, 1, DDB[DDB_NAME],
+		.FAB[FAB$L_STS], .FAB[FAB$L_STV]);
+
+
+    ! If we really created the file, check the protection
+    !
+    IF NOT .FAB[FAB$V_CIF] OR .FAB[FAB$L_STS] EQL RMS$_CREATED
+    THEN
+	BEGIN
+
+	! Verify that the protection is as restrictive as we want it to be.
+	! Leave owner, delete and write protections alone, since we're only
+	! interested in prohibiting processes that couldn't read the original
+	! files.  If the protection is not resrictive enough, change it.
+	!
+	LOCAL
+	    CHANGE_MASK: WORD;		! Bits we will want to change
+	LITERAL
+	    M_RELEVANT = %X'5505';	! W:DEWR,G:DEWR,O:DEWR,S:DEWR
+	EXTERNAL ROUTINE
+	    LIB$SET_FILE_PROT:	ADDRESSING_MODE(GENERAL);
+	EXTERNAL LITERAL
+	    LIB$_INVFILSPE;		! Invalid file spec, or file not on disk
+
+	CHANGE_MASK = NOT .XABPRO[XAB$W_PRO] AND .PRO AND M_RELEVANT;
+	IF .CHANGE_MASK NEQ 0
+	THEN
+	    BEGIN
+	    STATUS = LIB$SET_FILE_PROT(
+		DDB[DDB_NAME],			! File specification string
+		CHANGE_MASK,			! Mask of bits to change
+		PRO);				! Mask of bit values
+	    IF NOT .STATUS AND .STATUS NEQ LIB$_INVFILSPE
+	    THEN
+		RETURN SOR$$ERROR(
+		    SOR$_SHR_OPENOUT AND NOT STS$M_SEVERITY OR STS$K_WARNING,
+		    1, DDB[DDB_NAME], .STATUS);
+	    END;
+	END;
+
+    ! If this is not a VFC format file, clear the FSZ field
+    ! (since RMS does not clear it).
+    !
+    IF .FAB[FAB$B_RFM] NEQ FAB$C_VFC
+    THEN
+	FAB[FAB$B_FSZ] = 0;
+
+
+    ! Adjust the longest output record length
+    !
+    IF .FAB[FAB$W_MRS] EQL 0
+    THEN
+	0	! The only restriction is due to physical limitations.
+    ELSE
+	BEGIN
+	!
+	! Set the output LRL to the record length for the file.
+	! Thus, we have the correct output length available.
+	!
+!	IF .FAB[FAB$B_RFM] EQL FAB$C_FIX
+!	THEN
+	    CTX[COM_LRL_OUT] = .FAB[FAB$W_MRS] - .FAB[FAB$B_FSZ];
+	END;
+
+
+    ! More VFC processing
+    !
+    ! Remember, COM_MINVFC is the size we need in internal nodes,
+    ! and COM_MAXVFC is the size we need to allocate for RMS.
+    !
+    CTX[COM_MINVFC] = MINU( .CTX[COM_MAXVFC], .FAB[FAB$B_FSZ] );
+    IF .CTX[COM_MINVFC] EQL 0
+    THEN
+	CTX[COM_MAXVFC] = 0	! No storage needed for this
+    ELSE
+	CTX[COM_MAXVFC] = MAXU( .CTX[COM_MAXVFC], .FAB[FAB$B_FSZ] );
+    IF .CTX[COM_SORT_TYPE] NEQ TYP_K_RECORD
+    THEN
+	CTX[COM_MINVFC] = 0;	! Not needed in the nodes
+
+
+    !+
+    !
+    ! Various checks are not made.
+    !
+    ! Do not check converting variable-length input to fixed-length output.
+    !
+    ! If the file was overlaid, do not check that user-specified attributes
+    ! agree with the files existing attributes.
+    !
+    ! Don't check for creating an indexed file (with an awful primary key),
+    ! since RMS won't create an indexed file unless a KEY XAB is used.
+    !
+    ! Don't check that the output of an address or index sort is really
+    ! sequential and fixed-format.
+    !
+    !-
+
+
+    ! If the file was not created, and the file is not empty,
+    ! set the EOF option to position to the end-of-file before writing records.
+    ! Note that the EOF option is only allowed for sequential files.  Thus,
+    ! for sequential files, the records will be appended to the file,
+    ! for relative files, the records will be appended to the file,
+    ! for indexed files, mass-insert gives better performance.
+    !
+    ! If this is removed, an error occurs for sequential and relative files.
+    ! We may do this so that the user will not get unexpected results, and to
+    ! avoid any effects of the NEF and POS file options.
+    !
+    ! P.S. If we can't insert records in an indexed file sequentially, we will
+    ! switch over to keyed inserts.
+    !
+    IF .FAB[FAB$V_CIF] AND .FAB[FAB$L_STS] NEQ RMS$_CREATED
+    THEN
+	IF .FAB[FAB$B_ORG] NEQ FAB$C_IDX
+	THEN
+	    DDB[DDB_RAB+RAB$V_EOF] = TRUE;
+
+
+    ! If organization is sequential and the device is disk use MBC and MBF
+    ! if there are more than 8 blocks available.  Otherwise use MBF = 2.
+    !
+    IF .FAB[FAB$B_ORG] NEQ FAB$C_SEQ OR
+	.BLOCK[ FAB[FAB$L_DEV], DEV$V_SQD; ,BYTE] OR
+	NOT .BLOCK[ FAB[FAB$L_DEV], DEV$V_RND; ,BYTE]
+    THEN
+	DDB[DDB_RAB+RAB$B_MBF] = MAX_MBF
+    ELSE
+	BEGIN
+	DDB[DDB_RAB+RAB$B_MBC] = MAX_MBC;
+	DDB[DDB_RAB+RAB$B_MBF] = MAX_MBF;
+	END;
+
+
+    ! Connect to the FAB
+    !
+    STATUS = $CONNECT(RAB = DDB[DDB_RAB+BASE_]);
+    IF NOT .STATUS
+    THEN
+	RETURN SOR$$ERROR(SOR$_SHR_OPENOUT, 1, DDB[DDB_NAME],
+		.DDB[DDB_RAB+RAB$L_STS], .DDB[DDB_RAB+RAB$L_STV]);
+
+
+    ! Save the IFI and FOP
+    !
+    DDB[DDB_IFI] = .FAB[FAB$W_IFI];
+    DDB[DDB_FOP] = .FAB[FAB$L_FOP];
+
+    RETURN SS$_NORMAL;
+    END;
+
+GLOBAL ROUTINE SOR$$RFA_ACCESS
+	(
+	RFA:	REF BLOCK[RAB$S_RFA,BYTE];	! Addr of the RFA
+	LEN,					! Length of record
+	ADR					! Address of record
+	):	NOVALUE CAL_ACCESS =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine accesses a record by RFA, which is already in the RAB.
+!
+! FORMAL PARAMETERS:
+!
+!	RFA.raw.r	Address of the RFA, possibly follwed by a file number
+!	LEN.waw.r	Address of returned length
+!	ADR.wal.r	Address of returned address
+!	CTX		Longword pointing to work area (passed in COM_REG_CTX)
+!
+! IMPLICIT INPUTS:
+!
+!	The DDB for the input file.
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	Status code.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CTX =	COM_REG_CTX:	REF CTX_BLOCK;
+    LOCAL
+	DDB:	REF DDB_BLOCK,
+	STATUS;
+
+
+    ! Determine whether the RFA is immediately followed by a file number.
+    ! If so (because there is more than one input file), grab the DDB from the
+    ! array of DDBs, otherwise, just use the first (only) input DDB.
+    !
+    IF .CTX[COM_NUM_FILES] LEQ 1
+    THEN
+	DDB = .CTX[COM_INP_DDB]
+    ELSE
+	ASSERT_(COM_ORD_FILE EQL COM_ORD_RFA+1)
+	DDB = .VECTOR[.CTX[COM_INP_ARRAY], .RFA[RAB$S_RFA,0,8,0]];
+	
+
+    ASSERT_(RAB$S_RFA EQL 6)
+
+    DDB[DDB_RAB+RAB$L_RFA0] = .RFA[0,0,32,0];	! Copy the RFA
+    DDB[DDB_RAB+RAB$W_RFA4] = .RFA[4,0,16,0];
+
+    STATUS = $GET(RAB = DDB[DDB_RAB+BASE_]);	! Read from the file
+    IF NOT .STATUS
+    THEN
+	SOR$$ERROR(SOR$_SHR_READERR, 1, DDB[DDB_NAME],
+		.DDB[DDB_RAB+RAB$L_STS], .DDB[DDB_RAB+RAB$L_STV]);
+
+    LEN = .DDB[DDB_RAB+RAB$W_RSZ];
+    ADR = .DDB[DDB_RAB+RAB$L_RBF];
+
+    END;
+
+END
+ELUDOM

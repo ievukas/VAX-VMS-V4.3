@@ -1,0 +1,769 @@
+	.TITLE	UCBCREDEL General UCB Creation/Deletion Routines
+	.IDENT	'V04-000'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+; R. O. Weber  14-SEP-1982
+;
+; Permanently present paged and non-paged routines for UCB creatation,
+; deletion, and ancilliary related tasks.
+;
+;
+; MODIFIED BY:
+;
+;	V03-013	LMP0304		L. Mark Pilant,		22-Aug-1984  8:51
+;		Fix stack alignment problem introduced in LMP0302.
+;
+;	V03-012	LMP0302		L. Mark Pilant,		10-Aug-1984  14:45
+;		Use a special kernel AST routine to delete the ACL segments
+;		associated with a UCB.
+;
+;	V03-011	LMP0275		L. Mark Pilant,		12-Jul-1984  20:44
+;		Initialize the ACL info in the ORB to be a null descriptor
+;		list rather than an empty queue.  This avoids the overhead
+;		of locking and unlocking the ACL mutex, only to find out
+;		that the ACL was empty.
+;
+;	V03-010	RAS0300		Ron Schaefer		 2-May-1984
+;		Change unit number limit in IOC$CLONE_UCB to be 9999
+;		so that cluster device names will fit in 15 characters.
+;
+;	V03-009	TMK0001		Todd M. Katz		26-Apr-1984  
+;		Remove the $LOGDEF logical name definitions.
+;
+;	V03-008	LMP0221		L. Mark Pilant,		31-Mar-1984  9:07
+;		Add support for the Object's Rights Block (ORB).
+;
+;	V03-007	LMP0185		L. Mark Pilant,		23-Jan-1984  12:52
+;		Add support for ACLs on devices.
+;
+;	V03-006	ROW0216		Ralph O. Weber		27-AUG-1983
+;		Correct two incorrect uses of R5 as the UCB address in 
+;		IOC$LINK_UCB.  R2 contains the UCB address in that routine. 
+;		Also remove one instruction from the setup for IOC$LINK_UCB 
+;		and IOC$SEVER_UCB.  Also change R2 usage in IOC$CREDIT_UCB to 
+;		R5.
+;
+;	V03-005	KDM0076		Kathleen D. Morse	25-Aug-1983
+;		Fix incorrect use of R2 to be R5, in ROW0204 change.
+;
+;	V03-004	ROW0204		Ralph O. Weber		 5-AUG-1983
+;		Change IOC$DEBIT_UCB and IOC$CREDIT_UCB to test for DEV$M_CLU 
+;		being set and non-fatal bugcheck if it is.  This coincides 
+;		with moving UCB$L_CPID to overlay UCB$L_LOCKID.  The later 
+;		field is used only when DEV$M_CLU is set.  Therefore, testing 
+;		the bit insures correct use of the overlayed field.
+;
+;		Also remove IOC$DELMBX.  This has been the intention all along 
+;		and now that V3.4 has shipped its no longer needed for 
+;		compatibility.  Correct spelling error in .TITLE
+;
+;	V03-003	DMW4062		DMWalp			23-Jun-1983
+;		Changed LOG$xxx references to LNM$xxx
+;
+;	V03-002	ROW0182		Ralph O. Weber		15-APR-1983
+;		Change IOC$SEVER_UCB to overwrite UCB$L_LINK of the severed 
+;		UCB with minus one.  This assists wildcard GETDVI with context 
+;		verification between wildcard operation calls.
+;
+;	V03-001	ROW0164		Ralph O. Weber		25-FEB-1983
+;		Make several bug fixes including:
+;		o Fix IOC$COPY_UCB to actually preserve R3.
+;		o Change BSB, RSB in IOC$FREE_UCB to BR.
+;		o Fix comments to indicate that IOC$CREDIT_UCB must be entered 
+;		  at IPL$_ASTDEL.
+;		o Optimize IOC$CREDIT_UCB to skip elevated IPL code when 
+;		  UCB$L_CPID equals zero.
+;
+
+;
+; MACRO LIBRARY CALLS
+;
+ 
+	$ACBDEF				;DEFINE ACB OFFSETS
+	$CRBDEF				;DEFINE CRB OFFSETS
+	$DDBDEF				;DEFINE DDB OFFSETS
+	$DEVDEF				;DEFINE DEVICE CHARACTERISTICS FLAGS
+	$DYNDEF				;DEFINE STRUCTURE CODES
+	$IPLDEF				;DEFINE INTERRUPT PRIORITY LEVELS
+	$JIBDEF				;DEFINE JIB OFFSETS
+	$ORBDEF				;DEFINE OBJECT'S RIGHTS BLOCK OFFSETS
+	$PCBDEF				;DEFINE PCB OFFSETS
+	$PRIDEF				;DEFINE PRIORITY BOOST VALUES
+	$PRDEF				;DEFINE PROCESSOR REGISTERS
+	$SSDEF				;DEFINE SYSTEM STATUS VALUES
+	$UCBDEF				;DEFINE UCB OFFSETS
+ 
+;
+; LOCAL SYMBOLS
+;
+
+	.SBTTL	IOC$CHKUCBQUOTA - Check create UCB quota
+	.SBTTL	IOC$CHKMBXQUOTA - Check create mailbox quota
+;+
+;  IOC$CHKUCBQUOTA - Check create UCB quota
+;  IOC$CHKMBXQUOTA - Check create mailbox quota
+;
+;  FUNCTIONAL DESCRIPTION
+;
+;      Test byte I/O count quota of process whose PCB address is in R4 for
+;      sufficient quota to create the UCB whose template is pointed to by
+;      R5.  IOC$CHKMBXQUOTA tests a quota requirement with low order word
+;      of R8 summed to the UCB quota requirement.
+;
+;  INPUTS
+;
+;      R4	PCB address
+;      R5	Template UCB address
+;      R8	Additional quota charge (IOC$CHKMBXQUOTA only)
+;
+;  OUTPUTS
+;
+;      R0	SS$_NORMAL process has sufficient quota
+;		SS$_EXBYTLM process does not have sufficient quota
+;		SS$_BADPARAM quota charge overflow; <UCB$W_SIZE + R8> gt 65535
+;-
+
+	.PSECT	Y$EXEPAGED
+
+IOC$CHKMBXQUOTA::
+
+	MOVZWL	R8, -(SP)		; Save additional quota charge value.
+	BRB	CHKQUOTA		; Branch to common quota checking code.
+
+IOC$CHKUCBQUOTA::
+
+	CLRL	-(SP)			; Zero additional quota charge value.
+
+CHKQUOTA:
+
+	ADDW2	UCB$W_SIZE(R5), (SP)	; Sum UCB size and extra quota charge.
+	BCS	80$			; Branch if that overflowed a word.
+	ADDL2	#256, (SP)		; Add more to allow process deletion.
+	MOVL	PCB$L_JIB(R4), R0	; Get JIB address.
+	CMPL	(SP)+, JIB$L_BYTCNT(R0)	; Enough bytes to safisfy requirements?
+	BGTRU	90$			; Branch if not enough bytes.
+	MOVZWL	#SS$_NORMAL, R0		; Setup success status
+	RSB				; and return.
+
+80$:	MOVZWL	#SS$_BADPARAM, R0	; Setup quota charged overflow status
+	RSB				; and return.
+90$:	MOVZWL	#SS$_EXBYTLM, R0	; Setup insufficient quota status
+	RSB				; and return.
+
+	.SBTTL	IOC$CLONE_UCB - Copy and link a new UCB
+;+
+;  IOC$CLONE_UCB - Copy and link a new UCB
+;
+;  FUNCTIONAL DESCRIPTION
+;
+;      Copy a template UCB and link it.  This is a combination of
+;      IOC$COPY_UCB and IOC$LINK_UCB.  The unit number is determined adding
+;      one to UCB$W_UNIT_SEED in the template UCB.  If that unit number
+;      exists, the seed value is incremented and the link operation is
+;      repeated.
+;
+;      N.B.  The UCB is not added to the list of UCBs for this controller 
+;      kept in the IDB.
+;
+;      N.B.  This routine will loop forever if all UCBs between 1 and 9999
+;      are in use.
+;
+;  INPUTS
+;
+;      R5	Template UCB address
+;	UCB$W_UNIT_SEED(R5) seed unit number value
+;
+;      I/O database locked for write access
+;
+;      IPL less than or equal to IPL$_MAILBOX
+;
+;  OUTPUTS
+;
+;      R0	SS$_NORMAL UCB cloning successful
+;		SS$_INSFMEM insufficient non-paged pool to copy UCB
+;      R1	Address of UCB following this one in the list
+;      R2	Destination UCB address
+;      R3	Address of UCB preceding this one in the list
+;      R4	Preserved
+;      R5	Source UCB address
+;
+;      CRB$W_REFC( UCB$L_CRB(R2) ) incremented
+;      UCB$W_UNIT_SEED(R5) <== UCB$W_UNIT(R2) ; unit number of the new UCB
+;
+;      The following initialization is performed on the destination UCB:
+;	  UCB$L_FQFL   <== addr( UCB$L_FQFL )
+;	  UCB$L_FQBL   <== addr( UCB$L_FQFL )
+;	  UCB$L_FPC    <== 0
+;	  UCB$L_FR3    <== 0
+;	  UCB$L_FR4    <== 0
+;	  UCB$W_BUFQUO <== 0
+;	  UCB$L_LINK   <== addr( next UCB in list ) or zero
+;	  UCB$L_IOQFL  <== addr( UCB$L_IOQFL )
+;	  UCB$L_IOQBL  <== addr( UCB$L_IOQFL )
+;	  UCB$W_UNIT   <== unit number
+;	  UCB$W_CHARGE <== UCB$W_SIZE
+;	  UCB$W_REFC   <== 1
+;	  UCB$L_STS    <== UCB$M_ONLINE
+;	  UCB$W_DEVSTS <== 0
+;	  UCB$L_OPCNT  <== 0
+;	  UCB$L_SVAPTE <== 0
+;	  UCB$W_BOFF   <== 0
+;	  UCB$W_BCNT   <== 0
+;	  UCB$L_ORB    <== addr( ORB )
+;
+;      The following initialization is performed on the destination ORB:
+;	  ORB$L_OWNER  <== 0
+;	  ORB$L_ACL_MUTEX <== ^X0000FFFF
+;	  ORB$B_FLAGS  <== ORB$M_PROT_16
+;	  ORB$W_PROT   <== 0
+;	  ORB$L_ACL_COUNT <== 0
+;	  ORB$L_ACL_DESC  <== 0
+;	  ORB$R_MIN_CLASS <== first longword 0
+;-
+
+	.PSECT	WIONONPAGED
+
+IOC$CLONE_UCB::
+
+	BSBB	IOC$COPY_UCB		; Make a copy of the template UCB.
+	BLBC	R0, 90$			; Skip the rest if that failed.
+	ADDW3	#1, UCB$W_UNIT_SEED(R5), - ; Build first possible unit number
+		UCB$W_UNIT(R2)		   ; for the new UCB.
+30$:	CMPW	UCB$W_UNIT(R2),#9999	; Over the limit?
+	BLEQU	40$			; okay
+	MOVW	#1,UCB$W_UNIT(R2)	; Reset unit number
+40$:	BSBW	IOC$LINK_UCB		; Attempt to link to UCB.
+	BLBS	R0, 70$			; Branch if link successful.
+	INCW	UCB$W_UNIT(R2)		; Else increment unit number
+	BRB	30$			; and try again.
+70$:	MOVW	UCB$W_UNIT(R2), -	; Save final unit number as
+		UCB$W_UNIT_SEED(R5)	; next seed value.
+90$:	RSB				; Then return.
+
+	.SBTTL	IOC$COPY_UCB - Copy a given UCB
+;+
+;  IOC$COPY_UCB - Copy a given UCB
+;
+;  FUNCTIONAL DESCRIPTION
+;
+;      Non-paged pool sufficient to accommodate the template UCB is
+;      allocated.  The template UCB is copied to the newly allocated pool.
+;      The template copy UCB is initialized as shown below.
+;
+;  INPUTS
+;
+;      R5	Template UCB address
+;
+;      I/O database locked for write access
+;
+;      IPL less than or equal to IPL$_MAILBOX
+;
+;  OUTPUTS
+;
+;      R0	SS$_NORMAL UCB copy successful
+;	    	SS$_INSFMEM insufficient non-paged pool to copy UCB
+;      R1	Destroyed
+;      R2	Destination UCB address
+;      R3	Preserved
+;      R4	Preserved
+;      R5	Source UCB address
+;
+;      The following initialization is performed on the destination UCB:
+;	  UCB$L_FQFL   <== addr( UCB$L_FQFL )
+;	  UCB$L_FQBL   <== addr( UCB$L_FQFL )
+;	  UCB$L_FPC    <== 0
+;	  UCB$L_FR3    <== 0
+;	  UCB$L_FR4    <== 0
+;	  UCB$W_BUFQUO <== 0
+;	  UCB$L_IOQFL  <== addr( UCB$L_IOQFL )
+;	  UCB$L_IOQBL  <== addr( UCB$L_IOQFL )
+;	  UCB$W_CHARGE <== UCB$W_SIZE
+;	  UCB$W_REFC   <== 1
+;	  UCB$L_STS    <== UCB$M_ONLINE
+;	  UCB$W_DEVSTS <== 0
+;	  UCB$L_OPCNT  <== 0
+;	  UCB$L_SVAPTE <== 0
+;	  UCB$W_BOFF   <== 0
+;	  UCB$W_BCNT   <== 0
+;	  UCB$L_ORB    <== addr( ORB )
+;
+;      The following initialization is performed on the destination ORB:
+;	  ORB$L_ACL_MUTEX <== ^X0000FFFF
+;	  ORB$B_FLAGS  <== ORB$M_PROT_16
+;	  ORB$W_PROT   <== 0
+;	  ORB$L_ACL_COUNT <== 0
+;	  ORB$L_ACL_DESC  <== 0
+;	  ORB$R_MIN_CLASS <== first longword 0
+;-
+
+	.PSECT	WIONONPAGED
+
+IOC$COPY_UCB::				; Copy a given UCB
+	PUSHL	R3			; Save caller's R3.
+	MOVL	UCB$L_ORB(R5), R3	; Get prototype ORB address
+	MOVZWL	ORB$W_SIZE(R3), R0	; Get size of ORB
+	MOVZWL	UCB$W_SIZE(R5), R1	; Get size of block to allocate.
+	MOVL	R1, R3			; Save original size of UCB for later
+	ADDL2	R0, R1			; Make ORB adjacent to UCB
+	BSBW	EXE$ALONONPAGED		; Allocate block from nonpaged memory.
+	BLBC	R0, 40$			; Branch if allocation failure.
+	PUSHR	#^M<R2,R3,R4,R5>	; Save registers.
+	MOVC3	UCB$W_SIZE(R5), (R5), (R2)	; Copy given UCB to new UCB.
+	POPR	#^M<R2,R3,R4,R5>	; Restore registers.
+	ADDL3	R3, R2, UCB$L_ORB(R2)	; Set ORB address
+	MOVL	R2, UCB$L_FQFL(R2)	; Initialize new UCB fork queue
+	MOVL	R2, UCB$L_FQBL(R2)	; listhead.
+	ASSUME	UCB$L_FR3    EQ <UCB$L_FPC + 4>
+	ASSUME	UCB$W_BUFQUO EQ <UCB$L_FR4 + 4>
+	ASSUME	UCB$W_SRCADDR  EQ <UCB$L_FR4 + 6>
+	CLRQ	UCB$L_FPC(R2)		; Clear fork context information, byte
+	CLRQ	UCB$L_FR4(R2)		; count quota charge, and protection.
+	MOVAB	UCB$L_IOQFL(R2), UCB$L_IOQFL(R2) ; Init I/O queue listhead.
+	MOVAB	UCB$L_IOQFL(R2), UCB$L_IOQBL(R2)
+	MOVW	UCB$W_SIZE(R2), -	; Initialize byte count quota charge.
+		UCB$W_CHARGE(R2)
+	MOVW	#1, UCB$W_REFC(R2)	; Initialize reference count.
+	MOVZWL	#UCB$M_ONLINE, -	; Init device independent status.
+		UCB$L_STS(R2)
+	CLRW	UCB$W_DEVSTS(R2)	; Clear device dependent status.
+	CLRL	UCB$L_OPCNT(R2)		; Clear operations completed count.
+	ASSUME	UCB$W_BOFF EQ <UCB$L_SVAPTE + 4>
+	ASSUME	UCB$W_BCNT EQ <UCB$L_SVAPTE + 6>
+	CLRQ	UCB$L_SVAPTE(R2)	; Clear SVAPTE, byte offset, and count.
+
+; Now that the UCB has been initialized, it is time for the ORB.
+
+	MOVL	UCB$L_ORB(R2), R3	; Get the address of the new ORB
+	PUSHR	#^M<R2,R3,R4,R5>	; Save registers.
+	MOVL	UCB$L_ORB(R5), R4	; Get address of the prototype ORB
+	MOVC3	ORB$W_SIZE(R4), (R4), (R3)	; Copy given ORB to new ORB.
+	POPR	#^M<R2,R3,R4,R5>	; Restore registers.
+	MOVZWL	#-1, ORB$L_ACL_MUTEX(R3)	; Set initial mutex value
+	MOVB	#ORB$M_PROT_16, ORB$B_FLAGS(R3)	; SOGW protection word
+	CLRW	ORB$W_PROT(R3)		; Set all access to everybody
+
+	ASSUME	ORB$L_ACL_DESC EQ ORB$L_ACL_COUNT+4
+
+	CLRQ	ORB$L_ACL_COUNT(R3)	; Null initial ACL
+	CLRL	ORB$R_MIN_CLASS(R3)	; No classification supplied
+	MOVZWL	#SS$_NORMAL, R0		; Set success completion status.
+10$:	POPL	R3			; Restore caller's R3.
+	RSB				; Return.
+
+40$:	MOVZWL	#SS$_INSFMEM, R0	; Set insufficient memory status.
+	BRB	10$			; Return.
+
+	.SBTTL	IOC$LINK_UCB - Link UCB to DDB chain
+;+
+;  IOC$LINK_UCB - Link UCB to DDB chain
+;
+;  FUNCTIONAL DESCRIPTION
+;
+;      Search UCB list pointed to by DDB referenced in input UCB and link
+;      input UCB into list in ascending unit number order.  Count UCB in
+;      number of UCBs referencing CRB pointed to by UCB.  The UCB is not
+;      added to the list of UCBs for this controller kept in the IDB.
+;
+;      N.B.  The UCB is not added to the list of UCBs for this controller 
+;      kept in the IDB.
+;
+;  INPUTS
+;
+;      R2	Address of UCB to be linked
+;		UCB$L_DDB(R2) Address of DDB on which UCB will be hung
+;		UCB$W_UNIT(R2) Unit number for UCB
+;		UCB$L_CRB(R2) Address of CRB which UCB will be counted as a
+;			referencer
+;
+;      I/O database locked for write access
+;
+;  OUTPUTS
+;
+;      R0	SS$_NORMAL ==> Link operation successful
+;		SS$_OPINCOMPL ==> Link operation failed due to presence of UCB 
+;			with same unit number
+;      R1	Address of UCB following this one in the list
+;      R2	Address of this UCB
+;      R3	Address of UCB preceding this one in the list
+;
+;      CRB$W_REFC( UCB$L_CRB(R2) ) incremented
+;-
+
+	.PSECT	WIONONPAGED
+
+IOC$LINK_UCB::
+
+	SUBL3	#<UCB$L_LINK-DDB$L_UCB>, -
+		UCB$L_DDB(R2), R1	; Get address of first UCB link.
+20$:	MOVL	R1, R3			; Save address of previous UCB.
+	MOVL	UCB$L_LINK(R3), R1	; Get address of next UCB.
+	BEQL	50$			; 0 ==> end-of-list reached; go insert.
+	CMPW	UCB$W_UNIT(R2), UCB$W_UNIT(R1) ; Compare unit numbers.
+	BGTRU	20$			; If new GT list, continue search.
+	BEQL	90$			; If new EQ list, declare error.
+50$:	MOVL	R1, UCB$L_LINK(R2)	; Else, link UCB.  Forward link new UCB.
+	MOVL	R2, UCB$L_LINK(R3)	; Forward link previous UCB.
+	MOVL	UCB$L_CRB(R2), R0	; Get CRB address.
+	INCW	CRB$W_REFC(R0)		; Increment CRB reference count.
+	MOVZWL	#SS$_NORMAL, R0		; Set successful link status
+	RSB				; and return
+
+90$:	MOVZWL	#SS$_OPINCOMPL, R0	; Set link failed status.
+	RSB				; and return.
+
+	.SBTTL	IOC$DEBIT_UCB - Charge process quotas for created UCB
+;+
+;  IOC$DEBIT_UCB - Charge process quotas for created UCB
+;
+;  FUNCTIONAL DESCRIPTION
+;
+;      Charge the process whose PID is in R4 for the UCB whose address is
+;      in R2.
+;
+;  INPUTS
+;
+;      R2	Address of UCB to be debited from process quotas
+;	    	UCB$W_CHARGE(R2) Byte I/O byte count quota charge for the UCB
+;			and its associated paraphernalia
+;      R4	Address of PCB for process to be charged for UCB
+;
+;      IPL equal to IPL$_ASTDEL
+;
+;  OUTPUTS
+;
+;      R0	Destroyed
+;      R1	Destroyed
+;
+;      For JIB pointed to by PCB
+;	  JIB$L_BYTLM reduced by UCB$W_CHARGE
+;	  JIB$L_BYTCNT reduced by UCB$W_CHARGE
+;	  UCB$L_CPID (which is the same as UCB$L_DUETIM) <== JIB$L_MPID
+;-
+
+	.PSECT	Y$EXEPAGED
+
+IOC$DEBIT_UCB::
+
+	ASSUME	DEV$M_CLU EQ 1
+	BLBS	UCB$L_DEVCHAR2(R2), 90$	; Branch if UCB$L_LOCKID is in use.
+	MOVZWL	UCB$W_CHARGE(R2), R0	; Get amount to charge BYTLM quota.
+	MOVL	PCB$L_JIB(R4), R1	; Get JIB address.
+	SUBL2	R0, JIB$L_BYTLM(R1)	; Reduce byte count limit.
+	SUBL2	R0, JIB$L_BYTCNT(R1)	; Reduce byte count quota.
+	MOVL	JIB$L_MPID(R1), -	; Save master PID charged in
+		UCB$L_CPID(R2)		; charged UCB.
+	RSB
+
+90$:	BUG_CHECK INCONSTATE		; Non-fatal bugcheck if DEV$M_CLU set.
+	RSB				; Then continue, ignoring the debit
+					; request.
+
+	.SBTTL	IOC$DELETE_UCB - Delete UCB if REFC eq 0
+;+
+;  IOC$DELETE_UCB - Delete UCB if REFC eq 0
+;
+;  FUNCTIONAL DESCRIPTION
+;
+;      Check UCB pointed to by R5 for possible deletion and if needed
+;      delete it.  In order to be deleted, a UCB must 1) have UCB$W_REFC
+;      equal to zero, and 2) have the UCB$V_DELETEUCB bit set in UCB$L_STS.
+;      If UCB can be deleted, sever UCB linkage and return space occupied
+;      by UCB to non-paged pool.  This is a combination of IOC$SEVER_UCB
+;      and IOC$FREE_UCB.  The UCB is not removed from the list of UCBs
+;      for this controller kept in the IDB.
+;
+;  INPUTS
+;
+;      R5	Address of UCB to be unlinked
+;		UCB$L_DDB(R5) Address of DDB on which UCB is hung
+;		UCB$L_CRB(R5) Address of CRB which counts UCB as a
+;			referencer
+;
+;      I/O database locked for write access
+;
+;  OUTPUTS
+;
+;      R0	Destroyed
+;      R1	Destroyed
+;
+;      CRB$W_REFC( UCB$L_CRB(R5) ) decremented
+;-
+
+	.PSECT	WIONONPAGED
+
+IOC$DELETE_UCB::
+
+	PUSHAB	B^IOC$FREE_UCB		; Setup to free UCB after severing it.
+	BBC	#UCB$V_DELETEUCB, -	; Is the delete UCB bit set?
+		UCB$L_STS(R5), 70$	; Branch if bit not set.
+	TSTW	UCB$W_REFC(R5)		; Is the reference count zero?
+	BEQL	IOC$SEVER_UCB		; Branch to sever UCB if count is zero.
+
+70$:					; UCB cannot be deleted.
+	TSTL	(SP)+			; Pop IOC$FREE_UCB address from stack.
+	RSB				; Return without deleting UCB.
+
+	.SBTTL	IOC$SEVER_UCB - Unlink a UCB
+;+
+;  IOC$SEVER_UCB - Unlink a UCB
+;
+;      Remove UCB pointed to by R5 from UCB list pointed to by DDB
+;      referenced in UCB.  Reduce count of UCBs referencing CRB pointed
+;      to by UCB by one.  The UCB is not removed from the list of UCBs
+;      for this controller kept in the IDB.
+;
+;  INPUTS
+;
+;      R5	Address of UCB to be unlinked
+;		UCB$L_DDB(R5) Address of DDB on which UCB is hung
+;		UCB$L_CRB(R5) Address of CRB which counts UCB as a
+;			referencer
+;
+;      I/O database locked for write access
+;
+;  OUTPUTS
+;
+;      R0	Destroyed
+;      R1	Destroyed
+;
+;      UCB$L_LINK(R5) <== -1
+;      CRB$W_REFC( UCB$L_CRB(R5) ) decremented
+;-
+
+	.PSECT	WIONONPAGED
+
+IOC$SEVER_UCB::
+
+	SUBL3	#<UCB$L_LINK-DDB$L_UCB>, -
+		UCB$L_DDB(R5), R0	; Get address of first UCB link.
+10$:	MOVL	R0, R1			; Save address of last UCB.
+	MOVL	UCB$L_LINK(R1), R0	; Get address of next UCB.
+	CMPL	R0,R5			; Do the UCB addresses match?
+	BNEQ	10$			; Branch and loop if no match.
+	MOVL	UCB$L_LINK(R5), UCB$L_LINK(R1) ; Else, remove UCB from UCB list.
+	MNEGL	#1,UCB$L_LINK(R5)	; Invalidate severed UCB's forward link.
+	MOVL	UCB$L_CRB(R5), R0	; Get CRB address.
+	DECW	CRB$W_REFC(R0)		; Decrement CRB reference count.
+	RSB
+
+	.SBTTL	IOC$FREE_UCB - Free pool used by a UCB
+;+
+;  IOC$FREE_UCB - Free pool used by a UCB
+;
+;  FUNCTIONAL DESCRIPTION
+;
+;      Return to non-paged pool the space occupied by the UCB pointed to by
+;      R5.
+;
+;  INPUTS
+;
+;      R5	UCB address
+;
+;      I/O database locked for write access
+;
+;  OUTPUTS
+;
+;      R0	Destroyed
+;-
+
+	.PSECT	WIONONPAGED
+
+IOC$FREE_UCB::
+	MOVL	R4, -(SP)		; Save a register
+	MOVL	UCB$L_ORB(R5), R4	; Get the address of the ORB
+	BEQL	20$			; Skip following if no ORB present
+	BBC	#ORB$V_ACL_QUEUE, ORB$B_FLAGS(R4), 20$	; Xfer if ACL not a queue
+
+; If there are no ACL segments, life is simple.
+
+	MOVAB	ORB$L_ACLFL(R4), R0	; Get addr of ACL queue head
+	CMPL	(R0), R0		; Is the queue empty?
+	BEQL	20$			; Xfer if so, nothing to do here
+
+; Since there are ACL segments, it will be necessary to fire off a special
+; kernel AST to the SWAPPER process to delete them.  This is because IOC$FREE_UCB
+; may be called above IPL 2.  With ACL segments living in paged pool, this would
+; not be a friendly gesture.
+
+	MOVL	ORB$L_ACLBL(R4), -(SP)	; Save addr of last segment
+	REMQUE	ORB$L_ACLFL(R4), R0	; Separate ORB from ACL segments
+	MOVQ	R4, -(SP)		; Save R4 & UCB address
+	MOVL	R3, -(SP)		; Save some more registers
+	MOVQ	R1, -(SP)
+	MOVL	#ACB$C_LENGTH+8, R1	; Size of the block to get
+	BSBW	EXE$ALONONPAGED		; Get block for special kernel AST
+	MOVL	R2, R5			; Copy block addr to right register
+	MOVB	#DYN$C_ACB, ACB$B_TYPE(R5)	; Set structure type
+	MOVW	R1, ACB$W_SIZE(R5)	; Set structure size
+	MOVL	SCH$GL_SWPPID, ACB$L_PID(R5)	; Set target process PID
+	MOVB	#ACB$M_KAST, ACB$B_RMOD(R5)	; Special kernel AST
+	MOVAB	60$, ACB$L_KAST(R5)	; Set address of AST routine
+	INSQUE	ACB$C_LENGTH(R5), @20(SP)	; Add ACL segments to AST block
+	MOVL	#PRI$_RESAVL, R2	; Set priority increment
+	BSBW	SCH$QAST		; Fire off special kernel AST
+	MOVQ	(SP)+, R1		; Restore saved registers
+	MOVL	(SP)+, R3
+	MOVQ	(SP)+, R4
+	TSTL	(SP)+			; Final cleanup of the stack
+
+; Now that the ACL segments have been taken care of, delete the ORB and UCB.
+
+20$:	MOVZWL	UCB$W_SIZE(R5), R0	; Note size of the current UCB
+	ADDL2	R5, R0			; Calc end of the UCB
+	CMPL	R0, R4			; Is this where the ORB lives?
+	BEQL	40$			; Xfer if so, diddle the UCB size
+	MOVL	R4, R0			; Else setup ORB address to deallocate
+	BSBW	COM$DRVDEALMEM		; Release the ORB
+	BRB	50$			; And now for the UCB
+40$:	ADDW2	ORB$W_SIZE(R4), UCB$W_SIZE(R5)	; Release ORB also
+50$:	MOVL	(SP)+, R4		; Restore saved register
+	MOVL	R5, R0			; Setup UCB address to deallocate.
+	BRW	COM$DRVDEALMEM		; Deallocate the UCB and return to 
+					; caller.
+
+; Here is the special kernel AST routine used to deallocate the ACL segments
+; associated with the UCB being vaporized.
+
+60$:	MOVL	R3, -(SP)		; Save a register
+70$:	REMQUE	@ACB$C_LENGTH(R5), R0	; Remove ACL segment
+	BVS	80$			; Xfer if no more
+	BSBW	EXE$DEAPAGED		; Else deallocate the segment
+	BRB	70$			; And try for another
+80$:	MOVL	(SP)+, R3		; Restore a register
+	MOVL	R5, R0			; And now to deallocate the
+	BRW	EXE$DEANONPAGED		; AST control block
+
+	.SBTTL	IOC$CREDIT_UCB - Return UCB charged quotas
+;+
+;  IOC$CREDIT_UCB - Return UCB charged quotas
+;
+;  FUNCTIONAL DESCRIPTION
+;
+;      Credit the process with the PID stored in UCB$L_CPID(R5) for the
+;      UCB charges associated with the UCB whose address is in R5.  If
+;      UCB$L_CPID equals zero or the process pointed to by UCB$L_CPID does
+;      not exist, make no process quota changes.
+;
+;  INPUTS
+;
+;      R5	Address of UCB to be credited to process quotas
+;		UCB$L_CPID(R5) Process ID of process to which quota usage is to
+;			be credited
+;    		UCB$W_CHARGE(R5) Byte I/O byte count quota charge for the UCB
+;			and its associated paraphernalia
+;
+;	IPL equal to IPL$_ASTDEL
+;
+;  OUTPUTS
+;
+;      R0	Destroyed
+;      R1	Destroyed
+;
+;      For JIB pointed to by PCB
+;	  JIB$L_BYTLM increased by UCB$W_CHARGE
+;	  JIB$L_BYTCNT increased by UCB$W_CHARGE
+;	  UCB$L_CPID (which is the same as UCB$L_DUETIM) <== 0
+;-
+
+	.PSECT	Y$EXEPAGED
+
+IOC$CREDIT_UCB::
+
+	ASSUME	DEV$M_CLU EQ 1
+	BLBS	UCB$L_DEVCHAR2(R5), 90$	; Branch if UCB$L_LOCKID is in use.
+	MOVZWL	UCB$L_CPID(R5), R1	; Get charged PID index.
+	BEQL	40$			; Branch if none.
+	DSBINT	70$			; Block scheduler database changes.
+	MOVL	@SCH$GL_PCBVEC[R1], R1	; Get PCB address.
+	CMPL	PCB$L_PID(R1), UCB$L_CPID(R5)  ; Is PID correct?
+	BNEQ	30$			; Branch if no longer the right PID.
+	MOVL	PCB$L_JIB(R1), R1	; Get JIB address.
+	MOVZWL	UCB$W_CHARGE(R5), R0	; Get charged amount.
+	ADDL2	R0, JIB$L_BYTLM(R1)	; Return byte count limit.
+	ADDL2	R0, JIB$L_BYTCNT(R1)	; Return byte count quota.
+	CLRL	UCB$L_CPID(R5)		; Zero charged PID.
+30$:	ENBINT				; Restore privious IPL.
+40$:	RSB				; Return
+
+70$:	.LONG	IPL$_SYNCH			; Construct used to temporarily
+	ASSUME	<. - IOC$CREDIT_UCB> LE 512	; lock less than a page at
+						; elevated IPL.
+
+90$:	BUG_CHECK INCONSTATE		; Non-fatal bugcheck if DEV$M_CLU set.
+	RSB				; Then continue, ignoring the credit
+					; request.
+
+	.SBTTL	IOC$CREATE_UCB - CREATE MAILBOX OR NETWORK UCB
+;+
+; IOC$CREATE_UCB - CREATE MAILBOX OR NETWORK UCB
+;
+; THIS ROUTINE IS CALLED TO CREATE A MAILBOX OR NETWORK UCB AND LINK IT INTO
+; THE I/O DATABASE.
+;
+; INPUTS:
+;
+;	R4 = CURRENT PROCESS PCB ADDRESS.
+;	R5 = ADDRESS OF CLONE UCB.
+;
+;	I/O DATABASE IS LOCKED FOR WRITE ACCESS.
+;
+; OUTPUTS:
+;
+;	R0 LOW BIT CLEAR INDICATES FAILURE TO ALLOCATE UCB.
+;
+;		R0 = SS$_INSFMEM - INSUFFICIENT MEMORY TO ALLOCATE MAILBOX
+;			OR NETWORK UCB.
+;
+;	R0 LOW BIT SUCCESS INDICATES SUCCESSFUL CREATION.
+;
+;		R2 = ADDRESS OF ALLOCATED UCB.
+;
+;	CONTROL IS RETURNED WITH I/O DATABASE STILL LOCKED FOR WRITE ACCESS.
+;
+;	This is a temporary replacement for the V3.x UCB creation routine
+;	(found in IOSUBPAGD).  This routine will be removed when development
+;	of V3.x compatible software which dynamically creates and deletes 
+;	UCBs is concluded.
+;-
+
+	.PSECT	Y$EXEPAGED
+ 
+IOC$CREATE_UCB::			;CREATE MAILBOX OR NETWORK UCB
+
+	BSBW	IOC$CLONE_UCB		; Clone a copy of the UCB.
+	BLBC	R0, 90$			; Branch if clone failed.
+					; Then do the things that IOC$COPY_UCB
+					; did that IOC$CLONE_UCB does not do.
+	MOVL	UCB$L_ORB(R2),R0	; Get the address of the ORB
+	MOVL	PCB$L_UIC(R4), -	;   Insert creator UIC.
+		ORB$L_OWNER(R0)
+	MOVL	PCB$L_JIB(R4), R0	;   Get JIB address.
+	MOVL	JIB$L_MPID(R0), -	;   Store master PID as creator.
+		UCB$L_CPID(R2)
+	MOVZWL	#SS$_NORMAL, R0		; Indicate that function succeeded.
+90$:	RSB				; Return
+
+	.END

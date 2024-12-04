@@ -1,0 +1,696 @@
+MODULE TBKDPC ( IDENT = 'V04-000' ) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:
+!	TRACEBACK
+!
+! ABSTRACT:
+!	analyzes PC correlation tables for DEBUG and for symbolic
+!	traceback.
+!
+! ENVIRONMENT:	VAX/VMS, user mode, interrupts disabled.
+!
+! AUTHOR:	Carol Peters, CREATION DATE:	16 September 1977
+!
+! Version	13
+!
+! MODIFIED BY:
+!		Dale Roedger, 15 June 1978: Version 13
+!		Sid Maxwell	09-Dec-81
+!
+!	15-Aug-83       PS      Did general clean up to use updated files
+!				from DEBUG.
+!	   Jan-84	RT	Changed TBK$PC_TO_LINE so that it only
+!				reports a match if the pc/line tables
+!				indicate that the line is "open" (i.e.,
+!				"TERM" records now close the line and
+!				prevent a match.) This fixes a problem
+!				we were seeing with RPG programs (They
+!				have code not associated with lines).
+!--
+
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+	TBK$PC_TO_LINE,			! matches a PC to a line number
+	PROC_PC_CMD,			! processes a string of PC correlation commands
+	GET_NEXT_DPC;			! gets the next PC correlation record
+
+
+! REQUIRE FILES:
+!
+REQUIRE 'SRC$:TBKPROLOG.REQ';
+
+
+! MACROS:
+!
+MACRO
+	first_dpc_datum	= 2, 0, 32, 0%,		! passes count and type
+	current_byte	= 0, 0, 8, 1%,		! current top of record
+	next_uns_byte	= 1, 0, 8, 0%,		! byte argument to command
+	next_uns_word	= 1, 0, 16, 0%,		! word argument to command
+	next_uns_long	= 1, 0, 32, 0%,		! longword argument to command
+	add_one_byte	= 1, 0, 8, 0%,		! increment for top of record
+	add_two_bytes	= 2, 0, 8, 0%,		! ditto
+	add_three_bytes	= 3, 0, 8, 0%,		! ditto
+	add_five_bytes	= 5, 0, 8, 0%;		! ditto
+
+!
+! EQUATED SYMBOLS:
+!
+
+! The body of a PC/LINE Table Record is interpreted as a sequence of commands
+! each of which supplies some information about line/statement numbers in the
+! context of the preceding commands.  The value is taken from DSTRECRDS.REQ.
+
+
+LITERAL
+	line_open	= 1,
+	line_closed	= 2;
+
+!
+! OWN STORAGE:
+!
+OWN
+	dst_entry	: REF dst$record,
+	dpc_entry	: REF BLOCK [, BYTE],
+	start_pc,
+	current_line,
+	current_stmt,
+	current_incr,
+	current_pc,
+	current_stmt_mode,
+	prev_line,
+	prev_stmt,
+	prev_incr,
+	prev_pc,
+	prev_stmt_mode,
+	current_mark,
+	prev_mark;
+
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL
+	tbk$module_dst : REF dst$record;
+
+EXTERNAL ROUTINE
+	TBK$fake_MSG,
+	TBK$FAO_OUT : NOVALUE,
+	tbk$get_dst_rec,			! gets a DST record from a DST pointer.
+	tbk$get_nxt_dst,			! gets next DST record in sequence
+	tbk$POSITON_DST;			! Set up the DST 'next' sequence.
+
+GLOBAL ROUTINE tbk$pc_to_line (match_pc_ptr, routine_address, excep_type,
+			       line_no_ptr, stmt_no_ptr) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine matches an absolute PC address to a line number
+!	in a FORTRAN routine.  MATCH_PC is the given PC,
+!	and the location pointed to by LINE_NO_PTR
+!	is written as a result of delta-PC table analysis.
+!
+!	Each PC correlation record that exists for a single routine
+!	is sequentially analyzed until the desired PC is seen.
+!
+!	If a match cannot be made because and end of routine record or
+!	an invalid record is recognized, then this routine returns
+!	FALSE.
+!
+! FORMAL PARAMETERS:
+!
+!	match_pc_ptr	- a pointer to the PC to be matched.
+!	routine_address	- DST of record for enclosing routine.
+!	excep_type	- the type of exception, where
+!				zero, means irrelevant;
+!			  	one, means trap type exception,
+!			  	two, means fault or abort type exception.
+!	line_no_ptr	- a copy-back pointer for the line number.
+!	stmt_no_ptr	- a copy-back pointer for the statement number.
+!
+! IMPLICIT INPUTS:
+!
+!	The DST is already positioned to the record AFTER
+!	the ROUTINE record we want to look at line numbers for.
+!
+! IMPLICIT OUTPUTS:
+!
+!	the routine get_nxt_dst is set up to next return the record after
+!	the end of routine record or the record after the PC correlation
+!	record that matched the given parameters.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	true, if success; false, if any error or if match cannot
+!	be made.
+!
+! SIDE EFFECTS:
+!
+!	The DST is positioned for a GET_NXT_DST sequence.
+!
+!--
+
+	BEGIN
+
+	LOCAL	match_pc,
+		low_routine,
+		real_value;
+
+
+	! treat traps as faults by debumping PC
+	!
+	IF	.excep_type EQL trap_exc
+	THEN	match_pc = .match_pc_ptr - 1
+	ELSE	match_pc = .match_pc_ptr;
+
+	IF tbk$positon_dst(.tbk$module_dst) EQL 0
+	THEN
+		RETURN FALSE;
+	dst_entry = .tbk$module_dst;
+	low_routine = -1;
+	REPEAT
+		BEGIN
+		dst_entry = tbk$get_nxt_dst(dst_entry);
+		IF .dst_entry EQL 0
+		THEN
+			RETURN FALSE;
+		IF .dst_entry[dst$b_type] EQL dst$k_modend
+		THEN
+			EXITLOOP;
+		IF .dst_entry[dst$b_type] EQL dst$k_rtnbeg
+		THEN
+			BEGIN
+			IF .dst_entry[dst$l_value] LSSA .low_routine
+			THEN
+				low_routine = .dst_entry[dst$l_value];
+			END;
+	END;
+
+
+	IF tbk$positon_dst(.tbk$module_dst) EQL 0
+	THEN
+		RETURN FALSE;
+	IF get_next_dpc(dst_entry) EQL 0
+	THEN
+		RETURN FALSE;
+	dpc_entry = dst_entry[dst$b_vflags];
+
+
+	!++
+	! Initialize state variables.
+	!--
+	current_line = 0;
+	current_stmt = 1;
+	current_incr = 1;
+	current_stmt_mode = FALSE;
+	current_pc = start_pc = .low_routine;
+	current_mark = line_closed;
+
+
+
+	!++
+	! Call a routine that processes all PC correlation commands
+	! until a delta-PC command is seen. Then process that
+	! delta-PC command and return to this routine. If the processing
+	! is generally successful, return true, otherwise return false.
+	!--
+	REPEAT
+		BEGIN
+
+		prev_line = .current_line;
+		prev_stmt = .current_stmt;
+		prev_incr = .current_incr;
+		prev_stmt_mode = .current_stmt_mode;
+		prev_pc = .current_pc;
+		prev_mark = .current_mark;
+
+
+		IF NOT proc_pc_cmd ( )
+		THEN
+		    RETURN FALSE;
+
+
+		! Report a match to a line if:
+		! - The PC is within the range given by the previous
+		!   PC and the current PC, and
+		! - The line is marked as being OPEN.
+		!
+		IF	((.prev_pc LEQA .match_pc) AND
+			 (.match_pc LSSA .current_pc) AND
+			 (.prev_mark EQL line_open))
+		THEN	BEGIN	.stmt_no_ptr =	(IF	.prev_stmt EQL 1
+						 THEN	0
+						 ELSE	.prev_stmt);
+				.line_no_ptr = .prev_line;
+				RETURN	TRUE
+			END;
+
+		!++
+		! Found nothing this round; continue trying.
+		!--
+
+		END
+	END;
+
+ROUTINE PROC_PC_CMD =
+!++
+! Functional description:
+!	This routine processes PC correlation commands until a
+!	delta-Pc command is seen. The delta-PC command is also processed.
+!	Then this routine returns with all the contents of the
+!	parameter pointers updated appropriately.
+!
+!	This routine moves from PC record to PC record as necessary. If
+!	no more records are seen, this routine returns false. If
+!	an error is seen in a PC correlation record, then this
+!	routine sets the contents of line_ptr to zero and
+!	returns false.
+!
+! Inputs:
+!
+! Implicit inputs:
+!	None
+!
+! Implicit outputs:
+!	the contents of the line pointer, the increment pointer, the
+!	statement pointer, the next_pc pointer, dpc_entry, and possible
+!	dst_entry are updated to new values.
+!
+! Routine value:
+!	TRUE if all goes well, otherwise FALSE.
+!
+! Side effects:
+!	More of the correlation records for this routine are read.
+!--
+
+	BEGIN
+
+	REPEAT
+		BEGIN
+
+
+		! See whether the current record is exhausted. If
+		! so, get a new record. If none are available,
+		! return FALSE. Otherwise, set dpc_entry to point to
+		! the address of the third byte of the correlation record.
+		!
+		IF dpc_entry[current_byte] GTR (.dst_entry[dst$b_length] +
+				dst_entry[dst$b_length])
+		THEN
+			BEGIN
+			IF NOT get_next_dpc(dst_entry)
+			THEN
+			    RETURN FALSE
+
+			ELSE
+			    dpc_entry = dst_entry [dst$b_vflags];
+			END;
+
+
+		! Now process each command, either PC correlation or
+		! delta-PC one at a time. Once a delta-PC command is
+		! processed, control returns from this routine to its
+		! caller.
+    		!
+		CASE .dpc_entry [current_byte] FROM 1 TO dst$k_pccor_high OF
+			SET
+
+
+			! Read the next two bytes as an unsigned word 
+    			! representing a delta-PC value.  Update the next_pc 
+    			! and update the dpc_entry address.
+			!
+			[dst$k_delta_pc_w]:
+    				BEGIN
+				IF .current_stmt_mode
+				THEN
+					current_stmt = .current_stmt + 1
+				ELSE
+					current_line = .current_line +
+								.current_incr;
+
+				current_mark = line_open;
+				current_pc = .current_pc +
+						.dpc_entry [next_uns_word];
+				dpc_entry = dpc_entry [add_three_bytes];
+				RETURN TRUE;
+				END;
+
+
+			! Read the next four bytes as an unsigned longword 
+    			! representing a delta-PC value.  Update the next_pc 
+    			! and update the dpc_entry address.
+			!
+			[dst$k_delta_pc_l]:
+    				BEGIN
+				IF .current_stmt_mode
+				THEN
+					current_stmt = .current_stmt + 1
+				ELSE
+					current_line = .current_line +
+								.current_incr;
+
+				current_mark = line_open;
+				current_pc = .current_pc +
+						.dpc_entry [next_uns_long];
+				dpc_entry = dpc_entry [add_five_bytes];
+				RETURN TRUE;
+				END;
+
+
+			! Increase the current line number by the value 
+    			! contained in the next unsigned byte.
+			!
+			[dst$k_incr_linum]:
+    				BEGIN
+				current_line = .current_line + .dpc_entry [next_uns_byte];
+				IF .current_stmt_mode THEN current_stmt = 1;
+				dpc_entry = dpc_entry [add_two_bytes];
+				END;
+
+
+			! Increase the current line number by the value 
+    			! contained in the next unsigned word.
+			!
+			[dst$k_incr_linum_w]:
+				BEGIN
+				IF .current_stmt_mode THEN current_stmt = 1;
+				current_line = .current_line + .dpc_entry [next_uns_word];
+				dpc_entry = dpc_entry [add_three_bytes];
+				END;
+
+
+			! Increase the current line number by the value 
+    			! contained in the next unsigned longword.
+			!
+			[dst$k_incr_linum_l]:
+				BEGIN
+				IF .current_stmt_mode THEN current_stmt = 1;
+				current_line = .current_line + .dpc_entry [next_uns_long];
+				dpc_entry = dpc_entry [add_five_bytes];
+				END;
+
+
+			! Change the line increment from its present value to 
+    			! the value contained in the next unsigned byte.
+			!
+			[dst$k_set_linum_incr]:
+    				BEGIN
+				IF .current_stmt_mode THEN current_stmt = 1;
+				current_incr = .dpc_entry [next_uns_byte];
+				dpc_entry = dpc_entry [add_two_bytes];
+				END;
+
+
+			! Change the line increment from its present value to 
+    			! the value contained in the next word.
+			!
+			[dst$k_set_linum_incr_w]:
+    				BEGIN
+				IF .current_stmt_mode THEN current_stmt = 1;
+				current_incr = .dpc_entry [next_uns_word];
+				dpc_entry = dpc_entry [add_three_bytes];
+				END;
+
+
+			! Revert to a line increment of value 1.
+			!
+			[dst$k_reset_linum_incr]:
+    				BEGIN
+				IF .current_stmt_mode THEN current_stmt = 1;
+				current_incr = 1;
+				dpc_entry = dpc_entry [add_one_byte];
+				END;
+
+			[dst$k_beg_stmt_mode]:
+				BEGIN
+				IF .current_mark NEQ line_open
+				THEN
+					BEGIN
+					TBK$FAKE_MSG(TBK$_INVDSTREC,0);
+					RETURN FALSE;
+					END;
+
+				current_stmt = 1;
+				current_stmt_mode = TRUE;
+				dpc_entry = dpc_entry[add_one_byte];
+				END;
+
+			[dst$k_end_stmt_mode]:
+				BEGIN
+				current_stmt = 1;
+				current_stmt_mode = FALSE;
+				dpc_entry = dpc_entry[add_one_byte];
+				END;
+
+			[dst$k_set_linum_b]:
+				BEGIN
+				IF .current_mark NEQ line_closed
+				THEN
+					BEGIN
+					TBK$FAKE_MSG(TBK$_INVDSTREC,0);
+					RETURN FALSE;
+					END;
+
+				current_line = .dpc_entry[next_uns_byte];
+				dpc_entry = dpc_entry[add_two_bytes];
+				END;
+
+			[dst$k_set_linum]:
+				BEGIN
+				IF .current_mark NEQ line_closed
+				THEN
+					BEGIN
+					TBK$FAKE_MSG(TBK$_INVDSTREC,0);
+					RETURN FALSE;
+					END;
+
+				current_line = .dpc_entry[next_uns_word];
+				dpc_entry = dpc_entry[add_three_bytes];
+				END;
+
+			[dst$k_set_linum_l]:
+				BEGIN
+				IF .current_mark NEQ line_closed
+				THEN
+					BEGIN
+					TBK$FAKE_MSG(TBK$_INVDSTREC,0);
+					RETURN FALSE;
+					END;
+
+				current_line = .dpc_entry[next_uns_long];
+				dpc_entry = dpc_entry[add_five_bytes];
+				END;
+
+			[dst$k_set_stmtnum]:
+				BEGIN
+				current_stmt = .dpc_entry[next_uns_word];
+				dpc_entry = dpc_entry[add_three_bytes];
+				END;
+
+			[dst$k_set_pc]:
+				BEGIN
+				IF .current_mark NEQ line_closed
+				THEN
+					BEGIN
+					TBK$FAKE_MSG(TBK$_INVDSTREC,0);
+					RETURN FALSE;
+					END;
+
+				current_pc = .start_pc +
+						.dpc_entry[next_uns_byte];
+				dpc_entry = dpc_entry[add_two_bytes];
+				END;
+
+			[dst$k_set_pc_w]:
+				BEGIN
+				IF .current_mark NEQ line_closed
+				THEN
+					BEGIN
+					TBK$FAKE_MSG(TBK$_INVDSTREC,0);
+					RETURN FALSE;
+					END;
+
+				current_pc = .start_pc +
+						.dpc_entry[next_uns_word];
+				dpc_entry = dpc_entry[add_three_bytes];
+				END;
+
+			[dst$k_set_pc_l]:
+				BEGIN
+				IF .current_mark NEQ line_closed
+				THEN
+					BEGIN
+					TBK$FAKE_MSG(TBK$_INVDSTREC,0);
+					RETURN FALSE;
+					END;
+
+				current_pc = .start_pc +
+						.dpc_entry[next_uns_long];
+				dpc_entry = dpc_entry[add_five_bytes];
+				END;
+
+
+			! Set the current PC value to an absolute address.
+			!
+			[DST$K_SET_ABS_PC]:
+				BEGIN
+				IF .CURRENT_MARK NEQ LINE_CLOSED
+				THEN
+					BEGIN
+					TBK$FAKE_MSG(TBK$_INVDSTREC,0);
+					RETURN FALSE;
+					END;
+
+				CURRENT_PC = .DPC_ENTRY[NEXT_UNS_LONG];
+				DPC_ENTRY = DPC_ENTRY[ADD_FIVE_BYTES];
+				END;
+
+			[dst$k_term]:
+				BEGIN
+				current_pc = .current_pc +
+						.dpc_entry[next_uns_byte];
+				current_mark = line_closed;
+				dpc_entry = dpc_entry[add_two_bytes];
+				RETURN TRUE;
+				END;
+
+			[dst$k_term_w]:
+				BEGIN
+				current_pc = .current_pc +
+						.dpc_entry[next_uns_word];
+				current_mark = line_closed;
+				dpc_entry = dpc_entry[add_three_bytes];
+				RETURN TRUE;
+				END;
+
+			[dst$k_term_l]:
+				BEGIN
+				current_pc = .current_pc +
+						.dpc_entry[next_uns_long];
+				current_mark = line_closed;
+				dpc_entry = dpc_entry[add_five_bytes];
+				RETURN TRUE;
+				END;
+
+
+			! This is a standard delta_PC command if the value is 
+    			! less than or equal to zero. Otherwise it is an error. 
+    			! If okay, set next_pc value, update the dpc_entry,
+			! and return with success.
+			!
+			[OUTRANGE]:
+				BEGIN
+				IF .dpc_entry [current_byte] LSS
+							dst$k_delta_pc_low
+				OR .dpc_entry[current_byte] GTR
+							dst$k_delta_pc_high
+				THEN
+					BEGIN
+					TBK$FAKE_MSG(TBK$_INVDSTREC,0);
+					RETURN FALSE;
+					END;
+
+				IF .current_stmt_mode
+				THEN
+					current_stmt = .current_stmt + 1
+				ELSE
+					current_line = .current_line +
+								.current_incr;
+
+				current_pc = .current_pc -
+						.dpc_entry [current_byte];
+				current_mark = line_open;
+				dpc_entry = dpc_entry [add_one_byte];
+				RETURN TRUE;
+				END;
+
+			TES;
+		END;
+
+    	RETURN 0;
+	END;
+
+ROUTINE get_next_dpc (dst_rec_ptr) =	! gets next PC correlation record
+
+!++
+! Functional description:
+!	Reads DST records until either no more exist, a module end
+!	record is seen, or another PC correlation record is seen. In
+!	the first two cases, a FALSE return is taken. In the third
+!	case, the address of the new record and a success return is
+!	taken.
+!
+! Inputs:
+!	dst_rec_ptr	- pointer for new DST PC correlation record
+!
+!
+! Implicit inputs:
+!	the routine tbk$get_nxt_dst is set up to return
+!	each DST record sequentially, and the last record
+!	that it returned was a PC correlation record.
+!
+! Implicit outputs:
+!	tbk$get_nxt_dst is now set up to return the next record after
+!	the returned record or the next record after the record that
+!	caused this routine to fail.
+!
+! Routine value:
+!	true or false
+!
+! Side effects:
+!	none
+!--
+
+	BEGIN
+
+	BIND
+		dst_entry	= .dst_rec_ptr : REF dst$record;
+
+	LOCAL
+		dst_rec_id;
+
+	REPEAT
+		BEGIN
+		dst_entry = tbk$get_nxt_dst (dst_rec_id);
+		IF .dst_entry EQL 0
+		THEN RETURN FALSE;
+		IF .dst_entry [dst$b_type] EQL dst$k_modend
+		THEN RETURN FALSE;
+		IF .dst_entry [dst$b_type] EQL dst$k_line_num
+		OR .dst_entry [dst$b_type] EQL dst$k_line_num_rel_r11
+		THEN RETURN TRUE;
+		END;
+	RETURN FALSE;
+	END;
+
+END
+ELUDOM

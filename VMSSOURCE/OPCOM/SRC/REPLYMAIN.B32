@@ -1,0 +1,1182 @@
+MODULE	opc$replymain	(	%TITLE 'REPLY command main module' %SBTTL 'Copyright notice'
+			 LANGUAGE (BLISS32),
+			 IDENT = 'V04-000',
+			 MAIN = replymain_main
+			) =
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:
+!
+!	REPLY command
+!
+! ABSTRACT:
+!
+!	This module contains the top level logic for the DCL REPLY command.
+!
+! Environment:
+!
+!	VAX/VMS operating system.
+!
+! Author:
+!
+!	CW Hobbs
+!
+! Creation date:
+!
+!	1-Aug-1983
+!
+! Revision history:
+!
+!	V03-003	CWH3169		CW Hobbs			5-May-1984
+!		Second pass for cluster-wide OPCOM:
+!		 - Check for oper privs, and return NOOPER priv if not there.
+!		 - Add CSID to clm header.
+!		 - Force all batch jobs to /NONOTIFY.
+!		 - Return status codes with OPC$_facility set.
+!
+!	V03-002	CWH3002		CW Hobbs		14-Apr-1984
+!		Change the two SCS node items to the single SYI$_SCSNODE item
+!
+!--
+
+BEGIN						%SBTTL 'Start of REPLYMAIN'
+
+LIBRARY	'SYS$LIBRARY:LIB.L32';
+LIBRARY 'LIB$:OPCOMLIB';
+
+FORWARD ROUTINE
+    replymain_broadcast,			! Mid-level routine to handle terminal broadcasts
+    replymain_broadcast_local,			! Routine to broadcast locally
+    replymain_fuldev	: NOVALUE,		! Get full device name for terminal, do some checking
+    replymain_init,				! Initializations
+    replymain_logfile,				! Open or close the log file
+    replymain_main,				! Entry point, main routine
+    replymain_oprenable,			! Enable or disable operator's terminal
+    replymain_reply,				! Reply to a user's request
+    replymain_status;				! Give status for a single terminal
+
+EXTERNAL ROUTINE
+    replybrd_format,				! Format the reply message
+    replybrd_io,				! Do the actual break through I/O
+    share_lookup_oper_bit,			! Convert text string to operator bit number
+    share_trnlog	: NOVALUE;		! Recursively translate a name
+
+EXTERNAL
+    reply_image,				! Flag, 1 means REPLY image, 0 means OPCOM image
+    oper_keytbl		: VECTOR [, LONG];	! Keyword table for /ENABLE and /DISABLE qualifiers
+
+OWN
+    dvi_terminal_len,				! Length of terminal name
+    dvi_terminal_buf	: VECTOR [max_dev_nam, BYTE],
+    jpi_username_len,
+    jpi_username_buf	: VECTOR [12, BYTE],
+    jpi_privs		: $bblock [8],
+    nodename_buf	: VECTOR [16, BYTE],
+    nodename_desc	: $stat_str_desc (0, nodename_buf),
+    tranlog_desc	: $stat_str_desc (16, nodename_buf),
+    devchar		: $bblock [4],
+    in_VAXcluster	: LONG,
+    batch_mode		: LONG,
+    nodecsid		: LONG,
+    dvi_items		: VECTOR [7, LONG] PRESET (
+			    [0] = (dvi$_devchar^16 OR 4),
+			    [1] = devchar,
+			    [2] = 0,
+			    [3] = (dvi$_fulldevnam^16 OR max_dev_nam),
+			    [4] = dvi_terminal_buf,
+			    [5] = dvi_terminal_len,
+			    [6] = 0),
+    mba2_refcnt		: LONG,
+    mba2_dvi_items	: VECTOR [4, LONG] PRESET (
+			    [0] = (dvi$_refcnt^16 OR 4),
+			    [1] = mba2_refcnt,
+			    [2] = 0,
+			    [3] = 0),
+    jpi_items		: VECTOR [7, LONG] PRESET (
+			    [0] = (jpi$_username^16 OR 12),
+			    [1] = jpi_username_buf,
+			    [2] = jpi_username_len,
+			    [3] = (jpi$_curpriv^16 OR 8),
+			    [4] = jpi_privs,
+			    [5] = 0,
+			    [6] = 0),
+    syi_items		: VECTOR [10, LONG] PRESET (
+			    [0] = (syi$_nodename^16 OR 16),
+			    [1] = nodename_buf,
+			    [2] = nodename_desc [dsc$w_length],
+			    [3] = (syi$_node_csid^16 OR 4),
+			    [4] = nodecsid,
+			    [5] = 0,
+			    [6] = (syi$_cluster_member^16 OR 4),
+			    [7] = in_VAXcluster,
+			    [8] = 0,
+			    [9] = 0);
+!
+! Define ascii text descriptors once
+!
+BIND
+    ascid_ABORT		= %ASCID 'ABORT',
+    ascid_ALL		= %ASCID 'ALL',
+    ascid_BELL		= %ASCID 'BELL',
+    ascid_BLANK_TAPE	= %ASCID 'BLANK_TAPE',
+    ascid_DISABLE	= %ASCID 'DISABLE',
+    ascid_ENABLE	= %ASCID 'ENABLE',
+    ascid_INITIALIZE_TAPE = %ASCID 'INITIALIZE_TAPE',
+    ascid_LOG		= %ASCID 'LOG',
+    ascid_MBA2		= %ASCID '_MBA2:', 
+    ascid_NODE		= %ASCID 'NODE', 
+    ascid_NOTIFY	= %ASCID 'NOTIFY',
+    ascid_P1		= %ASCID 'P1', 
+    ascid_PENDING	= %ASCID 'PENDING',
+    ascid_SHUTDOWN	= %ASCID 'SHUTDOWN',
+    ascid_STATUS	= %ASCID 'STATUS', 
+    ascid_SYSCOMMAND	= %ASCID 'SYS$COMMAND', 
+    ascid_SYSNODE	= %ASCID 'SYS$NODE', 
+    ascid_TEMPORARY	= %ASCID 'TEMPORARY',
+    ascid_TERMINAL	= %ASCID 'TERMINAL', 
+    ascid_TO		= %ASCID 'TO',
+    ascid_URGENT	= %ASCID 'URGENT',
+    ascid_USERNAME	= %ASCID 'USERNAME', 
+    ascid_WAIT		= %ASCID 'WAIT';
+
+GLOBAL ROUTINE replymain_broadcast =			%SBTTL 'replymain_broadcast routine'
+!++
+! Functional description:
+!
+!	This routine controls terminal broadcasts.
+!
+! Input:
+!
+!	None.
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of replymain_broadcast
+
+OWN
+    node_csid		: LONG,
+    targnode_itmlst	: VECTOR [4, LONG] PRESET (
+			    [0] = (syi$_node_csid^16 OR 4),
+			    [1] = node_csid,
+			    [2] = 0,
+			    [3] = 0);
+
+REGISTER
+    mlen,					! Output message length
+    mptr	: $ref_bvector;			! Output message pointer
+
+LOCAL
+    text	: $dyn_str_desc,		! Dynamic string descr for message text
+    message	: $bblock [opc$k_maxread],	! Buffer to build message
+    message_desc : VECTOR [2, LONG],
+    status;
+!
+! Check for oper priv, return nooper error with opcom's facility code
+!
+IF NOT .jpi_privs [prv$v_oper]
+THEN
+    RETURN (opc$_facility^16 OR ss$_nooper);
+!
+! Initialize the message
+!
+! NOTE:  We are using an internal interface to OPCOM which is subject to change!
+!
+CH$FILL (0, rpybrd_k_min_size, message);		! Init all fixed fields to zero
+message [clm_b_rqstcode]	= opc$_x_clusmsg;
+message [clm_b_clm_code]	= clm__rpybrd_local;
+message [clm_b_ds_version]	= rpybrd_k_ds_version;
+message [clm_b_sw_version]	= opc$k_sw_version;
+message [clm_l_csid]		= .nodecsid;
+!
+! Find out which qualifiers are present, and set the bits in the message
+!
+message [rpybrd_v_all]		= cli$present (ascid_ALL);
+message [rpybrd_v_bell]		= cli$present (ascid_BELL);
+message [rpybrd_v_node]		= cli$present (ascid_NODE);
+message [rpybrd_v_notify]	= cli$present (ascid_NOTIFY);
+message [rpybrd_v_shutdown]	= cli$present (ascid_SHUTDOWN);
+message [rpybrd_v_terminal]	= cli$present (ascid_TERMINAL);
+message [rpybrd_v_urgent]	= cli$present (ascid_URGENT);
+message [rpybrd_v_username]	= cli$present (ascid_USERNAME);
+message [rpybrd_v_wait]		= cli$present (ascid_WAIT);
+IF .batch_mode					! Make adjustment for batch mode
+THEN
+    message [rpybrd_v_notify] = false;		! /NOTIFY doesn't make much sense for batch
+!
+! Move the standard fields to the message, first the sending terminal name
+!
+mptr = message [rpybrd_t_text];			! Set output pointer to start of text area
+mlen = .dvi_terminal_len;			! Get length of terminal name
+message [rpybrd_w_send_term_len] = .mlen;	! Store the length in the message header
+CH$MOVE (.mlen, dvi_terminal_buf, .mptr);	! Append the name to the buffer
+mptr = .mptr + .mlen;				! Move the output pointer past this item
+!
+! Next move the username of the sender
+!
+mlen = .jpi_username_len;
+message [rpybrd_w_send_user_len] = .mlen;
+CH$MOVE (.mlen, jpi_username_buf, .mptr);
+mptr = .mptr + .mlen;
+!
+! Move the csid and nodename of the sender
+!
+message [rpybrd_l_send_csid] = .nodecsid;
+mlen = .nodename_desc [dsc$w_length];
+message [rpybrd_w_send_node_len] = .mlen;
+CH$MOVE (.mlen, .nodename_desc [dsc$a_pointer], .mptr);
+mptr = .mptr + .mlen;
+!
+! Next fetch and move the actual message text
+!
+IF NOT (status = cli$get_value (ascid_P1, text))
+THEN
+    $signal_stop (.status);
+mlen = .text [dsc$w_length];			! Zero-length messages are fine with us
+message [rpybrd_w_message_len] = .mlen;
+CH$MOVE (.mlen, .text [dsc$a_pointer], .mptr);
+mptr = .mptr + .mlen;
+message [rpybrd_w_optional_off] = .mptr - message;	! Save offset to start of optional items
+!
+! Now we move the optional items.  These come from the /TERMINAL=(...), /USERNAME=(...) and /NODE=(...).
+! These items are stored as counted ASCII (ASCIC) items.  The length stored in the fixed length field
+! describes the total length of all of the ASCIC items.
+!
+! Move the targeted terminals to the message
+!
+IF .message [rpybrd_v_terminal]
+THEN
+    WHILE cli$get_value (ascid_TERMINAL, text)
+    DO
+	BEGIN
+	share_trnlog (text);					! Translate the name
+	replymain_fuldev (text);				! Convert to full device name and check
+	mlen = .text [dsc$w_length];				! Get the length of this item
+	mptr [0] = .mlen;					! Put the length in the message (ASCIC)
+	CH$MOVE (.mlen, .text [dsc$a_pointer], mptr [1]);	! Put the data after the length
+	mlen = .mlen + 1;					! Adjust the length for the count byte
+	message [rpybrd_w_targ_term_len] = 			! Add this item to the total length
+				.message [rpybrd_w_targ_term_len] + .mlen;
+	mptr = .mptr + .mlen;
+	END;
+!
+! Move targeted usernames
+!
+IF .message [rpybrd_v_username]
+THEN
+    WHILE cli$get_value (ascid_USERNAME, text)
+    DO
+	BEGIN
+	share_trnlog (text);					! Translate the name
+	mlen = .text [dsc$w_length];				! Get the length of this item
+	mptr [0] = .mlen;					! Put the length in the message (ASCIC)
+	CH$MOVE (.mlen, .text [dsc$a_pointer], mptr [1]);	! Put the data after the length
+	mlen = .mlen + 1;					! Adjust the length for the count byte
+	message [rpybrd_w_targ_user_len] = 			! Add this item to the total length
+				.message [rpybrd_w_targ_user_len] + .mlen;
+	mptr = .mptr + .mlen;
+	END;
+!
+! Now try the target node names
+!
+message [rpybrd_v_broad_local] = true;		! Assume it is going to the local node
+message [rpybrd_v_broad_remoteall] = true;	! Assume it is going to all remote nodes
+IF .message [rpybrd_v_node]
+THEN
+    BEGIN
+    !
+    ! If /NODE is present, assume it is not going to the local node until we know more.  We know 
+    ! that it will not be going to all nodes (case where every node is in the list is not interesting).
+    !
+    message [rpybrd_v_broad_local] = false;
+    message [rpybrd_v_broad_remoteall] = false;
+    message [rpybrd_w_targ_node_off] = .mptr - message;	! Save offset to node area for CLUSREPLY local code
+    !
+    ! Get each of the nodenames from the command line, and add them to the message buffer
+    !
+    WHILE cli$get_value (ascid_NODE, text)
+    DO
+	BEGIN
+	share_trnlog (text);					! Translate the name
+	!
+	! If the translated name is the same as the local name, set the local node flag.
+	!
+	IF CH$EQL (.text [dsc$w_length], .text [dsc$a_pointer],
+		.nodename_desc [dsc$w_length], .nodename_desc [dsc$a_pointer], 0)
+	THEN
+	    message [rpybrd_v_broad_local] = true		! Now we know it is going to the local node
+	!
+	! If the node is not the same, verify that it is in the cluster.  Then place the csid of the node
+	! in the message.
+	!
+	ELSE
+	    BEGIN
+	    LOCAL
+		ptr,
+		desc : VECTOR [2, LONG];
+	    !
+	    ! Remove leading "_" and trailing ":" from the node name, $GETSYI doesn't like them
+	    !
+	    desc [0] = .text [dsc$w_length];	! Make a local fixed descriptor for the dynamic string
+	    desc [1] = .text [dsc$a_pointer];
+	    ptr = CH$FIND_NOT_CH (.desc [0], .desc [1], %C '_');
+	    IF .ptr NEQ 0
+	    THEN
+		BEGIN
+		desc [0] = .desc [0] - (.ptr - .desc [1]);
+		desc [1] = .ptr;
+		END;
+	    ptr = CH$FIND_CH (.desc [0], .desc [1], %C ':');
+	    IF .ptr NEQ 0
+	    THEN
+		desc [0] = .ptr - .desc [1];
+	    !
+	    ! Do a $GETSYI to get information about the target system (the csid)
+	    !
+	    IF NOT (status = $getsyi (nodename=desc, itmlst=targnode_itmlst))
+	    THEN	
+		$signal_stop (opc$_valuerr, 1, text, .status);
+	    mlen = 5;						! Get the length of this item (plus count byte)
+	    mptr [0] = .mlen;					! Put the length in the message (ASCIC)
+	    (mptr [1]) = .node_csid;				! Put the data after the length
+	    message [rpybrd_w_targ_node_len] = 			! Add this item to the total length
+			.message [rpybrd_w_targ_node_len] + .mlen;
+	    mptr = .mptr + .mlen;
+	    END;
+	END;
+    !
+    ! If there were no node names, then the local node is the only node to get the message
+    !
+    IF .message [rpybrd_w_targ_node_len] EQL 0
+    THEN
+	message [rpybrd_v_broad_local] = true		! Now we know it is going to the local node
+    ELSE
+	message [rpybrd_v_broad_remotelst] = true;	! This means that nodes in a list
+    END;
+!
+! Almost done with the message, store the final length in the header and build a descriptor
+!
+message_desc [0] = message [clm_w_length] = .mptr - message;	! Save in header and descriptor
+message_desc [1] = message;
+!
+! Now, decide if we should let the OPCOM process do the actual i/o or whether we should do it locally.
+! We do it locally if any of the following conditions are true:
+!
+!    -	If the command is REPLY /WAIT, then the user has specifically requested local i/o operations.
+!    -	If the reference count on the operator mailbox is not equal to 2, then OPCOM is not there, and
+!	we have to do it.  (Also if the $getdvi fails, MBA2: is not there.  Should not be possible)
+!    -	If the $sndopr fails, then obviously OPCOM won't do it and we must.
+!
+IF .message [rpybrd_v_wait]
+THEN
+    RETURN replymain_broadcast_local (message);
+!
+! Check the operator mailbox
+!
+status = $getdvi (devnam=ascid_MBA2, itmlst=mba2_dvi_items);
+IF NOT .status
+  OR
+   .mba2_refcnt NEQ 2
+THEN
+    RETURN replymain_broadcast_local (message);
+!
+! Send the message to OPCOM so that it will get to remote nodes
+!
+IF NOT (status = $sndopr (msgbuf=message_desc))
+THEN
+    RETURN replymain_broadcast_local (message);
+
+RETURN (opc$_facility^16 OR ss$_normal);
+END;						! End of replymain_broadcast
+
+GLOBAL ROUTINE replymain_broadcast_local (message : $ref_bblock) =	%SBTTL 'replymain_broadcast_local (message)'
+!++
+! Functional description:
+!
+!	This routine broadcasts to terminals on the local node.
+!
+! Input:
+!
+!	message - pointer to RPYBRD message
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	I/O status
+!--
+
+BEGIN						! Start of replymain_broadcast_local
+
+LOCAL
+    status;
+
+!
+! If we thought we were going to talk to the cluster, let them know it ain't a gonna happen.
+!
+IF .in_VAXcluster
+ AND
+   (.message [rpybrd_v_broad_remoteall]
+   OR
+    .message [rpybrd_v_broad_remotelst])
+THEN
+    $signal (IF .message [rpybrd_v_wait] THEN opc$_noremwait ELSE opc$_norembroad);
+!
+! Format and broadcast the message to the local node
+!
+message [rpybrd_v_wait] = true;			! We are in /WAIT mode now, perhaps implicitly
+IF .message [rpybrd_v_broad_local]
+THEN
+    BEGIN
+    status = replybrd_format (.message, nodename_desc);
+    IF .status
+    THEN
+	status = replybrd_io (.message, nodename_desc);
+    END
+ELSE
+    status = opc$_nolclbroad;
+
+RETURN (opc$_facility^16 OR .status);
+END;						! End of replymain_broadcast_local
+
+GLOBAL ROUTINE replymain_fuldev (name : $ref_bblock) : NOVALUE =	%SBTTL 'replymain_fuldev (name : $ref_bblock)'
+
+!++
+! Functional description:
+!
+!	Convert terminal name to full (SCS) device name.  Make sure that a device name which fails contains
+!	a valid SCS nodename for a node in our cluster, plus at least three more letters (e.g. DELPHI$TT0)
+!
+! Input:
+!
+!	name - Address of dynamic string descriptor for input name
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	name - Receives a new dynamic string if we find the device on our system
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of replymain_fuldev
+
+LOCAL
+    len,
+    ptr,
+    p,
+    desc : VECTOR [2, LONG],
+    status;
+
+!
+! If the input string is not dynamic, scream and shout.
+!
+IF .name [dsc$b_class] NEQ dsc$k_class_d
+THEN
+    $signal_stop (ss$_badparam);
+!
+! See if we can get a local device name from the input
+!
+IF (status = $getdvi (devnam=.name, itmlst=dvi_items))
+THEN
+    BEGIN
+    !
+    ! Copy the dvi string to the output
+    !
+    desc [0] = .dvi_terminal_len;
+    desc [1] = dvi_terminal_buf;
+    IF NOT (status = str$copy_dx (.name, desc))
+    THEN
+	$signal_stop (.status);
+    RETURN;
+    END;
+!
+! If we are not in a VAXcluster, nothing more to do with the name.  It is wrong.
+!
+IF NOT .in_VAXcluster
+THEN
+    $signal_stop (.status);
+!
+! Not a local device, make sure it looks somewhat like a valid remote device.  For the sake of argument,
+! imagine that a valid remote device name looks like  "nnnnnn$xxx"  where "nnnnnn" is a node which is
+! actually in our cluster and "xxx" is a least three letters (can any valid terminal be shorter than TT0?)
+!
+len = .name [dsc$w_length];
+ptr = .name [dsc$a_pointer];
+p = CH$FIND_CH (.len, .ptr, %C '$');		! Find the dollar sign
+!
+! If there is no dollar sign, or if there are fewer than three letters after the "$", or the "$" is the
+! first letter then there is no such device.
+!
+IF .p EQL 0
+ OR
+   .p EQL .ptr
+THEN
+    $signal_stop (opc$_valuerr, 1, .name, ss$_nosuchdev);
+IF .len-(.p-.ptr-1) LSS 3
+THEN
+    $signal_stop (opc$_valuerr, 1, .name, ss$_nosuchdev);
+!
+! Found something that could be a node name, remove the "$xxx" from the string
+!
+len = .p - .ptr;
+!
+! If any leading underscores, skip over them
+!
+p = CH$FIND_NOT_CH (.len, .ptr, %C '_');
+IF .p NEQ 0
+THEN
+    BEGIN
+    len = .len - (.p - .ptr);
+    ptr = .p;
+    END;
+IF .len LSS 0
+THEN
+    $signal_stop (opc$_valuerr, 1, .name, ss$_nosuchdev);
+!
+! Ok, we should have a good node name, try it out by doing a $GETSYI on the node (any info will do)
+!
+desc [0] = .len;
+desc [1] = .ptr;
+IF NOT (status = $getsyi (nodename=desc, itmlst=syi_items))
+THEN
+    $signal_stop (opc$_valuerr, 1, .name, .status);
+!
+! We've got something that looks like a good name, but of course it could be _DELPHI$DUA169:.  We seem to
+! have two choices.  One is to make some assumptions about what a terminal name looks like, the other
+! would be to actually talk to the other node and see if it has the device.  It isn't a good idea to
+! assume anything about a device name (boy have we learned that lesson!), and it seems to be pretty
+! expensive to have a chat with the other node.  Actually, we have a third choice, which is to leave
+! things as they stand.  If the guy really wants to know if he succeeded, he will use /NOTIFY.
+!
+RETURN;
+END;						! End of replymain_fuldev
+
+GLOBAL ROUTINE replymain_init =			%SBTTL 'replymain_init routine'
+
+!++
+! Functional description:
+!
+!	This is the initialization routine for REPLY.  Various common initializations are done.
+!
+! Input:
+!
+!	None.
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of replymain_init
+
+LOCAL
+    ptr	: $ref_bblock,
+    status;
+!
+! Some routines which are shared with OPCOM need to know whether REPLY is running or OPCOM is running.
+! Let them know.
+!
+reply_image = 1;
+!
+! Do a $GETJPI to get information about the current process
+!
+IF NOT (status = $getjpi (itmlst=jpi_items))
+THEN
+    $signal_stop (.status);
+!
+! Get the actual length of the username, since it is blank padded to 12 bytes
+!
+ptr = CH$FIND_CH (12, jpi_username_buf, %C ' ');
+IF .ptr NEQ 0
+THEN
+    jpi_username_len = .ptr - jpi_username_buf;
+!
+! Do a $GETSYI to get information about the current system
+!
+IF NOT (status = $getsyi (itmlst=syi_items))
+THEN
+    $signal_stop (.status);
+!
+! Get the length of the node name, since it is blank padded to 8 bytes
+!
+ptr = CH$FIND_CH (8, nodename_buf, %C ' ');
+IF .ptr NEQ 0
+THEN
+    nodename_desc [dsc$w_length] = .ptr - nodename_buf;
+!
+! If the SCS nodename is null, try to translate SYS$NODE to find the DECnet name.  Remove the "_" and "::"
+! from the translated name.
+!
+IF .nodename_desc [dsc$w_length] EQL 0
+THEN
+    BEGIN
+    IF NOT (status = $trnlog (lognam=ascid_SYSNODE, rsllen=tranlog_desc, rslbuf=tranlog_desc, dsbmsk=6))
+    THEN
+	$signal_stop (.status);
+    IF .status EQL ss$_normal			! If we translated, remove the underscores and colons
+    THEN
+	BEGIN
+	ptr = CH$FIND_NOT_CH (.tranlog_desc [dsc$w_length], .tranlog_desc [dsc$a_pointer], %C '_');
+	IF .ptr NEQ 0
+	THEN
+	    BEGIN
+	    tranlog_desc [dsc$w_length] = .tranlog_desc [dsc$w_length] - (.ptr - .tranlog_desc [dsc$a_pointer]);
+	    tranlog_desc [dsc$a_pointer] = .ptr;
+	    END;
+	ptr = CH$FIND_CH (.tranlog_desc [dsc$w_length], .tranlog_desc [dsc$a_pointer], %C ':');
+	IF .ptr NEQ 0
+	THEN
+	    tranlog_desc [dsc$w_length] = .ptr - .tranlog_desc [dsc$a_pointer];
+	nodename_desc [dsc$w_length] = .tranlog_desc [dsc$w_length];
+	nodename_desc [dsc$a_pointer] = .tranlog_desc [dsc$a_pointer];
+	END;
+    END;
+!
+! Do a $GETDVI to get the name of the command terminal.
+!
+IF NOT (status = $getdvi (devnam=ascid_SYSCOMMAND, itmlst=dvi_items))
+THEN
+    $signal_stop (.status);
+IF NOT .devchar [dev$v_trm]			! If not a terminal, change to "nodename Batch"
+THEN
+    BEGIN
+    dvi_terminal_len = 6 + .nodename_desc [dsc$w_length];
+    CH$COPY (.nodename_desc [dsc$w_length], .nodename_desc [dsc$a_pointer],
+		6, UPLIT BYTE (' Batch'), 0, .dvi_terminal_len, dvi_terminal_buf);
+    batch_mode = true;
+    END;
+
+RETURN .status;
+END;						! End of replymain_init
+
+GLOBAL ROUTINE replymain_logfile =			%SBTTL 'replymain_logfile'
+!++
+! Functional description:
+!
+!	This routine controls closing and opening the operator's log file
+!
+! Input:
+!
+!	None.
+!
+! Implicit Input:
+!
+!	CLI parameters
+!
+! Output:
+!
+!	None.
+!
+! Implicit output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of replymain_logfile
+
+REGISTER
+    mlen,					! Output message length
+    mptr	: $ref_bvector;			! Output message pointer
+
+LOCAL
+    message	: $bblock [128],		! Buffer to build message
+    message_desc : VECTOR [2, LONG] PRESET ([1] = message),
+    status;
+!
+! Initialize the message
+!
+! NOTE:  We are using an internal interface to OPCOM which is subject to change!
+!
+CH$FILL (0, opc$k_logfile_min_size, message);	! Init all fixed fields to zero
+message [opc$b_rqstcode]	= opc$_x_logfile;
+message [opc$b_scope]		= opc$k_system;
+IF cli$present (ascid_LOG)
+THEN
+    $bblock [message [opc$l_rq_options], opc$v_initlog] = true
+ELSE
+    $bblock [message [opc$l_rq_options], opc$v_closelog] = true;
+!
+! Move the sending terminal name
+!
+mptr = message [opc$t_logfile_opr];		! Set output pointer to start of text area
+mlen = .dvi_terminal_len;			! Get length of terminal name
+mptr [0] = .mlen;				! Store the ASCIC length
+CH$MOVE (.mlen, dvi_terminal_buf, mptr [1]);	! Append the name to the buffer
+message_desc [0] = $byteoffset (opc$t_logfile_opr) + 1 + .mlen;	! Save total length
+!
+! Send the message to OPCOM
+!
+IF NOT (status = $sndopr (msgbuf=message_desc))
+THEN
+    $signal_stop (.status);
+
+RETURN ss$_normal;
+END;						! End of replymain_logfile
+
+GLOBAL ROUTINE replymain_main =			%SBTTL 'replymain_main routine'
+
+!++
+! Functional description:
+!
+!	This is the main routine for REPLY.  When REPLY is started, control is transfered here.
+!
+! Input:
+!
+!	None.
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of replymain_main
+
+LOCAL
+    status;
+
+!
+! Perform common initializations
+!
+replymain_init ();
+!
+! If one of the broadcast qualifiers is used, call the broadcast routine
+!
+IF  cli$present (ascid_ALL)
+  OR
+    cli$present (ascid_TERMINAL)
+  OR
+    cli$present (ascid_USERNAME)
+THEN
+    RETURN replymain_broadcast ();
+
+!
+! If enable or disable operator's terminal, call that routine
+!
+IF  cli$present (ascid_DISABLE)
+  OR
+    cli$present (ascid_ENABLE)
+THEN
+    RETURN replymain_oprenable ();
+
+!
+! If a logfile request, dispatch to the logfile action routine
+!
+status = cli$present (ascid_LOG);
+IF .status					! We have a /LOG
+  OR
+    .status EQL cli$_negated			! We have a /NOLOG
+THEN
+    RETURN replymain_logfile ();
+
+!
+! If a request for status, do it
+!
+IF cli$present (ascid_STATUS)
+THEN
+    RETURN replymain_status ();
+
+!
+! Otherwise, we assume it is one of the miscellaneous replies to requests,
+! as in /ABORT, /BLANK_TAPE, /INITIALIZE_TAPE, /PENDING or /TO.
+!
+RETURN replymain_reply ();
+
+END;						! End of replymain_main
+
+GLOBAL ROUTINE replymain_oprenable =			%SBTTL 'replymain_oprenable'
+!++
+! Functional description:
+!
+!	This routine controls enabling or disabling operator terminals.
+!
+! Input:
+!
+!	None.
+!
+! Implicit Input:
+!
+!	CLI parameters
+!
+! Output:
+!
+!	None.
+!
+! Implicit output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of replymain_oprenable
+
+REGISTER
+    mlen,					! Output message length
+    mptr	: $ref_bvector;			! Output message pointer
+
+LOCAL
+    text	: $dyn_str_desc,		! Dynamic string descr for message text
+    message	: $bblock [128],		! Buffer to build message
+    message_desc : VECTOR [2, LONG] PRESET ([1] = message),
+    idx,
+    status,
+    type_keyword;
+!
+! Initialize the message
+!
+! NOTE:  We are using an internal interface to OPCOM which is subject to change!
+!
+CH$FILL (0, opc$k_oprenable_min_size, message);	! Init all fixed fields to zero
+message [opc$b_rqstcode]	= opc$_x_oprenable;
+message [opc$b_scope]		= opc$k_system;
+IF cli$present (ascid_DISABLE)
+THEN
+    BEGIN
+    $bblock [message [opc$l_rq_options], opc$v_disable] = true;
+    type_keyword = ascid_DISABLE;
+    END
+ELSE
+    BEGIN
+    type_keyword = ascid_ENABLE;
+    IF NOT cli$present (ascid_TEMPORARY)
+    THEN
+	$bblock [message [opc$l_rq_options], opc$v_permoper] = true;
+    END;
+!
+! Move the sending terminal name
+!
+mptr = message [opc$t_oprenable_opr];		! Set output pointer to start of text area
+mlen = .dvi_terminal_len;			! Get length of terminal name
+mptr [0] = .mlen;				! Store the ASCIC length
+CH$MOVE (.mlen, dvi_terminal_buf, mptr [1]);	! Append the name to the buffer
+message_desc [0] = $byteoffset (opc$t_oprenable_opr) + 1 + .mlen;	! Save total length
+!
+! Set the attention mask according to the appropriate qualifier
+!
+IF NOT cli$get_value (.type_keyword, text)
+THEN
+    !
+    ! The qualifier is /ENABLE or /DISABLE without any keywords.  Operate on all operators.
+    !
+    BEGIN
+    message [opc$l_attnmask1] = known_attn_mask1;
+    message [opc$l_attnmask2] = known_attn_mask2;
+    END
+ELSE
+    !
+    ! The qualifier is /xABLE=(...), set the bit for each specified operator
+    !
+    DO $bblock [message [opc$l_attnmask1], 0, share_lookup_oper_bit (text), 1, 0] = 1
+    UNTIL NOT cli$get_value (.type_keyword, text);
+!
+! Send the message to OPCOM
+!
+IF NOT (status = $sndopr (msgbuf=message_desc))
+THEN
+    $signal_stop (.status);
+
+RETURN ss$_normal;
+END;						! End of replymain_oprenable
+
+GLOBAL ROUTINE replymain_reply =			%SBTTL 'replymain_reply'
+!++
+! Functional description:
+!
+!	This routine controls enabling or disabling operator terminals.
+!
+! Input:
+!
+!	None.
+!
+! Implicit Input:
+!
+!	CLI parameters
+!
+! Output:
+!
+!	None.
+!
+! Implicit output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of replymain_reply
+
+REGISTER
+    mlen,					! Output message length
+    mptr	: $ref_bvector;			! Output message pointer
+
+LOCAL
+    text	: $dyn_str_desc,		! Dynamic string descr for message text
+    message	: $bblock [2048],		! Buffer to build message
+    message_desc : VECTOR [2, LONG] PRESET ([1] = message),
+    idx,
+    status,
+    type_keyword;
+!
+! Initialize the message
+!
+! NOTE:  We are using an internal interface to OPCOM which is subject to change!
+!
+CH$FILL (0, opc$k_reply_min_size, message);	! Init all fixed fields to zero
+message [opc$b_rqstcode]	= opc$_x_reply;
+message [opc$b_scope]		= opc$k_system;
+!
+! Find out which flavor of reply.  The main routine calls us if it hasn't found something else, therefore
+! if it isn't one of ours we need to return the bad status.
+!
+SELECTONE cli$_present OF
+SET
+    [cli$present (ascid_ABORT)] :	BEGIN
+					message [opc$l_rq_options] = opc$_rqstabort;
+					type_keyword = ascid_ABORT;
+					END;
+    [cli$present (ascid_BLANK_TAPE)] :	BEGIN
+					message [opc$l_rq_options] = opc$_blanktape;
+					type_keyword = ascid_BLANK_TAPE;
+					END;
+    [cli$present (ascid_INITIALIZE_TAPE)] : BEGIN
+					message [opc$l_rq_options] = opc$_initape;
+					type_keyword = ascid_INITIALIZE_TAPE;
+					END;
+    [cli$present (ascid_PENDING)] :	BEGIN
+					message [opc$l_rq_options] = opc$_rqstpend;
+					type_keyword = ascid_PENDING;
+					END;
+    [cli$present (ascid_TO)] :		BEGIN
+					message [opc$l_rq_options] = opc$_rqstcmplte;
+					type_keyword = ascid_TO;
+					END;
+    [OTHERWISE] :			RETURN cli$_ivverb;
+TES;
+!
+! Move the request ID to the message
+!
+IF NOT (status = cli$get_value (.type_keyword, text))
+THEN
+    $signal_stop (.status);			! This is a required entity!
+IF NOT (status = ots$cvt_ti_l (text, message [opc$l_rqstid]))
+THEN
+    $signal_stop (opc$_valuerr, 1, text, .status);
+!
+! Move the sending terminal name
+!
+mptr = message [opc$t_reply_opr];		! Set output pointer to start of text area
+mlen = .dvi_terminal_len;			! Get length of terminal name
+mptr [0] = .mlen;				! Store the ASCIC length
+CH$MOVE (.mlen, dvi_terminal_buf, mptr [1]);	! Append the name to the buffer
+message_desc [0] = $byteoffset (opc$t_reply_opr) + 1 + .mlen;	! Save total length
+mptr = .mptr + 1 + .mlen;
+
+!
+! Move the reply text, if any
+!
+cli$get_value (ascid_P1, text);			! Get the parameter
+(mptr [0]) <0,16,0> = .text [dsc$w_length];	! Store 16-bit length of text
+message_desc [0] = .message_desc [0] + 2 + .text [dsc$w_length]; ! Add text plus length word to total length
+IF .text [dsc$w_length] GTR 0			! If a message came in, move it to the buffer after the len
+THEN
+    CH$MOVE (.text [dsc$w_length], .text [dsc$a_pointer], mptr [2]);
+!
+! Send the message to OPCOM
+!
+IF NOT (status = $sndopr (msgbuf=message_desc))
+THEN
+    $signal_stop (.status);
+
+RETURN ss$_normal;
+END;						! End of replymain_reply
+
+GLOBAL ROUTINE replymain_status =			%SBTTL 'replymain_status'
+!++
+! Functional description:
+!
+!	This routine requests a display of status
+!
+! Input:
+!
+!	None.
+!
+! Implicit Input:
+!
+!	CLI parameters
+!
+! Output:
+!
+!	None.
+!
+! Implicit output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of replymain_status
+
+REGISTER
+    mlen,					! Output message length
+    mptr	: $ref_bvector;			! Output message pointer
+
+LOCAL
+    message	: $bblock [128],		! Buffer to build message
+    message_desc : VECTOR [2, LONG] PRESET ([1] = message),
+    status;
+!
+! Initialize the message
+!
+! NOTE:  We are using an internal interface to OPCOM which is subject to change!
+!
+CH$FILL (0, opc$k_status_min_size, message);	! Init all fixed fields to zero
+message [opc$b_rqstcode]	= opc$_x_status;
+message [opc$b_scope]		= opc$k_system;
+!
+! Move the sending terminal name
+!
+mptr = message [opc$t_status_opr];		! Set output pointer to start of text area
+mlen = .dvi_terminal_len;			! Get length of terminal name
+mptr [0] = .mlen;				! Store the ASCIC length
+CH$MOVE (.mlen, dvi_terminal_buf, mptr [1]);	! Append the name to the buffer
+message_desc [0] = $byteoffset (opc$t_status_opr) + 1 + .mlen;	! Save total length
+!
+! Send the message to OPCOM
+!
+IF NOT (status = $sndopr (msgbuf=message_desc))
+THEN
+    $signal_stop (.status);
+
+RETURN ss$_normal;
+END;						! End of replymain_status
+
+END
+ELUDOM						! End of REPLYMAIN

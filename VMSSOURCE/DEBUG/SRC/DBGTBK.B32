@@ -1,0 +1,629 @@
+MODULE DBGTBK (	IDENT = 'V04-000') =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+! MODULE FUNCTION
+!	This module contains the routines that implement the SHOW CALLS
+!	command.  These routines give a traceback from the program location
+!	where the user is currently stopped.
+!
+! AUTHOR:	Carol Peters, CREATION DATE: September 20, 1977
+!
+! MODIFIED BY:
+!		Mike Candela,	28 January 1980
+!		V. Holt,	14 May 1982
+!		
+! 1.01	25-SEP-78	MCC	Deleted require file SYSLIT
+! 1.02	 9-OCT-78	MCC	Traceback reporting corrected to terminate when
+!				current FP = addr of DBG$FINAL_HANDL (bug-fix)
+! 1.03	02-NOV-78	DAR	Removed check for FORTRAN_MODULE from dbg$traceback.
+!				Also put in explicit field lengths into FAO strings.
+! 1.04	03-NOV-78	DAR	Traceback also stops if the PC is DBG$PSEUDO_PROG
+! 1.05	30-NOV-79	JBD	Put in statement number support.
+! 1.06	28-JAN-80	MCC	Fixed out_traceback to correctly format 31
+!				routine and module names for SHOW CALLS
+!
+! 1.07  19-apr-80	ala	Added additional parameter to output routines
+!				to allow access to output buffer's address
+! 3B.0  01-Mar-82       PS      When dbg$val_to_sym corresponds pc to rstptr,
+!				check to see if this is a data symbol before
+!				search for the surrounding routine and module
+!				entries.
+! 3B.0  27-Apr-82       PS      Display the module name when SHOW CALL even if
+!				the module is not set.
+! 3B.1  14-May-82	VJH	Added call to DBG$FLUSHBUF, eliminating need to
+!				initialize local output buffer.
+! 3B.2   3-Jun-82	VJH	Removed all references to DBG$FAO_PUT and
+!				DBG$OUT_PUT, as these are now obsolete.
+!				Replaced them with calls to DBG$PRINT and
+!				DBG$NEWLINE, respectively.
+! 3B.2  16-Nov-82       PS      Do a gernal clean up.  (We always print module
+!				name from the SAT look up for the current pc.
+!				We mark the set module.  We print JSB message.
+!				We print EXC message.)
+! 3B.2	27-Dec-82	BB	Clean up style and other minor things.
+!
+
+REQUIRE 'SRC$:DBGPROLOG.REQ';
+
+LIBRARY 'LIB$:DBGGEN.L32';
+
+FORWARD ROUTINE
+    DBG$TRACEBACK: NOVALUE,		! Traces calls through the stack and
+					!      generates the SHOW CALLS output
+    FIND_MODRST,			! Find the module RST pointer for a PC
+					!      from the Program SAT
+    OUT_TRACEBACK: NOVALUE;		! Output a single line of traceback
+					!      information
+
+EXTERNAL ROUTINE
+    DBG$FINAL_HANDL,			! Call frame exception handler
+    DBG$PC_TO_LINE_LOOKUP,		! Translates a PC to a line number
+    DBG$PRINT : NOVALUE,		! Format output lines.
+    DBG$NEWLINE : NOVALUE,		! Flush output lines.
+    DBG$SEARCH_BIN_SAT,			! Search-SAT routine
+    DBG$STA_SYMNAME: NOVALUE,		! Get symbol's name
+    DBG$PC_TO_SYMID,			! Translates a value to an RST pointer.
+    SYS$GETMSG;				! Get the message text for a condition
+
+EXTERNAL
+    DBG$PSEUDO_EXIT,			! Point to which CALL returns
+    DBG$RUNFRAME: BLOCK[,BYTE],		! The current register runframe
+    SAT$START_ADDR;			! Starting address of Program SAT
+
+GLOBAL ROUTINE DBG$TRACEBACK(INITIAL_PC, FP_POINTER,
+					EXCEPTION_NAME, NUM_LEVELS): NOVALUE =
+!
+! FUNCTION
+!	This routine collects the symbolic information describing each
+!	stack frame starting at the stack frame pointed to by the user's
+!	FP, and proceeding through the frame with which the user program
+!	was called by CLI, by the OTS, or by DEBUG.
+!
+!	Once the symbolic information for a frame is collected, a routine
+!	is called to output this information to DBG$OUTPUT.
+!
+!	The num_levels parameter is either -1, or it is the
+!	number of call frames which the uses has specifically
+!	requested (via SHOW CALLS N).
+!
+! INPUTS
+!	INITIAL_PC	- PC of user program when traceback occurs
+!
+!	FP_POINTER	- FP of user program when traceback occurs
+!
+!	EXCEPTION_NAME	- Type of exception where:
+!			  	1 - trap type exception
+!			  	2 - fault or abort type exception
+!
+!	NUM_LEVELS	- The number of frames the user wants to see,
+!			  or -1 which implies "show them all".
+!
+!
+! OUTPUTS
+!	NONE
+!
+
+    BEGIN
+
+    BUILTIN
+	PROBER;				! Probe for read access to a location
+
+    LITERAL
+	MAX_STRING_SIZE = 256;		! ???
+
+    LOCAL
+	CALL_FLAG,			! Flag to indicate the call is from
+					!	JSB or BSB
+	CURRENT_FP : REF BLOCK[,BYTE],	! Value of FP of working stack frame
+	CURRENT_PC,			! Current PC in writable variable
+	EXC_TYPE,			! Type of exception
+	J,				! Index value used for several purposes
+	LINE_NUMBER,			! Matching line number
+	MODNAME,			! Pointer to module's name
+	MOD_RSTPTR: REF RST$ENTRY,	! Pointer to RST entry for outermost scope
+	MOD_SET_FLAG,			! Flag to indicate that module is SET
+	MSG_DESCR: DBG$STG_DESC,	! String descriptor for message text
+	MSGLEN: WORD,			! The length of the message text
+	MSG_STRING:			! The message text buffer
+		VECTOR[MAX_STRING_SIZE, BYTE],	!
+	NEXT_FP: REF BLOCK[,BYTE],	! ???
+	REGMASK: BITVECTOR[16],		! The register save mask bit vector
+	REGSAVELOC: REF VECTOR[,LONG],	! Pointer to the register save area in
+					!      the current call frame
+	RTN_RSTPTR: REF RST$ENTRY,	! Pointer to RST entry for routine
+	SAVED_RUNFRAME: REF BLOCK[,BYTE],! Pointer to saved runframe from the
+					!      DEBUG CALL command
+	SIG_VECTOR: REF VECTOR[,LONG],	! Pointer to the Signal Argument Vector
+	SPVALUE: REF VECTOR[,LONG],	! The value of SP in the current frame
+	SYM_DSTPTR: REF DST$RECORD,	! Pointer to corresponding DST entry
+	SYMNAME,			! Pointer to symbol's name
+	SYM_RSTPTR: REF RST$ENTRY,	! Pointer to RST entry from VAL_TO_SYM
+	STARTING_PC,			! PC of start of routine or module
+	START_PC,			! ???
+	END_PC,				! ???
+	STMT_NUMBER;			! Matching statement number
+
+
+
+    ! If the user doesn't want to see any frames just return.  Otherwise check
+    ! that some call frames are active, get values of PC and FP to use, and
+    ! set up the exception type.
+    !
+    IF .NUM_LEVELS EQL 0 THEN RETURN;
+    IF .INITIAL_PC EQL 0 THEN SIGNAL(DBG$_NOCALLS);
+
+
+    ! Initialization.
+    !
+    NEXT_FP = .FP_POINTER;
+    CURRENT_PC = .INITIAL_PC;
+    EXC_TYPE = .EXCEPTION_NAME;
+    CALL_FLAG = FALSE;
+    SAVED_RUNFRAME = .DBG$RUNFRAME[DBG$L_NEXT_LINK];
+
+
+    ! Print the SHOW CALLS header.
+    !
+    DBG$PRINT(UPLIT BYTE (%ASCIC 
+    	' module name     routine name                     line       rel PC    abs PC!/'));
+    DBG$NEWLINE();
+
+
+    ! The following loop translates the current PC into a routine name and then
+    ! prints the name of the surrounding module, the name of the routine, the
+    ! line number, and the relative and absolute PC values for each user stack
+    ! frame.
+    !
+    INCR DEPTH FROM 0 TO MINU(.NUM_LEVELS, 1000) - 1 DO
+	BEGIN
+	IF PROBER(%REF(0), %REF(20), NEXT_FP[SF$A_HANDLER]) EQL 0
+	THEN
+	    BEGIN
+    	    SIGNAL(DBG$_BADSTACK);
+	    RETURN;
+	    END;
+
+
+	! Stop if the exception handler address points to DEBUG's final handler.
+	! This indicates that we have reached the end of the call stack.
+	!
+	IF .NEXT_FP[SF$A_HANDLER] EQL DBG$FINAL_HANDL THEN RETURN;
+
+
+	! Abort the SHOW CALLS processing if the user entered Control-Y DEBUG
+	! to stop the current command.
+	!
+	$ABORT_ON_CONTROL_Y;
+
+
+    	! Check to see if this is an exception handler.  (A handler is recog-
+	! nized by having a return PC of hex 80000014, which is where the VMS
+	! exception handling mechanism calls user handlers.)  If it is an
+	! exception handler, we must get the exception PC from the signal
+    	! argument list.  The location of this list is computed from the stack
+	! pointer value.
+    	!
+	IF (.CURRENT_PC EQL %X'80000014') AND (.DEPTH NEQ 0)
+    	THEN
+    	    BEGIN
+
+
+    	    ! Pass the saved registers in this call frame.
+    	    !
+    	    REGMASK = .CURRENT_FP[SF$W_SAVE_MASK];
+    	    REGSAVELOC = CURRENT_FP[SF$L_SAVE_REGS];
+    	    J = 0;
+    	    INCR I FROM 0 TO 11 DO
+    		BEGIN
+    		IF .REGMASK[.I] THEN J = .J + 1;
+    		END;
+
+
+    	    ! Set the stack pointer points at the end of the saved registers.
+    	    ! Adjust it by the offset values.
+    	    !
+    	    SPVALUE = REGSAVELOC[.J];
+    	    SPVALUE = .SPVALUE + .CURRENT_FP[SF$V_STACKOFFS];
+
+
+    	    ! Pass one longword of junk and the argument count.
+    	    !
+    	    SPVALUE = .SPVALUE + 8;
+
+
+    	    ! Get the pointer to the signal argument list.  Pick up the PC of
+	    ! the signal from the signal argument list.  Then print the line
+	    ! identifying this routine as a condition handler and the line that
+	    ! displays the message text that identifies the signalled condition.
+    	    !
+    	    SIG_VECTOR = .SPVALUE[0];
+    	    J = .SIG_VECTOR[0];
+    	    CURRENT_PC = .SIG_VECTOR[.J - 1];
+    	    DBG$PRINT(UPLIT BYTE(%ASCIC
+		'----- above condition handler called with exception !XL'),
+		.SIG_VECTOR[1]);
+    	    DBG$PRINT(UPLIT BYTE(%ASCIC ':'));
+    	    DBG$NEWLINE();
+    	    MSG_DESCR[DSC$W_LENGTH] = MAX_STRING_SIZE;
+    	    MSG_DESCR[DSC$A_POINTER] = MSG_STRING;
+    	    SYS$GETMSG(.SIG_VECTOR[1], MSGLEN, MSG_DESCR, 0, 0);
+    	    MSG_DESCR[DSC$W_LENGTH] = .MSGLEN;
+    	    DBG$PRINT(UPLIT BYTE(%ASCIC '----- !AS'), MSG_DESCR);
+    	    DBG$NEWLINE();
+    	    END;
+
+
+    	! Check to see if the CURRENT_PC is caused by the DEBUG CALL command.
+	! If so, print the line that indicates this and pick up the actual
+	! user PC value from the saved run-frame for this CALL command.
+    	!
+    	IF .CURRENT_PC EQL DBG$PSEUDO_EXIT
+    	THEN
+    	    BEGIN
+    	    CURRENT_PC = .SAVED_RUNFRAME[DBG$L_USER_PC];
+    	    DBG$PRINT(UPLIT BYTE(%ASCIC
+		'----- above routine called from DEBUG CALL command'));
+    	    DBG$NEWLINE();
+    	    SAVED_RUNFRAME = .SAVED_RUNFRAME[DBG$L_NEXT_LINK];
+    	    EXC_TYPE = FAULT_EXC;
+    	    END;
+
+
+	! Obtain the name of the innermost routine that surrounds the address.
+	! If there is no such routine in the RST, find out what module it is
+	! in and print only the module name (if any) and the absolute PC value.
+	!
+	IF NOT DBG$PC_TO_SYMID(.CURRENT_PC, SYM_RSTPTR, TRUE)
+	THEN
+	    BEGIN
+	    MODNAME = 0;
+	    MOD_SET_FLAG = FALSE;
+	    MOD_RSTPTR = FIND_MODRST(.CURRENT_PC);
+	    IF .MOD_RSTPTR NEQ 0
+	    THEN
+		BEGIN
+		DBG$STA_SYMNAME(.MOD_RSTPTR, MODNAME);
+		MOD_SET_FLAG = .MOD_RSTPTR[RST$V_MODSET];
+		END;
+
+	    OUT_TRACEBACK (.MODNAME, 0, 0, 0, 0, .CURRENT_PC, .MOD_SET_FLAG);
+	    END
+
+	ELSE
+	    BEGIN
+	    IF .SYM_RSTPTR EQL 0 THEN $DBG_ERROR('DBGTBK\TRACEBACK');
+	    SYM_DSTPTR = .SYM_RSTPTR[RST$L_DSTPTR];
+	    IF .SYM_RSTPTR[RST$V_GLOBAL]
+	    THEN
+
+
+		! Routine found in GST rather than in RST. (This is the case if
+		! the module containing the routine is not set). Just print the
+		! routine name and the relative and absolute PC values.
+    		! Note: Now the routine will find the module RST pointer thru
+    		!       Program SAT, and print out the module name even if the
+    		!	module is not set.
+    		!
+    		BEGIN
+    		CALL_FLAG = TRUE;
+	        MOD_RSTPTR = FIND_MODRST(.CURRENT_PC);
+	        DBG$STA_SYMNAME(.SYM_RSTPTR, SYMNAME);
+    		IF .MOD_RSTPTR NEQ 0
+    		THEN
+    		    BEGIN
+    		    DBG$STA_SYMNAME(.MOD_RSTPTR, MODNAME);
+	    	    OUT_TRACEBACK (.MODNAME, .SYMNAME, 0, 0,
+    			           (.CURRENT_PC - .SYM_DSTPTR[DST$L_VALUE]), 
+    			           .CURRENT_PC, .MOD_RSTPTR[RST$V_MODSET]);
+    		    END
+
+    		ELSE
+    		    OUT_TRACEBACK (0, .SYMNAME, 0, 0,
+    				   (.CURRENT_PC - .SYM_DSTPTR[DST$L_VALUE]),
+    				   .CURRENT_PC);
+    		END
+
+	    ELSE
+    		BEGIN
+    		IF .SYM_RSTPTR[RST$B_KIND] EQL RST$K_DATA
+    		THEN
+    		    OUT_TRACEBACK(0, 0, 0, 0, 0, .CURRENT_PC)
+
+    		ELSE
+		    BEGIN
+
+
+		    ! Search for the surrounding routine and module entries.
+		    !
+    		    CALL_FLAG = TRUE;
+		    RTN_RSTPTR = 0;
+		    MOD_RSTPTR = .SYM_RSTPTR;
+		    WHILE .MOD_RSTPTR NEQ 0 DO
+		        BEGIN
+		        CASE .MOD_RSTPTR[RST$B_KIND] FROM RST$K_TYPE_MINIMUM
+						TO RST$K_TYPE_MAXIMUM OF
+			    SET
+
+			    [RST$K_MODULE]:
+			        EXITLOOP;
+
+			    [RST$K_ROUTINE]:
+			        IF .RTN_RSTPTR EQL 0
+			        THEN
+				    BEGIN
+				    SYM_RSTPTR =  RTN_RSTPTR = .MOD_RSTPTR;
+				    SYM_DSTPTR = .MOD_RSTPTR[RST$L_DSTPTR];
+				    END;
+
+			    [RST$K_ENTRY,
+			     RST$K_BLOCK,
+			     RST$K_LINE,
+			     RST$K_LABEL]:
+			         0;
+
+			     [INRANGE,OUTRANGE] :
+			         SIGNAL(DBG$_RSTERR);
+
+			    TES;
+
+			MOD_RSTPTR = .MOD_RSTPTR[RST$L_UPSCOPEPTR];
+		        IF .MOD_RSTPTR EQL 0 THEN SIGNAL(DBG$_RSTERR);
+
+		        END;		! End of WHILE loop
+
+		    RTN_RSTPTR = .SYM_RSTPTR;
+    		    STARTING_PC = .SYM_DSTPTR[DST$L_VALUE];
+		    IF NOT DBG$PC_TO_LINE_LOOKUP
+    				(.CURRENT_PC - (.EXC_TYPE neq FAULT_EXC),
+    				 LINE_NUMBER, STMT_NUMBER,
+    				 START_PC, END_PC, MOD_RSTPTR)
+		    THEN
+			BEGIN
+			LINE_NUMBER = 0;
+			STMT_NUMBER = 0;
+			END;
+
+
+    		    ! We always use the MODRST ptr from searching module and
+    		    ! Program Static Address Table for the given current PC.
+    		    !
+	            MOD_RSTPTR = FIND_MODRST(.CURRENT_PC);
+    		    DBG$STA_SYMNAME(.SYM_RSTPTR, SYMNAME);
+    		    IF .MOD_RSTPTR NEQ 0
+    		    THEN
+    			BEGIN
+    			DBG$STA_SYMNAME(.MOD_RSTPTR, MODNAME);
+	    	        OUT_TRACEBACK (.MODNAME, .SYMNAME,
+    				   .LINE_NUMBER, .STMT_NUMBER,
+    			           .CURRENT_PC - .STARTING_PC,
+    			           .CURRENT_PC, .MOD_RSTPTR[RST$V_MODSET]);
+    			END
+
+    		    ELSE
+    		        OUT_TRACEBACK (0, .SYMNAME, 
+    				   .LINE_NUMBER, .STMT_NUMBER,
+    				   .CURRENT_PC - .STARTING_PC,
+    				   .CURRENT_PC);
+
+		    END;		! End of Searching for routine and modules.
+
+    		END;			! End of Checking data symbol rstptr.
+
+	    END;
+
+
+    	IF .CALL_FLAG
+    	THEN
+    	    BEGIN
+    	    CALL_FLAG = FALSE;
+    	    IF .SYM_RSTPTR[RST$B_KIND] EQL RST$K_ROUTINE
+    	    THEN
+    		BEGIN
+    		IF (.CURRENT_PC GEQU .SYM_RSTPTR[RST$L_STARTADDR]) AND
+    		   (.CURRENT_PC LEQU .SYM_RSTPTR[RST$L_ENDADDR])
+    		THEN
+    		    BEGIN
+    		    SYM_DSTPTR = .SYM_RSTPTR[RST$L_DSTPTR];
+    		    IF .SYM_DSTPTR[DST$V_RTNBEG_NO_CALL]
+    		    THEN
+    			BEGIN
+    			DBG$PRINT(UPLIT BYTE(%ASCIC
+			'----- above JSB routine called from unknown location'));
+    			DBG$NEWLINE();
+    			END;
+
+    		    END;
+
+    		END;
+
+    	    END;
+
+
+	! Update CURRENT_PC and CURRENT_FP to the previous frame.  Set the
+	! FP to point to next frame stack.
+    	!
+	EXC_TYPE = TRAP_EXC;
+    	CURRENT_FP = .NEXT_FP;
+	CURRENT_PC = .NEXT_FP[SF$L_SAVE_PC];
+	NEXT_FP = .NEXT_FP[SF$L_SAVE_FP];
+	END;				! End of DECR loop through call stack
+
+
+    ! We have output as many traceback lines as the user requested.  Now return.
+    !
+    RETURN;
+
+    END;
+
+ROUTINE OUT_TRACEBACK(MOD_NAM, LAB_NAM, LINE_NUM, STMT_NUM,
+						REL_PC, ABS_PC): NOVALUE =
+!
+! FUNCTION
+!	This routine actually calls FAO and DEBUG's output routine to
+!	format and output a line of traceback information.
+!
+! INPUTS
+!	MOD_NAM	- Address of a Counted ASCII string containing the module name.
+!
+!	LAB_NAM	- Address of a Counted ASCII string containing the routine name.
+!
+!	LINE_NUM - Line number matching the PC.
+!
+!	STMT_NUM - Statement number within the LINE_NUM line.
+!
+!	REL_PC	- Relative PC value from beginning of the routine.
+!
+!	ABS_PC	- The absolute PC value from the call frame.
+!
+! OUTPUTS
+!	NONE
+!
+
+    BEGIN
+
+    MAP
+	MOD_NAM: CS_POINTER,		!
+	LAB_NAM: CS_POINTER;		!
+
+    BUILTIN
+	ACTUALCOUNT,			! The number of actual parameters
+	ACTUALPARAMETER;		! Selects the N-th actual parameter
+
+    LOCAL
+	STRING_PTR: CS_POINTER;		!
+	
+    BIND	
+	NULL_STRING = UPLIT BYTE (0);
+
+
+
+    ! Mark the module if the module is set.
+    !
+    IF ACTUALCOUNT() GTR 6
+    THEN
+	BEGIN
+	IF ACTUALPARAMETER(7)
+	THEN
+	    DBG$PRINT(UPLIT BYTE(%ASCIC '*'))
+
+	ELSE
+	    DBG$PRINT(UPLIT BYTE(%ASCIC ' '))
+
+	END
+
+    ELSE
+	DBG$PRINT(UPLIT BYTE(%ASCIC ' '));
+
+
+    ! Print the module name, if we have one.
+    !
+    STRING_PTR = .MOD_NAM;
+    IF .MOD_NAM EQL 0 THEN STRING_PTR = NULL_STRING;
+    DBG$PRINT(UPLIT(%ASCIC '!15AC '), .STRING_PTR);
+
+
+    ! Print the routine name, if we have one.
+    !
+    STRING_PTR = .LAB_NAM;
+    IF .LAB_NAM EQL 0 THEN STRING_PTR = NULL_STRING;
+    IF .STRING_PTR[0] GTRU 31
+    THEN
+	BEGIN
+	DBG$PRINT(UPLIT(%ASCIC '!63AC'), .STRING_PTR);
+	DBG$NEWLINE();
+	DBG$PRINT(UPLIT(%ASCIC '!49* '));
+	END
+
+    ELSE
+	DBG$PRINT(UPLIT(%ASCIC '!32AC'), .STRING_PTR);
+
+
+    ! Print the line number if one is available.
+    !
+    IF .LINE_NUM NEQ 0
+    THEN
+	DBG$PRINT(UPLIT(%ASCIC '!5UL'), .LINE_NUM)
+
+    ELSE
+	DBG$PRINT(UPLIT(%ASCIC '!5* '));
+
+
+    ! Print the statement number if applicable.
+    !
+    IF .STMT_NUM NEQ 0
+    THEN
+	DBG$PRINT(UPLIT(%ASCIC '.!4ZL'), .STMT_NUM)
+
+    ELSE
+	DBG$PRINT(UPLIT(%ASCIC '!5* '));
+
+
+    ! Print the absolute PC and then output the print line.  Then return.
+    !
+    DBG$PRINT(UPLIT(%ASCIC '!9XL!10XL'), .REL_PC, .ABS_PC);
+    DBG$NEWLINE();
+    RETURN;
+
+    END;
+
+ROUTINE FIND_MODRST(VALUE) =
+!
+! FUNCTION
+!	This routine goes through the Program Static Address Table and
+!	test to see if the VALUE is within the module address range
+!	described in Program SAT.  If VALUE is within the range then Module
+!	RST is returned.
+!
+! INPUTS
+!	VALUE	- The virtual address for which the corresponding module is
+!		  to be found.
+!
+! OUTPUTS
+!       Return value is Module RST pointer for the given symbol or 0
+!		  if no Module RST pointer can be found.
+! 
+
+    BEGIN
+
+    LOCAL
+    	SATPTR: REF SAT$ENTRY;		! Pointer to Program SAT entry
+
+
+    ! Search through the Program Static Address Table until an entry is found
+    ! (if any) which covers the specified address.  If one is found, return a
+    ! pointer to the corresponding Module RST Entry.
+    !
+    SATPTR = DBG$SEARCH_BIN_SAT (.SAT$START_ADDR, .VALUE, FALSE, TRUE);
+    IF .SATPTR NEQ 0
+    THEN
+    	RETURN .SATPTR[SAT$L_RSTPTR];
+
+    ! No module was found which contains the given virtual address.
+    ! Return zero to indicate this.
+    !
+    RETURN 0;
+    END;
+END ELUDOM

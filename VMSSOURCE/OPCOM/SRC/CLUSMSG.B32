@@ -1,0 +1,1022 @@
+MODULE	OPC$CLUSMSG	(
+			 LANGUAGE (BLISS32),
+			 IDENT = 'V04-000'
+			) =
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:
+!
+!	OPCOM
+!
+! ABSTRACT:
+!
+!	This module contains the specialized logic to service
+!	a particular type of request sent by a user to OPCOM.
+!
+! Environment:
+!
+!	VAX/VMS operating system.
+!
+! Author:
+!
+!	CW Hobbs
+!
+! Creation date:
+!
+!	16-JUL-1983
+!
+! Revision history:
+!
+!	V03-006	CWH3006		CW Hobbs			24-May-1984
+!		REPLY /USER etc. stopped working in a non-cluster system
+!		because a check in CWH3169 was being applied to clm__rpybrd_local
+!		messages.  Move the check inside the block which excludes
+!		local node replies.
+!
+!	V03-005	CWH3005		CW Hobbs			16-May-1984
+!		Fix RSH0112 so that the receiving node will also see that
+!		no unformatted text was sent.
+!
+!	V03-004	CWH3169		CW Hobbs			5-May-1984
+!		Second pass for cluster-wide OPCOM:
+!		 - Add CLM_L_CSID to clm message header, and make the embedded
+!		   RQCB distinct, rather than overlaying on top of the header.
+!		 - If an input message has a standard header, then redo the
+!		   header so that the local time is first, and put the remote
+!		   time at the end.
+!		 - When a message is received, make sure that the CSID matches
+!		   a node that we can see.  If not, discard the message.
+!
+!	V03-003	RSH0112		R. Scott Hanna		12-Mar-1984
+!		CLUSMSG_RQCB_SEND / Increase the local buffer size
+!		and prevent unformatted security auditing messages
+!		from being sent to other cluster members.
+!
+!	V03-002	CWH3002		CW Hobbs		16-Sep-1983
+!		Add CLUMBX message type, use VM jacket routines
+!
+!
+!--
+
+BEGIN						! Start of CLUSMSG
+
+LIBRARY	'SYS$LIBRARY:LIB.L32';
+LIBRARY 'LIB$:OPCOMLIB';
+
+FORWARD ROUTINE
+	CLUSMSG_ACK_PLEASE : NOVALUE,		! Request an acknowledgement
+	CLUSMSG_CLM_ACK_HANDLER : NOVALUE,	! Handle an acknowledgement
+	CLUSMSG_CLM_ACK_PLEASE_HANDLER : NOVALUE, ! Handle a request for an acknowledgement
+	CLUSMSG_CLM_NOTIFY_HANDLER : NOVALUE,	! Log message and notify operators
+	CLUSMSG_CONV_CLM_RQCB,			! Convert a CLMRQCB structure to an RQCB
+	CLUSMSG_HANDLER	: NOVALUE,		! Main level, check message and dispatch
+	CLUSMSG_RQCB_SEND,			! Convert RQCB to CLMRQCB and send to cluster
+	CLUSMSG_STATE_SEND;			! Send current state to cluster node(s)
+
+EXTERNAL ROUTINE
+	!
+	! Miscellaneous routines
+	!
+	ALLOCATE_DS,
+	CLUSCOMM_SEND,				! Send message to the cluster
+	CLUSUTIL_CONFIGURE,			! Configure the club membership
+	CLUSUTIL_FIND_NOD_BY_CSID,		! Find a NOD block by its CSID
+	CLUSUTIL_NODE_ACTIVATE,			! Make a node active
+	CLUSUTIL_NODE_MESSAGE,			! Tell operators of a node activity
+	DEALLOCATE_RQCB,			! Release an RQCB
+	DUMP_LOG_FILE,				! Write a string to the log file
+	IMPLICITLY_CANCELED,			! Look for implicitly canceled requests
+	IMPLIED_CANCEL,				! Cancel queue of requests to be canceled
+	IMPLIED_DISABLE,			! Disable stale operators
+	LOG_MESSAGE,				! Write a message to the logfile
+	NOTIFY_LISTED_OPERATORS,		! Send messages to operators
+	SHARE_FAO_BUFFER,			! Format an FAO string
+	WRITE_LOG_FILE,				! Write a string to the log file
+	!
+	! Handlers for cluster messages (CLMs)
+	!
+	CANCEL_CLM_HANDLER		: NOVALUE,	! Cancel request from remote
+	CLUSREPLY_RPYBRD_HANDLER 	: NOVALUE,	! Broadcast from remote REPLY command
+	CLUSREPLY_RPYBRD_LOCAL_HANDLER 	: NOVALUE,	! Broadcast from local REPLY command
+	CLUSREPLY_RPYNOT_HANDLER 	: NOVALUE,	! Notification from remote REPLY command
+	OPERUTIL_CLM_IMP_DISABLE 	: NOVALUE,	! Implicitly disable a remote operator
+	OPRENABLE_CLM_HANDLER		: NOVALUE,	! Enable/Disable remote operator
+	REPLY_CLM_HANDLER		: NOVALUE,	! Remote reply (/PEND, /TO) handler
+	REQUEST_CLM_HANDLER		: NOVALUE,	! Remote request handler
+	REQUEST_CLM_CHECK_HANDLER	: NOVALUE,	! Remote check request handler
+	SHUTDOWN_CLM_HANDLER		: NOVALUE;	! Shutdown ordered by remote handler
+
+EXTERNAL
+	LCL_NOD		: $ref_bblock,
+	LCL_CSID	: LONG,
+	NOD_HEAD	: VECTOR [2, LONG],
+	OCD_VECTOR	: VECTOR,		! OCD list heads
+	GLOBAL_STATUS	: BITVECTOR;
+
+EXTERNAL LITERAL
+	MCB_K_TYPE,
+	RQCB_K_TYPE,
+	MIN_SCOPE,				! Minimum scope value
+	MAX_SCOPE;				! Maximum scope value
+
+GLOBAL ROUTINE CLUSMSG_ACK_PLEASE (NOD : $ref_bblock) : NOVALUE =		%SBTTL 'clusmsg_ack_please'
+
+!++
+! Functional description:
+!
+!	Request an acknowledgement from a remote node.
+!
+! Input:
+!
+!	NOD - pointer to NOD structure of the remote node
+!
+! Implicit Input:
+!
+!	LCL_NOD - pointer to NOD structure for local node
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	Message sent to remote.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of CLUSMSG_ACK_PLEASE
+
+LOCAL
+    MSG : $bblock [CLMACK_K_SIZE],
+    STATUS;
+!
+! If we have an ack pending, just return to avoid flooding with ack messages.  To resend
+! an ack, you must clear this bit before calling this routine.
+!
+IF .NOD [NOD_V_ACK_PEND]
+THEN
+    RETURN;
+!
+! If we have already tried to talk to this guy, let them know
+!
+IF .NOD [NOD_V_ACK_ATTEMPTED]
+THEN
+    CLUSUTIL_NODE_MESSAGE (.NOD, OPC$_NODE_RETRY, FALSE);
+NOD [NOD_V_ACK_ATTEMPTED] = TRUE;
+!
+! Fill in the ack message header
+!
+MSG [CLM_B_RQSTCODE]	= OPC$_X_CLUSMSG;
+MSG [CLM_B_CLM_CODE]	= CLM__ACKNOWLEDGE_PLEASE;
+MSG [CLM_B_DS_VERSION]	= CLMACK_K_DS_VERSION;
+MSG [CLM_B_SW_VERSION]	= OPC$K_SW_VERSION;
+MSG [CLM_W_LENGTH]	= CLMACK_K_SIZE;
+MSG [CLM_W_FILL_1]	= 0;
+MSG [CLM_L_CSID]	= .LCL_CSID;
+!
+! Fill in the ack message from the local node info
+!
+MSG [CLMACK_L_CSID] = .LCL_NOD [NOD_L_NODE_CSID];
+MSG [CLMACK_L_SYSTEMIDL] = .LCL_NOD [NOD_L_NODE_SYSTEMIDL];
+MSG [CLMACK_W_SYSTEMIDH] = .LCL_NOD [NOD_W_NODE_SYSTEMIDH];
+!
+! Send the message
+!
+STATUS = CLUSCOMM_SEND (.NOD [NOD_L_NODE_CSID], CLMACK_K_SIZE, MSG);
+!
+! If we were able to send, mark it as pending
+!
+NOD [NOD_V_ACK_PEND] = .STATUS;
+
+RETURN;
+END;
+
+GLOBAL ROUTINE CLUSMSG_CLM_ACK_HANDLER (BUFFER_DESC : $ref_bblock, CLM : $ref_bblock, LEN) : NOVALUE =
+
+!++
+! Functional description:
+!
+!	Handle an acknowledgement from a remote node.
+!
+! Input:
+!
+!	BUFFER_DESC -	pointer to message from remote node, including $SNDOPR header
+!	CLM -		pointer to CLMACK structure
+!	LEN -		length of LEN
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	Message sent to remote.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of CLUSMSG_CLM_ACK_HANDLER
+
+LOCAL
+    NOD : $ref_bblock,
+    STATUS;
+!
+! Check the version number of the message.  If the message is from any other version,
+! simply ignore it.
+!
+IF .CLM [CLM_B_DS_VERSION] NEQ CLMACK_K_DS_VERSION
+THEN
+    RETURN DUMP_LOG_FILE (.BUFFER_DESC, %ASCID 'CLM__ACK mismatch');
+!
+! Find the NOD structure
+!
+NOD = CLUSUTIL_FIND_NOD_BY_CSID (.CLM [CLMACK_L_CSID]);
+IF .NOD EQL 0
+THEN
+    RETURN DUMP_LOG_FILE (.BUFFER_DESC, %ASCID 'no NOD for ACK');
+!
+! Mark the NOD as active
+!
+CLUSUTIL_NODE_ACTIVATE (.NOD);
+
+RETURN;
+END;
+
+GLOBAL ROUTINE CLUSMSG_CLM_ACK_PLEASE_HANDLER (BUFFER_DESC : $ref_bblock, CLM : $ref_bblock, LEN) : NOVALUE =
+
+!++
+! Functional description:
+!
+!	Request an acknowledgement from a remote node.
+!
+! Input:
+!
+!	BUFFER_DESC -	pointer to message from remote node, including $SNDOPR header
+!	CLM -		pointer to CLMRQCB structure
+!	LEN -		length of LEN
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	Message sent to remote.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of CLUSMSG_ACK_PLEASE_HANDLER
+
+LOCAL
+    MSG : $bblock [CLMACK_K_SIZE],
+    NOD : $ref_bblock,
+    STATUS;
+!
+! Check the version number of the message.  If the message is from any other version,
+! simply ignore it.
+!
+IF .CLM [CLM_B_DS_VERSION] NEQ CLMACK_K_DS_VERSION
+THEN
+    RETURN DUMP_LOG_FILE (.BUFFER_DESC, %ASCID 'CLM__ACK mismatch');
+!
+! Tell the requestor everthing we know
+!
+CLUSMSG_STATE_SEND (.CLM [CLMACK_L_CSID]);
+!
+! Fill in the ack message header
+!
+MSG [CLM_B_RQSTCODE]	= OPC$_X_CLUSMSG;
+MSG [CLM_B_CLM_CODE]	= CLM__ACKNOWLEDGEMENT;
+MSG [CLM_B_DS_VERSION]	= CLMACK_K_DS_VERSION;
+MSG [CLM_B_SW_VERSION]	= OPC$K_SW_VERSION;
+MSG [CLM_W_LENGTH]	= CLMACK_K_SIZE;
+MSG [CLM_W_FILL_1]	= 0;
+MSG [CLM_L_CSID]	= .LCL_CSID;
+!
+! Fill in the ack message from the local node info
+!
+MSG [CLMACK_L_CSID] = .LCL_NOD [NOD_L_NODE_CSID];
+MSG [CLMACK_L_SYSTEMIDL] = .LCL_NOD [NOD_L_NODE_SYSTEMIDL];
+MSG [CLMACK_W_SYSTEMIDH] = .LCL_NOD [NOD_W_NODE_SYSTEMIDH];
+!
+! Send the acknowledge message back to from where it came
+!
+CLUSCOMM_SEND (.CLM [CLMACK_L_CSID], CLMACK_K_SIZE, MSG);
+!
+! If we haven't talked to this guy before, then request an acknowledgement from him
+!
+IF (NOD = CLUSUTIL_FIND_NOD_BY_CSID (.CLM [CLMACK_L_CSID])) NEQ 0
+THEN
+    BEGIN
+    IF .NOD [NOD_B_STATE] EQL NOD_K_STATE_START
+    THEN
+	BEGIN
+	NOD [NOD_V_ACK_PEND] = FALSE;		! Clear so that we can
+	CLUSMSG_ACK_PLEASE (.NOD);		!  request an acknowledgement
+	END;
+    END;
+
+RETURN;
+END;
+
+GLOBAL ROUTINE CLUSMSG_CLM_NOTIFY_HANDLER (BUFFER_DESC : $ref_bblock, CLM : $ref_bblock, LEN) : NOVALUE =
+
+!++
+! Functional description:
+!
+!	This routine is the handler for all simple messages received from remote nodes.  Simple
+!	messages are those which merely need to be logged and sent to interested operators.
+!
+! Input:
+!
+!	BUFFER_DESC -	pointer to message from remote node, including $SNDOPR header
+!	CLM -		pointer to CLMRQCB structure
+!	LEN -		length of LEN
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	Some accounting data will be updated 
+!	to reflect the receipt of the message.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of CLUSMSG_CLM_NOTIFY_HANDLER
+
+LOCAL
+	RQCB		: $ref_bblock,		! RQCB data structure
+	OCD		: $ref_bblock,		! OCD data structure
+	OCD_COUNT	: LONG,			! Count of OCDs in OCD list
+	OCD_INDEX	: LONG,			! Index into OCD_VECTOR
+	OPER_COUNT	: LONG,			! Count of operators in operator list
+	STATUS		: LONG;
+
+!
+! Check the version number of the message.  If the message is from any other version,
+! simply ignore it.
+!
+IF .CLM [CLM_B_DS_VERSION] NEQ CLMRQCB_K_DS_VERSION
+THEN
+    RETURN DUMP_LOG_FILE (.BUFFER_DESC, %ASCID 'clm notify mismatch');
+!
+! Allocate an RQCB and convert the message RQCB into the new RQCB
+!
+IF NOT CLUSMSG_CONV_CLM_RQCB (.CLM, RQCB)
+THEN
+    RETURN DUMP_LOG_FILE (.BUFFER_DESC, ascid_INVALIDRQCB);
+!
+! Log it, and send it to all interested operators.
+! Every operator in the data base is a candidate for the message.
+!
+OCD_INDEX = MAX_SCOPE;
+WHILE (.OCD_INDEX GEQ MIN_SCOPE) DO
+    BEGIN
+    !
+    ! Scan the OCD list for each class of operator.
+    !
+    OCD_COUNT = .OCD_VECTOR [(.OCD_INDEX - 1) * 2 + 1];
+    OCD = .OCD_VECTOR [(.OCD_INDEX - 1) * 2];
+    WHILE (.OCD_COUNT GTR 0) DO
+	BEGIN
+	!
+	! Notify every operator in the OCD's operator list.
+	! Also log the message for each OCD.
+	!
+	RQCB [RQCB_L_OCD] = .OCD;		! Set OCD address
+	LOG_MESSAGE (.RQCB);			! Log the message
+	NOTIFY_LISTED_OPERATORS (.RQCB);	! Inform the operators
+	OCD_COUNT = .OCD_COUNT - 1;		! Decrement operator count
+	OCD = .OCD [OCD_L_FLINK];		! Get next OCD address
+	END;
+    OCD_INDEX = .OCD_INDEX - 1;
+    END;
+!
+! Free the rqcb
+!
+DEALLOCATE_RQCB (.RQCB);
+RETURN; 	
+
+END;						! End of CLUSMSG_CLM_NOTIFY_HANDLER
+
+GLOBAL ROUTINE CLUSMSG_CONV_CLM_RQCB (CLM : $ref_bblock, RET_RQCB) =	%SBTTL 'CLUSMSG_CONV_CLM_RQCB (CLM, RET_RQCB)'
+
+!++
+! Functional description:
+!
+!	Convert a CLMRQCB to a local RQCB
+!
+! Input:
+!
+!	CLM	 - Pointer to CLMRQCB structure
+!	RET_RQCB - Address of longword to receive address of allocated RQCB
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	Data structure will be allocated
+!
+! Routine value:
+!
+!	Success or failure
+!--
+
+BEGIN						! Start of CLUSMSG_CONV_CLM_RQCB
+
+LOCAL
+	LEN		: LONG,
+	EOB		: LONG,
+	PTR		: $ref_bblock,
+	RQCB		: $ref_bblock,
+	RQCBUF		: $ref_bblock,
+	STATUS		: LONG;
+
+!
+! Set the return RQCB to null
+!
+.RET_RQCB = 0;
+!
+! Make sure that it is an RQCB in the message
+!
+RQCBUF = CLM [CLMRQCB_T_RQCB_OVERLAY];
+IF .RQCBUF [RQCB_W_SIZE] NEQ RQCB_K_SIZE
+  OR
+   .RQCBUF [RQCB_B_TYPE] NEQ RQCB_K_TYPE
+THEN
+    RETURN FALSE;
+!
+! Next thing, allocate an RQCB and copy the most of the CLM RQCB to the new RQCB,
+! taking care not to overwrite the RQCB header data
+!
+ALLOCATE_DS (RQCB_K_TYPE, RQCB);
+CH$MOVE (RQCB_K_OVERLAY_SIZE, RQCBUF [RQCB_T_OVERLAY], RQCB [RQCB_T_OVERLAY]);
+!
+! Take all of the character strings appended to the CLMRQCB and hang them from the RQCB
+!
+PTR = CLM [CLMRQCB_T_TEXT];			! Pointer to next data in text area
+EOB = .CLM + .CLM [CLM_W_LENGTH];		! Pointer to last byte +1 of text area
+!
+! If the original had an MCB, make a new MCB
+!
+IF (LEN = .RQCBUF [RQCB_L_MCB]) NEQ 0
+THEN
+    BEGIN
+    LOCAL
+	FAO_DESC : VECTOR [2, LONG],
+	FAO_BUFF : VECTOR [OPC$K_MAXMESSAGE, BYTE],
+	MCB : $ref_bblock,
+	NOD : $ref_bblock,
+	NEXT;
+    IF (NEXT = .LEN + .PTR) GTRU .EOB
+    THEN
+	BEGIN
+	DEALLOCATE_RQCB (.RQCB);
+	RETURN FALSE;
+	END;
+    ALLOCATE_DS (MCB_K_TYPE, MCB);
+    RQCB [RQCB_L_MCB] = .MCB;
+    MCB [MCB_L_RQCB] = .RQCB;
+    MCB [MCB_L_MSGID] = .CLM [CLMRQCB_L_MCB_MSGID];	! Restore message id
+    MCB [MCB_L_STATUS] = .CLM [CLMRQCB_L_MCB_STATUS];	!  and status
+    !
+    ! If the message is a standard header message, then readjust it so that we store the local
+    ! time at the front and record the remote time later in the message.
+    ! We check to make sure it hasn't been adjusted already, as can happen if the request was
+    ! being passed around.
+    !
+    IF CH$EQL (20, UPLIT BYTE ('%%%%%%%%%%%  OPCOM  '), 20, .PTR+1)
+    THEN
+	BEGIN
+	LOCAL
+	    PAR, CR;
+	PAR = CH$FIND_CH (.LEN, .PTR, %C'(');		! Find first open paren
+	CR  = CH$FIND_CH (.LEN, .PTR, 13);		! Find first carriage return (gotta have one!)		
+	IF .PAR EQL 0					! If no paren
+	  OR	
+	   .PAR GTR .CR					!  or if paren after first <CR>
+	THEN
+	    BEGIN
+	    FAO_DESC [0] = OPC$K_MAXMESSAGE;
+	    FAO_DESC [1] = FAO_BUFF;
+	    NOD = CLUSUTIL_FIND_NOD_BY_CSID (.RQCB [RQCB_L_CSID]);
+	    IF .NOD EQL 0
+	    THEN
+		BEGIN
+		WRITE_LOG_FILE (SHARE_FAO_BUFFER (%ASCID 'Unable to find NOD for CSID !XL', .RQCB [RQCB_L_CSID]));
+		DEALLOCATE_RQCB (.RQCB);
+		RETURN FALSE;
+		END;
+	    $FAO (%ASCID '!AD!%D!AD    (from node !6AS at !AD)!AD', FAO_DESC, FAO_DESC,
+				    21, .PTR, 0, 13, .PTR+44, NOD [NOD_Q_NAME_DESC], 23, .PTR+21, .LEN-57, .PTR+57);
+	    LEN = .FAO_DESC [0];
+	    PTR = FAO_BUFF;
+	    END;
+	END;
+    MCB [MCB_L_TEXTLEN] = .LEN;
+    IF NOT (STATUS = OPC$GET_VM (MCB [MCB_L_TEXTLEN], MCB [MCB_L_TEXTPTR]))
+    THEN
+	$signal_stop (.STATUS);
+    CH$MOVE (.LEN, .PTR, .MCB [MCB_L_TEXTPTR]);		! Copy the message
+    PTR = .NEXT;					! Update the output pointer
+    END;
+!
+! If the original had an operator name, make a new operator name
+!
+IF (LEN = .RQCBUF [RQCB_L_OPER_LEN]) NEQ 0
+THEN
+    BEGIN
+    LOCAL
+	NEXT;
+    IF (NEXT = .LEN + .PTR) GTRU .EOB
+    THEN
+	BEGIN
+	DEALLOCATE_RQCB (.RQCB);
+	RETURN FALSE;
+	END;
+    IF NOT (STATUS = OPC$GET_VM (RQCB [RQCB_L_OPER_LEN], RQCB [RQCB_L_OPER_PTR]))
+    THEN
+	$signal_stop (.STATUS);
+    CH$MOVE (.LEN, .PTR, .RQCB [RQCB_L_OPER_PTR]);	! Copy the message
+    PTR = .NEXT;					! Update the output pointer
+    END;
+!
+! If the original had text field, make a new one
+!
+IF (LEN = .RQCBUF [RQCB_L_TEXT_LEN]) NEQ 0
+THEN
+    BEGIN
+    LOCAL
+	NEXT;
+    IF (NEXT = .LEN + .PTR) GTRU .EOB
+    THEN
+	BEGIN
+	DEALLOCATE_RQCB (.RQCB);
+	RETURN FALSE;
+	END;
+    IF NOT (STATUS = OPC$GET_VM (RQCB [RQCB_L_TEXT_LEN], RQCB [RQCB_L_TEXT_PTR]))
+    THEN
+	$signal_stop (.STATUS);
+    CH$MOVE (.LEN, .PTR, .RQCB [RQCB_L_TEXT_PTR]);	! Copy the message
+    PTR = .NEXT;					! Update the output pointer
+    END;
+!
+! Set the return RQCB to the one we allocated
+!
+.RET_RQCB = .RQCB;
+!
+RETURN TRUE;
+END;						! End of CLUSMSG_CONV_CLM_RQCB
+
+GLOBAL ROUTINE CLUSMSG_HANDLER (buffer_desc : $ref_bblock) : NOVALUE =
+
+!++
+! Functional description:
+!
+!	This routine processes all messages alleged to have come from remote nodes (plus local broadcasts).
+!
+! Input:
+!
+!	BUFFER_DESC : The address of a quadword buffer descriptor that
+!		      describes the buffer containing the message.
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of CLUSMSG_HANDLER
+
+LOCAL
+	len,					! Length of message without the $SNDOPR header
+	msg		: $ref_bblock,		! Pointer to reply command message
+	status;
+!
+! Get a pointer to the regular part of the message, and compute the length.
+!
+msg = .buffer_desc [dsc$a_pointer] + opc$k_comhdrsiz;	! Init the message pointer
+len = .buffer_desc [dsc$w_length] - opc$k_comhdrsiz;	! Init the message pointer
+!
+! Check the version number of the message.  If the message is from any other version,
+! simply ignore it.
+!
+IF .msg [clm_b_sw_version] NEQ opc$k_sw_version
+THEN
+    RETURN DUMP_LOG_FILE (.BUFFER_DESC, %ASCID 'clm software mismatch');
+!
+! Check the actual length of the message vs. the length stored in the
+! message.  If any difference, ignore the message
+!
+IF .msg [clm_w_length] NEQ .len
+THEN
+    RETURN DUMP_LOG_FILE (.BUFFER_DESC, %ASCID 'clm length mismatch');
+!
+! Perform some privilege and sanity checks on CLM messages
+!
+IF .msg [clm_b_clm_code] NEQ clm__rpybrd_local	! Local replies are checked in CLUSREPLY module
+THEN
+    BEGIN
+    BIND
+	hdr = .buffer_desc [dsc$a_pointer] : $bblock;	! Start of $sndopr header
+    !
+    ! If not in a cluster, nothing to do but shout
+    !
+    IF NOT .GLOBAL_STATUS [GBLSTS_K_IN_VAXcluster]
+    THEN
+        RETURN DUMP_LOG_FILE (.BUFFER_DESC, %ASCID 'clm message in non-cluster');
+    !
+    ! Try to make sure that this is coming from the CLUSTER_SERVER process.  Since process name is
+    ! not (yet) part of the $SNDOPR header, we will check that the sender has both the UIC [1,4] and
+    ! has all privileges enabled.  This isn't completely solid, but someone with SETPRV would probably
+    ! be able to circumvent any check we could make.
+    !
+    IF	.hdr [4,0,32,0] NEQ -1			! First longword of priv mask in $sndopr header
+      OR
+    	.hdr [8,0,32,0] NEQ -1			! Second longword of privs
+      OR
+	.hdr [12,0,32,0] NEQ %X'00010004'	! UIC of [1,4]
+    THEN
+        RETURN DUMP_LOG_FILE (.BUFFER_DESC, %ASCID 'clm privilege violation');
+    !
+    ! Find the sending node in the database.  If we don't see it, then reconfigure.  If we
+    ! still do not see it after a reconfigure, then discard the message.  It is most likely
+    ! from a node which has crashed and rebooted.
+    !
+    IF CLUSUTIL_FIND_NOD_BY_CSID (.msg [clm_l_csid]) EQL 0
+    THEN
+	BEGIN
+	CLUSUTIL_CONFIGURE ();					! Might find the node
+	IF CLUSUTIL_FIND_NOD_BY_CSID (.msg [clm_l_csid]) EQL 0
+	THEN
+	    RETURN;
+	END;
+    END;
+!
+! Dispatch the request to the proper handler.
+!
+CASE .msg [clm_b_clm_code]
+    FROM  0  TO  clm__request_end_mark-1  OF
+    SET
+    !
+    [clm__acknowledgement] :	CLUSMSG_CLM_ACK_HANDLER		(.buffer_desc, .msg, .len);
+    [clm__acknowledge_please] :	CLUSMSG_CLM_ACK_PLEASE_HANDLER	(.buffer_desc, .msg, .len);
+    [clm__cancel] :		CANCEL_CLM_HANDLER		(.buffer_desc, .msg, .len);
+    [clm__check_operator] :	OPRENABLE_CLM_HANDLER		(.buffer_desc, .msg, .len);
+    [clm__check_request] :	REQUEST_CLM_CHECK_HANDLER	(.buffer_desc, .msg, .len);
+    [clm__clumbx] :		CLUSMSG_CLM_NOTIFY_HANDLER	(.buffer_desc, .msg, .len);
+    [clm__cluster] :		CLUSMSG_CLM_NOTIFY_HANDLER	(.buffer_desc, .msg, .len);
+    [clm__device] :		CLUSMSG_CLM_NOTIFY_HANDLER	(.buffer_desc, .msg, .len);
+    [clm__imp_disable] :	OPERUTIL_CLM_IMP_DISABLE	(.buffer_desc, .msg, .len);
+    [clm__oprenable] :		OPRENABLE_CLM_HANDLER		(.buffer_desc, .msg, .len);
+    [clm__reply] :		REPLY_CLM_HANDLER		(.buffer_desc, .msg, .len);
+    [clm__reply_complete] :	CANCEL_CLM_HANDLER		(.buffer_desc, .msg, .len);
+    [clm__request] :		REQUEST_CLM_HANDLER		(.buffer_desc, .msg, .len);
+    [clm__rpybrd] :		CLUSREPLY_RPYBRD_HANDLER	(.buffer_desc, .msg, .len);
+    [clm__rpybrd_local] :	CLUSREPLY_RPYBRD_LOCAL_HANDLER	(.buffer_desc, .msg, .len);
+    [clm__rpynot] :		CLUSREPLY_RPYNOT_HANDLER	(.buffer_desc, .msg, .len);
+    [clm__security] :		CLUSMSG_CLM_NOTIFY_HANDLER	(.buffer_desc, .msg, .len);
+    [clm__shutdown] :		SHUTDOWN_CLM_HANDLER		(.buffer_desc, .msg, .len);
+    !
+    ! Let the unknown message handler figure out what to do with it.
+    !
+    [INRANGE,OUTRANGE] :    	DUMP_LOG_FILE (.BUFFER_DESC, %ASCID 'unknown CLM_CODE in message');
+    TES;
+
+RETURN;
+END;						! End of CLUSMSG_HANDLER
+
+GLOBAL ROUTINE CLUSMSG_RQCB_SEND (CSID, CLM_CODE, RQCB : $ref_bblock) =	%SBTTL 'CLUSMSG_RQCB_SEND (CSID, CLM_CODE, RQCB)'
+
+!++
+! Functional description:
+!
+!	Put an RQCB into a self-relative format, and send it to remote node(s)
+!
+! Input:
+!
+!	CSID	 - Id of target node, -1 for broadcast to all nodes except local
+!	CLM_CODE - Secondary operation code
+!	RQCB	- Address of block
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	Messages will be sent to remote nodes.
+!
+! Routine value:
+!
+!	Status from comm primitive.
+!--
+
+BEGIN						! Start of CLUSCOMM_SEND
+
+LOCAL
+	BUFFER		: BLOCK [OPC$K_MAXMESSAGE+RQCB_K_SIZE+256, BYTE],
+	LEN		: LONG,
+	RQCBUF		: $ref_bblock,
+	PTR		: $ref_bblock,
+	FINAL_STAT	: LONG,
+	STATUS		: LONG;
+
+!
+! If not in a cluster we are done, return with success
+!
+IF NOT .GLOBAL_STATUS [GBLSTS_K_IN_VAXcluster]
+THEN
+    RETURN SS$_NORMAL;
+!
+! First thing, make sure that it is an RQCB
+!
+IF .RQCB [RQCB_W_SIZE] NEQ RQCB_K_SIZE
+  OR
+   .RQCB [RQCB_B_TYPE] NEQ RQCB_K_TYPE
+THEN
+    $signal_stop (OPC$_NOTRQCB);
+!
+! Next thing, copy the entire RQCB to the buffer
+!
+RQCBUF = BUFFER [CLMRQCB_T_RQCB_OVERLAY];
+CH$MOVE (RQCB_K_SIZE, .RQCB, .RQCBUF);
+!
+! Take all of the character strings hanging off the RQCB and append them to
+! the end of the buffer.
+!
+PTR = BUFFER [CLMRQCB_T_TEXT];
+IF .RQCBUF [RQCB_L_MCB] NEQ 0
+THEN
+    BEGIN
+    LOCAL
+	MCB : $ref_bblock;
+    MCB = .RQCBUF [RQCB_L_MCB];
+    BUFFER [CLMRQCB_L_MCB_MSGID] = .MCB [MCB_L_MSGID];	! Copy message id
+    BUFFER [CLMRQCB_L_MCB_STATUS] = .MCB [MCB_L_STATUS];!  and status
+    LEN = .MCB [MCB_L_TEXTLEN];
+    CH$MOVE (.LEN, .MCB [MCB_L_TEXTPTR], .PTR);		! Copy the message
+    PTR = .PTR + .LEN;					! Update the output pointer
+    RQCBUF [RQCB_L_MCB] = .LEN;				! Replace MCB address with text length
+    END;
+IF (LEN = .RQCBUF [RQCB_L_OPER_LEN]) NEQ 0
+THEN
+    BEGIN
+    CH$MOVE (.LEN, .RQCBUF [RQCB_L_OPER_PTR], .PTR);	! Copy the message
+    PTR = .PTR + .LEN;					! Update the output pointer
+    END;
+IF (LEN = .RQCBUF [RQCB_L_TEXT_LEN]) NEQ 0
+THEN
+    BEGIN
+    IF ((.RQCBUF [RQCB_W_MSGTYPE] EQLU MSG$_OPRQST) AND
+        (.RQCBUF [RQCB_B_RQSTCODE] EQLU OPC$_RQ_SECURITY))
+    THEN
+	RQCBUF [RQCB_L_TEXT_LEN] = 0				! Don't send raw messages for security alarms
+    ELSE
+	BEGIN
+	CH$MOVE (.LEN, .RQCBUF [RQCB_L_TEXT_PTR], .PTR);	! Copy the message
+	PTR = .PTR + .LEN;					! Update the output pointer
+	END;
+    END;
+!
+! Zero any remaining address fields, to prevent embarrasing mixups on the remote node.
+!
+RQCBUF [RQCB_L_OCD] = 0;
+RQCBUF [RQCB_L_OPER_PTR] = 0;
+RQCBUF [RQCB_L_TEXT_PTR] = 0;
+RQCBUF [RQCB_L_DSBLFLINK] = 0;
+RQCBUF [RQCB_L_DSBLBLINK] = 0;
+!
+! Put the cluster message header on top of the queue header of the RQCB
+!
+LEN = .PTR - BUFFER;				! Compute final length
+BUFFER [CLM_B_RQSTCODE] = OPC$_X_CLUSMSG;
+BUFFER [CLM_B_CLM_CODE] = .CLM_CODE;		! Use the input argument
+BUFFER [CLM_B_DS_VERSION] = CLMRQCB_K_DS_VERSION;
+BUFFER [CLM_B_SW_VERSION] = OPC$K_SW_VERSION;
+BUFFER [CLM_W_LENGTH]	= .LEN;
+BUFFER [CLM_W_FILL_1]	= 0;
+BUFFER [CLM_L_CSID]	= .LCL_CSID;
+!
+! Send it off to the designated target(s)
+!
+RETURN CLUSCOMM_SEND (.CSID, .LEN, BUFFER);
+END;						! End of CLUSMSG_RQCB_SEND
+
+GLOBAL ROUTINE CLUSMSG_STATE_SEND (CSID) =
+
+!++
+! Functional description:
+!
+!	CLUSMSG_STATE_SEND sends the state of the current OPCOM process to a remote process.
+!	The state consists of the active operators and active requests.
+!
+! Input:
+!
+!	None.
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of CLUSMSG_STATE_SEND
+
+LOCAL
+	RQCB		: $ref_bblock,		! RQCB data structure
+	OCD		: $ref_bblock,		! OCD data structure
+	NEXT_OCD	: $ref_bblock,		! ditto
+	OCD_COUNT	: LONG,			! Count of OCDs in list
+	EXIT_STATUS	: LONG,
+	STATUS		: LONG;
+
+!
+! Loop through all requests, and send each of them off
+!
+EXIT_STATUS = TRUE;
+INCR I FROM MIN_SCOPE TO MAX_SCOPE DO
+    BEGIN
+    !
+    ! For each each class of operator (SYSTEM, GROUP, USER) ...
+    !
+    NEXT_OCD = .OCD_VECTOR [(.I-1)*2];		! Get first OCD in list
+    INCR J FROM 1 TO .OCD_VECTOR [(.I-1)*2+1] DO
+	BEGIN
+	!
+	! For each OCD in the operator class list...
+	!
+	OCD = .NEXT_OCD;			    ! Get current OCD address
+	NEXT_OCD = .OCD [OCD_L_FLINK];		    ! Get next OCD address
+	RQCB = .OCD [OCD_L_RQSTFLINK];		    ! Get first request address
+	WHILE .RQCB NEQ OCD [OCD_L_RQSTFLINK] DO
+	    BEGIN
+	    !
+	    ! For each request in the OCD list...
+	    !
+	    IF NOT IMPLICITLY_CANCELED (.RQCB)
+	    THEN
+		!
+		! The request is still good, send it off to the target(s)
+		!
+		IF NOT (STATUS = CLUSMSG_RQCB_SEND (.CSID, CLM__CHECK_REQUEST, .RQCB))
+		THEN
+		    EXIT_STATUS = .STATUS;
+	    RQCB = .RQCB [RQCB_L_FLINK];		! Get next request address
+	    END;
+	END;
+    END;
+!
+! After sweeping through the data base, we may have discovered some implicitly canceled requests and
+! implicitly disabled operators.  Process them now.  The requests should be done first, as yet more
+! implicitly disabled operators may turn up.
+!
+IMPLIED_CANCEL ();
+IMPLIED_DISABLE ();
+!
+! Send the list of operators off to the world.
+!
+INCR I FROM MIN_SCOPE TO MAX_SCOPE DO
+    BEGIN
+    !
+    ! For each each class of operator (SYSTEM, GROUP, USER) ...
+    !
+    NEXT_OCD = .OCD_VECTOR [(.I-1)*2];		! Get first OCD in list
+    INCR J FROM 1 TO .OCD_VECTOR [(.I-1)*2+1] DO
+	BEGIN
+	!
+	! For each OCD in the operator class list...
+	!
+	OCD = .NEXT_OCD;			! Get current OCD address
+	NEXT_OCD = .OCD [OCD_L_FLINK];		! Get next OCD address
+	RQCB = .OCD [OCD_L_OPERFLINK];		! Get first operator address
+	WHILE .RQCB NEQ OCD [OCD_L_OPERFLINK] DO
+	    BEGIN
+	    !
+	    ! Tell the world about this operator
+	    !
+	    IF NOT (STATUS = CLUSMSG_RQCB_SEND (.CSID, CLM__CHECK_OPERATOR, .RQCB))
+	    THEN
+		EXIT_STATUS = .STATUS;
+	    RQCB = .RQCB [RQCB_L_FLINK];	! Get next operator address
+	    END;
+	END;
+    END;
+
+RETURN .EXIT_STATUS;
+END;						! End of CLUSMSG_STATE_SEND
+
+END						! End of module
+ELUDOM

@@ -1,0 +1,1855 @@
+	.TITLE	VAX$EDITPC - VAX-11 EDITPC Instruction Emulation
+	.IDENT	/V04-000/
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; Facility: 
+;
+;	VAX-11 Instruction Emulator
+;
+; Abstract:
+;
+;	The routines in this module emulate the VAX-11 EDITPC instruction.
+;	These routines can be a part of an emulator package or can be
+;	called directly after the input parameters have been loaded into
+;	the architectural registers.
+;
+;	The input parameters to these routines are the registers that
+;	contain the intermediate instruction state. 
+;
+; Environment: 
+;
+;	These routines run at any access mode, at any IPL, and are AST 
+;	reentrant.
+;
+; Author: 
+;
+;	Lawrence J. Kenah	
+;
+; Creation Date
+;
+;	20 September 1982
+;
+; Modified by:
+;
+;	V01-008	LJK0035		Lawrence J. Kenah	16-Jul-1984
+;		Fix bugs in restart logic.
+;
+;		R6 cannot be used as both the exception dispatch register and
+;		  a scratch register in the main EDITPC routine. Use R7 as the
+;		  scratch register. 
+;		Add code to the EDITPC_1 restart routine to restore R7 as the
+;		  address of the sign byte. 
+;		Clear C-bit in saved PSW in END_FLOAT_1 routine.
+;		Restore R9 (count of zeros) with CVTWL instruction.
+;		Fix calculation of initial srcaddr parameter.
+;		Preserve R8 in READ_1 and READ_2 routines.
+;		Preserve R7 in FLOAT_2 routine.
+;
+;	V01-007	LJK0032		Lawrence J. Kenah	5-Jul-1984
+;		Fix restart routine to take into account the fact that restart
+;		codes are based at one when computing restart PC. Load STATE
+;		cell with nonzero restart code in ROPRAND_FAULT routine.
+;
+;	V01-006	LJK0026		Lawrence J. Kenah	19-Mar-1984
+;		Final cleanup, especially in access violation handling. Make
+;		all of the comments in exception handling accurately describe
+;		what the code is really doing.
+;
+;	V01-005	LJK0018		Lawrence J. Kenah	23-Jan-1984
+;		Add restart logic for illegal pattern operator. Add access
+;		violation handling.
+;
+;	V01-004	LJK0014		Lawrence J. Kenah	21-Nov-1983
+;		Clean up rest of exception handling. Remove reference
+;		to LIB$SIGNAL.
+;
+;	V01-003	LJK0012		Lawrence J. Kenah	8-Nov-1983
+;		Start out with R9 containing zero so that pattern streams
+;		that do not contain EO$ADJUST_INPUT will work correctly.
+;
+;	V01-002	LJK0009		Lawrence J. Kenah	20-Oct-1983
+;		Add exception handling. Fix bug in size of count field.
+;
+;	V01-001	Original	Lawrence J. Kenah	20-Sep-1982
+;--
+
+	.SUBTITLE	Declarations
+
+; Include files
+
+	.NOCROSS			; No cross reference for these
+	.ENABLE		SUPPRESSION	; No symbol table entries either
+
+	EDITPC_DEF			; Define intermediaie instruction state
+
+	PACK_DEF			; Stack offsets for exceptions
+
+	$PSLDEF				; Define bit fields in PSL
+
+	.DISABLE	SUPPRESSION	; Turn on symbol table again
+	.CROSS				; Cross reference is OK now
+
+; Equated symbols
+
+	BLANK = ^A" "
+	MINUS = ^A"-"
+	ZERO  = ^A"0"
+
+; Local macro definitions
+
+	.MACRO	EO_READ
+	RESTART_POINT
+	BSBW	EO_READ
+	.ENDM	EO_READ
+
+; External declarations
+
+	.DISABLE	GLOBAL
+
+	.EXTERNAL -
+			VAX$REFLECT_FAULT,-
+			VAX$ROPRAND,-
+			VAX$EDITPC_OVERFLOW
+; PSECT Declarations:
+
+	.DEFAULT	DISPLACEMENT , WORD
+
+	.PSECT _VAX$CODE PIC, USR, CON, REL, LCL, SHR, EXE, RD, NOWRT, LONG
+
+	BEGIN_MARK_POINT	RESTART
+
+	.SUBTITLE	VAX$EDITPC - Edit Packed to Character String
+;+
+; Functional Description:
+;
+;	The destination  string  specified  by  the  pattern  and  destination
+;	address  operands  is  replaced  by  the editted version of the source
+;	string specified by the source length  and  source  address  operands.
+;	The  editing  is performed according to the pattern string starting at
+;	the address pattern and extending until a pattern end (EO$END) pattern
+;	operator  is  encountered.   The  pattern  string consists of one byte
+;	pattern operators.  Some pattern operators  take  no  operands.   Some
+;	take  a repeat count which is contained in the rightmost nibble of the
+;	pattern operator itself.  The rest  take  a  one  byte  operand  which
+;	follows  the  pattern operator immediately.  This operand is either an
+;	unsigned integer length or a byte character.  The  individual  pattern
+;	operators are described on the following pages.
+;
+; Input Parameters:
+;
+;	R0 - srclen.rw		Length of input packed decimal string
+;	R1 - srcaddr.ab		Address of input packed decimal string
+;	R3 - pattern.ab		Address of table of editing pattern operators
+;	R5 - dstaddr.ab		Address of output character string
+;
+; Intermediate State:
+;
+;     31               23               15               07            00
+;    +----------------+----------------+----------------+----------------+
+;    |           zero count            |             srclen              | : R0
+;    +----------------+----------------+----------------+----------------+
+;    |                              srcaddr                              | : R1
+;    +----------------+----------------+----------------+----------------+
+;    |  delta-srcaddr |    delta-PC    |      sign      |      fill      | : R2
+;    +----------------+----------------+----------------+----------------+
+;    |                              pattern                              | : R3
+;    +----------------+----------------+----------------+----------------+
+;    !   loop-count   |     state      |    saved-PSW   |   inisrclen    | : R4
+;    +----------------+----------------+----------------+----------------+
+;    |                              dstaddr                              | : R5
+;    +----------------+----------------+----------------+----------------+
+;
+; Output Parameters:
+;
+;	R0 - Length of input decimal string
+;	R1 - Address of most significant byte of input decimal string
+;	R2 - 0
+;	R3 - Address of byte containing EO$END pattern operator
+;	R4 - 0
+;	R5 - Address of one byte beyond destination character string
+;
+; Condition Codes:
+;
+;	N <- source string LSS 0	(src = -0 => N = 0)
+;	Z <- source string EQL 0
+;	V <- decimal overflow		(nonzero digits lost)
+;	C <- significance
+;-
+
+	.ENABLE	LOCAL_BLOCK
+
+	ASSUME EDITPC_B_STATE EQ 18	; Make sure we test the right FPD bit
+
+2$:	BRW	VAX$EDITPC_RESTART	; Restart somewhere else
+
+5$:	BRW	EDITPC_ROPRAND_ABORT	; Time to quit if illegal length
+
+VAX$EDITPC::
+	BBS	#<EDITPC_V_FPD+16>,R4,2$	; Branch if this is a restart
+	PUSHR	#^M<R0,R1,R6,R7,R8,R9,R10,R11>	; Save lots of registers
+	CMPW	R0,#31			; Check for R0 GTRU 31
+	BGTRU	5$			; Signal ROPRAND if R0 GTRU 31
+	MOVZWL	R0,R0			; Clear any junk from high-order word
+	MOVZBL	#BLANK,R2		; Set fill to BLANK, stored in R2
+	CLRL	R9			; Start with "zero count" of zero
+	ESTABLISH_HANDLER	EDITPC_ACCVIO
+	MOVPSL	R11			; Get current PSL
+	BICB	#<PSL$M_N!PSL$M_V!PSL$M_C>,R11	; Clear N-, V-, and C-bits
+	BISB	#PSL$M_Z,R11		; Set Z-bit. 
+
+; We need to determine the sign in the input decimal string to choose
+; the initial setting of the N-bit in the saved PSW.
+
+	EXTZV	#1,#4,R0,R7		; Get byte offset to end of string
+	ADDL	R1,R7			; Get address of byte containing sign
+	MARK_POINT	EDITPC_1 , RESTART
+	EXTZV	#0,#4,(R7),R7		; Get sign "digit" into R7
+
+	CASE	R7,LIMIT=#10,TYPE=B,<-	; Dispatch on sign 
+		20$,-			; 10 => +
+		10$,-			; 11 => -
+		20$,-			; 12 => +
+		10$,-			; 13 => -
+		20$,-			; 14 => +
+		20$,-			; 15 => +
+		>
+
+; Sign is MINUS
+
+10$:	BISB	#PSL$M_N,R11		; Set N-bit in saved PSW
+	MOVZBL	#MINUS,R4		; Set sign to MINUS, stored in R4
+	BRB	TOP_OF_LOOP		; Join common code
+
+; Sign is PLUS (but initial content of sign register is BLANK)
+
+20$:	MOVZBL	#BLANK,R4		; Set sign to BLANK, stored in R4
+
+; The architectural description of the EDITPC instruction uses an exit flag
+; to determine whether to continue reading edit operators from the input
+; stream. This implementation does not use an explicit exit flag. Rather, all
+; of the end processing is contained in the routine that handles the EO$END
+; operator.
+
+; The next several instructions are the main routine in this module. Each
+; pattern is used to dispatch to a pattern-specific routine that performs
+; its designated action. These routines (except for EO$END) return control
+; to TOP_OF_LOOP to allow the next pattern operator to be processed.
+
+TOP_OF_LOOP:
+	PUSHAB	B^TOP_OF_LOOP			; Store "return PC"
+
+; The following instructions pick up the next byte in the pattern stream and
+; dispatch to a pattern specific subroutine that performs the designated
+; action. Control is passed back to the main EDITPC loop by the RSB
+; instructions located in each pattern-specific subroutine. 
+
+; Note that the seemingly infinite loop actually terminates when the EO$END
+; pattern operator is detected. That routine insures that we do not return
+; to this loop but rather to the caller of VAX$EDITPC.
+
+	MARK_POINT	EDITPC_2 , RESTART
+	CASE	(R3)+,LIMIT=#0,TYPE=B,<-
+		EO$END_ROUTINE,-		; 00 - EO$END
+		EO$END_FLOAT_ROUTINE,-		; 01 - EO$END_FLOAT
+		EO$CLEAR_SIGNIF_ROUTINE,-	; 02 - EO$CLEAR_SIGNIF
+		EO$SET_SIGNIF_ROUTINE,-		; 03 - EO$SET_SIGNIF
+		EO$STORE_SIGN_ROUTINE,-		; 04 - EO$STORE_SIGN
+		>
+
+	MARK_POINT	EDITPC_3
+	CASE	-1(R3),LIMIT=#^X40,TYPE=B,<-
+		EO$LOAD_FILL_ROUTINE,-		; 40 - EO$LOAD_FILL
+		EO$LOAD_SIGN_ROUTINE,-		; 41 - EO$LOAD_SIGN
+		EO$LOAD_PLUS_ROUTINE,-		; 42 - EO$LOAD_PLUS
+		EO$LOAD_MINUS_ROUTINE,-		; 43 - EO$LOAD_MINUS
+		EO$INSERT_ROUTINE,-		; 44 - EO$INSERT
+		EO$BLANK_ZERO_ROUTINE,-		; 45 - EO$BLANK_ZERO
+		EO$REPLACE_SIGN_ROUTINE,-	; 46 - EO$REPLACE_SIGN
+		EO$ADJUST_INPUT_ROUTINE,-	; 47 - EO$ADJUST_INPUT
+		>
+
+	MARK_POINT	EDITPC_4
+	BITB	#^B1111,-1(R3)		; Check for 80, 90, or A0
+	BEQL	30$			; Reserved operand on repeat of zero
+	MARK_POINT	EDITPC_5
+	EXTZV	#4,#4,-1(R3),R7		; Ignore repeat count in dispatch
+
+	CASE	R7,LIMIT=#8,TYPE=B,<-
+		EO$FILL_ROUTINE,-		; 81 to 8F - EO$FILL
+		EO$MOVE_ROUTINE,-		; 91 to 9F - EO$MOVE
+		EO$FLOAT_ROUTINE,-		; A1 to AF - EO$FLOAT
+		>
+
+; If we drop through all three CASE instructions, the pattern operator is
+; unimplemented or reserved. R3 is backed up to point to the illegal
+; pattern operator and a reserved operand FAULT is signalled.
+
+30$:	DECL	R3			; Point R3 to illegal operator
+	ADDL	#4,SP			; Discard return PC
+	BRW	EDITPC_ROPRAND_FAULT	; Initiate exception processing
+
+	.DISABLE	LOCAL_BLOCK
+
+	.SUBTITLE	Description of Pattern-Specific Routines
+;+
+; Functional Description:
+;
+;	There is a separate action routine for each pattern operator. These 
+;	routines are entered with specific register contents and several 
+;	scratch registers at their disposal. They perform their designated 
+;	action and return to the main VAX$EDITPC routine.
+;
+;	There are several words used in the architectural description of this
+;	instruction that are carried over into comments in this module. These
+;	words are briefly mentioned here.
+;
+;	char	Character in byte following pattern operator (used by
+;		EO$LOAD_FILL, EO$LOAD_SIGN, EO$LOAD_PLUS, EO$LOAD_MINUS,
+;		and EO$INSERT)
+;
+;	length	Length in byte following pattern operator (used by
+;		EO$BLANK_ZERO, EO$REPLACE_SIGN, and EO$ADJUST_INPUT)
+;
+;	repeat	Repeat count in bits <3:0> of pattern operator (used by
+;		EO$FILL, EO$MOVE, and EO$FLOAT)
+;
+;	The architecture makes use of two character registers, described
+;	as appearing in different bytes of R2. For simplicity, we use an
+;	additional register.
+;
+;	fill	Stored in R2<7:0>
+;
+;	sign	Stored in R4<7:0> 
+;
+;	Finally, the architecture describes two subroutines, one that obtains
+;	the next digit from the input string and the other that stores a 
+;	character in the output string. 
+;
+;	READ	Subroutine EO_READ provides this functionality
+;
+;	STORE	A single instruction of the form
+;
+;			MOVB	xxx,(R5)+
+;
+;		or
+;
+;			ADDB3	#ZERO,R7,(R5)+
+;
+;		stores a single character and advances the pointer.
+;
+; Input Parameters:
+;
+;	R0 - Updated length of input decimal string
+;	R1 - Address of next byte of input decimal string
+;	R2 - Fill character
+;	R3 - Address of one byte beyond current pattern operator
+;	R4 - Sign character 
+;	R5 - Address of next character to be stored in output character string
+;
+; Implicit Input:
+;
+;	Several registers are used to contain intermediate state, passed
+;	from one action routine to the next.
+;
+;	R7  - Contains latest digit from input stream (output from EO_READ)
+;	R8  - Used as loop counter 
+;	R9  - Contains the value described in the architecture as R0<31:16>
+;	R11 - Pseudo-PSW that contains the saved condition codes
+;
+; Side Effects:
+;
+;	The remaining registers are used as scratch by the action routines.
+;	
+;	R6 - Scratch register used only by access violation handler
+;	R7 - Output parameter of EO_READ routine
+;	R8 - Scratch register used by pattern-specific routines
+;
+; Output Parameters:
+;
+;	The actual output depends on the pattern operator that is currently
+;	executing. The routine headers for each routine will describe the
+;	specific output parameters.
+;-
+
+	.SUBTITLE	Utility Subroutine (READ Next Digit)
+;+
+; Functional Description:
+;
+;	This routine reads the next digit from the input packed decimal
+;	string and passes it back to the caller.
+;
+; Input Parameters:
+;
+;	R0 - Updated length of input decimal string
+;	R1 - Address of next byte of input decimal string
+;	R9 - Count of extra zeros (see EO$ADJUST_INPUT)
+;
+;	(SP) - Return address to caller of this routine
+;
+;	Note that R9<15:0> contains the data described by the architecture as
+;	appearing in R0<31:16>. In the event of an restartable exception
+;	(access violation or reserved operand fault due to an illegal pattern
+;	operator), the contents of R9<15:0> will be stored in R0<31:16>. In
+;	order for the instruction to be restarted, the "zero count" (the
+;	contents of R9) must be preserved. While any available field will do
+;	in the event of an access violation, the use of R0<31:16> is clearly
+;	specified for a reserved operand fault. 
+;
+; Output Parameters:
+;
+;	The behavior of this routine depends on the contents of R9 
+;
+;	R9 is zero on input
+;
+;		R0 - Updated by one 
+;		R1 - Updated by one if R0<0> is clear on input
+;		R7 - Next decimal digit in input string
+;		R9 - Unchanged
+;
+;		PSW<Z> is set if the digit is zero, clear otherwise
+;
+;	R9 is nonzero (LSS 0) on input
+;
+;		R0 - Unchanged
+;		R1 - Unchanged
+;		R7 - Zero
+;		R9 - Incremented by one (toward zero)
+;
+;		PSW<Z> is set 
+;-
+
+EO_READ:
+	TSTL	R9			; Check for "R0" LSS 0
+	BNEQ	20$			; Special code if nonzero
+	DECL	R0			; Insure that digits still remain
+	BLSS	30$			; Reserved operand if none
+	BLBC	R0,10$			; Next code path is flip flop
+
+; R0 was even on input (and is now odd), indicating that we want the low
+; order nibble in the input stream. The input pointer R1 must be advanced 
+; to point to the next byte. 
+
+	MARK_POINT	READ_1
+	EXTZV	#0,#4,(R1)+,R7		; Load low order nibble into R7
+	RSB				; Return with information in Z-bit
+
+; R0 was odd on input (and is now even), indicating that we want the high
+; order nibble in the input stream. The next pass through this routine will
+; pick up the low order nibble of the same input byte. 
+
+	MARK_POINT	READ_2
+10$:	EXTZV	#4,#4,(R1),R7		; Load high order nibble into R7
+	RSB				; Return with information in Z-bit
+
+; R9 was nonzero on input, indicating that zeros should replace the original
+; input digits.
+
+20$:	INCL	R9			; Advance R9 toward zero
+	CLRL	R7			; Behave as if we read a zero digit
+	RSB				; Return with Z-bit set
+
+; The input decimal string ran out of digits before its time. The architecture
+; dictates that R3 points to the pattern operator that requested the input
+; digit and R0 contains a -1 when the reserved operand abort is reported.
+; It is not necessary to load R0 here. R0 already contains -1 because it just
+; turned negative.
+
+30$:	DECL	R3			; Back up R3 to current pattern operator
+	ADDL	#8,SP			; Discard two return PCs
+	BRW	EDITPC_ROPRAND_ABORT	; Branch aid for reserved operand abort
+
+	.SUBTITLE	EO$INSERT - Insert Character
+;+
+; Functional Description:
+;
+;	Insert a fixed character, substituting the fill character if
+;	not significant.
+;
+; Input Parameters:
+;
+;	R2 - Fill character
+;	R3 - Address of character to be inserted if significance is set
+;	R5 - Address of next character to be stored in output character string
+;	R11<C> - Current setting of significance
+;
+; Output Parameters:
+;
+;	Character in pattern stream (or fill character if no significance)
+;	is stored in the the output string.
+;
+;	R3 - Advanced beyond character in pattern stream
+;	R5 - Advanced one byte as a result of the STORE operation
+;-
+
+EO$INSERT_ROUTINE:
+	BBC	#PSL$V_C,R11,10$	; Skip next if no significance
+	MARK_POINT	INSERT_1
+	MOVB	(R3)+,(R5)+		; STORE "ch" in output string
+	RSB
+
+	MARK_POINT	INSERT_2
+10$:	MOVB	R2,(R5)+		; STORE fill character
+	INCL	R3			; Skip over unused character
+	RSB
+
+	.SUBTITLE	EO$STORE_SIGN - Store Sign
+;+
+; Functional Description:
+;
+;	The contents of the sign register are placed into the output string.
+;
+; Input Parameters:
+;
+;	R4 - Sign character
+;	R5 - Address of next character to be stored in output character string
+;
+; Output Parameters:
+;
+;	Sign character is stored in the the output string.
+;
+;	R5 - Advanced one byte as a result of the STORE operation
+;-
+
+EO$STORE_SIGN_ROUTINE:
+	MARK_POINT	STORE_SIGN_1
+	MOVB	R4,(R5)+		; STORE sign character
+	RSB
+
+	.SUBTITLE	EO$FILL - Store Fill
+;+
+; Functional Description:
+;
+;	The contents of the fill register are placed into the output string
+;	a total of "repeat" times. 
+;
+; Input Parameters:
+;
+;	R2 - Fill character
+;	R5 - Address of next character to be stored in output character string
+;
+;	-1(R3)<3:0> - Repeat count is stored in right nibble of pattern operator
+;
+; Output Parameters:
+;
+;	Fill character is stored in the output string "repeat" times
+;
+;	R5 - Advanced "repeat" bytes as a result of the STORE operations
+;-
+
+EO$FILL_ROUTINE:
+	MARK_POINT	FILL_1
+	EXTZV	#0,#4,-1(R3),R8		; Get repeat count from pattern operator
+	MARK_POINT	FILL_2 , RESTART
+10$:	MOVB	R2,(R5)+		; STORE fill character
+	SOBGTR	R8,10$			; Test for end of loop
+	RSB
+
+	.SUBTITLE	EO$MOVE - Move Digits
+;+
+; Functional Description:
+;
+;	The right nibble of the pattern operator is  the  repeat  count.   For
+;	repeat  times, the following algorithm is executed.  The next digit is
+;	moved from the source to the destination.  If the digit  is  non-zero,
+;	significance  is  set  and  zero  is  cleared.   If  the  digit is not
+;	significant (i.e., is a leading zero) it is replaced by  the  contents
+;	of the fill register in the destination.
+;-
+
+EO$MOVE_ROUTINE:
+	MARK_POINT	MOVE_1
+	EXTZV	#0,#4,-1(R3),R8		; Get repeat count
+
+10$:	EO_READ				; Get next input digit
+	BEQL	30$			; Is it zero? Branch if yes
+	BISB	#PSL$M_C,R11		; Indicate significance 
+	BICB	#PSL$M_Z,R11		; Also indicate nonzero
+
+	MARK_POINT	MOVE_2 , RESTART
+20$:	ADDB3	#ZERO,R7,(R5)+		; STORE digit in output stream
+	SOBGTR	R8,10$			; Test for end of loop
+	RSB
+
+30$:	BBS	#PSL$V_C,R11,20$	; If significance, then STORE digit
+
+	MARK_POINT	MOVE_3 , RESTART
+	MOVB	R2,(R5)+		; Otherwise, STORE fill character
+	SOBGTR	R8,10$			; Test for end of loop
+	RSB
+
+	.SUBTITLE	EO$FLOAT - Float Sign
+;+
+; Functional Description:
+;
+;	The right nibble of the pattern operator is  the  repeat  count.   For
+;	repeat  times,  the  following  algorithm is executed.  The next digit
+;	from the source is examined.  If it is non-zero  and  significance  is
+;	not  yet  set, then the contents of the sign register is stored in the
+;	destination, significance is set, and zero is cleared.  If  the  digit
+;	is  significant,  it  is  stored  in  the  destination,  otherwise the
+;	contents of the fill register is stored in the destination.
+;-
+
+EO$FLOAT_ROUTINE:
+	MARK_POINT	FLOAT_1
+	EXTZV	#0,#4,-1(R3),R8		; Get repeat count
+
+10$:	EO_READ				; Get next input digit
+	BBS	#PSL$V_C,R11,20$	; Is significance set? Branch if yes.
+	BEQL	30$			; Is digit zero? Branch if yes. 
+	MARK_POINT	FLOAT_2 , RESTART
+	MOVB	R4,(R5)+		; STORE sign
+	BISB	#PSL$M_C,R11		; Indicate significance 
+	BICB	#PSL$M_Z,R11		; Also indicate nonzero
+
+	MARK_POINT	FLOAT_3 , RESTART
+20$:	ADDB3	#ZERO,R7,(R5)+		; STORE digit in output stream
+	SOBGTR	R8,10$			; Test for end of loop
+	RSB
+
+30$:	MARK_POINT	FLOAT_4 , RESTART
+	MOVB	R2,(R5)+		; Otherwise, STORE fill character
+	SOBGTR	R8,10$			; Test for end of loop
+	RSB
+
+	.SUBTITLE	EO$END_FLOAT - End Floating Sign
+;+
+; Functional Description:
+;
+;	If the floating sign has not yet been placed into the destination
+;	string (that is, if significance is not yet set), then the contents
+;	of the sign register are stored in the output string and significance 
+;	is set.
+;
+; Input Parameters:
+;
+;	R4 - Sign character
+;	R5 - Address of next character to be stored in output character string
+;	R11<C> - Current setting of significance
+;
+; Output Parameters:
+;
+;	Sign character is optionally stored in the output string (if 
+;	significance was not yet set).
+;
+;	R5 - Optionally advanced one byte as a result of the STORE operation
+;	R11<C> - (Significance) is unconditionally SET
+;-
+
+EO$END_FLOAT_ROUTINE:
+	BBSS	#PSL$V_C,R11,10$	; Test and set significance
+	MARK_POINT	END_FLOAT_1
+	MOVB	R4,(R5)+		; STORE sign character
+10$:	RSB
+
+	.SUBTITLE	EO$BLANK_ZERO - Blank Backwards When Zero
+;+
+; Functional Description:
+;
+;	The pattern operator is followed by an unsigned byte  integer  length.
+;	If  the  value  of the source string is zero, then the contents of the
+;	fill register are stored into the last length bytes of the destination
+;	string.
+;
+; Input Parameters:
+;
+;	R2 - Fill character
+;	R3 - Address of "length", number of characters to blank
+;	R5 - Address of next character to be stored in output character string
+;	R11<Z> - Set if input string is zero
+;
+; Output Parameters:
+;
+;	Contents of fill register are stored in last "length" characters
+;	of output string if input string is zero.
+;
+;	R3 - Advanced one byte over "length"
+;	R5 - Unchanged
+;
+; Side Effects:
+;
+;	R8 is destroyed
+;-
+
+EO$BLANK_ZERO_ROUTINE:
+	MARK_POINT	BLANK_ZERO_1
+	MOVZBL	(R3)+,R8		; Get length
+	BBC	#PSL$V_Z,R11,20$	; Skip rest if source string is zero
+	SUBL	R8,R5			; Back up destination pointer
+	MARK_POINT	BLANK_ZERO_2 , RESTART
+10$:	MOVB	R2,(R5)+		; STORE fill character
+	SOBGTR	R8,10$			; Check for end of loop
+20$:	RSB
+
+	.SUBTITLE	EO$REPLACE_SIGN - Replace Sign When Zero
+;+
+; Functional Description:
+;
+;	If the value of the source string is zero, then the contents of the
+;	fill register are stored into the byte of the destination string
+;	that is "length" bytes before the current position.
+;
+; Input Parameters:
+;
+;	R2 - Fill character
+;	R3 - Address of "length", number of characters to blank
+;	R5 - Address of next character to be stored in output character string
+;	R11<Z> - Set if input string is zero
+;
+; Output Parameters:
+;
+;	Contents of fill register are stored in byte of output string
+;	"length" bytes before current position if input string is zero.
+;
+;	R3 - Advanced one byte over "length"
+;	R5 - Unchanged
+;
+; Side Effects:
+;
+;	R8 is destroyed
+;-
+
+EO$REPLACE_SIGN_ROUTINE:
+	MARK_POINT	REPLACE_SIGN_1
+	MOVZBL	(R3)+,R8		; Get length
+	BBC	#PSL$V_Z,R11,10$	; Skip rest if source string is zero
+	SUBL3	R8,R5,R8		; Get address of indicated byte
+	MARK_POINT	REPLACE_SIGN_2
+	MOVB	R2,(R8)			; STORE fill character
+10$:	RSB
+
+	.SUBTITLE	EO$LOAD_xxxxxx - Load Register
+;+
+; Functional Description:
+;
+;	The contents of the fill or sign register are replaced with the
+;	character that follows the pattern operator in the pattern stream.
+;
+;	EO$LOAD_FILL	Load Fill Register
+;
+;	EO$LOAD_SIGN	Load Sign Register
+;
+;	EO$LOAD_PLUS	Load Sign Register If Source String Is Positive (or Zero)
+;
+;	EO$LOAD_MINUS	Load Sign Register If Source String Is Negative
+;
+; Input Parameters:
+;
+;	R3 - Address of character to be loaded
+;	R11<N> - Set if input string is LSS zero (negative)
+;
+; Output Parameters:
+;
+;	If entry is at EO$LOAD_FILL, the fill register contents (R2<7:0>) are 
+;	replaced with the next character in the pattern stream. 
+; 
+;	If one of the other entry points is used (and the appropriate conditions
+;	obtain), the contents of the sign register are replaced with the next
+;	character in the pattern stream. For simplicity of implementation, the
+;	sign character is stored in R4<7:0> while this routine executes. 
+;
+;	In the event of an exception, the contents of R4<7:0> will be stored
+;	in R2<15:8>, either to conform to the architectural specification of
+;	register contents in the event of a reserved operand fault, or to
+;	allow the instruction to be restarted in the event of an access
+;	violation. 
+;
+;	R3 - Advanced one byte over new fill or sign character
+;-
+
+EO$LOAD_FILL_ROUTINE:
+	MARK_POINT	LOAD_xxxx_1
+	MOVB	(R3)+,R2		; Load new fill character
+	RSB
+
+EO$LOAD_SIGN_ROUTINE:
+	MARK_POINT	LOAD_xxxx_2
+	MOVB	(R3)+,R4		; Load new sign character into R4
+	RSB
+
+EO$LOAD_PLUS_ROUTINE:
+	BBC	#PSL$V_N,R11,EO$LOAD_SIGN_ROUTINE ; Use common code if plus
+	INCL	R3			; Otherwise, skip unused character
+	RSB
+
+EO$LOAD_MINUS_ROUTINE:
+	BBS	#PSL$V_N,R11,EO$LOAD_SIGN_ROUTINE ; Use common code if minus
+	INCL	R3			; Otherwise, skip unused character
+	RSB
+
+	.SUBTITLE	EO$xxxxxx_SIGNIF - Significance
+;+
+; Functional Description:
+;
+;	The significance indicator (C-bit in auxiliary PSW) is set or
+;	cleared according to the entry point.
+;
+; Input Parameters:
+;
+;	None
+;
+; Output Parameters:
+;
+;	EO$CLEAR_SIGNIF		R11<C> is cleared
+;
+;	EO$SET_SIGNIF		R11<C> is set 
+;-
+
+EO$CLEAR_SIGNIF_ROUTINE:
+	BICB2	#PSL$M_C,R11		; Clear significance
+	RSB
+
+EO$SET_SIGNIF_ROUTINE:
+	BISB2	#PSL$M_C,R11		; Set significance
+	RSB
+
+	.SUBTITLE	EO_ADJUST_INPUT - Adjust Input Length
+;+
+; Functional Description:
+;
+;	The pattern operator is followed by an unsigned byte integer length in
+;	the  range  1  through  31.  If the source string has more digits than
+;	this length, the excess leading digits are read and discarded.  If any
+;	discarded  digits  are  non-zero then overflow is set, significance is
+;	set, and zero is cleared.  If the source string has fewer digits  than
+;	this  length,  a  counter  is  set  of  the number of leading zeros to
+;	supply.  This counter is stored as a negative number in R0<31:16>.
+;-
+
+EO$ADJUST_INPUT_ROUTINE:
+	MARK_POINT	ADJUST_INPUT_1
+	MOVZBL	(R3)+,R8		; Get "length" from pattern stream
+	SUBL3	R8,R0,R8		; Is length larger than input length?
+	BLEQU	30$			; Branch if yes
+	CLRL	R9			; Clear count of zeros ("R0<31:16>")
+
+10$:	EO_READ				; Get next input digit
+	BEQL	20$			; Skip to end of loop if zero
+	BICB	#PSL$M_Z,R11		; Otherwise, indicate nonzero
+	BISB	#<PSL$M_C!PSL$M_V>,R11	; Indicate significance and overflow
+20$:	SOBGTR	R8,10$			; Test for end of loop
+	RSB
+
+30$:	MOVL	R8,R9			; Store difference into "R0<31:16>"
+	RSB
+
+	.SUBTITLE	EO$END - End Edit
+;+
+; Functional Description:
+;
+;	The edit operation is terminated.
+;
+;	The architectural description of EDITPC divides end processing between
+;	the EO$END routine and code at the end of the main loop. This 
+;	implementation performs all of the work in a single place.
+;
+;	The edit operation is terminated. There are several details that this
+;	routine must take care of.
+;
+;	1.  The return PC to the main dispatch loop is discarded.
+;
+;	2.  R3 is backed up to point to the EO$END pattern operator.
+;
+;	3.  A special check must be made for negative zero to insure that
+;	    the N-bit is cleared.
+;
+;	4.  If any digits still remain in the input string, a reserved
+;	    operand abort is taken.
+;
+;	5.  R2 and R4 are set to zero according to the architecture.
+;
+; Input Parameters:
+;
+;	R0 - Number of digits remaining in input string
+;	R3 - Address of one byte beyond the EO$END operator
+;
+;	00(SP)  - Return address in dispatch loop in this module (discarded)
+;	04(SP) - Saved R0
+;	08(SP) - Saved R1
+;	12(SP) - Saved R6
+;	16(SP) - Saved R7
+;	20(SP) - Saved R8
+;	24(SP) - Saved R9
+;	28(SP) - Saved R10
+;	32(SP) - Saved R11
+;	36(SP) - Return PC to caller of VAX$EDITPC
+;
+; Output Parameters:
+;
+;	If no overflow has occurred, then this routine exits through the RSB
+;	instruction with the following output parameters:
+;
+;		These register contents are dictated by the VAX architecture
+;
+;		R0 - Length in digits of input decimal string
+;		R1 - Address of most significant byte of input decimal string
+;		R2 - Set to zero to conform to architecture
+;		R3 - Backed up one byte to point to EO$END operator
+;		R4 - Set to zero to conform to architecture
+;		R5 - Address of one byte beyond destination character string
+;
+;		PSL<V> is clear
+;
+;	If the V-bit is set, then control is transferred to VAX$EDITPC_OVERFLOW
+;	where a check for decimal overflow exceptions is made.
+;
+;	The registers are loaded with their correct contents and then saved on
+;	the stack as follows: 
+;
+;		00(SP) - Saved R0
+;		04(SP) - Saved R1
+;		08(SP) - Saved R2
+;		12(SP) - Saved R3
+;		16(SP) - Saved R4
+;		20(SP) - Saved R5
+;		24(SP) - Saved R6
+;		28(SP) - Saved R7
+;		32(SP) - Saved R8
+;		36(SP) - Saved R9
+;		40(SP) - Saved R10
+;		44(SP) - Saved R11
+;		48(SP) - Return PC to caller of VAX$EDITPC
+;
+;		PSL<V> is set
+;-
+
+EO$END_ROUTINE:
+	ADDL	#4,SP			; Discard return PC to main loop
+	DECL	R3			; Back up pattern pointer one byte
+	BBC	#PSL$V_Z,R11,10$	; Check for negative zero
+	BICB	#PSL$M_N,R11		; Turn off N-bit if zero
+10$:	TSTL	R0			; Any digits remaining?
+	BNEQ	EDITPC_ROPRAND_ABORT	; Error if yes
+	TSTL	R9			; Any zeros (R0<31:16>) remaining?
+	BNEQ	EDITPC_ROPRAND_ABORT	; Error if yes
+	CLRL	R2			; Architecture specifies that R2
+	CLRL	R4			;  and R4 are zero on exit
+	BICPSW	#<PSL$M_N!PSL$M_Z!PSL$M_V!PSL$M_C>	; Clear condition codes
+	BISPSW	R11			; Set codes according to saved PSW
+	BBS	#PSL$V_V,R11,20$	; Get out of line if overflow
+	POPR	#^M<R0,R1,R6,R7,R8,R9,R10,R11>	; Restore saved registers
+	RSB				; Return to caller's caller
+
+; At this point, we must determine whether the DV bit is set. The tests that 
+; must be performed are identical to the tests performed by the overflow
+; checking code for the packed decimal routines. In order to make use of
+; that code, we need to set up the saved registers on the stack to match
+; the input to that routine. Note also that the decimal routines specify
+; that R0 is zero on completion while EDITPC dictates that R0 contains the
+; initial value of "srclen". For this reason, we cannot simply branch to
+; VAX$DECIMAL_EXIT but must use a special entry point.
+
+20$:	POPR	#^M<R0,R1>		; Restore R0 and R1
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; ... only to save them again
+
+; The condition codes were not changed by the previous two instructions.
+
+	BRW	VAX$EDITPC_OVERFLOW	; Join exit code
+
+	.SUBTITLE	EDITPC_ROPRAND_FAULT - Handle Illegal Pattern Operator
+;+
+; Functional Description:
+;
+;	This routine stores the intermediate state of an EDITPC instruction
+;	that has been prematurely terminated by an illegal pattern operator.
+;	These exceptions and access violations are the only exceptions from
+;	which execution can continue after the exceptional condition has been
+;	cleared up. After the state is stored in the registers R0 through R5,
+;	control is transferred through VAX$ROPRAND to VAX$REFLECT_FAULT, where
+;	the appropriate backup method is determined, based on the return PC
+;	from the VAX$EDITPC routine. 
+;
+; Input Parameters:
+;
+;	R0  - Current digit count in input string
+;	R1  - Address of next digit in input string
+;	R2  - Fill character
+;	R3  - Address of illegal pattern operator
+;	R4  - Sign character (stored in R2<15:8>)
+;	R5  - Address of next character to be stored in output character string
+;	R9  - Zero count (stored in R0<31:16>)
+;	R11 - Condition codes
+;
+;	00(SP) - Saved R0
+;	04(SP) - Saved R1
+;	08(SP) - Saved R6
+;	12(SP) - Saved R7
+;	16(SP) - Saved R8
+;	20(SP) - Saved R9
+;	24(SP) - Saved R10
+;	28(SP) - Saved R11
+;	32(SP) - Return PC from VAX$EDITPC routine
+;
+; Output Parameters:
+;
+;	00(SP) - Offset in packed register array to delta PC byte
+;	04(SP) - Return PC from VAX$EDITPC routine
+;
+;	Some of the register contents are dictated by the VAX architecture.
+;	Other register contents are architecturally described as "implementation
+;	dependent" and are used to store the instruction state that enables it
+;	to be restarted successfully and complete according to specifications.
+;
+;	The following register contents are architecturally specified
+;
+;		R0<15:00> - Current digit count in input string
+;		R0<31:16> - Current zero count (from R9)
+;		R1        - Address of next digit in input string
+;		R2<07:00> - Fill character
+;		R2<15:08> - Sign character (from R4)
+;		R3        - Address of next pattern operator
+;		R5        - Address of next character in output character string
+;
+;	The following register contents are peculiar to this implementation
+;
+;		R2<23:16> - Delta-PC (if initiated by exception)
+;		R2<31:24> - Delta srcaddr (current srcaddr minus initial srcaddr)
+;		R4<07:00> - Initial digit count (from saved R0)
+;		R4<15:08> - Saved condition codes (for easy retrieval)
+;		R4<23:16> - State flags
+;				State = EDITPC_2_RESTART
+;				FPD bit is set
+;				ACCVIO bit is clear
+;		R4<31:24> - Unused for this exception (see access violations)
+;
+;		EDITPC_2_RESTART is the restart code that causes the instruction
+;		to be restarted at the top of the main loop. It is the simplest
+;		point at which to resume execution after an illegal pattern
+;		operator fault.
+;
+;	The condition codes reported in the exception PSL are also defined
+;	by the VAX architecture.
+;
+;		PSL<N> - Source string has a minus sign
+;		PSL<Z> - All digits are zero so far
+;		PSL<V> - Nonzero digits have been lost
+;		PSL<C> - Significance
+;-
+
+	ASSUME EDITPC_L_SAVED_R1 EQ <EDITPC_L_SAVED_R0 + 4>
+
+EDITPC_ROPRAND_FAULT:
+	PUSHR	#^M<R0,R1,R2,R3>		; Save current R0..R3
+	MOVQ	EDITPC_L_SAVED_R0(SP),R0	; Retrieve original R0 and R1
+	MOVQ	R4,16(SP)			; Save R4 and R5 in right place on stack
+
+; Now start stuffing the various registers 
+
+	MOVW	R9,EDITPC_W_ZERO_COUNT(SP)	; Save R9 in R0<31:16>
+	MOVB	R4,EDITPC_B_SIGN(SP)		; Save R4 in R2<15:8>
+	MOVB	R0,EDITPC_B_INISRCLEN(SP)	; Save initial value of R0
+	SUBL3	R1,EDITPC_A_SRCADDR(SP),R1	; Calculate srcaddr difference
+	MOVB	R1,EDITPC_B_DELTA_SRCADDR(SP)	; Store it in R4<15:8>
+	MOVB	R11,EDITPC_B_SAVED_PSW(SP)	; Save condition codes
+	MOVB	#<EDITPC_M_FPD!EDITPC_2_RESTART>,-
+		EDITPC_B_STATE(SP)		; Set the FPD bit
+
+	POPR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Load registers
+	PUSHL	#<EDITPC_B_DELTA_PC!-	; Store delta-PC offset
+		PACK_M_FPD>		; Indicate that FPD should be set
+
+; The following is admittedly gross. This is the only code path into
+; VAX$ROPRAND where the condition codes are significant. All other paths can
+; store the delta-PC offset without concern for its affect on condition
+; codes. Fortunately, the POPR instruction does not affect condition codes.
+
+	ASSUME EDITPC_B_SAVED_PSW EQ 17	; Make sure we get them from right place
+
+	PUSHL	R0			; Get a scratch register
+	EXTZV	#8,#4,R4,R0		; Get codes from R4<11:8>
+	BICPSW	#<PSL$M_N!PSL$M_Z!PSL$M_V!PSL$M_C>	; Clear the codes
+	BISPSW	R0			; Set relevant condition codes
+	POPR	#^M<R0>			; Restore R0, preserving PSW
+	BRW	VAX$ROPRAND		; Continue exception handling
+
+	.SUBTITLE	EDITPC_ROPRAND_ABORT - Abnormally Terminate Instruction
+;-
+; Functional Description:
+;
+;	This routine reports a reserved operand abort back to the caller.
+;
+;	Reserved operand aborts are trivial to handle because they cannot be
+;	continued. There is no need to pack intermediate state into the
+;	general registers. Those registers that should not be modified by the
+;	EDITPC instruction have their contents restored. Control is then
+;	passed to VAX$ROPRAND, which takes the necessary steps to eventually
+;	reflect the exception back to the caller. 
+;
+;	The following conditions cause a reserved operand abort
+;
+;	    1.	Input digit count GTRU 31
+;		(This condition is detected by the EDITPC initialization code.)
+;
+;	    2.	Not enough digits in source string to satisfy pattern operators
+;		(This condition is detected by the EO_READ routine.)
+;
+;	    3.	Too many digits in source string (digits left over)
+;		(This condition is detected by the EO$END routine.)
+;
+;	    4.	An EO$END operator was encountered while zero count was nonzero
+;		(This condition is also detected by the EO$END routine.)
+;
+; Input Parameters:
+;
+;	00(SP) - Saved R0
+;	04(SP) - Saved R1
+;	08(SP) - Saved R6
+;	12(SP) - Saved R7
+;	16(SP) - Saved R8
+;	20(SP) - Saved R9
+;	24(SP) - Saved R10
+;	28(SP) - Saved R11
+;	32(SP) - Return PC from VAX$EDITPC routine
+;
+; Output Parameters:
+;
+;	The contents of R0 through R5 are not important because the 
+;	architecture states that they are UNPREDICTABLE if a reserved
+;	operand abort occurs. No effort is made to put these registers
+;	into a consistent state.
+;
+;	R6 through R11 are restored to their values when the EDITPC 
+;	instruction began executing.
+;
+;	00(SP) - Offset in packed register array to delta PC byte
+;	04(SP) - Return PC from VAX$EDITPC routine
+;
+; Implicit Output:
+;
+;	This routine passes control to VAX$ROPRAND where further
+;	exception processing takes place.
+;-
+
+EDITPC_ROPRAND_ABORT:
+	POPR	#^M<R0,R1,R6,R7,R8,R9,R10,R11>	; Restore saved registers
+	PUSHL	#EDITPC_B_DELTA_PC		; Store delta-PC offset
+	BRW	VAX$ROPRAND			; Continue exception handling
+
+	.SUBTITLE	EDITPC_ACCVIO - Reflect an Access Violation
+;+
+; Functional Description:
+;
+;	This routine receives control when an access violation occurs while
+;	executing within the EDITPC emulator. This routine determines whether
+;	the exception occurred while accessing the source decimal string, the
+;	pattern stream, or the output character string. (This check is made
+;	based on the PC of the exception.) 
+;
+;	If the PC is one that is recognized by this routine, then the state of
+;	the instruction (character counts, string addresses, and the like) are
+;	restored to a state where the instruction/routine can be restarted
+;	after (if) the cause for the exception is eliminated. Control is then
+;	passed to a common routine that sets up the stack and the exception
+;	parameters in such a way that the instruction or routine can restart
+;	transparently. 
+;
+;	If the exception occurs at some unrecognized PC, then the exception is
+;	reflected to the user as an exception that occurred within the
+;	emulator. 
+;
+;	There are two exceptions that can occur that are not backed up to
+;	appear as if they occurred at the site of the original emulated
+;	instruction. These exceptions will appear to the user as if they
+;	occurred inside the emulator itself. 
+;
+;	    1.	If stack overflow occurs due to use of the stack by one of 
+;		the routines, it is unlikely that this routine will even
+;		execute because the code that transfers control here must
+;		first copy the parameters to the exception stack and that
+;		operation would fail. (The failure causes control to be
+;		transferred to VMS, where the stack expansion logic is
+;		invoked and the routine resumed transparently.) 
+;
+;	    2.	If assumptions about the address space change out from under 
+;		these routines (because an AST deleted a portion of the 
+;		address space or a similar silly thing), the handling of the 
+;		exception is UNPREDICTABLE.
+;
+; Input Parameters:
+;
+;	R0  - Value of SP when exception occurred
+;	R1  - PC at which exception occurred
+;	R2  - scratch
+;	R3  - scratch
+;	R10 - Address of this routine (no longer needed)
+;
+;	00(SP) - Value of R0 when exception occurred
+;	04(SP) - Value of R1 when exception occurred
+;	08(SP) - Value of R2 when exception occurred
+;	12(SP) - Value of R3 when exception occurred
+;	16(SP) - Return PC in exception dispatcher in operating system
+;
+;	20(SP) - First longword of system-specific exception data
+;	  .
+;	  .
+;	xx(SP) - Last longword of system-specific exception data
+;
+;	The address of the next longword is the position of the stack when
+;	the exception occurred. R0 locates this address.
+;
+; R0 ->	xx+4(SP)     - Instruction-specific data
+;	  .	     - Optional instruction-specific data
+;	  .          - Optional instruction-specific data
+;	xx+<4*M>(SP) - Return PC from VAX$EDITPC routine (M is the number
+;		       of instruction-specific longwords)
+;
+; Implicit Input:
+;
+;	It is assumed that the contents of all registers coming into this
+;	routine are unchanged from their contents when the exception occurred.
+;	(For R0 through R3, this assumption applies to the saved register
+;	contents on the top of the stack. Any modification to these four
+;	registers must be made to their saved copies and not to the registers
+;	themselves.) 
+;
+;	It is further assumed that the exception PC is within the bounds of 
+;	this module. (Violation of this assumption is simply an inefficiency.)
+;
+;	Finally, the macro BEGIN_MARK_POINT should have been invoked at the
+;	beginning of this module to define the symbols 
+;
+;		MODULE_BASE
+;		PC_TABLE_BASE
+;		HANDLER_TABLE_BASE
+;		TABLE_SIZE
+;
+; Output Parameters:
+;
+;	If the exception is recognized (that is, if the exception PC is 
+;	associated with one of the mark points), control is passed to the 
+;	context-specific routine that restores the instruction state to a 
+;	uniform point from which the EDITPC instruction can be restarted.
+;
+;		R0  - Value of SP when exception occurred
+;		R1  - scratch
+;		R2  - scratch
+;		R3  - scratch
+;		R10 - scratch
+;
+;	VAX$EDITPC is different from the other emulated instructions in that 
+;	it requires intermediate state to be stored in R4 and R5 as well as R0 
+;	through R3. This requires that R4 and R5 also be saved on the stack so 
+;	that they can be manipulated in a consistent fashion. 
+;
+;	00(SP) - Value of R0 when exception occurred
+;	04(SP) - Value of R1 when exception occurred
+;	08(SP) - Value of R2 when exception occurred
+;	12(SP) - Value of R3 when exception occurred
+;	16(SP) - Value of R4 when exception occurred
+;	20(SP) - Value of R5 when exception occurred
+;	24(SP) - Value of R0 when exception occurred
+;	28(SP) - Value of R1 when exception occurred
+;	32(SP) - Value of R2 when exception occurred
+;	36(SP) - Value of R3 when exception occurred
+;	40(SP) - Return PC in exception dispatcher in operating system
+;	 etc.
+;
+; R0 ->	zz(SP) - Instruction-specific data begins here
+;
+;	If the exception PC occurred somewhere else (such as a stack access), 
+;	the saved registers are restored and control is passed back to the 
+;	host system with an RSB instruction.
+;
+; Implicit Output:
+;
+;	The register contents are modified to put the intermediate state of
+;	the instruction into a consistent state from which it can be
+;	continued. Any registers saved by the VAX$EDITPC routine are
+;	restored. 
+;-
+
+	.ENABLE		LOCAL_BLOCK
+
+EDITPC_ACCVIO:
+	MOVQ	R4,-(SP)		; Store R5 and R4 on the stack
+	MOVQ	16(SP),-(SP)		; ... and another copy of R3 and R2
+	MOVQ	16(SP),-(SP)		; ... and another copy of R1 and R0
+
+	CLRL	R2			; Initialize the counter
+	PUSHAB	MODULE_BASE		; Store base address of this module
+	SUBL2	(SP)+,R1		; Get PC relative to this base
+
+10$:	CMPW	R1,PC_TABLE_BASE[R2]	; Is this the right PC?
+	BEQL	30$			; Exit loop if true
+	AOBLSS	#TABLE_SIZE,R2,10$	; Do the entire table
+
+; If we drop through the dispatching based on PC, then the exception is not 
+; one that we want to back up. We simply reflect the exception to the user.
+
+20$:	ADDL	#16,SP			; Discard duplicate saved R0 .. R3
+	MOVQ	(SP)+,R4		; Restore R4 and R5
+	POPR	#^M<R0,R1,R2,R3>	; Restore saved registers
+	RSB				; Return to exception dispatcher
+
+; The exception PC matched one of the entries in our PC table. R2 contains
+; the index into both the PC table and the handler table. R1 has served
+; its purpose and can be used as a scratch register.
+
+30$:	MOVZWL	HANDLER_TABLE_BASE[R2],R1	; Get the offset to the handler
+	JMP	MODULE_BASE[R1]		; Pass control to the handler
+	
+; In all of the instruction-specific routines, the state of the stack
+; will be shown as it was when the exception occurred. All offsets will
+; be pictured relative to R0. 
+
+	.SUBTITLE	Access Violation While Reading Input Digit
+;+
+; EO_READ Packing Routine
+;
+; Functional Description:
+;
+;	This routine executes if an access violation occurred in the EO_READ
+;	subroutine while accessing the input packed decimal string. 
+;
+; Input Parameters:
+;
+;	R0 - Address of top of stack when access violation occurred
+;
+;	00(R0) - Return PC to caller of EO_READ
+;	04(R0) - Return PC to main VAX$EDITPC control loop
+;	08(R0) - Saved R0
+;	12(R0) - Saved R1
+;	  etc.
+;
+; Output Parameters:
+;
+;	If the caller of this routine a recognized restart point, the restart
+;	code is stored in EDITPC_B_STATE in the saved register array, the
+;	psuedo stack pointer R0 is advanced by one, and control is passed to
+;	the general EDITPC_PACK routine for final exception processing. 
+;
+;		R0 is advanced by one longword
+;
+;		00(R0) - Return PC to main VAX$EDITPC control loop
+;		04(R0) - Saved R0
+;		08(R0) - Saved R1
+;		  etc.
+;
+;		EDITPC_B_STATE(SP) - Code that uniquely determines the caller
+;			of EO_READ when the access violation was detected.
+;
+;	If the caller's PC is not recognized, the exception is dismissed from
+;	further modification.
+;-
+
+READ_1:
+READ_2:
+	CLRL	R2			; Set table index to zero
+	PUSHAB	MODULE_BASE		; Prepare for PIC arithmetic
+	SUBL3	(SP)+,(R0)+,R1		; R1 contains relative PC
+	SUBL2	#3,R1			; Back up over BSBW instruction
+
+40$:	CMPW	R1,RESTART_PC_TABLE_BASE[R2]	; Check next PC offset
+	BEQL	50$				; Exit loop if match
+	AOBLSS	#RESTART_TABLE_SIZE,R2,40$	; Check for end of loop
+
+; If we drop through this loop, we got into the EO_READ subroutine from
+; other than one of the three known call sites. We pass control back to
+; the general exception dispatcher.
+
+	BRB	20$			; Join common code to dismiss exception
+
+; Store the restart code appropriate to the return PC and join common code to
+; store the rest of the instruction state into the saved register array.
+
+	ASSUME EDITPC_V_STATE EQ 0
+
+50$:	ADDB3	#1,R2,EDITPC_B_STATE(SP)	; Restart code base is 1, not 0
+	INCW	EDITPC_W_SRCLEN(SP)		; Digit never got read
+	BRB	70$				; Make sure that R8 is saved
+
+	.SUBTITLE	Access Violation While Executing Loop
+;+
+; Packing Routine for Storage Loops
+;
+; Functional Description:
+;
+;	All of the following labels are associated with exceptions that occur
+;	inside a loop that is reading digits from the input stream and
+;	optionally storing these or other characters in the output string.
+;	While it is a trivial matter to back up the output pointer and restart
+;	the loop from the beginning, it is somewhat more difficult to handle
+;	all of the cases that can occur with the input packed decimal string
+;	(because a byte can contain two digits). To avoid this complication,
+;	we add the ability to restart the various loops where they left off.
+;	In order to accomplish this, we need to store the loop count and,
+;	optionally, the latest input digit in the intermediate state array. 
+;
+;	The two entry points where the contents of R7 (the last digit read
+;	from the input stream) are significant are MOVE_2 and FLOAT_3. All
+;	other entry points ignore the contents of R7. (Note that these two
+;	entry points exit through label 60$ to store R7 in the saved register
+;	array.) 
+;
+; Input Parameters:
+;
+;	R0 - Address of top of stack when access violation occurred
+;	R7 - Latest digit read from input stream (MOVE_2 and FLOAT_3 only)
+;	R8 - Remaining loop count
+;
+;	00(R0) - Return PC to main VAX$EDITPC control loop
+;	04(R0) - Saved R0
+;	08(R0) - Saved R1
+;	  etc.
+;
+; Output Parameters:
+;
+;	A restart code that is unique for each entry is stored in the saved
+;	register array. The loop count (and the latest input digit, if
+;	appropriate) is also stored before passing control to EDITPC_PACK. 
+;
+;	EDITPC_B_STATE(SP) - Code that uniquely determines the code that
+;		was executing when the access violation was detected.
+;
+;	EDITPC_B_EO_READ_CHAR(SP) - Latest digit read from the input string
+;
+;	EDITPC_B_LOOP_COUNT(SP) - Remaining loop count
+;
+; Side Effects:
+;
+;	R0 is unchanged by this code path
+;-
+
+	ASSUME EDITPC_V_STATE EQ 0
+
+FILL_2:
+	MOVB	#FILL_2_RESTART,EDITPC_B_STATE(SP)
+	BRB	70$
+
+MOVE_2:
+	MOVB	#MOVE_2_RESTART,EDITPC_B_STATE(SP)
+	BRB	60$
+
+MOVE_3:
+	MOVB	#MOVE_3_RESTART,EDITPC_B_STATE(SP)
+	BRB	70$
+
+FLOAT_2:
+	MOVB	#FLOAT_2_RESTART,EDITPC_B_STATE(SP)
+	BRB	60$
+
+FLOAT_3:
+	MOVB	#FLOAT_3_RESTART,EDITPC_B_STATE(SP)
+	BRB	60$
+
+FLOAT_4:
+	MOVB	#FLOAT_4_RESTART,EDITPC_B_STATE(SP)
+	BRB	70$
+
+BLANK_ZERO_2:
+	MOVB	#BLANK_ZERO_2_RESTART,EDITPC_B_STATE(SP)
+	BRB	70$
+
+60$:	MOVB	R7,EDITPC_B_EO_READ_CHAR(SP)	; Save result of latest read
+70$:	MOVB	R8,EDITPC_B_LOOP_COUNT(SP)	; Save loop counter
+	BRB	80$
+
+	.SUBTITLE	Access Violation in Initialization Code
+;+ 
+; Functional Description:
+;
+;	An access violation at EDITPC_1 indicates that the byte containing the
+;	sign of the input packed decimal string could not be read. There is
+;	little state to preserve. The key step here is to store a restart code
+;	that differentiates this exception from the large number that can be
+;	restarted at the top of the command loop. 
+;
+; Input Parameters:
+;
+;	00(R0) - Saved R0
+;	04(R0) - Saved R1
+;	  etc.
+;
+; Output Parameter:
+;
+;	EDITPC_B_STATE(SP) - Code that indicates that instruction should
+;		be restarted at point where sign "digit" is fetched.
+;-
+	ASSUME EDITPC_V_STATE EQ 0
+
+EDITPC_1:
+	MOVB	#EDITPC_1_RESTART,EDITPC_B_STATE(SP)
+	BRB	EDITPC_PACK
+
+	.SUBTITLE	Simple Access Violation 
+;+
+; Functional Description:
+;
+;	This routine handles all of the simple access violations, those that
+;	can be backed up to the same intermediate state. In general, an access
+;	violation occurred in one of the simpler routines or at some other
+;	point where it is not difficult to back up the EDITPC operation to the
+;	top of the main dispatch loop. 
+;
+; Input Parameters:
+;
+;	R3 - Points one byte beyond current pattern operator (except for 
+;		REPLACE_SIGN_2 where it is one byte further along)
+;
+;	00(R0) - TOP_OF_LOOP (Return PC to main VAX$EDITPC control loop)
+;	04(R0) - Saved R0
+;	08(R0) - Saved R1
+;	  etc.
+;
+; Output Parameters:
+;
+;	R3 must be decremented to point to the pattern operator that was being
+;	processed when the exception occurred. The return PC must be
+;	"discarded" to allow the registers to be restored and the return PC
+;	from VAX$EDITPC to be located. 
+;
+;		R3 - Points to current pattern operator
+;
+;		00(R0) - Saved R0
+;		04(R0) - Saved R1
+;		  etc.
+;
+; Output Parameter:
+;
+;	EDITPC_B_STATE(SP) - The restart point called EDITPC_2 is the place
+;		from which all "simple" access violations are restarted.
+;		This is essentially the location TOP_OF_LOOP.
+;-
+
+END_FLOAT_1:
+	BBSC	#PSL$V_C,R11,75$	; Clear saved C-bit before restarting
+	BRB	75$			; We should never get here but ...
+
+REPLACE_SIGN_2:
+	DECL	EDITPC_A_PATTERN(SP)	; Back up to "length" byte
+
+EDITPC_3:
+EDITPC_4:
+EDITPC_5:
+
+INSERT_1:
+INSERT_2:
+
+STORE_SIGN_1:
+
+FILL_1:
+
+MOVE_1:
+
+FLOAT_1:
+
+BLANK_ZERO_1:
+
+REPLACE_SIGN_1:
+
+LOAD_xxxx_1:
+LOAD_xxxx_2:
+
+ADJUST_INPUT_1:
+
+75$:	DECL	EDITPC_A_PATTERN(SP)	; Back up to current pattern operator
+
+EDITPC_2:
+	MOVB	#EDITPC_2_RESTART,-	; Store special restart code
+		EDITPC_B_STATE(SP)	
+80$:	ADDL	#4,R0			; Discard return PC
+					; ... and drop through to EDITPC_PACK
+
+	.DISABLE	LOCAL_BLOCK
+
+	.SUBTITLE	EDITPC_PACK - Store EDITPC Intermediate State
+;+
+; Functional Description:
+;
+;	This routine stores the intermediate state of an EDITPC instruction
+;	that has been prematurely terminated by an access violation. These
+;	exceptions and illegal pattern operators are the only exceptions from
+;	which execution can continue after the exceptional condition has been
+;	cleared up. After the state is stored in the registers R0 through R5,
+;	control is transferred to VAX$REFLECT_FAULT, where the appropriate
+;	backup method is determined, based on the return PC from the
+;	VAX$EDITPC routine. 
+;
+; Input Parameters:
+;
+;	R0  - Current digit count in input string
+;	R1  - Address of next digit in input string
+;	R2  - Fill character
+;	R3  - Address of current pattern operator
+;	R4  - Sign character (stored in R2<15:8>)
+;	R5  - Address of next character to be stored in output character string
+;	R9  - Zero count (stored in R0<31:16>)
+;	R11 - Condition codes
+;
+;	00(R0) - Saved R0
+;	04(R0) - Saved R1
+;	08(R0) - Saved R6
+;	12(R0) - Saved R7
+;	16(R0) - Saved R8
+;	20(R0) - Saved R9
+;	24(R0) - Saved R10
+;	28(R0) - Saved R11
+;	32(R0) - Return PC from VAX$EDITPC routine
+;
+; Output Parameters:
+;
+;	R0 - Address of return PC from VAX$EDITPC routine
+;
+;	00(R0) - Return PC from VAX$EDITPC routine
+;
+;	Some of the register contents are dictated by the VAX architecture.
+;	Other register contents are architecturally described as "implementation
+;	dependent" and are used to store the instruction state that enables it
+;	to be restarted successfully and complete according to specifications.
+;
+;	The following register contents are architecturally specified
+;
+;		R0<15:00> - Current digit count in input string
+;		R0<31:16> - Current zero count (from R9)
+;		R1        - Address of next digit in input string
+;		R2<07:00> - Fill character
+;		R2<15:08> - Sign character (from R4)
+;		R3        - Address of current pattern operator
+;		R5        - Address of next character in output character string
+;
+;	The following register contents are peculiar to this implementation
+;
+;		R2<23:16> - Delta-PC (if initiated by exception)
+;		R2<31:24> - Delta srcaddr (current srcaddr minus initial srcaddr)
+;		R4<07:00> - Initial digit count (from saved R0)
+;		R4<15:08> - Saved condition codes (for easy retrieval)
+;		R4<23:16> - State flags
+;				State field determines the restart point
+;				FPD bit is set
+;				ACCVIO bit is set
+;		R4<31:24> - Unused for this exception (see access violations)
+;
+;	The condition codes are not architecturally specified by the VAX
+;	architecture for an access violation. The following list applies to
+;	some but not all of the points where an access violation can occur. 
+;
+;		PSL<N> - Source string has a minus sign
+;		PSL<Z> - All digits are zero so far
+;		PSL<V> - Nonzero digits have been lost
+;		PSL<C> - Significance
+;-
+
+	ASSUME EDITPC_L_SAVED_R1 EQ <EDITPC_L_SAVED_R0 + 4>
+
+EDITPC_PACK:
+
+; Now start stuffing the various registers 
+
+	MOVW	R9,EDITPC_W_ZERO_COUNT(SP)	; Save R9 in R0<31:16>
+	MOVB	R4,EDITPC_B_SIGN(SP)		; Save R4 in R2<15:8>
+	MOVQ	(R0)+,R2			; Get initial R0/R1 to R2/R3
+	MOVB	R2,EDITPC_B_INISRCLEN(SP)	; Save initial value of R0
+	SUBL3	R3,EDITPC_A_SRCADDR(SP),R3	; Calculate srcaddr difference
+	MOVB	R3,EDITPC_B_DELTA_SRCADDR(SP)	; Store it in R4<15:8>
+	MOVB	R11,EDITPC_B_SAVED_PSW(SP)	; Save condition codes
+	BISB	#EDITPC_M_FPD,EDITPC_B_STATE(SP)	; Set the FPD bit
+
+; Restore the remaining registers 
+
+	MOVQ	(R0)+,R6			; Restore R6 and R7
+	MOVQ	(R0)+,R8			; ... and R8 and R9
+	MOVQ	(R0)+,R10			; ... and R10 and R11
+
+; Get rid of the extra copy of saved registers on the stack
+
+	MOVQ	(SP)+,16(SP)		; Copy the saved R0/R1 pair
+	MOVQ	(SP)+,16(SP)		; ... and the saved R2/R3 pair
+	MOVQ	(SP)+,R4		; R4 and R5 can be themselves
+
+; R1 contains delta-PC offset and indicates that FPD gets set
+
+	MOVL	#<EDITPC_B_DELTA_PC!-	; Locate delta-PC offset
+		PACK_M_FPD!-		; Set FPD bit in exception PSL
+		PACK_M_ACCVIO>,R1	; Indicate an access violation
+	BRW	VAX$REFLECT_FAULT	; Reflect fault to caller
+
+	.SUBTITLE	EDITPC_RESTART - Unpack and Restart EDITPC Instruction
+;+
+; Functional Description:
+;
+;	This routine receives control when an EDITPC instruction is restarted. 
+;	The instruction state (stack and general registers) is restored to the 
+;	point where it was when the instruction (routine) was interrupted and 
+;	control is passed back to the top of the control loop or to another
+;	restart point.
+;
+; Input Parameters:
+;
+;     31               23               15               07            00
+;    +----------------+----------------+----------------+----------------+
+;    |           zero count            |             srclen              | : R0
+;    +----------------+----------------+----------------+----------------+
+;    |                              srcaddr                              | : R1
+;    +----------------+----------------+----------------+----------------+
+;    |  delta-srcaddr |    delta-PC    |      sign      |      fill      | : R2
+;    +----------------+----------------+----------------+----------------+
+;    |                              pattern                              | : R3
+;    +----------------+----------------+----------------+----------------+
+;    !   loop-count   |     state      |    saved-PSW   |   inisrclen    | : R4
+;    +----------------+----------------+----------------+----------------+
+;    |                              dstaddr                              | : R5
+;    +----------------+----------------+----------------+----------------+
+;
+;	Depending on where the exception occurred, some of these parameters 
+;	may not be relevant. They are nevertheless stored as if they were 
+;	valid to make this restart code as simple as possible.
+;
+;	These register fields are more or less architecturally defined. They 
+;	are strictly specified for a reserved operand fault (illegal pattern 
+;	operator) and it makes sense to use the same register fields for 
+;	access violations as well.
+;
+;		R0<07:00> - Current digit count in input string 
+;			(see EO_READ_CHAR below)
+;		R0<31:16> - Current zero count (loaded into R9)
+;		R1        - Address of next digit in input string
+;		R2<07:00> - Fill character
+;		R2<15:08> - Sign character (loaded into R4)
+;		R3        - Address of next pattern operator
+;		R5        - Address of next character in output character string
+;
+;	These register fields are specific to this implementation. 
+;
+;		R0<15:08> - Latest digit from input string (loaded into R7)
+;		R2<23:16> - Size of instruction (Unused by this routine)
+;		R2<31:24> - Delta srcaddr (used to compute saved R1)
+;		R4<07:00> - Initial digit count (stored in saved R0)
+;		R4<15:08> - Saved condition codes (stored in R11)
+;			PSL<N> - Source string has a minus sign
+;			PSL<Z> - All digits are zero so far
+;			PSL<V> - Nonzero digits have been lost
+;			PSL<C> - Significance
+;		R4<23:16> - State flags
+;			State field determines the restart point
+;		R4<31:24> - Loop count (loaded into R8)
+;
+;	00(SP) - Return PC from VAX$EDITPC routine
+;
+; Implicit Input:
+;
+;	Note that the initial "srclen" is checked for legality before any
+;	restartable exception can occur. This means that R0 LEQU 31, which
+;	leaves bits <15:5> free for storing intermediate state. In the case of
+;	an access violation, R0<15:8> is used to store the latest digit read
+;	from the input stream. In the case of an illegal pattern operator,
+;	R0<15:5> are not used so that the architectural requirement that
+;	R0<15:0> contain the current byte count is adhered to. 
+;
+; Output Parameters:
+;
+;	All of the registers are loaded, even if some of their contents are 
+;	not relevant to the particular point at which the instruction will be 
+;	restarted. This makes the output of this routine conditional on a 
+;	single thing, namely on whether the restart point is in one of the 
+;	pattern-specific routines or in the outer VAX$EDITPC routine. This
+;	comment applies especially to R7 and R8.
+;
+;	R0  - Current digit count in input string
+;	R1  - Address of next digit in input string
+;	R2  - Fill character
+;	R3  - Address of next pattern operator
+;	R4  - Sign character (stored in R2<15:8>)
+;	R5  - Address of next character to be stored in output character string
+;	R6  - Scratch
+;	R7  - Latest digit read from input packed decimal string
+;	R8  - Loop count
+;	R9  - Zero count (stored in R0<31:16>)
+;	R10 - Address of EDITPC_ACCVIO, this module's "condition handler"
+;	R11 - Condition codes
+;
+;	00(SP) - Saved R0
+;	04(SP) - Saved R1
+;	08(SP) - Saved R6
+;	12(SP) - Saved R7
+;	16(SP) - Saved R8
+;	20(SP) - Saved R9
+;	24(SP) - Saved R10
+;	28(SP) - Saved R11
+;	32(SP) - Return PC from VAX$EDITPC routine
+;
+; Side Effects:
+;
+;	R6 is assumed unimportant and is used as a scratch register by this 
+;	routine as soon as it is saved.
+;-
+
+VAX$EDITPC_RESTART::
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>	; Save them all
+	ESTABLISH_HANDLER	EDITPC_ACCVIO	; Reload R10 with handler address
+	MOVZBL	R0,R0				; Clear out R0<31:8>
+	MOVZBL	EDITPC_B_SIGN(SP),R4		; Put "sign" back into R4
+	EXTZV	#EDITPC_V_STATE,-
+		#EDITPC_S_STATE,-
+		EDITPC_B_STATE(SP),R6		; Put restart code into R6
+
+; The following two values are not used on all restart paths but R7 and R8
+; are loaded unconditionally to make this routine simpler. The most extreme 
+; example is that R7 gets recalculated below for the EDITPC_1 restart point.
+
+	MOVZBL	EDITPC_B_EO_READ_CHAR(SP),R7	; Get latest input digit
+	MOVZBL	EDITPC_B_LOOP_COUNT(SP),R8	; Restore loop count
+	CVTWL	EDITPC_W_ZERO_COUNT(SP),R9	; Reset zero count (R9 LSS 0)
+	MOVZBL	EDITPC_B_SAVED_PSW(SP),R11	; Restore saved condition codes
+
+; The next four instructions reconstruct the initial values of "srclen" and
+; "srcaddr" and store them on the stack just above the saved R6. These values
+; will be loaded into R0 and R1 when the instruction completes execution.
+; Note that these two instructions destroy information in the saved copy of
+; R4 so all of that information must be removed before these instructions
+; execute. 
+
+	MOVZBL	EDITPC_B_DELTA_SRCADDR(SP),EDITPC_L_SAVED_R1(SP)
+	SUBL3	EDITPC_L_SAVED_R1(SP),-
+		EDITPC_A_SRCADDR(SP),-
+		EDITPC_L_SAVED_R1(SP)
+	MOVZBL	EDITPC_B_INISRCLEN(SP),EDITPC_L_SAVED_R0(SP)
+
+; The top four longwords are discarded and control is passed to the restart
+; point obtained from the restart PC table. Note that there is an assumption
+; here that the first two restart points are different from the others in that
+; they do not have an additional return PC (TOP_OF_LOOP) on the stack.
+
+	ADDL	#EDITPC_L_SAVED_R0,SP	; Make saved registers R0, R1, R6, ...
+	CMPL	R6,#EDITPC_1_RESTART	; Check for restart in main routine
+	BLEQU	10$			; Branch if no return PC
+	PUSHAB	TOP_OF_LOOP		; Restart in some subroutine
+	BRB	20$			; Use common code to resume execution
+
+; EDITPC_1 is a restart point where R7 must contain the address of the byte
+; that contains the sign "digit". This address must be recalculated. Note that
+; this calculation overwrites the previous R7 restoration.
+
+10$:	EXTZV	#1,#4,R0,R7		; Get byte offset to end of string
+	ADDL	R1,R7			; Get address of byte containing sign
+
+20$:	MOVZWL	RESTART_PC_TABLE_BASE-2[R6],R6	; Convert code to PC offset
+	JMP	MODULE_BASE[R6]		; Get back to work
+
+	END_MARK_POINT		EDITPC_M_STATE
+
+	.END

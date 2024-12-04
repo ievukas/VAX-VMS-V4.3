@@ -1,0 +1,713 @@
+	.TITLE	SYS$IMGFIX - Address Fixup System Service
+	.IDENT	'V04-000'
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+
+;++
+; Facility:
+;
+;	Executive - Image Activator Completion Routines
+;
+; Abstract:
+;
+;	This module contains subroutines used by the image activator
+;	to perform address relocation after images have been activated.
+;
+; Environment:
+;
+;	Most of the code in this module runs in user mode but some routines 
+;	may also be called from exec mode.
+;
+	.SUBTITLE	History		
+;
+; Author:
+;
+;	Lawrence J. Kenah
+;
+; Creation Date:
+;
+;	19 March 1981
+;
+; Modified by:
+;
+;	V03-010	LJK0279		Lawrence J. Kenah	8-May-1984
+;		Miscellaneous cleanup. Remove temporary definition of
+;		SHL$B_SHL_SIZE. Put all code into YF$$SYSIMGACT program 
+;		section.
+;
+;	V03-009	LJK0270		Lawrence J. Kenah	31-Mar-1984
+;		Add code to call shareable image initialization routines.
+;
+;	V03-008	LJK0275		Lawrence J. Kenah	25-Mar-1984
+;		The size of SHL elements is variable. It depends on when
+;		the image was linked.
+;
+;	V03-007	LJK0238		Lawrence J. Kenah	26-Jul-1983
+;		Use new concept of image base address instead of first address
+;		into which image is mapped.
+;
+;	V03-006	LJK0218		Lawrence J. Kenah	28-Jun-1983
+;		Minor cleanup.
+;
+;	V03-005	LJK0200		Lawrence J. Kenah	14-Jun-1983
+;		Make changes that support new image activator
+;
+;		Base addresses of shareable images are now located by searching 
+;		the ICB list, a much simpler list than the master fixup vector 
+;		list. Routine COPY_SHL is no longer needed. All code that 
+;		existed to support a previous design for mapping shareable 
+;		images permanently into P1 space is also eliminated. Use
+;		IMG$ prefix for global entry point names. Eliminate prefix
+;		from routines that are local.
+;
+;	V03-004	LJK0195		Lawrence J. Kenah	9-Mar-1983
+;		Make so-called recursive activation capable of activating
+;		more than one image without dropping some fixups on the floor.
+;
+;	V03-003	LJK0192		Lawrence J. Kenah	7-Jan-1983
+;		Do poor man's recursive activation to support shareable
+;		images that reference other shareable images not known
+;		to the image header of the executable image.
+;
+;	V03-002	MLJ0099		Martin L. Jack,	20-Oct-1982  19:40
+;		Fix broken BSBWs.
+;
+;	V03-001	KDM0002		Kathleen D. Morse	28-Jun-1982
+;		Added $SSDEF.
+;
+;--
+
+	.SUBTITLE	Declarations
+
+; Include Files:
+
+	$IACDEF			; Image activator control flags
+	$IAFDEF			; Offsets into image activator fixup 
+				;  area within image file
+	$ICBDEF			; Image control block offsets
+	$IMAGCTXDEF		; Context of currently executing image
+	$IMGDEF			; Image activator status codes
+	$PSLDEF			; PSL field definitions and constants
+	$SETPRTDEF		; Argument list offsets for $SETPRT system service
+	$SHLDEF			; Offsets into shareable image list element
+
+	.SBTTL	EXE$IMGFIX	Address Relocation Fixup System Service
+;+
+; Functional Description:
+;
+;	This procedure is called after an image is activated but before it
+;	is called in order to allow address fixups to be performed in user
+;	access mode if the caller of the image so wishes. This prevents
+;	process destruction os security breaches if the image that has just
+;	been activated contains garbage or selected cleverness.
+;
+; Calling Sequence:
+;
+;	CALLS	#0,EXE$IMGFIX
+;
+; Implicit Input:
+;
+;	Address space of image just activated that contains fixup vectors
+;	that describe the address fixups that must be done.
+;
+; Implicit Output:
+;
+;	All appropriate locations are relocated to reflect the locations
+;	of each shareable image during this activation of the image.
+;
+; Completion Codes:
+;
+;	R0 low bit set => successful completion (SS$_NORMAL)
+;
+;	R0 low bit clear => error occurred 
+;
+;		Actual error status codes are returned by GET_BASE_ADDRESSES and
+;		PROCESS_FIXUP_LIST.
+;
+; Side Effects:
+;
+;	See the routine headers for the two functional routines for a
+;	description of the effects of this procedure.
+;-
+
+; Put all of this module into a separate pageable program section
+
+	.PSECT	YF$$SYSIMGACT	
+
+EXE$IMGFIX::
+	.WORD	^M<R2,R3,R4,R5>		; Save some registers
+	BSBB	GET_BASE_ADDRESSES	; Get base address of each image
+	BLBC	R0,10$			; Skip hard part if an error occurred
+	BSBW	PROCESS_FIXUP_LIST	; Do the actual relocation
+	BBC	#IMAGCTX$V_SETVECTOR,-
+		G^IAC$GL_IMAGCTX,10$	; Any vectors to set?
+	$IMGACT_S	0,0,0,-
+		IMGCTL=#IAC$M_SETVECTOR	; Let image activator set them
+10$:	BBC	#IMAGCTX$V_INITIALIZE,-
+		G^IAC$GL_IMAGCTX,20$	; Any routines to be called?
+	BSBW	INISHRIMG		; Find them and call them
+20$:	RET				; Return with final status
+
+	.SBTTL	GET_BASE_ADDRESSES - Locate Each Shareable Image
+;+
+; Functional Description:
+;
+;	This routine is called before the actual fixup operations are performed
+;	to determine the base address of each shareable image that has been
+;	mapped. If a shareable image in the fixup list has no corresponding
+;	entry of the same name in the master ICB list, an error is reported.
+;
+;	Note that the image activator has filled in the base address for SHL
+;	entry 0, the SHL associated with the image itself.
+;
+; Calling Sequence:
+;
+;	JSB	GET_BASE_ADDRESSES
+;
+; Input Parameters:
+;
+;	none
+;
+; Implicit Input:
+;
+;	Listheads for fixup vector list and ICB list
+;
+; Output Parameters:
+;
+;	none
+;
+; Implicit Output:
+;
+;	All SHL entries in the linked list of fixup vectors have base addresses
+;	of their associated shareable images stored in SHL$L_BASEVA.
+;
+; Completion Codes:
+;
+;	R0 = SS$_NORMAL
+;
+;		All base addresses were successfully stored.
+;
+;	R0 = IMG$_IMAGE_NOT_FOUND
+;
+;		A shareable image name in a SHL entry had no corresponding
+;		ICB. This means that the shareable image was not mapped,
+;		which indicates an inconsistency between SHL entries and
+;		image section descriptors in the image header of one of the
+;		images that was mapped.
+;
+; Side Effects:
+;
+;	R0 and R1 are destroyed
+;-
+
+GET_BASE_ADDRESSES:
+	MOVAL	G^<CTL$GL_FIXUPLNK-IAF$L_FIXUPLNK>,R5 ; Pick up listhead address
+
+10$:	MOVL	IAF$L_FIXUPLNK(R5),R5	; Get address of next fixup vector
+	BEQL	30$			; Return success if done
+	MOVL	IAF$L_SHRIMGCNT(R5),R2	; Count of SHL entries to R2
+	BEQL	10$			; None here. Get next fixup vector
+	ADDL3	R5,IAF$L_SHLSTOFF(R5),R3 ; Address of first SHL entry to R3
+	MOVZBL	SHL$B_SHL_SIZE(R3),R4	; Get size of each SHL element
+
+; By jumping into the middle of the loop, we are in effect skipping over
+; entry 0, whose base address was stored by the image activator when the
+; image was mapped.
+
+	BRB	25$
+
+20$:	MOVAB	SHL$T_IMGNAM(R3),R0	; Pass shareable image name in R0
+	BSBW	IMG$IS_IT_MAPPED	; Find associated SHL entry in ICB LIST
+	BLBC	R0,40$			; Quit if error occurred
+	MOVL	ICB$L_BASE_ADDRESS(R1),SHL$L_BASEVA(R3)
+					; Store base address
+25$:	ADDL2	R4,R3			; Point to next SHL entry
+	SOBGTR	R2, 20$			;  and do next entry
+
+	BRB	10$			; Go back and get next fixup vector
+
+30$:	MOVZWL	#SS$_NORMAL,R0		; Indicate success to caller
+40$:	RSB				;  and return
+
+	.SUBTITLE	IMG$IS_IT_MAPPED - Search ICB List for Shareable Image
+;+
+; Functional Description:
+;
+;	This routine searches the shareable image list associated with the
+;	executable image to determine whether a shareable image with a given
+;	name exists in the list. This routine is used to determine whether a
+;	shareable image has already been mapped. Is is also used to relate the
+;	relative shareable image list within a shareable image to the shareable
+;	image list associated with the executable image.
+;
+; Calling Sequence:
+;
+;	JSB	IMG$IS_IT_MAPPED
+;
+; Input Parameters:
+;
+;	R0 = address of counted (ASCIC) string of shareable image name
+;
+; Implicit Input:
+;
+;	IAC$GL_IMAGE_LIST - Doubly linked list of ICBs describing images
+;		that have already been mapped
+;
+; Output Parameters:
+;
+;	If successful, R1 contains the address of the image control block
+;	that describes the named image.
+;
+; Completion Codes:
+;
+;	R0 low bit set indicates success (SS$_NORMAL)
+;
+;	R0 low bit clear indicates failure (IMG$_IMAGE_NOT_FOUND)
+;
+;		This status indicates that no match occurred, implying that
+;		the shareable image in question has not yet been mapped.
+;
+;		The severity of this status depends on the caller. This routine
+;		is called by the image activator to determine whether an image
+;		has been mapped. If the image name is not found, then the image 
+;		activator maps the image. If this routine returns this status
+;		to the fixup code located earlier in this module, that is a
+;		fatal error indicating an inconsistence between shareable image
+;		lists inside fixup vectors and ISD lists in image headers.
+;-
+
+IMG$IS_IT_MAPPED::
+	PUSHR	#^M<R2,R3,R4,R5,R6,R7>	; Save some registers
+	MOVZBL	(R0)+,R4		; Save character count in R4
+	MOVL	R0,R5			; Save string address in R5
+
+	ASSUME	ICB$L_FLINK EQ 0
+
+	MOVAL	G^IAC$GL_IMAGE_LIST,R7	; Get address of ICB listhead
+	MOVL	R7,R6			; Copy it to a working register
+
+10$:	MOVL	ICB$L_FLINK(R6),R6	; Get address of next ICB
+	CMPL	R6,R7			; Check for end of list
+	BEQL	30$			; Equality indicates no more ICBs
+
+	CMPB	R4,ICB$T_IMAGE_NAME(R6)	; Do string sizes agree?
+	BNEQ	10$			; No, go get next ICB
+	CMPC3	R4,(R5),ICB$T_IMAGE_NAME+1(R6)	; Check strings for equality
+	BNEQ	10$			; Go get next ICB if no match
+	MOVL	R6,R1			; Store ICB address
+
+	MOVL	#SS$_NORMAL,R0		; Indicate success to caller
+20$:	POPR	#^M<R2,R3,R4,R5,R6,R7>	; Restore registers
+	RSB				;  and return
+
+; If we loop through the entire ICB list without matching the image name, then
+; the shareable image has not yet been mapped. Indicate that to caller.
+
+30$:	MOVL	#IMG$_IMAGE_NOT_FOUND,R0
+	CLRL	R1
+	BRB	20$
+
+	.SBTTL	PROCESS_FIXUP_LIST - Perform Post-Activation Fixups
+;+
+; Functional Description:
+;
+;	This routine processes a linked list of fixup vectors and performs
+;	the specific fixup operations listed in each vector. There are three
+;	forms of fixup. 
+;
+;		o  Each exit vector has the base address of the shareable
+;		   image added to each entry.
+;
+;		o  Each .ADDRESS directive has the base address of the 
+;		   appropriate shareable image added to it.
+;
+;		o  The protection of each fixup vector is changed to prevent
+;		   its being written when the image executes.
+;
+; Calling Sequence:
+;
+;	JSB	PROCESS_FIXUP_LIST 
+;
+; Input Parameters:
+;
+;	none
+;
+; Implicit Input:
+;
+;	CTL$GL_FIXUPLNK		Listhead of linked list of fixup vectors for
+;				a set of shareable images
+;
+; Output Parameters:
+;
+;	none
+;
+; Implicit Output:
+;
+;	Elements in fixup vector G-hat offset area have base address
+;	of appropriate shareable image added to them.
+;
+;	.ADDRESS directives throughout the address space have base
+;	addresses added in.
+;
+;	Pages that should eventually be read-only but were set to
+;	writable while the image activator works are set back to read-only.
+;
+; Completion Codes:
+;
+;	none
+;
+; Side Effects:
+;
+;	CTL$GL_FIXUPLNK cleared after fixups are completed.
+;
+;--
+
+PROCESS_FIXUP_LIST:
+	MOVAL	G^<CTL$GL_FIXUPLNK-IAF$L_FIXUPLNK>,R5 ; Pick up listhead address
+
+10$:	MOVL	IAF$L_FIXUPLNK(R5),R5	; Get address of next fixup vector
+	BEQL	40$			; Quit if no more to process
+	CLRL	R1			; Need base address of this shareable
+	BSBW	SHIMG_BASVA		;  image (with index 0) 
+	MOVL	R1,R3			; Load correct input register
+	MOVL	IAF$L_G_FIXOFF(R5),R4	; Get offset to G-hat fixup data
+	BEQL	20$			; Skip this step if none
+	ADDL2	R5,R4			; Make an address
+	BSBW	FIXUP_G_HAT		; Go do the actual work
+20$:	MOVL	IAF$L_DOTADROFF(R5),R4	; Get offset to .ADDRESS fixup data
+	BEQL	30$			; Skip this step if none
+	ADDL2	R5,R4			; Make an address
+	BSBW	FIXUP_ADDRESS		; Fixup all .ADDRESS data
+30$:	MOVL	IAF$L_CHGPRTOFF(R5),R4	; Get offset to page protection data
+	BEQL	10$			; Skip this step if none
+	ADDL2	R5,R4			; Make an address
+	BSBW	FIXUP_PROT		; Change page protection
+	BRB	10$			; All done with this fixup vector
+					;  See if there are any more
+40$:	RSB				; Return to caller
+
+	.SBTTL	FIXUP_G_HAT	Fixup G-hat exit vector
+;+
+; Functional Description:
+;
+;	This routine performs the G-hat fixup for a specific exit vector.
+;	specifically, the base address of the appropriate shareable image
+;	is added to each entry in the exit vector.
+;
+; Calling Sequence:
+;
+;	BSBW	FIXUP_G_HAT
+;
+; Input Parameters:
+;
+;	R4 = Address of G-hat fixup area within fixup vector
+;
+; Implicit Input:
+;
+;	Contents of G-hat fixup area
+;
+; Output Parameters:
+;
+;	none
+;
+; Implicit Output:
+;
+;	Elements in fixup vector G-hat offset area have base address
+;	  of appropriate shareable image added to them.
+;
+; Completion Codes:
+;
+;	none
+;
+; Side Effects:
+;
+;	R0, R1, and R2 are destroyed
+;-
+
+FIXUP_G_HAT:
+	MOVL	(R4)+,R2		; R2 contains a count of fixups
+	BEQL	20$			; A zero indicates the end of the G-hat data
+	MOVL	(R4)+,R1		; Store shareable image number in R1
+	BSBB	SHIMG_BASVA		;  and then load R1 with base address 
+					;  of next shareable image. 
+10$:	ADDL2	R1,(R4)+		; Bias next exit vector entry
+	SOBGTR	R2,10$			; Do next entry
+	BRB	FIXUP_G_HAT		; Now do next shareable image
+
+20$:	MOVZWL	#SS$_NORMAL,R0		; Indicate success
+	RSB				; Return
+
+	.SBTTL	SHIMG_BASVA	Convert a shareable image index to an address
+;+
+; Functional Description:
+;
+;	This routine converts a relative shareable image number into the
+;	absolute base address at which that shareable image is mapped. It
+;	assumes that the base address of each shareable image has already
+;	been stored in its associated SHL entry.
+;
+; Calling Sequence:
+;
+;	BSBW	SHIMG_BASVA
+;
+; Input Parameters:
+;
+;	R1 = Relative number of shareable image
+;	R5 = Base address of fixup vector
+;
+; Implicit Input:
+;
+;	Contents of SHL$L_BASEVA for shareable image indexed by R1.
+;
+; Output Parameters:
+;
+;	R1 = Base address of shareable image indicated by input parameter
+;
+; Side Effects:
+;
+;	R0 is destroyed
+;-
+
+SHIMG_BASVA:
+	ADDL3	R5,IAF$L_SHLSTOFF(R5),R0 ; Base address of shareable image list
+	MOVZBL	SHL$B_SHL_SIZE(R0),-(SP) ; Get size of each SHL element
+	EMUL	(SP)+,R1,R0,R0		; R0 points to correct SHL entry
+	MOVL	SHL$L_BASEVA(R0),R1	; Store associated base address
+	RSB				;  and return
+
+	.SBTTL	FIXUP_ADDRESS	Fixup .ADDRESS entries throughout the image
+;+
+; Functional Description:
+;
+;	This routine performs the .ADDRESS fixup for a specific exit vector.
+;	Specifically, the base address of the appropriate shareable image
+;	is added to each .ADDRESS entry in this shareable image.
+;
+; Calling Sequence:
+;
+;	BSBW	FIXUP_ADDRESS
+;
+; Input Parameters:
+;
+;	R3 = Base address of shareable image whose .ADDRESS directives
+;		are being fixed
+;	R4 = Address of .ADDRESS fixup area within fixup vector
+;
+; Implicit Input:
+;
+;	Contents of .ADDRESS fixup area
+;
+; Implicit Output:
+;
+;	.ADDRESS directives within this shareable image have the base addresses
+;	of the appropriate shareable images added to them.
+;-
+
+FIXUP_ADDRESS:
+	MOVL	(R4)+,R2		; R2 contains a count of fixups
+	BEQL	20$			; A zero indicates the end of the G-hat data
+	MOVL	(R4)+,R1		; Store shareable image number in R1
+	BSBB	SHIMG_BASVA		;  and then load R1 with base address 
+					;  of next shareable image. 
+10$:	ADDL3	R3,(R4)+,R0		; Get address of .ADDRESS directive
+	ADDL2	R1,(R0)			; Bias by base address of shareable image
+	SOBGTR	R2,10$			; Do next entry
+	BRB	FIXUP_ADDRESS		; Now do next shareable image
+
+20$:	MOVZWL	#SS$_NORMAL,R0		; Indicate success
+	RSB				; Return
+
+	.SBTTL	FIXUP_PROT	Alter page protection to read only
+;+
+; Functional Description:
+;
+;	This routine alters the page protection of various sections within
+;	the image to read only. These pages were initially writable so the
+;	image activator could fixup all of the relative references. The pages
+;	cannot be writable while the image is executing.
+;
+; Calling Sequence:
+;
+;	BSBW	FIXUP_PROT
+;
+; Input Parameters:
+;
+;	R3 = Base address of image whose pages' protection is being altered
+;	R4 = Address of protection data within fixup vector
+;
+; Implicit Input:
+;
+;	Contents of protection data in fixup vector
+;
+; Implicit Output:
+;
+;	Pages in address ranges specified in fixup vector have their protections
+;	changed to the protections also specified in that data area. The
+;	protection is usually no write access for any access mode.
+;
+; Side Effects:
+;
+;	R0, R1, and R2 are destroyed
+;-
+
+FIXUP_PROT:
+	PUSHL	R6			; Need one more register here
+	SUBL2	#<4*SETPRT$_NARGS>,SP	; Set up space for argument list
+	PUSHL	#SETPRT$_NARGS		; Push argument count
+	MOVL	SP,R6			; Use R6 as argument pointer
+	CLRQ	-(SP)			; Initialize input address array
+	MOVL	SP,SETPRT$_INADR(R6)	; Put its address into argument list
+	CLRL	SETPRT$_RETADR(R6)	; Not interested in this argument
+	MOVL	#PSL$C_EXEC,SETPRT$_ACMODE(R6) ; The image activator owns these pages
+	CLRL	SETPRT$_PRVPRT(R6)	; Not interested in this either
+	MOVZWL	#SS$_NORMAL,R0		; Establish initial status
+	MOVL	(R4)+,R2		; Get count of number of protection changes
+	BEQL	20$			; Do not even start if nothing here
+10$:	ADDL3	R3,(R4)+,(SP)		; Get starting address
+	MOVZWL	(R4)+,R1		; Ending address must be calculated
+	ASHL	#9,R1,R1		;  ... from page count in image section
+	DECL	R1			; Make byte count an inclusive count
+	ADDL3	R1,(SP),4(SP)		; Put ending address in second longword
+	MOVZWL	(R4)+,SETPRT$_PROT(R6)	; Get new protection from fixup vector
+	CALLG	(R6),G^SYS$SETPRT	; Call the system service
+					; Ignore errors
+	SOBGTR	R2,10$			; Go get next image section
+
+20$:	ADDL2	#<8+4+<4*SETPRT$_NARGS>>,SP ;Reset stack pointer,
+	POPL	R6			;  restore that extra register,
+	RSB				;  and return
+
+	.SBTTL	IMG$PRVSHRIMG	Fixup Routine for Privileged Shareable Images
+;+
+; Functional Description:
+;
+;	This routine checks that a privileged shareable image has no 
+;	outbound calls. For images passing this test, remaining
+;	.ADDRESS fixups are performed.
+;
+; Calling Sequence:
+;
+;	BSBW	IMG$PRVSHRIMG
+;
+; Input Parameters:
+;
+;	R0	Address of fixup vector
+;	R1	Base address of privileged shareable image currently
+;		being mapped
+;
+; Implicit Output:
+;
+;	If the fixup vector indicates no outbound calls, the base address
+;	of the privileged shareable image is stored in the fixup vector
+;	and the .ADDRESS fixups are performed.
+;
+; Side Effects:
+;
+;	R0 and R1 are destroyed
+;
+; Completion Codes:
+;
+;	SS$_NORMAL	Fixups were completed for privileged shareable image
+;
+;	SS$_NOSHRIMG	Shareable image has outbound calls
+;-
+
+IMG$PRVSHRIMG::
+	PUSHR	#^M<R2,R3,R4,R5>	; Save some registers
+	MOVL	R0,R5			; Store fixup vector address in R5
+	SUBL3	#1,IAF$L_SHRIMGCNT(R5),R0	; Is shareable imagc count 1?
+	BNEQ	30$			; If not, report error
+	TSTL	IAF$L_G_FIXOFF(R5)	; Also report error if G^ fixup data
+	BNEQ	30$
+	MOVL	R1,R3			; Store base address of image in R3
+	ADDL3	R5,IAF$L_SHLSTOFF(R5),R0	; Also store base address in
+	MOVL	R1,SHL$L_BASEVA(R0)	;  SHL entry for SHIMG_BASVA
+	MOVL	IAF$L_DOTADROFF(R5),R4	; Any .ADDRESS fixups?
+	BEQL	10$			; Branch if none
+	ADDL2	R5,R4			; Convert R4 offset to address
+	BSBW	FIXUP_ADDRESS		; Fixup all .ADDRESS data
+10$:	MOVL	IAF$L_CHGPRTOFF(R5),R4	; Get offset to protection data
+	BEQL	20$			; All done if none
+	ADDL2	R5,R4			; Make R4 an address
+	BSBW	FIXUP_PROT		; Change page protection
+20$:	POPR	#^M<R2,R3,R4,R5>	; Restore registers
+	RSB				;  and return
+
+30$:	MOVZWL	#SS$_NOSHRIMG,R0	; No outbound calls allowed
+	BRB	20$			; Return error status
+
+	.SBTTL	INISHRIMG - Look for and Call Shareable Image Initialization Code
+;+
+; Functional Description:
+;
+;	This routine searches the shareable image list for images that have 
+;	included initialization code.
+;
+; Calling Sequence:
+;
+;	BSBW	INISHRIMG
+;
+; Input Parameters:
+;
+;	none
+;
+; Implicit Input:
+;
+;	IAC$GL_IMAGE_LIST - List of ICBs describing shareable images that 
+;		are currently mapped.
+;	IAC$GL_FIRST_ICB - Address of ICB representing main image in the
+;		most recent image activation.
+;
+; Implicit Output:
+;
+;	If there are any images with ICBs containing shareable image 
+;	initialization code, these procedures are called at their entry 
+;	points. Note that the ICB list is traversed backwards.
+;
+; Side Effects:
+;
+;	R0 and R1 are destroyed
+;
+; Completion Codes:
+;
+;	none
+;-
+
+INISHRIMG:
+	MOVQ	R2,-(SP)		; Save some registers
+	MOVAL	G^IAC$GL_IMAGE_LIST,R2	; Get the listhead address
+	MOVL	G^IAC$GL_FIRST_ICB,R3	; This is the stopper
+
+10$:	MOVL	ICB$L_BLINK(R2),R2	; Get the next ICB
+	BBC	#ICB$V_INITIALIZE,-	; Does this image need to be called?
+		ICB$L_FLAGS(R2),20$	;  Branch if no initialization routine
+	ADDL3	ICB$L_INITIALIZE(R2),-	; Form the address of the entry point
+		ICB$L_BASE_ADDRESS(R2),R1
+	CALLS	#0,(R1)			; Call the routine
+20$:	CMPL	R2,R3			; Is this the end of the line?
+	BNEQ	10$			; Back to the top is there's more
+	MOVQ	(SP)+,R2		; Restore R2 and R3
+	RSB				; All done. Return to caller.
+
+	.END

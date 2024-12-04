@@ -1,0 +1,736 @@
+MODULE RENAME (	%TITLE 'VAX/VMS RENAME Utility'
+		IDENT = 'V04-000',
+		MAIN = RENAME_MAIN
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	VAX/VMS RENAME Utility
+!
+! ABSTRACT:
+!
+!	This utility renames files and directories.
+!
+! ENVIRONMENT:	VAX/VMS Operating System, non-privileged user mode
+!
+! AUTHOR: Steven B. Lionel, CREATION DATE: 04-Oct-1982
+!
+!	  Adapted from RENAME V03-000, written by Greg Robert
+!
+! MODIFIED BY:
+!
+!	03-004	BLS0282		Benn Schreiber		 5-MAR-1984
+!		Use new argument to lib$delete_file for related file
+!		processing.
+!
+!	3B-003	SBL3003		Steven B. Lionel	11-Feb-1983
+!		/UIC is now /BYOWNER.  
+!
+!	3B-002	SBL3002		Steven B. Lionel	19-Jan-1983
+!		Remove special case RMS$_FEX code since $RENAME now
+!		correctly handles this.
+!
+!	3B-001	SBL3001		Steven B. Lionel	4-Oct-1982
+!		Rewritten from RENAME V03-000 to use new CLI interface,
+!		LIB$RENAME_FILE, and file selection qualification routines.
+!
+!--
+
+
+%SBTTL 'Declarations'
+!
+! SWITCHES:
+!
+
+SWITCHES ADDRESSING_MODE (EXTERNAL = GENERAL, NONEXTERNAL = WORD_RELATIVE);
+
+!
+! LINKAGES:
+!
+!	NONE
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+    RENAME_MAIN,				! Main routine
+    CONFIRM_ROUTINE,				! Confirm file to be renamed
+    LOG_ROUTINE: NOVALUE,			! Log successful renames
+    ERROR_ROUTINE,				! Report errors
+    ERROR_HANDLER;				! Intercept signalled errors
+
+!
+! INCLUDE FILES:
+!
+
+LIBRARY 'SYS$LIBRARY:STARLET';			! System symbols
+
+!
+! MACROS:
+!
+!	NONE
+!
+! EQUATED SYMBOLS:
+!
+
+!+
+! Define shared messages needed by RENAME.
+!-
+
+$SHR_MSGDEF (MSG, 144, LOCAL,
+    (NOFILES, INFO),	! No files selected
+    (OPENIN, ERROR),	! Error opening input file
+    (OPENOUT, ERROR),	! Error opening output file
+    (RENAMED, INFO),	! File renamed
+    (SEARCHFAIL, ERROR)	! Could not find file
+    );
+
+!
+! FIELDS:
+!
+
+!+
+! Data structure LOCAL_BLOCK (defined by LB_FIELDS) is passed as the
+! "user_argument" to LIB$RENAME_FILE, and thus to each of the action
+! routines.
+!-
+
+FIELD
+    LB_FIELDS =
+	SET
+
+	LB_L_WORST_ERROR 	= [0,0,32,0],	! Worst error so far
+	LB_L_QUAL_CONTEXT	= [4,0,32,0],	! Context for LIB$QUAL_xxx
+	LB_L_FLAGS		= [8,0,32,0],	! Flags
+	LB_V_LOG		= [8,0,1,0],	! Set if /LOG specified
+	LB_V_FILE_SELECTED	= [8,1,1,0]	! At least one file was renamed
+
+	TES;
+LITERAL
+    LB_K_SIZE = 12;				! Size of LOCAL_BLOCK in bytes
+
+!
+! PSECTS:
+!
+
+PSECT
+    CODE = $CODE (READ, NOWRITE, EXECUTE, SHARE, PIC, 
+	ADDRESSING_MODE (WORD_RELATIVE)),
+    PLIT = $CODE (READ, NOWRITE, EXECUTE, SHARE, PIC, 
+	ADDRESSING_MODE (WORD_RELATIVE)),
+    OWN  = $DATA (READ, WRITE, NOEXECUTE, NOSHARE, PIC, 
+	ADDRESSING_MODE (LONG_RELATIVE)),
+    GLOBAL = $DATA (READ, WRITE, NOEXECUTE, NOSHARE, PIC, 
+	ADDRESSING_MODE (LONG_RELATIVE));
+
+!
+! OWN STORAGE:
+!
+!	NONE
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL ROUTINE
+    CLI$GET_VALUE,				! Get value from command line
+    CLI$PRESENT,				! Is qualifier present?
+    LIB$RENAME_FILE,				! Rename files
+    LIB$QUAL_FILE_MATCH,			! Match selection qualifiers
+    LIB$QUAL_FILE_PARSE;			! Parse selection qualifiers
+
+EXTERNAL LITERAL
+    LIB$_FILFAIMAT,				! File failed to match qualifiers
+    LIB$_QUICONACT,				! Quit confirm action
+    LIB$_QUIPRO,				! Quit processing
+    RENAME$_NOTRENAMED,				! File not renamed
+    RENAME$_NOTSAMEDEV;				! Can't rename across devices
+
+
+%SBTTL 'RENAME_MAIN - Main routine'
+ROUTINE RENAME_MAIN =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This is the main routine for RENAME.  It calls LIB$QUAL_FILE_PARSE
+!	to parse the file selection qualifiers, sets up the local storage
+!	block, and calls LIB$RENAME_FILE to do the work.  LIB$RENAME_FILE
+!	will call other routines in this module as action routines to
+!	process the command.  Upon return from LIB$RENAME_FILE, the most
+!	severe error status will be returned as the exit status of RENAME
+!
+! CALLING SEQUENCE:
+!
+!	ret_status.wlc.v = RENAME ()
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	Command line
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS:
+!
+!	SS$_NORMAL	Normal successful completion
+!	RENAME$_NOFILES No files selected
+!	Other		Worst error encountered
+!
+! SIDE EFFECTS:
+!
+!	Renames one or more files.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	LOCAL_BLOCK: VOLATILE BLOCK [LB_K_SIZE, BYTE] FIELD (LB_FIELDS),
+	QUAL_FLAGS,				! Qualifier select flags
+	RENAME_FLAGS,				! Flags for LIB$RENAME_FILE
+ 	OLD_NAME_DSC: BLOCK [8, BYTE],		! Old name descriptor
+	NEW_NAME_DSC: BLOCK [8, BYTE],		! New name descriptor
+	OLD_RSN_DSC: BLOCK [8, BYTE],		! Old RSN descriptor
+	NEW_RSN_DSC: BLOCK [8, BYTE],		! New RSN descriptor
+	CLI_STRING_DSC: BLOCK [8, BYTE],	! Qualifier and parameter names
+	FILESCAN_CONTEXT,			! Related file context pointer
+	STATUS1;				! Return statuse
+
+    !+
+    ! Enable error handler which will keep track of the worst error
+    ! encountered so far.  It will also unwind to the caller of RENAME
+    ! (the CLI) if the status LIB$_QUIPRO is signalled.  Note that because
+    ! LOCAL_BLOCK is a VOLATILE enable argument, BLISS zeroes it for us.
+    !-
+
+    ENABLE
+	ERROR_HANDLER (LOCAL_BLOCK);
+
+    !+
+    ! Set up strings and descriptors.  All strings are dynamic.
+    !-
+
+    FILESCAN_CONTEXT = 0;
+    OLD_RSN_DSC [DSC$W_LENGTH] = 0;
+    OLD_RSN_DSC [DSC$B_DTYPE] = DSC$K_DTYPE_T;
+    OLD_RSN_DSC [DSC$B_CLASS] = DSC$K_CLASS_D;
+    OLD_RSN_DSC [DSC$A_POINTER] = 0;
+    NEW_RSN_DSC [DSC$W_LENGTH] = 0;
+    NEW_RSN_DSC [DSC$B_DTYPE] = DSC$K_DTYPE_T;
+    NEW_RSN_DSC [DSC$B_CLASS] = DSC$K_CLASS_D;
+    NEW_RSN_DSC [DSC$A_POINTER] = 0;
+    OLD_NAME_DSC [DSC$W_LENGTH] = 0;		! Initially zero length
+    OLD_NAME_DSC [DSC$B_DTYPE] = DSC$K_DTYPE_T;	! Text
+    OLD_NAME_DSC [DSC$B_CLASS] = DSC$K_CLASS_D;	! Dynamic
+    OLD_NAME_DSC [DSC$A_POINTER] = 0;		! No allocation
+    NEW_NAME_DSC [DSC$W_LENGTH] = 0;		! Initially zero length
+    NEW_NAME_DSC [DSC$B_DTYPE] = DSC$K_DTYPE_T;	! Text
+    NEW_NAME_DSC [DSC$B_CLASS] = DSC$K_CLASS_D;	! Dynamic
+    NEW_NAME_DSC [DSC$A_POINTER] = 0;		! No allocation
+    CLI_STRING_DSC [DSC$B_DTYPE] = DSC$K_DTYPE_T;
+    CLI_STRING_DSC [DSC$B_CLASS] = DSC$K_CLASS_S;
+
+    !+
+    ! Indicate which qualifiers we want parsed.
+    !-
+
+    QUAL_FLAGS = LIB$M_CQF_CONFIRM + 
+		 LIB$M_CQF_EXCLUDE +
+		 LIB$M_CQF_BEFORE +
+		 LIB$M_CQF_SINCE +
+		 LIB$M_CQF_CREATED +
+		 LIB$M_CQF_MODIFIED +
+		 LIB$M_CQF_EXPIRED +
+		 LIB$M_CQF_BACKUP +
+		 LIB$M_CQF_BYOWNER;
+
+    !+
+    ! Parse file selection qualifiers and save context.
+    !-
+
+    LIB$QUAL_FILE_PARSE (QUAL_FLAGS, LOCAL_BLOCK [LB_L_QUAL_CONTEXT]);
+
+    !+
+    ! See if /LOG was specified.
+    !-
+
+    CLI_STRING_DSC [DSC$W_LENGTH] = %CHARCOUNT ('LOG');
+    CLI_STRING_DSC [DSC$A_POINTER] = UPLIT BYTE ('LOG');
+    IF CLI$PRESENT (CLI_STRING_DSC)
+    THEN
+	LOCAL_BLOCK [LB_V_LOG] = 1;
+
+    !+
+    ! See if /NONEW_VERSION was specified.
+    !-
+
+    CLI_STRING_DSC [DSC$W_LENGTH] = %CHARCOUNT ('NEW_VERSION');
+    CLI_STRING_DSC [DSC$A_POINTER] = UPLIT BYTE ('NEW_VERSION');
+    RENAME_FLAGS = 0;
+    IF NOT CLI$PRESENT (CLI_STRING_DSC)
+    THEN
+	RENAME_FLAGS = 1;	! SET V_NONEW_VERSION bit
+
+    !+
+    ! Get new filename, since there can only be one.
+    !-
+
+    CLI_STRING_DSC [DSC$W_LENGTH] = %CHARCOUNT ('P2');
+    CLI_STRING_DSC [DSC$A_POINTER] = UPLIT BYTE ('P2');
+    CLI$GET_VALUE (CLI_STRING_DSC, NEW_NAME_DSC);
+
+    !+
+    ! Until all "old" filespecs are processed, get the next old filespec
+    ! and call LIB$RENAME_FILE for each one.  Use the previous old resultant
+    ! filename as the related filename for each iteration.
+    !-
+
+    CLI_STRING_DSC [DSC$W_LENGTH] = %CHARCOUNT ('P1');
+    CLI_STRING_DSC [DSC$A_POINTER] = UPLIT BYTE ('P1');
+    WHILE (CLI$GET_VALUE (CLI_STRING_DSC, OLD_NAME_DSC)) DO
+	BEGIN
+	STATUS1 = LIB$RENAME_FILE (
+	    OLD_NAME_DSC,		! Old name
+	    NEW_NAME_DSC,		! New name
+	    0,				! No default name
+	    0,				! Related name - previous old RSN
+	    RENAME_FLAGS,		! Rename flags
+	    LOG_ROUTINE,		! Log routine
+	    ERROR_ROUTINE,		! Error routine
+	    CONFIRM_ROUTINE,		! Confirm routine
+	    LOCAL_BLOCK,		! User argument
+	    OLD_RSN_DSC,		! Old resultant name
+	    NEW_RSN_DSC,		! New resultant name
+	    FILESCAN_CONTEXT);		! Related file context
+
+	IF NOT .STATUS1
+	THEN
+	    SIGNAL_STOP (.STATUS1);
+	END;
+
+    !+
+    ! If an error occurred, return the worst error.
+    ! If no files were selected, return an informational to that effect.
+    !-
+
+    IF .LOCAL_BLOCK [LB_L_WORST_ERROR] NEQ 0
+    THEN
+	RETURN .LOCAL_BLOCK [LB_L_WORST_ERROR];
+
+    IF NOT .LOCAL_BLOCK [LB_V_FILE_SELECTED]
+    THEN
+	BEGIN
+	SIGNAL (MSG$_NOFILES);	! Display message "no files selected"
+	RETURN MSG$_NOFILES;	! Won't get displayed again
+	END;
+
+    RETURN SS$_NORMAL;
+
+    END;					! End of routine RENAME_MAIN
+
+%SBTTL 'CONFIRM_ROUTINE - Confirm that rename should be done'
+ROUTINE CONFIRM_ROUTINE (
+    OLD_RSN: REF BLOCK [, BYTE],	! Old resultant string descriptor
+    NEW_RSN: REF BLOCK [, BYTE],	! New resultant string descriptor
+    FAB: REF BLOCK [, BYTE],		! File's FAB
+    LOCAL_BLOCK: REF BLOCK [LB_K_SIZE, BYTE] FIELD (LB_FIELDS)
+    ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called by LIB$RENAME_FILE to confirm that the
+!	file described by FAB should be renamed.
+!
+! CALLING SEQUENCE:
+!
+!	confirm.wv.v = CONFIRM_ROUTINE (OLD_RSN.rt.dd, NEW_RSN.rt.dd,
+!			FAB.rr.r, LOCAL_BLOCK.mr.r)
+!
+! FORMAL PARAMETERS:
+!
+!	OLD_RSN		- Old resultant name.
+!
+!	NEW_RSN		- New resultant name.
+!
+!	FAB		- FAB that describes file to be renamed.
+!
+!	LOCAL_BLOCK	- Block of local information.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	TRUE if file should be renamed
+!	FALSE if file should not be renamed
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	PROMPT_ARGS: VECTOR [2, LONG],		! FAO argument list for prompt
+	PROMPT_DSC: BLOCK [8, BYTE],		! Descriptor for prompt string
+	MATCH_STATUS;				! Status from QUAL_FILE_MATCH
+
+    !+
+    ! Set up PROMPT_ARGS and PROMPT_DSC.
+    !-
+    
+    PROMPT_ARGS [0] = OLD_RSN [0,0,0,0];	! Descriptor address
+    PROMPT_ARGS [1] = NEW_RSN [0,0,0,0];	! Descriptor address
+    PROMPT_DSC [DSC$B_DTYPE] = DSC$K_DTYPE_T;
+    PROMPT_DSC [DSC$B_CLASS] = DSC$K_CLASS_S;
+    PROMPT_DSC [DSC$W_LENGTH] = %CHARCOUNT ('!AS --> !AS ? (Y,N,Q,All): ');
+    PROMPT_DSC [DSC$A_POINTER] = UPLIT BYTE ('!AS --> !AS ? (Y,N,Q,All): ');
+
+    !+
+    ! Call LIB$QUAL_FILE_MATCH to see if this file meets the criteria.
+    !-
+
+    MATCH_STATUS = LIB$QUAL_FILE_MATCH (
+	LOCAL_BLOCK [LB_L_QUAL_CONTEXT],
+	FAB [0,0,0,0],
+	0,		! File name omitted
+	PROMPT_DSC,
+	PROMPT_ARGS,
+	0);		! Prompt routine omitted
+
+    !+
+    ! If a failure status other than "failed to match" was returned,
+    ! signal it.  If it is LIB$_QUIPRO, ERROR_HANDLER will unwind back to
+    ! the CLI with a success status.
+    !-
+
+    IF NOT .MATCH_STATUS 
+    THEN
+	IF .MATCH_STATUS NEQU LIB$_FILFAIMAT
+	THEN
+	    IF (.MATCH_STATUS EQLU LIB$_QUIPRO) OR (.FAB [FAB$L_STS])
+	    THEN
+		SIGNAL (.MATCH_STATUS)
+	    ELSE
+		BEGIN
+		!+
+		! LIB$QUAL_FILE_MATCH couldn't open the file.
+		! Signal "error opening file".
+		!-
+
+		LOCAL
+		    NAM: REF BLOCK [, BYTE],
+		    RSN_DESCR: BLOCK [8, BYTE];
+		NAM = .FAB [FAB$L_NAM];
+		RSN_DESCR [DSC$B_DTYPE] = DSC$K_DTYPE_T;
+		RSN_DESCR [DSC$B_CLASS] = DSC$K_CLASS_S;
+		RSN_DESCR [DSC$W_LENGTH] = .NAM [NAM$B_RSL];
+		RSN_DESCR [DSC$A_POINTER] = .NAM [NAM$L_RSA];
+		SIGNAL (MSG$_OPENIN, 1, RSN_DESCR,
+		    .FAB [FAB$L_STS], .FAB [FAB$L_STV]);
+		END;
+
+    !+
+    ! If this file was selected, indicate that in LOCAL_BLOCK.
+    !-
+
+    IF .MATCH_STATUS
+    THEN
+	LOCAL_BLOCK [LB_V_FILE_SELECTED] = 1;
+
+    !+
+    ! Return to LIB$RENAME_FILE with match status.
+    !-
+
+    RETURN .MATCH_STATUS;
+
+    END;					! End of routine CONFIRM_ROUTINE
+
+%SBTTL 'LOG_ROUTINE - Log successful rename'
+ROUTINE LOG_ROUTINE (
+    OLD_RSN: REF BLOCK [, BYTE],	! Old resultant name
+    NEW_RSN: REF BLOCK [, BYTE],	! New resultant name
+    LOCAL_BLOCK: REF BLOCK [LB_K_SIZE, BYTE] FIELD (LB_FIELDS)
+    ): NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called by LIB$RENAME_FILE after a successful
+!	rename.  If /LOG was specified, a message indicating the names
+!	of the files renamed is displayed.
+!
+! CALLING SEQUENCE:
+!
+!	CALL LOG_ROUTINE (OLD_RSN.rt.dd, NEW_RSN.rt.dd,
+!			LOCAL_BLOCK.mr.r)
+!
+! FORMAL PARAMETERS:
+!
+!	OLD_RSN		- Old resultant name.
+!
+!	NEW_RSN		- New resultant name.
+!
+!	LOCAL_BLOCK	- Block of local information.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    !+
+    ! If /LOG was specified, log the rename.
+    !-
+
+    IF .LOCAL_BLOCK [LB_V_LOG]
+    THEN
+	SIGNAL (MSG$_RENAMED, 2, OLD_RSN [0,0,0,0], NEW_RSN [0,0,0,0]);
+
+    RETURN;
+
+    END;					! End of routine LOG_ROUTINE
+
+%SBTTL 'ERROR_ROUTINE - Report failed rename'
+ROUTINE ERROR_ROUTINE (
+    OLD_RSN: REF BLOCK [, BYTE],	! Old resultant name
+    NEW_RSN: REF BLOCK [, BYTE],	! New resultant name
+    RMS_STS: REF BLOCK [, BYTE],	! RMS STS status code
+    RMS_STV: REF BLOCK [, BYTE],	! RMS STV status code
+    ERROR_SOURCE: REF VECTOR [, LONG],	! Source of error code
+    LOCAL_BLOCK: REF BLOCK [LB_K_SIZE, BYTE] FIELD (LB_FIELDS)
+    ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called by LIB$RENAME_FILE after a failed
+!	rename.  The error message is signalled.  
+!
+! CALLING SEQUENCE:
+!
+!	status.wlc.v = ERROR_ROUTINE (OLD_RSN.rt.dd, NEW_RSN.rt.dd,
+!			RMS_STS.rlc.r, RMS_STV.rlc.r, 
+!			ERROR_SOURCE.rl.r, LOCAL_BLOCK.mr.r)
+!
+! FORMAL PARAMETERS:
+!
+!	OLD_RSN		- Old resultant name.
+!
+!	NEW_RSN		- New resultant name.
+!
+!	RMS_STS		- The RMS STS condition code
+!
+!	RMS_STV		- The RMS STV condition code
+!
+!	ERROR_SOURCE	- An integer that indicates where the error occurred.
+!				0 = Error from LIB$FILE_SCAN
+!				1 = Error from $PARSE
+!				2 = Error from $RENAME
+!	LOCAL_BLOCK	- Block of local information.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	SS$_NORMAL
+!
+! SIDE EFFECTS:
+!
+!	Signals the error
+!
+!--
+
+    BEGIN
+
+    !+
+    ! Case on the error source code to signal the proper message.
+    !-
+
+    CASE .ERROR_SOURCE [0] FROM 0 TO 2 OF
+	SET
+
+	[0]:	! Error searching for file
+	    BEGIN
+	    SIGNAL (MSG$_SEARCHFAIL, 1, OLD_RSN [0,0,0,0],
+		.RMS_STS [0,0,32,0], .RMS_STV [0,0,32,0]);
+	    END;
+
+	[1]:	! Error during $PARSE of new filespec
+	    BEGIN
+	    SIGNAL (MSG$_OPENOUT, 1, NEW_RSN [0,0,0,0],
+		.RMS_STS [0,0,32,0], .RMS_STV [0,0,32,0]);
+	    END;
+
+	[2]:	! Error during $RENAME
+	    BEGIN
+	    !+
+	    ! If error is RMS$_DEV then assume the user is trying to
+	    ! rename across devices and give a specific message.
+	    !-
+
+	    IF .RMS_STS [0,0,32,0] EQL RMS$_DEV
+	    THEN
+		SIGNAL (RENAME$_NOTRENAMED, 1, OLD_RSN [0,0,0,0],
+		    RENAME$_NOTSAMEDEV)
+	    ELSE
+		SIGNAL (MSG$_OPENIN, 1, OLD_RSN [0,0,0,0],
+		    .RMS_STS [0,0,32,0], .RMS_STV [0,0,32,0]);
+	    END;
+	TES;
+
+    RETURN SS$_NORMAL;		! Continue renaming
+
+    END;					! End of routine ERROR_ROUTINE
+
+%SBTTL 'ERROR_HANDLER - Condition handler'
+ROUTINE ERROR_HANDLER(
+    SIGARGS: REF BLOCK [, BYTE],	! Signal argument list
+    MCHARGS: REF BLOCK [, BYTE]	,	! Mechanism argument list
+    ENBARGS: REF VECTOR [, LONG]	! Enable argument list
+    ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This is the condition handler for RENAME_MAIN.  It stores the
+!	"worst error" in the LOCAL_BLOCK.  If the error is LIB$_QUIPRO,
+!	caused by the user typing Quit to the confirm prompt, an unwind
+!	with status SS$_NORMAL is done to the caller of RENAME_MAIN.
+!
+! CALLING SEQUENCE:
+!
+!	ret_status.wlc.v = ERROR_HANDLER (sigargs.rbu.ra, mchargs.mbu.ra,
+!					  enbargs.mbu.ra)
+!
+! FORMAL PARAMETERS:
+!
+!	SIGARGS		- The signal arguments list
+!
+!	MCHARGS		- The mechanism arguments list
+!
+!	ENBARGS		- The enable arguments list.  It is an array of
+!			  two longwords, the second of which is the
+!			  address of LOCAL_BLOCK.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	SS$_RESIGNAL
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	LOCAL_BLOCK: REF BLOCK [, BYTE] FIELD (LB_FIELDS),
+	OLD_CODE: BLOCK [4, BYTE],	! Old status
+	NEW_CODE: BLOCK [4, BYTE];	! New status
+
+    !+
+    ! Check to see if this is an unwind.  If so, return.
+    ! Also return if the message is a success status.
+    !-
+
+    NEW_CODE = .SIGARGS [CHF$L_SIG_NAME];
+    IF (.NEW_CODE) OR (.NEW_CODE EQLU SS$_UNWIND)
+    THEN
+	RETURN SS$_RESIGNAL;
+
+    !+
+    ! Check to see if this is LIB$_QUIPRO.  If so, unwind.
+    !-
+
+    IF .NEW_CODE EQLU LIB$_QUIPRO
+    THEN
+	BEGIN
+	MCHARGS [CHF$L_MCH_SAVR0] = SS$_NORMAL;	! Restore status of R0
+	$UNWIND ();	! Unwind to caller of establisher
+	RETURN SS$_RESIGNAL;
+	END;
+
+    !+
+    ! If this status is "worse" than the previous worst status, save it.
+    !-
+
+    LOCAL_BLOCK = .ENBARGS [1];
+    OLD_CODE = .LOCAL_BLOCK [LB_L_WORST_ERROR];
+    IF .NEW_CODE [STS$V_SEVERITY] GTRU .OLD_CODE [STS$V_SEVERITY]
+    THEN
+	LOCAL_BLOCK [LB_L_WORST_ERROR] = .NEW_CODE + STS$M_INHIB_MSG;
+
+    RETURN SS$_RESIGNAL;
+
+    END;					! End of routine ERROR_HANDLER
+
+END						! End of module RENAME
+
+ELUDOM

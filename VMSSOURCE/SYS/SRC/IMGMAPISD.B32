@@ -1,0 +1,1470 @@
+%TITLE 'MAP_ISDS - Convert ISDs to Mapping Requests'
+MODULE IMG$MAP_ISDS (
+		IDENT = 'V04-001'		! File: SRC$:IMGMAPISD.B32
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! Facility:
+!
+!	Executive, Support Routines Used by Image Activator System Service
+!
+! Abstract:
+!
+!	This module contains the routines that transform each image section
+!	descriptor into a mapping request for the process address space.
+!
+! Environment:
+!
+!	The code in this module executes in executive mode.
+!
+! Author: 
+!
+!	Lawrence J. Kenah
+!
+! Creation Date: 
+!
+!	6 May 1983
+!
+! Modified By:
+!
+!	V04-001	MSH0074		Michael S. Harvey	6-Sep-1984
+!		Don't open image file for write for ISDs that are
+!		global, writeable, and demand-zero.
+!
+!     V03B-017	MSH0045	       Michael S. Harvey	10-May-1984
+!		Correctly set page protection for indirect message
+!		sections.
+!
+!     V03B-016	MSH0044	       Michael S. Harvey	9-May-1984
+!		Correct page protection for protected writable CRF
+!		sections.
+!
+!     V03B-015	LJK0281	       Lawrence J. Kenah	9-May-1984
+!		Still more cleanup. Make sure that all unused ICBs are
+!		deallocated when an error occurs in the middle of a
+!		complicated activation.
+!
+!     V03B-014	LJK0269        Lawrence J. Kenah	31-Mar-1984
+!		Miscellaneous cleanup.
+!		Do not perform fixups or load message or change mode vectors
+!		if this is the P0 part of a P1 merge activation. 
+!		Use flag in own storage to detect that situation.
+!		Pages in privileged shareable image should be owned by
+!		exec mode. 
+!		Add privileged vectors in exec mode instead of kernel mode. 
+!		Store alternate RMS address as part of kernel mode completion.
+!
+!     V03B-013	LJK0267		Lawrence J. Kenah	28-Mar-1984
+!		Do not use name in ICB as global section name. Instead, use
+!		name in CTX storage that was loaded from the KFE.
+!
+!     V03B-012	LJK0265		Lawrence J. Kenah	25-Mar-1984
+!		Add support for variable size SHL elements.
+!
+!     V03B-011	JWT0152		Jim Teague		20-Feb-1984
+!		Enlarge ISD_BUFFER to accomodate longer global ISDs.
+!
+!     V03B-010	WMC0001		Wayne Cardoza		23-Jan-1984
+!		Add loading of sequential image files.
+!		Fix bug in based shareable images.
+!
+!     V03B-009	LJK0245		Lawrence J. Kenah	23-Aug-1983
+!		Make user stack size a cumulative number.
+!
+!     V03B-008	LJK0242		Lawrence J. Kenah	2-Aug-1983
+!		Add support for writable global sections.
+!
+!     V03B-007	LJK0236		Lawrence J. Kenah	26-Jul-1983
+!		Add concept of image base address, different from first address
+!		that is mapped. Continue fixing bugs as they are found.
+!
+!     V03B-006	LJK0233		Lawrence J. Kenah	21-Jul-1983
+!		Try again to make the logic for P1 merges into P0 space
+!		to work correctly.
+!
+!     V03B-005	LJK0231		Lawrence J. Kenah	19-Jul-1983
+!		Make corrections for global section mapping
+!
+!     V03B-004	LJK0227		Lawrence J. Kenah	12-Jul-1983
+!		Continue with cleanup efforts and testing.
+!
+!     V03B-003	LJK0220		Lawrence J. Kenah	29-Jun-1983
+!		Handle case where input range is specified. Perform minor
+!		cleanup. Fix the many bugs discovered during testing.
+!
+!     V03B-002	LJK0216		Lawrence J. Kenah	25-Jun-1983
+!		Make new IHD generation constant conform to standard names
+!
+!     V03B-001	LJK0200		Lawrence J. Kenah	6-May-1983
+!		The original version of this module is a portion of a
+!		rewrite of the image activator.
+!--
+
+
+%SBTTL 'Declarations'
+
+SWITCHES ADDRESSING_MODE (EXTERNAL = GENERAL, NONEXTERNAL = WORD_RELATIVE);
+
+PSECT
+	CODE	= YF$$SYSIMGACT (WRITE),
+	PLIT	= YF$$SYSIMGACT (WRITE, EXECUTE);
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';		! Define system data structures
+
+REQUIRE 'LIB$:IMGMSGDEF.R32';		! Get status code definitions
+REQUIRE 'LIB$:IMGACTCTX.R32';		! Define internal structures
+
+! Machine dependent features
+
+BUILTIN
+    PROBEW,
+    INSQUE,
+    REMQUE;
+
+! Internal references
+
+FORWARD ROUTINE
+    PROCESS_ISD_LIST,
+    ADD_PRIVILEGED_VECTOR,
+    ADD_FIXUP_VECTOR,
+    NEXT_GBL_SEC_NAME		: NOVALUE,
+    LOAD_SEQ_IMAGE;
+
+! Linkage declaration for JSB routines 
+
+LINKAGE
+    EXE_ALOP1PROC    = JSB (REGISTER = 1; REGISTER = 1,REGISTER = 2) :
+                       NOPRESERVE (3)
+                       NOTUSED (4,5,6,7,8,9,10,11),
+    EXE_DEAP1        = JSB (REGISTER = 0, REGISTER = 1) :
+                       NOPRESERVE (2,3)
+                       NOTUSED (4,5,6,7,8,9,10,11),
+    IMG_IS_IT_MAPPED = JSB (REGISTER = 0; REGISTER = 1) :
+                       PRESERVE (2,3,4,5,6,7)
+                       NOTUSED (8,9,10,11),
+    IMG_PRVSHRIMG    = JSB (REGISTER = 0, REGISTER = 1) :
+                       PRESERVE (2,3,4,5)
+                       NOTUSED (6,7,8,9,10,11);
+
+! External routines with special linkages
+
+EXTERNAL ROUTINE
+    EXE$ALOP1PROC    : EXE_ALOP1PROC,
+    EXE$DEAP1        : EXE_DEAP1,
+    IMG$IS_IT_MAPPED : IMG_IS_IT_MAPPED,
+    IMG$PRVSHRIMG    : IMG_PRVSHRIMG;
+
+! Constants to make life simple
+
+LITERAL
+    TRUE = 1,
+    FALSE = 0,
+    BYTES_PER_PAGE       = 512 ,
+    END_OF_P1_SPACE      = %X'7FFFFFFF',
+    ISD_M_DISPATCH_FLAGS = (ISD$M_GBL OR ISD$M_CRF OR ISD$M_DZRO OR ISD$M_WRT);
+
+!  External routine references
+
+EXTERNAL ROUTINE
+    IMG$OPEN_IMAGE,
+    IMG$GET_HEADER,
+    IMG$ALLOCATE_ICB,
+    IMG$DEALLOCATE_ICB,
+    IMG$GET_NEXT_ISD;
+
+! References to external data cells
+
+EXTERNAL
+    CTL$A_DISPVEC,
+    CTL$GL_FIXUPLNK,
+    CTL$GL_PHD,
+    IAC$GL_IMAGCTX		: $BBLOCK,
+    IAC$AL_IMGACTBUF,
+    IAC$GL_WORK_LIST		: VECTOR [2],
+    IAC$GL_IMAGE_LIST		: VECTOR [2];
+
+! Miscellaneous constants defined elsewhere
+
+EXTERNAL LITERAL
+    EXE$C_SYSEFN	: UNSIGNED (6),
+    SYS$K_VERSION;
+
+! Some miscellaneous address definitions
+
+! The first part of the image activator scratch area is divided up into two
+! large pieces, each of which is further subdivided into a FAB, a NAM block,
+! a 512-byte block into which each succeeding block of the image header will
+! be read, and a buffer that will receive the decoded image header. The
+! decoded image header is assumed to be smaller than a page. The area that
+! follows these buffers is used as OWN storage by the image activator.
+
+LITERAL
+    INPUT_BUFFER_SIZE = BYTES_PER_PAGE,
+    IHD_BUFFER_SIZE   = BYTES_PER_PAGE;
+
+BIND               
+    INPUT_BUFFER = IAC$AL_IMGACTBUF,
+    PRIMARY_IHD  = INPUT_BUFFER + 512,
+    AUX_BUFFER   = PRIMARY_IHD  + 512,
+    AUX_IHD      = AUX_BUFFER   + 512,
+    PRIMARY_FAB  = AUX_IHD      + 512,
+    PRIMARY_NAM  = PRIMARY_FAB  + FAB$K_BLN,
+    AUX_FAB      = PRIMARY_NAM  + NAM$K_BLN,
+    AUX_NAM      = AUX_FAB      + FAB$K_BLN,
+    RESULT_NAME  = AUX_NAM      + NAM$K_BLN,
+    OWN_STORAGE  = RESULT_NAME  + NAM$C_MAXRSS	: $BBLOCK;
+
+! There are eight pages set aside in P1 space (in module SHELL) for
+! the image activator scratch area. The following assumption guarantees
+! that the scratch area that is defined here fits into eight pages.
+
+    $ASSUME ( OWN_STORAGE_SIZE + (2 * (INPUT_BUFFER_SIZE +
+                                       IHD_BUFFER_SIZE +
+                                       FAB$K_BLN + 
+                                       NAM$K_BLN) ),
+              LEQU,
+              8 * BYTES_PER_PAGE );
+
+%SBTTL 'PROCESS_WORK_LIST - Process Each Work List Item'
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine removes each work list item in turn from the work list,
+!	opens the file if it is not already opened, and calls the inner routine
+!	that processes the ISD list for this image.
+!
+! CALLING SEQUENCE:
+!
+!	IMG$DO_WORK_LIST ()
+!
+! FORMAL PARAMETERS:
+!
+!	TBS
+!
+! STATUS CODES:
+!
+!	TBS
+!--
+
+GLOBAL ROUTINE IMG$DO_WORK_LIST =
+
+BEGIN
+
+LOCAL 
+    ICB		: REF $BBLOCK,
+    OLD_ICB	: REF $BBLOCK,
+    NAME_DESC	: $BBLOCK [DSC$K_S_BLN],
+    IHD_CTX	: $BBLOCK [CTX_K_LENGTH],
+    NAME_STRING	: VECTOR [NAM$C_MAXRSS],
+    SIZE,
+    STATUS;
+
+WHILE NOT REMQUE (.IAC$GL_WORK_LIST , ICB) DO
+    BEGIN
+
+    STATUS = IMG$IS_IT_MAPPED (ICB [ICB$T_IMAGE_NAME]; OLD_ICB);
+    IF .STATUS EQL SS$_NORMAL
+    THEN 
+        IMG$DEALLOCATE_ICB (.ICB)
+    ELSE
+        BEGIN
+
+	! The ICB is immediately placed into the done list. If an error occurs
+	! later in activation, the error cleanup routine will remove it,
+	! deassign the channel, and deallocate the ICB.
+
+        IF NOT (.OWN_STORAGE [P1_MERGE_P0])
+        THEN
+            INSQUE (.ICB , .IAC$GL_IMAGE_LIST [1]);	! Insert at tail of list
+
+        ! A nonzero channel number implies that the ICB represents the image
+        ! whose name was passed to $IMGACT. This image file was already opened
+        ! by the caller and its header read and verified.
+
+        IF .ICB [ICB$W_CHAN] EQL 0 
+        THEN 
+            BEGIN
+
+            BIND
+                ICB_NAME = ICB [ICB$T_IMAGE_NAME]	: VECTOR [, BYTE];
+
+            ICB [ICB$L_CONTEXT] = IHD_CTX;
+            NAME_DESC [DSC$W_LENGTH] = .ICB_NAME [0];
+            NAME_DESC [DSC$A_POINTER] = ICB_NAME [1];
+            STATUS = IMG$OPEN_IMAGE (
+                NAME_DESC,
+                $DESCRIPTOR('SYS$SHARE:.EXE'),
+                AUX_FAB,
+                AUX_NAM,
+                NAME_STRING,
+                .ICB);
+            IF NOT .STATUS THEN RETURN .STATUS;
+
+            ! Use the auxiliary buffers when decoding the image header
+            ! from this point.
+
+            IHD_CTX [CTX_L_BUFFER] = AUX_BUFFER;
+            IHD_CTX [CTX_L_IHDBUF] = AUX_IHD;
+
+            STATUS = IMG$GET_HEADER (.ICB);
+            IF NOT .STATUS THEN RETURN .STATUS;
+            END;
+
+	! Reserve ISD storage if image is loaded from sequential device
+	! The allocation is for the worst case (all local ISDs)
+
+	IF .ICB [ICB$V_LOAD_IMAGE]
+	THEN
+	    BEGIN
+	    BIND 
+		IHD_CTX = .ICB [ICB$L_CONTEXT]: $BBLOCK,
+	    	IHD = .IHD_CTX [CTX_L_IHDBUF] : $BBLOCK;
+	    SIZE = 12 * (.IHD [IHD$B_HDRBLKCNT] * BYTES_PER_PAGE) / ISD$K_LENPRIV;
+	    IF NOT EXE$ALOP1PROC ( .SIZE; SIZE, OWN_STORAGE [SEQ_LOAD_ISDS])
+	    THEN RETURN SS$_INSFMEM;
+	    CH$FILL ( 0, .SIZE, .OWN_STORAGE [SEQ_LOAD_ISDS] );
+	    END;
+
+        STATUS = PROCESS_ISD_LIST (.ICB);
+        IF NOT .STATUS 
+	THEN 
+	    BEGIN
+
+	    ! Check for sequential load device and release ISD storage
+
+	    IF .ICB [ICB$V_LOAD_IMAGE]
+	    THEN
+		EXE$DEAP1 (.OWN_STORAGE [SEQ_LOAD_ISDS], .SIZE);
+
+	    RETURN .STATUS;
+	    END;
+
+	! See if image should be loaded now
+
+	IF .ICB [ICB$V_LOAD_IMAGE]
+	THEN
+	    BEGIN
+	    STATUS = LOAD_SEQ_IMAGE ( .ICB );
+	    EXE$DEAP1 (.OWN_STORAGE [SEQ_LOAD_ISDS], .SIZE);
+	    IF NOT .STATUS THEN RETURN .STATUS;
+	    END;
+
+        END;				! End of "it is not yet mapped" block
+
+    END;				! End of WHILE loop
+
+RETURN SS$_NORMAL;
+
+END;					! End of routine PROCESS_WORK_LIST
+
+%SBTTL 'PROCESS_ISD_LIST - Convert Each ISD into Mapping Request'
+
+ROUTINE PROCESS_ISD_LIST (ICB_PTR) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine converts each ISD in the current image into mapping 
+!	requests to one of the memory management system services. Global
+!	ISDs are converted into new work list items to be processes at a
+!	later time.
+!
+! CALLING SEQUENCE:
+!
+!	PROCESS_ISD_LIST (ICB pointer)
+!
+! FORMAL PARAMETERS:
+!
+!	TBS
+!
+! STATUS CODES:
+!
+!	TBS
+!--
+
+BEGIN
+
+BIND 
+    ICB     = .ICB_PTR			: $BBLOCK,
+    KFE     = .ICB [ICB$L_KFE]		: $BBLOCK,
+    IHD_CTX = .ICB [ICB$L_CONTEXT]	: $BBLOCK,
+    FLAGS   = OWN_STORAGE [INPUT_FLAGS]	: $BBLOCK;
+
+LOCAL 
+    SEQ_ISD			: REF VECTOR [],
+    GBL_ICB			: REF $BBLOCK
+                                  INITIAL (0),
+    ISD_BUFFER			: $BBLOCK [ISD$K_MAXLENGLBL],
+    ISD				: REF $BBLOCK
+                                  INITIAL (0),
+    GLOBAL_SEC_NAME_DESC	: $BBLOCK [DSC$K_S_BLN],
+    MAP_BASE_ADDRESS,
+    ISD_BASE_ADDRESS,
+    PAGE_COUNT,
+    INPUT_RANGE			: VECTOR [2],
+    RETURN_RANGE		: VECTOR [2],
+    ACCUMULATED_RANGE		: VECTOR [2]
+				  INITIAL (0,0),
+    SECTION_FLAGS,
+    BASE_ADDRESS_STORED		: INITIAL (FALSE),
+    FIRST_MAPPING               : INITIAL (TRUE),
+    STATUS;
+
+! A base address is selected that will determine the actual range passed to
+! the various mapping requests. If the ICB contains an explicit base address,
+! that address is used. Otherwise, the address following the last mapping
+! request is used. Note that this latter situation includes the case where
+! no input range is specified for the activation of a main program. Because
+! the CHECK_PARAMS routine sets RETURN_END_RANGE to FFFFFFFF, this logic
+! chooses 0 as MAP_BASE_ADDRESS.
+
+MAP_BASE_ADDRESS = (
+    IF .ICB [ICB$V_EXPREG]
+    THEN
+        .OWN_STORAGE [RETURN_END_ADDRESS] + 1
+    ELSE
+        .ICB [ICB$L_STARTING_ADDRESS]);
+
+! Remember where ISD storage is for a sequential device load
+! The storage location is meaningless in all other case
+
+SEQ_ISD = .OWN_STORAGE [SEQ_LOAD_ISDS];
+
+WHILE TRUE DO				! Idiom for DO FOREVER
+
+    BEGIN
+
+    ! If the header is resident, then it is not necessary to decode the ISDs
+    ! as that has already been done. For images where ISD decoding is
+    ! required, the context passed from IMG$DECODE_IHD to IMG$GET_NEXT_ISD is
+    ! contained in a context block located through an ICB pointer. 
+
+    IF .ICB [ICB$V_RES_HEADER] 
+    THEN
+        BEGIN
+
+        BIND
+            IHD = .KFE [KFE$L_IMGHDR]	: $BBLOCK;
+
+	ISD = (IF .ISD EQL 0        
+              THEN IHD + .IHD [IHD$W_SIZE]
+              ELSE .ISD + .ISD [ISD$W_SIZE]);
+
+        ! The next test is the loop breaker for the resident header case.
+        ! An ISD size of zero indicates the end of the ISD list.
+
+        IF .ISD [ISD$W_SIZE] EQL 0
+            THEN 
+                BEGIN
+
+                ! Update the address range in the ICB with the accumulated
+                ! range into which the image was mapped.
+
+                ICB [ICB$L_STARTING_ADDRESS] = .ACCUMULATED_RANGE [0];
+                ICB [ICB$L_END_ADDRESS] = .ACCUMULATED_RANGE [1];
+
+                RETURN SS$_NORMAL
+                END;
+        END
+    ELSE
+        BEGIN
+
+	STATUS = IMG$GET_NEXT_ISD (
+            .ICB [ICB$W_CHAN],
+            .IHD_CTX [CTX_L_BUFFER],
+            .IHD_CTX [CTX_L_IHDBUF],
+            IHD_CTX [CTX_L_VBN],
+            IHD_CTX [CTX_W_ISD_OFFSET],
+            ISD_BUFFER);
+
+        ! The following test is the loop breaker in the case where we are
+        ! making validity checks on the ISD contents as we go along. The
+        ! routine IMG$GET_NEXT_ISD returns a status of IMG$_ENDOFHDR when it
+        ! reaches the end of the ISD list. 
+
+        IF NOT .STATUS THEN 
+            IF .STATUS EQL IMG$_ENDOFHDR
+            THEN 
+                BEGIN
+
+                ! Update the address range in the ICB with the accumulated
+                ! range into which the image was mapped.
+
+                ICB [ICB$L_STARTING_ADDRESS] = .ACCUMULATED_RANGE [0];
+                ICB [ICB$L_END_ADDRESS] = .ACCUMULATED_RANGE [1];
+
+                RETURN SS$_NORMAL
+                END
+            ELSE 
+                RETURN .STATUS;
+
+        ISD = ISD_BUFFER;
+
+        END;
+
+    ! The common mapping parameters are computed from the ISD contents and
+    ! previous mapping context and stored in a suitable place for use by the
+    ! various memory management system services. 
+    ! 
+    ! The set of addresses that are passed to the various memory 
+    ! management system services depend on the kind of image that is 
+    ! being activated, and the kind of ISDs that exist within  these 
+    ! images. The various cases are described in an approximate order 
+    ! of occurrence.
+    ! 
+    ! 1.  New shareable images that are not based (that is, they
+    !     are PIC and based at zero) have the ISD addresses added
+    !     to the highest address previously mapped. 
+    !
+    ! 2.  New based shareable images use the addresses contained
+    !     in the ISDs. 
+    !
+    ! 3.  When processing old shareable images, the addresses
+    !     contained in the ISDs of the main program are taken at
+    !     face value. If the "last cluster" flag is set, the end
+    !     address is set to 7FFFFFFF to disable all upper limit
+    !     address checks. Note that the last cluster flag is
+    !     ignored in new shareable images. 
+
+    !!! NOW THAT I HAVE THIS WONDERFUL COMMENT, I OUGHT TO MAKE THE CODE
+    !!! BEHAVE THE WAY THAT IT'S SUPPOSED TO.
+
+    PAGE_COUNT = .ISD [ISD$W_PAGCNT];
+    IF .PAGE_COUNT EQL 0 THEN RETURN SS$_BADISD;
+
+    ISD_BASE_ADDRESS = ((.ISD [ISD$V_VPG]) * BYTES_PER_PAGE);
+
+    IF NOT .BASE_ADDRESS_STORED
+    THEN
+        BEGIN
+
+        ! Renormalize the base address for merged activations and for all
+        ! ICBs that represent implicitly referenced shareable images.
+
+	IF .ICB [ICB$B_ACT_CODE] NEQ ICB$K_MAIN_PROGRAM
+        THEN
+            MAP_BASE_ADDRESS = .MAP_BASE_ADDRESS - .ISD_BASE_ADDRESS;
+
+        ! The base address stored in the ICB is used by $IMGFIX to perform
+        ! address relocation fixups. The transfer address bias is used to
+        ! adjust transfer addresses that lie within the bounds of an image's
+        ! address space. 
+
+        ICB [ICB$L_BASE_ADDRESS] = .MAP_BASE_ADDRESS + .ISD_BASE_ADDRESS;
+        BASE_ADDRESS_STORED = TRUE;        
+
+        IF NOT .OWN_STORAGE [TRANSFER_BIAS_STORED]
+        THEN
+            BEGIN
+            OWN_STORAGE [TRANSFER_ARRAY_BIAS] = .MAP_BASE_ADDRESS;
+            OWN_STORAGE [TRANSFER_BIAS_STORED] = TRUE;
+            END;
+        END;
+
+    INPUT_RANGE [0] = .MAP_BASE_ADDRESS + .ISD_BASE_ADDRESS;
+    INPUT_RANGE [1] = .INPUT_RANGE [0] + ((.PAGE_COUNT * BYTES_PER_PAGE) - 1);
+
+    CASE .ISD [ISD$L_FLAGS]		! Form case index from low four 
+            AND				!  bits of the ISD flags longword
+         ISD_M_DISPATCH_FLAGS
+    FROM 0 TO ISD_M_DISPATCH_FLAGS OF
+
+    SET
+
+%SBTTL 'Create Address Space for Demand-Zero ISD'
+
+    [ISD$M_DZRO OR ISD$M_WRT , ISD$M_DZRO OR ISD$M_WRT OR ISD$M_CRF]:
+
+    ! The section is a demand-zero section. The pages are created at the
+    ! current end of the image.
+
+        BEGIN
+
+        IF .ISD [ISD$B_TYPE] NEQ ISD$K_USRSTACK
+        THEN
+            BEGIN
+            STATUS = $CRETVA (
+                INADR = INPUT_RANGE ,
+                RETADR = RETURN_RANGE ,
+                ACMODE = .OWN_STORAGE [ACCESS_MODE] );
+            IF NOT .STATUS THEN RETURN .STATUS;
+            END
+        ELSE
+            OWN_STORAGE [USER_STACK_SIZE] = 
+                .OWN_STORAGE [USER_STACK_SIZE] + .PAGE_COUNT;
+        END;
+
+
+%SBTTL 'Create or Map Address Space for Private ISD'
+
+    [ISD$M_CRF OR ISD$M_WRT , ISD$M_WRT , 0]:
+
+    ! The section is a private section that will be mapped into the process
+    ! address space. The section may be read only or writable. Read-only
+    ! sections may either be global sections or private sections. Writable CRF
+    ! sections are always created as private sections. Writable sections that
+    ! are not also copy on reference are always mapped as global global
+    ! sections. 
+    
+        BEGIN
+        LITERAL SEC_M_EXEC_OWNED = PSL$C_EXEC ^ $BITPOSITION (SEC$V_WRTMOD);
+
+        ! If the SHAREABLE bit is set in the ICB, then global sections were
+        ! created for the read-only sections of this image. These global
+        ! sections can be mapped. In other cases, private sections are
+        ! created. 
+
+        SECTION_FLAGS = (.ISD [ISD$L_FLAGS] AND ISD_M_DISPATCH_FLAGS);
+
+        ! If the section is marked protected, then the ownership and
+	! writability of the section pages is restricted to exec mode.
+
+	IF .ISD [ISD$V_PROTECT]
+	THEN
+            SECTION_FLAGS = .SECTION_FLAGS
+	                    OR
+	                    SEC$M_PROTECT 
+	                    OR 
+	                    SEC_M_EXEC_OWNED;
+
+        IF 
+            .ICB [ICB$V_SHAREABLE] 
+            AND 
+                ((NOT .ISD [ISD$V_WRT])
+                OR
+                (.ISD [ISD$V_WRT] AND NOT .ISD [ISD$V_CRF]))
+        THEN
+            BEGIN
+
+            BIND
+                GSD_NAME = IHD_CTX [CTX_T_GSD_NAME] : VECTOR [, BYTE];
+
+            GLOBAL_SEC_NAME_DESC [DSC$W_LENGTH] = .GSD_NAME [0] + 4;
+            GLOBAL_SEC_NAME_DESC [DSC$A_POINTER] = GSD_NAME [1];
+
+            NEXT_GBL_SEC_NAME (GSD_NAME);
+
+            STATUS = $MGBLSC (
+                INADR  = INPUT_RANGE ,
+                RETADR = RETURN_RANGE ,
+                ACMODE = .OWN_STORAGE [ACCESS_MODE] ,
+                FLAGS  = (.SECTION_FLAGS OR SEC$M_GBL OR SEC$M_SYSGBL) ,
+                GSDNAM = GLOBAL_SEC_NAME_DESC ,
+                IDENT  = ICB [ICB$Q_IDENT] );
+            IF NOT .STATUS THEN RETURN .STATUS;
+            END
+        ELSE
+            BEGIN
+
+            ! Private copies of writable sections that are not also copy on
+            ! reference are prohibited.
+
+            IF .ISD [ISD$V_WRT] AND NOT .ISD [ISD$V_CRF]
+            THEN
+                RETURN SS$_NOTINSTALL;
+
+	    ! Check for loading from a sequential device before deciding 
+	    ! whether to map the section or simply record the load data
+
+	    IF NOT .ICB [ICB$V_LOAD_IMAGE]
+	    THEN
+		BEGIN
+        	STATUS = $CRMPSC (
+                    INADR  = INPUT_RANGE ,
+                    RETADR = RETURN_RANGE ,
+                    ACMODE = .OWN_STORAGE [ACCESS_MODE] ,
+                    FLAGS  = .SECTION_FLAGS ,
+                    CHAN   = .ICB [ICB$W_CHAN] ,
+                    PAGCNT = .PAGE_COUNT ,
+                    VBN    = .ISD [ISD$L_VBN] ,
+                    PFC    = .ISD [ISD$B_PFC] );
+        	IF NOT .STATUS THEN RETURN .STATUS;
+		END
+	    ELSE
+
+		! Record size of image section, starting address, and flags
+		! Advance pointer for the next ISD
+
+		BEGIN
+		SEQ_ISD [0] = .PAGE_COUNT;
+		SEQ_ISD [1] = .INPUT_RANGE[0];
+		SEQ_ISD [2] = .ISD [ISD$L_FLAGS];
+		SEQ_ISD = SEQ_ISD [3];
+		END;
+
+            ! If the section just mapped is a fixup vector, then it must be
+            ! verified and added to the list of fixup vectors. Note that the
+            ! placement of this code assumes that fixup sections can never be
+            ! shared. That is, they are always writable CRF sections. 
+
+            IF (
+                (.ISD [ISD$V_FIXUPVEC])
+                AND 
+                (NOT (.OWN_STORAGE [P1_MERGE_P0]))
+               )
+            THEN 
+
+                ! If the image being mapped is a privileged shareable image,
+                ! then perform the fixups immediately in exec mode. Otherwise,
+                ! add the fixup vector to the list of fixups to be done. 
+		! This work is delayed for images loaded from sequential devices
+
+                IF .ISD [ISD$V_PROTECT]
+                THEN
+                    STATUS = (
+                        IF
+                            BEGIN
+                            IF (KFE EQL 0)
+                            THEN 
+                                TRUE
+                            ELSE
+                                NOT (.KFE [KFE$V_PROTECT] AND .KFE [KFE$V_SHARED])
+                            END
+                        THEN
+                            SS$_PROTINSTALL
+                        ELSE
+                            IMG$PRVSHRIMG (
+                                .RETURN_RANGE, 
+                                .ICB [ICB$L_BASE_ADDRESS]))
+                ELSE
+		    IF NOT .ICB [ICB$V_LOAD_IMAGE]
+		    THEN
+                        STATUS = ADD_FIXUP_VECTOR (
+                    	    RETURN_RANGE, 
+                    	    .ICB [ICB$L_BASE_ADDRESS]);
+            IF NOT .STATUS THEN RETURN .STATUS
+            END;
+
+        ! At this point, we need to check whether the section just mapped
+        ! is a message section or a vector section. We need to put the check
+        ! here because, while vector sections can only be global sections,
+        ! message sections can be either private or global.
+	! This work is delayed for images loaded from sequential devices
+
+        IF (
+            (.ISD [ISD$V_VECTOR])
+            AND
+            (NOT (.OWN_STORAGE [P1_MERGE_P0]))
+           )
+        THEN
+            IF .ISD [ISD$V_PROTECT]
+            THEN
+		BEGIN
+		IF NOT .ICB [ICB$V_LOAD_IMAGE]
+		THEN
+		    BEGIN
+                    STATUS = ADD_PRIVILEGED_VECTOR (RETURN_RANGE [0], ICB);
+                    IF NOT .STATUS THEN RETURN .STATUS
+                    END;
+		END
+            ELSE
+                RETURN SS$_BADISD;
+
+        END;
+
+
+%SBTTL 'Add ICB to Work List for Global ISD'
+
+[ISD$M_GBL, ISD$M_GBL OR ISD$M_WRT, ISD$M_GBL OR ISD$M_WRT OR ISD$M_CRF, ISD$M_GBL OR ISD$M_WRT OR ISD$M_DZRO]:
+
+    ! This is a global ISD. An entry will be made in the work list and the
+    ! actual mapping will occur in a later call to this routine. A check is
+    ! made to determine whether we are processing a list of global ISDs of
+    ! the same name. This is done by comparing the name in the global ISD
+    ! with the name in the most recently allocated ICB. 
+
+        BEGIN
+
+        BIND
+            ISD_NAM = ISD [ISD$T_GBLNAM]	: VECTOR [,BYTE];
+
+        LOCAL
+            ICB_NAM				: REF VECTOR [,BYTE];
+
+        IF 
+            BEGIN
+                IF (.GBL_ICB EQL 0)
+                THEN TRUE
+                ELSE 
+                    BEGIN
+                    ICB_NAM = GBL_ICB [ICB$T_IMAGE_NAME];
+                    CH$NEQ ( 
+                        .ISD_NAM [0] - 4, ISD_NAM [1],
+                        .ICB_NAM [0], ICB_NAM [1], 0)
+                    END
+            END
+        THEN
+            BEGIN
+
+            STATUS = IMG$ALLOCATE_ICB (GBL_ICB);
+            IF NOT .STATUS THEN RETURN .STATUS;
+
+            GBL_ICB [ICB$B_ACT_CODE] = ICB$K_GLOBAL_IMAGE_SECTION;
+
+            ICB_NAM = GBL_ICB [ICB$T_IMAGE_NAME];
+
+            ! Move the section name including the count and the 
+            ! trailing _00n into the ICB. Insert the ICB at the tail of the
+            ! work list. Subtract four from the count so that the _00n prefix,
+            ! while present in the ICB, is not represented in the count.
+
+            ICB_NAM [0] = .ISD_NAM [0] - 4;
+            CH$MOVE (.ISD_NAM [0], ISD_NAM [1], ICB_NAM [1]);
+                
+            GBL_ICB [ICB$L_MATCH_CONTROL] = .ISD [ISD$V_MATCHCTL];
+            GBL_ICB [ICB$L_VERSION] = .ISD [ISD$L_IDENT];
+            IF 
+                (.IHD_CTX [CTX_W_GENERATION] GEQU IHD$C_GEN_FIXUP)
+                AND
+                NOT (.ISD [ISD$V_BASED])
+            THEN
+                BEGIN
+                GBL_ICB [ICB$V_EXPREG] = TRUE;
+                GBL_ICB [ICB$L_STARTING_ADDRESS] = 0;
+                GBL_ICB [ICB$L_END_ADDRESS] = END_OF_P1_SPACE;
+                END
+            ELSE
+                BEGIN
+                GBL_ICB [ICB$L_STARTING_ADDRESS] = .INPUT_RANGE [0];
+                GBL_ICB [ICB$L_END_ADDRESS] = (
+                    IF .ISD [ISD$V_LASTCLU]
+                    THEN END_OF_P1_SPACE
+                    ELSE .INPUT_RANGE [1] );
+                END;
+
+            INSQUE (.GBL_ICB , .IAC$GL_WORK_LIST [1]);
+            END
+        ELSE
+            BEGIN
+
+            ! This is another global ISD of the same name. Some consistency 
+            ! checks are performed on the address range. The address range
+            ! stored in the ICB may change.
+
+            IF (.INPUT_RANGE [0] LEQU .GBL_ICB [ICB$L_STARTING_ADDRESS])
+            THEN RETURN SS$_BADISD;
+
+            IF .GBL_ICB [ICB$L_END_ADDRESS] NEQ END_OF_P1_SPACE
+            THEN 
+                BEGIN
+
+                IF (.INPUT_RANGE [0] LEQU .GBL_ICB [ICB$L_END_ADDRESS])
+                THEN RETURN SS$_BADISD;
+
+                GBL_ICB [ICB$L_END_ADDRESS] = .INPUT_RANGE [1];
+                END;
+            END;
+
+        ! If a global ISD has the WRT flag set but the CRF and DZRO bits clear,
+        ! this indicates a writable global section. A flag is set to indicate
+        ! that the image file should be opened for write access.
+
+        IF .ISD [ISD$V_WRT] AND NOT (.ISD [ISD$V_CRF] OR .ISD [ISD$V_DZRO])
+        THEN
+            GBL_ICB [ICB$V_OPEN_FOR_WRITE] = TRUE;
+
+        END;
+
+%SBTTL 'Update return address arrays'
+
+    [INRANGE]:
+
+    ! An unrecognized combination of flags exists in this ISD. Because the
+    ! linker would never produce such a combination, this is either not an
+    ! image file or some tampering has occurred.
+
+        RETURN SS$_BADISD;
+
+    TES;
+
+! Update the address range arrays in the ICB and in impure storage.
+! The latter may be returned to the caller and represents the total
+! address space mapped in this activation.
+!
+! Note that the following conditional update works correctly because
+! ALL of the nonglobal ISDs and NONE of the global ISDs result in
+! mapping requests.
+
+IF NOT .ISD [ISD$V_GBL]
+THEN
+    BEGIN
+    IF .FIRST_MAPPING
+    THEN
+        BEGIN
+        FIRST_MAPPING = FALSE;
+        ACCUMULATED_RANGE [0] = .RETURN_RANGE [0];
+        END;
+
+    IF .OWN_STORAGE [RETURN_START_ADDRESS] EQL -1
+    THEN 
+	OWN_STORAGE [RETURN_START_ADDRESS] = .RETURN_RANGE [0];
+
+    ACCUMULATED_RANGE [1] = .RETURN_RANGE [1];
+
+    IF .RETURN_RANGE [1]  GTR  .OWN_STORAGE [RETURN_END_ADDRESS]
+    THEN
+	OWN_STORAGE [RETURN_END_ADDRESS] = .RETURN_RANGE [1];
+
+    END;
+
+END					! End of DO FOREVER loop
+
+END;					! End of routine PROCESS_ISD_LIST
+
+%SBTTL 'ADD_PRIVILEGED_VECTOR - Install User-Written Change Mode Vectors'
+
+ROUTINE ADD_PRIVILEGED_VECTOR (SECTION_ADDRESS, ICB_ADDRESS) =
+
+!+
+! Functional Description:
+!
+! This routine is called when the section just mapped contains 
+! user-written change mode or message vectors. After verification, the 
+! vectors are added to the list of privileged routines called in 
+! response to an unfielded change mode call. 
+!
+! Calling Sequence:
+!
+!    ADD_PRIVILEGED_VECTOR (SECTION_ADDRESS, KFE_ADDRESS, ICB_ADDRESS)
+!
+! Input Parameters:
+!
+!    SECTION_ADDRESS - Address of section just mapped. The initial portion
+!        of this section contains the privileged library vector (PLV).
+!
+!    ICB_ADDRESS - Address of image control block that describes image.
+!
+! Implicit Input:
+!
+!    .ICB [ICB$L_KFE] - Address of known file entry for this image. (A change
+!        mode vector must be installed with a PROTECT option. Message
+!        vectors do not have to be installed.
+!-
+
+BEGIN
+
+BIND
+    KERNEL_VECTOR  = CTL$A_DISPVEC,
+    EXEC_VECTOR    = CTL$A_DISPVEC + (1*256),
+    RUNDOWN_VECTOR = CTL$A_DISPVEC + (2*256),
+    MESSAGE_VECTOR = CTL$A_DISPVEC + (3*256);
+
+BIND
+    PLV = .SECTION_ADDRESS : REF $BBLOCK,
+    ICB = .ICB_ADDRESS     : $BBLOCK,
+    KFE = .ICB [ICB$L_KFE] : $BBLOCK;
+
+LITERAL
+    VECTOR_SIZE = 256,			! One half page for each vector
+    ABSOLUTE_MODE = %X'9F',    
+    AT_R5_MODE = %X'65',
+    RSB_ABSOLUTE = (ABSOLUTE_MODE ^ 8) OR OP$_RSB : UNSIGNED (16);
+
+LOCAL
+    NEW_VECTOR_LOC;
+
+CASE .PLV [PLV$L_TYPE]
+    FROM PLV$C_TYP_CMOD TO PLV$C_TYP_MSG OF
+    SET
+
+    [PLV$C_TYP_CMOD]:
+
+    ! The section contains a user-written change-mode dispatcher. The beginning
+    ! of the section contains a privileged library vector, laid out as follows.
+    !
+    !    .PLV [PLV$L_TYPE]		! Vector type code (PLV$C_TYP_CMOD)
+    !
+    !    .PLV [PLV$L_VERSION]		! System version number (SYS$K_VERSION)             
+    !
+    !    .PLV [PLV$L_KERNEL]		! Offset to kernel mode dispatcher
+    !
+    !    .PLV [PLV$L_EXEC]		! Offset to exec mode dispatcher
+    !
+    !    .PLV [PLV$L_USRUNDWN]		! Offset to rundown routine
+    !
+    !    .PLV_L_CMOD_RFU		! Reserved longword
+    !
+    !    .PLV [PLV$L_RMS]		! Offset to alternate RMS dispatcher
+    !
+    !    .PLV [PLV$L_CHECK]		! Address check
+    !
+    ! If this last longword contains nonzero, its contents must be equal to
+    ! the base address of the section.
+
+    BEGIN
+
+    BIND
+        PLV_L_CMOD_RFU = PLV [PLV$L_USRUNDWN] + 4,
+        DISP_VEC = PLV [PLV$L_KERNEL] : VECTOR [3];
+
+    ! Check that the privileged shareable image is linked against the current
+    ! system and make other sanity checks on the vector contents. The CHECK
+    ! field insures that a position dependent privileged shareable image is
+    ! mapped at the correct address. If the contents of the PLV$L_CHECK are
+    ! not zero, the contents must be equal to the address of the cell.
+
+    IF 
+        (
+            (.PLV [PLV$L_VERSION] EQL 0)
+            AND
+            .ICB [ICB$V_SYS_STB]
+        )
+        OR
+        (
+            (.PLV [PLV$L_VERSION] NEQ 0)
+            AND
+            (.PLV [PLV$L_VERSION] NEQ SYS$K_VERSION)
+        )
+    THEN
+        RETURN SS$_BADVEC;
+
+    IF 
+        (.PLV_L_CMOD_RFU NEQ 0) 
+        OR
+        (
+            (.PLV [PLV$L_CHECK] NEQ 0) 
+            AND 
+            (.PLV [PLV$L_CHECK] NEQ PLV [PLV$L_CHECK])
+        )
+    THEN
+        RETURN SS$_BADVEC;
+
+    ! A privileged shareable image must be installed (KFE must exist) with
+    ! both the PROTECT and SHARED qualifiers.
+
+    IF
+        BEGIN
+        IF (KFE EQL 0)
+        THEN 
+            TRUE
+        ELSE
+            NOT (.KFE [KFE$V_PROTECT] AND .KFE [KFE$V_SHARED])
+        END
+    THEN
+        RETURN SS$_PROTINSTALL;
+
+    ! The same operations are performed for all three of kernel, exec,
+    ! and rundown routines.
+
+    INCR DISP_INDEX FROM 0 TO 2
+        DO
+
+        IF .DISP_VEC [.DISP_INDEX] NEQ 0
+        THEN
+            BEGIN
+
+            BIND
+                SPECIAL_VECTOR = KERNEL_VECTOR + (VECTOR_SIZE * .DISP_INDEX);
+
+            ! There must be enough room left in the vector to accommodate the
+            ! new JSB instruction (six bytes) and an RSB instruction (four
+            ! bytes to allow room for padding with zeros). 
+
+            IF (VECTOR_SIZE - (.SPECIAL_VECTOR) ) LSSU (6 + 4)
+            THEN RETURN SS$_VECFULL;
+
+            ! A special instruction sequence (RSB followed by absolute 
+            ! addressing) is inserted at the current end of the vector. After
+            ! the address fixups have been completed, the RSB will be replaced
+            ! with a JSB. The destination of the JSB is computed from the
+            ! contents and address of the current dispatch vector cell.
+
+            NEW_VECTOR_LOC = SPECIAL_VECTOR + .SPECIAL_VECTOR;
+            .NEW_VECTOR_LOC = RSB_ABSOLUTE;
+            (.NEW_VECTOR_LOC) + 2 = DISP_VEC [.DISP_INDEX] + .DISP_VEC [.DISP_INDEX];
+            (.NEW_VECTOR_LOC) + 6 = OP$_RSB;
+
+            ! Store the offset to the new location of the RSB
+
+            SPECIAL_VECTOR = ((.NEW_VECTOR_LOC) + 6) - SPECIAL_VECTOR;
+
+            IAC$GL_IMAGCTX [IMAGCTX$V_SETVECTOR] = TRUE;
+
+            END;
+
+    ! An alternate RMS dispatcher address is saved in OWN storage. The
+    ! completion routine that executes in kernel mode will store this
+    ! address into the cell used by the change-mode-to-exec handler. 
+
+    IF .PLV [PLV$L_RMS] NEQ 0
+    THEN OWN_STORAGE [RMS_BASE] = PLV [PLV$L_RMS] + .PLV [PLV$L_RMS];
+
+    RETURN SS$_NORMAL;			! All done
+
+    END;				! End of change mode section
+
+    [PLV$C_TYP_MSG]:
+
+    ! The section contains an image-specific message section, laid out in the
+    ! following way.
+    !
+    !    .PLV [PLV$L_TYPE]		! Vector type code (PLV$C_TYP_MSG)
+    !
+    !    .PLV_L_MSG_RFU			! Reserved longword (MBZ)
+    !
+    !    .PLV [PLV$L_MSGDSP]		! Offset to message dispatcher (6)
+    !
+    ! This offset locates the JSB (R5) instruction.
+    !
+    ! The rest of the message section header contains instructions that are
+    ! interpreted (not executed) by the Get Message system service. 
+    !
+    !    NOP				! The next two bytes could serve
+    !    NOP				!   as an entry mask
+    !    JSB	(R5)			! The offset above locates this
+
+    BEGIN
+
+    BIND
+        PLV_L_MSG_RFU = PLV [PLV$L_VERSION],
+        PLV_L_MSG_ENTRY = PLV [PLV$L_EXEC],
+	PLV_L_MSC_OFFSET = PLV [PLV$L_USRUNDWN],
+	MSC = PLV_L_MSC_OFFSET + .PLV_L_MSC_OFFSET : BYTE ;
+
+    LITERAL
+        JSB_AT_R5 = 
+            (AT_R5_MODE ^ 24) OR
+            (OP$_JSB ^ 16) OR
+            (OP$_NOP ^ 8) OR
+            (OP$_NOP);
+
+    LOCAL
+	PROT_DSC : VECTOR [2];
+
+    ! Verify the contents of the next three longwords in the vector
+
+    IF (
+        (.PLV_L_MSG_RFU NEQ 0) OR
+        (.PLV [PLV$L_MSGDSP] NEQ 6) OR
+        (.PLV_L_MSG_ENTRY NEQ JSB_AT_R5) )
+    THEN 
+        RETURN SS$_BADVEC;
+
+    ! There must be enough room left in the vector to accommodate the new
+    ! JSB instruction (six bytes) and an RSB instruction (four bytes to allow
+    ! room for padding with zeros).
+
+    IF (VECTOR_SIZE - (.MESSAGE_VECTOR) ) LSSU (6 + 4)
+    THEN RETURN SS$_VECFULL;
+
+    ! Find the current end of the vector and store a JSB @# instruction
+    ! there, pointing to the JSB (R5) instruction in the message section.
+
+    NEW_VECTOR_LOC = MESSAGE_VECTOR + .MESSAGE_VECTOR;
+    .NEW_VECTOR_LOC = RSB_ABSOLUTE;
+    (.NEW_VECTOR_LOC) + 2 = PLV_L_MSG_ENTRY + 2;
+    (.NEW_VECTOR_LOC) + 6 = OP$_RSB;
+
+    ! Store the offset to the new location of the RSB
+
+    MESSAGE_VECTOR = ((.NEW_VECTOR_LOC) + 6) - MESSAGE_VECTOR;
+
+    IAC$GL_IMAGCTX [IMAGCTX$V_SETVECTOR] = TRUE;
+
+    ! Finally, if this is a pointer (indirect) message section, the section
+    ! must be writable from user mode.
+
+    PROT_DSC [0] = ..SECTION_ADDRESS;	! Only need to change first page
+    PROT_DSC [1] = .PROT_DSC [0] + 511;
+
+    IF .MSC EQL MSC$C_IND		! Indirect message section?
+    THEN
+        $SETPRT (INADR = PROT_DSC,	! Yes, set page protection
+		 PROT = PRT$C_UW,
+		 ACMODE = PSL$C_EXEC);
+
+    RETURN SS$_NORMAL;
+
+    END;				! End of message section
+
+    [OUTRANGE]:
+        RETURN SS$_BADVEC
+
+    TES
+
+END;    				! End of routine ADD_PRIVILEGED_VECTOR
+
+%SBTTL 'ADD_FIXUP_VECTOR - Add Fixup Vector to Work List'
+
+ROUTINE ADD_FIXUP_VECTOR (SECTION_ADDRESS, BASE_ADDRESS) =
+
+!+
+! Functional Description:
+!
+!    This routine processes an image section that contains a fixup vector. In
+!    addition to some validation of the contents of the fixup vector, two
+!    operations are performed. 
+!
+!        The fixup vector is added to the front of the list of fixups that must
+!        be done after the image is activated. 
+!
+!        The base address of the image currently being activated is stored in
+!        the SHL entry at index 0. Note that the linker did not store a name
+!        here so the name field for SHL entry 0 is always left blank. 
+!
+!    If the image being activated represents a privileged shareable image, then
+!    this routine is not even called. Rather, a check is made to insure that
+!    the image contains no outbound calls. Then the fixups are performed
+!    immediately, rather than being postponed for later processing in user
+!    mode. 
+!
+! Calling Sequence:
+!
+!    ADD_FIXUP_VECTOR ()
+!
+! Formal Parameters:
+!
+!    SECTION_ADDRESS - Base address of image section that has been identified
+!        as a fixup vector.
+!
+!    BASE_ADDRESS - Base address of image that contains the current fixup 
+!        vector.
+!-
+
+BEGIN
+
+BIND
+    RANGE = .SECTION_ADDRESS		: VECTOR,
+    IAF   = .RANGE [0]			: $BBLOCK,
+    SHL = IAF + .IAF [IAF$L_SHLSTOFF]	: $BBLOCK;
+
+! Calculate the address of the shareable image list, insure that it lies 
+! within the bounds of the section just mapped, insure further that the 
+! caller can write into the SHL, and store the base address of the image that 
+! contains this SHL. If this SHL does not include a size, store a size that
+! reflects the size of an old SHL.
+
+IF (SHL LSSU .RANGE [0]) OR ((SHL+SHL$C_LENGTH) GTRU .RANGE [1])
+THEN RETURN IMG$_BAD_FIXUPVEC;
+
+! The following $ASSUME allows the BASEVA longword and SHL_SIZE byte
+! to have their writability checked with a single PROBE instruction.
+
+$ASSUME ( $BYTEOFFSET (SHL$L_BASEVA) EQL 0);
+$ASSUME ( $BYTEOFFSET (SHL$B_SHL_SIZE) LEQU 512);
+
+IF NOT PROBEW 
+    (OWN_STORAGE [ACCESS_MODE], 
+     %REF ($BYTEOFFSET (SHL$B_SHL_SIZE) ), 
+     SHL [SHL$L_BASEVA])
+THEN RETURN SS$_ACCVIO;
+
+SHL [SHL$L_BASEVA] = .BASE_ADDRESS;
+IF .SHL [SHL$B_SHL_SIZE] EQL 0
+THEN SHL [SHL$B_SHL_SIZE] = SHL$C_OLD_SHL_SIZE;
+
+! Insure that the caller can write into the link longword in the fixup
+! vector and then add this fixup vector to the front of the list.
+
+IF NOT PROBEW (OWN_STORAGE [ACCESS_MODE], %REF (4), IAF [IAF$L_FIXUPLNK])
+THEN RETURN SS$_ACCVIO;
+
+IAF [IAF$L_FIXUPLNK] = .CTL$GL_FIXUPLNK;
+CTL$GL_FIXUPLNK = IAF;
+RETURN SS$_NORMAL
+
+END;    				! End of routine ADD_FIXUP_VECTOR
+
+%SBTTL 'NEXT_GBL_SEC_NAME - Update Global Section Name Suffix'
+
+ROUTINE NEXT_GBL_SEC_NAME (STRING_POINTER) : NOVALUE =
+
+!+
+! Functional Description:
+!
+!    This routine performs string arithmetic on a global section name suffix of 
+!    the form _00n by adding one to the suffix and performing the appropriate 
+!    carries. No error checking for illegal string contents or carries beyond 
+!    _999 is performed. (The suffix _999 is transformed to _000.)
+!
+! Calling Sequence:
+!
+!    NEXT_GBL_SEC_NAME (STRING_POINTER)
+!
+! Formal Parameters:
+!
+!    STRING_POINTER - Address of counted ASCII string containing global
+!        section name
+!-
+
+BEGIN
+
+! Two synonyms are created. The string called NAME represents the entire
+! counted ASCII string for the global section name. Recall that the count field
+! does not contain the four character suffix. The substring SUFFIX represents
+! the final three characters in the global section name, usually 00n. 
+
+BIND
+    NAME   = .STRING_POINTER		: VECTOR [,BYTE],
+    SUFFIX = NAME [.NAME [0] + 2]	: VECTOR [3,BYTE];
+
+LOCAL 
+    DIGIT : INITIAL (2),
+    CARRY : INITIAL (TRUE);
+
+WHILE .CARRY DO
+    IF .SUFFIX [.DIGIT] NEQ %C'9'
+    THEN 
+        BEGIN
+        SUFFIX [.DIGIT] = .SUFFIX [.DIGIT] + 1;
+        CARRY = FALSE;
+        END
+    ELSE
+        BEGIN
+        SUFFIX [.DIGIT] = %C'0';
+        DIGIT = .DIGIT - 1;
+        IF .DIGIT LSS 0
+        THEN CARRY = FALSE;
+        END;
+
+END;    				! End of routine NEXT_GBL_SEC_NAME
+
+%SBTTL 'LOAD_SEQ_IMAGE - Load an image from a sequential device'
+
+ROUTINE LOAD_SEQ_IMAGE ( ICB : REF $BBLOCK ) =
+
+!+
+! Functional Description:
+!
+! This routine loads all private non-dzro sections of an image from a
+! sequential device.
+!
+! Calling Sequence:
+!
+!    LOAD_SEQ_IMAGE (ICB pointer)
+!
+! Formal Parameters:
+!
+!	ICB - pointer to the current ICB
+!-
+
+BEGIN
+
+! This routine expects a vector of image section entries.  Each entry consists
+! of two longwords.  The first is a page count.  The second is a starting 
+! address with the low order bit used to indicate writeable address space.
+! The read is done one page at a time under the assumption of one page records.
+!
+! This routine also zeros the debug symbol table entry in the image header to
+! prevent an attempt by DEBUG to read this table.
+
+LOCAL
+    SEQ_ISDS	: REF VECTOR [],
+    INADR	: VECTOR [2],
+    IHD		: REF $BBLOCK,
+    IOSB	: VECTOR [4,WORD],
+    NEXT_ADDRESS,
+    STATUS;
+
+BIND
+    IHD_CTX = .ICB [ICB$L_CONTEXT] : $BBLOCK;
+
+SEQ_ISDS = .OWN_STORAGE [SEQ_LOAD_ISDS];
+
+IHD = .IHD_CTX [CTX_L_IHDBUF];
+IHD [IHD$W_SYMDBGOFF] = 0;
+
+! Process ISDs until done
+
+UNTIL .SEQ_ISDS [0] EQL 0 
+DO
+    BEGIN
+    INADR [0] = .SEQ_ISDS [1];
+    INADR [1] = .INADR [0] + (.SEQ_ISDS [0] * BYTES_PER_PAGE) - 1;
+
+    ! Create adrress space
+
+    STATUS = $CRETVA (
+	INADR = INADR,
+	ACMODE = PSL$C_USER );
+    IF NOT .STATUS THEN RETURN .STATUS;
+
+    ! Read the image one page at a t4me
+
+    NEXT_ADDRESS = .INADR [0];
+    INCR I FROM 1 TO .SEQ_ISDS [0]
+    DO
+	BEGIN
+	STATUS = $QIOW (
+	    EFN = EXE$C_SYSEFN,
+	    CHAN = .ICB [ICB$W_CHAN],
+	    FUNC = IO$_READVBLK,
+	    IOSB = IOSB,
+	    P1 = .NEXT_ADDRESS,
+	    P2 = BYTES_PER_PAGE );
+	IF NOT .STATUS THEN RETURN .STATUS;
+	IF NOT .IOSB [0] THEN RETURN .IOSB [0];
+	NEXT_ADDRESS = .NEXT_ADDRESS + BYTES_PER_PAGE;
+	END;
+
+    ! Is it a message section (can't be vector since not installed)
+
+    IF (.SEQ_ISDS [2] AND ISD$M_VECTOR) NEQ 0
+    THEN
+	BEGIN
+        STATUS = ADD_PRIVILEGED_VECTOR (INADR, ICB);
+	IF NOT .STATUS THEN RETURN .STATUS
+	END;
+
+    ! Is it a fixup section
+
+    IF (.SEQ_ISDS [2] AND ISD$M_FIXUPVEC) NEQ 0
+    THEN
+	BEGIN
+	STATUS = ADD_FIXUP_VECTOR (
+	    INADR,
+	    .ICB [ICB$L_BASE_ADDRESS]);
+	IF NOT .STATUS THEN RETURN .STATUS
+	END;
+
+    ! Check to see if it should be left writeable
+
+    IF (.SEQ_ISDS [2] AND ISD$M_WRT) EQL 0
+    THEN
+	BEGIN
+	STATUS = $SETPRT (
+	    INADR = INADR,
+	    ACMODE = PSL$C_USER,
+	    PROT = PRT$C_UR );
+	IF NOT .STATUS THEN RETURN .STATUS;
+	END;
+
+    ! Advance pointer to next ISD description
+
+    SEQ_ISDS = SEQ_ISDS [3];
+
+    END;
+
+RETURN SS$_NORMAL;
+
+END;
+
+END					! End of module IMGACT_MAP_ISDS
+
+ELUDOM

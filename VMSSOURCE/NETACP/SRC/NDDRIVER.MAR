@@ -1,0 +1,1872 @@
+	.TITLE	NDDRIVER - DECnet DLE driver
+	.IDENT	'V04-000'
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+
+;++
+; FACILITY:	DECnet-VAX
+;
+; ABSTRACT:
+;
+;	This driver implements the DLE facility in DECnet-VAX which
+;	allows programs direct access to a DECnet circuit.  This is
+;	primarily used to implement MOP support.
+;
+; ENVIRONMENT:
+;
+;	MODE = KERNEL
+;
+; AUTHOR:
+;
+;	Tim Halvorsen, December 1982
+;
+; MODIFIED BY:
+;
+;	V03-005	LMP0275		L. Mark Pilant,		12-Jul-1984  19:48
+;		Initialize the ACL info in the ORB to be a null descriptor
+;		list rather than an empty queue.  This avoids the overhead
+;		of locking and unlocking the ACL mutex, only to find out
+;		that the ACL was empty.
+;
+;	V03-004	LMP0221		L. Mark Pilant,		30-Mar-1984  11:36
+;		Change UCB$L_OWNUIC to ORB$L_OWNER and UCB$W_VPROT to
+;		ORB$W_PROT.
+;
+;	V003	RNG0003		Rod Gamache	28-Jun-1983
+;		Remove internal definition for IRP$Q_STATION.
+;
+;	V002	TMH0002		Tim Halvorsen	08-May-1983
+;		Fix case where user receive was not being posted if the
+;		LPD was shutdown while a DLE receive was outstanding.
+;
+;	V001	TMH0001		Tim Halvorsen	20-Apr-1983
+;		Fix cancel routine to not abort pending user I/O, but to
+;		instead wait for the datalink driver to return the datalink
+;		IRPs before aborting user requests.
+;		Add bugcheck which checks for the condition of receiving a
+;		message from the datalink without any pending user receive
+;		outstanding.
+;		Insert DWBs onto global DWB list in order by NETACP channel
+;		number, so that it can be used as the collating sequence.
+;--
+
+	.SBTTL	DECLARATIONS
+;
+; VMS definitions
+;
+	$ABDDEF
+	$AQBDEF
+	$CANDEF
+	$CCBDEF
+	$CRBDEF
+	$CXBDEF
+	$DDBDEF
+	$DEVDEF
+	$DDTDEF
+	$DYNDEF
+	$IODEF
+	$IPLDEF
+	$IRPDEF
+	$JIBDEF
+	$ORBDEF
+	$PCBDEF
+	$PRDEF
+	$PRVDEF
+	$RSNDEF
+	$SSDEF
+	$UCBDEF
+	$VADEF
+	$VCBDEF
+	$VECDEF
+
+;
+; Network definitions
+;
+
+	$DWBDEF			; DLE window control block
+	$NETSYMDEF		; Get NET$C_IPL symbol
+	$RCBDEF			; Get RCB$W_MCOUNT symbol
+
+
+;
+; Definitions that follow the standard UCB fields
+;
+
+	$DEFINI	UCB			; Start of UCB definitions
+
+. = UCB$C_LENGTH			; Position at end of standard UCB
+
+$DEF	UCB$Q_DWB_LIST	.BLKQ	1	; "Global" DWB listhead
+$DEF	UCB$W_NEXT_ID	.BLKW	1	; Next unique identifier to allocate
+$DEF	UCB$C_ND_LENGTH			; Size of our UCB
+
+	$DEFEND	UCB
+
+;
+; Overlays of IRP
+;
+
+	$DEFINI	IRP
+ 
+. = IRP$L_ARB + 4
+$DEF	IRP$C_STDLEN			; End of standard IRP
+
+	$DEFEND	IRP
+
+;
+; Define maximum allowable length of a received message for datalinks
+; which do direct I/O on receives.
+;
+
+	MAX_DIR_RCV = 2048	; Define max receive for direct I/O
+
+;
+; Argument list offsets for FDT routines
+;
+
+P1	= 0
+P2	= 4
+P3	= 8
+P4	= 12
+P5	= 16
+P6	= 20
+
+;
+; Define format of second longword of IOSB returned in ACCESS and SETMODE
+; functions to the DLE user.
+;
+
+	$DEFINI	STAT
+
+	_VIELD	STAT,0,<-
+		<BC,,M>,-		; Circuit is a "broadcast circuit"
+		>
+
+	$DEFEND	STAT
+
+;
+; Define format of NI diagnostics buffer
+;
+
+	$DEFINI	DIAG
+
+$DEF	DIAG_L_DATA	.BLKL	1		; Address of start of data
+$DEF	DIAG_L_USERBUF	.BLKL	1		; Address of user buffer
+$DEF	DIAG_W_SIZE	.BLKW	1		; Size of structure
+$DEF	DIAG_B_TYPE	.BLKB	1		; Type of structure
+			.BLKB	1
+$EQU	DIAG_C_NIHDRSIZ		14
+$DEF	DIAG_G_DATA	.BLKB	DIAG_C_NIHDRSIZ	; 14 bytes of NI datalink header
+$DEF	DIAG_C_LENGTH				; Length of structure
+
+	$DEFEND	DIAG
+
+	.SBTTL	DRIVER PROLOGUE TABLE
+
+;
+; DRIVER PROLOGUE TABLE
+;
+ 
+		.PSECT	$$$105_PROLOGUE
+	DPTAB	-				; Define driver prologue table
+		END	= DLE$END,-		; End of driver
+		ADAPTER	= NULL,-		; Adapter type
+		UCBSIZE	= UCB$C_ND_LENGTH,-	; UCB size
+		NAME	= NDDRIVER		; Driver name
+
+	DPT_STORE INIT				; CONTROL BLOCK INIT VALUES
+						;
+	DPT_STORE CRB,CRB$L_INTD+VEC$L_ADP,L,0	; No ADP pointer 
+	DPT_STORE UCB,UCB$B_FIPL,B,NET$C_IPL	; Fork IPL
+	DPT_STORE UCB,UCB$B_DIPL,B,NET$C_IPL	; Device IPL
+	DPT_STORE ORB,ORB$B_FLAGS,B,-
+				<ORB$M_PROT_16>	; SOGW protection word
+	DPT_STORE ORB,ORB$W_PROT,W,0		; Default protection
+	DPT_STORE ORB,ORB$L_OWNER,L,<^X010001>	; Owner UIC
+	DPT_STORE UCB,UCB$L_DEVCHAR,L,-		; Device characteristics
+				<DEV$M_NET!-	;   Network device
+				 DEV$M_AVL!-	;   Available
+				 DEV$M_SHR!-	;   Shared by multiple users
+				 DEV$M_MBX!-	;   Mailbox type (no hardware)
+				 DEV$M_IDV!-	;   Input device
+			 	 DEV$M_ODV- 	;   Output device
+				>		;
+	DPT_STORE UCB,UCB$W_DEVBUFSIZ,W,0	;
+	DPT_STORE UCB,UCB$W_STS,W,UCB$M_ONLINE	; Device online
+	DPT_STORE UCB,UCB$W_NEXT_ID,W,0		; Initialize unique ID number
+						;
+	DPT_STORE REINIT			; CONTROL BLOCK RE-INIT VALUES
+
+	DPT_STORE DDB,DDB$L_DDT,D,ND$DDT 
+	DPT_STORE CRB,CRB$L_INTD+VEC$L_UNITINIT,D,UNIT_INIT ; Unit Initialization
+	DPT_STORE END
+
+	.SBTTL	DRIVER DISPATCH TABLE
+ 
+;
+; DRIVER DISPATCH TABLE
+;
+	.PSECT	$$$115_DRIVER,LONG
+
+	DDTAB	DEVNAM	= ND,-		; DRIVER DISPATCH TABLE
+		FUNCTB	= FUNCTABLE,-	; Function decision table address
+		START	= DLE$STARTIO,-	; Start I/O operation
+		CANCEL	= DLE$CANCEL,-	; Cancel I/O entry point
+		UNSOLIC	= DLE$LPD_DOWN	; "LPD down" entry point
+					;   (called by NETACP only)
+
+
+	.SBTTL	FUNCTION DECISION TABLE
+ 
+FUNCTABLE:				; FUNCTION DECISION TABLE
+	FUNCTAB	,-			; Legal Functions
+		<READVBLK,READLBLK,-	; Read 
+		 WRITEVBLK,WRITELBLK,-	; Write
+		 SETMODE,-		; Set mailbox message filters
+		 ACCESS,-		; Logical-link Connect/Reject
+		 ACPCONTROL,-		; ACP Control function
+		 DEACCESS,-		; Logical-link Disconnect
+	>
+	FUNCTAB	,-			; BUFFERED I/O FUNCTIONS
+		<READVBLK,READLBLK,-	; Read 
+		 WRITEVBLK,WRITELBLK,-	; Write
+		 SETMODE,-		; Set mailbox message filters
+		 ACCESS,-		; Logical-link Connect/Reject
+		 ACPCONTROL,-		; ACP Control function
+		 DEACCESS,-		; Logical-link Disconnect
+	>
+	FUNCTAB	DLE$FDT_RCV,     <READLBLK>   ; Read
+	FUNCTAB	DLE$FDT_XMT,     <WRITELBLK>  ; Write
+	FUNCTAB	DLE$FDT_ACCESS,  <ACCESS>     ; Connect Logical-link
+	FUNCTAB	DLE$FDT_DEACCESS,<DEACCESS>   ; Disconnect Logical-link
+	FUNCTAB DLE$FDT_SETMODE, <SETMODE>    ; Set mailbox message filters
+	FUNCTAB	DLE$FDT_CONTROL, <ACPCONTROL> ; ACP Control
+
+	.SBTTL	DLE$STARTIO	- Start I/O operation
+;+
+;  DLE$STARTIO - START I/O OPERATION
+;
+;  This routine is entered when the associated unit is idle and a packet
+;  is available for processing.  The IRP$L_WIND field is used to locate the 
+;  associated window block.
+;
+; Inputs:
+;
+;	R5 = UCB address
+;	R3 = IRP address
+;
+;	IPL = FIPL
+;
+; Outputs:
+;
+;	None
+;
+;	R0-R2,R4 are destroyed.
+;-
+DLE$STARTIO::				; Process next IRP
+	PUSHR	#^M<R5,R6,R7,R8,R9,R10>	; Save registers
+	BSBB	PROC_IO			; Process the I/O function
+	POPR	#^M<R5,R6,R7,R8,R9,R10>	; Restore registers
+	MOVL	UCB$L_IRP(R5),R3	; Get IRP
+	BEQL	50$			; If EQL then its been queued
+					; or suspended, start next I/O
+	MOVQ	IRP$L_IOST1(R3),R0	; Get IOSB
+	JMP	G^IOC$REQCOM		; Complete I/O & start next I/O
+	;
+	;   Start next I/O without completing current IRP
+	;
+50$:	REMQUE	@UCB$L_IOQFL(R5),R3	; Get next IRP
+	BVS	60$			; If VS then none
+	JMP	G^IOC$INITIATE		; Call Exec to deliver IRP to driver
+60$:	CLRBIT	#UCB$V_BSY,UCB$W_STS(R5); Allow further IRPs to be delivered
+	RSB				; Return to Exec
+
+PROC_IO:
+	;
+	;   Get the DWB address (if any) and dispatch on function code with:
+	;
+	;	R6 = DWB address (may be zero)
+	;	R5 = UCB address
+	;	R3 = IRP address
+	;
+	MOVL	IRP$L_WIND(R3),R6	; Get DWB, if any
+	BLSS	10$			; If LSS, DWB is in system space
+	CLRL	R6			; Else, Invalidate window pointer
+10$:	BICL3	#^C<IO$M_FCODE>,-	; Get function code without
+		IRP$W_FUNC(R3),R7	; modifier bits
+	$DISPATCH  R7,TYPE=B,-		; Process I/O 
+	<-
+	  <IO$_ACCESS,	   DLE$ACCESS>,-	; Connect Requests
+	  <IO$_DEACCESS,   DLE$DEACCESS>,-	; Disconnect Requests
+	  <IO$_SETMODE,	   DLE$SETMODE>,-	; SetMode Requests
+	  <IO$_ACPCONTROL, DLE$CONTROL>,-	; ACP Control function
+	>				; Else, fall thru
+	MOVZWL	#SS$_ILLIOFUNC,-	; Assume fct not supported
+		IRP$L_IOST1(R3)		; Set error code
+	RSB				; Return if unknown
+
+	.SBTTL	DLE$FDT_ACCESS	- IO$_ACCESS  FDT processing
+	.SBTTL	DLE$ACCESS	- IO$_ACCESS "startio" processing
+
+;++
+;  DLE$FDT_ACCESS - IO$_ACCESS FDT processing
+;  DLE$ACCESS	  - Common connect "startio" processing
+;
+;  DLE$FDT_ACCESS passes the IRP through the EXEC, where the user parameters 
+;  are packaged into a "complex buffer", to the ACP.  The ACP processes the
+;  connect request and puts the circuit into MOP mode, if necessary.
+;
+;  DLE$ACCESS gets control when the circuit is ready, so that the access
+;  function can be completed.
+;
+;  It should be noted that the size of the DWB is not charged against the user 
+;  byte count or byte limit quotas.  It is assumed that these quotas are at 
+;  least partly used to limit a run away process and that the file quota of a 
+;  process, which is charged, is a sufficient mechanism.
+;
+; Inputs:
+;
+;	R6 = CCB address
+;	R5 = UCB address
+;	R4 = PCB address
+;	R3 = IRP address
+;
+;	P1 = Circuit name desired for DLE
+;
+; Outputs:
+;
+;	None
+;-
+NOOPER:
+	MOVZWL	#SS$_NOOPER,R0		; "operator privilege required"
+	BRB	ABORTIO
+DEVNOTMNT:
+	MOVZWL	#SS$_DEVNOTMOUNT,R0	; "device not mounted"
+ABORTIO:
+	JMP	G^EXE$ABORTIO		; Return to abort I/O
+
+DLE$FDT_ACCESS::			; IO$_ACCESS  "FDT" processing
+	;
+	;   OPER privilege is required to issue a DLE IO$_ACCESS
+	;
+	IFNPRIV	OPER,NOOPER		; Error if user doesn't have OPER
+	;
+	;   Check if the ACP is in "dismounting" state, or if it's even
+	;   mounted at all.
+	;
+	BBC	#DEV$V_MNT,UCB$L_DEVCHAR(R5),DEVNOTMNT ; If not mounted, error
+	BBS	#DEV$V_DMT,UCB$L_DEVCHAR(R5),DEVNOTMNT ; If dismounting, error
+	;
+	;   Allocate DWB for a window control block
+	;
+	MOVZBL	#DWB$C_LENGTH,R1	; Set block length
+	BSBW	DLE$ALONPGD_Z		; Allocate/zero non-paged pool
+	BLBC	R0,ABORTIO		; Exit if error detected
+	MOVL	R2,IRP$L_DIAGBUF(R3)	; Save DWB address
+	MOVB	#DYN$C_BUFIO,DWB$B_TYPE(R2) ; Setup block type
+	;
+	;   Initialize the DWB
+	;
+	MOVL	UCB$L_DDB(R5),R0	; Get address of DDB
+	MOVL	DDB$L_UCB(R0),R0	; Get address of ND's UCB0
+	MOVL	R0,DWB$L_UCB0(R2)	; Save address of ND's UCB0
+	INCW	UCB$W_NEXT_ID(R0)	; Allocate another unique ID number
+	MOVW	UCB$W_NEXT_ID(R0),-	; Move unique ID to DWB
+		DWB$W_ID(R2)
+	MOVAB	DWB$Q_RCV_MSG(R2),R0	; Get address of received msg queue
+	MOVL	R0,(R0)			; Init. listhead
+	MOVAL	(R0)+,(R0)
+	MOVAB	DWB$Q_USER_RCV(R2),R0	; Get address of user receive queue
+	MOVL	R0,(R0)			; Init. listhead
+	MOVAL	(R0)+,(R0)
+	MOVAB	DWB$Q_USER_XMT(R2),R0	; Get address of user transmit queue
+	MOVL	R0,(R0)			; Init. listhead
+	MOVAL	(R0)+,(R0)
+	MOVAB	DWB$Q_XMT_PND(R2),R0	; Get address of transmits pending queue
+	MOVL	R0,(R0)			; Init. listhead
+	MOVAL	(R0)+,(R0)
+	INCW	DWB$W_REFCNT(R2)	; Increment reference count
+	MOVL	IRP$L_PID(R3),-		; Save PID of accessor
+		DWB$L_PID(R2)
+	MOVW	IRP$W_CHAN(R3),-	; Save channel of accessor
+		DWB$W_CHAN(R2)
+	;
+	;   Insert DWB onto "global" DWB list in our UCB0, so that we
+	;   can keep track of all DWBs for all DLE users.  Make sure
+	;   we keep the DWBs in order by DLL_CHAN.
+	;
+	MOVL	DWB$L_UCB0(R2),R0	; Get DLE UCB0 address
+	MOVAB	UCB$Q_DWB_LIST(R0),R1	; Get address of listhead
+	MOVL	R1,R0			; Setup for loop
+10$:	MOVL	(R0),R0			; Get next entry
+	CMPL	R0,R1			; End of list?
+	BEQL	15$			; If so, insert it
+	CMPW	DWB$W_ID(R0),-		; Are we at the right place?
+		DWB$W_ID(R2)
+	BLSSU	10$			; If not yet, keep going
+15$:	INSQUE	(R2),@4(R0)		; Insert into global DWB list
+	;
+	;   Increment ACP mount count, so the ACP doesn't go away until
+	;   we complete this DWB.
+	;
+	MOVL	UCB$L_VCB(R5),R0	; Get VCB address
+	INCW	RCB$W_MCOUNT(R0)	; Increment ACP mount count
+	;
+	;   Send the request to NETACP for further processing.  NETACP will
+	;   setup the circuit for DLE access, if necessary, and then return
+	;   the IRP back here again.
+	;
+	SETBIT	#IRP$V_PHYSIO,-		; Mark this as a DLE IRP
+		IRP$W_STS(R3)
+	JMP	G^ACP$ACCESSNET		; Continue in EXEC
+
+;
+; We arrive here after the ACP has finished with the IRP, and has requeued
+; it to this driver for further processing.
+;
+; Inputs:
+;
+;	R5 = UCB address
+;	R3 = IRP address
+;
+;	IRP$L_DIAGBUF = DWB address
+;	IRP$L_EXTEND = Address of CXB holding initial unsolicited MOP message
+;
+;		CXB$W_LENGTH	= Message length in bytes (not incl. NI header)
+;		CXB$C_HEADER	= 14-byte NI datalink header
+;		CXB$C_HEADER+14	= Message
+;
+; Outputs:
+;
+;	None
+;
+
+DLE$ACCESS::				; IO$_ACCESS  "startio" processing
+	BSBW	GET_WNDSC		; Get CCB$L_WIND image descriptor
+	CLRL	(R7)			; Init CCB$L_WIND image
+	SETBIT	#IRP$V_FUNC,IRP$W_STS(R3) ; Mark for write back
+	MOVW	#1,IRP$W_BCNT(R3)	; Write back one descriptor
+	MOVL	IRP$L_DIAGBUF(R3),R6	; Get DWB address
+	CLRL	IRP$L_DIAGBUF(R3)	; Clear pointer in IRP to DWB
+	BLBC	IRP$L_IOST1(R3),80$	; If ACP returned with error, exit
+	;
+	;   Successful access
+	;
+	SETBIT	#DWB$V_RUN,-		; Mark DWB in "run" state
+		DWB$W_FLAGS(R6)
+	MOVL	R6,(R7)			; Setup CCB$L_WIND value
+	;
+	;   Setup the flags which tell whether the datalink does
+	;   buffered or direct transmits/receives.
+	;
+	MOVL	DWB$L_DLL_UCB(R6),R0	; Get UCB address
+	MOVL	UCB$L_DDT(R0),R0	; Get DDT address
+	MOVL	DDT$L_FDT(R0),R0	; Get FDT address
+	BBC	#IO$_READLBLK,8(R0),20$	; If driver does buffered receives
+	SETBIT	#DWB$V_DLL_RBF,DWB$W_FLAGS(R6) ; then set flag for "buffered"
+20$:	BBC	#IO$_WRITELBLK,8(R0),30$; If driver does buffered transmits
+	SETBIT	#DWB$V_DLL_XBF,DWB$W_FLAGS(R6) ; then set flag for "buffered"
+30$:	;
+	;   If NETACP returned the initial MOP message for this DLE user,
+	;   then set it up as if we just received the message.
+	;
+	MOVL	R3,R5			; Save address of ACCESS IRP
+	MOVL	IRP$L_EXTEND(R5),R2	; Get CXB address
+	BEQL	40$			; Skip if none
+	BSBW	INIT_RCV_IRP		; Initialize datalink receive IRP
+	BLBC	R0,90$			; Branch if error detected
+	MOVL	R2,IRP$L_IOSB(R3)	; Attach CXB to datalink IRP
+	BBC	#IRP$V_DIAGBUF,-	; Br if not diagnostic buffer
+		IRP$W_STS(R3),35$
+	MOVL	IRP$L_DIAGBUF(R3),R0	; Get address of diag buffer
+	PUSHR	#^M<R2,R3,R5>		; Save registers
+	MOVC	#DIAG_C_NIHDRSIZ,-	; Copy NI header to diag buffer
+		CXB$C_HEADER(R2),-
+		@DIAG_L_DATA(R0)
+	POPR	#^M<R2,R3,R5>		; Restore registers
+35$:	MOVW	S^#SS$_NORMAL,-		; Set successful receive operation
+		IRP$L_IOST1(R3)
+	MOVW	CXB$W_LENGTH(R2),-	; Set size of message in IOSB
+		IRP$L_IOST1+2(R3)
+	INSQUE	(R3),@DWB$Q_RCV_MSG+4(R6) ; Insert message on receive queue
+	;
+	;   Queue initial receive to datalink driver
+	;
+40$:	MOVZWL	S^#SS$_NORMAL,R0	; Setup I/O status
+90$:	BSBW	GET_STATUS		; Setup second IOSB longword
+	MOVL	R5,R3			; Restore ACCESS IRP address
+	MOVQ	R0,IRP$L_IOST1(R3)	; Store status in IRP
+	RSB				; Return to post ACCESS I/O
+
+;
+;  Unsuccessful access
+;
+80$:	SETBIT	#DWB$V_DELETE,-		; Mark DWB to be deleted
+		DWB$W_FLAGS(R6)
+	BSBW	DEALLOC_DWB		; Deallocate DWB, if possible
+	BSBW	RESTORE_QUOTA		; Restore quota
+	RSB				; On return, complete I/O
+
+	.SBTTL	Get ABD descriptors
+;+
+; These routines return descriptors of the various QIO parameters from
+; the ABD.
+;
+; Inputs:
+;
+;	R3 = IRP
+;
+; Outputs:
+;
+;	R7 = Address of actual data field in ABD
+;	R8 = Size of data field
+;-
+	.ENABL	LSB
+
+GET_WNDSC:				; Get window descriptor
+	CLRL	R8			; Get descriptor offset
+	BRB	10$			; Continue
+GET_P1DSC:				; Get P1 descriptor
+	MOVL	#8,R8			; Get descriptor offset
+	BRB	10$			; Continue
+GET_P2DSC:				; Get P2 descriptor
+	MOVL	#8*2,R8			; Get descriptor offset
+	BRB	10$			; Continue in common
+GET_P3DSC:				; Get P3 descriptor
+	MOVL	#8*3,R8			; Get descriptor offset
+	BRB	10$			; Continue in common
+GET_P4DSC:				; Get P4 descriptor
+	MOVL	#8*4,R8			; Get desciptor offset
+10$:	ADDL	@IRP$L_SVAPTE(R3),R8	; Get descriptor address
+	MOVZWL	(R8)+,R7		; Get offset to data
+	MOVAB	-1(R8)[R7],R7		; Get ptr to data after skipping
+					; over access mode byte
+	MOVZWL	(R8),R8			; Get length of data
+	RSB
+
+	.DSABL	LSB
+
+	.SBTTL	DLE$FDT_DEACCESS- IO$_DEACCESS FDT processing
+	.SBTTL	DLE$DEACCESS	- IO$_DEACCESS "startio" processing
+;+
+; DLE$FDT_DEACCESS - User QIO request to disassociate DWB with the I/O channel
+;
+; Inputs:
+;
+;	R6 = CCB address
+;	R5 = UCB address
+;	R4 = PCB address
+;	R3 = IRP address
+;
+; Outputs:
+;
+;	None
+;-
+DLE$FDT_DEACCESS::			; IO$_DEACCESS FDT routine
+	BICL	#1,IRP$L_WIND(R3)	; Clear interlock bit
+	BLSS	10$			; If LSS then link is accessed
+	MOVZWL	#SS$_FILNOTACC,R0	; Say "link not accessed"
+	BRW	ABORTIO			; Abort the I/O
+10$:	;
+	;   Abort all outstanding I/O on the channel
+	;
+	PUSHR	#^M<R3,R4,R5,R6,R7,R8,R9,R10>
+	DSBINT	UCB$B_FIPL(R5)		; Synchronize
+	MOVL	IRP$L_WIND(R3),R6	; Get DWB address
+	BSBW	CANCEL_ALL		; Cancel all outstanding I/O
+	ENBINT				; Restore IPL
+	POPR	#^M<R3,R4,R5,R6,R7,R8,R9,R10>
+	;
+	;   Send the request to NETACP for further processing
+	;
+	SETBIT	#IRP$V_PHYSIO,-		; Mark this as a DLE IRP
+		IRP$W_STS(R3)
+	JMP	G^ACP$DEACCESS		; Goto common IO$_DEACCESS FDT routine
+
+;
+; We arrive here after the ACP has finished with the IRP, and has requeued
+; it to this driver for further processing.
+;
+; Inputs:
+;
+;	R6 = DWB address
+;	R5 = UCB address
+;	R3 = IRP address
+;
+; Outputs:
+;
+;	None
+;
+
+DLE$DEACCESS::				; IO$_DEACCESS "startio" processing
+	BSBW	GET_WNDSC		; Get CCB$L_WIND image descriptor
+	CLRL	(R7)			; Clear CCB$L_WIND image in the buffer
+	SETBIT	#IRP$V_FUNC,IRP$W_STS(R3) ; Mark for write back
+	MOVW	#1,IRP$W_BCNT(R3)	; Write back 1 (the window) ABD
+	MOVZWL	S^#SS$_NORMAL,-		; Request has succeeded
+		IRP$L_IOST1(R3)
+	CLRBIT	#DWB$V_RUN,-		; Mark DWB no longer active
+		DWB$W_FLAGS(R6)
+	SETBIT	#DWB$V_DELETE,-		; Mark DWB to be deleted
+		DWB$W_FLAGS(R6)
+	BSBW	DEALLOC_DWB		; Deallocate DWB, if possible
+	BSBW	RESTORE_QUOTA		; Restore quota
+	RSB
+
+	.SBTTL	DEALLOC_DWB	- Deallocate DWB
+;+
+; DEALLOC_DWB - Deallocate DWB, if possible
+;
+; This routine is called to deallocate the DWB if an access request fails,
+; or as a result of a deaccess function.  If the DWB still has I/O pending,
+; the DWB is marked for delete, so that when the I/O completes, the DWB is
+; deleted.
+;
+; Inputs:
+;
+;	R6 = DWB address (may be zero)
+;
+; Outputs:
+;
+;	None
+;
+;	R0-R1 are destroyed.
+;-
+DEALLOC_DWB:
+	TSTL	R6			; Check DWB address
+	BEQL	90$			; Skip if none
+	BBC	#DWB$V_DELETE,-		; If not yet marked for delete,
+		DWB$W_FLAGS(R6),90$	; then wait until it is allowed
+	;
+	;   Deallocate all received messages
+	;
+10$:	REMQUE	@DWB$Q_RCV_MSG(R6),R1	; Get received message IRP
+	BVS	20$			; If VS then none
+	BSBB	DEALLOC_MSG		; Deallocate received message
+	BRB	10$			; Loop
+20$:	;
+	;   If any IRPs are still queued to the datalink, then leave
+	;   the DWB around until the I/O completes.
+	;
+	TSTB	DWB$B_IRPCNT(R6)	; Any IRPs still queued to datalink?
+	BNEQ	90$			; If so, wait for them to complete
+	;
+	;   Deallocate the DWB
+	;
+	MOVL	DWB$L_UCB0(R6),R0	; Get UCB address
+	MOVL	UCB$L_VCB(R0),R0	; Get VCB address
+	BEQL	100$			; If none, fatal error
+	DECW	RCB$W_MCOUNT(R0)	; Decrement ACP mount count
+	REMQUE	(R6),R6			; Remove from UCB$Q_DWB_LIST
+	MOVL	R6,R0			; Get buffer address
+	JSB	G^COM$DRVDEALMEM	; Deallocate block
+	CLRL	R6			; Invalidate pointer
+90$:	RSB
+
+100$:	BUG_CHECK NETNOSTATE,FATAL	; ACP dismounted while DWB still active
+
+;
+; Deallocate a received message IRP
+;
+
+DEALLOC_MSG:
+	MOVL	IRP$L_IOSB(R1),R0	; Get CXB address, if any
+	BEQL	15$			; Skip if none
+	BSBB	50$			; Deallocate it
+15$:	MOVL	R1,R0			; Setup IRP address
+50$:	JSB	G^COM$DRVDEALMEM	; Deallocate it
+	RSB
+
+	.SBTTL	RESTORE_QUOTA	- Restore "access" quota
+;+
+; RESTORE_QUOTA - Restore quota taken for accessed channel
+;
+; This routine is called to return the user's quota when an access request
+; fails, or on a deaccess function.
+;
+; Inputs:
+;
+;	R3 = IRP address
+;
+; Outputs:
+;
+;	R0-R1 destroyed.
+;-
+RESTORE_QUOTA:
+	MOVZWL	IRP$L_PID(R3),R0	; Get process index
+	MOVL	G^SCH$GL_PCBVEC,R1	; Get address of PCB vector
+	MOVL	(R1)[R0],R1		; Get PCB address
+	CMPL	PCB$L_PID(R1),IRP$L_PID(R3) ; Still the same process?
+	BNEQ	90$			; If not, skip it
+	MOVL	PCB$L_JIB(R1),R0	; Get JIB address
+	INCW	JIB$W_FILCNT(R0)	; Return quota taken for access
+90$:	RSB
+
+	.SBTTL	DLE$FDT_SETMODE - Process IO$_SETMODE request
+;+
+; DLE$FDT_SETMODE	Process IO$_SETMODE QIO
+;
+; Sets the substate for the DLE adjacency.
+;
+; Inputs:
+;
+;	R6 = CCB address
+;	R5 = UCB address
+;	R4 = PCB address
+;	R3 = IRP address
+;
+;	P2(AP) = Address of UNA P2 buffer (used only for DLE access to UNA)
+;	P3(AP) = Address of 6 byte remote NI address (used only for UNA)
+;	P4(AP) = Address of 4 byte DLE substate for connection
+;
+; Outputs:
+;
+;	I/O is posted
+;-
+DLE$FDT_SETMODE::			; Process IO$_SETMODE function
+	BICL3	#1,IRP$L_WIND(R3),R2	; Clear interlock bit
+	BGEQ	60$			; Error if link not accessed
+	;
+	;   If P4 specified, update the DLE substate
+	;
+	MOVL	P4(AP),R0		; Is P4 specified?
+	BEQL	15$			; If not, skip it
+	IFNORD	#4,(R0),70$		; If not readable, report error
+	MOVB	(R0),DWB$B_SUBSTA(R2)	; Set the new sub-state
+15$:	;
+	;   If P3 specified, update the remote NI address
+	;
+	MOVL	P3(AP),R0		; Is P3 specified?
+	BEQL	25$			; If not, skip it
+	IFNORD	#6,(R0),70$		; If not readable, report error
+	MOVL	(R0)+,DWB$G_REMNOD(R2)	; Store remote NI address
+	MOVW	(R0),DWB$G_REMNOD+4(R2)
+25$:	;
+	;   Send the request to NETACP so that it can finish processing
+	;   those arguments which require process level action (like the
+	;   UNA P2 buffer).
+	;
+	SETBIT	#IRP$V_PHYSIO,-		; Mark this as a DLE IRP
+		IRP$W_STS(R3)
+	BSBB	SETMODE_ACPBUF		; Build ACP complex buffer
+	SETIPL	#IPL$_SYNCH		; Synchronize with I/O database
+	MOVL	UCB$L_VCB(R5),R0	; Get VCB address
+	INCW	VCB$W_TRANS(R0)		; Increment transaction count
+	JMP	G^EXE$QIOACPPKT		; Queue packet to AQB and RET
+
+	;
+	;   Error paths
+	;
+60$:	MOVZWL	#SS$_FILNOTACC,R0	; Say "link not accessed"
+	BRB	80$			; Abort the I/O
+
+70$:	MOVZWL	#SS$_ACCVIO,R0		; Access violation reading NI address
+80$:	BRW	ABORTIO			; Abort the I/O
+
+;
+; We arrive here after the ACP has finished with the IRP, and has requeued
+; it to this driver for further processing.
+;
+; Inputs:
+;
+;	R6 = DWB address
+;	R5 = UCB address
+;	R3 = IRP address
+;
+; Outputs:
+;
+;	None
+;
+
+DLE$SETMODE::				; IO$_SETMODE "startio" processing
+	BLBC	IRP$L_IOST1(R3),90$	; If error, leave IOST2 alone
+	BSBW	GET_STATUS		; Get status flags
+	MOVL	R1,IRP$L_IOST2(R3)	; Store them in second longword
+90$:	RSB				; Post I/O with ACP status in IOST1
+
+	.SBTTL	SETMODE_ACPBUF	- Build SETMODE ACP complex buffer
+;+
+; SETMODE_ACPBUF - Build complex buffer to pass QIO parameters to ACP
+;
+; This routine is called by ACCESS, DEACCESS, ACPCONTROL and SETMODE
+; to pass it's QIO arguments (P1-P6) to the ACP in a complex buffer
+; (a series of ABD descriptors).
+;
+; Inputs:
+;
+;	R6 = CCB address
+;	R5 = UCB address
+;	R4 = PCB address
+;	R3 = IRP address
+;
+;	P2 = Address of a descriptor of a input buffer (read, not written)
+;
+; Outputs:
+;
+;	IRP$L_SVAPTE = Address of complex buffer
+;
+;	All errors go to ABORTIO.
+;
+;	R0-R2,R9-R10 are destroyed.
+;-
+SETMODE_ACPBUF:
+	MOVL	#12+<7*9>,R1		; Compute basic ABD overhead for 6 args
+					; plus a window descriptor
+	MOVL	P2(AP),R10		; Get address of descriptor
+	BEQL	10$			; If specified,
+	IFNORD	#8,(R10),70$		; and if descriptor can be read,
+	MOVZWL	(R10),R0		; Get size of P2 buffer
+	ADDL	R0,R1			; Add in the size of the buffer
+10$:	PUSHL	R3			; Save IRP address
+	JSB	G^EXE$ALLOCBUF		; Allocate complex buffer
+	POPL	R3			; Restore IRP address
+	BLBC	R0,90$			; Exit if error detected
+	MOVL	R2,IRP$L_SVAPTE(R3)	; Save address of buffer
+	MOVW	#7,IRP$W_BCNT(R3)	; Save number of descriptors
+	SETBIT	#IRP$V_COMPLX,IRP$W_STS(R3) ; Mark buffer as complex
+	MOVAB	12(R2),(R2)		; First longword points to data
+	PUSHR	#^M<R2,R3,R4,R5>	; Save registers
+	MOVC5	#0,(SP),#0,#7*8,12(R2)	; Zero all the descriptors,
+	MOVL	R3,R1			; leaving R1 set to area afterwards
+	POPR	#^M<R2,R3,R4,R5>	; Restore registers
+	MOVAB	12(R2),R0		; Point to first descriptor
+	;
+	;   Copy window pointer to complex buffer
+	;
+	MOVW	#4,ABD$W_COUNT(R0)	; Set size of window pointer
+	SUBL3	R0,R1,R9		; Compute offset to data area
+	MOVW	R9,ABD$W_TEXT(R0)	; Set offset to window pointer
+	MOVAB	CCB$L_WIND(R6),ABD$L_USERVA(R0) ; Set address in process space
+	CLRB	(R1)+			; Set access mode = kernel
+	MOVL	CCB$L_WIND(R6),(R1)+	; Copy actual window pointer
+	;
+	;   Copy P2 argument to complex buffer
+	;
+	ADDL	#2*8,R0			; Skip to P2 descriptor
+	TSTL	R10			; Was P2 specified?
+	BEQL	50$			; If not, skip the following
+	MOVW	(R10),ABD$W_COUNT(R0)	; Set size of P2 buffer
+	SUBL3	R0,R1,R9		; Compute offset to data area
+	MOVW	R9,ABD$W_TEXT(R0)	; Set offset to window pointer
+	MOVL	4(R10),ABD$L_USERVA(R0)	; Set address in process space
+	MOVB	IRP$B_RMOD(R3),(R1)+	; Copy access mode
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; Save registers
+	MOVC	(R10),@4(R10),(R1)	; Copy actual P2 buffer
+	POPR	#^M<R0,R1,R2,R3,R4,R5>	; Restore registers
+50$:	RSB
+
+70$:	MOVZWL	#SS$_ACCVIO,R0		; Access violation
+90$:	BRW	ABORTIO			; Abort the I/O
+
+	.SBTTL	GET_STATUS	- Refresh DLE status flags for IOSB
+;+
+; GET_STATUS - Construct updated status flags for 2nd longword of IOSB
+;
+; This routine is called each time we want to return the DLE status flags
+; to the caller.  Currently, these flags are returned on all ACCESS and
+; SETMODE functions.
+;
+; The flags are defined by the STAT structure.
+;
+; Inputs:
+;
+;	R6 = DWB address
+;
+; Outputs:
+;
+;	R1 = DLE status flags
+;
+;	All other registers are preserved.
+;-
+GET_STATUS:
+	CLRL	R1			; Init. flags longword
+	;
+	;   Set a flag indicating if the circuit being used is
+	;   a "broadcast circuit" (Ethernet) or not.
+	;
+	BBC	#DWB$V_BC,DWB$W_FLAGS(R6),20$ ; If flag set,
+	SETBIT	#STAT_V_BC,R1		; Indicate that the circuit is an NI
+20$:	RSB
+
+	.SBTTL	DLE$FDT_CONTROL - IO$_ACPCONTROL FDT processing
+	.SBTTL	DLE$CONTROL	- IO$_ACPCONTROL "startio" processing
+;+
+;  DLE$FDT_CONTROL	- IO$_ACPCONTROL FDT processing
+;  DLE$CONTROL		- IO$_ACPCONTROL "startio" processing
+;
+;  The FDT routine simply routes the IRP through the Exec to the ACP.  The Exec
+;  builds a "complex buffer" describing the control function.  The ACP will 
+;  requeue any IRP to the driver if it does not recognize the control function.
+;  The driver has been designed to handle some of its own control functions 
+;  since many are protocol or control block format specific.
+;
+; Inputs:
+;
+;	R6 = CCB address
+;	R5 = UCB address
+;	R4 = PCB address
+;	R3 = IRP address
+;
+; Outputs:
+;
+;	None
+;-
+DLE$FDT_CONTROL::			; "FDT" phase for IO$_ACPCONTROL
+	BICL	#1,IRP$L_WIND(R3)	; Always clear interlock flag
+	SETBIT	#IRP$V_PHYSIO,-		; Mark this as a DLE IRP
+		IRP$W_STS(R3)
+	JMP	G^ACP$MODIFY		; Continue in EXEC
+
+;
+; We arrive here after the ACP has finished with the IRP, and has requeued
+; it to this driver for further processing.
+;
+; Inputs:
+;
+;	R6 = DWB address (may be zero)
+;	R5 = UCB address
+;	R3 = IRP address
+;
+; Outputs:
+;
+;	None
+;
+DLE$CONTROL::				; "Startio" phase for IO$_ACPCONTROL
+	MOVL	IRP$L_SVAPTE(R3),R0	; Get ptr to complex buffer
+	BEQL	10$			; Branch if none (if $CANCEL issues it)
+	MOVL	(R0),R0			; Get pointer to window descriptor
+	CLRL	(R0)			; Prevent I/O from affecting the window
+					; by clearing byte count in descriptor
+	RSB				; Exit with ACP status unchanged
+
+;
+; $CANCEL issues an IO$_ACPCONTROL function without any buffer to signal
+; a cancellation of an accessed channel.
+;
+
+10$:	MOVZWL	S^#SS$_NORMAL,-		; Set I/O status
+		IRP$L_IOST1(R3)		; 
+	BICL	#1,R6			; Clear interlock bit
+	BLSS	40$			; If LSS then valid DWB
+	;
+	;   This is a cancel of a channel with an ACCESS pending.  Since
+	;   the ACP has the IRP in-hand, there is nothing we can do to
+	;   get it back from here.
+	;
+	RSB
+
+	;
+	;   Cancel all outstanding I/O for active channel.
+	;
+40$:	BSBW	CANCEL_ALL		; Cancel all outstanding I/O
+	RSB				; Exit
+
+	.SBTTL	DLE$CANCEL	- Cancel I/O routine
+;+
+; DLE$CANCEL	- Cancel I/O entry point
+;
+; Most of the work for the Cancel-I/O sequence will occur when the special
+; IO$_ACPCONTROL QIO is issued by the $CANCEL system service.  A cancel
+; issued without the channel being accessed requires no work.
+;
+; Inputs:
+;
+;	R8 = Reason for cancel (CAN$C_CANCEL or CAN$C_DASSGN)
+;	R5 = UCB address
+;	R4 = PCB address
+;	R3 = IRP address if UCB is busy
+;	R2 = Channel number
+;
+;	IPL = FIPL
+;
+; Outputs:
+;
+;	R0-R3 may be destroyed.
+;-
+DLE$CANCEL::				; Cancel I/O entry point
+	RSB				; Done
+
+	.SBTTL	CANCEL_ALL	- Cancel all outstanding I/O
+;+
+; CANCEL_ALL	- Run down all outstanding I/O
+;
+; This routine is called to run down all I/O pending for the channel.
+;
+; Inputs:
+;
+;	R6 = DWB address
+;
+; Outputs:
+;
+;	None
+;
+;	R0-R2 are destroyed.
+;-
+CANCEL_ALL::				; Cancel all outstanding I/O
+	PUSHR	#^M<R3,R4,R5,R6,R8>	; Save regs
+	;
+	;   Abort all pending user transmits which haven't yet been
+	;   queued to the datalink.
+	;
+	MOVAB	DWB$Q_USER_XMT(R6),R8	; Get user transmit IRP listhead
+	BSBB	ABORT_IRPS		; Drain it
+	;
+	;   Issue a cancel request to the datalink to abort any I/O
+	;   requests we have outstanding to the datalink.  When the
+	;   receive IRPs come back aborted, we will return that status
+	;   in the corresponding user IRP.
+	;
+	MOVZBL	#CAN$C_CANCEL,R8	; Indicate "cancel", not "deassign"
+	MNEGW	DWB$W_DLL_CHAN(R6),R2	; Set channel to datalink
+	CLRL	R3			; No "current IRP"
+	MOVL	DWB$L_UCB0(R6),R0	; Get address of ND's UCB0
+	MOVL	UCB$L_VCB(R0),R0	; Get address of our VCB
+	MOVL	VCB$L_AQB(R0),R1	; Get address of our AQB
+	MOVZWL	AQB$L_ACPPID(R1),R0	; Get ACP process index
+	MOVL	G^SCH$GL_PCBVEC,R4	; Get address of PCB vector
+	MOVL	(R4)[R0],R4		; Get PCB address
+	CMPL	PCB$L_PID(R4),AQB$L_ACPPID(R1) ; Still the same process?
+	BNEQ	20$			; If not, skip it
+	MOVL	DWB$L_DLL_UCB(R6),R5	; Get datalink UCB address
+	DSBINT	UCB$B_FIPL(R5)		; Change IPL to datalink's level
+	MOVL	UCB$L_DDT(R5),R1	; Get datalink DDT
+	JSB	@DDT$L_CANCEL(R1)	; Call datalink cancel entry point
+	ENBINT				; Restore IPL
+20$:	POPR	#^M<R3,R4,R5,R6,R8>	; Restore regs
+	RSB				; Done
+
+ABORT_IRPS:
+	REMQUE	@(R8),R3		; Get IRP
+	BVS	30$			; If VS then none
+	MOVZWL	#SS$_CANCEL,-		; Setup I/O status and 0 transfer size
+		IRP$L_IOST1(R3)
+	MOVL	IRP$L_UCB(R3),R5	; Get UCB address
+	JSB	G^COM$POST		; Another packet for the heap
+	BRB	ABORT_IRPS		; Loop
+30$:	RSB				; Done
+
+	.SBTTL	DLE$LPD_DOWN	- The circuit has gone away
+;+
+; DLE$LPD_DOWN - Handle "LPD down" notification from NETACP
+;
+; This routine is called by NETACP when the LPD becomes unusable for reasons
+; beyond our control.  We must locate all DLE users associated with this
+; circuit, and cause the DLE sessions to be terminated.
+;
+; Inputs:
+;
+;	IPL = 0
+;
+;	R5 = any DLE UCB address
+;	R8 = LPD ID
+;	R0 = Status code
+;
+; Outputs:
+;
+;	None
+;
+;	R0-R1 is destroyed.
+;-
+DLE$LPD_DOWN::
+	DSBINT	UCB$B_FIPL(R5)		; Synchronize
+	PUSHR	#^M<R6,R7>		; Save registers
+	MOVL	UCB$L_DDB(R5),R0	; Get DLE DDB address
+	MOVL	DDB$L_UCB(R0),R0	; Get DLE UCB0 address
+	MOVAB	UCB$Q_DWB_LIST(R0),R7	; Get address of listhead
+	MOVL	R7,R6			; Setup for loop
+10$:	MOVL	(R6),R6			; Skip to next DWB
+	CMPL	R6,R7			; End of list?
+	BEQL	90$			; If so, exit
+	CMPW	DWB$W_PATH(R6),R8	; Does the circuit ID match?
+	BNEQ	10$			; If not, keep looking
+	;
+	;   Clear RUN flag, so that no further I/O is allowed on channel
+	;
+	BBCC	#DWB$V_RUN,DWB$W_FLAGS(R6),10$ ; Clear RUN flag
+					; If not in RUN state, don't do cancel
+	;
+	;   Cancel all outstanding I/O operations to datalink
+	;
+	BSBW	CANCEL_ALL		; Cancel all I/O
+	BRB	10$			; Keep looping
+
+90$:	POPR	#^M<R6,R7>		; Restore registers
+	ENBINT				; Restore IPL
+	RSB
+
+	.SBTTL	DLE$FDT_RCV	- FDT for IO$_READxBLK requests
+;+
+; DLE$FDT_RCV - FDT routine for read requests
+;
+; This routine prepares an IRP to be used to receive a message.
+;
+; The NOW modifier is allowed so the user can request immediate
+; notification if there are no messages pending.
+;
+; Inputs:
+;
+;	R5 = UCB address
+;	R4 = PCB address
+;	R3 = IRP address
+;
+; Outputs:
+;
+;	None
+;-
+DLE$FDT_RCV:
+	;
+	;   If the P5 buffer is specified, then it must point to a 14 byte
+	;   user writable buffer into which will be stored the NI datalink
+	;   header when the receive completes.
+	;
+	MOVL	P5(AP),R7		; Get address of buffer
+	BEQL	20$			; Skip if not specified
+	IFNOWRT	#DIAG_C_NIHDRSIZ,(R7),70$ ; Error if buffer not writable
+	BBS	#IRP$V_DIAGBUF,-	; If diagnostic buffer already given,
+		IRP$W_STS(R3),20$	; then skip it
+	MOVZBL	#DIAG_C_LENGTH,R1	; Get size of diagnostics buffer
+	BSBW	DLE$ALONONPAGED		; Allocate buffer
+	BLBC	R0,80$			; Branch if error detected
+	MOVL	R2,IRP$L_DIAGBUF(R3)	; Save address of buffer
+	MOVW	R1,DIAG_W_SIZE(R2)	; Set length of structure
+	MOVAB	DIAG_G_DATA(R2),-	; Set address of data portion
+		DIAG_L_DATA(R2)
+	MOVL	R7,DIAG_L_USERBUF(R2)	; Set address of user buffer
+	SETBIT	#IRP$V_DIAGBUF,-	; Mark diagnostics buffer present
+		IRP$W_STS(R3)
+20$:	;
+	;   Join common data buffer probing
+	;
+	MOVAB	G^EXE$READCHKR,R2	; Setup buffer probe action routine
+	BRB	DLE$FDT_RW		; Join common code
+
+	;
+	;   Error paths
+	;
+70$:	MOVZBL	S^#SS$_ACCVIO,R0	; Assume access violation
+80$:	BRW	ABORTIO
+
+	.SBTTL	DLE$FDT_XMT	- FDT for IO$_WRITExBLK requests
+;+
+; DLE$FDT_XMT - FDT routine for write requests
+;
+; This routine prepares an IRP to be used to write a message.
+;
+; Inputs:
+;
+;	R5 = UCB address
+;	R4 = PCB address
+;	R3 = IRP address
+;
+; Outputs:
+;
+;	None
+;-
+DLE$FDT_XMT:
+	MOVAB	G^EXE$WRITECHKR,R2	; Setup buffer probe action routine
+	BRB	DLE$FDT_RW		; Join common code
+
+	.SBTTL	DLE$FDT_RW	- DLE FDT Read/Write processing
+;+
+; DLE$FDT_RW	- Complete FDT Read/Write buffered I/O
+;
+; Probe the buffer.  Allocate a system buffer to receive
+; or transmit the data and queue the IRP to the XWB.  
+;
+; Inputs:
+;
+;	R5 = UCB address
+;	R4 = PCB address
+;	R3 = IRP address
+;	R2 = Address of buffer access check routine
+;
+;	P1(AP) = Address of user buffer
+;	P2(AP) = Length of user buffer
+;	P5(AP) = Address of 14-byte buffer to receive NI datalink header
+;
+; Outputs:
+;
+;	None
+;-
+DLE$FDT_RW::				; DLE Read/Write FDT
+	CLRW	IRP$W_BOFF(R3)		; No byte quota taken yet
+	CLRL	IRP$L_SVAPTE(R3)	; Clear the buffer pointer
+	CLRQ	IRP$L_IOST1(R3)		; Clear IOSB image
+	;
+	;   Must only use the P1 and P2 parameters once.  Else, a malicious
+	;   user could DMA some bogus data to overlay the argument list
+	;   contents after they have been verified to be okay via a probe.  
+	;   Thus, copy P1 and P2 to registers and only use the registers from
+	;   now on.
+	;
+	MOVL	P1(AP),R10		; Point to users' data
+	MOVZWL	P2(AP),R11		; Number of bytes
+	;
+	;   Test for user buffer accessiblity
+	;
+	MOVQ	R10,R0			; Setup user's buffer descriptor
+	PUSHL	R3			; Save IRP address
+	JSB	(R2)			; Is buffer accessible?
+					; - clobbers R0-R3, sets up IRP$W_BCNT
+	POPL	R3			; Restore IRP address
+	BLBC	R0,5$			; If LBC then access violation
+	;
+	;   Get the window block, and make sure the channel has been accessed.
+	;
+	MOVZWL	#SS$_FILNOTACC,R0	; Assume not accessed yet
+	MOVL	IRP$L_WIND(R3),R6	; Get DWB address
+	BEQL	5$			; If EQL window is not valid
+	BLBS	R6,5$			; If LBC window is not valid
+	SETIPL	#NET$C_IPL		; Synchronize access to DWB
+	;
+	;   Consume user's byte quota needed for buffer.  Wait if necessary.
+	;
+	MOVL	R11,R1			; Setup size of user's buffer
+	BSBW	DLE$FDT_BYTQUO		; Consume byte quota needed.  May wait
+					; at IPL$_ASTDEL if needed, but always
+					; returns at NET$C_IPL.
+	BLBC	R0,5$			; If LBC then return to abort I/O
+	SETIPL	#IPL$_ASTDEL		; Lower IPL for call to EXE$ALLOCBUF
+					; and to get at user memory to copy 
+					; data if needed
+	ADDW3	#CXB$C_OVERHEAD,R11,R1	; Get total buffer size
+	PUSHL	R3			; Save IRP address
+	JSB	G^EXE$ALLOCBUF		; Allocate non-paged buffer -- will
+					; wait if needed and allowed by the
+					; processes resource wait mode setting
+	POPL	R3			; Restore IRP address
+	BLBS	R0,10$			; If LBS then buffer was allocated
+5$:	BRW	100$			; Return with error in R0
+10$:	MOVL	R2,IRP$L_SVAPTE(R3)	; Store buffer address
+	;
+	;    Init the CXB
+	;
+	PUSHR	#^M<R1,R2,R3,R4,R5>	; Save critical regs destroyed by MOVC
+	MOVC5	#0,(SP),#0,-		; Zero the CXB header
+		#CXB$C_HEADER,(R2)	;
+	POPR	#^M<R1,R2,R3,R4,R5>	; Restore regs
+	MOVW	R1,CXB$W_SIZE(R2)	; Store size for deallocation
+	MOVB	#DYN$C_CXB,CXB$B_TYPE(R2) ; Setup structure type
+	MOVAB	CXB$C_HEADER(R2),(R2)	; Store data area ptr in CXB
+	MOVL	R10,4(R2)		; Store user buffer addr
+	MOVL	R3,CXB$L_IRP(R2)	; Store IRP back-pointer
+	BBS	#IRP$V_FUNC,-		; If BS then a RCV function
+		 IRP$W_STS(R3),20$	; 
+	PUSHL	R3			; Save IRP address
+	MOVC3	R11,(R10),@(R2)		; Move user data
+	POPL	R3			; Restore IRP address
+20$:	;
+	;   Check DWB state.  If still active, then continue.  Else return
+	;   to abort the I/O.
+	;
+	SETIPL	#NET$C_IPL		; Synch access to the DWB
+	MOVZWL	#SS$_FILNOTACC,R0	; Assume wrong state
+	BBC	#DWB$V_RUN,-		; If connection not active,
+		DWB$W_FLAGS(R6),100$	; then return an error
+	BBS	#IRP$V_FUNC,-		; If BS then RCV request
+		 IRP$W_STS(R3),40$
+	;
+	;   Finish IO$_WRITE processing
+	;
+	INSQUE	(R3),@DWB$Q_USER_XMT+4(R6) ; Insert IRP onto queue
+	BSBW	DLE$XMT_MSG		; Transmit the message, if possible
+	BRB	60$			; Done
+	;
+	;   Finish IO$_READ processing
+	;
+40$:	REMQUE	@DWB$Q_RCV_MSG(R6),R5	; Get waiting message (IRP)
+	BVS	50$			; If VS then none
+	BSBW	RCV_DONE		; Complete user IRP (in R3)
+	MOVL	R5,R1			; Set datalink receive IRP address
+	BSBW	DEALLOC_MSG		; Deallocate received message IRP/CXB
+	BRB	60$			; Take common exit
+50$:	;
+	;   No received messages are pending for the user.  If the NOW
+	;   modifier was specified, then return an indication that no
+	;   messages are pending.
+	;
+	BBC	#IO$V_NOW,-		; If NOW modifier specified,
+		IRP$W_FUNC(R3),55$
+	MOVZWL	#SS$_ENDOFFILE,R0	; Set error status
+	BRB	100$			; and ABORT the I/O
+	;
+	;   Receive must wait for incoming data.  Issue receive to datalink
+	;   on behalf of the user.
+	;
+55$:	INSQUE	(R3),@DWB$Q_USER_RCV+4(R6) ; Insert on wait queue
+	BSBW	INIT_RCV_IRP		; Initialize datalink receive IRP
+	BLBC	R0,70$			; Branch if error detected
+	BSBW	ISSUE_DLL_RCV		; Issue the receive to the datalink
+60$:	MOVZWL	S^#SS$_NORMAL,R0	; Success
+	SETIPL	S^#IPL$_ASTDEL		; Restore IPL
+	JMP	G^EXE$QIORETURN		; Return to user with success
+
+
+;
+; An error has been detected.  Abort the I/O request.
+;
+
+70$:	REMQUE	@DWB$Q_USER_RCV+4(R6),R3 ; Get the user IRP back
+					; Return INIT_RCV_IRP status to user
+
+100$:	MOVL	IRP$L_UCB(R3),R5	; Restore UCB address
+	BRW	ABORTIO			; Abort I/O with status in R0
+
+	.SBTTL	DLE$FDT_BYTQUO	- Get Non-paged Pool Quota
+;+
+; DLE$FDT_BYTQUO  - Get Non-paged Pool Quota
+;
+; Take indicate bytes from JIB BYTCNT quota.  Wait for them if necessary
+; and allowed.  The quota taken is subtracted form JIB$L_BYTCNT and moved
+; to IRP$W_BOFF.
+;
+; IPL is assumed to be NET$C_IPL and may be lowered to IPL$_ASTDEL or 
+; IPL$_SYNCH.  May go into MWAIT at IPL$_ASTDEL, always return at NET$C_IPL.
+;
+; Inputs:
+;
+;	R5 = UCB address
+;	R4 = PCB address
+;	R3 = IRP address
+;	R1 = Quota to take
+;
+; Outputs:
+;
+;	R0 = Status code
+;
+;	All other registers are preserved.
+;-
+DLE$FDT_BYTQUO::			; Get non-paged pool quota
+	PUSHL	R7			; Save registers
+	MOVL	PCB$L_JIB(R4),R7	; Get JIB
+10$:	CMPL	R1,JIB$L_BYTCNT(R7)	; Enough quota left ?
+	BLEQU	20$			; If LEQU then yes
+	CMPL	R1,JIB$L_BYTLM(R7)	; Is it worth waiting
+	BGTRU	30$			; If GTRU then waiting won't help
+	BBS	#PCB$V_SSRWAIT,-	; If BS then wait mode disabled
+		 PCB$L_STS(R4),30$	;
+	MOVL	S^#RSN$_ASTWAIT,R0	; Set resource to wait for
+					;
+	SETIPL	#IPL$_ASTDEL		; Set PSL for wait state
+	MOVPSL	-(SP)			; Save PSL for call to scheduler
+	ASSUME	IPL$_SYNCH  LE  NET$C_IPL
+	SETIPL	#IPL$_SYNCH		; Syncronize for call to SCH$RWAIT
+	JSB	G^SCH$RWAIT		; Wait for resource
+	SETIPL	#NET$C_IPL		; Restore IPL
+	BRB	10$			; Try again
+
+20$:	SUBL	R1,JIB$L_BYTCNT(R7)	; Consume bytes
+	MOVW	R1,IRP$W_BOFF(R3)	; Save quota taken from JIB
+	MOVL	S^#SS$_NORMAL,R0	; Indicate success
+90$:	POPL	R7			; Restore registers
+	RSB				; Done
+
+30$:	MOVZWL	#SS$_EXBYTLM,R0		; Setup error status
+	BRB	90$
+
+	.SBTTL	DLE$XMT_MSG	- Send message over direct-accessed circuit
+;+
+; DLE$XMT_MSG	- Send message over direct-accessed circuit
+;
+; This routine is called whenever a new transmit IRP is placed on the
+; user transmit queue.
+;
+; Inputs:
+;
+;	R6 = DWB address
+;
+; Outputs:
+;
+;	None - message is queued to datalink layer.
+;
+;	R0-R2 are destroyed.
+;-
+DLE$XMT_MSG::
+	PUSHR	#^M<R3,R4,R5,R6,R7>	; Save registers
+	;
+	;   Get next user transmit to process, if any are pending.
+	;
+	REMQUE	@DWB$Q_USER_XMT(R6),R7	; Get next user transmit request
+	BVS	19$			; Exit if none
+	;
+	;   Allocate and initialize an IRP to send to the datalink layer
+	;
+	MOVZBL	#IRP$C_LENGTH,R1	; Set length of block to allocate
+	BSBW	DLE$ALONPGD_Z		; Allocate/zero the IRP
+	BLBS	R0,10$			; Branch if got it
+	INSQUE	(R7),DWB$Q_USER_XMT(R6)	; Put IRP back on the queue
+19$:	BRW	90$			; Exit without doing anything
+10$:	MOVL	R2,R3			; Copy block address
+	MOVB	#DYN$C_IRP,IRP$B_TYPE(R3) ; Set block type
+	MOVB	#NET$C_IPL,IRP$B_RMOD(R3) ; Set driver IPL
+	MOVAB	B^DLE$XMT_DONE,IRP$L_PID(R3) ; Set I/O post-processing routine
+	MOVL	R6,IRP$L_ASTPRM(R3)	; Save DWB address in IRP
+	MOVL	DWB$L_DLL_UCB(R6),-	; Set address of datalink UCB
+		IRP$L_UCB(R3)
+	MOVW	S^#IO$_WRITELBLK,-	; Set I/O function code
+		IRP$W_FUNC(R3)
+	MOVB	#31,IRP$B_PRI(R3)	; Use lowest priority
+	MNEGW	DWB$W_DLL_CHAN(R6),-	; Set channel to datalink
+		IRP$W_CHAN(R3)
+	MOVL	DWB$G_REMNOD(R6),-	; Set remote NI address if datalink
+		IRP$Q_STATION(R3)
+	MOVW	DWB$G_REMNOD+4(R6),-	; (no-op if datalink not a UNA)
+		IRP$Q_STATION+4(R3)
+	;
+	;   Attach the user's message to the datalink IRP
+	;
+	MOVL	IRP$L_SVAPTE(R7),R4	; Get CXB address
+	MOVL	R4,IRP$L_IOSB(R3)	; Set IOSB to buffer address
+	MOVW	IRP$W_BCNT(R7),-	; Copy length of message
+		IRP$W_BCNT(R3)
+	BBC	#DWB$V_DLL_XBF,-	; Branch if datalink does direct xmits
+		DWB$W_FLAGS(R6),20$
+	;
+	;   The datalink does buffered transmits
+	;
+	MOVW	#IRP$M_BUFIO,-		; Assume datalink does buffered
+		IRP$W_STS(R3)		; transmits
+	MOVL	R4,IRP$L_SVAPTE(R3)	; Set buffer address
+	CLRW	IRP$W_BOFF(R3)		; Clear BOFF
+	BRB	30$
+	;
+	;   The datalink does direct transmits
+	;
+20$:	CLRW	IRP$W_STS(R3)		; Clear BUFIO flag
+	EXTZV	#VA$V_VPN,-		; Get virtual page number
+		#VA$S_VPN,(R4),R1
+	MOVL	G^MMG$GL_SPTBASE,R2	; Get base of system page table
+	MOVAL	(R2)[R1],IRP$L_SVAPTE(R3) ; Set PTE address
+	BICW3	#^C<VA$M_BYTE>,(R4),-	; Set byte offset within page
+		IRP$W_BOFF(R3)
+	;
+	;   Enter the user's request onto the "transmit pending" queue
+	;
+30$:	CLRL	IRP$L_SVAPTE(R7)	; Mark buffer no longer accessible
+	INSQUE	(R7),@DWB$Q_XMT_PND+4(R6) ; Insert on "transmit pending" queue
+	;
+	;   Queue the request to the datalink driver's altstart entry point
+	;
+	INCB	DWB$B_IRPCNT(R6)	; Increment outstanding I/O count
+	MOVL	IRP$L_UCB(R3),R5	; Setup datalink UCB address
+	JSB	G^EXE$ALTQUEPKT		; Queue the packet to the datalink
+90$:	POPR	#^M<R3,R4,R5,R6,R7>	; Restore registers
+	RSB
+
+	.SBTTL	DLE$XMT_DONE	- Transmit I/O post-processing
+;+
+; DLE$XMT_DONE - Transmit I/O post-processing
+;
+; This routine is called by IOPOST when a transmit request is completed.
+; This is because the address of this routine was put into the IRP PID
+; field before issuing the transmit.  The action here is to complete the
+; user request, and deallocate the datalink IRP and buffer.
+;
+; Inputs:
+;
+;	R5 = IRP address
+;
+;	IPL = IPL$_POST (4)
+;
+; Outputs:
+;
+;	None
+;-
+DLE$XMT_DONE::
+	DSBINT	#NET$C_IPL		; Raise to driver IPL
+	PUSHL	R6			; Save registers
+	MOVL	IRP$L_IOSB(R5),R0	; Get CXB address
+	;
+	;   Locate user's original transmit IRP, and copy the completion
+	;   status to it.
+	;
+	MOVL	CXB$L_IRP(R0),R1	; Get user IRP address
+	MOVL	IRP$L_IOST1(R5),-	; Copy I/O status and xfer size
+		IRP$L_IOST1(R1)		;
+	;
+	;   Deallocate the CXB attached to the datalink IRP
+	;
+	JSB	G^COM$DRVDEALMEM	; Deallocate the CXB
+	;
+	;   Deallocate the datalink IRP
+	;
+	MOVL	R5,R0			; Set address of datalink IRP
+	JSB	G^COM$DRVDEALMEM	; Deallocate the datalink IRP
+	;
+	;   Make sure user transmits are completed in order, as a sanity check.
+	;
+	MOVL	IRP$L_WIND(R1),R6	; Get associated DWB
+	CMPL	R1,DWB$Q_XMT_PND(R6)	; Is this the first IRP in the list ?
+	BEQL	10$			; If EQL then yes
+	BUG_CHECK  NETNOSTATE,FATAL	; DLE transmit completed out of order
+10$:	;
+	;   Remove the user's IRP from the "transmit pending" queue,
+	;   and complete it.
+	;
+	REMQUE	(R1),R3			; Remove IRP
+	MOVL	IRP$L_UCB(R3),R5	; Get corresponding UCB address
+	JSB	G^COM$POST		; Complete the user's I/O request
+	;
+	;   Decrement the count of the number of outstanding datalink I/Os
+	;
+	DECB	DWB$B_IRPCNT(R6)	; Decrement outstanding I/O refcnt
+	;
+	;   If the DWB has become inactive, and was waiting for this
+	;   I/O to complete before doing so, then do not issue any further
+	;   I/O.
+	;
+	BBS	#DWB$V_RUN,-		; If DWB no longer active,
+		DWB$W_FLAGS(R6),20$
+	BSBW	DEALLOC_DWB		; then try to deallocate DWB
+	BRB	50$			; and exit without any more I/O
+20$:	;
+	;   Transmit another user message, if there is one waiting
+	;
+	BSBW	DLE$XMT_MSG		; Transmit user message, if possible
+50$:	POPL	R6			; Restore registers
+	ENBINT				; Restore IOPOST IPL
+	RSB				; Done
+
+	.SBTTL	INIT_RCV_IRP	- Initialize datalink receive IRP
+;+
+; INIT_RCV_IRP - Initialize datalink receive IRP
+;
+; This routine is called to allocate and initialize a new read request IRP
+; to the datalink driver.
+;
+; Inputs:
+;
+;	R6 = DWB address
+;
+; Outputs:
+;
+;	R0 = Status code
+;	R3 = IRP address
+;
+;	R1 is destroyed.
+;-
+INIT_RCV_IRP::
+	PUSHL	R2			; Save registers
+	;
+	;   Allocate and initialize an IRP to send to the datalink layer
+	;
+	MOVZBL	#IRP$C_LENGTH,R1	; Set length of block to allocate
+	BSBW	DLE$ALONPGD_Z		; Allocate/zero the IRP
+	BLBC	R0,90$			; Exit if no memory
+	MOVL	R2,R3			; Copy block address
+	MOVB	#DYN$C_IRP,IRP$B_TYPE(R3) ; Set block type
+	MOVB	#NET$C_IPL,IRP$B_RMOD(R3) ; Set driver IPL
+	MOVAB	DLE$RCV_MSG,IRP$L_PID(R3) ; Set I/O post-processing routine
+	MOVL	R6,IRP$L_ASTPRM(R3)	; Save DWB address in IRP
+	MOVW	S^#IO$_READLBLK,-	; Set I/O function code
+		IRP$W_FUNC(R3)
+	MOVW	#IRP$M_FUNC!IRP$M_BUFIO,- ; Setup STS for buffered reads
+		IRP$W_STS(R3)
+	;
+	;   Setup diagnostics buffer and attach it to the receive IRP
+	;   so that we can get back the NI datalink header to return
+	;   to the DLE user, if desired.  Rather than allocate another
+	;   block from pool, we re-use the end of the IRP as a diagnostics
+	;   buffer.
+	;
+	BBC	#DWB$V_BC,DWB$W_FLAGS(R6),20$ ; Skip if not an NI
+	ASSUME	IRP$C_LENGTH-IRP$C_STDLEN GE DIAG_C_LENGTH
+	MOVAB	IRP$C_STDLEN(R3),R0	; Get address of diagnostics buffer
+	MOVW	#DIAG_C_LENGTH,-	; Set size of diagnostics buffer
+		DIAG_W_SIZE(R0)
+	MOVAB	DIAG_G_DATA(R0),-	; Make pointer to data area
+		DIAG_L_DATA(R0)
+	MOVL	R0,IRP$L_DIAGBUF(R3)	; Set address of diagnostics buffer
+	SETBIT	#IRP$V_DIAGBUF,-	; Indicate diagnostics buffer present
+		IRP$W_STS(R3)
+20$:	MOVZBL	S^#SS$_NORMAL,R0	; Success
+90$:	POPL	R2			; Restore registers
+	RSB				; Exit with status
+
+	.SBTTL	ISSUE_DLL_RCV	- Issue datalink receive request
+;+
+; ISSUE_DLL_RCV - Re-Issue receive request to datalink layer
+;
+; This routine is called to re-issue a read request to the datalink driver
+; to obtain more incoming DLE messages.  An IRP is passed to this routine
+; which is assumed to have already been setup as a datalink receive IIRP.
+; A CXB buffer may optionally still be attached to the IRP - if so, it will
+; be re-used by the datalink driver.
+;
+; Inputs:
+;
+;	R6 = DWB address
+;	R3 = IRP address to be re-cycled
+;
+; Outputs:
+;
+;	R0 = Status code
+;
+;	No registers are destroyed.
+;-
+ISSUE_DLL_RCV::
+	PUSHL	R5			; Save registers
+	;
+	;   Reset the UCB/CHAN pair each time we send an IRP to the datalink
+	;   because it is possible that the UCB address might have changed
+	;   since the last receive if the user did a UNA LIMITED SETMODE
+	;   which causes a different UCB to be used than the original.
+	;
+	MOVL	DWB$L_DLL_UCB(R6),-	; Set address of datalink UCB
+		IRP$L_UCB(R3)
+	MNEGW	DWB$W_DLL_CHAN(R6),-	; Set channel to datalink
+		IRP$W_CHAN(R3)
+	BBC	#DWB$V_DLL_RBF,-	; Branch if receiver uses direct I/O
+		DWB$W_FLAGS(R6),20$
+	;
+	;   The datalink does buffered receives
+	;
+	MOVW	#^X<3FFF>,IRP$W_BCNT(R3) ; Accept infinite size messages
+	BRB	30$
+	;
+	;   The datalink does direct I/O receives.  Allocate a CXB for the
+	;   DMA receive, and attach it to the IRP.
+	;
+20$:	MOVL	IRP$L_IOSB(R3),R2	; Is there a buffer already allocated?
+	BNEQ	25$			; Branch if so
+	MOVZWL	#CXB$C_OVERHEAD+-	; Compute total buffer size
+		MAX_DIR_RCV,R1
+	BSBW	DLE$ALONONPAGED		; Allocate nonpaged buffer
+	BLBC	R0,90$			; Branch if error detected
+	PUSHR	#^M<R1,R2,R3,R4,R5>	; Save critical regs destroyed by MOVC
+	MOVC5	#0,(SP),#0,-		; Zero the CXB header
+		#CXB$C_HEADER,(R2)	;
+	POPR	#^M<R1,R2,R3,R4,R5>	; Restore regs
+	MOVW	R1,CXB$W_SIZE(R2)	; Store size for deallocation
+	MOVB	#DYN$C_CXB,CXB$B_TYPE(R2) ; Setup structure type
+25$:	MOVAB	CXB$C_HEADER(R2),(R2)	; Store data area ptr in CXB
+	MOVL	R2,IRP$L_IOSB(R3)	; Store CXB address in IRP
+	CLRW	IRP$W_STS(R3)		; Clear BUFIO flag
+	EXTZV	#VA$V_VPN,-		; Get virtual page number
+		#VA$S_VPN,(R2),R1
+	MOVL	G^MMG$GL_SPTBASE,R2	; Get base of system page table
+	MOVAL	(R2)[R1],IRP$L_SVAPTE(R3) ; Set PTE address
+	BICW3	#^C<VA$M_BYTE>,(R2),-	; Set byte offset within page
+		IRP$W_BOFF(R3)
+	MOVW	#MAX_DIR_RCV,-		; Set maximum receive size
+		IRP$W_BCNT(R3)
+	;
+	;   Queue the request to the datalink driver
+	;
+30$:	INCB	DWB$B_IRPCNT(R6)	; Increment outstanding I/O count
+	MOVL	IRP$L_UCB(R3),R5	; Get datalink UCB address
+	JSB	G^EXE$ALTQUEPKT		; Queue request to datalink driver
+	MOVL	S^#SS$_NORMAL,R0	; Success
+90$:	POPL	R5			; Restore registers
+	RSB
+
+	.SBTTL	DLE$RCV_MSG	- Receive a message from datalink
+;+
+; DLE$RCV_MSG	- Receive a message from the datalink layer
+;
+; Inputs:
+;
+;	R5 = IRP address
+;
+;	IPL = IPL$_POST (4)
+;
+; Outputs:
+;
+;	None
+;-
+DLE$RCV_MSG::				; Receive message from datalink
+	DSBINT	#NET$C_IPL		; Raise to driver IPL
+	PUSHL	R6			; Save registers
+	MOVL	IRP$L_ASTPRM(R5),R6	; Get DWB address
+	DECB	DWB$B_IRPCNT(R6)	; Decrement outstanding I/O refcnt
+	;
+	;   If the receive was buffered I/O, then save the address of the
+	;   CXB allocated by the datalink in a consistent spot for all types
+	;   of datalinks.
+	;
+	BBC	#DWB$V_DLL_RBF,-	; If buffered I/O,
+		DWB$W_FLAGS(R6),5$
+	MOVL	IRP$L_SVAPTE(R5),-	; Copy the CXB address to a
+		IRP$L_IOSB(R5)		; consistent place in the IRP
+5$:	;
+	;   Dequeue the next user receive IRP, and copy the message and
+	;   completion status to it.  Then re-issue the read request to
+	;   the datalink driver.
+	;
+	REMQUE	@DWB$Q_USER_RCV(R6),R3	; Dequeue next user receive IRP
+	BVS	70$			; If none, bugcheck - should be one
+					; for every datalink I/O
+	BSBB	RCV_DONE		; Copy msg to user IRP and post it
+	;
+	;   Deallocate the datalink IRP and message.
+	;
+	MOVL	R5,R1			; Set datalink receive IRP address
+	BSBW	DEALLOC_MSG		; Deallocate received message IRP/CXB
+	;
+	;   If the DWB has become inactive, and was waiting for this
+	;   I/O to complete before doing so, then try to cleanup DWB.
+	;
+	BBS	#DWB$V_RUN,-		; If DWB no longer active,
+		DWB$W_FLAGS(R6),50$
+	BSBW	DEALLOC_DWB		; then try to deallocate DWB
+50$:	POPL	R6			; Restore registers
+	ENBINT				; Restore IPL
+	RSB
+	;
+	;   We have just received an IRP from the datalink, but there is
+	;   no user request pending.  This should never happen, since for
+	;   every user request, a corresponding datalink request is made.
+	;
+70$:	BUG_CHECK NETNOSTATE,FATAL
+
+	.SBTTL	RCV_DONE	- Complete User Receive IRP
+;+
+; RCV_DONE - Complete user receive IRP
+;
+; This routine is called to transfer the message from the datalink IRP
+; to the user's IRP, and to post the user's IRP.
+;
+; Inputs:
+;
+;	R5 = Datalink IRP
+;	R3 = User IRP
+;
+; Outputs:
+;
+;	R3 = 0 to indicate user IRP is posted.
+;
+;	R0 is destroyed.
+;-
+RCV_DONE:				; Complete User receive IRP
+	PUSHR	#^M<R1,R2,R3,R4,R5>	; Save regs
+	BBC	#IRP$V_DIAGBUF,-	; If diagnostics buffer present,
+		IRP$W_STS(R3),5$
+	BBC	#IRP$V_DIAGBUF,-	; and diagnostics returned by datalink
+		IRP$W_STS(R5),5$
+	MOVL	IRP$L_DIAGBUF(R5),R0	; Get address of datalink diag buffer
+	MOVL	IRP$L_DIAGBUF(R3),R1	; Get address of user diag buffer
+	PUSHR	#^M<R3,R5>		; Save registers
+	MOVC	#DIAG_C_NIHDRSIZ,-	; Copy NI datalink header
+		@DIAG_L_DATA(R0),-
+		@DIAG_L_DATA(R1)
+	POPR	#^M<R3,R5>		; Restore registers
+5$:	MOVL	IRP$L_IOST1(R5),-	; Copy I/O status and bytes xferred
+		IRP$L_IOST1(R3)		;
+	MOVZWL	IRP$L_IOST1+2(R5),R0	; Get bytes received
+	CMPW	R0,IRP$W_BCNT(R3)	; Bigger than user buffer?
+	BLEQU	10$			; If LEQU no
+	MOVZWL	IRP$W_BCNT(R3),R0	; Use user buffer size
+	MOVW	#SS$_DATAOVERUN,-	; Setup error code 
+		IRP$L_IOST1(R3)		; 
+10$:	MOVW	R0,IRP$W_BCNT(R3)	; Setup bytes to xfer to user buffer
+	MOVW	R0,IRP$L_IOST1+2(R3)	; ...and in IOSB image as well
+	BEQL	20$			; If EQL then no data to move
+	MOVL	@IRP$L_IOSB(R5),R1	; Point to datalink buffer's data area
+	MOVL	@IRP$L_SVAPTE(R3),R2	; Point to user buffer's data area
+	MOVC3	R0,(R1),(R2)		; Move data
+	MOVL	8(SP),R3		; Restore user IRP address
+20$:	MOVL	IRP$L_UCB(R3),R5	; Get user's UCB address
+	JSB	G^COM$POST		; Complete user I/O
+	POPR	#^M<R1,R2,R3,R4,R5>	; Restore regs
+	CLRL	R3			; Indicate user IRP gone
+	RSB				; Done
+
+	.SBTTL	UNIT_INIT	- Unit initialization
+;+
+; UNIT_INIT - Unit initialization
+;
+; This routine is called by SYSGEN when a new unit (UCB) is added.
+;
+; Inputs:
+;
+;	R5 = UCB address
+;
+; Outputs:
+;
+;	None
+;
+;	All registers are preserved.
+;-
+UNIT_INIT:
+	PUSHL	R0			; Save registers
+	MOVAB	UCB$Q_DWB_LIST(R5),R0	; Get address of listhead
+	MOVL	R0,(R0)			; Initialize listhead
+	MOVAL	(R0)+,(R0)
+	POPL	R0			; Restore registers
+	RSB
+
+	.SBTTL	DLE$ALONPGD_Z	- Allocate and zero from system pool
+	.SBTTL	DLE$ALONONPAGED	- Allocate from system pool
+
+;++
+; DLE$ALONPGD_Z    - Allocate and zero system non-paged buffer
+; DLE$ALONONPAGED  - Allocate buffer from system non-paged pool
+;
+; A buffer is allocated from non-paged pool and its size field is set to
+; the size requested.  Its type field is set to DYN$C_CXB.
+;
+; Inputs:
+;
+;	R1 = Size of block to be allocated in bytes
+;
+; Outputs:
+;
+;	R0 = Status
+;	R2 = Address of block if successful, else zero
+;
+;	All other registers are preserved.
+;-
+	.ENABL	LSB
+
+DLE$ALONPGD_Z::				; Allocate and zero non-paged buffer
+	BSBB	DLE$ALONONPAGED		; Allocate the buffer
+	BLBC	R0,20$			; If LBC then error
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; Save regs
+	MOVC5	#0,(SP),#0,R1,(R2)	; Zero the entire buffer
+	POPR	#^M<R0,R1,R2,R3,R4,R5>	; Restore regs
+	BRB	10$			; Setup the type and size fields (again)
+
+
+DLE$ALONONPAGED::			; Allocate non-paged memory
+	PUSHR	#^M<R1,R3>		; Save regs
+	JSB	G^EXE$ALONONPAGED	; Allocate memory
+	POPR	#^M<R1,R3>		; Restore regs
+	BLBS	R0,10$			; If LBS then success
+	MOVZWL	#SS$_INSFMEM,R0		; Return insufficient memory
+	CLRL	R2			; Zero the buffer pointer
+	BRB	20$			; Take common exit
+10$:	MOVW	R1,CXB$W_SIZE(R2)	; Set size for deallocation
+	MOVB	#DYN$C_CXB,-		;
+		CXB$B_TYPE(R2)		; Set tentative buffer type
+20$:	RSB				; Return with status in R0
+
+	.DSABL	LSB
+
+
+;
+; Mark end of driver
+;
+
+DLE$END::
+	.END

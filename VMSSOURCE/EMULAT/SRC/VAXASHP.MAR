@@ -1,0 +1,1145 @@
+	.TITLE	VAX$ASHP - VAX-11 Instruction Emulator for ASHP
+	.IDENT	/V04-000/
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; Facility: 
+;
+;	VAX-11 Instruction Emulator
+;
+; Abstract:
+;
+;	The routine in this module emulates the VAX-11 packed decimal 
+;	ASHP instruction. This procedure can be a part of an emulator 
+;	package or can be called directly after the input parameters 
+;	have been loaded into the architectural registers.
+;
+;	The input parameters to this routine are the registers that
+;	contain the intermediate instruction state. 
+;
+; Environment: 
+;
+;	This routine runs at any access mode, at any IPL, and is AST 
+;	reentrant.
+;
+; Author: 
+;
+;	Lawrence J. Kenah	
+;
+; Creation Date
+;
+;	18 October 1983
+;
+; Modified by:
+;
+;	V01-003	LJK0042		Lawrence J. Kenah	26-Jul-1984
+;		Final cleanup pass for source kit.
+;
+;	V01-002	LJK0024		Lawrence J. Kenah	20-Feb-1984
+;		Add code to handle access violations. Perform minor cleanup.
+;
+;	V01-001	LJK0008		Lawrence J. Kenah	18-Oct-1983
+;		The emulation code for ASHP was moved into a separate module.
+;--
+
+	.SUBTITLE	Declarations
+
+; Include files:
+
+	.NOCROSS			; No cross reference for these
+	.ENABLE		SUPPRESSION	; No symbol table entries either
+
+	ASHP_DEF			; Bit fields in ASHP registers
+
+	ADDP4_DEF			; Bit fields in ADDP4 registers
+	ADDP6_DEF			; Bit fields in ADDP6 registers
+	DIVP_DEF			; Bit fields in DIVP registers
+	MULP_DEF			; Bit fields in MULP registers
+	SUBP4_DEF			; Bit fields in SUBP4 registers
+	SUBP6_DEF			; Bit fields in SUBP6 registers
+
+	CVTPS_DEF			; Bit fields in CVTPS registers
+	CVTPT_DEF			; Bit fields in CVTPT registers
+	CVTSP_DEF			; Bit fields in CVTSP registers
+	CVTTP_DEF			; Bit fields in CVTTP registers
+
+	PACK_DEF			; Stack usage for reflecting exceptions
+	STACK_DEF			; Stack usage for original exception
+
+	$PSLDEF				; Define bit fields in PSL
+	$SRMDEF				; Define arithmetic trap codes
+
+	.DISABLE	SUPPRESSION	; Turn on symbol table again
+	.CROSS				; Cross reference is OK now
+
+; External declarations
+
+	.DISABLE	GLOBAL
+
+	.EXTERNAL -
+			DECIMAL$STRIP_ZEROS_R0_R1
+
+	.EXTERNAL -
+			VAX$EXIT_EMULATOR,-
+			VAX$ADD_PACKED_BYTE_R6_R7,-
+			VAX$REFLECT_FAULT,-
+			VAX$REFLECT_TRAP,-
+			VAX$ROPRAND
+
+; PSECT Declarations:
+
+	.DEFAULT	DISPLACEMENT , WORD
+
+	.PSECT _VAX$CODE PIC, USR, CON, REL, LCL, SHR, EXE, RD, NOWRT, LONG
+
+	BEGIN_MARK_POINT
+
+	.SUBTITLE	VAX$ASHP - Arithmetic Shift and Round Packed
+;+
+; Functional Description:
+;
+;	The source string specified by the  source  length  and  source  address
+;	operands is scaled by a power of 10 specified by the count operand.  The
+;	destination string specified by the destination length  and  destination
+;	address operands is replaced by the result.
+;
+;	A positive count  operand  effectively  multiplies;   a  negative  count
+;	effectively  divides;  and a zero count just moves and affects condition
+;	codes.  When a negative count is specified, the result is rounded  using
+;	the Round Operand.
+;
+; Input Parameters:
+;
+;	R0<15:0>  = srclen.rw	Number of digits in source character string
+;	R0<23:16> = cnt.rb	Shift count
+;	R1        = srcaddr.ab	Address of input character string
+;	R2<15:0>  = dstlen.rw	Length in digits of output decimal string
+;	R2<23:16> = round.rb	Round operand used with negative shift count 
+;	R3        = dstaddr.ab 	Address of destination packed decimal string
+;
+; Output Parameters:
+;
+;	R0 = 0
+;	R1 = Address of byte containing most significant digit of
+;	     the source string
+;	R2 = 0
+;	R3 = Address of byte containing most significant digit of
+;	     the destination string
+;
+; Condition Codes:
+;
+;	N <- destination string LSS 0
+;	Z <- destination string EQL 0
+;	V <- decimal overflow
+;	C <- 0
+;
+; Algorithm:
+;
+;	The routine tries as much as possible to work with entire bytes. This 
+;	makes the case of an odd shift count more difficult that of an even 
+;	shift count. The first part of the routine reduces the case of an odd 
+;	shift count to an equivalent operation with an even shift count.
+;
+;	The instruction proceeds in several stages. In the first stage, after 
+;	the input parameters have been verified and stored, the operation is 
+;	broken up into four cases, based on the sign and parity (odd or even) 
+;	of the shift count. These four cases are treated as follows, in order 
+;	of increasing complexity.
+;
+;	Case 1. Shift count is negative and even
+;
+;	    The actual shift operation can work with the source string in
+;	    place. There is no need to move the source string to an
+;	    intermediate work area. 
+;
+;	Case 2. Shift count is positive and even
+;
+;	    The source string is moved to an intermediate work area and the
+;	    sign "digit" is cleared before the actual shift operation takes
+;	    place. If the source is worked on in place, then a spurious sign
+;	    digit would be moved to the middle of the output string instead
+;	    of a zero. The alternative is to keep track of where, in the
+;	    several special cases of shifting, the sign digit is looked at.
+;	    We chose to use the work area to simplify the later stages of
+;	    this routine. 
+;
+;	Cases 3 and 4. Shift count is odd
+;
+;	    The case of an odd shift count is considerably more difficult
+;	    than an even shift count, which is only slightly more complicated
+;	    than MOVP. In the case of an even shift count, various digits
+;	    remain in the same place (high nibble or low nibble) in a byte.
+;	    For odd shift counts, high nibbles become low nibbles and vice
+;	    versa. In addition, digits that were adjacent when viewing the
+;	    decimal string as a string of bits proceeding from low address to
+;	    high are now separated by a full byte. 
+;
+;	    We proceed in two steps. The source string is first moved to a
+;	    work area. The string is then shifted by one. This shift reduces
+;	    the operation to one of the two even shift counts already
+;	    mentioned, where the source to the shift operation is the
+;	    modified source string residing in the work area. The details of
+;	    the shift-by-one are described below near the code that performs
+;	    the actual shift. 
+;-
+
+	ASHP_SHIFT_MASK = ^XF0F0F0F0	; Mask used to shift string by one
+
+VAX$ASHP::
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>	; Save the lot
+	MOVPSL	R11			; Get initial PSL
+	INSV	#PSL$M_Z,#0,#4,R11	; Set Z-bit, clear the rest
+	ESTABLISH_HANDLER	-	; Store address of access
+		ASHP_ACCVIO		;  violation handler
+	ROPRAND_CHECK	R2		; Insure that R2 LEQU 31
+	ROPRAND_CHECK	R0		; Insure that R0 LEQU 31
+	MOVL	SP,R8			; Remember current top of stack
+	SUBL	#20,SP			; Allocate work area on stack
+	MARK_POINT	ASHP_BSBW_20
+	BSBW	DECIMAL$STRIP_ZEROS_R0_R1	; Eliminate any high order zeros
+	EXTZV	#1,#4,R2,R2		; Convert output digit count to bytes
+	INCL	R2			; Make room for sign as well
+	EXTZV	#1,#4,R0,R0		; Same for input string
+	ADDL3	R0,R1,R6		; Get address of sign digit
+	INCL	R0			; Include byte containing sign
+	MARK_POINT	ASHP_20
+	BICB3	#^B11110000,(R6),R6	; Extract sign digit
+
+; Form sign of output string in R9 in preferred form (12 for "+" and 13 for "-")
+
+	MOVZBL	#12,R9			; Assume that input sign is plus
+	CASE	R6,LIMIT=#10,TYPE=B,<-	; Dispatch on sign 
+		40$,-			; 10 => +
+		30$,-			; 11 => -
+		40$,-			; 12 => +
+		30$,-			; 13 => -
+		40$,-			; 14 => +
+		40$,-			; 15 => +
+		>
+
+30$:	INCL	R9			; Change preferred plus to minus
+	BISB	#PSL$M_N,R11		; Set N-bit in saved PSW
+
+; We now retrieve the shift count from the saved R0 and perform the next set
+; of steps based on the parity and sign of the shift count. Note that the
+; round operand is ignored unless the shift count is strictly less than zero.
+
+40$:	CVTBL	ASHP_B_CNT(R8),R4	; Extract sign-extended shift count
+	BLSS	50$			; Branch if shift count negative
+	CLRL	R5			; Ignore "round" for positive shift
+	BSBW	ASHP_COPY_SOURCE	; Move source string to work area
+	BLBS	R4,60$			; Do shift by one for odd shift count
+	BICB2	#^B00001111,-(R8)	; Drop sign in saved source string
+	BRB	ASHP_SHIFT_POSITIVE	; Go do the actual shift
+
+; The "round" operand is important for negative shifts. If the shift count
+; is even, the source can be shifted directly into the destination. For odd
+; shift counts, the source must be moved into the work area on the stack and
+; shifted by one before the rest of the shift operation takes place.
+
+50$:	EXTZV	#ASHP_V_ROUND,-
+		#ASHP_S_ROUND,-
+		ASHP_B_ROUND(R8),R5	; Store "round" in a safe place
+	BLBC	R4,ASHP_SHIFT_NEGATIVE	; Get right to it for even shift count
+	BSBW	ASHP_COPY_SOURCE	; Move source string to work area
+
+; For odd shift counts, the saved source string is shifted by one in place.
+; This is equivalent to a shift of -1 so the shift count (R4) is adjusted
+; accordingly. The least significant digit is moved to the place occupied by
+; the sign, the tens digit becomes the units digit, and so on. Because the
+; work area was padded with zeros, this shift moves a zero into the high
+; order digit of a source string of even length. 
+
+60$:	PUSHL	R0			; We need a scratch register to count
+	DECL	R0			; Want to map {1..16} onto {0..3}
+	ASHL	#-2,R0,R0		; Convert a byte count to longwords
+
+; The following loop executes from one to four times such that the entire
+; source, taken as a collection of longwords, is shifted by one. Note that 
+; the two pieces of the source are shifted (rotated) in opposite directions. 
+; Note also that the shift mask is applied to one string before the shift and 
+; to the other string after the shift. (This points up the arbitrary choice 
+; of shift mask. We just as well could have chosen the one's complement of 
+; the shift mask and reversed the order of the shift and mask operations for 
+; the two pieces of the source string.)
+
+70$:	ROTL	#-4,-(R8),R6		; Shift left one digit
+	BICL2	#ASHP_SHIFT_MASK,R6	; Clear out old low order digits
+	BICL3	#ASHP_SHIFT_MASK,-1(R8),R7	; Clear out high order digits
+	ROTL	#4,R7,R7		; Shift these digits right one digit
+	BISL3	R6,R7,(R8)		; Combine the two sets of digits
+	SOBGEQ	R0,70$			; Keep going if more
+
+	MOVL	(SP)+,R0		; Restore source string byte count
+	INCL	R4			; Count the shift we did
+	BLSS	ASHP_SHIFT_NEGATIVE	; Join common code at the right place
+					; Drop through to ASHP_SHIFT_POSITIVE
+
+	.SUBTITLE	ASHP_SHIFT - Perform Shift 
+;+
+; Functional Description:
+;
+;	This routine completes the work of the ASHP instruction in the case of
+;	an even shift count. (If the original shift count was odd, the source
+;	string has already been shifted by one and the shift count adjusted by
+;	one.) A portion (from none to all) of the source string is moved to
+;	the destination string. Pieces of the destination string at either end
+;	may be filled with zeros. If excess digits of the source are not
+;	moved, they must be tested for nonzero to determine the correct
+;	setting of the V-bit. 
+;
+; Input Parameters:
+;
+;	R0<3:0> - Number of bytes in source string 
+;	R1	- Address of source string
+;	R2<3:0> - Number of bytes in destination string 
+;	R3	- Address of destination string
+;	R4<7:0> - Count operand (signed longword of digit count)
+;	R5<3:0> - Round operand in case of negative shift
+;	R9<3:0> - Sign of source string in preferred form
+;
+; Implicit Input:
+;
+;	R4 is presumed (guaranteed) even on input to this routine
+;
+;	The top of the stack is assumed to contain a 20-byte work area (that 
+;	may or may not have been used). The space must be allocated for this 
+;	work area in all cases so that the exit code works correctly for all 
+;	cases without the need for lots of extra conditional code.
+;
+; Output Parameters:
+;
+;	This routine completes the operation of VAX$ASHP. See the routine
+;	header for VAX$ASHP for details on output registers and conditon codes.
+;
+; Details:
+;
+;	PUT SOME OF THE STUFF FROM ASHP.TXT HERE.
+;-
+
+	.ENABLE		LOCAL_BLOCK
+
+ASHP_SHIFT_POSITIVE:
+	DIVL	#2,R4			; Convert digit count to byte count
+	SUBL3	R4,R2,R7		; Modify the destination count
+	BLSS	30$			; Branch if simply moving zeros
+
+	MOVL	R4,R6			; Number of zeros at low order end
+10$:	SUBL3	R0,R7,R8		; Are there any excess high order digits?
+	BLSS	60$			; No, excess is in source.
+
+; We only move "srclen" source bytes. The rest of the destination string is
+; filled with zeros.
+
+	MOVL	R0,R7			; Get number of bytes to actually move
+	BRB	100$			; ... and go move them
+
+; The count argument is larger than the destination length. All of the source
+; is checked for nonzero (overflow check). All of the destination is filled
+; with zeros.
+
+30$:	MOVL	R2,R6			; Number of low order zeros
+	CLRL	R7			; The source string is untouched
+	MOVL	R0,R8			; Number of source bytes to check
+	BRB	80$			; Go do the actual work
+
+; If the count is negative, then there is no need to fill in low order zeros
+; (R6 is zero). The following code is similar to the above cases, differing
+; in the roles played by source length (R0) and destination length (R2) and
+; also in the first loop (zero fill or overflow check) that executes.
+
+ASHP_SHIFT_NEGATIVE:
+	CLRL	R6			; No zero fill at low end of destination
+	MNEGL	R4,R4			; Get absolute value of count
+	DIVL	#2,R4			; Convert digit count to byte count
+	SUBL3	R4,R0,R7		; Get modified source length
+	BLSS	70$			; Branch if count is larger 
+
+	SUBL3	R7,R2,R8		; Are there zeros at high end?
+	BGEQ	100$			; Exit to zero fill loop if yes
+
+; The modified source length is larger than the destination length. Part
+; of the source is moved. The rest is checked for nonzero.
+
+	MOVL	R2,R7			; Only move "dstlen" bytes
+
+; In these cases, some digits in the source string will not be moved. If any
+; of these digits is nonzero, then the V-bit must be set.
+
+60$:	MNEGL	R8,R8			; Number of bytes in source to check
+	BRB	80$			; Exit to overflow check loop
+
+; The count argument is larger than the source length. All of the destination 
+; is filled with zeros. The source is ignored.
+
+70$:	CLRL	R7			; No source bytes get moved
+	MOVL	R2,R8			; All of the destination is filled
+	BRB	100$			; Join the zero fill loop
+
+;+
+; At this point, the three separate counts have all been calculated. Each
+; loop is executed in turn, stepping through the source and destination
+; strings, either alone or in step as appropriate.
+;
+;	R6 - Number of low order digits to fill with zero
+;	R7 - Number of bytes to move intact from source to destination
+;	R8 - Number of excess digits in one or the other string. 
+;
+;	If excess source digits, they must be tested for nonzero to
+;	correctly set the V-bit.
+;
+;	If excess destination bytes, they must be filled with zero.
+;-
+
+; Test excess source digits for nonzero
+
+	MARK_POINT	ASHP_20
+75$:	TSTB	(R1)+			; Is next byte nonzero
+	BNEQ	90$			; Handle overflow out of line
+80$:	SOBGEQ	R8,75$			; Otherwise, keep on looking
+
+	BRB	120$			; Join top of second loop
+
+90$:	BISB	#PSL$M_V,R11		; Set saved V-bit
+	ADDL	R8,R1			; Skip past rest of excess
+	BRB	120$			; Join top of second loop
+
+; In this case, the excess digits are found in the destination string. They
+; must be filled with zero.
+
+100$:	TSTL	R8			; Is there really something to do?
+	BEQL	120$			; Skip first loop if nothing
+
+	MARK_POINT	ASHP_20
+110$:	CLRB	(R3)+			; Store another zero
+	SOBGTR	R8,110$			; ... and keep on looping
+
+; The next loop is where something interesting happens, namely that parts of
+; the source string are moved to the destination string. Note that the use of
+; bytes rather than digits in this operation makes the detection of nonzero
+; digits difficult because the presence of a nonzero digit in the place
+; occupied by the sign or in the high order nibble of an even length output
+; string and nowhere else would cause the Z-bit to be incorrectly cleared.
+; For this reason, we ignore the Z-bit here and make a special pass over the
+; output string after all of the special cases have been dealt with. The
+; extra overhead of a second trip to memory is offset by the simplicity in
+; other places in this routine. 
+
+120$:	TSTL	R7			; Something to do here?
+	BEQL	140$			; Skip this loop if nothing
+
+	MARK_POINT	ASHP_20
+130$:	MOVB	(R1)+,(R3)+		; Move the next byte
+	SOBGTR	R7,130$			; ... and keep on looping
+
+; The final loop occurs in some cases of positive shift count where the low
+; order digits of the destination must be filled with zeros.
+
+140$:	TSTL	R6			; Something to do here?
+	BEQL	160$			; Skip if loop count is zero
+
+	MARK_POINT	ASHP_20
+150$:	CLRB	(R3)+			; Store another zero
+	SOBGTR	R6,150$			; ... until we're done
+
+;+
+; At this point, the destination string is complete except for the sign.
+; If there is a round operand, that must be added to the destination string.
+;
+;	R3 - Address one byte beyond destination string
+;	R5 - Round operand
+;-
+
+160$:	ADDL	#20,SP			; Deallocate work area
+	EXTZV	#1,#4,ASHP_W_DSTLEN(SP),R2	; Get original destination byte count
+	MOVQ	R2,-(SP)		; Save address and count for Z-bit loop
+	MOVZBL	R5,R8			; Load round into carry register
+	BEQL	180$			; Skip next mess unless "round" exists
+
+	MOVL	R3,R5			; R5 tracks the addition output
+	CLRL	R6			; We only need one term and carry in sum
+
+	MARK_POINT	ASHP_8
+170$:	MOVZBL	-(R3),R7		; Get next digit
+	MARK_POINT	ASHP_BSBW_8
+	BSBW	VAX$ADD_PACKED_BYTE_R6_R7	; Perform the addition
+	TSTL	R8			; See if this add produced a carry
+	BEQL	180$			; All done if no more carry
+	SOBGEQ	R2,170$			; Back for the next byte
+
+; If we drop through the end of the loop, then the final add produced a carry.
+; This must be reflected by setting the V-bit in the saved PSW.
+
+	BISB	#PSL$M_V,R11		; Set the saved V-bit
+
+; All of the digits are now loaded into the destination string. The condition
+; codes, except for the Z-bit, have their correct settings. The sign must be
+; set, a check must be made for even digit count in the output string, and
+; the various special cases (negative zero, decimal overflow trap, ans so on)
+; must be checked before completing the routine. 
+
+; This entire routine worked with entire bytes, ignoring whether digit counts
+; were odd or even. An illegal digit in the upper nibble of an even input string
+; is ignored. A nonzero digit in the upper nibble of an even output string is
+; not allowed but must be checked for. If one exists, it indicates overflow.
+
+180$:	BLBS	<8+ASHP_W_DSTLEN>(SP),-
+		185$			; Skip next if output digit count is odd
+	MARK_POINT	ASHP_8
+	BITB	#^B11110000,-
+		@<8+ASHP_A_DSTADDR>(SP)	; Is most significant digit nonzero?
+	BEQL	185$			; Nothing to worry about if zero
+	MARK_POINT	ASHP_8
+	BICB	#^B11110000,-
+		@<8+ASHP_A_DSTADDR>(SP)	; Make the digit zero
+	BISB	#PSL$M_V,R11		; ... and set the overflow bit
+
+; We have not tested for nonzero digits in the output string. This test is
+; made by making another pass over the ouptut string. Note that the low
+; order digit is unconditionally checked.
+
+185$:	MOVQ	(SP),R2			; Get address and count
+	MARK_POINT	ASHP_8
+	BITB	#^B11110000,-(R3)	; Do not test sign in low order byte
+	BNEQ	187$			; Skip loop if nonzero
+	BRB	186$			; Start at bottom of loop
+
+	MARK_POINT	ASHP_8
+183$:	TSTB	-(R3)			; Is next higher byte nonzero?
+	BNEQ	187$			; Exit loop if yes
+186$:	SOBGEQ	R2,183$			; Keep looking for nonzero if more bytes
+
+; The entire output string has been scanned and contains no nonzero
+; digits. The Z-bit retains its original setting, which is set. If the
+; N-bit is also set, then the negative zero must be changed to positive
+; zero (unless the V-bit is also set). Note that in the case of overflow,
+; the N-bit is cleared but the output string retrins the minus sign.
+
+	BBC	#PSL$V_N,R11,190$	; N-bit is off already
+	BICB	#PSL$M_N,R11		; Turn off saved N-bit unconditionally
+	BBS	#PSL$V_V,R11,190$	; No fixup if V-bit is also set 
+	MOVB	#12,R9			; Use preferred plus as sign of output
+	BRB	190$			; ... and rejoin the exit code
+
+; The following instruction is the exit point for all of the nonzero byte
+; checks. Its direct effect is to clear the saved Z-bit. It also bypasses
+; whatever other zero checks have not yet been performed.
+
+187$:	BICB	#PSL$M_Z,R11		; Clear saved Z-bit
+
+; The following code executes in all cases. It is the common exit path for
+; all of the ASHP routines when the count is even.
+
+190$:	MOVQ	(SP)+,R2		; Get address of end of output string
+	MARK_POINT	ASHP_0
+	INSV	R9,#0,#4,-1(R3)		; Store sign that we have been saving
+
+	.DISABLE	LOCAL_BLOCK
+
+; Drop into VAX$DECIMAL_EXIT for final processing
+
+	.SUBTITLE	VAX$DECIMAL_EXIT - Exit Path for Decimal Instructions
+;+
+; This is the common exit path for many of the routines in this module. This
+; exit path can only be used for instructions that conform to the following
+; restrictions.
+;
+; 1.  Registers R0 through R11 were saved on entry.
+;
+; 2.  The architecture requires that R0 and R2 are zero on exit.
+;
+; 3.  All other registers that have instruction-specific values on exit are 
+;     correctly stored in the appropriate locations on the stack.
+;
+; 4.  The saved PSW is contained in R11
+;
+; 5.  This instruction/routine should generate a decimal overflow trap if 
+;     both the V-bit and the DV-bit are set on exit.
+;-
+
+	.ENABLE		LOCAL_BLOCK
+
+VAX$DECIMAL_EXIT::
+	CLRL	(SP)			; R0 must be zero on exit
+	CLRL	8(SP)			; R2 must also be zero
+	BBS	#PSL$V_V,R11,20$	; See if exceptions are enabled
+10$:	BICPSW	#<PSL$M_N!PSL$M_Z!PSL$M_V!PSL$M_C>	; Clear condition codes
+	BISPSW	R11			; Set appropriate condition codes
+	POPR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>	; Restore 
+	RSB				; ... and return		
+
+; If the V-bit is set and decimal traps are enabled (DV-bit is set), then
+; a decimal overflow trap is generated. Note that the DV-bit can be set in
+; the current PSL or, if this routine was entered as the result of an emulated
+; instruction exception, in the saved PSL on the stack. Note that the final
+; condition codes in the PSW have not yet been set. This means that all exit
+; paths out of this code must set the condition codes to their correct values.
+
+VAX$EDITPC_OVERFLOW::
+20$:	BBS	#PSL$V_DV,R11,30$	; Report exception if current DV-bit set
+	MOVAB	VAX$EXIT_EMULATOR,R0	; Set up R0 for PIC address comparison
+	CMPL	R0,<4*12>(SP)		; Is return PC EQLU VAX$EXIT_EMULATOR ?
+	BNEQU	10$			; No. Simply return V-bit set
+	BBC	#PSL$V_DV,<<4*<12+1>>+EXCEPTION_PSL>(SP),10$
+					; Only return V-bit if DV-bit is clear
+
+; Restore all of the saved registers, reset the condition codes, and drop 
+; into DECIMAL_OVERFLOW.
+
+30$:	BICPSW	#<PSL$M_N!PSL$M_Z!PSL$M_V!PSL$M_C>	; Clear condition codes
+	BISPSW	R11			; Set appropriate condition codes
+	POPR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+
+;+
+; This code path is entered if the decimal string result is too large to
+; fit into the output string and decimal overflow exceptions are enabled.
+; The final state of the instruction, including the condition codes, is
+; entirely in place.
+;
+; Input Parameter:
+;
+;	(SP) - Return PC
+;
+; Output Parameters:
+;
+;	0(SP) - SRM$K_DEC_OVF_T (Arithmetic trap code)
+;	4(SP) - Final state PSL
+;	8(SP) - Return PC
+;
+; Implicit Output:
+;
+;	Control passes through this code to VAX$REFLECT_TRAP.
+;-
+
+VAX$DECIMAL_OVERFLOW::
+	MOVPSL	-(SP)			; Save final PSL on stack
+	PUSHL	#SRM$K_DEC_OVF_T	; Store arithmetic trap code
+	BRW	VAX$REFLECT_TRAP	; Report exception
+
+	.DISABLE	LOCAL_BLOCK
+
+	.SUBTITLE	ASHP_COPY_SOURCE - Copy Source String to Work Area
+;+
+; Functional Description:
+;
+;	For certain cases (three out of four), it is necessary to put the
+;	source string in a work area so that later portions of VAX$ASHP can
+;	proceed in a straightforward manner. In one case (positive even shift
+;	count), the sign must be eliminated before the least significant
+;	byte of the source is moved to its appropriate place (not the least
+; 	significant byte) in the destination string. For odd shift counts,
+;	the source string in the work area is shifted by one to reduce the
+;	complicated case of an odd shift count to an equivalent but simpler
+;	case with an even shift count.
+;
+;	This routine moves the source string to a 20-byte work area already
+;	allocated on the stack. Note that the work area is zeroed by this
+;	routine so that, if the work area is used, it consists of either
+;	valid bytes from the source string or bytes containing zero. If the
+;	work area is not needed (shift count is even and not positive), the
+;	overhead of zeroing the work area is avoided. 
+;
+; Input Parameters:
+;
+;	R0 - Byte count of source string (preserved)
+;	R1 - Address of most significant byte in source string
+;	R8 - Address one byte beyond end of work area (preserved)
+;
+; Output Parameters:
+;
+;	R1 - Address of most significant byte of source string in
+;	     work area
+;
+; Side Effects:
+;
+;	R6 and R7 are modified by this routine.
+;-
+
+ASHP_COPY_SOURCE:
+	CLRQ	-8(R8)			; Insure that the work area 
+	CLRQ	-16(R8)			; ... is entirely filled
+	CLRL	-20(R8)			; ... with zeros
+	ADDL3	R0,R1,R7		; R7 points one byte beyond source
+	MOVL	R8,R1			; R1 will step through work area
+	MOVL	R0,R6			; Use R6 as the loop counter
+
+	MARK_POINT	ASHP_BSBW_20
+10$:	MOVB	-(R7),-(R1)		; Move the next source byte
+	SOBGTR	R6,10$			; Check for end of loop
+
+	RSB				; Return with R1 properly loaded
+
+	.SUBTITLE	DECIMAL_ROPRAND
+;-
+; Functional Description:
+;
+;	This routine receives control when a digit count larger than 31 is
+;	detected. The exception is architecturally defined as an abort so
+;	there is no need to store intermediate state. The VAX$ASHP routine
+;	saves all registers R0 through R11 before performing the digit check.
+;	These registers must be restored before control is passed to
+;	VAX$ROPRAND. 
+;
+; Input Parameters:
+;
+;	00(SP) - Saved R0
+;	  .
+;	  .
+;	44(SP) - Saved R11
+;	48(SP) - Return PC from VAX$xxxxxx routine
+;
+; Output Parameters:
+;
+;	00(SP) - Offset in packed register array to delta PC byte
+;	04(SP) - Return PC from VAX$xxxxxx routine
+;
+; Implicit Output:
+;
+;	This routine passes control to VAX$ROPRAND where further
+;	exception processing takes place.
+;-
+
+DECIMAL_ROPRAND:
+	POPR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	PUSHL	#ASHP_B_DELTA_PC	; Store offset to delta PC byte
+	BRW	VAX$ROPRAND		; Pass control along
+
+	.SUBTITLE	ASHP_ACCVIO - Reflect an Access Violation
+;+
+;	The general approach to handling access violations that occur while
+;	emulating the packed decimal instructions is described here. We take
+;	advantage of the fact that there are no architectural constraints on
+;	the way that access violations must be handled. In general, we back
+;	the instruction up to the beginning, to the point where initial state
+;	is stored in the set of general registers modified by each
+;	instruction. Thus, the only step that is avoided when an instruction
+;	is restarted is operand evaluation. 
+;
+; Functional Description:
+;
+;	This routine (or its counterpart in other decimal emulation modules)
+;	receives control when an access violation occurs while executing
+;	within one of the VAX$xxxxxx routines that emulated a decimal string
+;	instruction. This routine determines whether the exception occurred
+;	while accessing a source or destination string or whether the access
+;	violation is peculiar to emulation, such as stack overflow. (This
+;	check is made based on the PC of the exception.) 
+;
+;	If the PC is one that is recognized by this routine, then the state of
+;	the instruction (digit counts, string addresses, and the like) are
+;	restored to a state where the instruction/routine can be restarted
+;	after (if) the cause for the exception is eliminated. Control is then
+;	passed to a common routine that sets up the stack and the exception
+;	parameters in such a way that the instruction or routine can restart
+;	transparently. 
+;
+;	If the exception occurs at some unrecognized PC, then the exception is
+;	reflected to the user as an exception that occurred within the
+;	emulator. 
+;
+;	There are two exceptions that can occur that are not backed up to
+;	appear as if they occurred at the site of the original emulated
+;	instruction. These exceptions will appear to the user as if they
+;	occurred inside the emulator itself. 
+;
+;	    1.	If stack overflow occurs due to use of the stack by one of 
+;		the routines, it is unlikely that this routine will even
+;		execute because the code that transfers control here must
+;		first copy the parameters to the exception stack and that
+;		operation would fail. (The failure causes control to be
+;		transferred to VMS, where the stack expansion logic is
+;		invoked and the routine resumed transparently.) 
+;
+;	    2.	If assumptions about the address space change out from under 
+;		these routines (because an AST deleted a portion of the 
+;		address space or a similar silly thing), the handling of the 
+;		exception is UNPREDICTABLE.
+;
+; Input Parameters:
+;
+;	R0  - Value of SP when exception occurred
+;	R1  - PC at which exception occurred
+;	R2  - scratch
+;	R3  - scratch
+;	R10 - Address of this routine (no longer needed)
+;
+;	00(SP) - Value of R0 when exception occurred
+;	04(SP) - Value of R1 when exception occurred
+;	08(SP) - Value of R2 when exception occurred
+;	12(SP) - Value of R3 when exception occurred
+;	16(SP) - Return PC in exception dispatcher in operating system
+;
+;	20(SP) - First longword of system-specific exception data
+;	  .
+;	  .
+;	xx(SP) - Last longword of system-specific exception data
+;
+;	The address of the next longword is the position of the stack when
+;	the exception occurred. R0 locates this address.
+;
+; R0 ->	xx+4(SP)     - Instruction-specific data
+;	  .	     - Optional instruction-specific data
+;	  .          - Optional instruction-specific data
+;	xx+<4*M>(SP) - Return PC from VAX$xxxxxx routine (M is the number
+;		       of instruction-specific longwords)
+;
+; Implicit Input:
+;
+;	It is assumed that the contents of all registers coming into this
+;	routine are unchanged from their contents when the exception occurred.
+;	(For R0 through R3, this assumption applies to the saved register
+;	contents on the top of the stack. Any modification to these four
+;	registers must be made to their saved copies and not to the registers
+;	themselves.) 
+;
+;	Finally, the macro BEGIN_MARK_POINT should have been invoked at the
+;	beginning of this module to define the symbols 
+;
+;		MODULE_BASE
+;		PC_TABLE_BASE
+;		HANDLER_TABLE_BASE
+;		TABLE_SIZE
+;
+;	PC_TABLE_BASE is the base of a word array with one entry for each 
+;		PC (relative to MODULE_BASE) that can cause an access 
+;		violation that is capable of being backed up.
+;
+;	HANDLER_TABLE_BASE is the base of a corresponding word array with an
+;		entry that locates the context specific code to handle each
+;		of the recognized access violations.
+;
+; Output Parameters (Exit via JMP instruction):
+;
+;	If the exception is recognized (that is, if the exception PC is 
+;	associated with one of the mark points), control is passed to the 
+;	context-specific routine that restores the instruction state to 
+;	its initial state.
+;
+;	These are the register values and stack state when the context
+;	specific code begins execution.
+;
+;		R0  - Value of SP when exception occurred
+;		R1  - scratch
+;		R2  - scratch
+;		R3  - scratch
+;		R10 - scratch
+;
+; R0 ->	zz(SP) - Instruction-specific data begins here
+;
+; Implicit Output:
+;
+;	The context-specific code accomplishes essentially the same thing for 
+;	all of the emulated instructions.
+;
+;	The register contents are restored to the values that they had on 
+;	entry to the VAX$xxxxxx routine. This causes the instruction to be 
+;	backed up almost (but not quite) to its starting point. (The operand 
+;	evaluation is not lost. The operands are saved in registers.) Any
+;	registers saved on entry are restored.
+;
+; Output Parameters (Exit via RSB instruction):
+;
+;	If the exception PC occurred somewhere else (such as a stack access), 
+;	the saved registers are restored and control is passed back to the 
+;	host system with an RSB instruction.
+;
+;-
+
+ASHP_ACCVIO:
+	CLRL	R2			; Initialize the counter
+	PUSHAB	MODULE_BASE		; Store base address of this module
+	PUSHAB	MODULE_END		; Store module end address
+	BSBW	DECIMAL$BOUNDS_CHECK	; Check if PC is inside the module
+	ADDL	#4,SP			; Discard end address
+	SUBL2	(SP)+,R1		; Get PC relative to this base
+
+10$:	CMPW	R1,PC_TABLE_BASE[R2]	; Is this the right PC?
+	BEQL	30$			; Exit loop if true
+	AOBLSS	#TABLE_SIZE,R2,10$	; Do the entire table
+
+; If we drop through the dispatching based on PC, then the exception is not 
+; one that we want to back up. We simply reflect the exception to the user.
+
+20$:	POPR	#^M<R0,R1,R2,R3>	; Restore saved registers
+	RSB				; Return to exception dispatcher
+
+; The exception PC matched one of the entries in our PC table. R2 contains
+; the index into both the PC table and the handler table. R1 has served
+; its purpose and can be used as a scratch register.
+
+30$:	MOVZWL	HANDLER_TABLE_BASE[R2],R1	; Get the offset to the handler
+	JMP	MODULE_BASE[R1]		; Pass control to the handler
+	
+; In all of the instruction-specific routines, the state of the stack
+; will be shown as it was when the exception occurred. All offsets will
+; be pictured relative to R0. 
+
+	.SUBTITLE	DECIMAL$BOUNDS_CHECK - Bounds Check on Exception PC
+;+
+; Functional Decsription:
+;
+;	This routine is called by the exception handlers for the various 
+;	decimal string instruction emulation routines to perform a bounds 
+;	check on the exception PC. The real reason for performing this check 
+;	is that certain exceptions can occur in subroutines that are outside a 
+;	given module. In this case, it is not the exception PC but rather the 
+;	return PC on the top of the stack that determines the context of the 
+;	exception (and therefore, the code necessary to back up the 
+;	instruction state). 
+;
+;	The basic mode of operation is that, if the exception PC is outside 
+;	the current module boundarise, then R1 (the exception PC) is replaced 
+;	by the return PC (presumed pointed to by R0).
+;
+; Input Parameters:
+;
+;	R0 - Top of stack when exception occurred
+;	R1 - PC at time of exception
+;
+;	(R0) - Return PC from subroutine in which access violation occurred
+;
+;	00(SP) - Return PC from caller of this routine
+;	04(SP) - End address of module
+;	08(SP) - Start address of module
+;
+; Output Parameters:
+;
+;	If the exception PC is outside the bounds of the module (as defined by
+;	the two longwords on the stack, then R1 is replaced by the "return
+;	PC", the contents of the longword located by R0. 
+;
+;	If the exception PC is inside the module, nothing is changed by the
+;	execution of this module. 
+;
+; Assumptions:
+;
+;	There are two assumptions that must hold for these subroutines
+;	in which access violations can occur.
+;
+;		They must not use the stack. This keeps the return PC on the 
+;		top of the stack, located by R0.
+;
+;		They must be called with a BSBW instruction. This causes the 
+;		return PC to be exactly three bytes beyond instruction that 
+;		transferred control to the subroutine.
+;-
+
+DECIMAL$BOUNDS_CHECK::
+	CMPL	R1,4(SP)		; Beyond upper end?
+	BGEQU	10$			; Branch if out of bounds
+	CMPL	R1,8(SP)		; Within lower limit?
+	BLSSU	10$			; Branch if out of bounds
+	RSB				; Return with R1 intact
+
+; R1 is out of bounds. Replace it with the return PC from the routine that
+; was executing when the access violation occurred. Note that the PC is
+; backed up over the BSBW instruction because the PC offset that appears in
+; the PC_TABLE will be the PC of the BSBW instruction and not the PC of the
+; next instruction. 
+
+10$:	SUBL3	#3,(R0),R1		; Get new "exception" PC
+	RSB
+
+	.SUBTITLE	Context-Specific Access Violation Handling for VAX$ASHP
+;+
+; Functional Description:
+;
+;	The only difference among the various entry points is the number of
+;	longwords on the stack. R0 is advanced beyond these longwords to point
+;	to the list of saved registers. These registers are then restored,
+;	effectively backing the routine up to its initial state. 
+;
+; Input Parameters:
+;
+;	R0 - Address of top of stack when access violation occurred
+;
+;	See specific entry points for details
+;
+; Output Parameters:
+;
+;	See input parameter list for VAX$DECIMAL_ACCVIO
+;-
+
+;+
+; ASHP_BSBW_20
+;
+; An access violation occurred in subroutine STRIP_ZEROS or in subroutine
+; ASHP_COPY_SOURCE while the source string was being copied to the work space
+; on the stack. In addition to the five longwords of work space on the stack,
+; this routine has an additional longword, the return PC, on the stack. 
+;
+;	00(R0) - Return PC in mainline of VAX$ASHP
+;	04(R0) - First longword of scratch space
+;	 etc.
+;-
+
+ASHP_BSBW_20:
+	ADDL	#4,R0			; Skip over return PC and drop into ...
+
+;+
+; ASHP_20
+;
+; There are five longwords of workspace on the stack for this entry point.
+;
+;	00(R0) - First longword of scratch space
+;	  .
+;	  .
+;	16(R0) - Fifth longword of scratch space
+;	20(SP) - Saved R0
+;	24(SP) - Saved R1
+;	 etc.
+;-
+
+ASHP_20:
+	ADDL	#20,R0			; Discard scratch space on stack
+	BRB	VAX$DECIMAL_ACCVIO	; Join common code to restore registers
+
+;+
+; ASHP_BSBW_8
+;
+; An access violation occurred in subroutine ADD_PACKED_BYTE while the round
+; operand was being propogated. In addition to the saved R2/R3 pair of
+; longwords on the stack, this routine has an additional longword, the return
+; PC, on the stack. 
+;
+;	00(R0) - Return PC in mainline of VAX$ASHP
+;	04(R0) - Saved intermediate value of R2
+;	 etc.
+;-
+
+ASHP_BSBW_8:
+	ADDL	#4,R0			; Skip over return PC and drop into ...
+
+;+
+; ASHP_8
+;
+; There is a saved register pair (two longwords) on the stack for these entry
+; points.
+;
+;	00(R0) - Saved intermediate value of R2
+;	04(R0) - Saved intermediate value of R3
+;	08(SP) - Saved R0
+;	12(SP) - Saved R1
+;	16(SP) - Saved R2
+;	20(SP) - Saved R3
+;	 etc.
+;-
+
+ASHP_8:
+	ADDL	#8,R0			; Discard saved register pair
+
+; Drop into VAX$DECIMAL_ACCVIO to restore saved registers
+
+;+
+; ASHP_0
+;
+; The stack is empty. This label is merely a synonym for VAX$DECIMAL_ACCVIO
+; because there is no context-specific work to do. 
+;
+;	00(SP) - Saved R0
+;	04(SP) - Saved R1
+;	08(SP) - Saved R2
+;	12(SP) - Saved R3
+;	 etc.
+;-
+
+ASHP_0:
+
+; Drop into VAX$DECIMAL_ACCVIO to restore saved registers
+
+	.SUBTITLE	VAX$DECIMAL_ACCVIO - Common Access Violation Handling
+;+
+; Functional Description:
+;
+;	This code is the final access violation processing for those 
+;	exceptions that have two things in common. 
+;
+;	The instruction/routine is to be backed up to its initial state.
+;
+;	All registers from R0 to R11 were saved on entry to VAX$xxxxxx.
+;
+; Input Parameters:
+;
+;	00(R0) - Saved R0 on entry to VAX$xxxxxx
+;	04(R0) - Saved R1
+;	  .
+;	  .
+;	44(R0) - Saved R11 on entry to VAX$xxxxxx
+;	48(R0) - Return PC from VAX$xxxxxx routine
+;
+;	00(SP) - Saved R0 (restored by VAX$HANDLER)
+;	04(SP) - Saved R1
+;	08(SP) - Saved R2
+;	12(SP) - Saved R3
+;
+; Output Parameters:
+;
+;	R0 is advanced over saved register array as the registers are restored.
+;	R0 ends up pointing at the return PC.
+;
+;	R1 contains the value of delta PC for all of the routines that
+;	use this common code path. The FPD and ACCVIO bits are both set
+;	in R1.
+;
+;	00(R0) - Return PC from VAX$xxxxxx routine
+;	
+;	00(SP) - Value of R0 on entry to VAX$xxxxxx
+;	04(SP) - Value of R1 on entry to VAX$xxxxxx
+;	08(SP) - Value of R2 on entry to VAX$xxxxxx
+;	12(SP) - Value of R3 on entry to VAX$xxxxxx
+;
+;	R4 through R11 are restored to their values on entry to VAX$xxxxxx.
+;-
+
+VAX$DECIMAL_ACCVIO::
+	MOVQ	(R0)+,PACK_L_SAVED_R0(SP)	; "Restore" R0 and R1
+	MOVQ	(R0)+,PACK_L_SAVED_R2(SP)	; "Restore" R2 and R3
+	MOVQ	(R0)+,R4			; Really restore R4 and R5
+	MOVQ	(R0)+,R6			; ... and R6 and R7
+	MOVQ	(R0)+,R8			; ... and R8 and R8
+	MOVQ	(R0)+,R10			; ... and R10 and R11
+
+	ASSUME ADDP4_B_DELTA_PC EQ ASHP_B_DELTA_PC
+	ASSUME ADDP6_B_DELTA_PC EQ ASHP_B_DELTA_PC
+	ASSUME SUBP4_B_DELTA_PC EQ ASHP_B_DELTA_PC
+	ASSUME SUBP6_B_DELTA_PC EQ ASHP_B_DELTA_PC
+	ASSUME MULP_B_DELTA_PC EQ ASHP_B_DELTA_PC
+	ASSUME DIVP_B_DELTA_PC EQ ASHP_B_DELTA_PC
+
+	ASSUME CVTPS_B_DELTA_PC EQ ASHP_B_DELTA_PC
+	ASSUME CVTPT_B_DELTA_PC EQ ASHP_B_DELTA_PC
+	ASSUME CVTSP_B_DELTA_PC EQ ASHP_B_DELTA_PC
+	ASSUME CVTTP_B_DELTA_PC EQ ASHP_B_DELTA_PC
+
+	MOVL	#<ASHP_B_DELTA_PC!-	; Indicate offset for delta PC
+		PACK_M_FPD!-		; FPD bit should be set
+		PACK_M_ACCVIO>,R1	; This is an access violation
+	BRW	VAX$REFLECT_FAULT	; Continue exception handling
+
+	END_MARK_POINT
+
+	.END

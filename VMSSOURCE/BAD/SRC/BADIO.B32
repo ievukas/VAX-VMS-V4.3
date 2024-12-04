@@ -1,0 +1,526 @@
+MODULE badio (%TITLE 'Analyze/Media Input/Output Procedures'
+		IDENT = 'V04-000') =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!
+!++
+!
+! Facility:
+!
+!	Analyze/Media
+!
+! Abstract:
+!
+!	This module contains the procedures required to perform input
+!	and output operations in both synchronous and asynchronous modes.
+!
+! Environment:
+!
+!	VAX/VMS User Mode, Non-Privileged
+!
+! Author:
+!
+!	Michael T. Rhodes, 		Creation Date: July, 1982
+!
+! Modified By:
+!
+!	V03-002	MTR0004		Michael T. Rhodes	 1-Mar-1983
+!		Relocate routines 'bad$retry' and 'bad$verify_blocks' to here
+!		and add routine 'recoverable_error' to perform robust IO error
+!		recovery actions.
+!
+!	V03-001	MTR0001		Michael T. Rhodes	15-Dec-1982
+!		Modify the AST servicing structure.
+!
+!--
+
+%SBTTL 'Declarations'
+!
+! Include Files:
+!
+REQUIRE	'lib$:baddef';					! Define BAD's structures.
+LIBRARY	'SYS$LIBRARY:LIB';				! Define VMS structures.
+
+!
+! Table of Contents:
+!
+FORWARD ROUTINE
+    bad$ast_serv	: NOVALUE,			! AST service routine.
+    bad$async_io,					! Perform assynchronous IO.
+    bad$sync_io,					! Perform synchronous IO.
+    bad$start_io	: NOVALUE,			! Starts the asychrounous IO operations
+							! and waits for completion.
+    bad$retry		: NOVALUE,			! Examine error status and retry recoverable IO errors.
+    bad$verify_blocks	: NOVALUE,			! Verify the contents of each block written to the medium.
+    recoverable_error;					! If the error condition is recoverable, perform recovery and cont.
+
+!
+! Private Storage
+!
+OWN
+    current_lbn,					! Current lbn to be transferred.
+    devadr		: VECTOR [2, LONG],		! Device addresses for requests.
+    last_lbn;						! Lbn of last whole buffer transfer.
+
+!
+! External references:
+!
+EXTERNAL ROUTINE
+    bad$check_ltk	: ADDRESSING_MODE (GENERAL),	! Insert bad block into SDBSF if not in MDBSF or SDBSF.
+    bad$check_nlt	: ADDRESSING_MODE (GENERAL),	! Insert bad block into SDBSF if not in non last track SDBSF.
+    LIB$MATCH_COND	: ADDRESSING_MODE (GENERAL);	! Match the condition value specified.
+
+EXTERNAL
+    bad$gl_chan,					! Channel number for device.
+    bad$gl_context	: BITVECTOR [32],		! Global control context flags.
+    bad$ga_bufadr	: VECTOR [2, LONG],		! Addresses of the data buffers.\
+    bad$ga_device	: $BBLOCK [dsc$c_s_bln],	! Address of device name descriptor.
+    bad$gl_devtype,					! Device type.
+    bad$gl_func,					! IO function code for $QIO.
+    bad$gq_iosb		: VECTOR [4, LONG],		! IOSB Vector for both transfers.
+    bad$gl_pagcnt,					! Number of pages transfered.
+    bad$gl_status,					! Global status.
+    bad$ga_tpb,						! Address of the test pattern buffer.
+    bad$gl_trnsfr_cnt;					! Number of bytes per transfer.
+
+!
+! Define message codes...
+!
+EXTERNAL LITERAL
+    bad$_readerr,					! Read error.
+    bad$_writeerr;					! Write error.
+
+
+%SBTTL	'bad$ast_serv -- AST service routine'
+GLOBAL	ROUTINE bad$ast_serv (astprm, reg_0, reg_1, reg_pc, reg_psl) : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    Upon IO completion, control is transfer here by VMS via AST delivery.
+!    We perform the following actions:
+!
+!	1.  Check the IO status returned in the IO status block selected
+!	    by the AST parameter.
+!	    If the status is unsuccessful, then retry the IO synchronously.
+!
+!	2.  Update the current block number.
+!
+!	3.  Check for remaining whole buffer transfers pending;
+!
+!	    True:
+!		If the transfer was a read, initiate verification of
+!		the buffer just read, against the test pattern buffer.
+!		Set up the next transfer address.
+!		Issue the IO request.
+!
+!	    False:
+!		Set the device completion event flag.
+!
+! Inputs:
+!
+!    astprm	val	AST parameter value, used to indicate the IO request
+!			parameters such as; the IO buffer, status block etc..
+!    reg_0	val	the contents of R0 at the time of AST delivery.
+!    reg_1	val	the contents of R1 at the time of AST delivery.
+!    reg_pc	val	the contents of the PC at the time of AST delivery.
+!    reg_psl	val	the contents of the PSL at the time of AST delivery.
+!
+!    NOTE:  ONLY the astprm is used, all other input parameters are unused.
+!
+!--
+BEGIN
+IF NOT .bad$gq_iosb [.astprm * 2]			! Was the transfer successful?
+THEN							! If not, retry the transfer synchronously.
+    bad$retry (.devadr [.astprm], .bad$gl_trnsfr_cnt,
+               bad$gq_iosb [.astprm * 2], .bad$ga_bufadr [.astprm]);
+
+current_lbn = .current_lbn + .bad$gl_pagcnt;		! Update the current LBN.
+
+IF .current_lbn LEQ .last_lbn				! Have we finished all of the
+THEN							! whole buffer transfers?
+    BEGIN						! NO...
+    IF (.bad$gl_func AND %X'3F') EQL IO$_READLBLK	! If read/verfiy phase, then request
+    THEN						! buffer verification.
+        bad$verify_blocks (.bad$ga_bufadr [.astprm],
+                           .bad$gl_trnsfr_cnt,
+                           .devadr [.astprm],
+                            bad$gq_iosb [.astprm * 2]);
+
+    devadr [.astprm] = .current_lbn;			! Set up the new address.
+    bad$async_io (.astprm);				! Queue the request.
+    END
+ELSE
+    $SETEF (EFN = 3);					! Yes, set the device completion semaphore.
+
+RETURN
+
+END;    ! of GLOBAL ROUTINE bad$ast_serv
+
+
+%SBTTL	'bad$start_io -- Start asynchronous IO transfers'
+GLOBAL	ROUTINE bad$start_io (last_block) : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    This procedure is responsible for starting the asynchronous IO operations
+!    and waiting for the device completion semaphore to be set.  Once device
+!    completion is indicated, we return to our caller.
+!
+! Inputs:
+!
+!    last_block	val	The last block number to which a whole buffer
+!			transfer may be made.
+!
+! Side Effects:
+!
+!    event flag 3 is set indicating device comletion.
+!    asynchrounous io to the device is complete.
+!
+!--
+BEGIN
+$CLREF (EFN = 3);					! Clear device completion semaphore.
+last_lbn = .last_block;					! Establish the last whole buffer transfer address.
+current_lbn = .bad$gl_pagcnt;				! Preset the current transfer block address.
+devadr [0] = 0;						! Set the first device transfer address.
+devadr [1] = .current_lbn;				! Set the next transfer address.
+bad$async_io (0);					! Initiate the IO operations.
+bad$async_io (1);					!
+$WAITFR (EFN = 3);					! Wait for device completion semaphore.
+
+END;    ! of GLOBAL ROUTINE bad$start_io
+
+
+%SBTTL	'bad$async_io -- Perform Asynchronous IO operation'
+GLOBAL	ROUTINE bad$async_io (selector) =
+!++
+!
+! Functional Description:
+!
+!    This routine performs all asynchronous IO operations for the utility.
+!
+! Inputs:
+!
+!    selector		Selects the IO buffer, IOSB, and device addresses.
+!			It also doubles as the ASTPRM and we add 1 to form the EFN.
+!
+! Implicit Inputs:
+!
+!    bad$gl_chan	IO channel for device
+!    bad$gl_func	IO function code
+!    bad$gq_iosb	IO status block Vector.
+!    bad$ga_bufadr	IO buffer address Vector.
+!    bad$gl_trnsfr_cnt	Number of bytes to be transfered.
+!    devadr		Device address vector (holds current io request addresses).
+!
+! Implicit Outputs:
+!
+!    The data has been transfered to/from the data buffer.
+!
+! Routine Value:
+!
+!    Success	If transfer request was queued successfully.
+!
+!    Failure	If transfer request failed to be queued.
+!
+! Side Effects:
+!
+!    IO errors are signalled here, rather than by the caller alone.
+!
+!--
+BEGIN
+IF NOT (bad$gl_status = $QIO	(EFN = .selector + 1,
+			CHAN =	.bad$gl_chan,
+			FUNC =	IF .bad$gl_context [ctx_v_retry]
+				THEN	.bad$gl_func
+				ELSE	.bad$gl_func OR IO$M_INHRETRY,
+			IOSB =	bad$gq_iosb [.selector * 2],
+			ASTADR = bad$ast_serv,
+			ASTPRM = .selector,
+			P1 =    .bad$ga_bufadr [.selector],
+			P2 =    .bad$gl_trnsfr_cnt,
+			P3 =    .devadr [.selector]))
+THEN
+    SIGNAL (IF (.bad$gl_func AND %X'3F') EQLU IO$_WRITELBLK
+            THEN bad$_writeerr
+            ELSE bad$_readerr,
+            1, bad$ga_device,
+            .bad$gl_status);
+
+RETURN    .bad$gl_status;
+
+END;    ! of GLOBAL ROUTINE bad$async_io
+
+
+%SBTTL	'bad$sync_io -- Perform Synchronous IO operation'
+GLOBAL	ROUTINE bad$sync_io (bufadr, bytcnt, addr, iosbadr) =
+!++
+!
+! Functional Description:
+!
+!    This routine performs all IO operations for the utility.
+!
+! Inputs:
+!
+!    bufadr		Address of the data buffer
+!    bytcnt		Number of bytes to transfer
+!    addr		Device address for data transfer
+!    iosbadr		Address of the IO status block (see Side Effects)
+!
+! Implicit Inputs:
+!
+!    bad$gl_chan	IO channel for device
+!    bad$gl_func	IO function code
+!
+! Implicit Outputs:
+!
+!    The data has been transfered to/from the data buffer.
+!
+! Routine Value:
+!
+!    The completion status and byte count of the IO (as extracted from
+!    the iosb).
+!
+! Side Effects:
+!
+!    If the iosbadr parameter is omitted, we default to the use of
+!    bad$gq_iosb [0].
+!
+!    IO errors are signalled here, rather than by the caller alone.
+!
+!--
+BEGIN
+
+BUILTIN
+    NULLPARAMETER;
+
+MAP
+    iosbadr : REF VECTOR [2, LONG];
+
+IF NOT (bad$gl_status = $QIOW	(CHAN =	.bad$gl_chan,
+			 FUNC =	IF .bad$gl_context [ctx_v_retry]
+				THEN	.bad$gl_func
+				ELSE	.bad$gl_func OR IO$M_INHRETRY,
+			IOSB =	IF NULLPARAMETER (4)
+				THEN    bad$gq_iosb [0]
+				ELSE    iosbadr [0],
+			P1 =    .bufadr,
+			P2 =    .bytcnt,
+			P3 =    .addr))
+THEN
+    SIGNAL (IF (.bad$gl_func AND %X'3F') EQLU IO$_WRITELBLK
+            THEN bad$_writeerr
+            ELSE bad$_readerr,
+            1, bad$ga_device,
+            .bad$gl_status);
+
+RETURN	IF NULLPARAMETER (4)
+	THEN    .bad$gq_iosb [0]
+	ELSE    .iosbadr [0];
+
+END;    ! of GLOBAL ROUTINE bad$sync_io
+
+
+%SBTTL	'bad$retry -- Retry bad block'
+GLOBAL ROUTINE	bad$retry (lbn, cnt, iosb, bufadr) : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    An error has been detected during the IO transfer.
+!    We will examine the IOSB to determine the number of blocks
+!    successfully transfered.  With this we can 'skip' the bad
+!    block and continue to write/read the remainder of the blocks
+!    (recursively if need be!).
+!
+! Inputs:
+!
+!    lbn	val	starting logical block number for the transfers.
+!    cnt	val	number of bytes requested by the IO.
+!    iosb	adr	address of the IO status block to use.
+!    bufadr	adr	address of the data buffer to use.
+!
+! Side Effects:
+!
+!    The block which caused the IO operation to unsuccessfully complete
+!    will be retired to the SDBSF (if its not already!).
+!
+!--
+BEGIN
+MAP
+    iosb : REF VECTOR [4, WORD];			! Allow reference to status/byte count etc..
+
+LOCAL
+    bad_block,						! Logical Block Number of the bad block.
+    blocks_done,					! Number of blocks successfully transferred.
+    byte_count,						! Number of bytes remaining to be transferred.
+    next_bufadr;					! The address within the buffer to use during IO.
+
+IF NOT recoverable_error (.iosb [0])			! Can we recover from this error condition?
+THEN SIGNAL_STOP (					! No, inform the user of the problem.
+	IF (.bad$gl_func AND %X'3F') EQLU IO$_WRITELBLK	! Choose the message (read or write error)
+	THEN bad$_writeerr				!
+	ELSE bad$_readerr,				!
+	1, bad$ga_device,				! Specify the device in question...
+	.iosb [0]);					! and the specific problem.
+
+blocks_done = .iosb [1] / bad$k_page_size;		! Number of blocks successfully transferred.
+bad_block = .lbn + .blocks_done;			! LBN of the bad block.
+byte_count = .cnt - bad$k_page_size -			! Bytes remaining to be transferred.
+            (.blocks_done * bad$k_page_size);		! (round the number of bytes off to page boundary)
+next_bufadr = .bufadr + (.cnt - .byte_count);		! Beginning address within buffer to use during IO.
+
+IF .bad$gl_context [ctx_v_ltdevice]			! Check for this block in the
+THEN							! appropriate file format.  If it
+    bad$check_ltk (.bad_block, .bad_block)		! has not already been recorded,
+ELSE							! create a new entry in the SDBSF
+    bad$check_nlt (.bad_block, .bad_block);		! for this block.
+
+IF .iosb [1] LSS .cnt					! Has the IO actually been completed?
+AND .byte_count GTR 0					! Do we actually have anything to transfer?
+THEN							! If so, skip past the bad block and finish up.
+    BEGIN						!
+    iosb [1] = 0;					! Reset the byte count.
+    bad$sync_io (.next_bufadr,				! Use the correct buffer address to complete the IO.
+                 .byte_count,				! Transfer the remaining bytes.
+                 .bad_block + 1,			! Skip past the bad block to continue.
+                 iosb [0]);				! Reuse the old IO status block.
+
+    IF NOT .iosb [0]					! ERROR during IO?! 
+    THEN						! Recursively go past bad block(s).
+        bad$retry (.bad_block + 1,			! Starting LBN.
+                   .byte_count,				! Number of bytes we wanted to transfer.
+                   iosb [0],				! Address of the IO status block.
+                   .next_bufadr);			! Beginning buffer address.
+    END;
+
+END;    ! of GLOBAL ROUTINE bad$retry
+
+
+%SBTTL	'bad$verify_blocks -- Verify contents of blocks against test pattern'
+GLOBAL ROUTINE	bad$verify_blocks (bufadr, bufsiz, devadr, iosb) : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    Compare the contents of the data buffer block by block against the test
+!    test pattern buffer.  If a mismatch occurs, we will look up the block
+!    in the appropriate bad block file.  If it has not been recorded previously
+!    we will create a new entry and retire it to the bad block file (SDBSF).
+!
+! Inputs:
+!
+!    bufadr	adr	address of the data buffer.
+!    bufsiz	val	size in bytes of the data buffer.
+!    devadr	val	starting logical block number for the transfer.
+!    iosb	adr	address of the IO status block.
+!
+! Implicit Inputs:
+!
+!    bad$ga_tpb		address of the current test pattern buffer.
+!
+!--
+BEGIN
+LOCAL
+    bad_block;						! Bad block number (LBN).
+
+INCR block FROM .bufadr TO .bufadr + .bufsiz - 4 BY bad$k_page_size DO
+    IF NOT CH$EQL (bad$k_page_size, .block,
+                   bad$k_page_size, .bad$ga_tpb)
+    THEN
+        BEGIN						! The current block has failed.
+        bad_block = .devadr +				! Compute the LBN of the failure.
+            ((.block - .bufadr) / bad$k_page_size); 
+
+        IF .bad$gl_context [ctx_v_ltdevice]		! Check for this block in the
+        THEN						! appropriate file format.  If it
+            bad$check_ltk (.bad_block, .bad_block)	! has not already been recorded,
+        ELSE						! create a new entry in the SDBSF
+            bad$check_nlt (.bad_block, .bad_block);	! for this block.
+        END;
+
+END;    ! of GLOBAL ROUTINE bad$verify_blocks
+
+
+%SBTTL	'recoverable_error -- Perform recovery action if possible'
+ROUTINE recoverable_error (status) =
+!++
+!
+! Functional Description:
+!
+!    This procedure is responsible for determining the severity of an IO error.
+!    This 'severity' is returned to the caller as the routine value and is
+!    categorized into two classes.  RECOVERABLE [true] which indicates that a
+!    recovery action can be performed and NONRECOVERABLE [false] which indicates
+!    that no recovery action can be performed.
+!
+!    The selection for the severity/action is accomplished by matching the
+!    status supplied by the caller against a list of 'known recoverable
+!    error conditions'.  A match generally indicates that the condition is 
+!    recoverable and all others are considered nonrecoverable.  An index is
+!    generated which becomes a dispatch argument to CASE to the appropriate
+!    action routine.
+!
+! Inputs:
+!
+!    status	val	the actual IO error condition returned from the $QIO.
+!
+! Routine Value:
+!
+!    true		the error was recoverable.
+!    false		the error was not recoverable.
+!
+!--
+BEGIN
+
+LITERAL
+    opincompl =	1,					! First error condition label.
+    parity =	2;					! Last error condition label.
+
+LOCAL
+    index,						! Index to action routine.
+    recoverable	: INITIAL (FALSE);			! Condition severity returned to the caller.
+
+index = LIB$MATCH_COND (status,				! Find the action routine which matchs this condition.
+			%REF (ss$_opincompl),		! Operation incomplete.
+			%REF (ss$_parity));		! Parity error.
+
+CASE .index FROM opincompl TO parity OF
+SET
+[opincompl]:	IF .bad$gl_devtype EQL dt$_rp07		! Operation Incomplete.  Special Case, for the RP07
+		THEN recoverable = true;		! this condition generally indicates a media flaw.
+							! However, for all others it indicates a hardware error.
+
+[parity]:	recoverable = true;			! Parity error.  Mark the block bad and continue.
+TES;
+
+RETURN .recoverable;					! Return the severity of this condition.
+
+END;    ! of ROUTINE recoverable_error
+
+END    ! of MODULE badio
+ELUDOM

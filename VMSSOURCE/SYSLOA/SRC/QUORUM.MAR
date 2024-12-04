@@ -1,0 +1,1055 @@
+	.TITLE	QUORUM - DISK QUORUM MODULE
+	.IDENT	'V04-000'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+; Facility: Executive, Cluster management
+;
+; Abstract:
+;	This module contains the routines that implement the disk quorum
+;	algorithm.
+;
+; Enviornment:
+;	VMS Non Paged Exec - Kernel mode
+;--
+;
+; Author:
+;
+;	R. Scott Hanna, CREATION DATE: 25-Jul-1983
+;
+; Modified by:
+;
+;	V03-008	WMC0003		Wayne Cardoza		16-Jul-1984
+;		Call mount verification under some error conditions.
+;		Clear CLUDCB$B_COUNTER on any entry to CLUSTER state.
+;
+;	V03-007	WMC0002		Wayne Cardoza		28-Jun-1984
+;		Allow one error before calling CSP.
+;
+;	V03-006	WMC0001		Wayne Cardoza		31-May-1984
+;		Make sure IRP$W_STS field is cleared.
+;
+;	V03-005	SSA0023		Stan Amway		 6-Apr-1984
+;		Decrement UCB device queue length when I/O completes
+;		in READ_COMPLETE or WRITE_COMPLETE. This is required
+;		because EXE$INSIOQ increments the length, but the IRP
+;		does not go through the normal IOPOST code which does
+;		the corresponding decrement.
+;
+;	V03-004	RSH0119		R. Scott Hanna		14-Mar-1984
+;		Rewrite of module to use a new algorithm.
+;
+;	V03-003	RSH0085		R. Scott Hanna		23-Nov-1983
+;		Remove clear of quorum file logical block number on
+;		"connection" loss.
+;
+;	V03-002	RSH0078		R. Scott Hanna		10-Nov-1983
+;		Changes in error handling to print error messages one
+;		time only. Clear quorum file logical block number in
+;		CLUDCB when "connection" is lost. Changes necessary due
+;		to re-structured quorum block. Changes due to move of
+;		QF_TRANS and QF_TIMEOUT from CLUB to CLUDCB.
+;
+;	V03-001	RSH0071		R. Scott Hanna		27-Sep-1983
+;		Make sure CLUDCB$L_QBLAST and CLUDCB$L_QBBUF are
+;		swapped on quorum file transition from inactive
+;		regardless of the CLUB$V_QF_SKIP_READ bit.
+;--
+
+	.SBTTL	Declarations
+;
+;	Define Symbols
+;
+
+	$CLUBDEF				; Cluster block
+	$CLUDCBDEF				; Cluster quorum disk control block
+	$CLUQFDEF				; Cluster quorum file
+	$CSBDEF					; Cluster system block
+	$CSDDEF					; Cluster server data
+	$CSPDEF					; CSP communication codes
+	$DYNDEF					; Dynamic data structure types
+	$IODEF					; I/O function codes
+	$IPLDEF					; Interrupt priority levels
+	$IRPDEF					; I/O request packet
+	$SBDEF					; System Block
+	$TQEDEF					; Time queue entry
+	$UCBDEF					; Unit control block
+	$VADEF					; Virtual address fields
+
+;
+; The cycle count insures that we will not get burned by race conditions
+; and not see another cluster through the quorum disk.
+;
+	CYCLE_COUNT = 2
+
+;
+; The following assumptions are in effect for the entire module
+;
+	ASSUME	IPL$_TIMER EQ IPL$_SYNCH
+	ASSUME	IPL$_TIMER EQ IPL$_SCS
+	ASSUME	CLUDCB$S_BUFFER EQ CLUQF$K_LENGTH
+	ASSUME	CLUQF$K_CHECK_LENGTH&3 EQ 0
+
+	.DEFAULT DISPLACEMENT,WORD
+
+;
+; Own Storage
+;
+	.PSECT	$$$060,LONG
+
+CLUQF_IDENT_STRING:
+	.ASCII	/QUORUM  FILE/
+	ASSUME	CLUQF$S_IDENT EQ .-CLUQF_IDENT_STRING
+
+.SBTTL	CNX$QUORUM_INIT - Quorum initialization
+
+;++
+; CNX$QUORUM_INIT - Quorum initialization
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine determines if a quorum disk has been specified,
+;	and if so allocates and initializes the cluster quorum disk
+;	control block (CLUDCB) and associated data structures.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSBx CNX$QUORUM_INIT
+;	    IPL is 31
+;
+; INPUTS:
+;
+;	NONE
+;
+; OUTPUT:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	R0-R5 are destroyed
+;--
+
+	.PSECT	$$$002,LONG			; Initialization PSECT
+
+CNX$QUORUM_INIT::
+
+	PUSHR	#^M<R6,R7,R8,R9,R10,R11>	; Save registers
+;
+; Determine if we have a quorum file
+;
+	LOCC	#^A/ /,#CLUDCB$S_DISK_QUORUM,-	; Locate end of quorum disk name
+		G^CLU$GB_QDISK
+	CMPL	R0,#CLUDCB$S_DISK_QUORUM	; Is there a disk name?
+	BNEQU	1$				; Br if yes
+	BRW	4$
+;
+; Allocate the CLUDCB
+;
+1$:	MOVL	#CLUDCB$K_LENGTH,R1		; CLUDCB size
+	JSB	G^EXE$ALONONPAGED		; Allocate CLUDCB
+	BLBC	R0,2$				; Br if error
+	MOVQ	R1,R6				; Save CLUDCB size and address
+;
+; Allocate the IRP
+;
+	MOVL	#IRP$K_LENGTH,R1		; IRP size
+	JSB	G^EXE$ALONONPAGED		; Allocate IRP
+	BLBC	R0,2$				; Br if error
+	MOVQ	R1,R8				; Save IRP size and address
+;
+; Allocate the TQE
+;
+	MOVL	#TQE$K_LENGTH,R1		; TQE size
+	JSB	G^EXE$ALONONPAGED		; Allocate TQE
+	MOVQ	R1,R10				; Save TQE size and address
+	BLBS	R0,3$				; Br if success
+2$:	BRW	5$
+;
+; Initialize the CLUDCB
+;
+3$:	MOVC5	#0,(SP),#0,R6,(R7)		; Zero the CLUDCB
+	MOVW	R6,CLUDCB$W_SIZE(R7)		; Store size
+	MOVB	#DYN$C_CLU,CLUDCB$B_TYPE(R7)	; Store type
+	MOVB	#DYN$C_CLU_CLUDCB,-		; Store subtype
+		CLUDCB$B_SUBTYPE(R7)
+	MOVL	R9,CLUDCB$L_IRP(R7)		; Store IRP address
+	MOVL	R11,CLUDCB$L_TQE(R7)		; Store TQE address
+	MOVW	#CLUDCB$M_QS_NOT_READY,-	; Initial state is NOT_READY
+		CLUDCB$W_STATE(R7)
+;
+; Initialize the IRP
+;
+	MOVC5	#0,(SP),#0,R8,(R9)		; Zero the IRP
+	MOVW	R8,IRP$W_SIZE(R9)		; Store size
+	MOVB	#DYN$C_IRP,IRP$B_TYPE(R9)	; Store type
+	MOVB	#^XFF,IRP$B_PRI(R9)		; Store priority
+;
+; Initialize the TQE
+;
+	MOVC5	#0,(SP),#0,R10,(R11)		; Zero the TQE
+	MOVL	R10,TQE$W_SIZE(R11)		; Store size
+	MOVB	#DYN$C_TQE,TQE$B_TYPE(R11)	; Store type
+	MOVB	#TQE$C_SSREPT,TQE$B_RQTYPE(R11)	; Store request type
+	MOVAB	QUORUM_TIMEOUT,TQE$L_FPC(R11)	; Set up timer request fork PC
+	MOVL	R7,TQE$L_FR3(R11)		; Store fork register three
+	MOVL	G^CLU$GL_CLUB,R4		; Get CLUB address
+	MOVL	R4,TQE$L_FR4(R11)		; Store fork register four
+	MOVZWL	G^CLU$GW_QDSKINTERVAL,R2	; Get timeout value. (in seconds)
+	EMUL	R2,#10000000,#0,-		; Convert timeout to 100ns units
+		TQE$Q_DELTA(R11)		; ...and store in TQE
+;
+; Point CLUB to CLUDCB
+;
+	MOVL	R7,CLUB$L_CLUDCB(R4)		; Store CLUDCB pointer in CLUB
+
+4$:	MOVL	#SS$_NORMAL,R0			; Return success
+5$:	POPR 	#^M<R6,R7,R8,R9,R10,R11>	; Restore registers
+	RSB
+
+.SBTTL	QUORUM_TIMEOUT - Quorum timeout
+;++
+; QUORUM_TIMEOUT - Quorum timeout
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine executes every n seconds as a fork process where n is
+;	determined by the sysgen parameter QDSKINTERVAL.
+;
+; CALLING SEQUENCE:
+;
+;	JSB QUORUM_TIMEOUT
+;
+; INPUTS:
+;
+;	R3 = address of CLUDCB
+;	R4 = address of CLUB
+;	R5 = address of TQE
+;
+; OUTPUT:
+;
+;	R0-R2 Destroyed
+;--
+
+	.PSECT	$$$100,LONG
+
+QUORUM_TIMEOUT::
+
+	PUSHL	R6				; Save R6
+	BBS	#CLUDCB$V_QF_TIM,-		; Br if we already timed out the
+		CLUDCB$W_FLAGS(R3),5$		; ...I/O in progress
+	MOVAL	CLUDCB$T_BUFFER(R3),R6		; Get buffer address
+	BBC	#CLUDCB$V_QF_WIP,-		; Br if no write in progress
+		CLUDCB$W_FLAGS(R3),1$
+	INCB	CLUQF$B_IGNORE(R6)		; Invalidate buffer
+	BRB	2$
+1$:	BBC	#CLUDCB$V_QF_RIP,-		; Br if no read in progress
+		CLUDCB$W_FLAGS(R3),3$
+2$:	BISW2	#CLUDCB$M_QF_TIM,-		; Set timeout bit
+		CLUDCB$W_FLAGS(R3)
+	MOVAB	W^QDTIMOUT_MSG,R0		; Point to timeout message
+	BSBW	QUORUM_DISK_TIMEOUT		; Process timeout error
+	BRB	5$
+3$:	BBC	#CLUDCB$V_QS_NOT_READY,-	; Br if we are in one of the 
+		CLUDCB$W_STATE(R3),4$		; ...ready states
+	BSBW	REQUEST_CSP
+	BRB	5$
+4$:	BSBW	READ_QUORUM_FILE		; Queue a quorum file read request
+5$:	MOVL	(SP)+,R6			; Restore R6
+	RSB	
+
+.SBTTL	READ_QUORUM_FILE - Queue a read to the quorum file
+;++
+; READ_QUORUM_FILE - Queue a read to the quorum file
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine builds and queues an IRP to read the quorum file.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSBx READ_QUORUM_FILE
+;
+; INPUTS:
+;
+;	R3 = address of CLUDCB
+;	R6 = address of quorum file buffer
+;
+; OUTPUT:
+;
+;	R0-R2 destroyed
+;--
+
+READ_QUORUM_FILE:
+
+	PUSHR	#^M<R3,R4,R5>			; Save registers
+	BISW	#CLUDCB$M_QF_RIP,-		; Set read in progress bit
+		CLUDCB$W_FLAGS(R3)
+	MOVL	CLUDCB$L_IRP(R3),R2		; Get IRP address
+	MOVAL	READ_COMPLETE,IRP$L_PID(R2)	; Store completion address in PID
+	MOVL	CLUDCB$L_UCB(R3),R5		; Get UCB address
+	MOVL	R5,IRP$L_UCB(R2)		; Store UCB address
+	MOVW	#IO$_READPBLK,IRP$W_FUNC(R2)	; Store function code
+	CLRW	IRP$W_STS(R2)			; Mount verification bit may be set
+	BBS	#UCB$V_NOCNVRT,UCB$W_DEVSTS(R5),1$ ; Br if logical I/O
+	MOVW	#IRP$M_PHYSIO,IRP$W_STS(R2)	; Set physical I/O flag in IRP
+1$:	MOVZWL	#CLUQF$K_LENGTH,IRP$L_BCNT(R2)	; Store byte count
+	BICW3	#^C<VA$M_BYTE>,R6,-		; Store buffer start byte offset
+		IRP$W_BOFF(R2) 
+	EXTZV	#VA$V_VPN,#VA$S_VPN,R6,R1	; Get buffer virtual page number
+	MOVL	G^MMG$GL_SPTBASE,R0		; Get SPT base address
+	MOVAL	(R0)[R1],IRP$L_SVAPTE(R2)	; Store PTE address
+	MOVL	CLUDCB$L_QFLBN(R3),R0		; Get logical block number
+	MOVL	R2,R3				; Set up IRP address
+	JSB	G^IOC$CVTLOGPHY			; Convert LBN to PBN
+	JSB	G^EXE$INSIOQ			; Queue the request
+	POPR	#^M<R3,R4,R5>			; Restore registers
+	RSB
+
+.SBTTL	READ_COMPLETE - Quorum file read complete
+;++
+; READ_COMPLETE - Quorum file read complete
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called when the quorum file read completes.
+;
+; CALLING SEQUENCE:
+;
+;	JSB READ_COMPLETE
+;
+;	    Called as a fork process by IOCIOPOST at IPL$_IOPOST
+;
+; INPUTS:
+;
+;	R5 = address of IRP
+;
+; OUTPUT:
+;
+;	R0-R5 destroyed
+;--
+
+READ_COMPLETE::
+	PUSHR	#^M<R6,R7>			; Save registers
+	MOVL	IRP$L_UCB(R5),R4		; Get UCB address
+	DECW	UCB$W_QLEN(R4)			; Decrement device queue length
+	SETIPL	#IPL$_TIMER			; Raise IPL
+	MOVL	G^CLU$GL_CLUB,R4		; Get CLUB address
+	MOVL	CLUB$L_CLUDCB(R4),R3		; Get CLUDCB address
+	MOVAL	CLUDCB$T_BUFFER(R3),R6		; Get quorum file buffer
+	BICW2	#CLUDCB$M_QF_RIP,-		; Clear read in progress bit
+		CLUDCB$W_FLAGS(R3)
+	MOVAB	W^QDRDERROR_MSG,R0		; Assume read error
+	BBCC	#CLUDCB$V_QF_TIM,-		; Br if read has not timed out
+		CLUDCB$W_FLAGS(R3),10$
+	BLBS	IRP$L_IOST1(R5),40$		; Br if read was successful
+	BSBW	CHECK_ERROR			; Is error fatal?
+	BLBS	R0,40$				; Continue
+	MOVW	#CLUDCB$M_QS_NOT_READY,-	; Set state to not ready
+		CLUDCB$W_STATE(R3)
+	BSBW	REQUEST_CSP
+	BRB	40$
+10$:	BLBS	IRP$L_IOST1(R5),14$		; Br if no read error
+	BSBW	CHECK_ERROR			; Is error fatal?
+	BLBS	R0,40$				; Continue
+	MOVAB	W^QDRDERROR_MSG,R0		; Read error
+	BBSS	#CLUDCB$V_QF_FIRST_ERR,-	; Is this first error
+		CLUDCB$W_FLAGS(R3),20$
+	BSBW	QUORUM_FILE_RETRY		; Process error
+	BRB	40$
+14$:	BBCC	#CLUDCB$V_QF_FIRST_ERR,-	; Clear any previous error
+		CLUDCB$W_FLAGS(R3),15$
+15$:	BSBW	VALIDATE_QUORUM_FILE
+	BLBS	R0,30$				; Br if quorum file valid
+	MOVAB	W^QDINVDAT_MSG,R0		; Point to invalid data message
+20$:	BSBW	QUORUM_FILE_ERROR		; Process error
+	BRB	40$
+30$:	FFS	#CLUDCB$V_QS_READY,#4,-		; Get relative state bit position
+		CLUDCB$W_STATE(R3),R0
+	MOVAL	DISPATCH,R1			; Get dispatch table address
+	ADDL2	DISPATCH-4[R0],R1		; Form routine address
+	JSB	(R1)				; Dispatch to routine
+40$:	SETIPL	#IPL$_IOPOST			; Restore IPL
+	POPR	#^M<R6,R7>			; Restore registers
+	RSB
+
+DISPATCH:	.LONG  READ_COMPLETE_READY-DISPATCH
+		.LONG  READ_COMPLETE_ACTIVE-DISPATCH
+		.LONG  READ_COMPLETE_CLUSTER-DISPATCH
+		.LONG  READ_COMPLETE_VOTE-DISPATCH
+
+.SBTTL	READ_COMPLETE_READY - Read complete processing for READY state
+;++
+; READ_COMPLETE_READY - Read complete processing for READY state
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine performs the read complete processing specific
+;	to the READY state.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSBx READ_COMPLETE_READY
+;
+; INPUTS:
+;
+;	R3 = address of CLUDCB
+;	R4 = address of CLUB
+;	R6 = address of quorum file buffer
+;
+; OUTPUT:
+;
+;	R0-R2,R5 Destroyed
+;--
+
+READ_COMPLETE_READY:
+
+	MOVW	#CLUDCB$M_QS_ACTIVE,-		; Set state to active
+		CLUDCB$W_STATE(R3)
+	BICW	#CLUDCB$M_QF_ERROR,-		; Clear error reported bit
+		CLUDCB$W_FLAGS(R3)
+	MOVL	CLUQF$L_ACT_COUNT(R6),-		; Save activity longword
+		CLUDCB$L_ACT_COUNT(R3)
+	MCOML	#0,CLUB$L_FOREIGN_CLUSTER(R4)	; Fill shift register with 1's
+	BISL	#CLUB$M_QF_ACTIVE,-		; Set active bit
+		CLUB$L_FLAGS(R4)
+	MOVAB	W^QDCON_MSG,R0			; Point to connect message
+	CLRL	R5				; No CSB
+	BSBW	CNX$CONFIG_CHANGE		; Output message
+	BSBW	CNX$DISK_CHANGE			; Let connection manager know
+	BBC	#CLUB$V_CLUSTER,-		; Br if local node not a
+		CLUB$L_FLAGS(R4),1$		; ...cluster member
+	MOVW	#CLUDCB$M_QS_CLUSTER,-		; Set state to cluster
+		CLUDCB$W_STATE(R3)
+	CLRB	CLUDCB$B_COUNTER(R3)		; Clear counter
+	BICL	#CLUB$M_QF_FAILED_NODE,-	; Clear failout bit in CLUB
+		CLUB$L_FLAGS(R4)
+	BSBW	BUILD_QUORUM_FILE		; Build the owner & activity blocks
+	BSBW	WRITE_QUORUM_OWNACT		; Write the owner & activity blocks
+1$:	RSB
+
+.SBTTL	READ_COMPLETE_ACTIVE - Read complete processing for ACTIVE state
+;++
+; READ_COMPLETE_ACTIVE - Read complete processing for ACTIVE state
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine performs the read complete processing specific
+;	to the ACTIVE state.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSBx READ_COMPLETE_ACTIVE
+;
+; INPUTS:
+;
+;	R3 = address of CLUDCB
+;	R4 = address of CLUB
+;	R6 = address of quorum file buffer
+;
+; OUTPUT:
+;
+;	R0-R2 Destroyed
+;--
+
+READ_COMPLETE_ACTIVE:
+
+	BBC	#CLUB$V_CLUSTER,-		; Br if local node not a
+		CLUB$L_FLAGS(R4),1$		; ...cluster member
+	MOVW	#CLUDCB$M_QS_CLUSTER,-		; Set state to cluster
+		CLUDCB$W_STATE(R3)
+	CLRB	CLUDCB$B_COUNTER(R3)		; Clear counter
+	BICL	#CLUB$M_QF_FAILED_NODE,-	; Clear failout bit in CLUB
+		CLUB$L_FLAGS(R4)
+	BSBW	BUILD_QUORUM_FILE		; Build the owner & activity blocks
+	BSBW	WRITE_QUORUM_OWNACT		; Write the owner & activity blocks
+	BRB	2$
+1$:	ASHL	#1,CLUB$L_FOREIGN_CLUSTER(R4),- ; Assume no activity
+		CLUB$L_FOREIGN_CLUSTER(R4)
+	CMPL	CLUQF$L_ACT_COUNT(R6),-		; Activity longword change?
+		CLUDCB$L_ACT_COUNT(R3)
+	BEQLU	2$				; Br if not
+	BISL	#1,CLUB$L_FOREIGN_CLUSTER(R4)	; We have seen a foreign cluster
+	MOVL	CLUQF$L_ACT_COUNT(R6),-		; Save activity longword
+		CLUDCB$L_ACT_COUNT(R3)
+2$:	RSB
+
+.SBTTL	READ_COMPLETE_CLUSTER/VOTE - Read complete processing for CLUSTER and VOTE states
+;++
+; READ_COMPLETE_CLUSTER - Read complete processing for CLUSTER state
+; READ_COMPLETE_VOTE - Read complete processing for VOTE state
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine performs the read complete processing specific
+;	to the CLUSTER and VOTE states.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSBx READ_COMPLETE_CLUSTER
+;	JSB/BSBx READ_COMPLETE_VOTE
+;
+; INPUTS:
+;
+;	R3 = address of CLUDCB
+;	R4 = address of CLUB
+;	R6 = address of quorum file buffer
+;
+; OUTPUT:
+;
+;	R0-R2,R5 Destroyed
+;--
+
+READ_COMPLETE_CLUSTER:
+READ_COMPLETE_VOTE:
+
+	BBCC	#CLUB$V_QF_FAILED_NODE,-	; Br if node was not failed out
+		CLUB$L_FLAGS(R4),1$
+	MOVW	#CLUDCB$M_QS_CLUSTER,-		; Set state to CLUSTER
+		CLUDCB$W_STATE(R3)
+	BRB	4$
+1$:	TSTB	CLUQF$B_IGNORE(R6)		; Is data in quorum file stale?
+	BNEQU	4$				; Br if yes
+	BSBW	CHECK_OWNER			; Determine who owns quorum file
+	BLBC	R0,2$				; Br if not a member of my cluster
+	INCB	CLUDCB$B_COUNTER(R3)		; Increment counter
+	BSBW	WRITE_QUORUM_ACT		; Write the activity block
+	BRB	5$
+2$:	MOVAB	W^QDFORCLUS_MSG,R0		; Point to foreign cluster message
+	CLRL	R5				; No CSB
+	BSBW	CNX$CONFIG_CHANGE		; Output message
+	BBS	#CLUQF$V_QUORUM,-		; Bugcheck if he has dynamic quorum
+		CLUQF$W_FLAGS(R6),3$
+	BBS	#CLUB$V_QUORUM,-		; Continue if we have dynamic quorum
+		CLUB$L_FLAGS(R4),4$
+	CMPW	CLUQF$W_VOTES(R6),-		; Does he have static quorum?
+		CLUQF$W_QUORUM(R6)
+	BGEQU	3$				; Br if yes
+	CMPW	CLUB$W_VOTES(R4),-		; Do we have static quorum?
+		CLUB$W_QUORUM(R4)	
+	BGEQU	4$				; Br if yes
+3$:	BSBW	CNX$BUGCHECK_CLUSTER		; Cause all nodes to bugcheck
+	BRB	5$
+4$:	CLRB	CLUDCB$B_COUNTER(R3)		; Clear counter
+	BSBW	BUILD_QUORUM_FILE		; Build the owner & activity blocks
+	BSBW	WRITE_QUORUM_OWNACT		; Write the owner & activity blocks
+5$:	RSB
+
+.SBTTL	BUILD_QUORUM_FILE - Build the quorum file owner and activity blocks
+;++
+; BUILD_QUORUM_FILE - Build the quorum file owner and activity blocks
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine builds the quorum file owner and activity blocks.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSBx BUILD_QUORUM_FILE
+;
+; INPUTS:
+;
+;	R4 = address of CLUB
+;	R6 = address of quorum file buffer
+;
+; OUTPUT:
+;
+;	R0-R2 destroyed
+;--
+
+BUILD_QUORUM_FILE:
+
+	ASSUME	CLUQF$K_VERSION EQ 2		; Assume version 2 structure
+	ASSUME	SB$S_SYSTEMID EQ 6		; Assume system ID is 6 bytes
+	PUSHR	#^M<R3,R4,R5,R7>		; Save registers
+	MOVC3	#CLUQF$S_IDENT,-		; Store ID string
+		CLUQF_IDENT_STRING,(R6)
+	MOVL	R3,R0				; R0 = current buffer pointer
+	MOVQ	(SP),R3				; Restore CLUDCB and CLUB pointers
+	MOVW	#CLUQF$K_VERSION,(R0)+		; Store QF version number
+	MOVW	#CLUQF$M_QUORUM,(R0)+		; Assume we have dynamic quorum
+	BBS	#CLUB$V_QUORUM,-		; Br if we do have dynamic quorum
+		CLUB$L_FLAGS(R4),1$
+	CLRW	-2(R0)				; Fix the incorrect assumption
+1$:	MOVQ	CLUB$Q_FTIME(R4),(R0)+		; Store FOU_TIME
+	MOVQ	CLUB$Q_LST_TIME(R4),(R0)+	; Store LST_TIME
+	MOVQ	G^EXE$GQ_SYSTIME,(R0)+		; Store QF_TIME
+	MOVQ	G^SCS$GA_LOCALSB+SB$Q_SWINCARN,(R0)+ ; Store SWINCARN
+	MOVL	CLUB$L_LOCAL_CSID(R4),(R0)+	; Store CSID
+	MOVW	CLUB$W_QUORUM(R4),(R0)+		; Store cluster quorum
+	MOVW	CLUB$W_VOTES(R4),(R0)+		; Store cluster votes
+	MOVL	G^SCS$GA_LOCALSB+SB$B_SYSTEMID,(R0)+ ; Store system ID
+	MOVW	G^SCS$GA_LOCALSB+SB$B_SYSTEMID+4,(R0)+
+	MOVL	CLUB$B_FSYSID(R4),(R0)+		; Store FSYSID
+	MOVW	CLUB$B_FSYSID+4(R4),(R0)+
+	CLRL	(R0)				; Initialize checksum
+	CLRB	4(R0)				; Zero the ignore flag
+	BSBW	CALCULATE_CHECKSUM		; Calculate the owner block checksum
+	MOVL	R7,(R0)				; Store checksum
+	INCL	CLUQF$L_ACT_COUNT(R6)		; Increment the activity counter
+	POPR	#^M<R3,R4,R5,R7>		; Restore registers
+	RSB
+
+.SBTTL	Quorum file write routines
+;++
+; WRITE_QUORUM_OWNACT - Write the quorum file owner and activity blocks
+; WRITE_QUORUM_ACT - Write the quorum file activity block
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine builds and queues an IRP to write the owner and activity
+;	block or just the activity block to the quorum file.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSBx WRITE_QUORUM_OWNACT
+;	JSB/BSBx WRITE_QUORUM_ACT
+;
+; INPUTS:
+;
+;	R3 = address of CLUDCB
+;	R6 = address of quorum file buffer
+;
+; OUTPUT:
+;
+;	R0-R2 destroyed
+;--
+	.ENABLE	LSB
+
+WRITE_QUORUM_OWNACT:
+
+	PUSHR	#^M<R3,R4,R5,R6>		; Save registers
+	CLRL	-(SP)				; Quorum file block 0
+	MOVZWL	#CLUQF$K_LENGTH,-(SP)		; Byte count
+	BRB	1$
+
+WRITE_QUORUM_ACT:
+
+	PUSHR	#^M<R3,R4,R5,R6>		; Save registers
+	MOVAL	CLUQF$L_ACT_COUNT(R6),R6	; Get activity block address
+	INCL	(R6)				; Increment the activity counter
+	MOVZBL	#1,-(SP)			; Quorum file block 1
+	MOVZBL	#CLUQF$K_ACT_LENGTH,-(SP)	; Byte count
+1$:	BISW	#CLUDCB$M_QF_WIP,-		; Set write in progress bit
+		CLUDCB$W_FLAGS(R3)
+	MOVL	CLUDCB$L_IRP(R3),R2		; Get IRP address
+	MOVAL	WRITE_COMPLETE,IRP$L_PID(R2)	; Store completion address in PID
+	MOVL	CLUDCB$L_UCB(R3),R5		; Get UCB address
+	MOVL	R5,IRP$L_UCB(R2)		; Store UCB address
+	MOVW	#IO$_WRITEPBLK,IRP$W_FUNC(R2)	; Store function code
+	CLRW	IRP$W_STS(R2)			; Mount verification bit may be set
+	BBS	#UCB$V_NOCNVRT,UCB$W_DEVSTS(R5),2$ ; Br if logical I/O
+	MOVW	#IRP$M_PHYSIO,IRP$W_STS(R2)	; Set physical I/O flag in IRP
+2$:	MOVL	(SP)+,IRP$L_BCNT(R2)		; Store byte count
+	BICW3	#^C<VA$M_BYTE>,R6,-		; Store buffer start byte offset
+		IRP$W_BOFF(R2)
+	EXTZV	#VA$V_VPN,#VA$S_VPN,R6,R1	; Get buffer virtual page number
+	MOVL	G^MMG$GL_SPTBASE,R0		; Get SPT base address
+	MOVAL	(R0)[R1],IRP$L_SVAPTE(R2)	; Store PTE address
+	ADDL3	(SP)+,CLUDCB$L_QFLBN(R3),R0	; Get logical block number
+	MOVL	R2,R3				; Set up IRP address
+	JSB	G^IOC$CVTLOGPHY			; Convert LBN to PBN
+	JSB	G^EXE$INSIOQ			; Queue the request
+	POPR	#^M<R3,R4,R5,R6>		; Restore registers
+	RSB
+
+	.DISABLE LSB
+
+.SBTTL	WRITE_COMPLETE - Quorum file write complete
+;++
+; WRITE_COMPLETE - Quorum file write complete
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called when a quorum file write completes.
+;
+; CALLING SEQUENCE:
+;
+;	JSB WRITE_COMPLETE
+;
+;	    Called as a fork process by IOCIOPOST at IPL$_IOPOST
+;
+; INPUTS:
+;
+;	R5 = address of IRP
+;
+; OUTPUT:
+;
+;	R0-R4 destroyed
+;--
+
+WRITE_COMPLETE::
+	MOVL	IRP$L_UCB(R5),R4		; Get UCB address
+	DECW	UCB$W_QLEN(R4)			; Decrement device queue length
+	SETIPL	#IPL$_TIMER			; Raise IPL
+	MOVL	G^CLU$GL_CLUB,R4		; Get CLUB address
+	MOVL	CLUB$L_CLUDCB(R4),R3		; Get CLUDCB address
+	BICW2	#CLUDCB$M_QF_WIP,-		; Clear write in progress bit
+		CLUDCB$W_FLAGS(R3)
+	MOVAB	W^QDWRERROR_MSG,R0		; Point to write error message
+	BBCC	#CLUDCB$V_QF_TIM,-		; Br if write has not timed out
+		CLUDCB$W_FLAGS(R3),10$
+	BLBS	IRP$L_IOST1(R5),30$		; Br if write was successful
+	BSBW	CHECK_ERROR			; Is error fatal?
+	BLBS	R0,30$				; Continue
+	MOVW	#CLUDCB$M_QS_NOT_READY,-	; Set state to not ready
+		CLUDCB$W_STATE(R3)
+	BSBW	REQUEST_CSP			; Request the CSP process
+	BRB	30$
+10$:	BLBS	IRP$L_IOST1(R5),20$		; Br if write success
+	BSBW	CHECK_ERROR			; Is error fatal?
+	BLBS	R0,30$				; Continue
+	MOVAB	W^QDWRERROR_MSG,R0		; Point to write error message
+	BBSS	#CLUDCB$V_QF_FIRST_ERR,-	; Is this first error
+		CLUDCB$W_FLAGS(R3),15$
+	BSBW	QUORUM_FILE_RETRY		; Process error (retry)
+	BRB	30$
+15$:	BSBW	QUORUM_FILE_ERROR		; Process error
+	BRB	30$
+20$:	ASSUME  CLUDCB$M_QF_WRL_ERR LE 255
+	BICB	#CLUDCB$M_QF_WRL_ERR,-		; Not write locked
+		CLUDCB$W_FLAGS(R3)
+	BBS	#CLUDCB$V_QS_VOTE,-		; Br if state = VOTE
+		CLUDCB$W_STATE(R3),30$
+	CMPB	#CYCLE_COUNT,-			; Have we cycled enough?
+		CLUDCB$B_COUNTER(R3)
+	BNEQU	30$				; Br if not
+	BBS	#CLUB$V_QF_FAILED_NODE,-	; Br if a node has been failed out
+		CLUB$L_FLAGS(R4),30$
+	MOVW	#CLUDCB$M_QS_VOTE,-		; Set state to VOTE
+		CLUDCB$W_STATE(R3)
+	BISL	#CLUB$M_QF_DYNVOTE,-		; Set dynamic vote bit in CLUB
+		CLUB$L_FLAGS(R4)
+	BSBW	CNX$DISK_CHANGE			; Let connection manager know
+30$:	SETIPL	#IPL$_IOPOST			; Restore IPL
+	RSB
+
+.SBTTL	VALIDATE_QUORUM_FILE - Validate quorum file
+;++
+; VALIDATE_QUORUM_FILE - Validate quorum file
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine validates the contents of the quorum file.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSBx VALIDATE_QUORUM_FILE
+;
+; INPUTS:
+;
+;	R6 = address of quorum file buffer
+;
+; OUTPUT:
+;
+;	R0 = status
+;	    0 - The block is invalid
+;	    1 - The block is valid
+;
+;	R1-R2 destroyed
+;--
+
+VALIDATE_QUORUM_FILE:
+
+	PUSHR	#^M<R3,R7>			; Save CLUDCB
+	CLRL	-(SP)				; Assume invalid buffer
+	BSBW	CALCULATE_CHECKSUM		; Calculate quorum file checksum
+	TSTL	R7				; Is checksum valid?
+ 	BNEQU	1$				; Br if not
+	CMPC3	#CLUQF$S_IDENT,-		; Validate ID area
+		CLUQF$T_IDENT(R6),-
+		CLUQF_IDENT_STRING
+	BNEQU	1$				; Br if invalid
+	CMPW	#CLUQF$K_VERSION,-		; Is version correct?
+		CLUQF$W_VERSION(R6)
+	BNEQU	1$				; Br if not
+	MOVL	#1,(SP)				; Indicate success
+1$:	POPR	#^M<R0,R3,R7>			; Return status and restore registers
+	RSB
+
+.SBTTL	CHECK_OWNER - Check quorum file ownership
+;++
+; CHECK_OWNER - Check quorum file ownership
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine checks the quorum file owner block to see if it
+;	is owned by a member of this nodes cluster.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSBx CHECK_OWNER
+;
+; INPUTS:
+;
+;	R4 = address of CLUB
+;	R6 = address of quorum file buffer
+;
+; OUTPUT:
+;
+;	R0 = Status
+;	    0 - Quorum file is owned by a foreign cluster
+;	    1 - Quorum file is owned by my cluster
+;
+;	R1-R2 Destroyed
+;--
+
+CHECK_OWNER:
+
+	PUSHL	R3				; Save CLUDCB
+	CLRL	-(SP)				; Assume foreign cluster
+	CMPL	CLUB$Q_FTIME+4(R4), -		; Same high order foundation times?
+		CLUQF$Q_FOU_TIME+4(R6)
+	BNEQU	1$				; Br if not
+	CMPL	CLUB$Q_FTIME(R4), -		; Same low order foundation times?
+		CLUQF$Q_FOU_TIME(R6)
+	BNEQU	1$				; Br if not
+	CMPC3	#CLUQF$S_FSYSID,-		; Same founding system ID's?
+		CLUB$B_FSYSID(R4),-
+		CLUQF$B_FSYSID(R6)
+	BNEQU	1$				; Br if not
+	MOVZWL	CLUQF$W_CSID_IDX(R6),R1		; Get CSID index
+	CMPW	R1,G^CLU$GW_MAXINDEX		; Is index in range?
+	BGEQU	1$				; Br if not
+	MOVL	G^CLU$GL_CLUSVEC,R0		; Get vector address
+	MOVL	(R0)[R1],R0			; Get entry (should be CSB address)
+	BGEQ	1$				; Br if no entry
+	CMPL	CSB$L_CSID(R0),-		; Do CSID's match?
+		CLUQF$L_CSID(R6)
+	BNEQ	1$				; Br if not
+	CMPL	CSB$Q_SWINCARN(R0),-		; Incarnation numbers match?
+		CLUQF$Q_SWINCARN(R6)
+	BNEQU	1$				; Br if not
+	MOVL	#1,(SP)				; Quorum file is owned by my cluster
+1$:	POPR	#^M<R0,R3>			; Restore CLUDCB
+	RSB
+
+.SBTTL	CALCULATE_CHECKSUM - Calculate the quorum file checksum
+;++
+; CALCULATE_CHECKSUM - Calculate the quorum file checksum
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine calulates the checksum of the quorum owner block
+;	pointed to by R6. It includes the field CLUQF$L_CHECKSUM in the
+;	checksum calculation.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSBx CALCULATE_CHECKSUM
+;
+; INPUTS:
+;
+;	R6 = address of quorum file buffer
+;
+; OUTPUT:
+;
+;	R7 = Quorum block checksum
+;--
+
+CALCULATE_CHECKSUM:
+
+	PUSHR	#^M<R2,R3>			; Save registers
+	MOVL	#CLUQF$K_CHECK_LENGTH/4,R2	; R2 = checksum longword count
+	MOVL	R6,R3				; Copy buffer address
+	CLRL	R7				; Form checksum in R7
+1$:	XORL2	(R3)+,R7			; Accumulate checksum
+	SOBGTR	R2,1$				; Br if more
+	POPR	#^M<R2,R3>			; Restore registers
+	RSB
+
+.SBTTL	Quorum file error routines
+;++
+; QUORUM_DISK_TIMEOUT - Quorum disk timeout
+; QUORUM_FILE_ERROR - Quorum file error
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine handles timeouts and other errors associated
+;	with the quorum disk.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSBx QUORUM_DISK_TIMEOUT
+;	JSB/BSBx QUORUM_FILE_ERROR
+;
+; INPUTS:
+;
+;	R0 = address of error message
+;	R3 = address of CLUDCB
+;	R4 = address of CLUB
+;
+; OUTPUT:
+;
+;	R0-R2 destroyed
+;--
+	.ENABLE	LSB
+
+QUORUM_DISK_TIMEOUT:
+QUORUM_FILE_RETRY:
+
+	MOVW	#CLUDCB$M_QS_READY,R1		; The new state is READY
+	BRB	1$
+
+QUORUM_FILE_ERROR:
+
+	PUSHL	R0				; Save error message address
+	BSBW	REQUEST_CSP			; Request the CSP process
+	MOVL	(SP)+,R0			; Restore error message address
+	MOVW	#CLUDCB$M_QS_NOT_READY,R1	; The new state is not ready
+1$:	PUSHR	#^M<R5>				; Save R5
+	CLRL	R5				; No CSB (input to CNX$CONFIG_CHANGE)
+	MOVZWL	CLUDCB$W_STATE(R3),-(SP)	; Save current state
+	MOVW	R1,CLUDCB$W_STATE(R3)		; Update state
+	BBSS	#CLUDCB$V_QF_ERROR,-		; Br if an error has already been reported
+		CLUDCB$W_FLAGS(R3),2$
+	BSBW	CNX$CONFIG_CHANGE		; Output error message
+2$:	BITL	#<CLUDCB$M_QS_NOT_READY! -	; Was state NOT_READY or READY?
+		  CLUDCB$M_QS_READY>,(SP)+
+	BNEQU	3$				; Br if yes
+	BICL	#<CLUB$M_QF_ACTIVE! -		; Clear the CLUB bits
+		  CLUB$M_QF_DYNVOTE! -
+		  CLUB$M_QF_FAILED_NODE>,-
+		CLUB$L_FLAGS(R4)
+	MOVAB	W^QDDISCON_MSG,R0		; Point to quorum disk disconnect message
+	BSBW	CNX$CONFIG_CHANGE		; Output message
+	BSBW	CNX$DISK_CHANGE			; Let connection manager know
+3$:	POPR	#^M<R5>				; Restore R5
+	RSB
+
+	.DISABLE LSB
+
+.SBTTL	REQUEST_CSP - Request the CSP process
+;++
+; REQUEST_CSP - Request the CSP process
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	If it has not already been requested, this routine requests the
+;	quorum thread of the CSP process.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSBx REQUEST_CSP
+;
+; INPUTS:
+;
+;	R3 = address of CLUDCB
+;
+; OUTPUT:
+;
+;	R0-R2 destroyed
+;--
+
+REQUEST_CSP:
+	PUSHR	#^M<R3,R4>			; Save CLUDCB and CLUB pointers
+	MOVL	#CSP$_LOCAL,R1			; Send to local CSP
+	CLRL	R2				; No CSD pointer
+	CLRL	R3				; Must be zero
+	MOVL	#CSD$K_QUORUM,R4		; R4 = client code
+	BSBW	EXE$CSP_COMMAND			; Request CSP
+	POPR	#^M<R3,R4>			; Restore CLUDCB and CLUB pointers
+	RSB
+
+
+.SBTTL	CHECK_ERROR - Check to see if error is fatal
+;++
+; CHECK_ERROR - Check to see if error is fatal
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine checks the error status to see if we should simply retry.
+;	We then cause a cluster state change and also cause mount verification 
+; 	to be invoked.  This is necessary because the "internal" IRP
+;	format used by quorum I/Os does not trigger mount verification.
+;
+;	In the case of accidental write-lock, quorum I/O is retried.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSBx CHECK_ERROR
+;
+; INPUTS:
+;
+;	R3 = address of CLUDCB
+;	R4 = address of CLUB
+;	R5 = address of UCB
+;
+; OUTPUT:
+;
+;	R0 = Status (low bit)
+;	    0 - no recovery - normal error processing
+;	    1 - non-fatal error
+;
+;--
+
+CHECK_ERROR:
+
+	PUSHR	#^M<R1,R2,R3,R4,R5>
+;
+	MOVZWL	IRP$L_IOST1(R5),R1	; Get the error status
+	;
+	; If the medium is offline, or the volume is
+	; invalid, the error can be recovered from.
+	;
+	CMPW	#SS$_MEDOFL,R1		; Is the media (disk volume) offline?
+	BEQL	40$			; Branch if true
+	CMPW	#SS$_VOLINV,R1		; Is the volume invalid?
+	BEQL	40$			; Branch if true
+	;
+	; If the volume has been writelocked, make sure that it was
+	; an accidental writelock.  If the software writelock bit is
+	; on, then the volume was mounted with the volume write protected.
+	; If the bit is not set, then the volume has been mounted for
+	; read/write access, and has since been (accidentally) write protected.
+	; The first time through this code and any time we are in the cluster or
+	; vote states, we put everything in mount verification and cause a 
+	; cluster state change and return to the active state.  All other times, 
+	; we remain in the same state and quietly return.  This saves many 
+	; trees.
+	;
+	CMPW	#SS$_WRITLCK,R1		; Is the device writelocked?
+	BEQL	10$
+	MOVL	R1,R0			; Get an error code in R0
+	BRB	30$			; Go back to treat it as real error
+10$:	BBS	#DEV$V_SWL,-		; Branch if software writelocked
+		UCB$L_DEVCHAR(R5),30$
+	BBCS	#CLUDCB$V_QF_WRL_ERR,-	; See if this is the first time
+		CLUDCB$W_FLAGS(R3),15$
+	CLRB	CLUDCB$B_COUNTER(R3)	; Restart counter in case in cluster state
+	BBC	#CLUDCB$V_QS_VOTE,-	; Is it a dangerous state
+		CLUDCB$W_STATE(R3),25$	; No - leave it there
+15$:	MOVAB	W^QDWRLERROR_MSG,R0	; Point to write error message
+20$:	BSBW	QUORUM_FILE_RETRY	; Go try again	
+25$:	MOVL	#1,R0			; Error recovery in progress
+30$:	POPR	#^M<R1,R2,R3,R4,R5>
+	RSB
+;
+40$:	JSB	G^EXE$CLUTRANIO		; Get everyting in mount verification
+	BRB	20$
+
+
+	.END

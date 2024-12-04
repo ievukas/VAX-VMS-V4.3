@@ -1,0 +1,1527 @@
+%TITLE 'Network Management Down Line Load Routines'
+MODULE MOMLOAD (
+		LANGUAGE (BLISS32),
+		ADDRESSING_MODE (NONEXTERNAL=LONG_RELATIVE),
+		ADDRESSING_MODE (EXTERNAL=LONG_RELATIVE),
+		IDENT = 'V04-000'
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:  DECnet-VAX V2.0 Maintenance Operations Module
+!
+! ABSTRACT:
+!	This module contains routines to handle load maintenance operations,
+!	both target requested (automatic) and operator requested.
+!
+! ENVIRONMENT:  VAX/VMS Operating System
+!
+! AUTHOR:  Kathy Perko
+!
+! CREATION DATE:  18-Feb-1983
+!
+! MODIFIED BY:
+!	V03-004	MKP0004		Kathy Perko		2-May-1984
+!		Fix the LOAD trigger to use one channel for non-NI loads.
+!
+!	V03-003	MKP0003		Kathy Perko		11-Feb-1984
+!		Fix TRIGGER so it is sent on NI using Remote Console protocol
+!		instead of load/dump protocol.
+!
+!	V03-002	MKP0002		Kathy Perko		31-May-1983
+!		Fix load file open so that, if the target requests diagnostics,
+!		the diagnostics are loaded.
+!
+!	V03-001	MKP0001		Kathy Perko		10-May-1983
+!		Fix check on load number requested by target so it wraps
+!		from FF to 00.  Only trigger target if loading the
+!		secondary loader first.
+!
+!--
+
+
+%SBTTL 'Declarations'
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+    mom$load		: NOVALUE,
+    mom_load_trigger,
+    mom_mblkload,
+    mom_load_sys_file,
+    mom_load_cc_file,
+    mom_secload,
+    mom_xmit_load_frame,
+    mom_openloadfile,
+    mom_readloadfile	: NOVALUE,
+    mom_check_label_blk	: NOVALUE,
+    mom$loadhandler;
+
+!
+! INCLUDE FILES:
+!
+
+LIBRARY 'LIB$:MOMLIB.L32';
+LIBRARY 'SHRLIB$:NMALIBRY.L32';
+LIBRARY 'SHRLIB$:EVCDEF.L32';
+LIBRARY 'SHRLIB$:NET.L32';
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+
+!
+! MOM$K_LOADBUFSIZ must be large enough to accomodate the entire secondary
+! load image, since the secondary loader is always sent in one transmit.
+! MOM$K_SEGBLKCNT is used to determine the number of 32 word blocks in
+! each MOP transmit for a multiblock load (tertiary load and operating
+! system load).
+!
+LITERAL
+    mom$k_loadbufsiz = 1536,
+    mom$k_segblkcnt = 4;	! Number of 32-word blocks in a multiblock
+				!	load segment
+
+!
+! OWN STORAGE:
+!
+
+OWN
+    mom$l_baseadr,			! Base address of load segment
+    mom$l_blkcnt,			! Number of blocks in buffer
+    mom$l_loadsize,			! Size of image in 32-word blocks
+    mom$l_transfer,			! Image transfer address
+    mom$w_pgmdetail : WORD,		! Program error detail
+    mom$w_first_load_frame;		! Indicates if first load frame for
+					! a multiblock load has been sent.
+!
+! The following buffers are used for downline loading.
+!
+! MOM$T_LOADBUFFER is used for transmitting memory image data.  There
+! are 6 bytes of overhead at the beginning of the buffer to hold MOP
+! message information.  There are 4 bytes of overhead at the end of
+! the buffer to contain the transfer address if it is needed and the
+! image data takes up the entire buffer.  MOM$T_READBUFFER is the
+! center of MOM$T_LOADBUFFER.  The image data is read from disk a block 
+! at a time, and transmitted piece by piece directly
+! from this buffer which is why the overhead bytes are required.
+! The MOM$Q_DATADSC is used to describe the extent of the image data
+! read in to MOM$T_READBUFFER.
+! 
+LITERAL
+    mom$k_maxsecsiz = 1498 - 6 - 4;
+OWN
+    mom$t_cc_wrap_buf: BBLOCK [mom$k_loadbufsiz],
+    mom$t_loadbuffer : BBLOCK [6 + mom$k_loadbufsiz + 4];
+
+BIND
+    mom$t_readbuffer = mom$t_loadbuffer + 6
+		     : BBLOCK [mom$k_loadbufsiz],
+    mom$q_loadbfdsc  = UPLIT (6 + mom$k_loadbufsiz + 4, mom$t_loadbuffer)
+		     : VECTOR [2],
+    mom$q_readbfdsc  = UPLIT (mom$k_loadbufsiz, mom$t_readbuffer)
+		     : VECTOR [2];
+OWN
+    mom$q_datadsc    : VECTOR [2]
+		       INITIAL (0, mom$t_readbuffer);
+
+!
+! EXTERNAL REFERENCES:
+!
+
+$mom_externals;				! Macro to define common externals
+
+EXTERNAL LITERAL
+    mom$_unsmopdev,
+    mom$_imgrecsiz,
+    mom$_invccfil,
+    mdt$gk_mopdevcnt;
+
+EXTERNAL
+    mom$ab_mopdevices : BBLOCKVECTOR [0,mdt$k_entrylen],
+    mom$gq_timeout    : VECTOR [0],
+    mom$npa_mopload;
+ 
+EXTERNAL ROUTINE
+    nma$nparse,
+    mom$bld_reply,
+    mom$bldmopboot,
+    mom$bldmopplt,
+    mom$chk_mop_error,
+    mom$debug_txt,
+    mom$error,
+    mom$init_cib,
+    mom$log_event,
+    mom$mopopen,
+    mom$mopsndrcv,
+    mom$mopsetsubstate,
+    mom$srvclose,
+    mom$srvopen,
+    mom$srvread,
+    mom$srvrewind,
+    mom$srvwrite;
+
+
+
+%SBTTL 'mom$load  Perform a downline system load'
+GLOBAL ROUTINE mom$load : NOVALUE =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine performs the downline system load function.
+!
+! INPUTS:
+!	CIB - Channel Information Block for MOP QIO channel to the circuit
+!		over which to do the down line load.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Signal errors.
+!
+!--
+ 
+BEGIN
+
+LOCAL
+    fldadr,
+    fldsize,
+    loadflag,
+    msgdsc : VECTOR [2],
+    msgsize,
+    snddsc : VECTOR [2],
+    status;
+!
+! Enable condition handler to perform cleanup after load function.
+!
+ENABLE mom$loadhandler;
+!
+! Set the circuit substate.
+!
+IF .mom$gl_service_flags [mom$v_autoservice] THEN
+    mom$mopsetsubstate (nma$c_linss_alo,
+			 .mom$ab_cib [cib$l_chan])  ! -AUTOLOADING
+ELSE
+!
+! If doing an operator requested load, set the circuit substate to
+! loading and trigger the target's load device.  If it doesn't respond
+! to the trigger, mom_load_trigger will not return here.
+!
+    BEGIN
+    !
+    ! Open the I/O channel over which to do the load.
+    !
+    mom$mopopen (mom$ab_cib [cib$l_chan]);
+    mom$mopsetsubstate (nma$c_linss_loa,
+			 .mom$ab_cib [cib$l_chan]); ! -LOADING
+    !
+    ! Set up Channel Information Block for the load channel.  For NI circuits,
+    ! this sets up the NI protocol (in this case load/dump) the circuit, and
+    ! associates it with a specific NI destination.
+    !
+    mom$init_CIB (mom$ab_cib,		! Channel Information Block addr
+		  nma$c_fnc_loa,	! Function = load
+		  svd$gk_pcno_pha,	! NI Phycial Address
+		  svd$gk_pcno_add,	! Node address
+		  svd$gk_pcno_hwa);	! NI hardware address
+    IF .mom$ab_service_data [svd$gk_pcno_sty, svd$l_param] EQL nma$c_soft_secl
+    THEN
+	mom_load_trigger ();
+    END;
+!
+! Perform the load.
+!
+loadflag = true;			! Set the load retry flag
+
+WHILE 1 DO
+    BEGIN
+    !
+    ! Open the file to be loaded.
+    !
+    status = mom_openloadfile ();
+    !
+    ! Load it.
+    !
+    IF .status THEN
+	BEGIN
+	!
+	! Log event for load requested.  Responding to a multicast load request
+	! from the target, however, don't log the event.  It's not reasonable
+	! for every node on the target's NI to log events.  Only the host that
+	! performs the load will log them.
+	!
+	mom$gw_evt_code = evc$c_nma_als;	! Event code (automatic service)
+	mom$gb_evt_pser = evc$c_nma_pser_loa;
+	mom$log_event (0,0);
+
+	!
+	! Output the trace message.
+	!
+	mom$debug_txt (dbg$c_srvtrc,
+	    (SELECTONEU .mom$ab_service_data [svd$gk_pcno_sty, svd$l_param] OF
+		SET
+		[nma$c_soft_secl]: $ASCID ('Loading secondary bootstrap.');
+		[nma$c_soft_terl]: $ASCID ('Loading tertiary bootstrap.');
+		[nma$c_soft_osys]: $ASCID ('Loading operating system.');
+		TES)
+	    );
+
+	SELECTONEU .mom$ab_service_data [svd$gk_pcno_sty, svd$l_param] OF
+	    SET
+
+	    [nma$c_soft_secl]:
+		status = mom_secload (loadflag, msgdsc);
+
+	    [OTHERWISE]:
+		status = mom_mblkload (loadflag, msgdsc);
+
+	    TES;
+	!
+	! Close the load file.
+	!
+	mom$srvclose ();
+
+	IF .status THEN
+	    BEGIN
+	    !
+	    ! Log the file that was loaded.
+	    !
+	    mom$debug_txt ( dbg$c_srvtrc,
+		(SELECTONEU .mom$ab_service_data [svd$gk_pcno_sty, svd$l_param] OF
+		     SET
+		     [nma$c_soft_osys]: $ASCID ('Operating system loaded.');
+		     [nma$c_soft_terl]: $ASCID ('Tertiary bootstrap loaded.');
+		     [nma$c_soft_secl]: $ASCID ('Secondary bootstrap loaded.');
+		     TES)
+		);
+	    !
+	    ! The load is complete if the operating system has been loaded.
+	    !
+	    IF .mom$ab_service_data [svd$gk_pcno_sty, svd$l_param]
+						EQLU nma$c_soft_osys THEN
+		BEGIN
+		mom$ab_msgblock [msb$l_flags] = 0;
+		mom$ab_msgblock [msb$b_code]  = nma$c_sts_suc;
+		EXITLOOP;
+		END;
+	    !
+	    ! Log "load successful" event for the secondary or tertiary loader.
+	    !
+	    mom$gb_evt_pser = evc$c_nma_pser_loa;
+	    mom$log_event (4,UPLIT (BYTE (nma$c_sts_suc, %X'ff', %X'ff', 0)));
+	    !
+	    ! Parse the received MOP message to get information about the
+	    ! next load attempt.
+	    !
+	    mom$ab_nparse_blk [npa$l_msgcnt] = .msgdsc [0];
+	    mom$ab_nparse_blk [npa$l_msgptr] = .msgdsc [1];
+
+	    status = nma$nparse (mom$ab_nparse_blk, mom$npa_mopload);
+
+	    END;
+	END;
+    !
+    ! If the load failed on the first message then there are two cases:
+    !	The load was an NI multicast load request, and some other host responded
+    !	    to the target first.  So, give up now.
+    !	Otherwise, trigger the target's bootstrap and try the load again.
+    !
+    IF NOT .status THEN
+	BEGIN
+	IF .mom$gl_service_flags [mom$v_ni_multicast] THEN
+	    EXITLOOP;
+	IF .loadflag THEN
+	    BEGIN
+	    loadflag = false;	! No more retries
+	    mom_load_trigger ();
+	    END
+	ELSE
+	    EXITLOOP;
+
+	END
+    ELSE
+	loadflag = FALSE;
+
+    END;
+!
+! Return status.
+!
+mom$bld_reply (mom$ab_msgblock, msgsize);
+$signal_msg (mom$ab_nice_xmit_buf, .msgsize);
+
+END;				! End of mom$load
+
+
+%SBTTL 'mom_load_trigger   Trigger target node'
+ROUTINE mom_load_trigger =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine sends a boot message to the target system and
+!	parses the MOP message sent in response to the boot message.
+!	Two channels to the NI are used: one to send the boot message
+!	using the remote console protocol, and one to receive the response
+!	which will be sent using the load/dump protocol.
+!
+! FORMAL PARAMETERS:
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Signal errors.
+!
+!--
+ 
+BEGIN
+
+LOCAL
+    save_service_timer,
+    xmit_CIB :	REF BBLOCK,
+    rcv_CIB :	REF BBLOCK,
+    snddsc :	VECTOR [2],
+    msgdsc : 	VECTOR [2],
+    msgsize,
+    status;
+
+rcv_CIB = mom$ab_cib;
+xmit_CIB = mom$ab_cib;
+!
+! Get a channel to the NI on which to send the boot message to the target.
+! This channel is necessary because the boot message must be sent using the
+! remote console NI protocol.  The response "load me" message from the target
+! will be sent to the load/dump NI protocol.
+!
+IF .mom$gl_service_flags [mom$v_ni_circ] THEN
+    BEGIN
+    xmit_CIB = mom$ab_trigger_cib;
+    mom$mopopen (xmit_CIB [cib$l_chan]);
+    mom$init_CIB (.xmit_CIB,			! Channel Information Block addr
+	          nma$c_fnc_tri,		! Function = trigger
+	          svd$gk_pcno_pha,		! NI physical address of target
+	          svd$gk_pcno_add,		! Node address of target
+	          svd$gk_pcno_hwa);		! NI hardware address of target
+    END;
+!
+! Build the trigger (old 'enter MOP mode', new 'boot') message.
+!
+mom$bldmopboot (snddsc);
+mom$debug_txt (dbg$c_srvtrc,
+	       $ASCID ('Triggering remote bootstrap'));
+!
+! Use an extra long timeout period because the PLUTO self test (which it
+! goes through for every boot) takes a while.
+!
+xmit_CIB [cib$l_retry_cnt] = 2;
+save_service_timer = .mom$gq_timeout [0];
+mom$gq_timeout [0] = .mom$gq_timeout [0] * 10;
+msgdsc [1] = .mom$gq_mop_rcv_buf_dsc [1];
+!
+! Send the boot message and listen for the target's response.  It should be
+! a Program Load Request.
+!
+status = mom$mopsndrcv (.xmit_CIB, snddsc,
+			.rcv_CIB, mom$gq_mop_rcv_buf_dsc,
+			msgdsc [0],
+			0);		! Don't skip program load requests
+mom$chk_mop_error (.status);
+mom$gq_timeout [0] = .save_service_timer;
+
+!
+! Parse the returned MOP message to make sure it's a valid Program Load
+! Request.
+!
+mom$ab_nparse_blk [npa$l_msgcnt] = .msgdsc [0];
+mom$ab_nparse_blk [npa$l_msgptr] = .msgdsc [1];
+status = nma$nparse (mom$ab_nparse_blk, mom$npa_mopload);
+IF NOT .status THEN
+    BEGIN
+    mom$bld_reply (mom$ab_msgblock, msgsize);
+    $signal_msg (mom$ab_nice_xmit_buf, .msgsize);
+    END;
+!
+! Deassign the MOP channel used to send the boot message.
+!
+IF .mom$gl_service_flags [mom$v_ni_circ] THEN
+    $DASSGN (CHAN = .xmit_CIB [cib$l_chan]);
+RETURN .status;
+END;				! End of mom_load_trigger
+
+%SBTTL 'mom_mblkload      Perform general multiblock load'
+ROUTINE mom_mblkload (loadflag, msgdsc) =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine performs a general multiblock system load.  It is
+!	used to down-line load the tertiary loader and the operating
+!	system images.
+!
+! FORMAL PARAMETERS:
+!
+!	LOADFLAG	Address of load retry flag (TRUE=>if load failed
+!			it failed on the first message exchange).
+!	MSGDSC		Address of descriptor for received MOP message.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Signal errors.
+!
+!--
+ 
+BEGIN
+
+MAP
+    msgdsc : REF VECTOR;
+
+OWN
+    PLT_response;
+
+LOCAL
+    status,
+    snddsc: VECTOR [2],
+    loadnum,
+    skip_msg_dsc_addr;
+
+BIND
+    PLT_response_dsc = UPLIT (2, PLT_response);
+
+msgdsc [1] = mom$ab_mop_rcv_buf;
+
+!
+! Send the load file to the target, a frame at a time, getting a response
+! from the target for each frame.  If loading the console carrier code, the
+! file format is different.
+!
+mom$w_first_load_frame = 1;
+IF .mom$gl_service_flags [mom$v_console_carrier_load] THEN
+    status = mom_load_cc_file (.loadflag, .msgdsc, loadnum)
+ELSE
+    status = mom_load_sys_file (.loadflag, .msgdsc, loadnum);
+IF NOT .status THEN
+    RETURN .status;
+!
+! The load is successfully finished.  Build the Parameter Load with Transfer
+! address (PLT) message.  This message tells the target what address to start
+! executing the image just loaded.
+!
+mom$bldmopplt (snddsc, .loadnum, .mom$l_transfer);
+!
+! The newer NI loaders return a Request Memory Load message (with the load
+! number = the last load frame + 2) as an acknowledgment to the Parameter
+! Load with Transfer (PLT) message.  In the case of the tertiary, set up to
+! skip over this message and keep looking for the request for the operating
+! system.  In the case of the operating system, receipt of the RML indicates
+! that the load is complete.
+!
+IF .mom$ab_service_data [svd$gk_pcno_sty, svd$l_param] EQL
+						nma$c_soft_terl THEN
+    BEGIN
+    PLT_response <0,8> = mop$_fct_rml;
+    PLT_response + 1 <0,8> = .loadnum + 1;
+    skip_msg_dsc_addr = PLT_response_dsc;
+    END
+ELSE
+    skip_msg_dsc_addr = 0;
+DECR retry FROM 4 TO 0 DO
+    BEGIN    
+    status = mom$mopsndrcv (mom$ab_cib, snddsc,
+			    mom$ab_cib, mom$gq_mop_rcv_buf_dsc,
+			    msgdsc [0],
+			    .skip_msg_dsc_addr);
+    mom$chk_mop_error (.status);
+    !
+    ! A response was successfully received.  If it's another request for the
+    ! PLT message (it's really a request for the last load frame + 1),
+    ! retransmit the PLT.
+    !
+    IF (.mom$gq_mop_rcv_buf_dsc [0] LSS 2) OR
+       (.mom$ab_mop_rcv_buf <0,8> NEQ mop$_fct_rml) OR
+       (.mom$ab_mop_rcv_buf+1 <0,8> NEQ .loadnum) THEN
+	EXITLOOP;
+    status = failure;
+    END;
+RETURN .status
+
+END;				! End of mom_mblkload
+
+
+%SBTTL 'mom_load_sys_file      Perform load of system code'
+ROUTINE mom_load_sys_file (loadflag, recv_msg_dsc, final_loadnum) =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine performs a multiblock system load of system
+!	code.  The file format system images is different than that
+!	for console carrier (see next routine).  The image is loaded
+!	into the target's memory contiguously, so there is only an
+!	address (supplied in the file header) specifying which address
+!	to begin loading the image.
+!
+! FORMAL PARAMETERS:
+!	LOADFLAG	Address of load retry flag (TRUE=>if load failed
+!			it failed on the first message exchange).
+!	RECV_MSG_DSC	Address of descriptor for received MOP message.
+!	FINAL_LOADNUM	Load number of last load frame + 1.  Returned to
+!			caller to be used in the Parameter Load with
+!			Transfer Address MOP message.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Signal errors.
+!
+!--
+ 
+BEGIN
+
+MAP
+    recv_msg_dsc: REF BBLOCK;
+
+LOCAL
+    bufptr,
+    len,
+    loadnum : BYTE,
+    loadblkcnt,
+    loadbytcnt,
+    blocks_left,		! 64 byte blocks of data left in read buffer.
+    ptr,
+    snddsc  : VECTOR [2],
+    status;
+
+!
+! LOADNUM is defined as a byte to correspond to the size of the field in the
+! MOP message.  This field will overflow when it gets to load number 256 so
+! it will go back to zero.  Overflow must be guaranteed in order for a load
+! to succeed so great care should be taken to avoid BLISS optimizations that
+! could change this situation.  Be especially careful if any compare or
+! increment operations are modified.
+!
+loadnum = 0;
+!
+! Load every block in the image.
+!
+WHILE .mom$l_loadsize GTR 0 DO
+    BEGIN
+
+    status = success;			! Reset the status code
+    !
+    ! Read a block (record) from the file.
+    !
+    mom_readloadfile (mom$q_readbfdsc);
+    !
+    ! Load the image block (in one or more 64-byte pieces).
+    !
+    bufptr = mom$t_loadbuffer;
+
+    INCR i FROM 0 TO .mom$l_blkcnt - 1 BY mom$k_segblkcnt DO
+	BEGIN
+	!
+	! If the data left in the read buffer is less than the MOP transmit
+	! size (MOM$K_SEGBLKCNT * 64), send the data that's left.
+	!
+	blocks_left = .mom$l_blkcnt - .i;
+	IF .blocks_left LSS mom$k_segblkcnt THEN
+	    loadblkcnt = .blocks_left
+	ELSE
+	    loadblkcnt = mom$k_segblkcnt;
+
+	!
+	! Calculate the actual byte count of the data to be loaded.
+	!
+	loadbytcnt = .loadblkcnt * 64;
+	!
+	! Build the MOP memory load message in the buffer around the
+	! image data.
+	!
+	ptr = .bufptr;
+
+	CH$WCHAR_A (mop$_fct_mld, ptr);		! Function code
+	CH$WCHAR_A (.loadnum, ptr);		! Load number
+	loadnum = .loadnum + 1;			! Increment load number
+	ptr = CH$MOVE (4, mom$l_baseadr, .ptr); ! Base address
+	ptr = .ptr + .loadbytcnt;		! Skip image data
+
+	snddsc [1] = .bufptr;
+	snddsc [0]  = .ptr - .bufptr;
+	!
+	! Transmit the load data to the target node and receive a response.
+	!
+	status = mom_xmit_load_frame (.loadflag, snddsc, .recv_msg_dsc);
+	IF NOT .status THEN
+	    EXITLOOP;
+	!
+	! Decrement the number of blocks remaining to be loaded.
+	!
+	mom$l_loadsize = .mom$l_loadsize - .loadblkcnt;
+	mom$l_baseadr = .mom$l_baseadr + .loadbytcnt;
+	bufptr = .bufptr + .loadbytcnt;
+
+	END;
+
+    IF NOT .status THEN EXITLOOP;
+
+    END;
+.final_loadnum = .loadnum;
+RETURN .status;
+END;		! of mom_load_sys_file
+
+%SBTTL 'mom_load_cc_file      Perform load of console carrier code'
+ROUTINE mom_load_cc_file (loadflag, recv_msg_dsc, final_loadnum) =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine performs a multiblock system load of the console
+!	carrier code.  The file format for console carrier is different
+!	from other load images because it is not necessarily into the
+!	target in contiguous memory locations.  Therefore the load
+!	"records" contain a target memory address and record length.
+! 
+!      Absolute Loader Format for storing UNA Microcode on a Host
+!                      20-Aug-82     Al MacInnes
+! 
+!        The following describes the planned file format for  the  Con-
+!	sole  Carrier  Server loadable microcode.  Please return any comments,
+!	problems, and/or suggestions.  
+! 
+!	        The Absolute Loader format is planned to be used  for  storing
+!	UNA  loadable microcode, such as the Console Carrier Server, on a host
+!	system.  A file stored in this format would be read by a down-line lo-
+!	ader  task,  executing on some host, and loaded over the NI to the WCS
+!	and/or Link Memory of the destination UNA.  A file in Absolute  Loader
+!	format is comprised of some number of variable-length "records".  Each
+!	record specifies a 16-bit load address, followed  by  some  number  of
+!	bytes  which  are  to  be loaded into memory starting at that address.
+!	This should allow easy construction of  MOP  "Memory  Load"  messages.
+!	Also,  the  records are physically contiguous in the file, even if the
+!	"image" that is represented is not physically  contiguous.   In  other
+!	words,  there  are  no unused gaps in the file, even though, as in the
+!	case of a UNA loadable microcode image the code will reside in several
+!	discontiguous segments.
+! 
+!	        The Absolute Loader record format is as follows:
+! 
+!	Byte    Contents
+!	----    --------
+! 
+!	0,1     always a binary word of "1"
+!	2,3     number of bytes in record (can be odd), from byte 0
+!	        to last data byte, but excluding checksum byte
+!	4,5     PDP-11 load address
+!	6-last byte     image data 
+!	last byte+1     checksum (XOR ?), can be ignored for our
+!	                purposes
+! 
+!	Note:  a record with a byte count of "6" indicates the last record  of
+!	the  file.   If the load address of this last record is even, this re-
+!	presents a program transfer address.  
+!
+! FORMAL PARAMETERS:
+!	LOADFLAG	Address of load retry flag (TRUE=>if load failed
+!			it failed on the first message exchange).
+!	RECV_MSG_DSC	Address of descriptor for received MOP message.
+!	FINAL_LOADNUM	Load number of last load frame + 1.  Returned to
+!			caller to be used in the Parameter Load with
+!			Transfer Address MOP message.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Signal errors.
+!
+!--
+ 
+BEGIN
+
+MAP
+    recv_msg_dsc: REF BBLOCK;
+
+MACRO
+    !
+    ! Console carrier load file definitons.  There are variable length "records"
+    ! in the file that can be loaded to noncontiguous memory areas in the target.
+    !
+    cc_head =	 0,0,16,0%,	! load frame header word (always = 0001)
+    cc_rec_len =  2,0,16,0%,	! load frame data length
+    cc_load_add = 4,0,16,0%,	! load frame target address
+
+    mld_code =	 0,0,8,0%,	! MOP memory load message function code
+    mld_load_num =1,0,8,0%,	! MOP memory load message load number
+    mld_add	=2,0,32,0%;	! MOP memory load message target address
+
+LOCAL
+    buf_ptr: REF BBLOCK,
+    load_rec_len,
+    load_num: BYTE,	! Number of this load frame.  Used for checking load
+			! frame sequence between MOM and the target.
+    mld_msg_dsc: VECTOR [2],
+    record_end,
+    partial_record_len,	! length of a partial load frame at the end of a
+			! record from the load file.
+    msgsize,
+    status;
+
+!
+! Read the first record from the console carrier load file.
+!
+mom_readloadfile (mom$q_readbfdsc);
+load_num = 0;
+buf_ptr = mom$t_readbuffer;
+!
+! Load the console carrier image file to the target.
+!
+WHILE true DO
+    BEGIN
+    !
+    ! Each record in the console carrier must start with a word of 1.
+    ! Validate this to make sure the right file is being loaded.
+    !
+    IF .buf_ptr [cc_head] NEQ 1 THEN
+	BEGIN
+	mom$ab_msgblock [msb$l_flags]  = msb$m_msg_fld;
+	mom$ab_msgblock [msb$b_code]   = nma$c_sts_fco;
+	mom$ab_msgblock [msb$w_detail] = .mom$w_pgmdetail;
+	mom$ab_msgblock [msb$l_text]   = mom$_invccfil;
+	mom$bld_reply (mom$ab_msgblock, msgsize);
+	$signal_msg (mom$ab_nice_xmit_buf, .msgsize);
+	END;
+    !
+    ! The last record of the console carrier load file has a byte count of 6.
+    ! Load console carrier records until it is found.
+    !
+    IF .buf_ptr [cc_rec_len] EQL 6 THEN
+	EXITLOOP;
+    !
+    ! Save the load record length so it can be overwritten with the MOP
+    ! Memory Load message header information and the MOP message transmitted
+    ! directly from the read buffer.
+    !
+    load_rec_len = .buf_ptr [cc_rec_len];
+    record_end = .buf_ptr + .load_rec_len + 1;
+    If .record_end GTR mom$t_readbuffer + mom$k_loadbufsiz THEN
+	!
+	! The load frame is partly in this record, and partly in the next one.
+	! Move the beginning of this load frame so, when the next file read
+	! is complete, the record is contiguous.
+	!
+	BEGIN
+	partial_record_len = mom$t_readbuffer + mom$k_loadbufsiz - .buf_ptr;
+	CH$MOVE (.partial_record_len,
+		.buf_ptr,
+		mom$t_readbuffer - .partial_record_len);
+	!
+	! Get the next buffer from the load file.
+	!
+	mom_readloadfile (mom$q_readbfdsc);
+	buf_ptr = mom$t_readbuffer - .partial_record_len;
+	END;
+    !
+    ! Build the MOP message in the read buffer and transmit it to the target
+    ! from the read buffer.  Overwrite the record byte count with the MOP
+    ! Memory Load function code and load number.
+    !
+    buf_ptr [mld_code] = mop$_fct_mld;
+    buf_ptr [mld_load_num] = .load_num;
+    buf_ptr [mld_add] = .buf_ptr [cc_load_add];
+    load_num = .load_num + 1;
+    mld_msg_dsc [0] = .load_rec_len;
+    mld_msg_dsc [1] = .buf_ptr;
+    !
+    ! If the console carrier load record won't fit in the load buffer
+    ! (this size is fixed when the load is initiated), signal an "image
+    ! record size" error
+    !
+    IF .mld_msg_dsc [0] GTR (mom$k_segblkcnt * 64) THEN
+	BEGIN
+	mom$ab_msgblock [msb$l_flags]  = msb$m_det_fld OR
+					 msb$m_msg_fld;
+	mom$ab_msgblock [msb$b_code]   = nma$c_sts_fio;
+	mom$ab_msgblock [msb$w_detail] = .mom$ab_service_data [svd$gk_pcno_sty,
+								svd$l_param];
+	mom$ab_msgblock [msb$l_text] = mom$_imgrecsiz;
+	mom$bld_reply (mom$ab_msgblock, msgsize);
+	$signal_msg (mom$ab_nice_xmit_buf, .msgsize);
+	END;
+    !
+    ! Send the MOP Memory Load message to the target and get a response.
+    !
+    status = mom_xmit_load_frame (.loadflag, mld_msg_dsc, .recv_msg_dsc);
+    IF NOT .status THEN
+	EXITLOOP;
+    !
+    ! Point to next "record" in the buffer, skipping the checksum byte at
+    ! the end which is not included in the record length field.
+    !
+    buf_ptr = .buf_ptr + .load_rec_len + 1;
+    END;
+!
+! If the load address of the last record is even, use it as the transfer
+! address.
+!
+IF NOT .buf_ptr [cc_load_add] THEN
+    mom$l_transfer = .buf_ptr [cc_load_add]
+ELSE
+    mom$l_transfer = 0;
+.final_loadnum = .load_num;
+RETURN .status;
+END;		! of mom_load_cc_file
+
+%SBTTL 'mom_xmit_load_frame     Transmit multiblock load frame to target'
+ROUTINE mom_xmit_load_frame  (loadflag, xmit_msg_dsc, recv_msg_dsc) =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine sends a single load frame to the target during
+!	a multiblock load sequence.
+!
+! FORMAL PARAMETERS:
+!
+!	LOADFLAG	Address of load retry flag (TRUE=>if load failed
+!			it failed on the first message exchange).
+!	XMIT_MSG_DSC	Address of descriptor of MOP messageto transmit.
+!	RCV_MSG_DSC	Address of descriptor for received MOP message.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Signal errors.
+!
+!--
+ 
+BEGIN
+
+MAP
+    xmit_msg_dsc: REF VECTOR,
+    recv_msg_dsc: REF VECTOR;
+
+LOCAL
+    skip_msg_dsc_addr,
+    next_loadnum : BYTE,
+    status;
+
+DECR retry FROM 4 TO 0 DO
+    BEGIN
+    !
+    ! For NI circuits, program load requests are retransmitted if no
+    ! response is received within a specified time.  If this the first
+    ! load frame, set up to skip them, in case there are a number of
+    ! these messages backed up on the circuit.
+    !
+    IF .mom$w_first_load_frame THEN
+	skip_msg_dsc_addr = mom$gq_mop_msg_dsc
+    ELSE
+	skip_msg_dsc_addr = 0;
+    status = mom$mopsndrcv (mom$ab_cib, .xmit_msg_dsc,
+			    mom$ab_cib, mom$gq_mop_rcv_buf_dsc,
+			    recv_msg_dsc [0],
+			    .skip_msg_dsc_addr);
+    IF NOT .status THEN
+	BEGIN
+	IF ..loadflag THEN
+	    BEGIN
+	    mom$ab_msgblock [msb$l_flags] = 0;
+	    mom$ab_msgblock [msb$b_code]  = nma$c_sts_lco;
+	    EXITLOOP;
+	    END
+	ELSE
+	    mom$chk_mop_error (.status);
+	END;
+    !
+    ! Verify the response message from the target node.  It must
+    ! be a MOP request memory load message.
+    !
+    IF (.recv_msg_dsc [0] lss 2)
+	OR (CH$RCHAR (mom$ab_mop_rcv_buf) NEQ mop$_fct_rml) THEN
+	BEGIN
+	mom$ab_msgblock [msb$l_flags] = 0;
+	mom$ab_msgblock [msb$b_code]  = nma$c_sts_lpr;
+	status = failure;
+	EXITLOOP;
+	END;
+    !
+    ! If response message from the target node is requesting the
+    ! the next load buffer, then don't retry.
+    !
+    next_loadnum = .(.xmit_msg_dsc [1] + 1)<0,8> +1;
+    IF .(mom$ab_mop_rcv_buf + 1)<0,8> EQL .next_loadnum THEN
+	BEGIN
+	.loadflag = false;
+	EXITLOOP;
+	END;
+    END;
+mom$w_first_load_frame = 0;
+RETURN .status;
+END;			! End of mom_xmit_load_frame
+
+%SBTTL 'mom_secload       Perform secondary bootstrap load'
+ROUTINE mom_secload (loadflag, msgdsc) =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine down line loads the secondary bootstrap loader to the
+!	target node.  It sends the entire load image in a single MOP
+!	message.  This is required by MOP to keep the primary boot as simple
+!	as possible.
+!
+! FORMAL PARAMETERS:
+!
+!	LOADFLAG	Address of load retry flag (TRUE=>if load failed
+!			it failed on the first message exchange).
+!	MSGDSC		Address of descriptor for received MOP message.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Signal errors.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+ 
+BEGIN
+
+MAP
+    msgdsc : REF VECTOR;
+
+LOCAL
+    load_byte_cnt,		! Byte count of secondary boot loader image.
+    ptr,
+    snddsc : VECTOR [2],
+    status,
+    skip_msg_dsc_addr;
+!
+! Check the load size.  The entire secondary loader image must fit in the
+! transmit buffer.  MOM$L_LOADSIZE is secondary bootstrap image size.  It
+! was obtained from the secondary boostrap file header, and is specified
+! in 32 word blocks.
+!
+load_byte_cnt = .mom$l_loadsize * 64;
+!
+! If the byte count is slightly greater than 1500 because the loader took
+! the last 32 word block and went over the limit, truncate the length of
+! the loader down to fit into a single NI message.
+!
+IF .load_byte_cnt GTRU mom$k_maxsecsiz
+    AND .load_byte_cnt LEQU mom$k_loadbufsiz
+THEN
+    load_byte_cnt = mom$k_maxsecsiz;
+!
+! Make sure the message fits into a single NI message
+!
+IF .load_byte_cnt GTRU mom$k_loadbufsiz THEN
+    mom$error (nma$c_sts_fco, .mom$w_pgmdetail);
+IF NOT .mom$gl_service_flags [mom$v_ni_circ] THEN
+    BEGIN
+    !
+    ! MOP specifies that the transfer address and image start address must be
+    ! 6.  For generality, add 6 to the values specified for these fields in
+    ! the secondary load file header.
+    !
+    mom$l_baseadr = .mom$l_baseadr + 6;
+    mom$l_transfer = .mom$l_transfer + 6;
+    END;
+!
+! Read a block from the load image file.
+!
+mom_readloadfile (mom$q_readbfdsc);
+!
+! Fill in the MOP message information.
+!
+ptr = mom$t_loadbuffer;
+
+ch$wchar_a (mop$_fct_mlt, ptr);	! Function code
+ch$wchar_a (0, ptr);		! Load number
+ptr = ch$move (4, mom$l_baseadr, .ptr); ! Load address (base)
+ptr = .ptr + .load_byte_cnt;	! Skip image data
+ptr = ch$move (4, mom$l_transfer, .ptr); ! Transfer address
+
+snddsc [0] = .ptr - mom$t_loadbuffer;
+snddsc [1] = mom$t_loadbuffer;
+msgdsc [1] = mom$ab_mop_rcv_buf;
+!
+! Send the message and receive the response.  If the request for the secondary
+! was an NI multicast, MOM is essentially volunteering assistance.  Send the
+! secondary only once (as you would with an assistance volunteer), and if no
+! response is received, quit.  Some other host responded to the multicast
+! first.
+!
+IF .mom$gl_service_flags [mom$v_ni_volunteering] THEN
+    mom$ab_cib [cib$l_retry_cnt] = 1;
+!
+! If it's an NI circuit, the target could have multicast the Program Load
+! Request more than once.  If so, skip over these messages until one is
+! received which is a response to the secondary loader.
+!
+IF .mom$gl_service_flags [mom$v_ni_circ] THEN
+    skip_msg_dsc_addr = mom$gq_mop_msg_dsc
+ELSE
+    skip_msg_dsc_addr = 0;
+status = mom$mopsndrcv (mom$ab_cib, snddsc,
+			mom$ab_cib, mom$gq_mop_rcv_buf_dsc,
+			msgdsc [0],
+			.skip_msg_dsc_addr);
+!
+! If the receive failed and no messages had been previously exchanged
+! then return the error status.  If the receive failed and some messages
+! had been exchanged then signal a communications error to terminate
+! the operation.
+!
+IF (NOT .status) AND (NOT ..loadflag) THEN
+    mom$chk_mop_error (.status);
+!
+! Restore retry count in case MOM was volunteering assistance and a response
+! addressed directly to this node was received.  This means this node was
+! chosen by the target to do the load.
+!
+mom$ab_cib [cib$l_retry_cnt] = 5;
+!
+! If the target responded with a message addressed directly to this node,
+! exit the volunteering state.  This node was chosen to perform the load.
+! All further messages between MOM and the target will be non multicast.
+!
+IF .status THEN
+    BEGIN
+    IF NOT .mom$gl_service_flags [mom$v_ni_multicast] THEN
+	mom$gl_service_flags [mom$v_ni_volunteering] = false
+    ELSE
+	!
+	! MOM got a multicast request from the target that wasn't a request
+	! for the secondary.  Quit.  Presumably the target will retransmit
+	! the request and MOM will get started up again in a context that it
+	! can process the request.
+	!
+	status = failure;
+    END;
+RETURN .status
+
+END;				! End of mom_secload
+
+
+%SBTTL 'mom_openloadfile       Open the image file for loading'
+ROUTINE mom_openloadfile =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Open the image file to be loaded and check the validity of the image.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+!
+! IMPLICIT OUTPUTS:
+!
+!	MOM$W_PGMDETAIL	Detail code to use for file errors.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	If no file name or service device is specified then FALSE is
+!	returned indicating that not enough information was specified.
+!	A FALSE return value indicates to the calling routine that
+!	the target system must supply the missing information.  Any
+!	errors encountered when trying to open the file will be signalled.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+ 
+BEGIN
+
+LOCAL
+    adr,
+    dev,
+    fildsc    : VECTOR [2],
+    len,
+    msgsize,
+    file_svd_index,
+    ptr,
+    status;
+
+!
+! Get the file type.
+!
+SELECTONEU .mom$ab_service_data [svd$gk_pcno_sty, svd$l_param] OF
+    SET
+    [nma$c_soft_terl]:		! Tertiary loader
+	BEGIN
+	file_svd_index = svd$gk_pcno_tlo;
+	mom$w_pgmdetail = nma$c_fopdtl_tlf;
+	END;
+
+    [nma$c_soft_osys]:		! Operating system or diagnostics
+	BEGIN
+	IF .mom$ab_service_data [svd$gk_pcno_$fty, svd$l_param] EQL
+					mop$c_sid_osy OR
+	   NOT .mom$gl_service_flags [mom$v_autoservice] THEN
+	    !
+	    ! Ignore requests for the diagnostics if the operator
+	    ! requested the load.  This is in case the test button
+	    ! has been left in on the target.
+	    !
+	    file_svd_index = svd$gk_pcno_loa
+	ELSE
+	    file_svd_index = svd$gk_pcno_dfl;
+	mom$w_pgmdetail = nma$c_fopdtl_lfl;
+	END;
+
+    [OTHERWISE]:			! Secondary loader
+	BEGIN
+	file_svd_index = svd$gk_pcno_slo;
+	mom$w_pgmdetail = nma$c_fopdtl_slf;
+	END;
+
+    TES;
+!
+! Get the file name of the file to be loaded.
+!
+IF .mom$ab_service_data [.file_svd_index, svd$b_string_len] EQL 0 THEN
+    BEGIN
+    !
+    ! File was not found in the data base so build it from the file type
+    ! and the service circuit.
+    !
+    ptr = mom$ab_service_data [.file_svd_index, svd$t_string];
+
+    SELECTONEU .mom$ab_service_data [svd$gk_pcno_sty, svd$l_param] OF
+	SET
+	[nma$c_soft_secl]:
+	    ptr = CH$MOVE (3, UPLIT BYTE ('SEC'), .ptr);
+
+	[nma$c_soft_terl]:
+	    ptr = CH$MOVE (3, UPLIT BYTE ('TER'), .ptr);
+
+	[OTHERWISE]:
+	    BEGIN
+	    mom$error (nma$c_sts_pms, nma$c_pcno_loa);
+	    RETURN false;
+	    END;
+
+	TES;
+    !
+    ! Get the service device type code from the data base.
+    !
+    dev = .mom$ab_service_data [svd$gk_pcno_sdv, svd$l_param];
+    !
+    ! Get the service device name string from the table.
+    !
+    status = false;
+    INCR i FROM 0 TO mdt$gk_mopdevcnt - 1 DO
+	BEGIN
+	!
+	! If a match is found in the table then move the device name string into
+	! the file name buffer.
+	!
+	IF .mom$ab_mopdevices [.i, mdt$b_devtype] EQL .dev THEN
+	    BEGIN
+	    adr = .mom$ab_mopdevices [.i, mdt$a_devstring];
+	    len = .(.adr)<0,8>;
+	    adr = .adr + 1;
+	    ptr = CH$MOVE (.len, .adr, .ptr);
+	    status = true;
+	    EXITLOOP;
+	    END;
+	END;
+    !
+    ! If a service device was found in the table then set up the file name
+    ! descriptor.
+    !
+    IF .status THEN
+	mom$ab_service_data [.file_svd_index, svd$b_string_len] =
+		.ptr - mom$ab_service_data [.file_svd_index, svd$t_string]
+    ELSE
+	BEGIN
+	mom$ab_msgblock [msb$l_flags] = msb$m_msg_fld;
+	mom$ab_msgblock [msb$l_text]  = mom$_unsmopdev;
+	mom$bld_reply (mom$ab_msgblock, msgsize);
+	$signal_msg (mom$ab_nice_xmit_buf, .msgsize);
+	END;
+    END;
+fildsc [0] = .mom$ab_service_data [.file_svd_index, svd$b_string_len];
+fildsc [1] = mom$ab_service_data [.file_svd_index, svd$t_string];
+!
+! Open the file to be loaded.
+!
+status = mom$srvopen (fildsc, nma$c_opn_ac_ro);
+!
+! If the file could not be opened then build and signal an error message.
+!
+IF NOT .status THEN
+    BEGIN
+    mom$ab_msgblock [msb$w_detail] = .mom$w_pgmdetail;
+    mom$bld_reply (mom$ab_msgblock, msgsize);
+    $signal_msg (mom$ab_nice_xmit_buf, .msgsize);
+    RETURN .status;
+    END;
+!
+! Read in the first label block of the load file.  Get the load file attributes
+! from the block, and then skip over the rest of the label blocks to the
+! beginning of the load file image data.  Note the the console carrier system
+! load file skips this because it does not need, and therefore, does not have
+! a label block.
+!
+IF NOT .mom$gl_service_flags [mom$v_console_carrier_load] OR
+   .mom$ab_service_data [svd$gk_pcno_sty, svd$l_param] EQL nma$c_soft_secl THEN
+    mom_check_label_blk ();
+RETURN true
+
+END;				! End of mom_openloadfile
+
+
+%SBTTL 'mom_readloadfile       Read a block from the image file'
+ROUTINE mom_readloadfile (read_buf_dsc) : NOVALUE =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine reads a block from the load file that is currently open.
+!
+! FORMAL PARAMETERS:
+!
+!	READ_BUF_DSC	Address of read buffer descriptor.
+!
+! IMPLICIT INPUTS:
+!
+!	The load file to be read is open.
+!
+!	MOM$L_LOADSIZE	.
+!	MOM$W_PGMDETAIL	.
+!
+! IMPLICIT OUTPUTS:
+!
+!	MOM$Q_DATADSC 	Describes the extent of the data that was read.
+!	MOM$L_BLKCNT	Number of 64-byte blocks in the buffer.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Signal errors.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+ 
+BEGIN
+
+LOCAL
+    msgsize,
+    status;
+
+!
+! Read as many records from the load file as will fit into the read buffer
+! and return the byte count of the data read in MOM$Q_DATADSC.
+!
+mom$srvread (.read_buf_dsc,
+	    mom$q_datadsc [0],
+	    .mom$w_pgmdetail);
+!
+! Return the number of 64 byte blocks.  If the number of blocks in the
+! buffer is less than the number of blocks remaining to be loaded then
+! use the number to be loaded.  This will account for extra blocks that
+! were the result of zero-filling.
+!
+mom$l_blkcnt = .mom$q_datadsc [0] / 64;
+!
+! If the number of blocks is zero then the byte count of the record that was
+! read was not valid.  The record size must be a multiple of 64.
+!
+IF .mom$l_blkcnt EQLU 0 THEN
+    BEGIN
+
+    mom$ab_msgblock [msb$l_flags]  = msb$m_msg_fld;
+    mom$ab_msgblock [msb$b_code]   = nma$c_sts_fco;
+    mom$ab_msgblock [msb$w_detail] = .mom$w_pgmdetail;
+    mom$ab_msgblock [msb$l_text]   = mom$_imgrecsiz;
+    mom$bld_reply (mom$ab_msgblock, msgsize);
+    $signal_msg (mom$ab_nice_xmit_buf, .msgsize);
+
+    END;
+
+IF .mom$l_blkcnt GTRU .mom$l_loadsize THEN
+    mom$l_blkcnt = .mom$l_loadsize;
+
+END;				! End of mom_readloadfile
+
+
+%SBTTL 'mom_check_label_blk       Perform file label block check'
+ROUTINE mom_check_label_blk : NOVALUE =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	The load files are assumed to be built by the RSX11M task image
+!	builder.  Read in the file label blocks and extract the information
+!	required to down line load the image in the file.
+!
+! IMPLICIT INPUTS:
+!
+!	MOM$W_PGMDETAIL	Detail code to use for file contents errors.
+!
+! IMPLICIT OUTPUTS:
+!
+!	MOM$L_LOADSIZE = the size of the image to be down line loaded.
+!			 The size is specified in number of 32 word blocks.
+!	MOM$L_BASEADR =  The address at which to start loading the image
+!			 into the target node's memory.
+!	MOM$L_TRANSFER = The address at which to start executing the image
+!			 once it has been down line loaded to the target node.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Signal errors.
+!
+!--
+ 
+BEGIN
+
+!
+! Define RSX label block symbols.
+!
+EXTERNAL LITERAL
+    l$bflg,		! Word
+    l$bhgv,		! Word
+    l$bmxv,		! Word
+    l$bldz,		! Word
+    l$bmxz,		! Word
+    l$bwnd,		! Byte
+    l$blib,		! Word
+    l$bsgl,		! Word
+    l$boff,		! Word
+    l$bblk,		! Word
+    l$bsa,		! Word
+    l$bxfr,		! Word
+    ts$nhd,
+    ts$chk,
+    ts$res;
+
+LOCAL
+    label_buf_dsc : VECTOR [2],	! Descriptor for label read buffer
+    lbl : REF BBLOCK,		! Pointer to label buffer
+    isd : REF BBLOCK,		! Pointer to VMS image section desc
+    iha : REF BBLOCK;		! Pointer to VMS image activation desc
+
+label_buf_dsc [0] = 512;
+label_buf_dsc [1] = mom$t_readbuffer;
+!
+! Read the file label block.
+!
+mom_readloadfile (label_buf_dsc);
+
+lbl = mom$t_readbuffer;
+!
+! Determine whether image is an RSX-11 or VMS image.  This is done by
+! testing the last word in the image header.
+!
+IF .lbl[510,0,16,1] GEQ 0 THEN
+    BEGIN
+    !
+    ! Save the RSX task image information from the label block.
+    !
+    mom$l_blkcnt = .lbl [l$bblk,0,16,0];
+    mom$l_loadsize = .lbl [l$bldz,0,16,0]; ! Image size (32-word blocks)
+    mom$l_baseadr  = .lbl [l$bsa ,0,16,0]; ! Starting memory address
+    mom$l_transfer = .lbl [l$bxfr,0,16,0]; ! Image transfer address
+
+    END
+ELSE
+    BEGIN
+    !
+    ! Save the VMS image information from the image header block.
+    !
+    mom$l_blkcnt = .lbl [ihd$b_hdrblkcnt];
+    isd = .lbl [ihd$w_size] + .lbl;            ! Get first image section desc
+    mom$l_loadsize = .isd [isd$w_pagcnt] * 8;   ! Image size (32-word blocks)
+    mom$l_baseadr  = .isd [isd$v_vpn] * 512;    ! Starting memory address
+    iha = .lbl [ihd$w_activoff] + .lbl;
+    mom$l_transfer = .iha [iha$l_tfradr1];      ! Image transfer address
+    mom$l_transfer = .mom$l_transfer<0,31,0>;   ! (remove S0 bit)
+	
+    END;
+!
+! Read past the load file label blocks to the beginning of the image to be
+! loaded.  (The first label block has already been read.)
+!
+DECR i FROM .mom$l_blkcnt - 2 DO
+    BEGIN
+    mom_readloadfile (label_buf_dsc);
+    END;
+RETURN
+
+END;				! End of mom_check_label_blk
+
+%SBTTL 'mom$loadhandler  Condition handler'
+GLOBAL ROUTINE mom$loadhandler (signal_vec, mechanism)	=
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is a condition handler that performs cleanup
+!	at the end of load operations.  All files are closed.
+!
+! FORMAL PARAMETERS:
+!
+!	SIGNAL_VEC	Pointer to the signal vector.
+!	MECHANISM	Pointer to the mechanism array.
+!
+!--
+BEGIN
+
+MAP
+    signal_vec : REF BBLOCK,	! Signal vector argument
+    mechanism  : REF BBLOCK;	! Mechanism vector array pointer
+
+!
+! Close any open file.
+!
+mom$srvclose ();
+
+RETURN ss$_resignal;		! Always resignal error
+  
+END;				! End of mom$loadhandler
+
+
+
+END
+
+ELUDOM

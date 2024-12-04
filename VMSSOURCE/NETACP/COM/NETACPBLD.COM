@@ -1,0 +1,150 @@
+$ !
+$ !	DECnet ACP and Drivers
+$ !
+$ GOTO 'PHASE'
+$
+$INIT:
+$ !
+$ !	Create the Directories
+$ !
+$ @SYSBLDCOM$:CREATEDIR
+$ EXIT
+$
+$UPDATE:
+$ !
+$ !	Create updated sources for macro library
+$ !
+$ SRCUPDATE NETCTL.SDL			! CNR/CNF definitions
+$ SRCUPDATE NETNPAGED.SDL		! Non-paged pool structures
+$ SRCUPDATE NETUSR.SDL			! ACP control QIO interface
+$ SRCUPDATE DLEDEF.SDL			! DLE structures
+$
+$ SRCUPDATE NETMACROS.MAR		! Macros for the ACP and driver
+$ SRCUPDATE NETDEFS.MAR			! Symbol definitions
+$
+$ SRCUPDATE XWBDEF.SDL			! XWB and LSB structures for driver
+$ SRCUPDATE NSPMSGDEF.SDL		! NSP driver definitions
+$ SRCUPDATE NETDRVMAC.MAR		! NETDRIVER macro definitions
+$
+$ SRCUPDATE PSIUSR.SDL			! PSI user interface (X.25 datalink)
+$
+$ SRCUPDATE LIBHEAD.B32			! Head and tail to build bliss library
+$ SRCUPDATE LIBTAIL.B32
+$
+$ ! VMSLIB needs NETUSR during SRCLIB, we need to do this now
+$
+$ DELETE LIB$:NETUSR.*;*
+$ DELSHRLIB LIB$:NETUSR.MAR
+$ SDL /VMS SRC$:NETUSR /LANGUAGE=(MACRO=LIB$:NETUSR,BLISS=LIB$:NETUSR)
+$ CPYSHRLIB LIB$:NETUSR.MAR			! Share file with VMSLIB
+$
+$ EXIT
+$
+$SRCLIB:
+$ !
+$ !	Create the macro library NET.MLB
+$ !
+$ DELSHRLIB LIB$:NET.L32
+$ DELSHRLIB LIB$:NET.MLB
+$
+$ DELETE LIB$:NETCTL.*;*, LIB$:NETNPAGED.*;*, LIB$:PSIUSR.*;*, LIB$:DLEDEF.*;*
+$ SDL /VMS SRC$:NETCTL    /LANGUAGE=(MACRO=LIB$:NETCTL,	  BLISS=LIB$:NETCTL)
+$ SDL /VMS SRC$:NETNPAGED /LANGUAGE=(MACRO=LIB$:NETNPAGED,BLISS=LIB$:NETNPAGED)
+$ SDL /VMS SRC$:PSIUSR    /LANGUAGE=(MACRO=LIB$:PSIUSR,	  BLISS=LIB$:PSIUSR)
+$ SDL /VMS SRC$:DLEDEF    /LANGUAGE=(MACRO=LIB$:DLEDEF,	  BLISS=LIB$:DLEDEF)
+$
+$ DELETE LIB$:NET.MLB;*
+$ LIB/MACRO/CREATE LIB$:NET -
+	SRC$:NETMACROS,NETDEFS, -
+	LIB$:NETCTL,NETNPAGED,NETUSR,PSIUSR,DLEDEF
+$
+$ DELETE LIB$:NET.L32;*, LIS$:NET.LIS;*
+$ BLISS /LIB=LIB$:NET /LIS=LIS$:NET -
+	SRC$:LIBHEAD+LIB$:NETCTL+NETNPAGED+NETUSR+DLEDEF+SRC$:LIBTAIL
+$
+$ CPYSHRLIB LIB$:NET.L32
+$ CPYSHRLIB LIB$:NET.MLB
+$ !
+$ ! Create the macro library NETDRV.MLB, used primarily by NETDRIVER
+$ !
+$ DELSHRLIB LIB$:NETDRV.MLB
+$
+$ DELETE LIB$:XWBDEF.MAR;*, LIB$:NSPMSGDEF.MAR;*
+$ SDL SRC$:XWBDEF /LANGUAGE=(MACRO=LIB$:XWBDEF)
+$ SDL SRC$:NSPMSGDEF /LANGUAGE=(MACRO=LIB$:NSPMSGDEF)
+$
+$ DELETE LIB$:NETDRV.MLB;*
+$ LIB/MACRO/CREATE LIB$:NETDRV -
+	SRC$:NETDRVMAC, -
+	LIB$:XWBDEF,NSPMSGDEF
+$
+$ CPYSHRLIB LIB$:NETDRV.MLB
+$ EXIT
+$
+$ASSEM:
+$ !
+$ !	PURGE and re-create the assembly language objects and listings
+$ !
+$ PURGE OBJ$:*.OBJ,LIS$:*.LIS
+$ @SYSBLDCOM$:FASM 'FACNAM' "" NOLIB 'UPDATES'
+$ EXIT
+$
+$OBJLIB:
+$ !
+$ ! 	Create NETDRIVER object library
+$ !
+$ DELETE LIB$:NETDRV.OLB;*
+$ LIB/CREATE LIB$:NETDRV OBJ$:NETDRV*.OBJ
+$ DELETE OBJ$:NETDRV*.OBJ;*
+$ IF CPYOLB THEN CPYRESOBJ LIB$:NETDRV.OLB
+$ !
+$ !	Create NDDRIVER object library
+$ !
+$ DELETE LIB$:DLE.OLB;*
+$ LIB/CREATE LIB$:DLE OBJ$:NDDRIVER.OBJ
+$ DELETE OBJ$:NDDRIVER.OBJ;*
+$ IF CPYOLB THEN CPYRESOBJ LIB$:DLE.OLB
+$ !
+$ !	Create NETACP and NETSERVER object library
+$ !
+$ @SYSBLDCOM$:OBJLIB NETACP 150 500 30
+$ EXIT
+$
+$LNKLIB:
+$ !
+$ ! Null LNKLIB phase
+$ !
+$ EXIT
+$
+$LINK:
+$ !
+$ !	Link NETACP
+$ !
+$ @COM$:NETACPLNK
+$ !
+$ !	Link NETDRIVER
+$ !
+$ @COM$:NETDRVLNK
+$ !
+$ !	Link NDDRIVER
+$ !
+$ @COM$:NDLNK
+$ !
+$ !	Link NETSERVER
+$ !
+$ @COM$:SERVERLNK
+$ EXIT
+$
+$RESULT:
+$ !
+$ !	Move listing of DECnet license module from listing area, to
+$ !	prevent it from being included in the final fiche kit.
+$ !
+$ IF F$SEARCH("LIS$:NETGETLIN.LIS") .NES. "" THEN -
+	RENAME LIS$:NETGETLIN.LIS;* LIB$:
+$ !
+$ !	Copy the EXE and MAP to a System area
+$ !
+$ CPYRESEXE EXE$:NETACP.EXE,NETDRIVER.EXE,NDDRIVER.EXE,NETSERVER.EXE
+$ CPYRESMAP MAP$:NETACP.MAP,NETDRIVER.MAP,NDDRIVER.MAP,NETSERVER.MAP
+$ CPYRESLIS LIS$:*.LIS NETACP.LSS

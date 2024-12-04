@@ -1,0 +1,298 @@
+	.TITLE	BTMEM790 - Configure and Test 11/790 Memory
+	.IDENT	'V04-000'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; FACILITY:
+;
+;	BOOTS
+;
+; ENVIRONMENT:
+;
+;	Linked with VMB.EXE; runs at IPL 31, kernel mode, memory management
+;	OFF,  PSL<IS>=1 (on interrupt stack), and code must be PIC.
+;
+; ABSTRACT:
+;
+;	This module is 11/790-specific.  It contains routines that:
+;		- locate all of 11/790 physical memory
+;		- test a range of 11/790 memory for hard (RDS) errors
+;		- handle 11/790 machine checks generated when encountering
+;		  hard memory errors
+;
+;	The routines in this module, in conjunction with common memory routines
+;	in VMB.EXE, build a PFN bitmap that identifies each page of good 11/790
+;	memory.
+;
+; AUTHOR:  TRUDY MATTHEWS,	CREATION DATE: 14-July-1982
+;
+; MODIFIED BY:
+;
+;	V03-009	TCM0008		Trudy C. Matthews	23-Jul-1984
+;		Turn off cache before testing memory.  Test memory a page
+;		at a time instead of a quadword at a time.
+;
+;	V03-008	TCM0007		Trudy C. Matthews	28-Nov-1983
+;		Fix "EXTZV" instruction that extracts the PFN field from a
+;		physical address.
+;
+;	V03-007	TCM0006		Trudy C. Matthews	17-Oct-1983
+;		Use "MCOML #0,dest" instead of "MCOML #1,dest" to write a
+;		pattern of all 1's.
+;
+;	V03-006	TCM0005		Trudy C. Mattehws	02-Jun-1983
+;		Correct bug in TCM0001; we were writing the wrong bit to
+;		disable ECC correction.  Also correct algorithm that tests
+;		a quadword of memory by writing all 1's and then all 0's.
+;
+;	V03-005	TCM0004		Trudy C. Matthews	19-May-1983
+;		Don't allow disable of CRDTEST to skip R4 initialization.
+;
+;	V03-004	TCM0003		Trudy C. Matthews	27-Apr-1983
+;		Change sense of CRDTEST flag from an enable to an inhibit; i.e.
+;		remove pages with CRD errors by default.
+;
+;	V03-003	TCM0002		Trudy C. Matthews	26-Jan-1983
+;		Correct bug in TCM0001; didn't clear the "machine check on
+;		CRD error" flag after memory testing was complete.
+;
+;	V03-002	TCM0001		Trudy C. Matthews	20-Oct-1982
+;		Added optional ability to remove pages with single-bit
+;		memory errors, in addition to always removing pages with
+;		double-bit memory errors.
+;
+;--
+
+	.SBTTL	Declarations
+;
+; Macros to describe VMS data structures.
+;
+	$CSWPDEF			; 11/790 cache sweep register
+	$EHSRDEF			; 11/790 Error Handling status reg
+	$IO790DEF			; 11/790 I/O spce definitions
+	$MDCTLDEF			; Define memory data control register.
+	$PAMMDEF			; Physical Address Memory Map defs
+	$PR790DEF			; 11/790-specific processor registers
+	$RPBDEF				; Restart Parameter Block definitions
+
+
+	.PSECT	YBTMEM,LONG
+
+	.SBTTL	CHECKMEM_790, Locate 11/790 memory
+;++
+;
+; Routine CHECKMEM_790
+;
+; VENUS address space and the PAMM
+; --------------------------------
+;	VENUS's design provides for 512 Mb of memory physical address space,
+; and 512 Mb of I/O physical address space.  Memory physical addresses can
+; range from 00000000 to 1FFFFFFF; I/O space physical addresses can range from
+; 20000000 to 3FFFFFFF.
+;
+;	On VENUS systems, VMS will determine the memory configuration by using
+; a structure called the PAMM (physical array memory map), which is set up by
+; the VENUS console to map VENUS address space.  The PAMM is an array of 1024
+; locations, each of which corresponds to 1 Mb of physical address space (i.e.
+; the index to each PAMM location can also be thought of as bits <29:20> of the
+; physical address of the corresponding Mb of address space; the first 512 PAMM
+; locations correspond to memory physical address space and the last 512 PAMM
+; locations correspond to I/O physical address space).
+;
+;	Each PAMM location contains a 5-bit type code that identifies what
+; entity is referenced in that Mb of physical address space.  The low 4 bits
+; of the PAMM type codes are:
+;
+;	CODE		SELECTS
+;	----		-------
+;	 0		Memory array slot 0
+;	 1		Memory array slot 1
+;	 .			.
+;	 .			.
+;	 7		Memory array slot 7
+;	 8		ABUS adapter slot 0
+;	 9		ABUS adapter slot 1
+;	 A		ABUS adapter slot 2
+;	 B		ABUS adapter slot 3
+;	 C,D,E		unused
+;	 F		non-existent memory
+;
+;
+;	The high bit of the PAMM type code is the CACHE bit; if set it
+; disables the use of cache for that Mb of physical address space.  The console
+; will initialize the cache bit to 1 for all valid I/O space addresses (I/O
+; space data should not be cached) and to 0 for all valid memory addresses
+; (memory data should be cached).
+;
+; VENUS Memory System
+; -------------------
+;	VENUS will have 8 memory array slots in its CPU cab; each array slot
+; can contain 1 or 4 Mb of memory (depending on whether 64k or 256k memory
+; chips are used).  This limits the maximum amount of VENUS physical memory
+; to 32Mb.
+;
+;	The VENUS console will always set up the PAMM so that physical memory
+; addresses start at physical address 0 and are contiguous.
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Starting at PAMM location 0, search the PAMM for memory type codes.
+; For each memory type code found, call BOO$TEST_MEM to test 1 Mb worth of
+; memory and record its configuration in the PFN bitmap.
+;
+; INPUTS:
+;
+;	R7	- address of System Control Block (SCB)
+;	R11	- address of Restart Parameter Block (RPB)
+;	SP	- current top of stack
+;
+; OUTPUTS:
+;
+;	BOO$TEST_MEM modifies the PFN bitmap to describe all of physical memory
+;	described by the PAMM and found to be good (RDS and/or CRD free).
+;
+;	RPB$L_PFNCNT stores the number of good pages of physical memory.
+;
+;	Memory descriptor array in RPB is filled in with starting PFN and
+;	total number of pages of memory.
+;
+;	R7,R8,R10,R11,AP,FP preserved.
+;	All others may be altered.
+;
+;--
+
+CHECKMEM_790::
+;
+; During the memory locate and test loop, the following registers are used:
+;
+;	R2	- address of VENUS-specific page test routine
+;	R3	- number of pages to test (2048 pages = 1Mb)
+;	R4	- physical address of the Mb of memory being tested
+;	R5	- PAMM type code
+;	R7	- address of SCB
+;	R9	- PFN of Mb of memory being tested
+;	R11	- address of RPB
+;
+
+	BICL	#<RPB$M_MPM!RPB$M_USEMPM!RPB$M_FINDMEM>, -
+		RPB$L_BOOTR5(R11)	; Clear all MA780 specific boot flags.
+	CLRQ	RPB$L_MEMDSC(R11)	; Zero # of pages in this memory, TR#,
+					; and starting PFN.
+	MOVAB	PAGE_MCHECK_790+1,4(R7)	; Establish RDS machine check handler.
+					; (+1 to execute on interrupt stack)
+	CLRL	R4			; Start at physical address 0.
+	MTPR	#CSWP$M_INV,#PR790$_CSWP; Turn off the cache.
+	BBS	#RPB$V_CRDTEST, -	; Should we also remove pages with
+		RPB$L_BOOTR5(R11), -	; single bit memory errors?
+		TRY_NEXT_790		; Branch if no.
+	MTPR	#MDCTL$M_DISECC, -	; Disable ECC correction (so single
+		#PR790$_MDCTL		; bit errors cause machine checks).
+;
+; Read the PAMM and check the type code.
+;
+TRY_NEXT_790:
+	MTPR	R4,#PR790$_PAMLOC	; Request type code from next PAMM loc.
+	MFPR	#PR790$_PAMACC,R5	; Get PAMM type code for this Mb.
+	EXTZV	#PAMM$V_CODE,#PAMM$S_CODE,R5,R5
+					; Isolate type code.
+	CMPL	R5,#PAMM$C_NEXM		; Non-existent memory?
+	BEQL	ALL_DONE_790		; Yes, we've found all of memory.
+	CMPL	R5,#PAMM$C_MEM7		; Higher than highest memory type code?
+	BGTR	DO_NEXT_790		; Yes, ignore this Mb.
+;
+; Call BOO$TEST_MEM to test 1 Mb worth of memory.
+;
+					; Inputs to BOO$TEST_MEM:
+	MOVAL	TEST_QUAD_790,R2	; Address of page test routine.
+	MOVZWL	#2048,R3		; # of pages to test.
+	EXTZV	#9,#21,R4,R9		; Starting PFN for this Mb of memory.
+	BSBW	BOO$TEST_MEM		; Test 1 Mb worth of memory.
+	ADDL2	#2048,RPB$L_MEMDSC(R11)	; Add 1Mb to total page count.
+;
+; Step to next megabyte of memory and loop.
+;
+DO_NEXT_790:
+	ADDL2	#^X100000,R4		; Increment to next Mb boundary.
+	BBC	#29,R4,TRY_NEXT_790	; If we're not at the end of memory
+					; address space, go try next Mb.
+ALL_DONE_790:
+	MOVAL	UNEXP_MCHK+1,4(R7)	; Restore normal machine check handler.
+	CLRL	RPB$L_MEMDSC+8(R11)	; Signal end of memory descriptor list.
+	MTPR	#0,#PR790$_MDCTL	; Clear diagnostic bit that turned
+					; single-bit errors into machine checks.
+	RSB
+
+	.SBTTL	TEST_QUAD_790, Test 11/790 Memory
+;++
+; Routine TEST_QUAD_790
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Test specified number of quadwords of memory for hard memory errors,
+; by first writing to and then reading back from the specified location.
+;
+; INPUTS:
+;
+;	R0	- starting address to test
+;	R1	- quadword iteration count (64 for one page)
+;
+; OUTPUTS:
+;
+;	Returns via RSB if page is ok.
+;	Else error exit via machine check to BOO$PAGE_MCHECK.
+;	R0,R1 destroyed.
+;--
+
+TEST_QUAD_790:
+	ASHL	#3,R1,R1		; Convert quad count to byte count.
+	MOVQ	R4,-(SP)		; Save R4 and R5.
+	MOVQ	R2,-(SP)		; Save R2 and R3.
+	MOVQ	R0,-(SP)		; Save R0 and R1.
+	MOVC5	#0,#0,#-1,R1,(R0)	; Write a bit pattern of all 1's.
+	MOVQ	(SP)+,R0		; Get original R0 and R1.
+	MOVC5	#0,#0,#0,R1,(R0)	; Write a bit pattern of all 0's.
+;
+; If no gross errors occur, then execution continues below.  Otherwise,
+; control is transferred to the fault handler PAGE_MCHECK_790.
+;
+	MOVQ	(SP)+,R2		; Restore R2 and R3.
+	MOVQ	(SP)+,R4		; Restore R4 and R5.
+	RSB
+
+
+;
+; Handler that gains control if page has a hard memory error.
+;
+	.ALIGN	LONG			; All handlers longword-aligned.
+PAGE_MCHECK_790:
+	MFPR	#PR790$_EHSR,R0		; Get Error Handling Status Register.
+	BBCC	#EHSR$V_VMS,R0,10$	; Clear bit to indicate VMS machine
+10$:					; check handling complete.
+	MTPR	R0,#PR790$_EHSR		; Write register back.
+	BRW	BOO$PAGE_MCHECK		; Goto common page error handler.
+
+	.end

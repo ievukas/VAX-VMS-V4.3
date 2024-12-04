@@ -1,0 +1,1129 @@
+MODULE DBGEXC (IDENT = 'V04-000') =
+
+BEGIN
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+! WRITTEN BY
+!	Carol Peters, 05 Oct 1976: Version 01
+!
+! MODULE FUNCTION
+!	This module contains DEBUG's Primary Exception Handler and associated
+!	routines.  DEBUG's Primary Handler is actually located in module
+!	DBGSTART, but that code calls DBG$EXC_HANDLER in this module to do
+!	most of the work of handling primary exceptions.
+!
+! Revision History
+!	R. Title	May 1983	Most of the original code was
+!					removed from this module.
+!       P. Sager        Aug 1983	Added a read error count to force
+!                                       DEBUG to take exit.
+!	P. Sager        Aug 1983        Added the Facility code and Bit 15
+!					in Message number test in 
+!					DBG$EXCEPTION_IS_FAULT and
+!					DBG$PUTMSG.  This is also a bug
+!					reported by our user through SPR.
+REQUIRE 'SRC$:DBGPROLOG.REQ';
+
+LIBRARY 'LIB$:DBGGEN.L32';
+
+FORWARD ROUTINE
+    DBG$CREATE_VIRTUAL_KEYBOARD,	! Initialize keypad input
+    DBG$COMMAND_PROC : NOVALUE,		! Accepts a command from the user
+    DBG$EXC_HANDLER,			! Handles DEBUG set exception conditions
+    DBG$EXCEPTION_IS_FAULT,		! If exception is fault, true
+    DBG$PUTMSG : NOVALUE;		! Checks exception type before calling
+					!      SYS$PUTMSG
+
+EXTERNAL ROUTINE
+    DBG$INIT_STEP : NOVALUE,		! Reset step level to what is
+    DBG$KEY_INITIALIZE: NOVALUE,	! Keypad initialization
+    DBG$SET_STP_LVL : NOVALUE,		! Needed at BEGIN_OF_COMMAND
+    DBG$REL_MEMORY : NOVALUE,		! Releases free storage
+    DBG$GET_MEMORY,			! Allocates free storage
+    DBG$OUT_MESSAGE : NOVALUE,		! Writes string descriptor message
+					!      to DBG$OUTPUT
+    DBG$NCONTROL : NOVALUE,		! New debugger control routine
+    DBG$CIS_ADD,			! Add a link to the cis
+    DBG$CIS_REMOVE,			! Remove a link from the cis
+    DBG$FINAL_HANDL,			! Call frame exception handler
+    DBG$SCR_GENERATE_SCREEN: NOVALUE,	! Generate all automatic screen displays
+    DBG$SCR_OUTPUT_SCREEN: NOVALUE,	! Output Screen Displays to terminal
+    DBG$EXCEPTION_HANDLER,		! New Event exception handler
+    DBG$ACTIVATE_EVENTS : NOVALUE,	! Activate events
+    SMG$CREATE_KEY_TABLE,		! Keypad initialization routine
+    SMG$CREATE_VIRTUAL_KEYBOARD,	! Keypad initialization routine
+    SMG$READ_COMPOSED_LINE,		! Keypad input
+    SYS$PUTMSG: ADDRESSING_MODE(GENERAL);! System output message routine
+
+EXTERNAL
+    DBG$GB_KEYPAD_INPUT: BYTE,		! TRUE if keypad input is enabled
+    DBG$GL_KEYBOARD_ID,
+    DBG$GB_LANGUAGE: BYTE,		! Language setting
+    DBG$GL_KEY_TABLE_ID,
+    DBG$GB_DEF_OUT: VECTOR[,BYTE],	! Current OUTPUT configuration
+    DBG$GL_EXIT_STATUS,			! Last known user error status
+    DBG$GL_INPRAB: BLOCK[,BYTE],	! RAB for 'INPUT'
+    DBG$GL_OUTPRAB: BLOCK[,BYTE],	! RAB for 'OUTPUT'
+    DBG$GL_LOGRAB: BLOCK[,BYTE],	! RAB for LOG file
+    DBG$GL_LOG_BUF,			! Ptr to log filespec
+    DBG$GL_READERR_CNT,			! Read error count
+    DBG$GL_SCREEN_MODE,			! Set to TRUE if screen mode is active
+    DBG$GL_CISHEAD: REF CIS$LINK,	! Head of command input stream
+    DBG$GV_CONTROL: DBG$CONTROL_FLAGS;	! DEBUG control bits
+
+! Declare a global which is used to store the address of the exit handler
+! routine declared by SMG$CREATE_VIRTUAL_KEYBOARD.
+!
+GLOBAL
+    DBG$GL_SMG_EXIT_HANDLER : INITIAL(0);
+
+! Declare an own variable which says whether keypad initialization 
+! has been done yet.
+!
+OWN
+    KEYPAD_INITIALIZATION_DONE: INITIAL(0);
+
+EXTERNAL LITERAL
+    SMG$_EOF;				! End-of-file code
+
+MACRO
+    ! INP_READ_ERROR signals any RMS error encountered when reading input
+    !
+    INP_READ_ERROR =
+		BEGIN
+		LOCAL
+			FAB_PTR  : REF $FAB_DECL,
+			MSG_DESC : BLOCK [8,BYTE];
+
+		FAB_PTR = .INPRAB [RAB$L_FAB];
+		MSG_DESC [DSC$W_LENGTH]  = .FAB_PTR [FAB$B_FNS];
+		MSG_DESC [DSC$A_POINTER] = .FAB_PTR [FAB$L_FNA];
+
+    		SIGNAL ((SHR$_READERR + DBG_FAC_CODE) OR FATAL_BIT, 1, MSG_DESC,
+			.INPRAB [RAB$L_STS], .INPRAB [RAB$L_STV]);
+		END %,
+
+
+    ! LOG_WRITE_ERROR signals any RMS error encountered in writing to the LOG
+    ! file.
+    !
+    LOG_WRITE_ERROR =
+		BEGIN
+
+		LOCAL
+			FAB_PTR : REF $FAB_DECL,
+			MSG_DESC : BLOCK [8,BYTE];
+
+		FAB_PTR = .DBG$GL_LOGRAB [RAB$L_FAB];
+		IF .DBG$GL_LOG_BUF NEQ 0
+		THEN
+			BEGIN
+			MSG_DESC [DSC$W_LENGTH]  = .FAB_PTR [FAB$B_FNS];
+			MSG_DESC [DSC$A_POINTER] = .FAB_PTR [FAB$L_FNA];
+			END
+		ELSE
+			BEGIN
+			MSG_DESC [DSC$W_LENGTH]  = .FAB_PTR [FAB$B_DNS];
+			MSG_DESC [DSC$A_POINTER] = .FAB_PTR [FAB$L_DNA];
+			END;
+
+		SIGNAL (SHR$_WRITEERR + DBG_FAC_CODE, 1, MSG_DESC,
+		       .DBG$GL_LOGRAB[RAB$L_STS], .DBG$GL_LOGRAB[RAB$L_STV]);
+		END %;
+
+GLOBAL ROUTINE DBG$CREATE_VIRTUAL_KEYBOARD =
+!
+! FUNCTION
+!
+!	This routine initializes the keypad input data structures.
+!	The routine is just a cover routine for the RTL routine
+!	SMG$CREATE_VIRTUAL_KEYBOARD. This initialization routine
+!	is called once from DBG$COMMAND_PROC, the first time we
+!	get input after mode has been set to "KEYPAD". The routine
+!	is called again from the exit handler in DBGSTART. The
+!	reason for this is that the keypad routines declare an exit
+!	handler that disables keypad input, and we need to re-enable
+!	it from our exit handler so that keypad input continues to
+!	work after running to the end of the program.
+!
+! INPUTS
+!	none
+!
+! OUTPUTS
+!	The global variable DBG$GL_KEYBOARD_ID is set.
+!	A status is returned (STS$K_SUCCESS if all goes well).
+!
+    BEGIN
+    OWN
+    	desblk: VECTOR[4],
+    	dummy1,
+    	dummy2;
+    LOCAL
+    	filespec: dbg$stg_desc,
+    	forward_link: REF VECTOR[4],
+    	save_link,
+    	status;
+
+    ! Initialize the block that is passed to the "declare exit handler"
+    ! and "cancel exit handler" system services.
+    !
+    desblk[0] = 0;
+    desblk[1] = dummy1;
+    desblk[2] = 1;
+    desblk[3] = dummy2;
+
+    ! Initialize the file spec that is passed in to the 
+    ! SMG$CREATE_VIRTUAL_KEYBOARD routine.
+    ! We supply the file name to open for input - either DBG$INPUT,
+    ! or if that fails, then SYS$INPUT.
+    !
+    filespec[dsc$b_class] = dsc$k_class_s;
+    filespec[dsc$b_dtype] = dsc$k_dtype_t;
+    filespec[dsc$w_length] = 9;
+    filespec[dsc$a_pointer] = UPLIT BYTE(%ASCII 'DBG$INPUT');
+
+    ! Declare a temporary exit handler for the purpose of finding out
+    ! the most recently declared exit handler. We will need to know this
+    ! to discover if SMG$CREATE_VIRTUAL_KEYBOARD set up a new exit handler.
+    !
+    $dclexh (desblk = desblk);
+    save_link = .desblk[0];
+    $canexh (desblk = desblk);
+
+    ! Call the routine that initializes the keypad input data
+    ! structures. If this fails with DBG$INPUT as the input device,
+    ! then call it with SYS$INPUT.
+    !
+    status = smg$create_virtual_keyboard(dbg$gl_keyboard_id, filespec);
+    IF NOT .status
+    THEN
+	BEGIN
+    	filespec[dsc$a_pointer] = UPLIT BYTE(%ASCII 'SYS$INPUT');
+    	status = smg$create_virtual_keyboard(dbg$gl_keyboard_id, filespec);
+    	END;
+
+    ! We want to get rid of the exit handler that was declared by
+    ! SMG$CREATE_VIRTUAL_KEYBOARD, if indeed it declared one.
+    ! We first declare a temporary exit handler,
+    ! so we can pick up the address of the most recent exit handler
+    ! from the forward link. If this address is different from the
+    ! one in SAVE_LINK which we determined before the call to
+    ! the SMG routine, then the SMG routine set up a new handler.
+    ! In that case, we get rid of the handler here. We save the
+    ! handler routine so we can call it ourselves when DEBUG exits.
+    !
+    $dclexh (desblk = desblk);
+    forward_link = .desblk[0];
+    $canexh (desblk = desblk);
+    IF .forward_link NEQ .save_link
+    THEN
+    	BEGIN
+    	dbg$gl_smg_exit_handler = .forward_link[1];
+        $canexh (desblk = .forward_link);
+    	END;
+
+    RETURN .status;
+    END;
+
+GLOBAL ROUTINE DBG$COMMAND_PROC : NOVALUE =
+!
+! FUNCTIONAL DESCRIPTION:
+!	Accepts a single (possibly multiple through the use of
+!	continuation lines) command sequence from the user at DEBUG
+!	command level. If the argument buffer_desc holds a value other
+!	than a zero, then the command comes from this buffer.
+!	Otherwise a command is read from the input device.
+!
+!	This routine declares an exception vector. Exceptions
+!	encountered from this point generally cause an unwind, and then
+!	this routine is called again by user_proc. They are generally
+!	caused by user typing errors.
+!
+!	If the command read from the device INPUT is interpreted by
+!	RMS as EOF, or any other nonsuccessful return from RMS is seen,
+!	then set the exit flag, cancel the command taking flag, and return.
+!
+! FORMAL PARAMETERS:
+!	None
+!
+! IMPLICIT INPUTS:
+!	The name of the DEBUG command level exception handler that is
+!	declared within the context of this routine.
+!
+!	The fact that if the DBG$_L_BPT_PC field in the runframe
+!	has a non-zero value then it must be the address
+!	of a "temporary" breakpoint which DEBUG set to implement
+!	step /OVER.
+!
+! IMPLICIT OUTPUTS:
+!	none
+!
+! ROUTINE VALUE:
+!	novalue
+!
+! SIDE EFFECTS:
+!	The parser is called with the contents of the input buffer.
+!
+
+    BEGIN
+
+    BUILTIN
+	FP;
+
+    LITERAL
+	NULL_BYTE_LOC = 1;
+
+    BIND
+	PMT_STRING_1 = UPLIT BYTE
+		(%ASCII %STRING(%CHAR(CARRIAGE_RET), %CHAR(LINEFEED), 'DBG>')),
+	PMT_SIZE_1 = %CHARCOUNT
+		(%ASCII %STRING(%CHAR(CARRIAGE_RET), %CHAR(LINEFEED), 'DBG>')),
+	PMT_STRING_SUP = UPLIT BYTE
+		(%ASCII %STRING(%CHAR(CARRIAGE_RET), %CHAR(LINEFEED), 'SDBG>')),
+	PMT_SIZE_SUP = %CHARCOUNT
+		(%ASCII %STRING(%CHAR(CARRIAGE_RET), %CHAR(LINEFEED), 'SDBG>')),
+	PMT_STRING_2 = UPLIT BYTE
+		(%ASCII %STRING(%CHAR(CARRIAGE_RET), %CHAR(LINEFEED), '_')),
+	PMT_SIZE_2 = %CHARCOUNT
+		(%ASCII %STRING(%CHAR(CARRIAGE_RET), %CHAR(LINEFEED), '_'));
+
+    LOCAL
+	ALPHAPTR,
+	ALPHAVECTOR: VECTOR[150,BYTE],
+    	filespec: DBG$STG_DESC,
+	HAVE_A_LINE,			! Flag set when we have a command line
+	INPRAB : REF $RAB_DECL,		! Record Access Block (RAB) for input
+	INPUT_BUFFER: VECTOR[		! Command input buffer
+			NO_OF_INP_CHARS + %UPVAL, BYTE], !
+	INP_LENGTH,			! Input line length
+    	LENGTH,
+	MUST_UPDATE_SCREEN,		! Flag set to TRUE if screen displays
+					!      must be updated before read
+	NBUF: VECTOR[TTY_OUT_WIDTH,BYTE],!
+	NEW_POINTER: REF VECTOR[,BYTE],	! Pointer to current buffer
+	OLD_POINTER,			! Pointer to previous buffer
+	PREV_COUNT,			! Current character count
+    	PROMPT_STG_DESC: DBG$STG_DESC,	! String descriptor for prompt.
+	STATUS,				! Status returned by $GET operation
+    	STATUS1,
+	STG_DESC: DBG$STG_DESC,		! String descriptor for keypad input
+	STOP_FLAG;			! Flag set if Control-Y DEBUG was done
+
+
+
+    ! Enable a condition handler as described above.
+    !
+    .FP = DBG$FINAL_HANDL;
+
+
+    ! Reset the level in the STP type structure so that we forget about
+    ! any kind of "override" type stepping we may have been doing.
+    !
+    DBG$INIT_STEP (OVERRIDE_STEP, USER_DEF_STEP);
+    DBG$SET_STP_LVL (USER_DEF_STEP);
+
+
+    ! Also set the Update-Screen flag to indicate whether we should update the
+    ! contents of the terminal screen.  Screen updating is done only if we are
+    ! in screen mode.
+    !
+    MUST_UPDATE_SCREEN = .DBG$GL_SCREEN_MODE;
+
+
+    ! See whether we need to initialize the keypad.
+    !
+    IF .DBG$GB_KEYPAD_INPUT AND
+      (NOT .KEYPAD_INITIALIZATION_DONE)
+    THEN
+    	BEGIN
+
+    	! Check that we are on a V4 system (else we cannot use keypad input).
+    	!
+    	IF .dbg$gv_control[dbg$v_control_version_4]
+    	THEN
+    	    BEGIN
+    	    status = dbg$create_virtual_keyboard();
+    	    IF .status
+    	    THEN
+    	        ! Intialize the key table used in DEFINE/KEY.
+    	        !
+    	        status1 = smg$create_key_table(dbg$gl_key_table_id);
+            IF (NOT .status) OR (NOT .status1)
+    	    THEN
+    	        BEGIN
+    	        dbg$gb_keypad_input = FALSE;
+    		
+    		! This is an information message (so we do not get signalled
+    		! out of this routine).
+    		!
+    	        SIGNAL(dbg$_nokeypad, 1, 
+    		    (IF .status THEN .status1 ELSE .status));
+    	        END;
+
+    	    DBG$KEY_INITIALIZE();
+    	    KEYPAD_INITIALIZATION_DONE = TRUE;
+    	    END
+
+        ELSE
+    	
+    	    ! Not a version 4 system - set keypad mode back to false
+    	    ! and signal an informational informing the user what is
+    	    ! happening.
+    	    !
+    	    BEGIN
+    	    dbg$gb_keypad_input = FALSE;
+    	    SIGNAL(dbg$_keypadv4);
+    	    END;
+    	END;
+
+    ! If we have re-entered DEBUG by means of a ^Y, DEBUG sequence then
+    ! the flag DBG$V_CONTROL_STOP will be set. If this is the case, all
+    ! command buffers, etc., are to be deleted, and we are to return to
+    ! taking commands from the default input device.
+    !
+    STOP_FLAG = FALSE;
+    IF .DBG$GV_CONTROL[DBG$V_CONTROL_STOP]
+    THEN
+	BEGIN
+	DBG$GV_CONTROL[DBG$V_CONTROL_STOP] = FALSE;
+	WHILE .DBG$GL_CISHEAD[CIS$B_INPUT_TYPE] NEQ CIS_DBG$INPUT DO
+	    DBG$CIS_REMOVE(FALSE);
+
+	STOP_FLAG = TRUE;
+	END;
+
+
+    ! Set up the string descriptor that describes the prompt.  The prompt is
+    ! either the SUPERDEBUG prompt "SDBG>" or the normal DEBUG prompt "DBG>".
+    !
+    PROMPT_STG_DESC[DSC$B_CLASS] = DSC$K_CLASS_S;
+    PROMPT_STG_DESC[DSC$B_DTYPE] = DSC$K_DTYPE_T;
+    IF .DBG$GV_CONTROL[DBG$V_CONTROL_SDBG]
+    THEN
+    	BEGIN
+    	PROMPT_STG_DESC[DSC$W_LENGTH] = 7;
+    	PROMPT_STG_DESC[DSC$A_POINTER] = UPLIT BYTE
+	    (%ASCII %STRING(%CHAR(CARRIAGE_RET), %CHAR(LINEFEED), 'SDBG>'));
+    	END
+
+    ELSE
+    	BEGIN
+    	PROMPT_STG_DESC[DSC$W_LENGTH] = 6;
+    	PROMPT_STG_DESC[DSC$A_POINTER] = UPLIT BYTE
+	    (%ASCII %STRING(%CHAR(CARRIAGE_RET), %CHAR(LINEFEED), 'DBG>'));
+    	END;
+
+
+    ! Enter the read loop.  Here we loop, reading input from the user's
+    ! terminal (or DBG$INPUT) until we get a complete command line.  We
+    ! stay in the loop to collect all continuation lines until no more
+    ! continuation lines are present.
+    !
+    HAVE_A_LINE = FALSE;
+    WHILE NOT .HAVE_A_LINE DO
+	BEGIN
+
+
+	! If screen mode is set and the user program has gained control since
+	! the last time we updated all automatically updated screen displays,
+	! then we update all automatic screen displays at this point.  (This is
+	! suppressed if the STOP_FLAG is set due to a Control-Y DEBUG.)  The
+	! effect of doing so is to add CIS_SCREEN entries to the Command Input
+	! Stream.  These entries then cause the necessary commands to be exe-
+	! cuted below to fill in the contents of these screen displays.
+	!
+	IF .DBG$GL_SCREEN_MODE                   AND
+	   .DBG$GV_CONTROL[DBG$V_CONTROL_SCREEN] AND
+	   (NOT .STOP_FLAG)                      AND
+	   (.DBG$GL_CISHEAD[CIS$B_INPUT_TYPE] EQL CIS_DBG$INPUT)
+	THEN
+	    BEGIN
+	    DBG$GV_CONTROL[DBG$V_CONTROL_SCREEN] = FALSE;
+	    DBG$SCR_GENERATE_SCREEN(0);
+	    END;
+
+
+	! If the head of the command argument list is of type buffer, process
+	! it.  
+	!
+	IF (.DBG$GL_CISHEAD[CIS$B_INPUT_TYPE] EQL CIS_INPBUF) OR
+	   (.DBG$GL_CISHEAD[CIS$B_INPUT_TYPE] EQL CIS_ACBUF)  OR
+	   (.DBG$GL_CISHEAD[CIS$B_INPUT_TYPE] EQL CIS_IF)     OR
+	   (.DBG$GL_CISHEAD[CIS$B_INPUT_TYPE] EQL CIS_REPEAT) OR
+	   (.DBG$GL_CISHEAD[CIS$B_INPUT_TYPE] EQL CIS_WHILE)  OR
+	   (.DBG$GL_CISHEAD[CIS$B_INPUT_TYPE] EQL CIS_FOR)    OR
+	   (.DBG$GL_CISHEAD[CIS$B_INPUT_TYPE] EQL CIS_SCREEN)
+	THEN
+	    BEGIN
+	    DBG$NCONTROL (.DBG$GL_CISHEAD);
+	    RETURN;
+	    END;
+
+
+	! If we are reading from the user's terminal (DBG$INPUT in general)
+	! or from an indirect command file, set up and do such a read.
+	!
+	IF (.DBG$GL_CISHEAD[CIS$B_INPUT_TYPE] EQL CIS_RAB) OR
+	   (.DBG$GL_CISHEAD[CIS$B_INPUT_TYPE] EQL CIS_DBG$INPUT)
+	THEN
+	    BEGIN
+
+
+	    ! If link is flagged for removal due to RMS problems, do it now.
+	    !
+	    IF .DBG$GL_CISHEAD [CIS$V_REM_FLAG]
+	    THEN
+		DBG$CIS_REMOVE (FALSE)
+
+
+	    ! Otherwise we must collect an entire command line before calling
+	    ! the parser.  Enter a loop that collects multiple lines of input,
+	    ! ceasing only when a line ends with other than a hyphen ("-"),
+	    ! which is the line continuation character. Buffer the possibly
+	    ! multiple lines into free storage.
+	    !
+	    ELSE
+		BEGIN
+		INPRAB = .DBG$GL_CISHEAD [CIS$A_INPUT_PTR];
+		PREV_COUNT = 0;
+		OLD_POINTER = 0;
+		IF .DBG$GL_CISHEAD [CIS$B_INPUT_TYPE] EQL CIS_DBG$INPUT
+		THEN
+		    BEGIN
+		    IF .DBG$GV_CONTROL[DBG$V_CONTROL_SDBG]
+		    THEN
+			BEGIN
+			INPRAB [RAB$L_PBF] = PMT_STRING_SUP;
+			INPRAB [RAB$B_PSZ] = PMT_SIZE_SUP;
+			END
+
+		    ELSE
+			BEGIN
+			INPRAB [RAB$L_PBF] = PMT_STRING_1;
+			INPRAB [RAB$B_PSZ] = PMT_SIZE_1;
+			END;
+
+		    END;
+
+
+		! If screen mode is active and we have not yet updated the
+		! displays in this call on DBG$COMMAND_PROC, we do so now.
+		! This means that the user sees all his screen displays
+		! updated just before he is prompted for more input.
+		!
+		IF .MUST_UPDATE_SCREEN AND (NOT .STOP_FLAG) AND
+		   (.DBG$GL_CISHEAD[CIS$B_INPUT_TYPE] EQL CIS_DBG$INPUT)
+		THEN
+		    BEGIN
+		    MUST_UPDATE_SCREEN = FALSE;
+		    DBG$SCR_OUTPUT_SCREEN();
+		    END;
+
+
+    		! If keypad input is enabled, then we read a line of input
+    		! using the RTL routine SMG$READ_COMPOSED_LINE, which
+    		! handles keypad input.
+		!
+		INPRAB[RAB$W_USZ] = NO_OF_INP_CHARS;
+		INPRAB[RAB$L_UBF] = INPUT_BUFFER;
+    		IF .DBG$GB_KEYPAD_INPUT AND
+		   (.DBG$GL_CISHEAD[CIS$B_INPUT_TYPE] EQL CIS_DBG$INPUT)
+    		THEN
+    		    BEGIN
+
+
+    		    ! Set up a string descriptor for the input line.
+    		    !
+    		    STG_DESC[DSC$B_CLASS] = DSC$K_CLASS_S;
+    		    STG_DESC[DSC$B_DTYPE] = DSC$K_DTYPE_T;
+		    STG_DESC[DSC$W_LENGTH] = NO_OF_INP_CHARS;
+	            STG_DESC[DSC$A_POINTER] = INPUT_BUFFER;
+
+
+    		    ! Call the keypad input routine.
+    		    ! Zero the INP_LENGTH variable first because 
+    		    ! SMG$READ_COMPOSED_LINE writes only into the low word,
+    		    ! so we first clear out junk in the high word.
+    		    !
+    		    INP_LENGTH = 0;
+    		    STATUS = SMG$READ_COMPOSED_LINE (
+    				    DBG$GL_KEYBOARD_ID,
+    				    DBG$GL_KEY_TABLE_ID,
+    				    STG_DESC,
+    				    PROMPT_STG_DESC,
+
+! *** Note - the fifth parameter (DEFAULT_STATE) is going away from
+! *** SMG$READ_COMPOSED_LINE in this build (according to Steve Lionel,
+! *** so this "0" is commented out. If Steve's change does not get in,
+! *** the "0" fifth parameter must be put back.
+!
+!    				    0,
+
+
+    				    INP_LENGTH);
+
+    		    ! If we got back a bad status and it was not EOF,
+    		    ! then we try reverting to ordinary RMS input.
+    		    !
+    		    IF (NOT .STATUS)
+    		    AND (.STATUS NEQ RMS$_EOF)
+    		    AND (.STATUS NEQ SMG$_EOF)
+    		    THEN
+    			BEGIN
+    			DBG$GB_KEYPAD_INPUT = FALSE;
+    	    		SIGNAL(dbg$_nokeypad, 1, .status); 
+		        STATUS = $GET(RAB = .INPRAB);
+    		        INP_LENGTH = .INPRAB[RAB$W_RSZ];
+    			END;
+    		    END
+
+
+		! Keypad input is not enabled or we are reading from an indirect
+		! command file.  Hence we do read by calling $GET to read a line
+		! of input.
+		!
+		ELSE
+    		    BEGIN
+		    STATUS = $GET(RAB = .INPRAB);
+    		    INP_LENGTH = .INPRAB[RAB$W_RSZ];
+    		    END;
+
+
+		! If $GET returned a bad status, try to determine why.  If we
+		! got an End-of-File, resume taking input from the next link
+		! in the CIS.  Any other error is simply signalled.
+		!
+		IF NOT .STATUS
+		THEN
+		    BEGIN
+
+
+		    ! Check for an End-of-File--in this case, resume taking
+		    ! input from the next link in the CIS and if none exists,
+		    ! simply exit from DEBUG.
+		    !
+		    IF (.STATUS EQL RMS$_EOF) OR
+    		       (.STATUS EQL SMG$_EOF)
+		    THEN
+			BEGIN
+			IF .DBG$GL_CISHEAD [CIS$B_INPUT_TYPE] EQL CIS_DBG$INPUT
+			THEN
+			    BEGIN
+			    DBG$GV_CONTROL[DBG$V_CONTROL_EXIT] = TRUE;
+			    DBG$GV_CONTROL[DBG$V_CONTROL_USER] = TRUE;
+
+    			    ! Call the SMG exit handler - this resets the
+    			    ! terminal to what it was when we entered.
+    			    !
+    			    IF .DBG$GL_SMG_EXIT_HANDLER NEQ 0
+    			    THEN
+    			        (.DBG$GL_SMG_EXIT_HANDLER)();
+
+			    $EXIT(CODE = .DBG$GL_EXIT_STATUS OR STS$M_INHIB_MSG);
+			    END
+
+			ELSE
+			    DBG$CIS_REMOVE (FALSE);
+
+			END
+
+
+		    ! On any other read problem, simply signal the error.
+		    !
+		    ELSE
+    			BEGIN
+			DBG$GL_READERR_CNT = .DBG$GL_READERR_CNT + 1;
+    			IF .DBG$GB_KEYPAD_INPUT
+    			THEN
+    			    SIGNAL(DBG$_INPREADERR, 0, .STATUS)
+
+    			ELSE
+			    INP_READ_ERROR;
+    			END;
+
+		    END
+
+
+		! There was no read problem--we successfully got the line.
+		!
+		ELSE
+    		    BEGIN
+		    HAVE_A_LINE = TRUE;
+    		    DBG$GL_READERR_CNT = 0;
+    		    END;
+
+		END;
+
+	    END;
+
+	END;				! End of read loop for complete command
+
+
+    ! We have now read a complete command line, including all continuation
+    ! lines.
+    !
+    INPRAB [RAB$V_PTA] = FALSE;
+    IF .DBG$GL_CISHEAD[CIS$B_INPUT_TYPE] EQL CIS_DBG$INPUT
+    THEN
+	BEGIN
+	INPRAB [RAB$L_PBF] = PMT_STRING_2;
+	INPRAB [RAB$B_PSZ] = PMT_SIZE_2;
+    	PROMPT_STG_DESC[DSC$W_LENGTH] = 3;
+    	PROMPT_STG_DESC[DSC$A_POINTER] = UPLIT BYTE
+	    (%ASCII %STRING(%CHAR(CARRIAGE_RET), %CHAR(LINEFEED), '_'));
+
+
+	! If logging is enabled, copy the newly read input line to the LOG file
+	! Note this is only done if we are reading commands from DBG$INPUT,
+	! otherwise DBG$VERIFY_OUT takes care of things.
+	!
+	IF .DBG$GB_DEF_OUT [OUT_LOG]
+	THEN
+	    BEGIN
+
+	    LOCAL
+		CMT_BUF : VECTOR [NO_OF_INP_CHARS + %UPVAL + 1, BYTE];
+
+
+	    ! If this is a comment line, insert a leading "!" if there
+	    ! are less than two already.
+	    !
+	    IF (.INPUT_BUFFER[0] EQL %C'!') AND (.INPUT_BUFFER[1] NEQ %C'!')
+	    THEN
+		BEGIN
+		CMT_BUF[0] = %C'!';
+		LENGTH = MIN(.INP_LENGTH, NO_OF_INP_CHARS - 1);
+		INCR K FROM 0 TO .LENGTH - 1 DO
+		    CMT_BUF [.K + 1] = .INPUT_BUFFER [.K];
+
+		DBG$GL_LOGRAB [RAB$L_RBF] = CMT_BUF;
+		DBG$GL_LOGRAB [RAB$W_RSZ] = .LENGTH + 1;
+		END
+
+	    ELSE
+		BEGIN
+		DBG$GL_LOGRAB [RAB$L_RBF] = INPUT_BUFFER;
+		DBG$GL_LOGRAB [RAB$W_RSZ] = .INP_LENGTH;
+		END;
+
+
+	    ! We were reading from DBG$INPUT and logging is enabled, so we
+	    ! write the read line to the Log file.  If we get a Record Stream
+	    ! Active error, we wait and retry the write operation.  Any other
+	    ! error we simply signal.
+	    !
+	    STATUS = $PUT(RAB = DBG$GL_LOGRAB);
+	    IF .STATUS EQL RMS$_RSA
+	    THEN
+		BEGIN
+		$WAIT(RAB = DBG$GL_LOGRAB);
+		STATUS = $PUT (RAB = DBG$GL_LOGRAB);
+		END;
+
+	    IF NOT .STATUS THEN LOG_WRITE_ERROR;
+	    END;
+
+	END;
+
+    WHILE TRUE DO
+	BEGIN
+
+	LOCAL
+	    CONT_LINE;			! Boolean test for end of line character
+
+
+	! Check for continuation character '-' only if the
+	! length of the input line was greater than zero.
+	!
+	CONT_LINE = FALSE;
+	IF .INP_LENGTH GTR 0
+	THEN
+	    BEGIN
+	    IF .INPUT_BUFFER[.INP_LENGTH - 1] EQL '-'
+	    THEN
+
+    		! Assume '--' at end of line in C is post-decrement operator.
+    		!
+    		IF .DBG$GB_LANGUAGE NEQ DBG$K_C
+    		OR (IF .INP_LENGTH GEQ 2
+    		      THEN .INPUT_BUFFER[.INP_LENGTH - 2] NEQ '-'
+    		      ELSE TRUE)
+    		THEN
+		    BEGIN
+		    INP_LENGTH = .INP_LENGTH - 1;
+		    CONT_LINE = TRUE;
+		    END;
+
+	    END;
+
+
+	! Allocate space for this buffer plus all previous buffers.
+	! If the space can be found, write the old and new buffers
+	! into the new space.
+	!
+	NEW_POINTER = DBG$GET_MEMORY((.PREV_COUNT + NULL_BYTE_LOC +
+						.INP_LENGTH + 3)/4);
+	IF .OLD_POINTER NEQ 0
+	THEN
+	    BEGIN
+	    CH$MOVE(.PREV_COUNT, .OLD_POINTER, .NEW_POINTER);
+	    DBG$REL_MEMORY(.OLD_POINTER);
+	    END;
+
+	CH$MOVE(.INP_LENGTH , INPUT_BUFFER,
+				CH$PLUS(.NEW_POINTER, .PREV_COUNT));
+	PREV_COUNT = .PREV_COUNT + .INP_LENGTH;
+	NEW_POINTER[.PREV_COUNT] = 0;
+	OLD_POINTER = .NEW_POINTER;
+
+
+	! See whether this line ends with a continuation character.  If so, get
+	! another line, either from $GET or the active input Screen Display (if
+	! there is one).  If the $GET or screen read fails, set the status so
+	! that DEBUG returns to the CLI.
+	!
+	IF NOT .CONT_LINE THEN EXITLOOP;
+    	IF .DBG$GB_KEYPAD_INPUT AND
+    	  (.DBG$GL_CISHEAD[CIS$B_INPUT_TYPE] EQL CIS_DBG$INPUT)
+    	THEN
+	    BEGIN
+
+	    ! Set up a string descriptor for the input line.
+	    !
+	    STG_DESC[DSC$B_CLASS] = DSC$K_CLASS_S;
+	    STG_DESC[DSC$B_DTYPE] = DSC$K_DTYPE_T;
+    	    STG_DESC[DSC$W_LENGTH] = NO_OF_INP_CHARS;
+	    STG_DESC[DSC$A_POINTER] = INPUT_BUFFER;
+
+    	    ! Call the keypad input routine.
+    	    !
+    	    INP_LENGTH = 0;
+    	    STATUS = SMG$READ_COMPOSED_LINE (
+    				    DBG$GL_KEYBOARD_ID,
+    				    DBG$GL_KEY_TABLE_ID,
+    				    STG_DESC,
+    				    PROMPT_STG_DESC,
+
+! *** Note - the fifth parameter (DEFAULT_STATE) is going away from
+! *** SMG$READ_COMPOSED_LINE in this build (according to Steve Lionel,
+! *** so this "0" is commented out. If Steve's change does not get in,
+! *** the "0" fifth parameter must be put back.
+!
+!    				    0,
+
+    				    INP_LENGTH);
+    	    ! If we got back a bad status and it was not EOF,
+    	    ! then we try reverting to ordinary RMS input.
+    	    !
+    	    IF (NOT .STATUS)
+    	    AND (.STATUS NEQ RMS$_EOF)
+    	    AND (.STATUS NEQ SMG$_EOF)
+    	    THEN
+    		BEGIN
+    		DBG$GB_KEYPAD_INPUT = FALSE;
+    		SIGNAL(dbg$_nokeypad, 1, .status); 
+		STATUS = $GET(RAB = .INPRAB);
+    		INP_LENGTH = .INPRAB[RAB$W_RSZ];
+    		END;
+    	    END
+
+	ELSE
+    	    BEGIN
+	    STATUS = $GET(RAB = .INPRAB);
+    	    INP_LENGTH = .INPRAB[RAB$W_RSZ];
+    	    END;
+	IF NOT .STATUS 
+    	THEN 
+    	    BEGIN
+	    DBG$GL_READERR_CNT = .DBG$GL_READERR_CNT + 1;
+    	    IF .DBG$GB_KEYPAD_INPUT
+    	    THEN
+    		SIGNAL(DBG$_INPREADERR, 0, .STATUS)
+    	    ELSE
+    	        INP_READ_ERROR;
+    	    END
+
+    	ELSE
+    	    DBG$GL_READERR_CNT = 0;
+
+
+	! Another write to LOG file, but only if we are taking commands
+	! from DBG$INPUT.
+	!
+	IF .DBG$GB_DEF_OUT[OUT_LOG] AND
+	   (.DBG$GL_CISHEAD[CIS$B_INPUT_TYPE] EQL CIS_DBG$INPUT)
+	THEN
+	    BEGIN
+	    DBG$GL_LOGRAB[RAB$L_RBF] = INPUT_BUFFER;
+	    DBG$GL_LOGRAB[RAB$W_RSZ] = .INP_LENGTH;
+	    STATUS = $PUT (RAB = DBG$GL_LOGRAB);
+	    IF .STATUS EQL RMS$_RSA			! Record stream active error
+	    THEN
+		BEGIN
+		$WAIT(RAB = DBG$GL_LOGRAB);	! Wait and retry
+		STATUS = $PUT (RAB = DBG$GL_LOGRAB);
+		END;
+
+	    IF NOT .STATUS THEN LOG_WRITE_ERROR;
+	    END;
+
+	END;
+
+
+    ! A complete line has been collected. Put the just read in
+    ! buffer at the top of the command input stream. Call the parser with
+    ! the address of a string descriptor that describes the
+    ! concatenated input string.
+    !
+    DBG$CIS_ADD (.NEW_POINTER, .PREV_COUNT, CIS_INPBUF, 0, 0);
+    DBG$NCONTROL (.DBG$GL_CISHEAD);
+    RETURN;
+    END;
+
+GLOBAL ROUTINE dbg$exc_handler (signal_arg_ptr, mechan_arg_ptr) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!	Exception analyzer called by the primary vector exception handler,
+!	which is a MARS routine found in DBGSTART.MAR. The MARS routine
+!	immediately resignals if the user program was not running. Otherwise
+!	it saves the registers of the user program and disables ASTs for
+!	the time that DEBUG is running.
+!
+!	Then it calls this routine, where the exception is analyzed for
+!	the type of exception. Breakpoints and trace traps are given
+!	special handling, which usually ends with control being passed
+!	to the user. If the breakpoint or trace trap was illegal, then
+!	the exception is resignaled unless the user has asked for control
+!	on every exception.
+!
+!	Some trace traps cause an interim halt that requires some action,
+!	but doesn't pass control back to the user. After checking the
+!	validity of these trace traps, the value ss$_continue is returned.
+!
+!	After the exception is analyzed and it is determined that immediate
+!	resignaling or continuing is not desired, the user_proc routine is
+!	called. This routine accepts user commands either from prespecified
+!	action commands from breakpoints, or interactively from the terminal.
+!	Eventually, a command is given that either causes the user program
+!	to continue or DEBUG to exit. If the user program is to continue,
+!	the value returned from user_proc is ss$_continue, and that value
+!	is passed back to the MARS handler.
+!
+!	If an exception occurs during DEBUG processing, the exception
+!	handler is final_handl, not this routine.
+!
+! FORMAL PARAMETERS:
+!	signal_arg_ptr	- address of block that contains at least four longwords.
+!			  THE PERTINENT WORDS ARE THE EXCEPTION NAME, THE
+!			  PC AT THE TIME OF THE EXCEPTION, AND THE PSL AT
+!			  THE TIME OF THE EXCEPTION. THE NAME IS ALWAYS
+!			  THE SECOND LONGWORD, THE PC AND THE PSL THE NEXT
+!			  TO LAST AND LAST RESPECTIVELY.
+!	mechan_arg_ptr	- address of block that contains five longwords.
+!			  THE PERTINENT WORDS ARE THE SAVED R0 AND R1.
+!			  THEY ARE IN THE FOURTH AND FIFTH LONGWORDS RESPECTIVELY.
+!			  NEITHER IS USED AT THIS TIME.
+!
+! IMPLICIT INPUTS:
+!	SOME VARIABLE NUMBER OF ADDITIONAL ARGUMENTS MAY EXIST BETWEEN THE EXCEPTION
+!	NAME AND THE PC. FLAGS INDICATING THE VALIDITY OF TBITS AND BREAKPOINTS
+!	ARE REFERENCED. THE FLAG DBG$GB_RESIGNAL CAUSES ILLEGAL EXCEPTIONS TO
+!	BE RESIGNALED IF THE FLAG IS SET TO TRUE.
+!
+! IMPLICIT OUTPUTS:
+!	The TBIT in the RUNFRAME PSL may be changed.
+!
+! ROUTINE VALUE:
+!	ss$_resignal OR ss$_continue FOR RESIGNALING AND CONTINUING
+!	RESPECTIVELY.
+!
+! SIDE EFFECTS:
+!	ANY NUMBER OF THINGS.
+!--
+
+	BEGIN
+
+	MAP
+		signal_arg_ptr : REF VECTOR;
+
+	LOCAL
+		dummy,
+		string_desc : BLOCK [8,BYTE],
+		sig_arg_count;
+
+
+	! If the EVENT developer bit is on, call DBG$EXCEPTION_HANDLER
+	! instead of anything else here....
+    	! With the conversion to the new eventpoint code, just call
+    	! the new exception handler here...
+	!
+	RETURN DBG$EXCEPTION_HANDLER (.SIGNAL_ARG_PTR, .MECHAN_ARG_PTR);
+    	END;
+
+GLOBAL	ROUTINE	dbg$exception_is_fault	(exception) =
+!++
+!
+! Functional Description:
+!
+!	Given an exception name - the longword which encodes the
+!	type, etc, of an exception - deduce if this exception is
+!	the so-called FAULT_EXC type.  This is for the PC_TO_LINE
+!	translation - we have to know if the PC is on the instruction
+!	which caused the exception, or if it is on the next instruction.
+!
+!	The answer to the question is simply whether
+!	the given EXC_NAME is in our table of exceptions.  The only
+!	trickery is that this routine makes sure only to look at
+!	the part of the longword which encodes the error code - and
+!	not at the rest of it since that may change.
+!
+! Formal Parameters:
+!
+!	EXCEPTION - the longword system-defined exception name.
+!
+! Routine Value:
+!
+!	TRUE or FALSE.  See above.
+!
+! Side Effects:
+!	None.
+!--
+
+BEGIN	MAP	exception :	BLOCK	[%UPVAL, BYTE];
+
+	BIND	! The 0-ended list of exception codes.
+
+		exception_list =	UPLIT WORD
+					(	SS$_ACCVIO,
+						SS$_NOTRAN,
+						SS$_RADRMOD,
+						SS$_ROPRAND,
+						SS$_OPCDEC,
+						SS$_OPCCUS,
+						SS$_BREAK,
+						SS$_FLTOVF_F,
+						SS$_FLTUND_F,
+						SS$_FLTDIV_F,
+						SS$_TBIT,
+						SS$_COMPAT,
+						0
+					) :	VECTOR	[, WORD];
+
+	! Simply loop thru the list checking each one,
+	! ending when the 0 one is encountered.
+	!
+	INCR	i
+	FROM	0
+	DO	BEGIN	LOCAL	list_entry :	BLOCK	[%UPVAL, BYTE];
+
+			IF	((list_entry = .exception_list [.i]) EQL 0)
+			THEN	EXITLOOP;
+
+    			IF      (.exception [STS$V_FAC_NO] EQL 0) AND
+    				(.exception [STS$V_MSG_NO] EQL .list_entry [STS$V_MSG_NO])
+			THEN	RETURN	(TRUE);
+		END;
+
+	! Entry not found in the exception list.
+
+	RETURN	(FALSE);
+END;
+
+GLOBAL ROUTINE DBG$PUTMSG (SIG_ARG_LIST) : NOVALUE =
+!
+! FUNCTION
+!	Reports a message by calling SYS$PUTMSG with an action routine
+!	address of a routine to write the formatted string to DBG$OUTPUT.
+!	This routine checks the exception name to see if the exception is not
+!	a hardware exception.  If it is not a hardware exception 2 is sub-
+!	tracted from the signal argument list count before calling SYS$PUTMSG.
+!	After SYS$PUTMSG returns the original count is restored.
+!
+! INPUTS
+!	SIG_ARG_LIST	- The address of the signal argument list.
+!
+! OUTPUTS
+!	NONE
+!
+
+    BEGIN
+
+    LOCAL
+	ORIG_ARG_COUNT,			!
+	INDEX,				!
+	EXCEP_NAME: BLOCK[%UPVAL,BYTE],	!
+	TABLE_VALUE: BLOCK[%UPVAL,BYTE];!
+
+    MAP
+	SIG_ARG_LIST: REF VECTOR;	! The input signal argument list
+
+    BIND
+	HARDWARE_EXCEP = UPLIT WORD(SS$_ACCVIO, SS$_ARTRES, SS$_INTOVF,
+				SS$_INTDIV, SS$_FLTOVF, SS$_FLTDIV, SS$_FLTUND,
+				SS$_DECOVF, SS$_SUBRNG, SS$_ASTFLT, SS$_BREAK,
+				SS$_CMODSUPR, SS$_CMODUSER, SS$_COMPAT,
+				SS$_DEBUG, SS$_OPCCUS, SS$_OPCDEC, SS$_PAGRDERR,
+				SS$_RADRMOD, SS$_ROPRAND, SS$_SSFAIL, SS$_TBIT,
+				0): VECTOR[,WORD];
+
+
+
+    ! Get the original argument count and the exception name.
+    !
+    ORIG_ARG_COUNT = .SIG_ARG_LIST[0];
+    EXCEP_NAME = .SIG_ARG_LIST[1];
+    IF (.EXCEP_NAME [STS$V_FAC_NO] NEQ 0)	! Not SYSTEM facility
+    THEN
+	SIG_ARG_LIST[0] = .SIG_ARG_LIST[0] - 2
+
+    ELSE
+	BEGIN
+	INDEX = 0;
+
+
+	! This loop will exit with -1 if the exception name is not found.
+	! In that case we must subtract 2 from the signal argument list
+	! argument count before calling SYS$PUTMSG.
+	!
+	IF (WHILE (.HARDWARE_EXCEP[.INDEX] NEQ 0) DO
+		BEGIN
+		TABLE_VALUE = .HARDWARE_EXCEP [.INDEX];	! pick up next value
+
+		IF (.EXCEP_NAME [STS$V_MSG_NO] EQL .TABLE_VALUE [STS$V_MSG_NO])
+		THEN
+		    EXITLOOP 0;
+
+		INDEX = .INDEX + 1;
+		END
+	    )
+	THEN
+	    SIG_ARG_LIST [0] = .SIG_ARG_LIST [0] - 2;
+
+	END;
+
+    SYS$PUTMSG (.SIG_ARG_LIST, DBG$OUT_MESSAGE, 0);
+    SIG_ARG_LIST [0] = .ORIG_ARG_COUNT;
+    END;
+END ELUDOM

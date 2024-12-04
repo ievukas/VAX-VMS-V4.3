@@ -1,0 +1,821 @@
+MODULE PAS$HEAP ( %TITLE 'NEW, DISPOSE, MARK and RELEASE procedures'
+		IDENT = '1-002'			! File: PASHEAP.B32 Edit: SBL1002
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	Pascal Language Support
+!
+! ABSTRACT:
+!
+!	This module contains the procedures which implement VAX-11 Pascal
+!	heap storage management.  The language names for these procedures
+!	are NEW, DISPOSE, MARK and RELEASE.
+!
+! ENVIRONMENT:	User mode - AST reentrant
+!
+! AUTHOR: Steven B. Lionel, CREATION DATE: 8-June-1981
+!
+! MODIFIED BY:
+!
+! 1-001	- Original.  SBL 8-June-1981
+! 1-002 - Add DISPOSE_HANDLER to turn ACCVIOs during DISPOSEs into ERRDURDIS.
+!	  SBL 12-July-1982
+!--
+
+
+%SBTTL 'Declarations'
+!
+! PROLOGUE DEFINITIONS
+!
+
+REQUIRE 'RTLIN:PASPROLOG';			! Externals, linkages, PSECTs, structures
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+    PAS$NEW2,					! Allocate new storage
+    PAS$DISPOSE2: NOVALUE,			! Free a single item
+    PAS$MARK2,					! Mark place on allocated list
+    PAS$RELEASE2: NOVALUE,			! Free all allocated since mark
+    INITIALIZE_QUEUE: NOVALUE,			! Initialize the queue
+    DISPOSE_HANDLER;				! Error handler for DISPOSE
+
+!
+! MACROS:
+!
+!	NONE
+!
+! EQUATED SYMBOLS:
+!
+
+LITERAL
+    PAS$K_HEAP_HDRSIZ = 8;			! Size of item header info (unmarked)
+
+!
+! FIELDS:
+!
+
+!+
+! Fields in item header
+!-
+
+FIELD
+    PAS$HEAP_FIELDS = 
+	SET
+
+	PAS$Q_HEAP_QLINK  = [-16,0,32,0],	! Link in double-linked queue
+	PAS$Q_HEAP_HDR    = [-8,0,0,0],		! Offset of non-marked header
+	PAS$L_HEAP_SIZE   = [-8,0,32,0],	! Size of allocated storage
+	PAS$W_HEAP_FLAGS  = [-4,0,16,0],	! Status flags
+	PAS$V_HEAP_DEALL  = [-4,0,1,0],		! Item has been deallocated
+	PAS$V_HEAP_MARKER = [-4,1,1,0],		! Item is a marker
+	PAS$V_HEAP_MARKED = [-4,2,1,0],		! Item is on marked queue
+	PAS$W_ADDR_CHECK  = [-4,16,16,0]	! Low word of item address
+						! (for validity check)
+
+	TES;
+
+!
+! OWN STORAGE:
+!
+
+!+
+! Declare head of queue to which we will link items which have been
+! allocated since a MARK.
+!-
+OWN
+    MARKED_HEAP_QUEUE: VECTOR [2, LONG],
+    QUEUE_INITIALIZED: INITIAL (0);
+
+%SBTTL 'PAS$NEW2 - Allocate new heap storage item'
+GLOBAL ROUTINE PAS$NEW2(			! Allocate new heap storage item
+	SIZE					! Item size in bytes
+    ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This procedure implements the Pascal NEW function.  It allocates
+!	heap storage of the specified size and returns a pointer to that
+!	storage to the caller.
+!
+! CALLING SEQUENCE:
+!
+!	pointer.wa.v = PAS$NEW2 (size.rlu.v)
+!
+! FORMAL PARAMETERS:
+!
+!	size		The size of the requested item in bytes.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	The pointer to the beginning of the user storage for the item.
+!
+! SIDE EFFECTS:
+!
+!	Calls LIB$GET_VM to allocate heap storage.
+!	May signal PAS$_ERRDURNEW, error during NEW
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	ITEM: REF BLOCK [, BYTE] FIELD (PAS$HEAP_FIELDS),
+						! Address of allocated storage
+	ALLOC_SIZE,				! Size of allocated storage
+	MARKED,					! 1 if to be placed on MARKED queue
+	STATUS;					! Status return from LIB$GET_VM
+
+    BUILTIN
+	INSQUE;
+
+    !+
+    ! Set MARKED flag depending on whether or not a MARK is in effect.  
+    ! At the same time, determine ALLOC_SIZE depending on whether or not
+    ! the item is to be marked.
+    !-
+
+    IF .MARKED_HEAP_QUEUE [0] NEQ 0	! Queue not empty?
+    THEN
+	BEGIN
+	MARKED = 1;
+	ALLOC_SIZE = .SIZE + PAS$K_HEAP_HDRSIZ + 8;
+	END
+    ELSE
+	BEGIN
+	MARKED = 0;
+	ALLOC_SIZE = .SIZE + PAS$K_HEAP_HDRSIZ;
+	END;
+
+    !+
+    ! Allocate heap storage for item.
+    !-
+
+    STATUS = LIB$GET_VM (ALLOC_SIZE, ITEM);
+    IF NOT .STATUS
+    THEN
+	BEGIN
+	SIGNAL_STOP (PAS$_ERRDURNEW,0,.STATUS);
+	RETURN 0;
+	END;
+
+    !+
+    ! Zero-fill header and storage.
+    !-
+
+	BEGIN
+	LOCAL
+	    PTR,			! Current pointer to item
+	    BYTES_LEFT;			! Remaining size to fill
+	PTR = .ITEM;
+	BYTES_LEFT = .ALLOC_SIZE;
+	WHILE (.BYTES_LEFT GTRU 65535) DO
+	    BEGIN
+	    PTR = CH$FILL (0, 65535, .PTR);
+	    BYTES_LEFT = .BYTES_LEFT - 65535
+	    END;
+	CH$FILL (0, .BYTES_LEFT, .PTR);
+	END;
+
+    !+
+    ! Set ITEM to point to beginning of user storage.
+    !-
+
+    IF .MARKED
+    THEN
+	ITEM = .ITEM + PAS$K_HEAP_HDRSIZ + 8
+    ELSE
+	ITEM = .ITEM + PAS$K_HEAP_HDRSIZ;
+
+    !+
+    ! Set appropriate values in header.
+    !-
+
+    ITEM [PAS$L_HEAP_SIZE] = .ALLOC_SIZE;
+    ITEM [PAS$W_ADDR_CHECK] = .ITEM;		! Low word of item address
+						! for consistency check
+
+    !+
+    ! If a MARK is in effect, link this item on the queue.
+    !-
+
+    IF .MARKED
+    THEN
+	BEGIN
+	IF NOT .QUEUE_INITIALIZED
+	THEN
+	    INITIALIZE_QUEUE ();
+	ITEM [PAS$V_HEAP_MARKED] = 1;		! Note item as marked
+	INSQUE (ITEM [PAS$Q_HEAP_QLINK], MARKED_HEAP_QUEUE);	! Insert at head
+	END;
+
+    RETURN .ITEM;				! Return pointer to user storage
+
+    END;					! End of routine PAS$NEW2
+!<BLF/PAGE>
+
+%SBTTL 'PAS$DISPOSE2 - Deallocate heap storage item'
+GLOBAL ROUTINE PAS$DISPOSE2(				! Deallocate heap storage item
+	POINTER						! Pointer expression
+    ) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This procedure implements the Pascal DISPOSE function.  It deallocates
+!	the specified item which is presumed to have been allocated using
+!	the NEW function.
+!
+! CALLING SEQUENCE:
+!
+!	PAS$DISPOSE2 (pointer.ra.v)
+!
+! FORMAL PARAMETERS:
+!
+!	pointer		The address of the item to dispose.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	May call LIB$FREE_VM to deallocate heap storage.
+!	May signal PAS$_ERRDURDIS, error during DISPOSE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	ITEM: REF BLOCK [, BYTE] FIELD (PAS$HEAP_FIELDS), ! Allocated item
+	STATUS;					! Status return from LIB$FREE_VM
+
+    !+
+    ! Enable an error handler to turn ACCVIOs into PAS$_ERRDURDIS.
+    !-
+
+    ENABLE DISPOSE_HANDLER;
+
+    !+
+    ! Get actual address of item.
+    !-
+
+    ITEM = .POINTER;
+
+    !+
+    ! If consistency check word does not match the low word of the item
+    ! address, signal an error.
+    !-
+
+    IF .ITEM [PAS$W_ADDR_CHECK] NEQ .ITEM<0,16>
+    THEN
+	BEGIN
+	SIGNAL_STOP (PAS$_ERRDURDIS,0,0);	! Extra args to allow cross-jumping
+	RETURN;
+	END;
+
+    !+
+    ! If item is a marker, it's an error to try and DISPOSE it.  Also if
+    ! the item has already been disposed, then it's an error.
+    !-
+
+    IF .ITEM [PAS$V_HEAP_MARKER] OR .ITEM [PAS$V_HEAP_DEALL]
+    THEN
+	BEGIN
+	SIGNAL_STOP (PAS$_ERRDURDIS,0,0);	! Extra args to allow cross-jumping
+	RETURN;
+	END;
+
+    !+
+    ! Set the DEALL flag so that it can't be DISPOSEd in the future.
+    !-
+
+    ITEM [PAS$V_HEAP_DEALL] = 1;
+
+    !+
+    ! If item is on the marked queue, just return.
+    ! We assume a future RELEASE will actually delete it.
+    !-
+
+    IF .ITEM [PAS$V_HEAP_MARKED]
+    THEN
+	RETURN;
+
+    !+
+    ! We know that it's not marked, so call LIB$FREE_VM to free the
+    ! allocated storage.
+    !-
+
+    ITEM [PAS$W_ADDR_CHECK] = 0;
+    STATUS = LIB$FREE_VM (ITEM [PAS$L_HEAP_SIZE], %REF(ITEM [PAS$Q_HEAP_HDR]));
+    IF NOT .STATUS
+    THEN
+	BEGIN
+	SIGNAL_STOP (PAS$_ERRDURDIS,0,.STATUS);
+	RETURN;
+	END;
+
+    RETURN;
+
+    END;					! End of routine PAS$DISPOSE2
+!<BLF/PAGE>
+
+%SBTTL 'PAS$MARK2 - Mark place on allocated list'
+GLOBAL ROUTINE PAS$MARK2(			! Mark place on allocated list
+	SIZE					! Item size in bytes
+     ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This procedure implements the Pascal MARK function.  It 
+!	allocates new storage, like NEW, but marks it in such a
+!	way that a future call to PAS$RELEASE2, specifying the
+!	pointer value given by PAS$MARK, will free all storage
+!	allocated since the call to PAS$MARK.
+!
+!	NOTE!  MARK and RELEASE are not supported as intrinsic
+!	functions in the VAX-11 Pascal compiler.  They are provided
+!	here solely for compatibility with the VAX-11 Pascal V1
+!	compiler which used MARK and RELEASE in the compiler sources.
+!
+! CALLING SEQUENCE:
+!
+!	pointer.wa.v = PAS$MARK2 (size.rlu.v)
+!
+! FORMAL PARAMETERS:
+!
+!	size		The size of the requested item in bytes.
+!
+! IMPLICIT INPUTS:
+!
+!	MARKED_HEAP_QUEUE
+!
+! IMPLICIT OUTPUTS:
+!
+!	A marker is created and linked onto the marked heap queue.
+!
+! ROUTINE VALUE:
+!
+!	The pointer to the marker
+!
+! SIDE EFFECTS:
+!
+!	Calls LIB$GET_VM to allocate heap storage.
+!	May signal PAS$_ERRDURMAR, error during MARK
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	ITEM: REF BLOCK [, BYTE] FIELD (PAS$HEAP_FIELDS),
+						! Address of item
+	STATUS;					! Status return from LIB$GET_VM
+
+    BUILTIN
+	INSQUE;
+
+
+    !+
+    ! Allocate storage for the marker.
+    !-
+
+    STATUS = LIB$GET_VM (%REF(.SIZE+PAS$K_HEAP_HDRSIZ+8), ITEM);
+    IF NOT .STATUS
+    THEN
+	BEGIN
+	SIGNAL_STOP (PAS$_ERRDURMAR,0,.STATUS);
+	RETURN 0;
+	END;
+
+    !+
+    ! Zero-fill header and storage.
+    !-
+
+	BEGIN
+	LOCAL
+	    PTR,			! Current pointer to item
+	    BYTES_LEFT;			! Remaining size to fill
+	PTR = .ITEM;
+	BYTES_LEFT = .SIZE+PAS$K_HEAP_HDRSIZ+8;
+	WHILE (.BYTES_LEFT GTRU 65535) DO
+	    BEGIN
+	    PTR = CH$FILL (0, 65535, .PTR);
+	    BYTES_LEFT = .BYTES_LEFT - 65535;
+	    END;
+	CH$FILL (0, .BYTES_LEFT, .PTR);
+	END;
+
+    !+
+    ! Initialize the item
+    !-
+
+    ITEM = .ITEM + PAS$K_HEAP_HDRSIZ + 8;
+    ITEM [PAS$V_HEAP_MARKED] = 1;
+    ITEM [PAS$V_HEAP_MARKER] = 1;
+    ITEM [PAS$L_HEAP_SIZE] = .SIZE + PAS$K_HEAP_HDRSIZ + 8;
+    ITEM [PAS$W_ADDR_CHECK] = .ITEM;	! For consistency check
+
+    !+
+    ! Insert it on the queue
+    !-
+
+    IF NOT .QUEUE_INITIALIZED
+    THEN
+	INITIALIZE_QUEUE ();
+    INSQUE (ITEM [PAS$Q_HEAP_QLINK], MARKED_HEAP_QUEUE);
+
+    RETURN .ITEM;				! Return to caller
+
+    END;					! End of routine PAS$MARK2
+!<BLF/PAGE>
+
+%SBTTL 'PAS$RELEASE2 - Free all allocated storage since MARK'
+GLOBAL ROUTINE PAS$RELEASE2(				! Free all allocated storage since MARK
+    	POINTER: REF VECTOR [, LONG]			! Marked item
+    ) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This procedure implements the Pascal RELEASE function.  It deallocates
+!	all storage allocated with NEW since the specified MARK was performed.
+!
+!	NOTE!  MARK and RELEASE are not defined as intrinsic functions by
+!	the VAX-11 Pascal compiler.
+!
+! CALLING SEQUENCE:
+!
+!	PAS$DISPOSE2 (pointer.ra.r)
+!
+! FORMAL PARAMETERS:
+!
+!	pointer			The address of the item allocated by a 
+!				previous call to PAS$MARK2.
+!
+! IMPLICIT INPUTS:
+!
+!	MARKED_HEAP_QUEUE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Disables and reenables AST delivery.
+!	Calls LIB$FREE_VM to deallocate heap storage.
+!	Removes allocated items from the heap storage queue.
+!	May signal PAS$_ERRDURREL, error during RELEASE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	ITEM: REF BLOCK [, BYTE] FIELD (PAS$HEAP_FIELDS),	! Heap marker
+	CUR_ITEM: REF BLOCK [, BYTE] FIELD (PAS$HEAP_FIELDS);	! Current item
+
+    BUILTIN
+	REMQUE;
+
+    !+
+    ! Get actual address of item.
+    !-
+
+    ITEM = .POINTER [0];
+
+    !+
+    ! If the pointer is zero, it isn't an allocated item.
+    !-
+
+    IF .ITEM EQL 0
+    THEN
+	BEGIN
+	SIGNAL_STOP (PAS$_ERRDURREL);
+	RETURN;
+	END;
+
+    !+
+    ! If consistency check word doesn't match low word of item
+    ! address, signal an error.
+    !-
+
+    IF .ITEM [PAS$W_ADDR_CHECK] NEQ .ITEM<0,16>
+    THEN
+	BEGIN
+	SIGNAL_STOP (PAS$_ERRDURREL);
+	RETURN;
+	END;
+
+    !+
+    ! If ITEM is in fact not a marker, signal an error.
+    !-
+
+    IF NOT .ITEM [PAS$V_HEAP_MARKER]
+    THEN
+	BEGIN
+	SIGNAL_STOP (PAS$_ERRDURREL);
+	RETURN;
+	END;
+
+    !+
+    ! If marker has already been "deallocated" by a previous RELEASE, free
+    ! the storage it uses.
+    !-
+
+    IF .ITEM [PAS$V_HEAP_DEALL]
+    THEN
+	BEGIN
+	LOCAL
+	    STATUS;
+
+	ITEM [PAS$V_HEAP_MARKER] = 0;	! Set so that it can't be RELEASEd
+					! again.
+	STATUS = LIB$FREE_VM (ITEM [PAS$L_HEAP_SIZE], 
+		             %REF(ITEM [PAS$Q_HEAP_QLINK]));
+	IF NOT .STATUS
+	THEN
+	    BEGIN
+	    SIGNAL_STOP (PAS$_ERRDURREL,0,.STATUS);
+	    RETURN;
+	    END;
+	END
+   
+    ELSE
+
+	BEGIN
+    
+	LOCAL
+	    AST_STATUS;			! Status of AST enable
+
+	!+
+	! Disable AST delivery.
+	!-
+
+	AST_STATUS = $SETAST (ENBFLG=0);
+
+	!+
+	! Start removing items from the tail of the marked heap queue and
+	! deallocating them until we come to the marker.
+	!-
+    
+	IF NOT .QUEUE_INITIALIZED
+	THEN
+	    INITIALIZE_QUEUE ();
+	WHILE 1 DO
+	    BEGIN
+	    IF REMQUE (.MARKED_HEAP_QUEUE, CUR_ITEM)	! TRUE if it fails (!)
+	    THEN
+		BEGIN
+		SIGNAL_STOP (PAS$_ERRDURREL);
+		RETURN;
+		END;
+	    CUR_ITEM = .CUR_ITEM + PAS$K_HEAP_HDRSIZ + 8;	! Point to data area
+    
+	    !+
+	    ! If this is a marker, but not the one we're releasing to,
+	    ! mark it for deallocation.  Otherwise, free the item.
+	    !-
+	    IF .CUR_ITEM [PAS$V_HEAP_MARKER] AND (.CUR_ITEM NEQA .ITEM)
+	    THEN
+		CUR_ITEM [PAS$V_HEAP_DEALL] = 1
+	    ELSE
+		BEGIN
+	
+		LOCAL
+		    STATUS;
+
+		CUR_ITEM [PAS$V_HEAP_DEALL] = 1;	! Set as protection against
+							! another attempt to DISPOSE it.
+	
+		STATUS = LIB$FREE_VM (CUR_ITEM [PAS$L_HEAP_SIZE],
+			              %REF(CUR_ITEM [PAS$Q_HEAP_QLINK]));
+		IF NOT .STATUS
+		THEN
+		    BEGIN
+		    SIGNAL_STOP (PAS$_ERRDURREL,0,.STATUS);
+		    RETURN;
+		    END;
+    
+		END;
+    
+	    IF .CUR_ITEM EQLA .ITEM
+	    THEN
+		EXITLOOP;
+    
+	    END;
+
+	!+
+	! Reenable ASTs if previously enabled.
+	!-
+
+	IF .AST_STATUS EQL SS$_WASSET
+	THEN
+	    $SETAST (ENBFLG=1);
+
+	END;
+
+    RETURN;
+
+    END;					! End of routine PAS$RELEASE2
+!<BLF/PAGE>
+
+%SBTTL 'INITIALIZE_QUEUE - Initialize MARKED_HEAP_QUEUE'
+ROUTINE INITIALIZE_QUEUE  
+    : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Initializes MARKED_HEAP_QUEUE to be an empty queue.
+!
+! CALLING SEQUENCE:
+!
+!	INITIALIZE_QUEUE ()
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	MARKED_HEAP_QUEUE
+!	QUEUE_INITIALIZED
+!
+! IMPLICIT OUTPUTS:
+!
+!	MARKED_HEAP_QUEUE	
+!	QUEUE_INITIALIZED
+!
+! COMPLETION STATUS: 
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Makes MARKED_HEAP_QUEUE an empty queue.
+!
+! SIGNALLED ERRORS:
+!
+!	NONE
+!--
+
+    BEGIN
+
+    LOCAL
+	AST_STATUS;				! Previous AST enable status
+
+    BUILTIN
+	TESTBITCS;
+
+    !+
+    ! Disable ASTs.
+    !-
+
+    AST_STATUS = $SETAST (ENBFLG = 0);
+
+    !+
+    ! If QUEUE_INITIALIZED is still clear, initialize MARKED_HEAP_QUEUE to
+    ! be an empty queue.  Set QUEUE_INITIALIZED.
+    !-
+
+    IF TESTBITCS (QUEUE_INITIALIZED)
+    THEN
+	BEGIN
+	MARKED_HEAP_QUEUE [0] = MARKED_HEAP_QUEUE;	! Set forward link
+	MARKED_HEAP_QUEUE [1] = .MARKED_HEAP_QUEUE [0];	! Set backward link
+	END;
+
+    !+
+    ! Reenable ASTs if previously enabled.
+    !-
+
+    IF .AST_STATUS EQL SS$_WASSET
+    THEN
+	$SETAST (ENBFLG = 1);
+
+    RETURN;
+
+    END;					! End of routine INITIALIZE_QUEUE
+
+!<BLF/PAGE>
+
+%SBTTL 'DISPOSE_HANDLER - Error handler for DISPOSE'
+ROUTINE DISPOSE_HANDLER (
+    SIGNAL_ARGS: REF BLOCK [, BYTE],		! Signal arguments list
+    MECHANISM_ARGS: REF BLOCK [, BYTE]		! Mechanism arguments list
+    ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	DISPOSE_HANDLER is a condition handler enabled by DISPOSE.  It converts
+!	zero-level access violations into PAS$_ERRDURDIS.  It is presumed that
+!	any access violations in DISPOSE are caused by invalid pointers.
+!
+! CALLING SEQUENCE:
+!
+!	ret_status.wlc.v = DISPOSE_HANDLER (signal_args.mz.r, mechanism_args.rz.r)
+!
+! FORMAL PARAMETERS:
+!
+!	SIGNAL_ARGS	- The signal arguments list
+!	MECHANISM_ARGS	- The mechanism arguments list
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS: 
+!
+!	SS$_RESIGNAL
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+! SIGNALLED ERRORS:
+!
+!	NONE
+!--
+
+    BEGIN
+
+    IF .SIGNAL_ARGS [CHF$L_SIG_NAME] EQLU SS$_ACCVIO AND
+       .MECHANISM_ARGS [CHF$L_MCH_DEPTH] EQL 0
+    THEN
+	BEGIN
+	!+
+	! Change SS$_ACCVIO to PAS$_ERRDURDIS.
+	!-
+
+	SIGNAL_ARGS [CHF$L_SIG_NAME] = PAS$_ERRDURDIS;
+	SIGNAL_ARGS [12,0,32,0] = 0;	! FAO Argument count
+	SIGNAL_ARGS [16,0,32,0] = 0;	! Erase original SS$_ACCVIO arguments
+	SIGNAL_ARGS [20,0,32,0] = 0;
+	END;
+
+    RETURN SS$_RESIGNAL;
+
+    END;					! End of routine DISPOSE_HANDLER
+
+!<BLF/PAGE>
+
+END						! End of module PAS$HEAP
+
+ELUDOM

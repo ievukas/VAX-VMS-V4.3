@@ -1,0 +1,1057 @@
+%TITLE 'Special service routines'
+MODULE MOMSUBS (
+		LANGUAGE (BLISS32),
+		ADDRESSING_MODE (NONEXTERNAL=GENERAL),
+		ADDRESSING_MODE (EXTERNAL=GENERAL),
+		IDENT = 'V04-000'
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:  DECnet-VAX Network Maintenance Operations Module (MOM)
+!
+! ABSTRACT:
+!	This module contains utility routines used for maintenance operations.
+!
+! ENVIRONMENT:  VAX/VMS Operating System
+!
+! AUTHOR:  Kathy Perko
+!
+! CREATION DATE:  6-Jan-1983
+!
+! MODIFIED BY:
+!	V03-005 MKP0005		Kathy Perko		26-June-1984
+!		If sending a BOOT message for a LOAD command, set the bit
+!		that tells the target to perform the load from this host.
+!
+!	V03-004 MKP0004		Kathy Perko		12-April-1984
+!		Change padding on SERVICE PASSWORD to zero instead of high
+!		byte.
+!
+!	V03-003 MKP0003		Kathy Perko		20-Jan-1984
+!		Add SERVICE NODE VERSION parameter.
+!		Pad the service password in the boot message with the
+!		high byte.
+!
+!	V03-002	MKP0002		Kathy Perko		23-May-1983
+!		When building the MOP Parameter Load with Transfer Address
+!		message, mask out the area number if the target isn't on the
+!		NI (this is a temporary way of identifying Phase III targets).
+!		
+!	V03-001	MKP0001		Kathy Perko		11-May-1983
+!		Fix length of password put into MOP boot message.
+!
+!--
+
+
+%SBTTL 'Declarations'
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+    mom$getsrvdata  	: NOVALUE,
+    mom$get_circuit_type: NOVALUE,
+    mom$get_node_id	: NOVALUE,
+    mom$getsrvtimer	: NOVALUE,
+    mom$get_voldb_data,
+    mom_get_circ_search2_key: NOVALUE,
+    mom$bldmoprds	: NOVALUE,
+    mom$bldmopboot	: NOVALUE,
+    mom$bldmopplt	: NOVALUE;
+
+!
+! INCLUDE FILES:
+!
+
+LIBRARY 'LIB$:MOMLIB.L32';
+LIBRARY 'SHRLIB$:NMALIBRY.L32';
+LIBRARY 'SHRLIB$:NET.L32';
+LIBRARY 'SYS$LIBRARY:STARLET.L32';
+
+!
+! OWN STORAGE:
+!
+
+OWN
+    mom$t_p2buffer : VECTOR [mom$k_p2_buf_len, BYTE];	! P2 QIO buffer
+
+BIND
+    mom$q_p2_buf_dsc  = UPLIT (mom$k_p2_buf_len, mom$t_p2buffer) : VECTOR [2];
+
+!
+! EXTERNAL REFERENCES:
+!
+
+$mom_externals;				! Define external service data
+
+EXTERNAL
+    mom$npa_load,
+    mom$npa_cirloop,
+    mom$npa_trigger;
+ 
+EXTERNAL ROUTINE
+    mom$bld_reply,
+    mom$build_p2,
+    mom$error,
+    mom$debug_msg,
+    mom$debug_txt,
+    mom$netacp_qio;
+
+%SBTTL 'mom$getsrvdata  Build the service data base'
+GLOBAL ROUTINE mom$getsrvdata : NOVALUE =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine gets the information needed for a maintenance operation
+!	from the target node's volatile data base entry.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Signal errors.
+!
+!--
+ 
+BEGIN
+
+LOCAL
+    datptr,
+    string_len,
+    p4_buf_dsc : VECTOR [2],
+    qio_p4_buffer : BBLOCK [mom$k_qio_buf_len];
+
+IF .mom$gb_function NEQ nma$c_fnc_tes THEN
+    BEGIN
+    !
+    ! Get the maintenance parameters from NETACPs node database entry for the
+    ! target node.
+    !
+    p4_buf_dsc [0] = mom$k_qio_buf_len;
+    p4_buf_dsc [1] = qio_p4_buffer;
+
+    mom$get_voldb_data (nfb$c_db_ndi, p4_buf_dsc);
+    !
+    ! Build the service data table.  This table contains the values of longword
+    ! parameters, and pointers to string parameters.
+    !
+    datptr = qio_p4_buffer;
+    !
+    ! Some parameters have already been extracted from the NICE or MOP message
+    ! and inserted in the Service Data table.  These take precedence over
+    ! what's in the volatile database.  So, move the rest of the service
+    ! parameters from the QIOs P4 buffer into Service Data Table.
+    ! The field IDs were put into the NFB in the order they are in in the
+    ! Service Data Table.  Extract the parameter values from the P4 buffer
+    ! in the same order.
+    !
+    INCR i FROM 0 TO svd$c_entry_count DO
+	BEGIN
+	!
+	! If the parameter value is obtained from the remote node (NDI)
+	! database and it hasn't already been set by the NICE or MOP message,
+	! put it into the Service Data Table.
+	!
+	IF .mom$ab_service_data [.i, svd$b_nfb_database]
+					EQL nfb$c_db_ndi THEN
+            BEGIN
+	    IF .mom$ab_service_data [.i, svd$b_nice_type] NEQ
+						svd$k_string THEN
+		!
+		! If the parameter isn't a string and a value was returned
+		! for it, move its value into the Service Data Table.
+		!
+		BEGIN
+		IF ..datptr GTR -1 AND
+	           NOT .mom$ab_service_data [.i, svd$v_msg_param] THEN
+		    mom$ab_service_data [.i, svd$l_param] = ..datptr;
+		datptr = .datptr + 4;
+		END
+	    ELSE
+		!
+		! If the parameter is a string, and a value was returned for
+		! it, move the string into Service Data Table.
+		!
+		BEGIN
+		string_len = .(.datptr)<0,16>;
+		IF .string_len GTR 0 AND
+	           NOT .mom$ab_service_data [.i, svd$v_msg_param] THEN
+		    BEGIN
+		    mom$ab_service_data [.i, svd$b_string_len] = .string_len;
+		    CH$MOVE (.string_len,
+			     (.datptr + 2),
+			     mom$ab_service_data [.i, svd$t_string]);
+		    END;
+		datptr = .string_len + .datptr + 2;
+		END;
+	    END;
+	END;
+    !
+    ! Get the Host node id for Loads and dumps.
+    !
+    IF .mom$gb_function EQL nma$c_fnc_loa OR
+       .mom$gb_function EQL nma$c_fnc_dum THEN
+        mom$get_node_id (svd$gk_pcno_iho,
+			 svd$gk_pcno_$hna);
+    END;
+
+!
+! Determine if service circuit is an NI circuit.  NI service operations
+! are different from point-to-point or multipoint at many points.  For
+! autoservice this is determined elsewhere.
+!
+IF NOT .mom$gl_service_flags [mom$v_autoservice] THEN
+    mom$get_circuit_type ();
+END;				! End of mom$getsrvdata
+
+%SBTTL 'mom$get_circuit_type   See if Circuit is on Ethernet'
+GLOBAL ROUTINE mom$get_circuit_type : NOVALUE =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine looks the service circuit up in the volatile database
+!	to determine if it's an NI circuit or not.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Signal errors.
+!
+!--
+ 
+BEGIN
+
+$nfbdsc (mom_q_cirtyp_nfbdsc, show, , cri
+	,nam,		! Search key one = circuit name, oper1 = eql
+	,,		! Null search key two.
+	,typ		! Circuit type
+	);
+
+LOCAL
+    len,
+    msgsize,
+    p2dsc: VECTOR [2],
+    p3,
+    err_detail,
+    status;
+
+!
+! If there isn't any service circuit for the node, return an error to NCP.
+! (There is always a service circuit for autoservice functions).
+!
+len = .mom$ab_service_data [svd$gk_pcno_sli, svd$b_string_len];
+IF .len EQL 0 THEN
+    BEGIN
+    mom$ab_msgblock [msb$l_flags]  = msb$m_det_fld;
+    mom$ab_msgblock [msb$b_code]   = nma$c_sts_pms;
+    mom$ab_msgblock [msb$w_detail] = nma$c_pcno_sli;
+    mom$bld_reply (mom$ab_msgblock, msgsize);
+    $signal_msg (mom$ab_nice_xmit_buf, .msgsize);
+    END;
+!
+! Get the circuit type from NETACPs CRI database to determine if it's
+! an NI (Ethernet) circuit.
+!
+mom$build_p2 (.len,
+	mom$ab_service_data [svd$gk_pcno_sli, svd$t_string],
+	-1, 0,
+	mom$q_p2_buf_dsc, p2dsc);
+status = mom$netacp_qio (mom_q_cirtyp_nfbdsc,
+			 p2dsc,
+			 p3,
+			 mom$gq_acpqio_buf_dsc);
+IF NOT .status THEN
+    BEGIN
+    mom$bld_reply (mom$ab_msgblock, msgsize);
+    $signal_msg (mom$ab_nice_xmit_buf, .msgsize);
+    END;
+IF .(.mom$gq_acpqio_buf_dsc [1]) EQL nma$c_cirty_ni THEN
+    BEGIN
+    mom$gl_service_flags [mom$v_ni_circ] = true;
+    err_detail = 0;
+    !
+    ! If it's an NI circuit, and the NICE command was LOAD VIA, TRIGGER VIA,
+    ! it must also specify a physical address.  If it's LOOP CIRCUIT it must
+    ! specify a physical address or a node id.  This is because the circuit
+    ! id is not sufficient to uniquely identify a target on the NI.
+    !
+    IF NOT .mom$gl_service_flags [mom$v_autoservice] AND
+       NOT .mom$ab_service_data [svd$gk_pcno_pha, svd$v_msg_param] THEN
+	BEGIN
+	IF .mom$gb_entity_code EQL mom$c_circuit THEN
+	    BEGIN
+	    IF .mom$gb_function NEQ nma$c_fnc_tes AND
+	       NOT .mom$ab_service_data [svd$gk_pcno_add, svd$v_msg_param] AND
+	       NOT .mom$ab_service_data [svd$gk_pcno_nna, svd$v_msg_param] THEN
+		err_detail = nma$c_pcno_pha
+	    ELSE
+	    IF NOT .mom$ab_service_data [svd$gk_pcno_lpn, svd$v_msg_param] AND
+	       NOT .mom$ab_service_data [svd$gk_pcno_$lna, svd$v_msg_param] AND
+	       NOT .mom$ab_service_data [svd$gk_pcno_lan, svd$v_msg_param] AND
+	       NOT .mom$ab_service_data [svd$gk_pcno_$lnn, svd$v_msg_param] THEN
+		err_detail = nma$c_pcno_pha;
+	    END
+	ELSE
+	    !
+	    ! If it's an NI circuit, and the NICE command was LOAD NODE or
+	    ! TRIGGER NODE with no PHYSICAL ADDRESS specified, there must
+	    ! be a hardware address in the volatile database.
+	    !
+	    BEGIN
+	    IF .mom$ab_service_data [svd$gk_pcno_hwa, svd$b_string_len]
+								EQL 0 THEN
+		err_detail = nma$c_pcno_hwa;
+	    END;
+	IF .err_detail NEQ 0 THEN
+	    BEGIN
+	    mom$ab_msgblock [msb$l_flags]  = msb$m_det_fld;
+	    mom$ab_msgblock [msb$b_code]   = nma$c_sts_pms;
+	    mom$ab_msgblock [msb$w_detail] = .err_detail;
+	    mom$bld_reply (mom$ab_msgblock, msgsize);
+	    $signal_msg (mom$ab_nice_xmit_buf, .msgsize);
+	    END;
+	END;
+    END;
+END;			! of mom$get_circuit_type
+
+%SBTTL 'mom$get_node_id  Get the name of the host node'
+GLOBAL ROUTINE mom$get_node_id (node_add_svd,
+				node_name_svd,
+				NI_hwa_svd) : NOVALUE =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine gets the node name and node address needed for a
+!	load, dump, or loop circuit operation.  It uses the SVD indices
+!	to determine what node name or address is already known (from
+!	the NICE command or the volatile database), and gets the node
+!	name, address, and NI hardware address for that node.  If no
+!	node name or address is already known, the executor node is used.
+!
+! FORMAL PARAMETERS:
+!	NODE_ADD_SVD	= Service Data (SVD) table index of entry for node
+!			  address.
+!	NODE_NAME_SVD	= Service Data (SVD) table index of entry for node
+!			  name.
+!	NI_HWA_SVD	= Service Data (SVD) table indes of NI hardware
+!			  address for node.  Set up only for loop functions.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Signal errors.
+!
+!--
+ 
+BEGIN
+
+$nfbdsc(nfbdsc, show, , ndi
+	,add,		! Search key 1 = node address, oper1 = eql
+	,nfb$c_wildcard,! Search key 2 = wildcard, oper2 = eql
+	,tad		! Node address
+	,nna		! Node name
+	,hwa);		! NI hardware address
+
+MAP
+    nfbdsc:	VECTOR;
+
+LOCAL
+    search_key,
+    search_len,
+    search_value,
+    status,
+    p2_dsc:	VECTOR [2],
+    p2_buf_dsc:	VECTOR [2],
+    p2_buffer:	BBLOCK [mom$k_p2_buf_len],
+    nfb:	REF BBLOCK,
+    p4_dsc:	VECTOR [2],
+    p4_buffer:	BBLOCK [32],
+    ptr,
+    length;
+
+
+!
+! If the node name was supplied in the NICE command, use it to get the address.
+!
+IF .mom$ab_service_data [.node_name_svd, svd$v_msg_param] THEN
+    BEGIN
+    search_len = .mom$ab_service_data [.node_name_svd, svd$b_string_len];
+    search_value = mom$ab_service_data [.node_name_svd, svd$t_string];
+    search_key = nfb$c_ndi_nna;
+    END
+ELSE
+    BEGIN
+    search_key = nfb$c_ndi_tad;
+    search_len = 0;
+    !
+    ! If the node address was supplied in the NICE command, use it to get
+    ! the name.  Otherwise, get the executor's name and address (this works
+    ! because the SVD$L_PARAM is initialized to 0).
+    !
+    search_value = .mom$ab_service_data [.node_add_svd, svd$l_param];
+    END;
+!
+! Get the name and address of the node from the volatile data base.
+! If it is not found then report an error in the node identification parameter.
+!
+p2_buf_dsc [0] = mom$k_p2_buf_len;
+p2_buf_dsc [1] = p2_buffer;
+mom$build_p2 (.search_len, 
+	      .search_value,
+	      -1, 0,
+	      p2_buf_dsc, p2_dsc);
+nfb = .nfbdsc [1];
+nfb [nfb$l_srch_key] = .search_key;
+p4_dsc [0] = 32;
+p4_dsc [1] = p4_buffer;
+IF mom$netacp_qio (	nfbdsc,
+			p2_dsc,
+			0,
+			p4_dsc) THEN
+    BEGIN
+    ptr = p4_buffer;
+    !
+    ! If the node name and/or address were not supplied in the NICE command,
+    ! take the ones returned from the volatile database, and put them into
+    ! the service data.
+    !
+    IF NOT .mom$ab_service_data [.node_add_svd, svd$v_msg_param] THEN
+	mom$ab_service_data [.node_add_svd, svd$l_param] = ..ptr;
+    ptr = .ptr + 4;
+    length = .(.ptr)<0,16>;
+    IF NOT .mom$ab_service_data [.node_name_svd, svd$v_msg_param] THEN
+	BEGIN
+	CH$MOVE (.length, (.ptr + 2),
+		 mom$ab_service_data [.node_name_svd, svd$t_string]);
+	mom$ab_service_data [.node_name_svd, svd$b_string_len] = .length;
+	END;
+    ptr = .ptr + 2 + .length;
+    !
+    ! If it's a LOOP CIRCUIT function, also return the NI hardware address.
+    ! For LOAD, TRIGGER, and DUMP functions, the hardware address is obtained
+    ! with the rest of the service data.
+    !
+    IF .mom$gb_function EQL nma$c_fnc_tes THEN
+	BEGIN
+	length = .(.ptr)<0,16>;
+	CH$MOVE (.length, (.ptr + 2),
+		 mom$ab_service_data [.ni_hwa_svd, svd$t_string]);
+	mom$ab_service_data [.ni_hwa_svd, svd$b_string_len] = .length;
+	END;
+    END
+ELSE
+    mom$error (nma$c_sts_ide, nma$c_ent_nod);
+
+END;				! End of mom$get_node_id
+
+
+%SBTTL 'mom$getsrvtimer  Get the service timer'
+GLOBAL ROUTINE mom$getsrvtimer: NOVALUE =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine gets the service timer of the circuit to be used.
+!	Since service timer is a line parameter, the routine must access
+!	the volatile data base of the line which corresponds to the
+!	target node's service circuit.
+!
+! FORMAL PARAMETERS:
+!
+! IMPLICIT INPUTS:
+!	Service Data Table (MOM$AB_SERVICE_DATA)
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Signal errors.
+!
+!--
+ 
+BEGIN
+
+LOCAL
+    p4_buf_dsc : VECTOR [2],
+    qio_p4_buffer : BBLOCK [mom$k_qio_buf_len],
+    status;
+
+!
+! Get the maintenance parameters from NETACPs node database entry for the
+! target node.
+!
+p4_buf_dsc [0] = mom$k_qio_buf_len;
+p4_buf_dsc [1] = qio_p4_buffer;
+
+status = mom$get_voldb_data (nfb$c_db_pli, p4_buf_dsc);
+IF .status THEN
+!
+! Return the service timer value.  If the parameter is not set then
+! the value will be -1.  This is a suitable value for infinity.
+! Note that the service timer is defaulted to -1 when MOM is initializing.
+!
+    mom$ab_service_data [svd$gk_pcli_sti, svd$l_param] = .qio_p4_buffer;
+END;				! End of mom$getsrvtimer
+
+
+%SBTTL 'mom$get_voldb_data  Get data from volatile database'
+GLOBAL ROUTINE mom$get_voldb_data (database, p4_buf_dsc) : =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine builds the QIO buffers to get information about the
+!	target from the volatile data base specified.  It issues the
+!	QIO to NETACP.
+!
+! Inputs:
+!	DATABASE - Database id to use when building the NFB and to determine
+!		which of the parameters in the Service Data Table
+!		to request.
+!	P4_BUF_DSC - P4 buffer descriptor in which to return information.
+!
+! IMPLICIT INPUTS:
+!	MOM$GB_ENTITY_CODE
+!	MOM$GQ_ENTITY_BUF_DSC
+!
+! OUTPUTS:
+!	The P4 buffer described by P4_BUF_DSC contains the maintenance
+!	information from the specified database.
+!
+!--
+
+BEGIN
+
+MAP
+    p4_buf_dsc : REF VECTOR;
+
+LOCAL
+    status,
+    p2_dsc : VECTOR [2],
+    key,
+    length,
+    address,
+    line_len,
+    period_ptr,
+    nfb : REF BBLOCK,
+    nfbdsc : VECTOR [2],
+    nfb_buffer : BBLOCK [mom$k_qio_buf_len],
+    msgsize;
+
+!
+! Build the NFB, which tells NETACP which information you want returned.
+!
+CH$FILL (0, mom$k_qio_buf_len, nfb_buffer);
+nfb = nfb_buffer;
+nfb [nfb$b_fct] = nfb$c_fc_show;
+nfb [nfb$b_database] = .database;
+nfb [nfb$b_oper] = nfb$c_op_eql;
+nfb [nfb$l_srch2_key] = nfb$c_wildcard;
+nfb [nfb$b_oper2] = nfb$c_op_eql;
+
+!
+! Build the P2 buffer for the specified entity.  The P2 buffer identifies
+! the specific circuit or node for which information is being requested.
+!
+SELECTONEU .database OF
+    SET
+    [nfb$c_db_ndi]:
+	SELECTONEU .mom$gb_entity_code OF
+	    SET
+
+	    [mom$c_circuit]:
+		BEGIN
+		nfb [nfb$l_srch_key] = nfb$c_ndi_sli;
+		!
+		! Figure out what the second search key should be.  It's
+		! either the node address or the hardware address, depending
+		! on whether the physical address is the UNA hardware address
+		! or the hiord (node address with DEC NI address space constant)
+		! address.
+		!
+		mom_get_circ_search2_key (key, length, address);
+		nfb [nfb$l_srch2_key] = .key;
+		mom$build_p2 (	.mom$gq_entity_buf_dsc [0],
+				.mom$gq_entity_buf_dsc [1],
+				.length, .address,
+				mom$q_p2_buf_dsc, p2_dsc);
+		END;
+
+	    [mom$c_node]:
+		BEGIN
+		nfb [nfb$l_srch_key] = nfb$c_ndi_add;
+		mom$build_p2 (	0,
+				.(.mom$gq_entity_buf_dsc [1])<0,16>,
+				-1, 0,
+				mom$q_p2_buf_dsc, p2_dsc);
+		END;
+
+	    [mom$c_nodebyname]:
+		BEGIN
+		nfb [nfb$l_srch_key] = nfb$c_ndi_nna;
+		mom$build_p2 (	.mom$gq_entity_buf_dsc [0],
+				.mom$gq_entity_buf_dsc [1],
+				-1, 0,
+				mom$q_p2_buf_dsc, p2_dsc);
+		END;
+	    TES;
+
+    [nfb$c_db_pli]:
+	BEGIN
+	nfb [nfb$l_srch_key] = nfb$c_pli_nam;
+	!
+	! If the service circuit for the target node is multidrop (eg. DMP-0.1),
+	! the corresponding line name will include the period and tributary
+	! number.  If so, before using the circuit name to access the ACPs line
+	! database, eliminate the period and tributary number from the end of the
+	! circuit name to get the line name.
+	!
+	line_len = .mom$ab_service_data [svd$gk_pcno_sli, svd$b_string_len];
+	period_ptr = CH$FIND_CH (.line_len,
+			mom$ab_service_data [svd$gk_pcno_sli, svd$t_string],
+			%C'.');
+	IF NOT CH$FAIL (.period_ptr) THEN
+	    line_len = .period_ptr - mom$ab_service_data [svd$gk_pcno_sli,
+							svd$t_string];
+
+	mom$build_p2 (.line_len,
+		   mom$ab_service_data [svd$gk_pcno_sli, svd$t_string],
+		   -1, 0,
+		   mom$q_p2_buf_dsc, p2_dsc);
+	END;
+
+    TES;
+
+!
+! Step through the Service Data Table to find all parameters in the requested
+! database.  Move these parameter's field IDs into the NFB so that NETACP
+! will return their values in the P4 buffer.
+!
+INCR svd_index FROM 0 TO svd$c_entry_count DO
+    BEGIN
+    IF .mom$ab_service_data [.svd_index, svd$b_nfb_database]
+					EQL .database THEN
+	BEGIN
+	nfb [nfb$l_fldid] = .mom$ab_service_data [.svd_index, svd$l_nfb_id];
+	nfb = .nfb + 4;
+	END;
+    END;
+nfb [nfb$l_fldid] = 0;
+
+nfbdsc [0] = nfb [nfb$l_fldid] + 4 - nfb_buffer;
+nfbdsc [1] = nfb_buffer;
+!
+! If there is an entry in the volatile data base then NETACP will return the
+! data requested in the NFB.  Return this data to the calling routine.
+!
+STATUS = mom$netacp_qio (nfbdsc,
+			p2_dsc,
+			p4_buf_dsc [0], 
+			.p4_buf_dsc);
+
+IF NOT .status THEN
+    BEGIN
+    mom$bld_reply (mom$ab_msgblock, msgsize);
+    $signal_msg (mom$ab_nice_xmit_buf, .msgsize);
+    END;
+
+RETURN .status;
+END;			! of mom$get_voldb_data
+
+%SBTTL 'mom_get_circ_search2_key'
+GLOBAL ROUTINE mom_get_circ_search2_key (key, length, address) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine is called when preparing to get service data for
+!	the target from the volatile database.  At this point the entity
+!	is always MOM$C_CIRCUIT, and the operation is a TRIGGER VIA, a
+!	LOAD VIA, or autoservice.  In these three cases, there is no node
+!	ID with which to locate the target in the node volatile database.
+!	For point to point circuits, it is sufficient to look for a node
+!	with a service circuit matching the one from the command.  For
+!	NI circuits, this routine sets up the second search key to match
+!	in the database.
+!
+! FORMAL PARAMETERS:
+!	KEY	Address to return search key two ID
+!	LENGTH	Address to return search key two length
+!	ADDRESS Address to return search key two address.
+!
+!--
+
+BEGIN
+
+LOCAL
+    physical_addr_ptr;
+
+!
+! At this point the NICE message (operservice) or initial MOP message (auto-
+! service) has been parsed, and the only parameters in the Service Data table
+! are from this message.  Therefore, the presence of the NI physical address
+! in the SVD is an indication that the service circuit is an NI.
+!
+IF .mom$ab_service_data [svd$gk_pcno_pha, svd$v_msg_param] THEN
+    !
+    ! If the Physical Address begins with the DEC assigned NI prefix, then
+    ! the last word of the Physical Address is the target node's address.
+    ! Extract it an use it as the second search key to find the target in
+    ! the volatile database (it would actually be sufficient by itself).
+    !
+    BEGIN
+    physical_addr_ptr = mom$ab_service_data [svd$gk_pcno_pha, svd$t_string];
+    IF ..physical_addr_ptr EQL mom$k_ni_prefix THEN
+	BEGIN
+	.key = nfb$c_ndi_add;
+	.length = 0;
+	.address = .(.physical_addr_ptr + 4)<0,16>;
+	END
+    ELSE
+	!
+	! Build a P2 buffer that uses the NI hardware address (the entire
+	! physical address) to find the target's entry in NETACP's node
+	! database.
+	!
+	BEGIN
+	.key = nfb$c_ndi_hwa;
+	.length = 6;
+	.address = .physical_addr_ptr;
+	END;
+    END
+ELSE
+    !
+    ! The circuit is point-to-point or multipoint.  The service circuit
+    ! IDs in the node volatile database must be unique for these.
+    ! 
+    BEGIN
+    .key = nfb$c_wildcard;
+    .length = -1;
+    .address = 0;
+    END;
+END;				! End of mom_get_circ_search2_key
+
+%SBTTL 'mom$bldmoprds  Build MOP mode running message'
+GLOBAL ROUTINE mom$bldmoprds (msgdsc) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine builds a 'MOP Request Dump Service' message in the
+!	MOP transmit buffer.
+!
+! FORMAL PARAMETERS:
+!
+!	MSGDSC
+!
+!--
+
+BEGIN
+
+MAP
+    msgdsc : REF VECTOR;
+!
+! Move the 'MOP request dump service' function code into the buffer.
+!
+CH$WCHAR (mop$_fct_rds, mom$ab_mop_xmit_buf);
+!
+! Set up the descriptor for the return.
+!
+msgdsc [0] = 1;
+msgdsc [1] = mom$ab_mop_xmit_buf;
+
+END;				! End of MOM$BLDMOPRDS
+
+%SBTTL 'mom$bldmopboot  Build enter MOP mode message'
+GLOBAL ROUTINE mom$bldmopboot (msgdsc) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine builds the 'Boot' (trigger) message in the
+!	MOP transmit buffer.  This is the old 'Enter MOP Mode' message.
+!
+! FORMAL PARAMETERS:
+!
+!	MSGDSC
+!
+!--
+
+BEGIN
+
+MAP
+    msgdsc : REF VECTOR;
+
+LOCAL
+    db_passwd_len,
+    msg_passwd_len,
+    ptr,
+    status;
+
+!
+! Build the 'Boot' message.
+!
+ptr = mom$ab_mop_xmit_buf;
+CH$WCHAR_A (mop$_fct_emm, ptr);
+!
+! Move the service password from the Service Data base to the MOP message.
+! If no password is set then zeros will be used.  The MOP trigger password
+! is always four bytes for point to point and 8 bytes for NI.
+!
+db_passwd_len = .mom$ab_service_data [svd$gk_pcno_spa, svd$b_string_len];
+msg_passwd_len = .db_passwd_len;
+IF .mom$gl_service_flags [mom$v_ni_circ] THEN
+    msg_passwd_len = 8
+ELSE
+    msg_passwd_len = 4;
+ptr = CH$COPY (.db_passwd_len,
+	       mom$ab_service_data [svd$gk_pcno_spa, svd$t_string],
+	       0, .msg_passwd_len, .ptr);
+!
+! The MOP V2.1 Boot message has an 8 byte password (the old version has a
+! 4 byte one) and some extra fields.  Add those extra fields.
+!
+IF .msg_passwd_len GTR 4 THEN
+    BEGIN
+    IF .mom$gl_service_flags [mom$v_console_carrier_load] THEN
+	CH$WCHAR_A (mop$c_pro_com, ptr)		! Load communications processor
+    ELSE
+	CH$WCHAR_A (mop$c_pro_sys, ptr);	! Load system processor
+    IF .mom$gb_function EQL nma$c_fnc_tri THEN
+	!
+	! Control: Boot server = system default,
+	!		Boot device = system default
+	CH$WCHAR_A (0, ptr)
+    ELSE
+	!
+	! For load triggers, tell the target to request the load from this
+	! system (as opposed to multicasting the load request).
+	! Control: Boot server = requesting system,
+	!		Boot device = system default
+	CH$WCHAR_A (1, ptr);
+    !
+    !
+    ! Software ID - always boot for operating system.  I don't see any way
+    ! for me to tell if I'm loading diagnostics or not.
+    !
+    CH$WCHAR_A (-1, ptr);    
+    END;
+!
+! Set up the descriptor for the return.
+!
+msgdsc [0] = .ptr - mom$ab_mop_xmit_buf;
+msgdsc [1] = mom$ab_mop_xmit_buf;
+
+END;				! End of mom$bldmopboot
+
+%SBTTL 'mom$bldmopplt   Build MOP Parameter Load with Transfer Address message'
+GLOBAL ROUTINE mom$bldmopplt (plt_msg_dsc, load_seg_num,
+					transfer_addr) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine is called to build the MOP Parameter Load with
+!	Transfer message which is sent to the target node at the end of
+!	a down line load.
+!
+! FORMAL PARAMETERS:
+!	PLT_MSG_DSC - Descriptor of buffer for MOP Parameter Load with
+!		Transfer message.
+!	LOAD_SEG_NUM - Number of load segments loaded modulo 256.
+!	TRANSFER_ADDR - Address to start executing image just loaded.
+!
+! IMPLICIT OUTPUTS:
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!--
+
+BEGIN
+
+MAP
+    plt_msg_dsc : REF VECTOR,
+    load_seg_num: BYTE;
+
+LOCAL
+    len,
+    ptr,
+    node_addr: WORD,
+    date_time : VECTOR [7, WORD],
+    century,
+    year;
+
+!
+! If the load file was a bootstrap then send an empty memory load with
+! transfer address message.
+!
+IF .mom$ab_service_data [svd$gk_pcno_sty, svd$l_param] NEQU nma$c_soft_osys THEN
+    BEGIN
+
+    ptr = mom$ab_mop_xmit_buf;
+
+    CH$WCHAR_A (mop$_fct_mlt, ptr);		! Function code
+    CH$WCHAR_A (.load_seg_num, ptr);		! Load segment number
+    (.PTR)<0,32> = 0;				! Zero load address
+    ptr = .ptr + 4;				! Skip load address
+!
+! Output the MOP message to the debug log.
+!
+    mom$debug_txt (dbg$c_srvtrc,
+	    $ASCID ('Transmitting empty memory load with transfer address.')
+	    );
+
+    END
+ELSE
+    BEGIN
+!
+! The load file was the system image so send a parameter load with transfer
+! address message.
+!
+    ptr = mom$ab_mop_xmit_buf;
+    CH$WCHAR_A (mop$_fct_plt, ptr);    		! Function code
+    CH$WCHAR_A (.load_seg_num, ptr);		! Load segment number
+!
+! If target node name specified then add it to message.
+!
+    len = .mom$ab_service_data [svd$gk_pcno_nna, svd$b_string_len];
+    IF .len NEQ 0 THEN
+	BEGIN
+	CH$WCHAR_A (mop$c_par_nna, ptr);	! Parameter code
+	CH$WCHAR_A (.len, ptr);			! Name length
+	PTR = CH$MOVE (.len,			! Name
+			mom$ab_service_data [svd$gk_pcno_nna, svd$t_string],
+			.ptr); 
+	END;
+!
+! Add target node address to message.  If address not specified then
+! program error.
+!
+    CH$WCHAR_A (mop$c_par_nad, ptr);	! Parameter code
+    CH$WCHAR_A (2, ptr);		! Address length
+    node_addr = .mom$ab_service_data [svd$gk_pcno_add, svd$l_param];
+    !
+    ! If it's a phase III node, mask out the area number in the node address.
+    ! DECnet Phase III did not include areas.
+    !
+    IF .mom$ab_service_data [svd$gk_pcno_snv, svd$l_param] EQL nma$c_nodsnv_ph3
+    THEN
+	BEGIN
+	MAP node_addr: BBLOCK;
+	node_addr [nma$v_area] = 0;
+	END;
+    ptr = CH$MOVE (2, node_addr, .ptr);
+
+!
+! If the host node name is specified then add it to the message.
+!
+    len = .mom$ab_service_data [svd$gk_pcno_$hna, svd$b_string_len];
+    IF .len NEQ 0 THEN
+	BEGIN
+	CH$WCHAR_A (mop$c_par_hna, ptr);	! Parameter code
+	CH$WCHAR_A (.len,			! Name length
+		    ptr);
+	PTR = CH$MOVE (.len,			! Name
+		       mom$ab_service_data [svd$gk_pcno_$hna, svd$t_string],
+		       .ptr);
+	END;
+!
+! If the host address is specified then add it to the message.
+!
+    IF .mom$ab_service_data [svd$gk_pcno_iho, svd$l_param] NEQ 0 THEN
+	BEGIN
+	CH$WCHAR_A (mop$c_par_had, ptr);	! Parameter code
+	CH$WCHAR_A (2, ptr);		! Address length
+	node_addr = .mom$ab_service_data [svd$gk_pcno_iho, svd$l_param];
+	!
+	! If it's a phase III node, mask out the area number in the node address.
+	!
+	IF .mom$ab_service_data [svd$gk_pcno_snv, svd$l_param] EQL
+					nma$c_nodsnv_ph3 THEN
+	    BEGIN
+	    MAP node_addr: BBLOCK;
+	    node_addr [nma$v_area] = 0;
+	    END;
+	ptr = CH$MOVE (2, node_addr, .ptr);
+	END;
+
+    !
+    ! If it's not a phase III node, add the system time to the message
+    !
+    IF .mom$ab_service_data [svd$gk_pcno_snv, svd$l_param] NEQ
+					nma$c_nodsnv_ph3 THEN
+	BEGIN
+	CH$WCHAR_A (mop$c_par_hti, ptr);
+	CH$WCHAR_A (10, ptr);
+	$NUMTIM (TIMBUF = date_time);
+	!
+	! The parameter load with transfer message requires that the year be
+	! broken up into a century and a year.  Do that.
+	!
+	century = .date_time [0] /100;
+	year = .date_time [0] MOD 100;
+	!
+	! The rest of the date/time string required in the MOP Parameter Load with
+	! Transfer message is in the same order as that returned by the $NUMTIM
+	! system service.  Put the string into the MOP message, converting the words
+	! to bytes.
+	!
+	CH$WCHAR_A (.century, ptr);
+	CH$WCHAR_A (.year, ptr);
+	INCR i FROM 1 TO 6 DO
+	    CH$WCHAR_A (.date_time [.i], ptr);
+	!
+	! Fill in the Time Differential Factor hours and minutes as 0.  VMS
+	! doesn't keep Greenwich Mean Time around for figuring these out with.
+	!
+	ptr = CH$FILL (0, 2, .ptr);
+	END;
+
+    !
+    ! Add the end mark.
+    !
+    CH$WCHAR_A (0, ptr);
+    !
+    ! Output the trace message.
+    !
+    mom$debug_txt ( dbg$c_srvtrc,
+	    $ASCID ('Transmitting parameter load with transfer address.')
+	    );
+
+    END;
+!
+! Add transfer address.
+!
+ptr = CH$MOVE (4, transfer_addr, .ptr);
+!
+! Send the message.
+!
+plt_msg_dsc [0]  = .ptr - mom$ab_mop_xmit_buf;
+plt_msg_dsc [1] = mom$ab_mop_xmit_buf;
+END;				! End of MOM$BLDMOPPLT
+
+END
+
+ELUDOM

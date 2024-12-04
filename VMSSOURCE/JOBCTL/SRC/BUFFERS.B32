@@ -1,0 +1,1228 @@
+MODULE BUFFERS	(%TITLE	'Buffer management utilities'
+		IDENT = 'V04-001'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:
+!	Job controller.
+!
+! ABSTRACT:
+!	This module contains the buffer management utilities.
+!
+! ENVIRONMENT:
+!	VAX/VMS user and kernel mode.
+!--
+!
+! AUTHOR: M. Jack, CREATION DATE: 16-Feb-1982
+!
+! MODIFIED BY:
+!
+!	V04-001	JAK0236		J A Krycka	14-Sep-1984
+!		Collect more diagnostic information.
+!
+!	V03-008	JAK0223		J A Krycka	10-Aug-1984
+!		Retry enqueue for queue file lock on SS$_DEADLOCK error to
+!		prevent aborting job controller on false deadlock indication.
+!
+!	V03-007	JAK0219		J A Krycka	17-Jul-1984
+!		Track changes in JOBCTLDEF.REQ.
+!
+!	V03-006	KPL0001		P Lieberwirth,	10-Jul-1984
+!		Add global routine FLUSH_RECORD, to be used when a record
+!		needs to be written back to the queue-file for reliability
+!		reasons but is also still needed for subsequent processing.
+!		This routine provides better performance than doing a pair
+!		of REWRITE_RECORD/READ_RECORD calls.
+!
+!	V03-005	JAK0211		J A Krycka	14-May-1984
+!		Continuation of V03-004.
+!
+!	V03-004	JAK0210		J A Krycka	10-May-1984
+!		Conditionally set ROP record locking options.
+!
+!	V03-003	JAK0209		J A Krycka	09-May-1984
+!		Log diagnostic information in DIAG_TRACE vector.
+!
+!	V03-002	MLJ0114		Martin L. Jack,	23-Jun-1983
+!		Changes for job controller baselevel.
+!
+!	V03-001	MLJ0109		Martin L. Jack,	14-Apr-1983
+!		Changes for job controller baselevel.
+!
+!**
+
+REQUIRE 'SRC$:JOBCTLDEF';
+
+
+FORWARD ROUTINE
+	ALLOCATE_MEMORY,
+	DEALLOCATE_MEMORY:		NOVALUE,
+	ALLOCATE_BUFFER,
+	DEALLOCATE_BUFFER:		NOVALUE,
+	ALLOCATE_RECORD:		L_OUTPUT_2,
+	DEALLOCATE_RECORD:		NOVALUE,
+	DEALLOCATE_RECORD_LIST:		NOVALUE,
+	READ_RECORD,
+	FLUSH_RECORD:			NOVALUE,
+	REWRITE_RECORD:			NOVALUE,
+	RELEASE_RECORD:			NOVALUE,
+	LOCK_QUEUE_FILE:		NOVALUE,
+	UNLOCK_QUEUE_FILE:		NOVALUE;
+
+
+EXTERNAL ROUTINE
+	DELETE_OPEN_GETQUIS:		NOVALUE,
+	SIGNAL_FILE_ERROR:		NOVALUE;
+
+
+! Buffer control block.
+!
+MACRO
+	BCB_LINK=		0,0,32,0 %,	! Link to next block
+	BCB_RECNO=		4,0,32,0 %,	! Record number
+	BCB_REFCOUNT=		8,0,32,0 %,	! Reference count
+	BCB_BUFFER=		12,0,32,0 %;	! Pointer to buffer
+
+
+LITERAL
+	BCB_K_LENGTH=		16;		! Block length
+
+
+BUILTIN
+	INSQUE,
+	REMQUE,
+	TESTBITCS,
+	TESTBITSC;
+
+GLOBAL ROUTINE ALLOCATE_MEMORY(PAGES)=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine allocates pages of virtual memory.
+!
+! INPUT PARAMETERS:
+!	PAGES		- (Optional) Number of pages to allocate.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	Pointer to the allocated memory.
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	P:	REF VECTOR,	! Pointer to allocated block
+	NP;			! Number of pages to allocate
+BUILTIN
+	ACTUALCOUNT;
+
+
+! Get the number of pages to allocate.
+!
+NP = 1;
+IF ACTUALCOUNT() GTRU 0 THEN NP = .PAGES;
+
+
+IF NOT REMQUE(.MEMORY_FREE_QUEUES[2*(.NP-1)], P)
+THEN
+    BEGIN
+    P[0] = P[1] = 0;
+    .P
+    END
+ELSE
+    BEGIN
+    LOCAL
+	RETADR:		VECTOR[2],	! $EXPREG return address array
+	STATUS;				! Status return
+
+    STATUS = $EXPREG(PAGCNT=.NP, RETADR=RETADR);
+    IF NOT .STATUS THEN SIGNAL(JBC$_ALLOCMEM OR STS$K_SEVERE, 0, .STATUS);
+    .RETADR[0]
+    END
+END;
+
+GLOBAL ROUTINE DEALLOCATE_MEMORY(P,PAGES): NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine deallocates pages of virtual memory.
+!
+! INPUT PARAMETERS:
+!	P		- Pointer to memory to be deallocated.
+!	PAGES		- (Optional) Number of pages to deallocate.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	NP;			! Number of pages to deallocate
+BUILTIN
+	ACTUALCOUNT;
+
+
+! Get the number of pages to deallocate.
+!
+NP = 1;
+IF ACTUALCOUNT() GTRU 1 THEN NP = .PAGES;
+
+
+! Clear the pages and link them to the free list.
+!
+CH$FILL(0, .NP * 512, .P);
+INSQUE(.P, MEMORY_FREE_QUEUES[2*(.NP-1)]);
+END;
+
+ROUTINE ALLOCATE_BUFFER=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine allocates a buffer control block and a buffer from
+!	dynamic memory.
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	Pointer to the buffer control block.
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	BCB:		REF BBLOCK;	! Pointer to buffer control block
+
+
+! If the buffer control block free list is empty, allocate a page of memory
+! and transform it into free buffer control blocks.
+!
+IF .BCB_FREE_LIST EQL 0
+THEN
+    BEGIN
+    BCB_FREE_LIST = ALLOCATE_MEMORY();
+    DECRA P
+    FROM .BCB_FREE_LIST+512-2*BCB_K_LENGTH TO .BCB_FREE_LIST BY BCB_K_LENGTH DO
+	.P = .P + BCB_K_LENGTH;
+    END;
+
+
+! Remove a buffer control block from the free list, allocate a buffer from
+! dynamic memory, and initialize the buffer pointer.
+!
+BCB = .BCB_FREE_LIST;
+BCB_FREE_LIST = .BCB[BCB_LINK];
+BCB[BCB_BUFFER] = ALLOCATE_MEMORY();
+
+
+! Return the buffer control block.
+!
+.BCB
+END;
+
+ROUTINE DEALLOCATE_BUFFER(BCB): NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine deallocates a buffer control block and a buffer to
+!	dynamic memory.
+!
+! INPUT PARAMETERS:
+!	BCB		- Pointer to buffer control block.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+MAP
+	BCB:		REF BBLOCK;	! Pointer to buffer control block
+
+
+! Deallocate the buffer to the free list.
+!
+DEALLOCATE_MEMORY(.BCB[BCB_BUFFER]);
+
+
+! Deallocate the buffer control block to the free list.
+!
+CH$COPY(4, BCB_FREE_LIST, 0, BCB_K_LENGTH, .BCB);
+BCB_FREE_LIST = .BCB;
+END;
+
+GLOBAL ROUTINE ALLOCATE_RECORD( ; REC_N, REC): L_OUTPUT_2=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine allocates a record from the free list or by extending the
+!	queue file.
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	REC_N		- Record number of record.
+!	REC		- Pointer to record.
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	Completion status.
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	SQH:		REF BBLOCK,	! Pointer to SQH record
+	PREV,				! Pointer to previous forward link
+	BCB:		REF BBLOCK,	! Pointer to buffer control block
+	BUFFER:		BBLOCK[SYM$S_SYM],	! Buffer for file extend
+	FREE_N;				! Record number of free record
+
+
+! Read the queue header.
+!
+SQH = READ_RECORD(SQH$K_RECNO);
+
+
+! Establish the record number that will be allocated.
+!
+FREE_N = .SQH[SQH$L_FREE_LIST];
+IF .FREE_N EQL 0
+THEN
+    BEGIN
+
+    ! Extend the queue file.
+    !
+    QUEUE_FAB[FAB$L_ALQ] = .QUEUE_ALQ;
+    IF NOT $EXTEND(FAB=QUEUE_FAB)
+    THEN
+	BEGIN
+	SIGNAL_FILE_ERROR(
+	    JBC$_WRITEERR + STS$K_ERROR,
+	    QUEUE_FAB, QUEUE_FAB);
+	RETURN JBC$_NOQUESPACE;
+	END;
+
+
+    ! Link the newly allocated records to the free list.
+    !
+    CH$FILL(0, SYM$S_SYM, BUFFER);
+    QUEUE_RAB[RAB$L_RBF] = BUFFER;
+    IF .FLAGS[FLAGS_V_QUEUE_SHARED]
+	THEN QUEUE_RAB[RAB$L_ROP] = RAB$M_UIF OR RAB$M_NLK
+	ELSE QUEUE_RAB[RAB$L_ROP] = RAB$M_UIF;
+    DECR REC_T
+    FROM .SQH[SQH$L_HIGHEST_RECORD] + .QUEUE_FAB[FAB$L_ALQ]
+    TO   .SQH[SQH$L_HIGHEST_RECORD] + 1 DO
+	BEGIN
+	BUFFER[SYM$L_LINK] = .FREE_N;
+	QUEUE_RAB[RAB$L_KBF] = REC_T;
+	DIAG_COUNT[1] = .DIAG_COUNT[1] + 1;
+	IF NOT $PUT(RAB=QUEUE_RAB)
+	THEN
+	    SIGNAL_FILE_ERROR(
+		JBC$_WRITEERR + STS$K_SEVERE,
+		QUEUE_FAB, QUEUE_RAB);
+	FREE_N = .REC_T;
+	END;	
+    SQH[SQH$L_HIGHEST_RECORD] = .SQH[SQH$L_HIGHEST_RECORD] + .QUEUE_FAB[FAB$L_ALQ];
+
+
+    ! Update the end of file pointer.
+    !
+    IF NOT $FLUSH(RAB=QUEUE_RAB)
+    THEN
+	SIGNAL_FILE_ERROR(
+	    JBC$_WRITEERR + STS$K_SEVERE,
+	    QUEUE_FAB, QUEUE_RAB);
+    END;
+
+
+! Search the active buffer control block list for the specified record number.
+!
+PREV = BCB_ACTIVE_LIST;
+WHILE ..PREV NEQ 0 DO
+    BEGIN
+    BCB = ..PREV;
+
+
+    ! If the current record number is greater than the desired record number,
+    ! the record is not in the list.
+    !
+    IF .BCB[BCB_RECNO] GTRU .FREE_N
+    THEN
+	EXITLOOP;
+
+
+    ! If the current record number is equal to the desired record number,
+    ! it indicates an internal error.
+    !
+    IF .BCB[BCB_RECNO] EQLU .FREE_N
+    THEN
+	SIGNAL(JBC$_INVBLOCK OR STS$K_SEVERE, 1, .FREE_N);
+
+
+    ! Advance to the next buffer control block.
+    !
+    PREV = BCB[BCB_LINK];
+    END;
+
+
+! The specified record was not found.  Allocate a new buffer control block,
+! link it into the list, and initialize it.
+!
+BCB = ALLOCATE_BUFFER();
+BCB[BCB_LINK] = ..PREV;
+.PREV = .BCB;
+BCB[BCB_RECNO] = .FREE_N;
+BCB[BCB_REFCOUNT] = 1;
+
+
+! Read the free record.
+!
+QUEUE_RAB[RAB$L_KBF] = BCB[BCB_RECNO];
+IF .FLAGS[FLAGS_V_QUEUE_SHARED]
+    THEN QUEUE_RAB[RAB$L_ROP] = RAB$M_NLK OR RAB$M_RRL
+    ELSE QUEUE_RAB[RAB$L_ROP] = 0;
+QUEUE_RAB[RAB$L_UBF] = .BCB[BCB_BUFFER];
+DIAG_COUNT[0] = .DIAG_COUNT[0] + 1;
+IF NOT $GET(RAB=QUEUE_RAB)
+THEN
+    SIGNAL_FILE_ERROR(
+	JBC$_READERR + STS$K_SEVERE,
+	QUEUE_FAB, QUEUE_RAB);
+
+
+! Remove the record from the free list.
+!
+SQH[SQH$L_FREE_LIST] = .BBLOCK[.BCB[BCB_BUFFER], SYM$L_LINK];
+BBLOCK[.BCB[BCB_BUFFER], SYM$L_LINK] = 0;
+
+
+! Rewrite the queue header.
+!
+REWRITE_RECORD(SQH$K_RECNO);
+
+
+! Return the buffer address and record number.
+!
+REC_N = .FREE_N;
+REC = .BCB[BCB_BUFFER];
+DIAG_TRACE[2] = .FREE_N;		! ***** diagnostic info *****
+SS$_NORMAL
+END;
+
+GLOBAL ROUTINE DEALLOCATE_RECORD(RECNO): NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine deallocates a specified record to the free record list.
+!	The record may have a reference count of zero or one.
+!
+! INPUT PARAMETERS:
+!	RECNO		- Relative record number.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	SQH:		REF BBLOCK,	! Pointer to SQH record
+	PREV,				! Pointer to previous forward link
+	BCB:		REF BBLOCK,	! Pointer to buffer control block
+	BUFFER:		BBLOCK[SYM$S_SYM];	! Temporary buffer
+
+
+! Read the queue header.
+!
+DIAG_TRACE[3] = .RECNO;		! ***** diagnostic info *****
+SQH = READ_RECORD(SQH$K_RECNO);
+
+
+! Search the active buffer control block list for the specified record number.
+!
+PREV = BCB_ACTIVE_LIST;
+WHILE ..PREV NEQ 0 DO
+    BEGIN
+    BCB = ..PREV;
+
+
+    ! If the current record number is greater than the desired record number,
+    ! the record is not in the list.
+    !
+    IF .BCB[BCB_RECNO] GTRU .RECNO
+    THEN
+	EXITLOOP;
+
+
+    ! If the current record number is equal to the desired record number,
+    ! ensure that the record has a reference count of one.  If not, it
+    ! indicates an internal error.  Then, link the record to the free list
+    ! and rewrite it.
+    !
+    IF .BCB[BCB_RECNO] EQLU .RECNO
+    THEN
+	BEGIN
+	IF .BCB[BCB_REFCOUNT] NEQ 1
+	THEN
+	    SIGNAL(JBC$_INVBLOCK OR STS$K_SEVERE, 1, .RECNO);
+
+
+	! Link the record to the free list.
+	!
+	CH$COPY(4, SQH[SQH$L_FREE_LIST], 0, SYM$S_SYM, .BCB[BCB_BUFFER]);
+	SQH[SQH$L_FREE_LIST] = .RECNO;
+
+
+	! Rewrite the record.
+	!
+	QUEUE_RAB[RAB$L_KBF] = BCB[BCB_RECNO];
+	QUEUE_RAB[RAB$L_RBF] = .BCB[BCB_BUFFER];
+	IF .FLAGS[FLAGS_V_QUEUE_SHARED]
+	    THEN QUEUE_RAB[RAB$L_ROP] = RAB$M_UIF OR RAB$M_NLK
+	    ELSE QUEUE_RAB[RAB$L_ROP] = RAB$M_UIF;
+	DIAG_COUNT[1] = .DIAG_COUNT[1] + 1;
+	IF NOT $PUT(RAB=QUEUE_RAB)
+	THEN
+	    SIGNAL_FILE_ERROR(
+		JBC$_WRITEERR + STS$K_SEVERE,
+		QUEUE_FAB, QUEUE_RAB);
+
+
+	! Unlink and release the buffer control block.
+	!
+	.PREV = .BCB[BCB_LINK];
+	DEALLOCATE_BUFFER(.BCB);
+
+
+	! Rewrite the queue header.
+	!
+	REWRITE_RECORD(SQH$K_RECNO);
+	RETURN;
+	END;
+
+
+    ! Advance to the next buffer control block.
+    !
+    PREV = BCB[BCB_LINK];
+    END;
+
+
+! The specified record was not found.  Therefore, it has a reference count of
+! zero.  Using a scratch buffer, link the record to the free list and rewrite
+! the record.
+!
+CH$COPY(4, SQH[SQH$L_FREE_LIST], 0, SYM$S_SYM, BUFFER);
+SQH[SQH$L_FREE_LIST] = .RECNO;
+QUEUE_RAB[RAB$L_KBF] = RECNO;
+QUEUE_RAB[RAB$L_RBF] = BUFFER;
+IF .FLAGS[FLAGS_V_QUEUE_SHARED]
+    THEN QUEUE_RAB[RAB$L_ROP] = RAB$M_UIF OR RAB$M_NLK
+    ELSE QUEUE_RAB[RAB$L_ROP] = RAB$M_UIF;
+DIAG_COUNT[1] = .DIAG_COUNT[1] + 1;
+IF NOT $PUT(RAB=QUEUE_RAB)
+THEN
+    SIGNAL_FILE_ERROR(
+	JBC$_WRITEERR + STS$K_SEVERE,
+	QUEUE_FAB, QUEUE_RAB);
+
+
+! Rewrite the queue header.
+!
+REWRITE_RECORD(SQH$K_RECNO);
+END;
+
+GLOBAL ROUTINE DEALLOCATE_RECORD_LIST(RECNO): NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine deallocates a list of records linked through SYM$L_LINK
+!	to the free list.
+!
+! INPUT PARAMETERS:
+!	RECNO		- Relative record number of the first record.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	LRECNO,				! Current record number
+	NRECNO,				! Next record number
+	REC:		REF BBLOCK;	! Pointer to record
+
+
+IF .RECNO NEQ 0
+THEN
+    BEGIN
+
+    ! Read the queue header to avoid thrashing it.
+    !
+    READ_RECORD(SQH$K_RECNO);
+
+
+    ! Loop for all records in the list.
+    !
+    LRECNO = .RECNO;
+    WHILE .LRECNO NEQ 0 DO
+	BEGIN
+
+	! Read the record, save the link to the next record, deallocate the
+	! record, and advance to the next.
+	!
+	REC = READ_RECORD(.LRECNO);
+	NRECNO = .REC[SYM$L_LINK];
+	DEALLOCATE_RECORD(.LRECNO);
+	LRECNO = .NRECNO;
+	END;
+
+
+    ! Release the queue header.
+    !
+    RELEASE_RECORD(SQH$K_RECNO);
+    END;
+END;
+
+GLOBAL ROUTINE READ_RECORD(RECNO)=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine reads a specified record.
+!
+! INPUT PARAMETERS:
+!	RECNO		- Relative record number.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	Address of buffer containing specified record.
+!
+! SIDE EFFECTS:
+!	Specified record read into buffer.
+!
+!--
+
+BEGIN
+LOCAL
+	PREV,				! Pointer to previous forward link
+	BCB:		REF BBLOCK;	! Pointer to buffer control block
+
+
+! Search the active buffer control block list for the specified record number.
+!
+DIAG_TRACE[4] = .RECNO;		! ***** diagnostic info *****
+DIAG_COUNT[2] = .DIAG_COUNT[2] + 1;
+PREV = BCB_ACTIVE_LIST;
+WHILE ..PREV NEQ 0 DO
+    BEGIN
+    BCB = ..PREV;
+
+
+    ! If the current record number is greater than the desired record number,
+    ! the record is not in the list.
+    !
+    IF .BCB[BCB_RECNO] GTRU .RECNO
+    THEN
+	EXITLOOP;
+
+
+    ! If the current record number is equal to the desired record number,
+    ! increase the reference count on the record and return its buffer address.
+    !
+    IF .BCB[BCB_RECNO] EQLU .RECNO
+    THEN
+	BEGIN
+	DIAG_COUNT[3] = .DIAG_COUNT[3] + 1;		! We saved a read
+	BCB[BCB_REFCOUNT] = .BCB[BCB_REFCOUNT] + 1;
+	RETURN .BCB[BCB_BUFFER];
+	END;
+
+
+    ! Advance to the next buffer control block.
+    !
+    PREV = BCB[BCB_LINK];
+    END;
+
+
+! The specified record was not found.  Allocate a new buffer control block,
+! link it into the list, and initialize it.
+!
+BCB = ALLOCATE_BUFFER();
+BCB[BCB_LINK] = ..PREV;
+.PREV = .BCB;
+BCB[BCB_RECNO] = .RECNO;
+BCB[BCB_REFCOUNT] = 1;
+
+
+! Initialize the RAB and read the specified record.
+!
+QUEUE_RAB[RAB$L_KBF] = BCB[BCB_RECNO];
+IF .FLAGS[FLAGS_V_QUEUE_SHARED]
+    THEN QUEUE_RAB[RAB$L_ROP] = RAB$M_NLK OR RAB$M_RRL
+    ELSE QUEUE_RAB[RAB$L_ROP] = 0;
+QUEUE_RAB[RAB$L_UBF] = .BCB[BCB_BUFFER];
+DIAG_COUNT[0] = .DIAG_COUNT[0] + 1;
+IF NOT $GET(RAB=QUEUE_RAB)
+THEN
+    SIGNAL_FILE_ERROR(
+	JBC$_READERR + STS$K_SEVERE,
+	QUEUE_FAB, QUEUE_RAB);
+
+
+! Return the address of the record.
+!
+.BCB[BCB_BUFFER]
+END;
+
+GLOBAL ROUTINE FLUSH_RECORD(RECNO): NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine flushes a specified record to the queue file without
+!	releasing access to it.
+!
+! INPUT PARAMETERS:
+!	RECNO		- Relative record number.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	PREV,				! Pointer to previous forward link
+	BCB:		REF BBLOCK;	! Pointer to buffer control block
+
+
+! Search the active buffer control block list for the specified record number.
+!
+DIAG_TRACE[6] = .RECNO;		! ***** diagnostic info *****
+DIAG_COUNT[5] = .DIAG_COUNT[5] + 1;
+PREV = BCB_ACTIVE_LIST;
+WHILE ..PREV NEQ 0 DO
+    BEGIN
+    BCB = ..PREV;
+
+
+    ! If the current record number is greater than the desired record number,
+    ! the record is not in the list.
+    !
+    IF .BCB[BCB_RECNO] GTRU .RECNO
+    THEN
+	EXITLOOP;
+
+
+    ! If the current record number is equal to the desired record number,
+    ! flush the record.
+    !
+    IF .BCB[BCB_RECNO] EQLU .RECNO
+    THEN
+	BEGIN
+
+	! Rewrite the record.
+	!
+	QUEUE_RAB[RAB$L_KBF] = BCB[BCB_RECNO];
+	QUEUE_RAB[RAB$L_RBF] = .BCB[BCB_BUFFER];
+	IF .FLAGS[FLAGS_V_QUEUE_SHARED]
+	    THEN QUEUE_RAB[RAB$L_ROP] = RAB$M_UIF OR RAB$M_NLK
+	    ELSE QUEUE_RAB[RAB$L_ROP] = RAB$M_UIF;
+	DIAG_COUNT[1] = .DIAG_COUNT[1] + 1;
+	IF NOT $PUT(RAB=QUEUE_RAB)
+	THEN
+	    SIGNAL_FILE_ERROR(
+		JBC$_WRITEERR + STS$K_SEVERE,
+		QUEUE_FAB, QUEUE_RAB);
+
+	RETURN;
+	END;
+
+
+    ! Advance to the next buffer control block.
+    !
+    PREV = BCB[BCB_LINK];
+    END;
+
+
+! The specified record was not found.  This condition indicates an internal
+! logic error.
+!
+SIGNAL(JBC$_INVBLOCK OR STS$K_SEVERE, 1, .RECNO);
+END;
+
+GLOBAL ROUTINE REWRITE_RECORD(RECNO): NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine rewrites a specified record and decreases its reference
+!	count.
+!
+! INPUT PARAMETERS:
+!	RECNO		- Relative record number.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	PREV,				! Pointer to previous forward link
+	BCB:		REF BBLOCK;	! Pointer to buffer control block
+
+
+! Search the active buffer control block list for the specified record number.
+!
+DIAG_TRACE[5] = .RECNO;		! ***** diagnostic info *****
+DIAG_COUNT[4] = .DIAG_COUNT[4] + 1;
+PREV = BCB_ACTIVE_LIST;
+WHILE ..PREV NEQ 0 DO
+    BEGIN
+    BCB = ..PREV;
+
+
+    ! If the current record number is greater than the desired record number,
+    ! the record is not in the list.
+    !
+    IF .BCB[BCB_RECNO] GTRU .RECNO
+    THEN
+	EXITLOOP;
+
+
+    ! If the current record number is equal to the desired record number,
+    ! decrease the reference count on the record, and rewrite the record.
+    ! If the reference count has fallen to zero, deallocate the buffer
+    ! control block.
+    !
+    IF .BCB[BCB_RECNO] EQLU .RECNO
+    THEN
+	BEGIN
+
+	! Rewrite the record.
+	!
+	QUEUE_RAB[RAB$L_KBF] = BCB[BCB_RECNO];
+	QUEUE_RAB[RAB$L_RBF] = .BCB[BCB_BUFFER];
+	IF .FLAGS[FLAGS_V_QUEUE_SHARED]
+	    THEN QUEUE_RAB[RAB$L_ROP] = RAB$M_UIF OR RAB$M_NLK
+	    ELSE QUEUE_RAB[RAB$L_ROP] = RAB$M_UIF;
+	DIAG_COUNT[1] = .DIAG_COUNT[1] + 1;
+	IF NOT $PUT(RAB=QUEUE_RAB)
+	THEN
+	    SIGNAL_FILE_ERROR(
+		JBC$_WRITEERR + STS$K_SEVERE,
+		QUEUE_FAB, QUEUE_RAB);
+
+
+	! If the reference count has fallen to zero, unlink and release the
+	! buffer control block.
+	!
+	BCB[BCB_REFCOUNT] = .BCB[BCB_REFCOUNT] - 1;
+	IF .BCB[BCB_REFCOUNT] EQL 0
+	THEN
+	    BEGIN
+	    .PREV = .BCB[BCB_LINK];
+	    DEALLOCATE_BUFFER(.BCB);
+	    END;
+	RETURN;
+	END;
+
+
+    ! Advance to the next buffer control block.
+    !
+    PREV = BCB[BCB_LINK];
+    END;
+
+
+! The specified record was not found.  This condition indicates an internal
+! logic error.
+!
+SIGNAL(JBC$_INVBLOCK OR STS$K_SEVERE, 1, .RECNO);
+END;
+
+GLOBAL ROUTINE RELEASE_RECORD(RECNO): NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine decreases the reference count of a specified record.
+!
+! INPUT PARAMETERS:
+!	RECNO		- Relative record number.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	PREV,				! Pointer to previous forward link
+	BCB:		REF BBLOCK;	! Pointer to buffer control block
+
+
+! Search the active buffer control block list for the specified record number.
+!
+PREV = BCB_ACTIVE_LIST;
+WHILE ..PREV NEQ 0 DO
+    BEGIN
+    BCB = ..PREV;
+
+
+    ! If the current record number is greater than the desired record number,
+    ! the record is not in the list.
+    !
+    IF .BCB[BCB_RECNO] GTRU .RECNO
+    THEN
+	EXITLOOP;
+
+
+    ! If the current record number is equal to the desired record number,
+    ! decrease the reference count on the record.  If the reference count has
+    ! fallen to zero, deallocate the buffer control block.
+    !
+    IF .BCB[BCB_RECNO] EQLU .RECNO
+    THEN
+	BEGIN
+	BCB[BCB_REFCOUNT] = .BCB[BCB_REFCOUNT] - 1;
+	IF .BCB[BCB_REFCOUNT] EQL 0
+	THEN
+	    BEGIN
+	    .PREV = .BCB[BCB_LINK];
+	    DEALLOCATE_BUFFER(.BCB);
+	    END;
+	RETURN;
+	END;
+
+
+    ! Advance to the next buffer control block.
+    !
+    PREV = BCB[BCB_LINK];
+    END;
+
+
+! The specified record was not found.  This condition indicates an internal
+! logic error.
+!
+SIGNAL(JBC$_INVBLOCK OR STS$K_SEVERE, 1, .RECNO);
+END;
+
+GLOBAL ROUTINE LOCK_QUEUE_FILE: NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine locks the system queue file in preparation for a
+!	transaction.
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	COUNT,			! Loop counter
+	STATUS;			! Status return
+
+
+IF TESTBITCS(FLAGS[FLAGS_V_QUEUE_LOCKED])
+THEN
+    BEGIN
+
+    ! Retry enqueue service on deadlock error up to 20 times before signalling
+    ! this error condition to prevent aborting the job controller on a false
+    ! deadlock indication from the lock manager.
+    !
+    INCR COUNT FROM 1 TO 20 DO
+	BEGIN
+	STATUS = $ENQW(
+	    EFN=JBC$K_SYNC_EFN,
+	    LKMODE=LCK$K_EXMODE,
+	    LKSB=QUEUE_LOCK_LKSB,
+	    FLAGS=LCK$M_CONVERT);
+	IF .STATUS THEN STATUS = .QUEUE_LOCK_LKSB[0];
+	IF .STATUS NEQ SS$_DEADLOCK THEN EXITLOOP;
+	DIAG_TRACE[11] = .DIAG_TRACE[11] + 1;	! ***** diagnostic info *****
+	END;
+
+    IF NOT .STATUS
+    THEN
+	BEGIN
+	IF .FLAGS[FLAGS_V_CS_QF_DEADLOCK]	! Conditionally bugcheck cluster
+	    THEN FLAGS[FLAGS_V_CLUSTER_SCRAM] = TRUE;
+	SIGNAL(JBC$_COMREMJBC OR STS$K_ERROR, 0, .STATUS);
+	END;
+    END;
+END;
+
+GLOBAL ROUTINE UNLOCK_QUEUE_FILE: NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine unlocks the system queue file following a transaction.
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	BCB:		REF BBLOCK,	! Pointer to buffer control block
+	STATUS;				! Status return
+
+
+IF .QUEUE_FAB[FAB$W_IFI] NEQ 0
+THEN
+    BEGIN
+
+    ! If the active buffer control block list is not empty, release each one.
+    !
+    WHILE .BCB_ACTIVE_LIST NEQ 0 DO
+	BEGIN
+	BCB = .BCB_ACTIVE_LIST;
+	BCB_ACTIVE_LIST = .BCB[BCB_LINK];
+	DEALLOCATE_BUFFER(.BCB);
+	END;
+
+
+    ! Release the queue file lock.
+    !
+    IF TESTBITSC(FLAGS[FLAGS_V_QUEUE_LOCKED])
+    THEN
+	BEGIN
+	STATUS = $ENQW(
+	    EFN=JBC$K_SYNC_EFN,
+	    LKMODE=LCK$K_NLMODE,
+	    LKSB=QUEUE_LOCK_LKSB,
+	    FLAGS=LCK$M_CONVERT);
+	IF .STATUS THEN STATUS = .QUEUE_LOCK_LKSB[0];
+	IF NOT .STATUS
+	THEN
+	    SIGNAL(JBC$_COMREMJBC OR STS$K_ERROR, 0, .STATUS);
+	END;
+
+
+    ! Close the file if appropriate.
+    !
+    IF .QUEUE_REFERENCE_COUNT EQL 0
+    THEN
+	BEGIN
+	IF NOT $CLOSE(FAB=QUEUE_FAB)
+	THEN
+	    SIGNAL_FILE_ERROR(
+		JBC$_CLOSEOUT OR STS$K_ERROR,
+		QUEUE_FAB, QUEUE_FAB);
+
+
+	! Release context associated with open $GETQUI operations.
+	!
+	DELETE_OPEN_GETQUIS();
+
+
+	! Release all locks acquired for the file.
+	!
+	$DEQ(LKID=.(REMOTE_REQUEST_LKSB[2]));
+	$DEQ(LKID=.(QUEUE_FILE_LKSB[2]));
+	$DEQ(LKID=.(QUEUE_LOCK_LKSB[2]));
+	END;
+    END;
+END;
+
+END
+ELUDOM

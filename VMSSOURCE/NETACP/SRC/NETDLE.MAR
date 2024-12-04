@@ -1,0 +1,1502 @@
+	.TITLE	NETDLE - NETACP DLE processing
+	.IDENT	'V04-000'
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+
+;++
+; FACILITY:	DECnet-VAX
+;
+; ABSTRACT:
+;
+;	This module contains most of the DLE process-level code in
+;	NETACP.  It works with the DLE driver (NDDRIVER) to implement
+;	DLE to allow programs direct access to DECnet circuits.  This
+;	is primarily used to implement MOP support.
+;
+; ENVIRONMENT:
+;
+;	MODE = KERNEL
+;
+; AUTHOR:
+;
+;	Tim Halvorsen, January 1983
+;
+; MODIFIED BY:
+;
+;	V003	TMH0003		Tim Halvorsen	24-Aug-1984
+;		Prevent duplicate MOM processes from being started due
+;		to unsolicited messages received AFTER MOM has issued
+;		its ACCESS but before it has established a connection
+;		with the node (via SETMODE).  This is done by simply
+;		leaving the unsolicited message which started MOM in the
+;		unsolicited queue for the life of the MOM process, causing
+;		any new unsolicited messages which "squeak through" to be
+;		dropped rather than starting a new MOM process.
+;
+;	V002	TMH0002		Tim Halvorsen	28-Apr-1983
+;		Change loopback assistant multicast address to be
+;		the one listed in the Ethernet V2 spec.
+;
+;	V001	TMH0001		Tim Halvorsen	29-Mar-1983
+;		Compute a unique MOM process name, so that multiple
+;		service operations can occur on the same circuit.
+;		Fix deallocation of BC blocks to wait for all outstanding
+;		I/O to rundown before deallocating the block.
+;		Add protective code to prevent multiple MOMs from starting
+;		up if the remote station sends requests too often - if we
+;		receive another message while a MOM process is still starting,
+;		it is ignored.
+;--
+
+	.SBTTL	Declarations
+;
+; VMS definitions
+;
+
+	$ABDDEF				; ACP buffer descriptor
+	$CCBDEF				; Channel control block
+	$CXBDEF				; Complex buffer
+	$DDBDEF				; Device data block
+	$DDTDEF				; Driver dispatch table
+	$DYNDEF				; Structure types
+	$IRPDEF				; I/O request packet
+	$IODEF				; I/O function codes
+	$JIBDEF				; Job information block
+	$PCBDEF				; Process control block
+	$UCBDEF				; Device unit control block
+
+;
+; Network definitions
+;
+
+	$DWBDEF			; DLE window control block
+	$EVCDEF			; Event logging parameter codes
+	$LPDDEF			; Logical path descriptor (circuit)
+	$NETSYMDEF		; Get NET$C_IPL symbol
+	$NFBDEF			; Network parameter codes
+	$NMADEF			; NICE parameter codes
+	$WQEDEF			; Work queue entries
+
+;
+; Define symbols for timer qualifiers
+;
+
+TID_C_READSUP = 1		; NI receive "wait" timer
+
+WQE$C_QUAL_DLE = 4		; && temp &&
+
+;
+; Define format of broadcast circuit "default protocol user" context block.
+; This block holds all context related to enabling this process to receive
+; all unsolicited messages ("default user") for the MOP protocol types on
+; a broadcast circuit, specifically "load/dump" and "loopback" protocol types.
+;
+
+	$DEFINI	BC GLOBAL		; (GLOBAL is only for debugging)
+
+$DEF	BC_L_FLINK	.BLKL	2	; Forward/backward queue links
+$DEF	BC_W_SIZE	.BLKW	1	; Size of structure
+$DEF	BC_B_TYPE	.BLKB	1	; Type of structure
+$DEF	BC_B_FLAGS	.BLKB	1	; Flags
+_VIELD	BC,0,<-
+	<DELETE,,M>,-			; Block is marked for deallocation
+	>
+$DEF	BC_B_REFCNT	.BLKB	1	; # of IOWQEs still outstanding
+			.BLKB	1	; (spare for alignment)
+$DEF	BC_W_LPD	.BLKW	1	; LPD ID of broadcast circuit
+$DEF	BC_W_LD_CHAN	.BLKW	1	; Channel for "load/dump" protocol
+$DEF	BC_W_LP_CHAN	.BLKW	1	; Channel for "loopback" protocol
+$DEF	BC_Q_PND_RCV	.BLKL	2	; Listhead of pending receive IOWQEs
+$DEF	BC_Q_CUR_RCV	.BLKL	2	; Listhead of current receive IOWQEs
+$DEF	BC_Q_UNSOL_MSGS	.BLKL	2	; Listhead for received unsolicited msgs
+$DEF	BC_C_LENGTH			; Length of structure
+
+	$DEFEND	BC
+
+;
+; Define format of an unsolicited message context block
+;
+
+NIHDRSIZ = 14				; Size of NI datalink header
+
+	$DEFINI	IOWQE GLOBAL		; (GLOBAL is only for debugging)
+
+	. = WQE$C_LENGTH		; Start just after standard WQE
+
+$DEF	IOWQE_Q_IOSB	.BLKL	2	; I/O status block
+IOWQE_W_MSGLEN = IOWQE_Q_IOSB+2		; Message length
+$DEF	IOWQE_W_CHAN	.BLKW	1	; Channel to datalink
+			.BLKW	1	; (spare for alignment)
+$DEF	IOWQE_L_PID	.BLKL	1	; IPID of MOM process for this msg
+$DEF	IOWQE_L_BC	.BLKL	1	; Address of corresponding BC block
+$DEF	IOWQE_G_NIHDR	.BLKB	NIHDRSIZ ; NI datalink header
+$DEF	IOWQE_G_MSG	.BLKB	1500	; Actual message (allow for largest)
+$DEF	IOWQE_C_LENGTH
+
+	$DEFEND	IOWQE
+
+;
+; Read/write storage
+;
+
+	.PSECT	NET_IMPURE,WRT,NOEXE,LONG
+
+DLE_ACC:
+	.ADDRESS DLE_ACC		; Queue of DLE IO$_ACCESS IRPs
+	.ADDRESS DLE_ACC		; waiting for circuit to go into MOP
+
+BC_QUEUE:
+	.ADDRESS BC_QUEUE		; Queue of BC blocks for all broadcast
+	.ADDRESS BC_QUEUE		; circuits in the "run" state
+
+IOSB:	.BLKL	2			; General purpose I/O status block
+
+	.PSECT	NET_PURE,NOWRT,NOEXE,LONG
+
+;
+; Define storage needed to startup MOM
+;
+
+MAX_MOM_PROC = 10			; Maximum number of simultaneous
+					; MOM processes for a single circuit
+MOM_OBJ_NAM:
+	.ASCIC	"$MOM"			; Name of MOM object
+MOM_PRCNAM:
+	.ASCIC	"MOM_!AD_!UL"		; MOM process name
+
+;
+; UNA "setmode" parameters for load/dump protocol
+;
+
+LD_PARAMS:
+	.WORD	NMA$C_PCLI_PTY		; Protocol type = 60-01
+	.LONG	^X0160
+	.WORD	NMA$C_PCLI_ACC		; Protocol access mode = SHARED
+	.LONG	NMA$C_ACC_SHR
+	.WORD	NMA$C_PCLI_BUS		; Buffer size = 1498 (2 bytes for PAD)
+	.LONG	1498
+	.WORD	NMA$C_PCLI_BFN		; Number of buffers = 2
+	.LONG	2
+	.WORD	NMA$C_PCLI_MCA		; Reception of multicast messages:
+	.WORD	8			; 	(8 byte string follows)
+	.WORD	NMA$C_LINMC_SET		; Enable reception of multicast
+	.LONG	^X010000AB		;   "dump/load assistance"
+	.WORD	0
+	.WORD	NMA$C_PCLI_PAD		; Padding length word = ON
+	.LONG	NMA$C_STATE_ON
+	.WORD	NMA$C_PCLI_PRM		; Promiscuous mode = OFF
+	.LONG	NMA$C_STATE_OFF
+	.WORD	NMA$C_PCLI_MLT		; Multicast address state = OFF
+	.LONG	NMA$C_STATE_OFF
+	.WORD	NMA$C_PCLI_DCH		; Data chaining = OFF
+	.LONG	NMA$C_STATE_OFF		; (DLE driver can't handle multiple CXBs)
+	.WORD	NMA$C_PCLI_CRC		; CRC generation = ON
+	.LONG	NMA$C_STATE_ON
+
+LD_SETMODE:
+	.LONG	.-LD_PARAMS		; Descriptor of above buffer
+	.ADDRESS LD_PARAMS
+
+;
+; UNA "setmode" parameters for loopback protocol
+;
+
+LP_PARAMS:
+	.WORD	NMA$C_PCLI_PTY		; Protocol type = 90-00
+	.LONG	^X0090
+	.WORD	NMA$C_PCLI_ACC		; Protocol access mode = SHARED
+	.LONG	NMA$C_ACC_SHR
+	.WORD	NMA$C_PCLI_BUS		; Buffer size = 1500
+	.LONG	1500
+	.WORD	NMA$C_PCLI_BFN		; Number of buffers = 2
+	.LONG	2
+	.WORD	NMA$C_PCLI_MCA		; Reception of multicast messages:
+	.WORD	8			; 	(8 byte string follows)
+	.WORD	NMA$C_LINMC_SET		; Enable reception of multicast
+	.LONG	^X000000CF		;   "loopback assistance"
+	.WORD	0
+	.WORD	NMA$C_PCLI_PAD		; Padding length word = OFF
+	.LONG	NMA$C_STATE_OFF
+	.WORD	NMA$C_PCLI_PRM		; Promiscuous mode = OFF
+	.LONG	NMA$C_STATE_OFF
+	.WORD	NMA$C_PCLI_MLT		; Multicast address state = OFF
+	.LONG	NMA$C_STATE_OFF
+	.WORD	NMA$C_PCLI_DCH		; Data chaining = OFF
+	.LONG	NMA$C_STATE_OFF		; (DLE driver can't handle multiple CXBs)
+	.WORD	NMA$C_PCLI_CRC		; CRC generation = ON
+	.LONG	NMA$C_STATE_ON
+
+LP_SETMODE:
+	.LONG	.-LP_PARAMS		; Descriptor of above buffer
+	.ADDRESS LP_PARAMS
+
+
+	.PSECT	NET_CODE,NOWRT,EXE
+
+	.SBTTL	DLE$DISPATCH - Dispatch newly recieved DLE IRP
+;+
+; DLE$DISPATCH - Dispatch newly received DLE IRP
+;
+; This routine is called from AQB dispatching when an IRP is dequeued
+; which has the PHYSIO flag set in the IRP flags.  This flag is used
+; by convention between NETDRIVER and NDDRIVER to distinguish between
+; various flavors of IRPs.
+;
+; Inputs:
+;
+;	R3 = IRP address
+;
+; Outputs:
+;
+;	None - the IRP is always returned to the driver.
+;-
+DLE$DISPATCH::
+	EXTZV	#IRP$V_FCODE,-		; Get function code
+		#IRP$S_FCODE,-
+		IRP$W_FUNC(R3),R7
+	$DISPATCH  R7,<-
+		<IO$_ACCESS,	 30$>,-
+		<IO$_ACPCONTROL, 40$>,-
+		<IO$_DEACCESS,	 50$>,-
+		<IO$_SETMODE,	 60$>>
+10$:	MOVZWL	#SS$_ILLIOFUNC,-	; Say "illegal I/O function"
+		    IRP$L_IOST1(R3)
+	BRB	90$			; Exit
+	;
+	;   ACCESS function - dispatch to connect processor
+	;
+30$:	BSBW	DLE$ACCESS		; Process IO$_ACCESS function
+	BRB	90$			; Exit
+	;
+	;   ACP Control 
+	;
+40$:	BBS	#IRP$V_COMPLX,-		; If normal IO$_ACPCONTROL, then
+		    IRP$W_STS(R3),10$	; inform user we don't support them
+	BICB	#1,IRP$L_WIND(R3)	; Clear interlock bit in case an
+					; IO$_ACCESS or IO$_DEACCESS is pending
+	BSBW	DLE$CANCEL		; Do cancel-related work
+	BRB	90$			; Continue
+	;
+	;   DEACCESS function 
+	;
+50$:	BICL3	#1,IRP$L_WIND(R3),R6	; Get DWB without interlock bit
+	BGEQ	90$			; If GEQ then no DWB
+	BSBW	DLE$DEACCESS		; Process IO$_DEACCESS function
+	BRB	90$			; Continue
+	;
+	;   SETMODE function
+	;
+60$:	MOVL	IRP$L_WIND(R3),R6	; Get DWB address
+	BGEQ	90$			; If GEQ then no DWB
+	BSBW	DLE$SETMODE		; Process IO$_SETMODE function
+	;
+	;   Give the IRP back to the DLE driver with the I/O status setup
+	;
+90$:	TSTL	R3			; Did IRP get tucked away somewhere
+	BEQL	100$			; If so, exit
+	MOVL	IRP$L_UCB(R3),R5	; Get UCB address
+	JSB	G^EXE$INSIOQ		; Queue packet to driver
+100$:	RSB				; Done
+
+	.SBTTL	DLE$ACCESS	- Handle IO$_ACCESS function
+;+
+; DLE$ACCESS - Process IO$_ACCESS function for a DLE channel
+;
+; This routine is entered after the initial IO$_ACCESS processing
+; done in the DLE driver.  It's main function is to perform all
+; those things which must be done in process context in order to
+; setup the connection between DLE user and the datalink.
+;
+; Inputs:
+;
+;	R3 = IRP address
+;
+;	P1 = Circuit name for DLE I/O
+;
+; Outputs:
+;
+;	R3 = IRP address, 0 if not to be returned to driver yet.
+;	IRP$L_IOST1 = I/O status
+;-
+DLE$ACCESS:
+	CLRL	IRP$L_EXTEND(R3)	; Assume no rcvd msg to be returned
+	;
+	;   Construct a descriptor of the circuit name
+	;
+	ADDL3	@IRP$L_SVAPTE(R3),-	; Get address of P1 ABD
+		#ABD$C_FIB*ABD$C_LENGTH,R4
+	MOVZWL	ABD$W_COUNT(R4),R7	; Get length of circuit name
+	MOVZWL	ABD$W_TEXT(R4),R1	; Get offset to circuit name
+	MOVAB	1+ABD$W_TEXT(R4)[R1],R8	; Get address of text (skip acmode)
+	;
+	;   Locate the CRI and LPD for the circuit, and make sure it is
+	;   in a state to handle MOP mode.
+	;
+	MOVL	NET$GL_CNR_CRI,R11	; Point to CRI root block
+	CLRL	R10			; Start at beginning of CRI list
+	MOVZWL	#SS$_NOSUCHDEV,R0	; Setup default error code
+	$SEARCH	eql,cri,s,nam		; Lookup CRI by circuit name
+	BLBC	R0,91$			; If error detected, then report it
+	$GETFLD	cri,l,sta		; Get circuit state
+	MOVZWL	#SS$_DEVINACT,R0	; Assume circuit not on
+	CMPL	R8,#NMA$C_STATE_OFF	; Circuit off?
+	BEQL	91$			; If so, report an error
+	BSBW	NET$LOCATE_LPD		; Get LPD address
+	BLBC	R0,91$			; Exit if error detected
+	MOVL	IRP$L_DIAGBUF(R3),R0	; Get DWB address
+	MOVW	LPD$W_PTH(R6),-		; Store LPD ID of circuit
+		DWB$W_PATH(R0)		; into DLE window block
+	$GETFLD	cri,v,ser		; Service functions enabled?
+	MOVZWL	#SS$_IVMODE,R0		; Assume service disabled
+	BLBS	R8,91$			; If disabled, then report error
+	BBS	#LPD$V_X25,-		; No service is allowed
+		LPD$W_STS(R6),91$	; on X.25 DLM circuits
+	;
+	;   If this is a multiaccess circuit, such as Ethernet,
+	;   then skip the circuit transition, since there is no
+	;   circuit "mode".
+	;
+	BBC	#LPD$V_BC,-		; Skip if not broadcast
+		LPD$W_STS(R6),10$
+	BSBW	BC_ACCESS		; Handle broadcast DLE access
+91$:	BRW	90$			; Return status to DLE driver
+10$:	;
+	;   Mark the DLE process as the owner of the circuit.  If the
+	;   circuit is already owned, return an error.
+	;
+	$GETFLD	cri,l,owpid		; Get PID of DLE owner
+	BLBC	R0,20$			; Branch if not currently owned
+	CMPL	R8,IRP$L_PID(R3)	; Is it already owned by process?
+	BEQL	20$			; If so, ok to access
+15$:	MOVZWL	#SS$_DEVALLOC,R0	; Report circuit already owned
+	BRB	90$
+20$:	BBSS	#LPD$V_ACCESS,-		; Mark circuit accessed for DLE
+		LPD$W_STS(R6),15$	; If already accessed, report error
+	MOVL	IRP$L_PID(R3),R8	; Get caller's PID
+	BSBW	CNF$PUT_FIELD		; Make process owner of the circuit
+	BBSS	#LPD$V_DLE,-		; Mark in DLE mode
+		LPD$W_STS(R6),30$ 	; If already in DLE, skip logging event
+	;
+	;   Log an event indicating the circuit has been accessed
+	;   locally by a process.
+	;
+	MOVAB	NET$AB_EVT_WQE,R5	; Get address of common WQE
+	MOVW	LPD$W_PTH(R6),-		; Set LPD ID into WQE
+		WQE$W_REQIDT(R5)
+	MOVW	#EVC$C_DLL_LSC,-	; "locally initiated state change"
+		WQE$W_EVL_CODE(R5)
+	MOVB	#EVC$C_DLL_POLD_RUNG,-	; Old state = RUNNING
+		WQE$B_EVL_DT1(R5)
+	MOVB	#EVC$C_DLL_POLD_MAIN,-	; New state = MAINTAINANCE
+		WQE$B_EVL_DT2(R5)
+	BSBW	NET$EVT_INTRAW		; Log the event record
+	;
+	;   Bring the circuit up in "MOP" state.
+	;
+30$:	MOVZWL	#LEV$C_DLE_ACC,R0	; Setup DLLTRN event code
+	BSBW	SET_DLL_EVT		; Queue the request
+	;
+	;   Wait for the circuit to become ready.  When it does, the
+	;   routine DLE$LPD_STATUS will be called.
+	;
+	INSQUE	(R3),@DLE_ACC+4		; Insert IRP onto waiting queue
+	CLRL	R3			; Indicate IRP not to be returned
+	BRB	100$
+
+;
+; An error has been detected.  Return the IRP back to the driver.
+;
+
+90$:	MOVZWL	R0,IRP$L_IOST1(R3)	; Pass status back in IRP
+100$:	RSB
+
+	.SBTTL	DLE$LPD_STATUS - Check completion of MOP transition
+;+
+; DLE$LPD_STATUS - Check completion of MOP transition
+;
+; This routine is called when an LPD has made the transition into MOP
+; state or if an error has occurred.  It is always called by DLLTRN
+; on circuit transitions if the ACCESS flag is set in the LPD.
+;
+; If there is a process waiting to access the circuit, then if the
+; transition was successful, then that process is allowed to proceed
+; with the access. 
+;
+; Inputs:
+;
+;	R6 = LPD address
+;	R0 = Status of attempted MOP transition of circuit
+;
+; Outputs:
+;
+;	None
+;
+;	R0-R3,R8-R9 are destroyed.
+;-
+DLE$LPD_STATUS::
+	PUSHR	#^M<R4,R5>		; Save registers
+	;
+	;   Locate the DWB corresponding to the process attempting
+	;   the circuit ACCESS.
+	;
+	MOVAB	DLE_ACC,R1		; Get address of DLE ACCESS IRP listhead
+	MOVL	R1,R3			; Setup for loop
+10$:	MOVL	(R3),R3			; Skip to next IRP in list
+	CMPL	R3,R1			; End of list?
+	BEQL	60$			; If so, then ignore the status
+	MOVL	IRP$L_DIAGBUF(R3),R4	; Get DWB address for ACCESS request
+	CMPW	LPD$W_PTH(R6),-		; Is it for this circuit?
+		DWB$W_PATH(R4)
+	BNEQ	10$			; If not, keep looking
+	REMQUE	(R3),R3			; Remove from pending ACCESS list
+	BLBC	R0,20$			; Branch if circuit is down
+	;
+	;   Setup the datalink channel and UCB address in DWB
+	;
+	MOVW	LPD$W_CHAN(R6),-	; Save channel to datalink
+		DWB$W_DLL_CHAN(R4)
+	MOVL	LPD$L_UCB(R6),-		; Save UCB of datalink
+		DWB$L_DLL_UCB(R4)
+	;
+	;   Set the circuit substate to "auto-service"
+	;
+	MOVB	#NMA$C_LINSS_ASE,-	; Set circuit substate
+		LPD$B_SUB_STA(R6)
+	BRB	50$			; Pass success back to driver
+	;
+	;   Failure to make transition - reset LPD to original state
+	;
+20$:	PUSHL	R0			; Save final status
+	BSBW	LEAVE_MOP_STATE		; Leave MOP state
+	POPL	R0			; Restore final status
+	;
+	;   Report the status back to DLE driver
+	;
+50$:	MOVW	R0,IRP$L_IOST1(R3)	; Store status in IRP
+	MOVL	IRP$L_UCB(R3),R5	; Point to the DLE UCB
+	JSB	G^EXE$INSIOQ		; Queue packet to DLE driver
+	BRB	90$
+
+60$:	;
+	;   There is no ACCESS request pending for this circuit.  If
+	;   the LPD status is "success", then we can ignore it, since
+	;   its not relevant except to restart a pending ACCESS.
+	;
+	BLBS	R0,90$			; Exit if LPD is ok
+	;
+	;   There may be an active DLE session currently in progress
+	;   over this circuit.  Tell the DLE driver to locate all DWBs
+	;   associated with this circuit, and if any, to abort them.
+	;
+	MOVZWL	LPD$W_PTH(R6),R8	; Pass path ID to driver
+	MOVL	NET$GL_DLE_UCB,R5	; Get DLE UCB address
+	MOVL	UCB$L_DDT(R5),R1	; Get DDT address
+	JSB	@DDT$L_UNSOLINT(R1)	; Call "LPD down" entry point
+					; with R0 = status code
+					;  and R8 = path ID
+	;
+	;   Leave MOP state
+	;
+	BSBW	LEAVE_MOP_STATE		; Leave MOP state
+90$:	POPR	#^M<R4,R5>		; Restore registers
+	RSB
+
+	.SBTTL	BC_ACCESS - Handle DLE access to broadcast circuit
+;+
+; BC_ACCESS - Handle DLE access to multiaccess circuit
+;
+; This routine is called when an access is being attempted to an
+; Ethernet.  Since there is no "MOP mode" for multiaccess circuits,
+; we simply assign a new channel to the device, issue a SETMODE to
+; enable access to a given destination, and complete the access.
+;
+; Inputs:
+;
+;	R3 = IRP address for ACCESS request
+;	R6 = LPD address
+;	R10/R11 = CNF/CNR addresses for CRI
+;
+; Outputs:
+;
+;	R0 = Status code
+;-
+BC_ACCESS:
+	;
+	;   Make sure the circuit is in the "run" state
+	;
+	BBS	#LPD$V_RUN,-		; If circuit not ready,
+		LPD$W_STS(R6),10$
+	MOVZWL	#SS$_DEVINACT,R0	; Return "circuit not on"
+	BRW	90$			; Report the error
+10$:	;
+	;   Set a flag in the DWB indicating that this is an NI.
+	;
+	MOVL	IRP$L_DIAGBUF(R3),R4	; Get DWB address
+	SETBIT	#DWB$V_BC,DWB$W_FLAGS(R4) ; Indicate circuit is an NI
+	;
+	;   Assign a new channel for this DLE session.  Each DLE
+	;   session uses a new NETACP channel so that the demultiplexing
+	;   done by the datalink for received messages (based on the
+	;   source node) can be used by the DLE driver to distinguish
+	;   incoming messages between the various DLE users.
+	;
+	MOVZWL	#SS$_NOSUCHDEV,R0	; Setup default error code
+	$GETFLD	cri,s,vmsnam		; Get datalink device name
+	BLBC	R0,90$			; Exit if error detected
+	MOVQ	R7,-(SP)		; Push descriptor on stack
+	MOVL	SP,R0			; Get address of descriptor
+	$ASSIGN_S DEVNAM=(R0),-		; Assign a new channel for DLE
+		CHAN=DWB$W_DLL_CHAN(R4)
+	ADDL	#8,SP			; Pop descriptor off stack
+	BLBC	R0,90$			; Exit if error detected
+	PUSHL	R3			; Save IRP address
+	MOVZWL	DWB$W_DLL_CHAN(R4),R0	; Get channel number
+	JSB	G^IOC$VERIFYCHAN	; Get the CCB address; ignore errors
+	POPL	R3			; Restore IRP address
+	MOVL	CCB$L_UCB(R1),-		; Save the datalink UCB address
+		DWB$L_DLL_UCB(R4)
+	BSBW	ATTACH_UNSOL_MSG	; Pass unsolicited message to user
+	MOVL	S^#SS$_NORMAL,R0	; Success
+90$:	RSB				; Exit with status
+
+	.SBTTL	DLE$SETMODE - Process IO$_SETMODE request
+;+
+; DLE$SETMODE - Process IO$_SETMODE request at process level
+;
+; This routine is called to perform all work needed for the DLE SETMODE
+; QIO at IPL 0.  This includes issuing a SETMODE function to the datalink
+; driver on the DLE user's behalf.  Most of the work done for the SETMODE
+; has already been accomplished by the DLE driver.
+;
+; Inputs:
+;
+;	R6 = DWB address
+;	R3 = IRP address
+;
+;	P2 = UNA P2 buffer (used only for DLE access to UNA)
+;	P3 = Ethernet remote address (used only for DLE access to UNA)
+;	P4 = Substate
+;
+; Outputs:
+;
+;	R3 = IRP address, 0 if not to be returned to driver yet.
+;	IRP$L_IOST1 = I/O status
+;-
+DLE$SETMODE:
+	;
+	;   For point-to-point circuits, propagate the (possibly) updated
+	;   circuit substate to the LPD (it has already been set in the
+	;   DWB by the driver) so that we can see it with existing network
+	;   management.
+	;
+	BBS	#DWB$V_BC,-		; If point-to-point circuit,
+		DWB$W_FLAGS(R6),10$
+	MOVZWL	DWB$W_PATH(R6),R8	; Get LPD ID
+	PUSHL	R6			; Save DWB address
+	BSBW	NET$FIND_LPD		; Locate LPD
+	MOVL	R6,R2			; Set LPD address in R2
+	POPL	R6			; Restore DWB address
+	BLBC	R0,10$			; If cannot be found, skip it
+	MOVB	DWB$B_SUBSTA(R6),-	; Copy substate value to LPD
+		LPD$B_SUB_STA(R2)
+10$:	;
+	;   Construct a descriptor of the P2 buffer (UNA P2 buffer).
+	;   If none specified, then skip the SETMODE.
+	;
+	ADDL3	@IRP$L_SVAPTE(R3),-	; Get address of P2 ABD
+		#ABD$C_NAME*ABD$C_LENGTH,R4
+	MOVZWL	ABD$W_COUNT(R4),R7	; Get length of P2
+	BEQL	40$			; Skip if none
+	MOVZWL	ABD$W_TEXT(R4),R1	; Get offset to P2 data
+	MOVAB	1+ABD$W_TEXT(R4)[R1],R8	; Get address of P2 data (skip acmode)
+	;
+	;   Issue a SETMODE to the datalink driver to establish
+	;   "shared" access to the remote node.  This allows
+	;   more than one DLE user to use the protocol type at the
+	;   same time - demultiplexing is done for received messages
+	;   based on the remote node address.
+	;
+	MOVQ	R7,-(SP)		; Push descriptor of UNA P2 buffer
+	MOVL	SP,R0			; Get address of descriptor
+	MOVAB	IOSB,R2			; Get address of I/O status block
+	$QIOW_S FUNC=#IO$_SETMODE!IO$M_CTRL!IO$M_STARTUP,- ; Issue request
+		CHAN=DWB$W_DLL_CHAN(R6),-
+		EFN=#NET$C_EFN_WAIT,-
+		IOSB=(R2),-
+		P2=R0
+	ADDL	#8,SP			; Pop descriptor off stack
+	BLBC	R0,90$			; Exit if error detected
+	MOVZWL	(R2),R0			; Get final I/O status
+	BLBS	R0,30$			; Exit if ok
+	MOVL	4(R2),IRP$L_IOST2(R3)	; Return UNA longword to user
+	BRB	90$			; Store primary status and exit
+30$:	;
+	;   As a result of a SETMODE to the UNA driver for LIMITED protocol
+	;   access, the UNA driver may have evaporated the UCB we initially
+	;   got after the $ASSIGN, and "integrated" us into an existing UCB
+	;   for the first user of the protocol type.  As a result, we must
+	;   re-lookup the datalink UCB address immediately after the SETMODE,
+	;   and reset our saved value, whether it changed or not.
+	;
+	PUSHL	R3			; Save IRP address
+	MOVZWL	DWB$W_DLL_CHAN(R6),R0	; Get channel number
+	JSB	G^IOC$VERIFYCHAN	; Get the CCB address; ignore errors
+	POPL	R3			; Restore IRP address
+	MOVL	CCB$L_UCB(R1),-		; Save the datalink UCB address
+		DWB$L_DLL_UCB(R6)
+40$:	MOVL	S^#SS$_NORMAL,R0	; Successful
+90$:	MOVW	R0,IRP$L_IOST1(R3)	; Store status in IRP
+	RSB				; Exit with status
+
+	.SBTTL	DLE$DEACCESS - Process IO$_DEACCESS request
+;+
+; DLE$DEACCESS - Process IO$_DEACCESS request
+;
+; This routine is called to perform all work needed for the DLE DEACCESS
+; QIO at IPL 0.  If this is a point-to-point circuit, then we must cause
+; the circuit to revert back into its original state.
+;
+; Inputs:
+;
+;	R6 = DWB address
+;	R3 = IRP address
+;
+; Outputs:
+;
+;	R3 = IRP address, 0 if not to be returned to driver yet.
+;	IRP$L_IOST1 = I/O status
+;-
+DLE$DEACCESS:
+	;
+	;   Locate the circuit data structures based on the LPD ID
+	;   stored in the DWB at access time.
+	;
+	MOVL	R6,R4			; Save DWB address for later
+	MOVZWL	DWB$W_PATH(R6),R8	; Get LPD ID
+	BEQL	70$			; If none, report error
+	BSBW	NET$GET_LPD_CRI		; Get LPD, CRI addresses
+	BLBC	R0,90$			; Exit if error detected
+	;
+	;   If this is a multiaccess circuit, such as Ethernet,
+	;   then skip the circuit transition, since there is no
+	;   circuit "mode".
+	;
+	BBC	#LPD$V_BC,-		; Skip if not broadcast
+		LPD$W_STS(R6),20$
+	$DASSGN_S CHAN=DWB$W_DLL_CHAN(R4) ; Deassign channel to datalink
+	BRB	90$			; Exit with status
+20$:	;
+	;   Make sure this user is actually the current "owner"
+	;   of the circuit.
+	;
+	$GETFLD	cri,l,owpid		; Get the owner PID
+	BLBC	R0,70$			; If none at all, report an error
+	CMPL	R8,IRP$L_PID(R3)	; Check if this user is owner
+	BNEQ	70$			; If not, return an error
+	;
+	;   Leave MOP state
+	;
+	BSBW	LEAVE_MOP_STATE		; Leave MOP state
+	;
+	;   Bring the circuit down, which will cause it to attempt
+	;   to re-initialize, this time in normal mode (because the
+	;   DLE flag is off).
+	;
+	MOVZWL	#LEV$C_LIN_DOWN,R0	; Setup DLLTRN event code
+	BSBW	SET_DLL_EVT		; Queue the request
+	MOVL	S^#SS$_NORMAL,R0	; Success
+90$:	MOVW	R0,IRP$L_IOST1(R3)	; Store status in IRP
+	RSB				; Exit with status
+
+70$:	MOVZWL	#SS$_FILNOTACC,R0	; Circuit not accessed
+	BRB	90$
+
+	.SBTTL	LEAVE_MOP_STATE - Leave MOP state
+;+
+; LEAVE_MOP_STATE - Leave MOP state for an LPD
+;
+; This routine is called to reset LPD fields when leaving MOP state.
+;
+; Inputs:
+;
+;	R10/R11 = CRI pointers
+;	R6 = LPD address
+;
+; Outputs:
+;
+;	None
+;-
+LEAVE_MOP_STATE:
+	;
+	;   Mark the circuit no longer accessed
+	;
+	CLRBIT	#LPD$V_ACCESS,-		; Mark no longer accessed
+		LPD$W_STS(R6)
+	$CLRFLD	cri,l,owpid		; Clear the owner PID
+	;
+	;   If we are just leaving MOP mode, then reset circuit
+	;   substate and log an event record.
+	;
+	BBCC	#LPD$V_DLE,-		; Clear DLE flag
+		LPD$W_STS(R6),30$	; If already cleared, skip following
+	MOVB	#NMA$C_LINSS_SYN,-	; Enter "synchronizing" substate
+		LPD$B_SUB_STA(R6)
+	MOVAB	NET$AB_EVT_WQE,R5	; Get address of common WQE
+	MOVW	LPD$W_PTH(R6),-		; Set LPD ID into WQE
+		WQE$W_REQIDT(R5)
+	MOVW	#EVC$C_DLL_LSC,-	; "locally initiated state change"
+		WQE$W_EVL_CODE(R5)
+	MOVB	#EVC$C_DLL_POLD_MAIN,-	; Old state = MAINTAINANCE
+		WQE$B_EVL_DT1(R5)
+	MOVB	#EVC$C_DLL_POLD_RUNG,-	; New state = RUNNING
+		WQE$B_EVL_DT2(R5)
+	BSBW	NET$EVT_INTRAW		; Log the event record
+30$:	RSB
+
+	.SBTTL	DLE$CANCEL - Process DLE cancel request
+;+
+; DLE$CANCEL - Process DLE cancel request
+;
+; This routine is called to perform all work needed for a cancel of a
+; DLE "accessed" channel at IPL 0.  Presently, nothing needs to be done
+; except the datalink cancel I/O already done by the driver.
+;
+; Inputs:
+;
+;	R3 = IRP address
+;
+; Outputs:
+;
+;	R3 = IRP address, 0 if not to be returned to driver yet.
+;	IRP$L_IOST1 = I/O status
+;-
+DLE$CANCEL:
+	MOVL	S^#SS$_NORMAL,R0	; Successful
+	MOVW	R0,IRP$L_IOST1(R3)	; Store status in IRP
+	RSB
+
+	.SBTTL	DLE$BC_UP - Initialize DLE on broadcast circuit
+;+
+; DLE$BC_UP - Initialize DLE on a broadcast circuit which has just come up
+;
+; This routine is called when a broadcast circuit has just come up and
+; entered the "run" state.  It sets up NETACP as the "shared" protocol user
+; of the "load/dump" and "loopback" NI protocols, so that DECnet can
+; receive requests from other nodes on the NI.
+;
+; Inputs:
+;
+;	R11 = CRI CNR address
+;	R10 = CRI CNF address
+;	R7 = ADJ address
+;	R6 = LPD address
+;	R4 = RCB address
+;
+; Outputs:
+;
+;	R0 = Status code
+;
+;	R1 is destroyed.
+;-
+DLE$BC_UP::
+	PUSHR	#^M<R2,R3,R4,R5,R6,R7,R8,R9> ; Save registers
+	;
+	;   If service functions are disabled for this circuit, then do
+	;   not enable "load/dump" or "loopback" protocol types.
+	;
+	$GETFLD	cri,l,ser		; Get SERVICE flag
+	BLBS	R8,90$			; Branch if disabled
+	;
+	;   Allocate and initialize a new BC context block
+	;
+	MOVZWL	#BC_C_LENGTH,R1		; Size of structure
+	JSB	NET$ALLOCATE		; Allocate the block
+	BLBC	R0,100$			; Exit if error detected
+	PUSHL	R2			; Save address of block
+	MOVC5	#0,(SP),#0,#BC_C_LENGTH-12,12(R2) ; Zero the block
+	POPL	R5			; Set R5 to block address
+	MOVAB	BC_Q_UNSOL_MSGS(R5),R0	; Get address of listhead
+	MOVL	R0,(R0)			; Init listhead
+	MOVAL	(R0)+,(R0)
+	MOVAB	BC_Q_PND_RCV(R5),R0	; Get address of listhead
+	MOVL	R0,(R0)			; Init listhead
+	MOVAL	(R0)+,(R0)
+	MOVAB	BC_Q_CUR_RCV(R5),R0	; Get address of listhead
+	MOVL	R0,(R0)			; Init listhead
+	MOVAL	(R0)+,(R0)
+	MOVW	LPD$W_PTH(R6),BC_W_LPD(R5) ; Save LPD of associated circuit
+	INSQUE	(R5),@BC_QUEUE+4	; Insert block into queue
+	;
+	;   Initialize ourselves as the "default user" of the "load/dump"
+	;   protocol type.
+	;
+	MOVAW	BC_W_LD_CHAN(R5),R3	; Point to word to receive channel #
+	MOVAB	LD_SETMODE,R4		; Point to descriptor of SETMODE buffer
+	BSBW	INIT_UNSOL_CHAN		; Initialize channel
+	BLBC	R0,100$			; Exit if error detected
+	;
+	;   Initialize ourselves as the "default user" of the "loopback"
+	;   protocol type.
+	;
+	MOVAW	BC_W_LP_CHAN(R5),R3	; Point to word to receive channel #
+	MOVAB	LP_SETMODE,R4		; Point to descriptor of SETMODE buffer
+	BSBW	INIT_UNSOL_CHAN		; Initialize channel
+	BLBC	R0,100$			; Branch if error detected
+90$:	POPR	#^M<R2,R3,R4,R5,R6,R7,R8,R9> ; Restore registers
+	RSB				; Exit with status
+
+;
+; An error occurred trying to setup the circuit for service functions.
+; Log an error, and bring down the circuit.
+;
+
+100$:	MOVAB	NET$AB_EVT_WQE,R5	; Get address of common WQE
+	MOVW	#EVC$C_NMA_ABS,-	; "aborted service request"
+		WQE$W_EVL_CODE(R5)
+	MOVB	#EVC$C_NMA_PRSN_LOE,-	; Reason = "line open error"
+		WQE$B_EVL_DT1(R5)
+	BSBW	NET$EVT_INTRAW		; Log the event record
+	MOVZWL	#LEV$C_LIN_DOWN,R0	; Setup "circuit down" event
+	BSBW	SET_DLL_EVT		; Queue event to DLLTRN
+	BRB	90$			; Exit
+
+	.SBTTL	DLE$BC_DOWN - Cleanup DLE on broadcast circuit
+;+
+; DLE$BC_DOWN - Cleanup DLE on broadcast circuit
+;
+; This routine is called when a broadcast circuit leaves the "run" state.
+; We must deallocate any BC context blocks if they were associated with this
+; circuit.
+;
+; Inputs:
+;
+;	R6 = LPD address
+;
+; Outputs:
+;
+;	None
+;-
+DLE$BC_DOWN::
+	PUSHR	#^M<R2,R3,R4,R5>	; Save registers
+	;
+	;   Locate the BC block associated with this circuit.
+	;
+	MOVAB	BC_QUEUE,R1		; Get address of BC queue
+	MOVL	R1,R5			; Setup for loop
+10$:	MOVL	(R5),R5			; Skip to next block in queue
+	CMPL	R5,R1			; End of list?
+	BEQL	90$			; If not found, skip it
+	CMPW	BC_W_LPD(R5),-		; Does the LPD ID match?
+		LPD$W_PTH(R6)
+	BNEQ	10$			; If not, keep looking
+	REMQUE	(R5),R5			; Remove BC from list
+	;
+	;   For any non-zero channels, deassign them
+	;
+	MOVZWL	BC_W_LD_CHAN(R5),R0	; Get "load/dump" channel
+	BEQL	20$			; If nonzero,
+	$DASSGN_S CHAN=R0		; Deassign it
+20$:	MOVZWL	BC_W_LP_CHAN(R5),R0	; Get "loopback" channel
+	BEQL	30$			; If nonzero,
+	$DASSGN_S CHAN=R0		; Deassign it
+30$:	;
+	;   Deallocate all unsolicited messages still waiting for
+	;   the process to deal with them.
+	;
+40$:	REMQUE	@BC_Q_UNSOL_MSGS(R5),R0	; Get next unsolicited message
+	BVS	45$			; Branch if none left in queue
+	JSB	NET$DEALLOCATE		; Deallocate the block
+	BRB	40$			; Empty the entire queue
+45$:	;
+	;   Deallocate all receive IOWQEs waiting to be issued to
+	;   the NI driver.
+	;
+60$:	REMQUE	@BC_Q_PND_RCV(R5),R0	; Get next waiting receive IOWQE
+	BVS	65$			; Branch if none left in queue
+	JSB	NET$DEALLOCATE		; Deallocate the block
+	BRB	60$			; Empty the entire queue
+65$:	;
+	;   Deallocate the BC context block
+	;
+	SETBIT	#BC_V_DELETE,BC_B_FLAGS(R5) ; Mark block for deletion
+	TSTB	BC_B_REFCNT(R5)		; Are there still receives outstanding?
+	BNEQ	90$			; If so, wait for them to complete
+					; before deallocating BC block
+	MOVL	R5,R0			; Set the block address
+	JSB	NET$DEALLOCATE		; Deallocate it
+90$:	POPR	#^M<R2,R3,R4,R5>	; Restore registers
+	RSB
+
+	.SBTTL	INIT_UNSOL_CHAN - Initialize channel for unsolicited msgs
+;+
+; INIT_UNSOL_CHAN - Initialize channel for unsolicited messages for a protocol
+;
+; This routine is called to assign a new datalink channel, setup the channel
+; to be the "default user" of the protocol, so that messages not directly
+; intended for any other "limited users" of the protocol come to us, and then
+; issue an asynchronous recieve on the channel.
+;
+; Inputs:
+;
+;	R10/R11 = CRI pointers
+;	R3 = Address of word to store channel number
+;	R4 = Address of SETMODE P2 buffer
+;	R5 = Address of BC context block
+;
+; Outputs:
+;
+;	R0 = Status code
+;-
+INIT_UNSOL_CHAN:
+	MOVZWL	#SS$_NOSUCHDEV,R0	; Setup default error status
+	$GETFLD	cri,s,vmsnam		; Get datalink device name
+	BLBC	R0,90$			; Branch if error detected
+	MOVQ	R7,-(SP)		; Push descriptor on stack
+	MOVL	SP,R0			; Get address of descriptor
+	$ASSIGN_S DEVNAM=(R0),-		; Assign channel to NI driver
+		CHAN=(R3)
+	ADDL	#8,SP			; Pop descriptor off stack
+	BLBC	R0,90$			; Branch if error detected
+	;
+	;   Issue a SETMODE request to the NI driver to establish the
+	;   channels as accessing the protocol type as "default user".
+	;
+	$QIOW_S	FUNC=#IO$_SETMODE!IO$M_CTRL!IO$M_STARTUP,-
+		CHAN=(R3),-
+		EFN=#NET$C_EFN_WAIT,-
+		IOSB=IOSB,-
+		P2=R4
+	BLBC	R0,90$			; Branch if error detected
+	MOVZWL	IOSB,R0			; Get final I/O status
+	BLBC	R0,90$			; Branch if error detected
+	;
+	;   Allocate and initialize an IOWQE to to be used to receive
+	;   unsolicited messages for this protocol.
+	;
+	MOVZWL	#IOWQE_C_LENGTH-WQE$C_LENGTH,R1	; Get additional storage size
+	MOVL	#WQE$C_SUB_AST,R0	; Indicate WQE sub-type
+	BSBW	WQE$ALLOCATE		; Allocate a WQE - always succeeds
+	MOVW	(R3),IOWQE_W_CHAN(R2)	; Store channel to datalink
+	MOVL	R5,IOWQE_L_BC(R2)	; Store backpointer to BC block
+	MOVW	BC_W_LPD(R5),-		; Use LPD ID as REQIDT
+		WQE$W_REQIDT(R2)
+	INSQUE	(R2),@BC_Q_PND_RCV+4(R5); Insert on pending receive queue
+	;
+	;   Issue asynchronous read on the channel, so that we are
+	;   notified when someone sends us an unsolicited message.
+	;
+	MOVZWL	BC_W_LPD(R5),R1		; Get LPD index
+	BSBB	ISSUE_NI_READ		; Issue read request
+	MOVL	S^#SS$_NORMAL,R0	; Success
+90$:	RSB				; Exit with status
+
+	.SBTTL	ISSUE_NI_READ - Issue read request to NI driver
+;+
+; ISSUE_NI_READ - Issue read request to NI driver
+;
+; This routine is called to issue the read request, and return as soon
+; as the request has been queued.  All read requests are automatically
+; delayed by 1 second, so that if there is an abnormal node continuously
+; sending messages, we won't get swamped (the NI driver will drop them
+; for us).  The delay doesn't affect normal reception, because the NI
+; driver buffers any incoming messages for us, up to a limit.
+;
+; Inputs:
+;
+;	R1 = LPD ID for circuit
+;
+; Outputs:
+;
+;	None
+;
+;	R0-R1 are destroyed.
+;-
+ISSUE_NI_READ:
+	PUSHR	#^M<R2,R3>		; Save registers
+	ASHL	#16,R1,R1		; Shift LPD ID into upper word
+	MOVW	#<<WQE$C_QUAL_DLE>@8>!-	; Overlay QUAL and EVT fields
+		TID_C_READSUP,R1
+	MOVAB	B^50$,R2		; Set address of action routine
+	MOVQ	#1*10*1000*1000,R3	; Wait 1 second
+	BSBW	WQE$RESET_TIM		; Wait for timer to fire
+	POPR	#^M<R2,R3>		; Restore registers
+	RSB
+;
+; Call here when timer fires
+;
+50$:	MOVZWL	WQE$W_REQIDT(R5),R8	; Get LPD ID
+	MOVL	R5,R0			; Get timer WQE address
+	BSBW	WQE$DEALLOCATE		; Deallocate timer WQE
+	;
+	;   Locate the BC block associated with this circuit.  When found,
+	;   if there are any IOWQEs (receives) waiting to be issued to the
+	;   NI driver, issue them now.
+	;
+	MOVAB	BC_QUEUE,R4		; Get address of BC queue
+	MOVL	R4,R5			; Setup for loop
+5$:	MOVL	(R5),R5			; Skip to next block in queue
+	CMPL	R5,R4			; End of list?
+	BEQL	90$			; If not found, skip it
+	CMPW	BC_W_LPD(R5),R8		; Does the LPD ID match?
+	BNEQ	5$			; If not, keep looking
+10$:	REMQUE	@BC_Q_PND_RCV(R5),R2	; Get any receives waiting to be issued
+	BVS	5$			; If none, keep looking
+	INSQUE	(R2),@BC_Q_CUR_RCV+4(R5); Insert on outstanding receive queue
+	INCB	BC_B_REFCNT(R5)		; Increment reference count
+	MOVAB	IOWQE_G_NIHDR(R2),R0	; Get address of NI header buffer
+	$QIO_S	FUNC=#IO$_READVBLK,-	; Wait for a message to come in
+		CHAN=IOWQE_W_CHAN(R2),-
+		EFN=#NET$C_EFN_ASYN,-
+		IOSB=IOWQE_Q_IOSB(R2),-
+		ASTADR=B^RCV_DLE_MSG_AST,-
+		ASTPRM=R2,-
+		P1=IOWQE_G_MSG(R2),-	; Address of receive buffer
+		P2=#1500,-		; Length of receive buffer
+		P5=R0			; Address of buffer to receive NI header
+	BLBS	R0,10$			; Branch if ok
+	MOVZWL	R0,IOWQE_Q_IOSB(R2)	; Store QIO status in IOSB
+	PUSHL	R2			; IOWQE address
+	CALLS	#1,B^RCV_DLE_MSG_AST	; Call AST routine
+	BRB	10$			; Keep scanning
+90$:	RSB
+
+;
+; Receive AST
+;
+
+RCV_DLE_MSG_AST:
+	.WORD	0
+
+	MOVL	4(AP),R0		; Get WQE address
+	;
+	;   Remove from outstanding receive queue
+	;
+	REMQUE	(R0),R0			; Remove from queue
+	;
+	;   Queue a work queue entry to process the I/O completion
+	;
+	MOVAB	B^RCV_DLE_MSG,-		; Set address of work routine
+		WQE$L_ACTION(R0)
+	BSBW	WQE$INSQUE		; Insert onto work queue
+	RET
+
+	.SBTTL	RCV_DLE_MSG - Receive unsolicited DLE message
+;+
+; RCV_DLE_MSG - Receive unsolicited DLE message
+;
+; This routine is called when a receive completes on one of the DLE "shared"
+; channels.  This means that an unsolicited message has come in which could
+; not be associated with any existing protocol user.  Our action is to start
+; up a MOM process to handle the DLE session.
+;
+; Inputs:
+;
+;	R5 = IOWQE address
+;
+; Outputs:
+;
+;	None
+;-
+RCV_DLE_MSG:
+	MOVL	IOWQE_L_BC(R5),R4	; Get BC address
+	DECB	BC_B_REFCNT(R4)		; Decrement outstanding I/O count
+	;
+	;   Locate the CRI associated with this circuit
+	;
+	MOVZWL	BC_W_LPD(R4),R8		; Get LPD ID
+	BSBW	NET$GET_LPD_CRI		; Get LPD, CRI addresses
+	BLBC	R0,5$			; Exit if error detected
+	;
+	;   If the BC is marked for rundown, then this I/O completion
+	;   should be ignored, and the BC deallocated if possible.
+	;
+	BBC	#BC_V_DELETE,BC_B_FLAGS(R4),4$ ; If BC marked for rundown,
+	TSTB	BC_B_REFCNT(R4)		; Any more receives still outstanding?
+	BNEQ	5$			; If so, don't deallocate BC yet
+	MOVL	R4,R0			; Set address of BC
+	JSB	NET$DEALLOCATE		; Deallocate BC
+	BRB	5$			; and deallocate IOWQE as well
+4$:	;
+	;   If I/O status was not successful, then stop doing any I/O
+	;   on this channel (assume it is in the process of running down).
+	;
+	BLBS	IOWQE_Q_IOSB(R5),10$	; If I/O failure,
+	MOVW	#EVC$C_NMA_ABS,-	; "Aborted service request"
+		WQE$W_EVL_CODE(R5)
+	MOVB	#EVC$C_NMA_PRSN_ERR,-	; "Receive error"
+		WQE$B_EVL_DT1(R5)
+	BSBW	NET$EVT_INTRAW		; Log the event record
+	MOVZWL	#LEV$C_LIN_DOWN,R0	; Setup "circuit down" event
+	BSBW	SET_DLL_EVT		; Queue event to DLLTRN
+5$:	MOVL	R5,R0			; Get IOWQE address
+	JSB	NET$DEALLOCATE		; Deallocate it
+	RSB
+10$:	;
+	;   If there is already an unsolicited message received from
+	;   the remote node waiting for the MOM process to startup,
+	;   then drop the message on the floor - don't startup a
+	;   redundant MOM process for the same node.
+	;
+	MOVAB	BC_Q_UNSOL_MSGS(R4),R1	; Get address of unsolicited msg queue
+	MOVL	R1,R2			; Setup for loop
+15$:	MOVL	(R2),R2			; Skip to next msg in list
+	CMPL	R2,R1			; End of list?
+	BEQL	20$			; If so, then skip it
+	PUSHR	#^M<R1,R2>		; Save registers
+	CMPC	#NIHDRSIZ,-		; Does the NI header match?
+		IOWQE_G_NIHDR(R2),-
+		IOWQE_G_NIHDR(R5)
+	POPR	#^M<R1,R2>		; Restore registers
+	BNEQ	15$			; If it doesn't match, keep looking
+	BRB	30$			; If match found, drop msg on floor
+20$:	;
+	;   Startup a process to deal with the message
+	;
+	BSBW	STARTUP_MOM		; Start MOM process
+	;
+	;   If the process could not be created, re-issue the read
+	;   request using the same buffer.
+	;
+	BLBS	R0,40$			; Branch if successful
+30$:	INSQUE	(R5),@BC_Q_PND_RCV+4(R4); Insert on pending receive queue
+	MOVZWL	BC_W_LPD(R4),R1		; Get LPD ID
+	BSBW	ISSUE_NI_READ		; Re-issue read request
+	RSB
+	;
+	;   Save PID of MOM process just started in unsolicited message
+	;   context block.  From now on, this message is "tagged" for
+	;   that process: If the process comes in with an ACCESS function,
+	;   we give it the message; if the process dies, we deallocate the
+	;   message.
+	;
+40$:	MOVL	R1,IOWQE_L_PID(R5)	; Save PID of associated MOM process
+	;
+	;   Insert the message on the queue waiting for the process to
+	;   get started.
+	;
+	INSQUE	(R5),@BC_Q_UNSOL_MSGS+4(R4)	; Insert at end of queue
+	;
+	;   Re-issue another receive request for this protocol type
+	;
+	MOVZWL	#IOWQE_C_LENGTH-WQE$C_LENGTH,R1	; Get additional storage size
+	MOVL	#WQE$C_SUB_AST,R0	; Indicate WQE sub-type
+	BSBW	WQE$ALLOCATE		; Allocate a WQE - always succeeds
+	MOVW	IOWQE_W_CHAN(R5),-	; Copy channel to datalink
+		IOWQE_W_CHAN(R2)
+	MOVL	IOWQE_L_BC(R5),-	; Copy backpointer to BC block
+		IOWQE_L_BC(R2)
+	MOVW	WQE$W_REQIDT(R5),-	; Use the same REQIDT
+		WQE$W_REQIDT(R2)
+	INSQUE	(R2),@BC_Q_PND_RCV+4(R4); Insert on pending receive queue
+	MOVZWL	BC_W_LPD(R4),R1		; Get LPD ID
+	BSBW	ISSUE_NI_READ		; Issue another read request
+90$:	RSB
+
+	.SBTTL	DLE$MOP_REQUEST - Partner has requested MOP mode
+;+
+; DLE$MOP_REQUEST - The circuit partner has requested MOP mode
+;
+; This routine is called when the datalink has received a MOP message
+; from the partner node on a point-to-point datalink.
+;
+; Inputs:
+;
+;	R10/R11 = CRI pointers
+;	R6 = LPD address
+;
+; Outputs:
+;
+;	None
+;
+;	R0-R3,R8-R9 are destroyed.
+;-
+DLE$MOP_REQUEST::
+	PUSHR	#^M<R4,R5,R6,R7>	; Save registers
+	BBSS	#LPD$V_DLE,-		; Mark circuit in MOP mode
+		LPD$W_STS(R6),10$	; If already marked, skip logging event
+	;
+	;   Log an event indicating the circuit has gone into MOP mode
+	;
+	MOVAB	NET$AB_EVT_WQE,R5	; Get address of common WQE
+	MOVW	LPD$W_PTH(R6),-		; Set LPD ID into WQE
+		WQE$W_REQIDT(R5)
+	MOVW	#EVC$C_DLL_RSC,-	; "remotely initiated state change"
+		WQE$W_EVL_CODE(R5)
+	MOVB	#EVC$C_DLL_POLD_RUNG,-	; Old state = RUNNING
+		WQE$B_EVL_DT1(R5)
+	MOVB	#EVC$C_DLL_POLD_MAIN,-	; New state = MAINTAINANCE
+		WQE$B_EVL_DT2(R5)
+	BSBW	NET$EVT_INTRAW		; Log the event record
+	;
+	;   If circuit is already accessed, then ignore MOP notification
+	;
+10$:	BBS	#LPD$V_ACCESS,-		; Branch if circuit accessed
+		LPD$W_STS(R6),40$
+	;
+	;   If service functions are disabled for this circuit, then
+	;   ignore MOP request, and recycle circuit.
+	;
+	$GETFLD	cri,l,ser		; Get SERVICE flag
+	BLBS	R8,50$			; Branch if disabled
+	;
+	;   Set the circuit substate to "auto-service"
+	;
+	MOVB	#NMA$C_LINSS_ASE,-	; Set circuit substate
+		LPD$B_SUB_STA(R6)
+	;
+	;   Startup a process to deal with the message
+	;
+	BSBW	STARTUP_MOM		; Start MOM process
+	BLBC	R0,50$			; Branch if unsuccessful
+	;
+	;   Save PID of MOM process just started in CRI block
+	;
+	MOVL	R1,R8			; Setup PID of created process
+	$PUTFLD	cri,l,owpid		; Set DLE owner of circuit
+	;
+	;   We can respond to the MOP request.  Recycle the circuit
+	;   and force it to come up in "MOP" state (because of the
+	;   DLE flag).
+	;
+40$:	MOVZWL	#LEV$C_LIN_DOWN,R0	; Setup "line down" event
+	BSBW	SET_DLL_EVT		; Queue the event
+	BRB	90$
+
+	;
+	;   We cannot respond to the MOP request.  Recycle the circuit
+	;   and force it to come back in regular mode.
+	;
+50$:	CLRBIT	#LPD$V_DLE,LPD$W_STS(R6) ; Mark circuit in "normal" mode
+	MOVZWL	#LEV$C_LIN_DOWN,R0	; Setup "line down" event
+	BSBW	SET_DLL_EVT		; Queue the event
+90$:	POPR	#^M<R4,R5,R6,R7>	; Restore registers
+	RSB
+
+	.SBTTL	STARTUP_MOM - Start MOM process
+;+
+; STARTUP_MOM - Start MOM process for auto-service
+;
+; This routine is called to start the MOM process.
+;
+; Inputs:
+;
+;	R10/R11 = CRI pointers
+;
+; Outputs:
+;
+;	R0 = Status code
+;	R1 = IPID of process, if successful
+;
+;	R2-R3,R7-R9 are destroyed.
+;-
+STARTUP_MOM:
+	PUSHR	#^M<R4,R5>		; Save registers
+	$GETFLD	cri,s,nam		; Get circuit name
+	;
+	;   Repeatly try to startup MOM, and if it fails due to "duplicate
+	;   process name", then try again with another process name until
+	;   it suceeds.
+	;
+	MOVL	#1,R9			; Start with postfix #1
+10$:	SUBL	#12,SP			; Allocate prcnam buffer on stack
+	PUSHL	SP			; Construct descriptor of buffer
+	PUSHL	#12
+	MOVAB	MOM_PRCNAM,R1		; Get address of FAO string
+	MOVZBL	(R1)+,R0		; Construct descriptor of FAO string
+	MOVQ	R0,-(SP)		; Push FAO descriptor onto stack
+	MOVL	SP,R0			; Get stack address
+	$FAO_S	CTRSTR=(R0),-		; Construct process name
+		OUTBUF=8(R0),-
+		OUTLEN=8(R0),-
+		P1=R7,-			; Length of circuit name
+		P2=R8,-			; Address of circuit name
+		P3=R9			; Process number
+	ADDL	#8,SP			; Pop FAO string descriptor
+	MOVQ	(SP)+,R4		; R4/R5 = descriptor of process name
+	MOVQ	R7,R2			; Pass circuit name as SYS$NET
+	PUSHR	#^M<R7,R8>		; Save circuit name
+	MOVAB	MOM_OBJ_NAM,R8		; Point to ASCIC MOM object name
+	MOVZBL	(R8)+,R7		; Construct descriptor of name
+	BSBW	NET$STARTUP_OBJ_NAM	; Startup the object
+	POPR	#^M<R7,R8>		; Restore circuit name
+	ADDL	#12,SP			; Pop process name buffer
+	CMPW	R0,#SS$_DUPLNAM		; Process name already exist?
+	BNEQ	20$			; If so,
+	ACBL	#MAX_MOM_PROC,#1,R9,10$	; Increment number and try again
+	BRB	90$			; Exit with error, but don't log
+					; any error - too many MOMs already
+20$:	;
+	;   If the process could not be created, log an event record.
+	;
+	BLBS	R0,90$			; Branch if successful
+	PUSHL	R0			; Save status
+	MOVAB	NET$AB_EVT_WQE,R5	; Get address of common WQE
+	MOVW	#EVC$C_NMA_ABS,-	; "aborted service request"
+		WQE$W_EVL_CODE(R5)
+	MOVB	#EVC$C_NMA_PRSN_LOE,-	; Reason = "line open error"
+		WQE$B_EVL_DT1(R5)
+	BSBW	NET$EVT_INTRAW		; Log the event record
+	POPL	R0			; Restore status
+90$:	POPR	#^M<R4,R5>		; Restore registers
+	RSB
+
+	.SBTTL	ATTACH_UNSOL_MSG - Attach unsolicited message
+;+
+; ATTACH_UNSOL_MSG - Attach unsolicited message to newly accessed DWB
+;
+; This routine is called to search the unsolicited message queue, and
+; if one is found for this DLE user, to insert the message onto it's
+; private receive queue.
+;
+; Inputs:
+;
+;	R3 = IO$_ACCESS IRP address
+;	R4 = DWB adress
+;
+; Outputs:
+;
+;	IRP$L_EXTEND(R3) = Address of CXB containing unsolicited message
+;				(or zero if no message found)
+;
+;		CXB$W_LENGTH	= Message length in bytes (not incl. NI header)
+;		CXB$C_HEADER	= 14-byte NI datalink header
+;		CXB$C_HEADER+14	= Message
+;
+;	R0-R1 are destroyed.
+;-
+ATTACH_UNSOL_MSG:
+	PUSHL	R5			; Save registers
+	CLRL	IRP$L_EXTEND(R3)	; Preset no CXB address
+	;
+	;   Locate the BC block associated with this circuit.
+	;
+	MOVAB	BC_QUEUE,R1		; Get address of BC queue
+	MOVL	R1,R5			; Setup for loop
+5$:	MOVL	(R5),R5			; Skip to next block in queue
+	CMPL	R5,R1			; End of list?
+	BEQL	90$			; If not found, skip it
+	CMPW	BC_W_LPD(R5),-		; Does the LPD ID match?
+		DWB$W_PATH(R4)
+	BNEQ	5$			; If not, keep looking
+	;
+	;   Search for unsolicited message which was "tagged" for
+	;   this process.
+	;
+	MOVAB	BC_Q_UNSOL_MSGS(R5),R1	; Get address of unsolicited msg queue
+	MOVL	R1,R5			; Setup for loop
+10$:	MOVL	(R5),R5			; Skip to next msg in list
+	CMPL	R5,R1			; End of list?
+	BEQL	90$			; If so, then skip it
+	CMPL	IOWQE_L_PID(R5),-	; Does the IPID match?
+		IRP$L_PID(R3)
+	BNEQ	10$			; If not, keep looking
+	;
+	;   Allocate a CXB from non-paged pool, store the message into
+	;   the block, and insert it into the DWB receive queue.
+	;
+	MOVZWL	IOWQE_W_MSGLEN(R5),R1	; Get size of message
+	ADDL	#CXB$C_OVERHEAD+NIHDRSIZ,R1 ; Compute size of CXB
+	JSB	NET$ALONPAGED		; Allocate from non-paged pool
+	BLBC	R0,90$			; If insufficient memory, skip it
+	MOVW	R1,CXB$W_SIZE(R2)	; Set size of structure
+	MOVB	#DYN$C_CXB,CXB$B_TYPE(R2) ; Set type of structure
+	MOVAB	CXB$C_HEADER+-		; Set data area address in CXB
+		NIHDRSIZ(R2),(R2)
+	MOVW	IOWQE_W_MSGLEN(R5),-	; Save message size in CXB
+		CXB$W_LENGTH(R2)
+	MOVL	R2,IRP$L_EXTEND(R3)	; Save address of CXB
+	PUSHR	#^M<R2,R3,R4,R5>	; Save registers
+	MOVC	#NIHDRSIZ,-		; Copy NI datalink header
+		IOWQE_G_NIHDR(R5),-
+		CXB$C_HEADER(R2)
+	MOVL	3*4(SP),R5		; Recover IOWQE address
+	MOVC	IOWQE_W_MSGLEN(R5),-	; Copy message
+		IOWQE_G_MSG(R5),-
+		(R3)
+	POPR	#^M<R2,R3,R4,R5>	; Restore registers
+90$:	POPL	R5			; Restore registers
+	RSB
+
+	.SBTTL	DLE$PRC_EXIT - Handle MOM process termination
+;+
+; DLE$PRC_EXIT - Handle MOM process termination
+;
+; This routine is called whenever any process "owned" by NETACP terminates.
+; We must check if we have any unsolicited MOP messages intended for the
+; terminated process, and if so, clean them up.
+;
+; Inputs:
+;
+;	R8 = IPID of terminated process
+;
+; Outputs:
+;
+;	None
+;-
+DLE$PRC_EXIT::
+	;
+	;   Scan all broadcast circuits
+	;
+	MOVAB	BC_QUEUE,R1		; Get address of BC queue
+	MOVL	R1,R5			; Setup for loop
+5$:	MOVL	(R5),R5			; Skip to next block in queue
+	CMPL	R5,R1			; End of list?
+	BEQL	20$			; If not found, skip it
+	;
+	;   Deallocate any messages which are intended for this process
+	;
+	MOVAB	BC_Q_UNSOL_MSGS(R5),R2	; Get address of unsolicited msg queue
+	MOVL	R2,R3			; Setup for loop
+10$:	MOVL	(R3),R3			; Skip to next msg in list
+15$:	CMPL	R3,R2			; End of list?
+	BEQL	5$			; If so, then continue to next circuit
+	CMPL	IOWQE_L_PID(R3),R8	; Does the IPID match?
+	BNEQ	10$			; If not, keep looking
+	PUSHL	(R3)			; Save pointer to next block in list
+	REMQUE	(R3),R0			; Remove it from the queue
+	JSB	NET$DEALLOCATE		; Deallocate the block
+	POPL	R3			; Set R3 to next block in list
+	BRB	15$			; Keep looking for more
+20$:	;
+	;   If any circuits are in MOP state waiting for the MOM
+	;   process to issue its initial ACCESS, then reset them
+	;   back into normal state.  We recognize this condition
+	;   if the OWPID field is still set to the PID, meaning
+	;   that the process must never have accessed the DLE
+	;   channel (or else we would have cleared it on DEACCESS).
+	;
+	MOVL	NET$GL_CNR_CRI,R11	; Point to CRI database
+	CLRL	R10			; Start at beginning
+25$:	$SEARCH	eql,cri,l,owpid		; Search for circuits 
+	BLBC	R0,30$			; Branch if none found
+	BSBW	NET$LOCATE_LPD		; Locate associated LPD
+	BLBC	R0,25$			; If error detected, skip it
+	BSBW	LEAVE_MOP_STATE		; Return circuit to normal mode
+	MOVZWL	#LEV$C_LIN_DOWN,R0	; Setup "line down" event
+	BSBW	SET_DLL_EVT		; Queue the event
+	BRB	25$			; Keep looping
+30$:	RSB	
+
+
+	.END

@@ -1,0 +1,557 @@
+%TITLE 'Encrypt Facility'
+MODULE ENCRYPT$FACILITY (
+			IDENT = 'V04-000',
+			main = encrypt_facility,
+    			addressing_mode ( external=general )
+			) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:
+!   VAX/VMS Data Encrypt Facility Utility Mainline
+!
+! ABSTRACT:
+!   This module serves as the dispatch point for all functions of the
+!   Data Encryption facility. This includes key definition and deletion,
+!   as well as algorithm testing and verification.
+!
+! ENVIRONMENT:
+!   VAX/VMS non-privileged user mode.
+!
+! AUTHOR: J. Eric Pollack, CREATION DATE: 20 December 1982
+!
+! MODIFIED BY:
+!
+!	V01-004	MSH0073		Michael S. Harvey	15-Aug-1984
+!		Add support for /JOB qualifier.
+!
+!	V01-003	JEP0009		J. Eric Pollack		10-Mar-1984
+!		Clarify %Variant usage
+!
+!	V01-002 JEP0005		J. Eric Pollack		31-Aug-1983
+!		Revise call to encrypt$file, revise DCL interaction
+!
+!	V01-001	JEP0004		J. Eric Pollack		1-Aug-1983
+!		Revise entrypoints.
+!--
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+    encrypt_facility ,			! mainline dispatcher
+    fac_define_key ,			! facility define key
+    fac_delete_key ,			! facility delete key
+    fac_en_decrypt ,			! facility encrypt file
+    fac_test ;				! facility test algorithms
+
+!
+! INCLUDE FILES:
+!
+LIBRARY
+    'SYS$LIBRARY:STARLET.L32' ;		! system library
+REQUIRE
+    'SRC$:ENCFACMAC.R32'	;	! facility common definitions
+REQUIRE
+    'LIB$:ENCSTRUCT.R32'	;	! facility structure definitions
+
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL ROUTINE
+    cli$get_value,			! Get qualifier value
+    cli$present ,			! Test if qualifier present
+%IF VMS_V4
+%THEN
+    lib$qual_file_parse,		! common qualifier file parse
+    lib$qual_file_end,			! release common qualifier context
+%FI
+    str$free1_dx ,			! free string dynamic storage
+    str$copy_dx ,			! copy string
+    str$compare_eql ,			! string compare
+    encrypt$define_key ,		! define key
+    encrypt$delete_key ,		! delete key
+    encrypt$encrypt_file ,		! file encrypt/decrypt service
+    encrypt$$compress_key ,		! compress key value string
+    encrypt$$cvt_to_hex ,		! convert key value
+    encrypt$$algorithm_name ;		! lookup algorithm name in table
+
+EXTERNAL
+    ENCRYPT$_NOTESTROU,			! No test routine available
+    ENCRYPT$_NOFILESER,			! No file encryption service supported
+    ENCRYPT$_NOTYETIMP ;		! error code for unimplemented functions
+
+%SBTTL 'define_key'
+ROUTINE fac_define_key =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This module supports the DCL command "ENCRYPT/DEFINE_KEY".
+!
+! FORMAL PARAMETERS:
+!
+!	None.
+!
+! IMPLICIT INPUTS:
+!
+!	Command Line Input context is assumed to represent a define_key
+!	function.
+!
+! IMPLICIT OUTPUTS:
+!
+!	A key name and associated value are placed into facility key storage
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!
+!	SS$_NORMAL	success
+!	other		as returned from the facility define key primitive
+!
+! SIDE EFFECTS:
+!
+!	None.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	status : LONG INITIAL(ss$_normal),		! return status
+	key_name_desc : $DDESCRIP INITIAL ($DDYNAMIC),	! key name descriptor
+	key_value_desc : $DDESCRIP INITIAL ($DDYNAMIC),! key value descriptor
+	define_flags : $BBLOCK [ 4 ] ;	! mask of flags to be passed to $CRELOG
+
+!
+! obtain the key name from the cli
+!
+    cli$get_value ( $descriptor('P1') , key_name_desc ) ;
+!
+! obtain the key value string 
+!
+    cli$get_value ( $descriptor('P2') , key_value_desc ) ;
+!
+! obtain the key definition flags
+!
+    define_flags = 0 ;
+    define_flags[encrypt$v_key_system] = cli$present($descriptor('SYSTEM')) ;
+    define_flags[encrypt$v_key_group] = cli$present($descriptor('GROUP'));
+    define_flags[encrypt$v_key_job] = cli$present($descriptor('JOB'));
+    define_flags[encrypt$v_key_process] = cli$present($descriptor('PROCESS')) ;
+
+    define_flags[encrypt$v_key_literal] = cli$present($descriptor('COMPRESS')) ;
+    define_flags[encrypt$v_key_parity] = cli$present ( $descriptor('PARITY'));
+!
+! determine if the user wants the key value treated as a hexadecimal number
+! This overrides the values of the /COMPRESS and /PARITY switches
+!
+    IF cli$present ( $descriptor('HEXADECIMAL'))
+	THEN
+	    BEGIN
+	    status = encrypt$$cvt_to_hex(key_value_desc, key_value_desc) ;
+	    define_flags[encrypt$v_key_literal] = TRUE ;
+	    define_flags[encrypt$v_key_parity] = FALSE ;
+
+	    END ;
+!
+! and use the facility common key definition routine
+!
+    IF .status
+    THEN
+    status = encrypt$define_key ( key_name_desc , key_value_desc , 
+    					define_flags ) ;
+!
+! free up the dynamic storage so we don't loose vm.
+!
+    release_descriptor_space ( key_name_desc ) ;
+    release_descriptor_space ( key_value_desc ) ;
+!
+! return with status
+!
+    .status
+
+    END;			! end of routine
+
+
+%SBTTL 'delete key'
+ROUTINE fac_delete_key =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine interprets the DCL command "ENCRYPT/DELETE_KEY".
+!
+! FORMAL PARAMETERS:
+!
+!	None.
+!
+! IMPLICIT INPUTS:
+!
+!	DCL command line context.
+!
+! IMPLICIT OUTPUTS:
+!
+!	The named key is deleted from facility key storage.
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!
+!	SS$_NORMAL or
+!	return value from encrypt$delete_key.
+!
+! SIDE EFFECTS:
+!
+!	None.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	status : LONG ,			! return status
+	key_name_desc : $DDESCRIP INITIAL ($DDYNAMIC),! key name descriptor
+	delete_flags : $BBLOCK [ 4 ];	! mask of flags to be passed to $CRELOG
+
+!
+! obtain the key name from the cli
+!
+    cli$get_value ( $descriptor('P1') , key_name_desc ) ;
+!
+! obtain the key deletion flags
+!
+    delete_flags = 0 ;
+    delete_flags[encrypt$v_key_system] = cli$present( $descriptor('SYSTEM')) ;
+
+    delete_flags[encrypt$v_key_group] = cli$present( $descriptor('GROUP'));
+    delete_flags[encrypt$v_key_job] = cli$present( $descriptor('JOB'));
+    delete_flags[encrypt$v_key_process] = 
+    				NOT .delete_flags[encrypt$v_key_group] ;
+!
+! and use the facility common key deletion routine
+!
+    status = encrypt$delete_key ( key_name_desc , delete_flags ) ;
+!
+! free up the dynamic storage so we don't loose vm.
+!
+    release_descriptor_space ( key_name_desc ) ;
+!
+! return with status
+!
+    .status
+    END;			! end of routine
+
+
+%SBTTL 'encrypt file'
+ROUTINE fac_en_decrypt ( direction ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This module supports the DCL command "ENCRYPT file" and "DECRYPT file".
+!
+! FORMAL PARAMETERS:
+!
+!	None.
+!
+! IMPLICIT INPUTS:
+!
+!	DCL command context.
+!
+! IMPLICIT OUTPUTS:
+!
+!	None.
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!
+!	Return value from encrypt$encrypt_file.
+!
+! SIDE EFFECTS:
+!
+!	None.
+!
+!--
+
+    BEGIN
+    LOCAL
+	status : LONG ,			! return status
+	input_file_spec : $DDESCRIP INITIAL ($DDYNAMIC),! input file specification
+	output_file_spec : $DDESCRIP INITIAL ($DDYNAMIC), ! output file specification
+	key_name_spec : $DDESCRIP INITIAL ($DDYNAMIC),! keyname specification
+	alg_name_spec : $DDESCRIP INITIAL ($DDYNAMIC),! algorithm specification
+	file_flags : $BBLOCK [ 4 ] ,	! file operation flags
+	common_qual_flags : LONG ,	! flags for lib$qual_file_parse
+	common_qual_context : LONG INITIAL (0);	! context from lib$qual_file_parse
+
+    !
+    ! if file encryption is not linked with this facility, say so now
+    !
+    IF encrypt$encrypt_file EQLA 0 THEN RETURN ENCRYPT$_NOFILESER ;
+    !
+    ! set encrypt/decrypt direction
+    !
+    file_flags[encrypt$v_file_encrypt] = .direction ;
+    !
+    ! obtain the command parameters from the cli
+    !
+    cli$get_value ( $descriptor('INPUT') , input_file_spec ) ;
+    cli$get_value ( $descriptor('OUTPUT') , output_file_spec ) ;
+    cli$get_value ( $descriptor('KEY') , key_name_spec ) ;
+
+    file_flags [ encrypt$v_file_delete ] = cli$present($descriptor('DELETE')) ;
+    file_flags [ encrypt$v_file_erase ] = cli$present($descriptor('ERASE')) ;
+    file_flags [ encrypt$v_file_log ] = cli$present($descriptor('LOG')) ;
+    file_flags [ encrypt$v_file_statistics ] = cli$present($descriptor('STATISTICS')) ;
+    !
+    ! Setup context for common file qualifiers
+    !
+%IF VMS_V4
+%THEN
+    common_qual_flags = LIB$M_CQF_CONFIRM OR LIB$M_CQF_BEFORE OR
+    			LIB$M_CQF_SINCE OR LIB$M_CQF_EXCLUDE OR
+    			LIB$M_CQF_BYOWNER;
+    IF NOT (status = lib$qual_file_parse (common_qual_flags,common_qual_context ))
+    THEN
+    	RETURN .status ;
+%ELSE
+    common_qual_flags = 0 ;
+%FI
+    !
+    ! determine which encryption algorithm is to be used
+    !
+    IF cli$present($descriptor('ALGORITHM')) 
+    THEN
+	cli$get_value($descriptor('ALGORITHM'), alg_name_spec) 
+    ELSE
+    	str$copy_dx ( alg_name_spec , $descriptor('DESCBC')) ;
+
+    !
+    ! and call the file encrypt/decrypt function
+    !
+    IF .status
+	THEN
+	status = encrypt$encrypt_file ( input_file_spec ,
+    					output_file_spec ,
+    					key_name_spec ,
+    					alg_name_spec ,
+    					file_flags ,
+					common_qual_context);
+    !
+    ! release string memory
+    !
+%IF VMS_V4
+%THEN
+    lib$qual_file_end ( common_qual_context ) ;
+%FI
+    release_descriptor_space ( input_file_spec ) ;
+    release_descriptor_space ( output_file_spec ) ;
+    release_descriptor_space ( key_name_spec ) ;
+    release_descriptor_space ( alg_name_spec ) ;
+    !
+    ! and return
+    !
+    .status
+
+    END;			! end of routine 
+
+
+%SBTTL 'test facility'
+ROUTINE fac_test =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Verify the operation of the ENCRYPT facility. This routine performs
+!	tests at several levels to verify that the encrypt primitives, the
+!	ENCRYPT$ interface, and the LIB$ interface perform as intended.
+!
+! FORMAL PARAMETERS:
+!
+!	The tests are directed by options and parameters on the
+!	command line.
+!
+! IMPLICIT INPUTS:
+!
+!	Standard test data is provided in the ENCTSTDAT module.
+!
+! IMPLICIT OUTPUTS:
+!
+!	None.
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!
+!	SS$_NORMAL for correctly completed test.
+!	Value as returned from the algorithm specific test routine.
+!
+! SIDE EFFECTS:
+!
+!	None.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	status : LONG ,		! return status
+	algorithm_name : $DDESCRIP INITIAL ($DDYNAMIC),	! ascii code for selected algorithm
+	algorithm_table : REF $BBLOCK,	! pointer to algorithm parameter table
+	test_report : LONG ,	! test reporting switch
+    	test_list_desc : $DDESCRIP INITIAL ($DDYNAMIC), ! list of tests to do
+	option_desc : $DDESCRIP INITIAL ($DDYNAMIC) ; ! algorithm options
+!
+! determine the input and output reporting requirements for the test
+!
+	test_report = cli$present($descriptor('LOG')) ;
+!
+! determine the algorithm to be tested
+!
+    IF cli$present($descriptor('ALGORITHM')) 
+    THEN
+	cli$get_value($descriptor('ALGORITHM'),option_desc) 
+    ELSE
+        str$copy_dx ( option_desc , $descriptor('DES') ) ;
+!
+! obtain the list of tests to be performed
+!
+    cli$get_value($descriptor('SELECT'),test_list_desc) ;
+!
+! dispatch to the appropriate test routine
+!
+    status = encrypt$$algorithm_name ( option_desc , algorithm_table) ;
+
+    IF .status THEN 
+	IF .algorithm_table[encrypt$a_agt_test_routine] NEQA 0
+	THEN
+    	status = (.algorithm_table[encrypt$a_agt_test_routine])
+			(algorithm_table,
+			test_report,
+    			test_list_desc
+			) 
+	ELSE
+	status = encrypt$_notestrou ;
+
+
+!
+! release any dynamic string memory acquired
+!
+    release_descriptor_space ( option_desc ) ;
+    release_descriptor_space ( algorithm_name ) ;
+    release_descriptor_space ( test_list_desc ) ;
+
+    .status 
+    END;			! end of routine
+
+
+
+%SBTTL 'encrypt_facility mainline'
+GLOBAL ROUTINE encrypt_facility =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This is the main routine. It obtains the command line information
+!	via CLI callback and dispatches to the appropriate function. The
+!	basic operations performed are:
+!
+!		algorithm testing,
+!		call interface verification,
+!		key definition,
+!		key deletion,
+!		file encryption, and
+!		file decryption.
+!
+! FORMAL PARAMETERS:
+!
+!	None.
+!
+! IMPLICIT INPUTS:
+!
+!	The DCL command context.
+!
+! IMPLICIT OUTPUTS:
+!
+!	None.
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!
+!	SS$_NORMAL
+!	or value as returned by command specific facility routine.
+!
+! SIDE EFFECTS:
+!
+!	None.
+!
+!--
+
+    BEGIN
+
+LOCAL
+    exit_status : $BBLOCK[4] INITIAL (ss$_normal), ! Most severe error status
+    verb_descriptor : $DDESCRIP INITIAL ($DDYNAMIC);! command verb descriptor
+
+!
+! establish the condition handler for the encrypt facility
+!
+!!    ENABLE condition_handler ( exit_status) ;	!
+!
+! determine which function is being performed
+!
+    cli$get_value ( $descriptor ('$VERB') , verb_descriptor ) ;
+
+    IF str$compare_eql ( $descriptor ('ENCR') , verb_descriptor ) EQLU 0 
+	THEN 
+	BEGIN
+	    IF (cli$present($descriptor('CREATE_KEY')))
+	    THEN exit_status = fac_define_key ()
+	    ELSE IF (cli$present($descriptor('REMOVE_KEY')))
+		THEN exit_status = fac_delete_key() 
+		ELSE IF cli$present ( $descriptor('TEST_FACILITY') )
+		    THEN exit_status = fac_test()
+		    ELSE exit_status = fac_en_decrypt (TRUE) ;
+	END ELSE
+
+	IF str$compare_eql ( $descriptor ('DECR') , verb_descriptor ) EQLU 0
+	    THEN exit_status = fac_en_decrypt(FALSE)
+	    ELSE exit_status = ENCRYPT$_NOTYETIMP ;
+
+
+    !
+    ! release string storage
+    !
+    release_descriptor_space ( verb_descriptor ) ;
+    !
+    ! and return
+    !
+    .exit_status		! return exit status
+
+    END;			! end of routine 
+
+END				! End of module
+ELUDOM

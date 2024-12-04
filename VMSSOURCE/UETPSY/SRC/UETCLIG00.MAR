@@ -1,0 +1,3485 @@
+	.TITLE UETCLIG00 VAX/VMS UETP Cluster Integration Test
+	.IDENT	'V04-000'
+	.ENABLE SUPPRESSION
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+
+;++
+; FACILITY:
+;	This module will be distributed with VAX/VMS under the [SYSTEST]
+;	account.
+;
+; ABSTRACT:
+;	This module is the Cluster Integration phase of the UETP.  It tests
+;	that the node from which it is run fits in with all other nodes in
+;	a cluster, trying those basic functions of a cluster which are
+;	accessible to typical user programs.
+;
+; ENVIRONMENT:
+;	Because of the requirement that all error messages be displayed at
+;	the terminal that is running the UETP, all errors reported by a slave
+;	process must be sent to the master process.  We have chosen to do that
+;	by copying (via $PUTMSG action routine) slave messages of other than
+;	success severity to a disk file, and then relaying that file to the
+;	master process at the end of the test.  The file, SYS$ERROR.LOG,
+;	should be automatically deleted at the end of the test.
+;
+;	Note that the test assumes that DECnet node names correspond to cluster
+;	node names!
+;
+; 	This program will run in user access mode except when getting a copy
+;	of VMS's configuration data base.  We require the following
+;	privileges and quotas:
+;		CMKRNL
+;
+;--
+;
+; AUTHOR: Richard Holstein,	CREATION DATE: June, 1983
+;
+; MODIFIED BY:
+;
+;	V03-009	RNH0008		Richard N. Holstein,	05-Jul-1984
+;		Fix Spelling error in message, add message to warn if deadlock
+;		detection is turned off.
+;
+;	V03-008	RNH0007		Richard N. Holstein,	29-Apr-1984
+;		Have SCSNODE return the entire string, not just 4 chars.  Have
+;			NO_NODE_MSG be a warning, not info message.
+;
+;	V03-007	WHM0001		Bill Matthews		14-Apr-1984
+;		Replace reference to SCSNODEL and SCSNODEH with SCSNODE.
+;
+;	V03-006	RNH0006		Richard N. Holstein,	11-Apr-1984
+;		Use correct error message if a node has no disk DDBs for file
+;		test.  Allow multiple strings to be encoded in the MODE logical
+;		name.  Test blocking ASTs in a cluster and allow the test to
+;		$HIBER minimally or not at all if deadlock detection is quick.
+;
+;	V03-005	RNH0005		Richard N. Holstein,	24-Feb-1984
+;		Fix SSERROR interaction with RMS_ERROR.  Change sentinel lines
+;		from slave process log files so that we may copy them into the
+;		master log without the test controller thinking that they are
+;		sentinels from the master process.  Indent all of slave log
+;		file lines copied, including embedded newlines.
+;
+;	V03-004	RNH0004		Richard N. Holstein,	07-Jan-1984
+;		Be more choosey about the nodes we'll allow for lock testing
+;		and for file testing:  ensure that we believe a VMS node is a
+;		member of our cluster and that the path to all nodes is in
+;		good shape.
+;
+;	V03-003	RNH0003		Richard N. Holstein,	22-Nov-1983
+;		Fix params to DEADLOCK_WAIT error message.
+;
+;	V03-002	RNH0002		Richard N. Holstein,	26-Sep-1983
+;		Fix RET from subroutine which should be RSB.  Change trace
+;		logical name to MODE to avoid naming conflict and be compatible
+;		with the rest of UETP.  Add SE_NAM so correct SYS$ERROR.LOG file
+;		is always $ERASEd.
+;
+;	V03-001	RNH0001		Richard N. Holstein,	28-Jul-1983
+;		Add shared file access, new UETP messages and file access
+;		debugging info.
+;
+;**
+
+	.SBTTL	Declarations
+;
+; INCLUDE FILES:
+;
+;	SYS$LIBRARY:LIB.MLB	for general definitions
+;	SHRLIB$:UETP.MLB	for UETP definitions
+
+;
+; MACROS:
+;
+	$CHFDEF				; Condition handler frame definitions
+	$BRKDEF				; $BRKTHRU flags
+	$DVIDEF				; $GETDVI ITMLST item codes
+	$IODEF				; I/O function codes
+	$JPIDEF				; $GETJPI ITMLST item codes
+	$LCKDEF				; $ENQ flags and miscellany
+	$NAMDEF				; NAM block definitions and constants
+	$PBDEF				; Path block definitions
+	$SHRDEF				; Shared messages
+	$STSDEF				; Status return
+	$SYIDEF				; $GETSYI ITMLST item codes
+	$UETIDBDEF			; UETP I/O database definitions
+	$UETPDEF			; UETP
+
+.MACRO	MESSAGES			; Define msgs between master and slaves
+	DEFMSG	HELLO			; Identify master to slave
+	DEFMSG	IMOK			; Slave got correctly set up
+	DEFMSG	TAKELOCK		; Tell slave to take out a lock
+	DEFMSG	GOTLOCK			; Slave successfully took out a lock
+	DEFMSG	QUEUELOCK		; Slave is queued for a lock (deadlock)
+	DEFMSG	DEADLOCK		; Slave was chosen as a deadlock victim
+	DEFMSG	ACCESS			; Tell slave to access a file
+	DEFMSG	CONTINUE		; Slave is accessing a file
+	DEFMSG	MOVE_ON			; Section finished, continue with next
+	DEFMSG	ERRORLOG		; Slave is sending a copy of SYS$ERROR
+	DEFMSG	ERRORLOG_ENDED		; Slave is finished sending SYS$ERROR
+.ENDM	MESSAGES
+
+.MACRO	BEQLW	DISPL,?L1		; Word displacement branch if equal
+	BNEQ	L1			; Reverse the sense of the test...
+	BRW	DISPL			; ...so that the false passes over
+L1:
+.ENDM	BEQLW
+
+.MACRO	BNEQW	DISPL,?L1		; Word displacement branch if not equal
+	BEQL	L1			; Reverse the sense of the test...
+	BRW	DISPL			; ...so that the false passes over
+L1:
+.ENDM	BNEQW
+
+.MACRO	BLBCW	SRC,DISPL,?L1		; Word displacement BR on low bit clear
+	BLBS	SRC,L1			; Reverse the sense of the test...
+	BRW	DISPL			; ...so that the false passes over
+L1:
+.ENDM	BLBCW
+
+.MACRO	BLBSW	SRC,DISPL,?L1		; Word displacement BR on low bit set
+	BLBC	SRC,L1			; Reverse the sense of the test...
+	BRW	DISPL			; ...so that the false passes over
+L1:
+.ENDM	BLBSW
+
+.MACRO	BBCW	POS,BASE,DISPL,?L1	; Word displacement BR on bit clear
+	BBS	POS,BASE,L1		; Reverse the sense of the test...
+	BRW	DISPL			; ...so that the false passes over
+L1:
+.ENDM	BBCW
+
+.MACRO	BBSW	POS,BASE,DISPL,?L1	; Word displacement BR on bit set
+	BBC	POS,BASE,L1		; Reverse the sense of the test...
+	BRW	DISPL			; ...so that the false passes over
+L1:
+.ENDM	BBSW
+
+;
+; EQUATED SYMBOLS:
+;
+;   Facility number definitions:
+	RMS$_FACILITY = 1
+
+;   SHR message definitions:
+	UETP = UETP$_FACILITY@STS$V_FAC_NO ; Define the UETP facility code
+	UETP$_ABENDD = UETP!SHR$_ABENDD	; Define the UETP message codes
+	UETP$_BEGIND = UETP!SHR$_BEGIND
+	UETP$_ENDEDD = UETP!SHR$_ENDEDD
+	UETP$_TEXT   = UETP!SHR$_TEXT
+
+;   Internal flag bits...:
+	CLIG_V_DEADNODE = 1		; Marks a slave node as out of the test
+					; Kept in one of NODE_NAMES descriptors
+	CLIG_V_DEBUG    = 0		; Remembers if running in debug mode
+					; Kept in FLAGS
+	CLIG_V_SLAVE    = 1		; Remembers if I'm a slave or a master
+					; Kept in FLAGS
+	CLIG_V_SE_DEAD  = 2		; Set if can't write to SYS$ERROR.LOG
+					; Kept in FLAGS
+	CLIG_V_BEGINMSG = 3		; Set if we've typed beginning message
+					; Kept in FLAGS
+;   ...and corresponding masks:
+	CLIG_M_DEADNODE = 1@CLIG_V_DEADNODE
+	CLIG_M_DEBUG    = 1@CLIG_V_DEBUG
+	CLIG_M_SLAVE    = 1@CLIG_V_SLAVE
+	CLIG_M_SE_DEAD  = 1@CLIG_V_SE_DEAD
+	CLIG_M_BEGINMSG = 1@CLIG_V_BEGINMSG
+
+;   Miscellany:
+	.MACRO	DEFMSG	MSGNAM		; Compute the longest message name
+	MSGNAM'_LENGTH = %LENGTH(MSGNAM)
+	.IIF LT MAX_MSGNAM_LENGTH - MSGNAM'_LENGTH,-
+		MAX_MSGNAM_LENGTH = MSGNAM'_LENGTH
+	.ENDM	DEFMSG
+	MAX_MSGNAM_LENGTH = 0		; Set up an initial value
+	MESSAGES			; Set up MAX_MSGNAM_LENGTH final value
+	TEXTB_SIZE     = 200		; Internal text buffer size
+					; Also, maximum length of msg to send
+					; We must pass a filespec as a mesasge
+	.IIF LT TEXTB_SIZE - NAM$C_MAXRSS - MAX_MSGNAM_LENGTH,-
+		TEXTB_SIZE = NAM$C_MAXRSS + MAX_MSGNAM_LENGTH
+	SS_SYNCH_EFN   = 1		; EFN for synchronizing system svcs
+	MAX_NODES      = 255		; Maximum number of nodes per cluster
+	PRCNAM_LENGTH  = 15		; Maximum length of a process name
+	NODE_LENGTH    = 6		; Maximum length of a node name
+	UNIT_LENGTH    = 5		; Maximum length of a device unit number
+	PATTERN_1      = ^X5A		; Data pattern for test files 1st block
+	PATTERN_2      = ^XF0		; Data pattern for test files 2nd block
+	BRKTHRU_TIMOUT = 60		; Seconds to wait for cluster $BRKTHRU
+	QIO_TIMEOUT    = 60		; Seconds to wait for DECnet $QIO
+	INDENT         = 4		; Spaces to indent slave's log on copy
+
+	.SBTTL	Read-Only Data
+	.PSECT	RODATA,NOEXE,NOWRT,PAGE
+
+PROCESS_NAME:				; Test and image name
+	.ASCID	/UETCLIG00/
+
+SYS$INPUT:				; Name of device from which...
+	.ASCID	/SYS$INPUT/		; ...the test can be aborted
+
+SYS$NET:				; Logical name of DECnet link...
+	.ASCID	/SYS$NET/		; ...if we're a network process
+
+REPORT:					; Tells us the type of regular...
+	.ASCID	/REPORT/		; ...messages to type to SYS$OUTPUT
+
+SHORT:					; If translation of REPORT, says...
+	.ASCID	/SHORT/			; ...to type minimal non-error messages
+
+MODE:					; If defined as "DUMP" says to type...
+	.ASCID	/MODE/			; ...tracing messages as we progress
+
+DUMP:					; String to match for dump mode...
+	.ASCID	/DUMP/			; ...operation
+
+OPA0:					; Name of device to receive warning...
+	.ASCID	/OPA0:/			; ...of testing on other nodes
+
+TASK:					; Used to set up DECnet link...
+	.ASCID	/"SYSTEST_CLIG"::"TASK=UETCLIG00"/ ; ...if we're master process
+
+VMS:					; SWTYPE in system block that we want
+	.ASCII	/VMS /
+
+UETCLIG:				; Becomes part of a slave's process name
+	.ASCID	/UETCLIG_/
+
+MASTER:					; Fills in READ_MSG, WRITE_MSG...
+	.ASCID	/master/		; ...GARBLE_MSG and NEWNAM
+
+NULL:					; Fills in READ_MSG, WRITE_MSG...
+	.LONG	0			; ...and GARBLE_MSG
+
+BLANK_LINE:				; Puts white space on a page
+	.ASCID	//
+
+UETP$CLIG:				; Part of a test filespec...
+	.ASCID	/UETP$CLIG_/		; ...and part of lock names
+
+BLOCK:					; Part of a lock RESNAM when using...
+	.ASCID	/_BLOCK/		; ...blocking ASTs
+
+DOTTEST:				; Part of a test filespec
+	.ASCID	/.TEST;1/
+
+SYSTEST_DIR:				; Part of a test filespec (default)
+	.ASCID	/[SYSTEST]/
+
+SYS0_SYSTEST_DIR:			; Part of a test filespec (default)
+	.ASCID	/[SYS0.SYSTEST]/
+
+FILE:					; Fills in RMS_ERR_STRING
+	.ASCID	/file/
+
+RECORD:					; Fills in RMS_ERR_STRING
+	.ASCID	/record/
+
+RMS_ERR_STRING:				; Announces an RMS error
+	.ASCID	/RMS !AS error in file !AD/
+
+STATUS_STRING:				; Announces text for a status value
+	.ASCID	/Status returned was, "/
+
+LONELY_MSG:				; We're a solitary system
+	.ASCID	/This system is not a member of any cluster./
+
+REBEL_MSG:				; Tells if CI occupant not in cluster
+	.ASCID	/!AS is not a member of the cluster./
+
+WARN_OF_TESTING:			; Warns cluster OPA0s of our test
+	.ASCID	\!/Note to Operator:\-
+		\!/!_UETP Cluster Integration Test started by node !AD at !%D.\
+
+END_OF_TESTING:				; Tells cluster OPA0s of test end
+	.ASCID	\!/Note to Operator:\-
+		\!/!_UETP Cluster Integration Test ended by node !AD at !%D.\
+
+BRKTHRU_ERRORS:				; Warnings didn't get to all OPA0s
+	.ASCID	\!UW operator console!%S timed out on the cluster test warning\-
+		\!/!_and !UW operator console!%S rejected it.\
+
+CLSIODB_FAIL:				; UETP$CLSIODB returned an error
+	.ASCID	/Unable to read list of cluster nodes and devices./
+
+CLSIODB_SCREWEY:			; Record was not a system block record
+	.ASCID	/Internal list of cluster nodes is inconsistent./
+
+LINK_FAILED:				; $ASSIGN failed
+	.ASCID	\Could not set up a DECnet link to !AS.  Please check the\-
+		\!/!_UETP documentation for the correct cluster preparation.\-
+		\!/!_Node !AS will not be included in cluster lock testing.\
+
+NO_NODE_MSG:				; No nodes found to be testable
+	.ASCID	\No available cluster DECnet/VAX nodes found for lock tests.\
+
+NODE_LIST_MSG:				; Names nodes to test
+	.ASCID	/Nodes included in lock tests:  !#(AS)/
+
+COMMASPACE:				; Separates successive nodes...
+	.ASCID	/, /			; ...for NODE_LIST_MSG
+
+CRLFTAB:				; Wraps a line for NODE_LIST_MSG
+	.ASCID	<13><10>/	/
+
+WRONG_ENQ:				; $ENQ for master's lock goofed
+	.ASCID	\$ENQ of a lock that should have been owned by a process\-
+		\!/!_running on !AS got an unexpected result (below).\-
+		\!/!_The result should have been "SYSTEM-W-NOTQUEUED".\
+
+NO_LOCK_ENQ:				; Slave couldn't get a lock it wanted
+	.ASCID	\$ENQ of a lock that should have been available failed.\
+
+NO_BLOCK_LOCK:				; Master can't do $ENQ with BLKAST set
+	.ASCID	\Unable to set up a lock to check blocking ASTs in deadlock \-
+		\test.\
+NO_DLOCK_SETUP:				; Node died during deadlock setup
+	.ASCID	\Setup for deadlock testing may have been broken.\-
+		<13><10>\	Please disregard any deadlock error message.\
+
+DEADLOCK_OFF_MSG:			; Someone has d'lock detection disabled
+	.ASCID	\Deadlock detection is disabled on !AD.\
+
+DEADLOCK_WAIT_MSG:			; DEADLOCK_WAIT was inconsistent
+	.ASCID	\Deadlock checking interval is !UL second!%S on !AS,\-
+		\!/!_but !UL second!%S on !AD.\
+
+VICTIMS_MSG:				; Problem with deadlock detection
+	.ASCID	\!UL victim!%S chosen for cluster-wide deadlock detection.\
+
+DLOCK_ENQ:				; Slave couldn't queue a lock request
+	.ASCID	\$ENQ failed to queue a request during deadlock test.\
+
+NO_SLAVE_BLOCK:				; Slave's blocked lock request failed
+	.ASCID	\$ENQ got unexpected result for resource for which BLKAST was \-
+		\enabled.\
+
+MEMB_PATH:				; Can't attempt file access
+	.ASCID	\Not attempting file test to !AD.\-
+		\!/!_Node is not a cluster member or path to it is not enabled.\
+
+NO_FILE_NODE:				; All $CREATEs failed
+	.ASCID	/No suitable disk found to check remote file access on !AD./
+
+SLAVE_NO_ACCESS:			; Can't get to shared file
+	.ASCID	\Process on !AS was unable to share access to !AS.\
+
+SLAVE_EXT_FAIL:				; Error reading second block
+	.ASCID	\Process on !AS had trouble reading !AS when file was extended.\
+
+WRITE_MSG:				; DECnet write $QIO failed
+	.ASCID	/DECnet write of "!AD" message to !AS failed.!AS/
+
+READ_MSG:				; DECnet read $QIO failed
+	.ASCID	/DECnet read of "!AD" message from !AS failed.!AS/
+
+GARBLE_MSG:				; Node replied with trash to our message
+	.ASCID	/Garbled "!AD" message or unexpected message from !AS.!AS/
+
+CANCEL_MSG:				; $QIO was $CANCELled on timed out chan
+	.ASCID	\Timed out on DECnet $QIO to/from !AS.  I/O was cancelled.\
+
+EXCLUDE_MSG:				; Consequence of DECnet error
+	.ASCID	<13><10>/	That node is excluded from further tests./
+
+PLEASE_CHECK_MSG:			; Failure while copying slave's log
+	.ASCID	<13><10><9>\Please check SYS$TEST:NETSERVER.LOG on that node.\
+
+DEBUG_INTRO_MSG:			; Warns that we'll report debugging info
+	.ASCID	\trace -- Program execution trace messages are enabled.\
+
+DEBUG_WRITE_MSG:			; Reports debugging info
+	.ASCID	\trace -- $QIO write of !AD message to !AS.\
+
+DEBUG_READ_MSG:				; Reports debugging info
+	.ASCID	\trace -- $QIO read of !AD message from !AS.\
+
+DEBUG_REQ_LOCK_MSG:			; Master told slave to take out lock
+	.ASCID	\trace -- !AS was requested to lock resource !AS.\
+
+DEBUG_TAK_LOCK_MSG:			; Slave is requesting a lock
+	.ASCID	\trace -- Queuing up a lock for resource !AS.\
+
+DEBUG_DLOCK_VICTIM_MSG:			; Slave was/was not selected as victim
+	.ASCID	\trace -- !AD was !ASselected as the deadlock victim.\
+
+NOT_MSG:				; Used to fill in DEBUG_DLOCK_VICTIM_MSG
+	.ASCID	\not \
+
+DEBUG_FILE_MSG:				; Reports debugging info
+	.ASCID	\trace -- Created !AS.\
+
+DEBUG_NOFILE_MSG:			; Reports debugging info
+	.ASCID	\trace -- Failed to create !AS.  Status was !XL.\
+
+DEBUG_NOSHARE_MSG:			; Reports debugging info
+	.ASCID	\trace -- No available node to share access to !AS.\
+
+DEBUG_SHARE_MSG:			; Reports debugging info
+	.ASCID	\trace -- !AD was able to share access to !AS.\
+
+DEBUG_EXTEND_MSG:			; Reports debugging info
+	.ASCID	\trace -- !AD read additional records when !AS was extended.\
+
+ABORTC_MSG_PTR:				; $PUTMSG MSGVEC for CTRL/C handler
+	.WORD	3,^XF
+	.LONG	UETP$_ABORTC!STS$K_SUCCESS
+	.WORD	1,0
+	.ADDRESS PROCESS_NAME
+
+LONELY_MSG_PTR:				; $PUTMSG MSGVEC for not in a cluster
+	.WORD	3,^XF
+	.LONG	UETP$_TEXT!STS$K_INFO
+	.WORD	1,0
+	.ADDRESS LONELY_MSG
+
+REBEL_MSG_PTR:				; $PUTMSG MSGVEC for node not in cluster
+	.WORD	3,^XF
+	.LONG	UETP$_TEXT!STS$K_INFO
+	.WORD	1,0
+	.ADDRESS BUFFER_PTR
+
+NO_NODE_MSG_PTR:			; $PUTMSG MSGVEC for no nodes to test
+	.WORD	3,^XF
+	.LONG	UETP$_TEXT!STS$K_WARNING
+	.WORD	1,0
+	.ADDRESS NO_NODE_MSG
+
+NODE_LIST_MSG_PTR:			; $PUTMSG MSGVEC for nodes to test
+	.WORD	3,^X1
+	.LONG	UETP$_TEXT!STS$K_INFO
+	.WORD	1,0
+	.ADDRESS BUFFER_PTR
+
+NO_DLOCK_SETUP_PTR:			; $PUTMSG MSGVEC for deadlock...
+	.WORD	3,^XF			; ...setup problems
+	.LONG	UETP$_TEXT!STS$K_WARNING
+	.WORD	1,0
+	.ADDRESS NO_DLOCK_SETUP
+
+DEADLOCK_OFF_PTR:			; $PUTMSG MSGVEC if some node has...
+					; deadlock detection disabled
+MEMB_PATH_PTR:				; $PUTMSG MSGVEC for case when can't...
+					; ...do file access on a node because...
+					; ...the node is not a cluster member...
+					; ...or has no useable path to it
+NO_FILE_NODE_PTR:			; $PUTMSG MSGVEC for case when can't...
+					; ...create test file on some node
+CANCEL_MSG_PTR:				; $PUTMSG MSGVEC for $CANCEL $QIO
+	.WORD	3,^XF
+	.LONG	UETP$_TEXT!STS$K_WARNING
+	.WORD	1,0
+	.ADDRESS BUFFER_PTR
+
+BLANK_LINE_PTR:				; $PUTMSG MSGVEC for leaving...
+	.WORD	3,^X1			; ...a blank line between messages
+	.LONG	UETP$_TEXT!STS$K_SUCCESS ; Note that if we incorporate this...
+	.WORD	1,0			 ; ...into another MSGVEC, the "%"...
+	.ADDRESS BLANK_LINE		 ; ...of that message becomes a "-"
+
+ERRORLOG_PTR:				; $PUTMSG MSGVEC for copying...
+	.WORD	4,^X1			; ... a slave's SYS$ERROR.LOG
+	.LONG	UETP$_COPY_LOG_LINE
+	.WORD	2,0
+	.LONG	0
+	.ADDRESS BUFFER_PTR
+
+DEBUG_QIO_MSG_PTR:			; $PUTMSG MSGVEC for $QIO debug msg
+	.WORD	3,^XF
+	.LONG	UETP$_TEXT!STS$K_INFO
+	.WORD	1,0
+	.ADDRESS DEBUG_PTR
+
+INPUT_ITMLST:				; $GETDVI arg list for SYS$INPUT
+	.WORD	64,DVI$_DEVNAM		; We need the equivalence name...
+	.ADDRESS BUFFER,BUFFER_PTR
+	.WORD	4,DVI$_DEVCHAR		; ...and the device independent info
+	.ADDRESS DEVCHAR,0
+	.LONG	0
+
+MYNODE_ITMLST:				; $GETSYI arg list for...
+	.WORD	NODE_LENGTH,SYI$_SCSNODE ; ...my node name...
+	.ADDRESS SCSNODE,0
+	.WORD	4,SYI$_DEADLOCK_WAIT	; ...deadlock search interval
+	.ADDRESS DEADLOCK_WAIT,0
+	.LONG	0
+
+OTHERNODE_ITMLST:			; $GETSYI arg list for...
+	.WORD	4,SYI$_CLUSTER_MEMBER	; ...cluster membership
+	.ADDRESS CLUSTER_MEMBER,0
+	.LONG	0
+
+MYPROC_ITMLST:				  ; $GETJPI arg list for...
+	.WORD	PRCNAM_LENGTH,JPI$_PRCNAM ; ...my process name
+	.ADDRESS CURNAM,CURNAM_DESC
+	.LONG	0
+
+CLSIODB_ARGS:				; Arg list when calling UETP$CLSIODB
+	.LONG	4
+	.ADDRESS CLSPTR,0,0
+	.LONG	UIDFLAG$M_SID!UIDFLAG$M_PATH!-
+		UIDFLAG$M_DDB!UIDFLAG$M_UCB!UIDFLAG$M_MYSYS
+
+QIO_DELTA:				 ; Delta time to wait for ordinary...
+	.LONG	-10000000*QIO_TIMEOUT,-1 ; ...DECnet $QIO completion
+
+SLAVE_QIO_DELTA:			   ; Delta time to wait for slave...
+	.LONG	-10000000*5*QIO_TIMEOUT,-1 ; ...read DECnet $QIO completion
+					   ; They must be more tolerant...
+					   ; ...because master services several
+
+FIVE_SECONDS:				; Nominal time to wait for $QIO when...
+	.LONG	-50000000,-1		; ...copying slave's error log to master
+
+FAO_BUF:				; Fixed desc for misc text strings
+	.LONG	TEXTB_SIZE
+	.ADDRESS BUFFER
+
+DEBUG_FAO_BUF:				; Fixed desc for debug text strings
+	.LONG	TEXTB_SIZE
+	.ADDRESS DEBUG_BUFFER
+
+NO_RMS_AST_TABLE:			; List of errors for which...
+	.LONG	RMS$_BLN		; ...RMS cannot deliver an AST...
+	.LONG	RMS$_BUSY		; ...even if one has an ERR= arg
+	.LONG	RMS$_CDA		; Note that we can search table...
+	.LONG	RMS$_FAB		; ...via MATCHC since <31:16>...
+	.LONG	RMS$_RAB		; ...pattern can't be in <15:0>
+NRAT_LENGTH = .-NO_RMS_AST_TABLE
+
+MESSAGE_NAMES:				; Create message names and texts
+	.MACRO	DEFMSG	MSGNAM		; Define the way we'll name messages
+	MSGNAM'_MSG:
+		.WORD	MSGNAM'_LENGTH
+		.ASCII	/MSGNAM/
+	.ENDM	DEFMSG
+	MESSAGES			; Name and list messages with text
+
+	.SBTTL	Read/Write Data
+	.PSECT	RWDATA,WRT,NOEXE,PAGE
+
+CLIG_ANNOUNCE:				; $PUTMSG MSGVEC for begin & end msgs
+	.WORD	4,^XF
+	.LONG	UETP$_BEGIND!STS$K_INFO	; This will change at test end
+	.WORD	2,0
+	.ADDRESS PROCESS_NAME		; This will change to new process name
+	.LONG	0
+
+EXIT_DESC:				; Exit handler descriptor
+	.LONG	0
+	.ADDRESS EXIT_HANDLER
+	.LONG	1
+	.ADDRESS EXIT_STATUS
+
+FLAGS:					; State variables existing over time
+	.BLKL	1			; (See Equated Symbols for definitions)
+
+EXIT_STATUS:				; Status value on program exit
+	.BLKL	1
+
+QUAD_STATUS:				; IO status block for misc sys. svcs.
+	.BLKQ	1
+
+ERROR_COUNT:				; Cumulative error count
+	.BLKL	1
+
+ARG_COUNT:				; Argument counter used by ERROR_EXIT
+	.BLKL	1
+
+TTCHAN:					; Channel associated with ctrl. term.
+	.BLKW	1
+
+DEVCHAR:				; Device independent characteristics
+	.BLKL	1
+
+SCSNODE:				; My node name in the cluster...
+	.BLKL	2
+
+CURNAM_DESC:				; Gets my process name length...
+	.BLKW	2
+	.ADDRESS CURNAM			; ...to become a descriptor
+
+CURNAM:					; My process name on entry
+	.BLKB	PRCNAM_LENGTH
+
+NEWNAM_DESC:				; Desc for the process name...
+	.BLKW	2
+	.ADDRESS NEWNAM			; ...in use while running this image
+
+NEWNAM:					; My process name while running
+	.BLKB	PRCNAM_LENGTH
+
+DEADLOCK_VICTIMS:			; Number of deadlock victim processes
+	.BLKL	1
+
+DEADLOCK_WAIT:				; Deadlock search interval in seconds
+	.BLKL	1
+
+DEADLOCK_COUNT:				; Count of processes participating in...
+	.BLKL	1			; ...a deadlock, but who have not yet...
+					; ...caused a blocking AST for our...
+					; ...lock used for communication
+
+DEADLOCK_LOCKID:			; Lock id of the lock used for...
+	.BLKL	1			; ...blocking AST communication
+
+DEADLOCK_MSG_TIME:			; Delta time to wait to hear that...
+	.BLKQ	1			; ...some process is a deadlock victim
+
+CLUSTER_MEMBER:				; Receives TRUE/FALSE if a VMS node...
+	.BLKL	1			; ...is a member of our cluster
+
+MASTER_NODE_DESC:			; Simplifies using MASTER_NODE...
+	.LONG	NODE_LENGTH		; ...in $FAO strings
+	.ADDRESS MASTER_NODE
+MASTER_NODE:				; Name of master node. This gets...
+	.ASCII	/master/		; ...overwritten when HELLO msg read
+
+CLSPTR:					; Pointer to local copy of cluster db
+	.BLKL	2
+
+NODE_CHANS:				; List of DECnet channels to...
+	.BLKW	MAX_NODES		; ...nodes on which we have slaves
+	.BLKW	1			; Guaranteed list terminator
+
+NODE_NAMES:				; List of descriptors to names of...
+	.BLKQ	MAX_NODES		; ...nodes on which we have slaves
+					; The second word of each descriptor...
+					; ...carries flags.  No flags set...
+					; ...(valid string descriptor) is the...
+					; ...normal state
+
+MESSAGE_BUFFER:				; Messages we send to slave nodes...
+	.BLKB	2*TEXTB_SIZE		; ...or messages we receive from master
+					; The size is to allow us to use...
+					; ...this buffer to send a slave's...
+					; ...copy of SYS$ERROR to the master
+
+BUFFER_PTR:				; Variable desc for misc text strings
+	.BLKL	1
+	.ADDRESS BUFFER
+BUFFER:					; Buffer for miscellaneous text strings
+	.BLKB	2*TEXTB_SIZE		; The size is to allow us to use...
+					; ...this buffer to send a slave's...
+					; ...copy of SYS$ERROR to the master
+
+STATUS_PTR:				; Variable desc for status code strings
+	.BLKL	1
+	.ADDRESS STATUS_BUFFER
+STATUS_BUFFER:
+	.BLKB	TEXTB_SIZE
+
+DEBUG_PTR:				; Variable desc for debug text strings
+	.BLKL	1
+	.ADDRESS DEBUG_BUFFER
+DEBUG_BUFFER:
+	.BLKL	TEXTB_SIZE
+
+	.SBTTL	RMS-32 Data Structures
+	.ALIGN	LONG
+
+SE_FAB:					; Used for copy of slave's SYS$ERROR
+	$FAB-
+	FNM = <SYS$ERROR.LOG>,-
+	NAM = SE_NAM,-
+	FAC = <PUT,GET>,-
+	MRS = 2*TEXTB_SIZE,-
+	ORG = SEQ
+
+SE_NAM:	$NAM-				; Used for copy of slave's SYS$ERROR
+	RSS = NAM$C_MAXRSS,-
+	RSA = SE_FILESPEC
+
+SE_RAB:					; Used for copy of slave's SYS$ERROR
+	$RAB-
+	FAB = SE_FAB
+
+SE_FILESPEC:				; Used for copy of slave's SYS$ERROR
+	.BLKB	NAM$C_MAXRSS
+
+RF_FAB:					; Used to create files on cluster nodes
+	$FAB-
+	FNA = RF_FILESPEC,-
+	FOP = <SUP>,-
+	FAC = <PUT,GET>,-
+	NAM = RF_NAM,-
+	SHR = <PUT,GET,UPI>,-
+	MRS = TEXTB_SIZE,-
+	ORG = SEQ
+
+RF_NAM:					; Used to create files on cluster nodes
+	$NAM-
+	RSS = NAM$C_MAXRSS,-
+	RSA = RESULT_FILESPEC
+
+RF_RAB:					; Used to create files on cluster nodes
+	$RAB-
+	FAB = RF_FAB,-
+	ROP = <NLK>,-
+	RSZ = TEXTB_SIZE,-
+	RBF = BUFFER,-
+	USZ = TEXTB_SIZE,-
+	UBF = BUFFER
+
+RF_FILESPEC_DESC:			; String descriptor for error messages
+	.BLKW	2
+	.ADDRESS RF_FILESPEC
+
+RF_FILESPEC:				; Holds filespecs for test files
+	.BLKB	NAM$C_MAXRSS
+
+RESULT_FILESPEC:			; Receives resultant test file filespec
+	.BLKB	NAM$C_MAXRSS
+
+	.SBTTL	Main Program
+	.PSECT	_UETP$CODE,EXE,NOWRT,PIC,SHR,PAGE
+
+	.DEFAULT DISPLACEMENT,WORD
+
+;+
+;	The UETP Cluster Integration test will test the cluster functions
+;	available to typical user applications.  It relies very heavily
+;	on DECnet.
+;
+;	The node from which the test is originally run is called the master
+;	node.  VMS nodes in the cluster which run the test at the request of
+;	the master node are called slave nodes.  The main flow of testing is:
+;		If we are in a cluster then
+;		    If we are the master process then
+;			Get a list of VAX cluster nodes. Warn each of testing
+;			Initiate a DECnet link to each VAX cluster node
+;			Start a slave task on each such node
+;			Have each node take out a lock (no deadlock)
+;			Have each node take out another lock (to check deadlock)
+;			Check that file access works to all cluster nodes
+;			Terminate slave processes
+;			Send an end of testing message to all cluster consoles
+;		    Else
+;			Complete the DECnet link to the master process
+;			Take out a lock (no deadlock)
+;			Take out another lock (in order to check deadlock)
+;			Wait to be told what to do next
+;		Exit the test
+;-
+
+.ENTRY UETCLIG00,^M<>			; Entry mask
+
+	MOVAL	SSERROR,(FP)		; Declare exception handler
+	$SETSFM_S ENBFLG = #1		; Enable system service failure mode
+	$TRNLOG_S LOGNAM = SYS$NET,-	; Are we a slave or a master process?
+		  RSLBUF = FAO_BUF
+	CMPW	#SS$_NOTRAN,R0		; If SYS$NET is undefined...
+	BEQL	10$			; ...then we're a master process
+	BISL2	#CLIG_M_SLAVE,FLAGS	; Otherwise, mark us as a slave...
+	$CREATE	FAB = SE_FAB,-		; ...and set up our copy of SYS$ERROR
+		ERR = RMS_ERROR
+	$CONNECT RAB = SE_RAB,-
+		 ERR = RMS_ERROR
+10$:
+	$DCLEXH_S DESBLK = EXIT_DESC	; Declare an exit handler
+
+	$GETSYI_S ITMLST = MYNODE_ITMLST ; Get my node's node name
+	LOCC	#0,#NODE_LENGTH,SCSNODE	; Ensure that...
+	MOVC5	#0,#0,#^A/ /,R0,(R1)	; ...the name is blank filled
+
+	$GETJPI_S ITMLST = MYPROC_ITMLST ; Find out my process name
+	MOVAQ	UETCLIG,R6		; Define a new one...
+	MOVAB	SCSNODE,R7		; ...assuming we are a slave...
+	BBS	#CLIG_V_SLAVE,FLAGS,20$
+	MOVAQ	PROCESS_NAME,R6		; ...but different...
+	MOVAB	MASTER+8,R7		; ...if we're master
+20$:
+	MOVAB	NEWNAM,R8		; We'll use the new one...
+	MOVC3	(R6),8(R6),(R8)		; ...
+	MOVC3	#NODE_LENGTH,(R7),(R3)	; ...
+	SUBW3	R8,R3,NEWNAM_DESC	; ...
+	$SETSFM_S ENBFLG = #0
+	$SETPRN_S PRCNAM = NEWNAM_DESC	; ...while running this test
+	$SETSFM_S ENBFLG = #1
+	MOVAQ	NEWNAM_DESC,CLIG_ANNOUNCE+12 ; Use process name in sentinel msgs
+	$PUTMSG_S MSGVEC = CLIG_ANNOUNCE,- ; Give a beginning message
+		  ACTRTN = SE_COPY
+	BISL2	#CLIG_M_BEGINMSG,FLAGS	; Set flag so we don't print it again
+
+	$TRNLOG_S LOGNAM = MODE-	; See if the user wants tracing info
+		  RSLBUF = FAO_BUF
+	CMPW	#SS$_NOTRAN,R0		; If MODE logical name defined...
+	BEQL	30$
+	MATCHC	DUMP,@DUMP+4,-		; ...as "DUMP"...
+		#2*TEXTB_SIZE,BUFFER
+	BNEQ	30$
+	BISL2	#CLIG_M_DEBUG,FLAGS	; ...remember that user wants trace info
+	MOVQ	DEBUG_INTRO_MSG,DEBUG_PTR ; Warn the user...
+	BSBW	GIVE_DEBUG_MSG		  ; ...if there will be extra messages
+	MOVAL	DEBUG_BUFFER,DEBUG_PTR+4 ; Reset standard pointer
+30$:
+
+	$GETDVIW_S DEVNAM = SYS$INPUT,-    ; Get the name of the device...
+		   ITMLST = INPUT_ITMLST,- ; ...which may abort the test
+		   EFN    = #SS_SYNCH_EFN,-
+		   IOSB   = QUAD_STATUS
+	BLBC	QUAD_STATUS,40$		; Avoid CTRL/C handler if any error
+	BBC	S^#DEV$V_TRM,DEVCHAR,40$ ; BR if SYS$INPUT is NOT a terminal
+	$ASSIGN_S DEVNAM = BUFFER_PTR,-	; Set up for CTRL/C AST handler
+		  CHAN   = TTCHAN
+	$QIOW_S	CHAN   = TTCHAN,-	; Enable CTRL/C ASTs
+		FUNC   = #IO$_SETMODE!IO$M_CTRLCAST,-
+		P1     = CCASTHAND
+	$PUTMSG_S MSGVEC = ABORTC_MSG_PTR ; Tell user how to abort gracefully
+40$:
+
+	IFCLSTR	50$			    ; BR if we're a cluster member...
+	$PUTMSG_S MSGVEC = LONELY_MSG_PTR,- ; ...else say there's no testing
+		  ACTRTN = SE_COPY
+	BRB	70$
+50$:
+	BBS	#CLIG_V_SLAVE,FLAGS,60$	; BR if we are a slave process
+	BSBW	ANNOUNCE_US		; Let systems know of our test
+	BSBW	GET_NODES		; Collect nodes in cluster, start DECnet
+	BSBW	START_TALKING		; Say "Hi" to the other nodes
+	BSBW	CHECK_LOCKS		; See if locks are cluster visible
+	BSBW	CHECK_DEADLOCK		; See if deadlock detection works
+	BSBW	FILE_ACCESS		; See if we can get to cluster files
+	BSBW	WIND_DOWN		; Terminate slaves and clean up
+	BRB	70$			; Exit successfully
+60$:
+	BSBW	SET_UP_SLAVE		; Set up the DECnet link to master
+	BSBW	TAKE_OUT_LOCK		; See if locks work in the cluster
+	BSBW	GET_DEADLOCK		; Participate in a deadlock
+	BSBW	SHARE_ACCESS		; Access a file in use by master process
+70$:
+	$EXIT_S CODE = -		; Exit with a successful status
+		#SS$_NORMAL!STS$M_INHIB_MSG
+
+	.SBTTL	ANNOUNCE_US - Let Systems Know of Our Test
+;++
+; FUNCTIONAL DESCRIPTION:
+;	Get the names of all the nodes in the cluster.
+;	For record keeping purposes, it's a good idea to let other systems in
+;	the cluster know that we're about to start testing.  Put a message to
+;	the operator's console on each VAX node, itself a test of $BRKTHRU.
+;	
+; IMPLICIT INPUTS:
+;	VMS's list of cluster (VMS and non-VMS both) nodes
+;
+; IMPLICIT OUTPUTS:
+;	Copy of our node's view of the cluster
+;
+; SIDE EFFECTS:
+;	Message to all console terminals in the cluster.
+;	P0 space expanded to include output from UETP$CLSIODB.
+;
+;--
+
+ANNOUNCE_US:
+	$CMKRNL_S ROUTIN = UETP$CLSIODB,- ; Form a list of other cluster...
+		  ARGLST = CLSIODB_ARGS	  ; ...nodes and SCS peripherals
+	BLBS	R0,10$			; BR if the list was formed correctly
+	PUSHL	R0			; Save the error status
+	CALLS	#1,STATUS_TO_TEXT	; Get the text for it
+	PUSHAL	STATUS_PTR		; Explain what went wrong
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_SEVERE
+	PUSHAL	CLSIODB_FAIL
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_SEVERE
+	PUSHL	#6
+	BRW	ERROR_EXIT		; We can't continue
+10$:
+	MOVAL	SCSNODE,R0
+	$FAO_S	CTRSTR = WARN_OF_TESTING,-
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = #NODE_LENGTH,-
+		P2     = R0,-
+		P3     = #0
+	$BRKTHRUW_S -			; Warn other nodes by a console message
+		MSGBUF = BUFFER_PTR,-
+		EFN    = #SS_SYNCH_EFN,-
+		SENDTO = OPA0,-
+		SNDTYP = #BRK$C_DEVICE,-
+		FLAGS  = #BRK$M_CLUSTER,-
+		TIMOUT = #BRKTHRU_TIMOUT,-
+		IOSB   = QUAD_STATUS
+	BLBC	QUAD_STATUS,20$		; BR if there was any error in sending
+	ADDW3	QUAD_STATUS+4,-		; Did all nodes see the warning?
+		QUAD_STATUS+6,R1
+	BEQL	30$			; BR if so - all OK
+20$:
+	MOVZWL	QUAD_STATUS,-(SP)	; Get the text...
+	CALLS	#1,STATUS_TO_TEXT	; ...associated with any error
+	MOVZWL	QUAD_STATUS+4,R1
+	MOVZWL	QUAD_STATUS+6,R2
+	$FAO_S	CTRSTR = BRKTHRU_ERRORS,- ; Form a message
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R1,-
+		P2     = R2
+	PUSHAL	STATUS_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	PUSHAL	BUFFER_PTR
+	PUSHL	#^XF0001
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	CALLS	#6,ERROR_SIGNAL		; Let users know of any problems
+30$:
+	RSB
+
+	.SBTTL	GET_NODES - Collect the DECnet/VAX Nodes in Our Cluster
+;++
+; FUNCTIONAL DESCRIPTION:
+;	Form descriptors to the names of the VAX/VMS nodes.  See if we're
+;	running DECnet to those nodes by establishing a link and starting up a
+;	task on the node.  In order that we may recover from not being able
+;	to DECnet to a node or nodes, turn off System Service failure mode
+;	and explicitly check for errors.
+;	
+; IMPLICIT INPUTS:
+;	The list of cluster nodes from UETP$CLSIODB
+;
+; IMPLICIT OUTPUTS:
+;	NODE_CHANS has a channel number for all those nodes to which we were
+;		able to establish a DECnet link.
+;	NODE_NAMES has a descriptor to all the names of the VMS nodes.
+;
+; SIDE EFFECTS:
+;	DECnet links to and remote tasks on VMS cluster nodes.
+;	Warning messages if we were unable to establish a link to such a node.
+;
+;--
+
+GET_NODES:
+	MOVL	CLSPTR,R6		; Used to loop through system records
+	MOVAW	NODE_CHANS,R7		; Used to loop through channel words
+	MOVAQ	NODE_NAMES,R8		; Used to loop through name descriptors
+10$:
+	CMPB	#UID$K_SID_RTYPE,-	; Is this a system block record?
+		UIDGNRC$B_TYPE(R6)
+	BEQL	20$			; BR if it is
+	PUSHAL	CLSIODB_SCREWEY		; Die noisily if it is isn't
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_SEVERE
+	PUSHL	#3
+	BRW	ERROR_EXIT
+20$:
+	CMPL	VMS,UIDSID$T_SWTYPE(R6)	; Is this a VAX/VMS node?
+	BNEQW	60$			; BR if it is not
+	TSTL	UIDSID$L_PBFL(R6)	; Have we any path to the node?
+	BEQLW	60$			; BR if not - we can't test it
+	MOVZBW	UIDSID$T_NODENAME(R6),(R8) ; Save the length of the name...
+	MOVAL	UIDSID$T_NODENAME+1(R6),-  ; ...and its address
+		4(R8)
+	$SETSFM_S ENBFLG = #0		   ; Turn off SS errors...
+	$GETSYIW_S EFN   = #SS_SYNCH_EFN,- ; ...while checking to see...
+		IOSB     = QUAD_STATUS,-   ; ...if this node is in our cluster
+		ITMLST   = OTHERNODE_ITMLST,-
+		NODENAME = (R8)
+	MOVL	R0,R2			; Preserve the return status...
+	$SETSFM_S ENBFLG = #1		; ...while resuming SS error checking
+	BLBC	R2,30$			; BR if it is not a member
+	BLBC	QUAD_STATUS,30$		; BR if it is not
+	BLBS	CLUSTER_MEMBER,40$	; BR if it finally is
+30$:	$FAO_S	CTRSTR = REBEL_MSG,-	; Tell user that we can't test it
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R8
+	$PUTMSG_S MSGVEC = REBEL_MSG_PTR
+	BRW	60$			; "Next" item will overwrite this one
+40$:	
+	MOVC3	(R8),@4(R8),BUFFER	; Concatenate the node name with the...
+	MOVC3	TASK,@TASK+4,(R3)	; ...rest of the DECnet target string
+	ADDW3	(R8),TASK,BUFFER_PTR	; Form a descriptor for the string
+	$SETSFM_S ENBFLG = #0		; Turn off SS errors...
+	$ASSIGN_S DEVNAM = BUFFER_PTR,-	; ...while getting a DECnet link...
+		  CHAN   = (R7)
+	MOVL	R0,R2			; Preserve the return status...
+	$SETSFM_S ENBFLG = #1		; ...while restoring error handling
+	BLBS	R2,50$			; ...so we don't bomb out...
+	PUSHL	R2			; ...if we should get an error
+	CALLS	#1,STATUS_TO_TEXT	; Get the text for the error code...
+	$FAO_S	CTRSTR = LINK_FAILED,-	; ...and an explanatory message...
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R8,-
+		P2     = R8
+	PUSHAL	STATUS_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	PUSHAL	BUFFER_PTR
+	PUSHL	#^XF0001
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	CALLS	#6,ERROR_SIGNAL		; ...and signal the error
+	BRB	60$			; Let "next" node overwrite this one
+50$:
+	TSTW	(R7)+			; Point to the next space for channel
+	TSTD	(R8)+			; Point to the next space for name desc
+60$:
+	MOVL	UIDSID$A_FLINK(R6),R6	; Point to the next possible SID record
+	BNEQW	10$			; Loop for another node if there's one
+
+;
+; Set up an $FAOL PRMLST so we can tell the world which nodes we're testing.
+;
+	MOVAW	NODE_CHANS,R7		; Used to loop through channel words
+	MOVAQ	NODE_NAMES,R8		; Used to loop through name descriptors
+	MNEGL	#1,R9			; This will count items to print
+					; Sleaze: Last COMMASPACE not printed!
+	SUBW3	#6,NODE_LIST_MSG,R6	; Initialize line length
+	SUBL2	#<4+4+2+4+1>*MAX_NODES,SP ; We need a throwaway data str...
+	MOVL	SP,R11			  ; ...to store some throwaway data
+	SUBL2	#4*MAX_NODES,SP		; Preallocate a worst-case amount...
+	MOVL	SP,R10			; ...of space for $FAOL PRMLST
+70$:
+	TSTW	(R7)+			; Will we try testing another node?
+	BEQL	90$			; BR if we're at the end of the list
+	ACBW	#80,#<NODE_LENGTH+2+2+4+1>,- ; BR if this node and version...
+		R6,80$			     ; ...won't wrap the line
+	MOVAQ	CRLFTAB,(R10)+		; Wrap the line neatly
+	MOVW	#8,R6			; Reinitialize the line length
+	INCL	R9			; Count the line wrap as item to print
+80$:
+	MOVAQ	(R8),(R10)+		; Put the node desc in our PRMLST
+	MOVL	R11,(R10)+		; Save a pointer...
+	MOVL	#<2+4+1>,(R11)+		; ...to a descriptor...
+	MOVAL	4(R11),(R11)+		; ...in our throwaway data structure...
+	MOVW	#^A/ (/,(R11)+		; ...that's used to display...
+	MOVL	4(R8),R0		; ...
+	MOVL	<UIDSID$T_SWVERS--	; ...the software version...
+		UIDSID$T_NODENAME-1>(R0),(R11)+
+	MOVB	#^A/)/,(R11)+		; ...running on this node
+	MOVAQ	COMMASPACE,(R10)+	; Separate successive nodes
+	ADDL2	#3,R9			; Count items on the PRMLST
+
+	TSTD	(R8)+			; Point to the next possible node desc
+	BRB	70$			; Loop for more nodes
+90$:
+	TSTL	R9			; Were any nodes to be tested?
+	BGTR	100$			; BR if there were
+	$PUTMSG_S MSGVEC = NO_NODE_MSG_PTR ; Let the world know if there weren't
+	BRB	110$			; Use common exit
+100$:
+	$TRNLOG_S LOGNAM = REPORT,-	; See if the user wants misc info
+		  RSLBUF = FAO_BUF
+	CMPC3	SHORT,SHORT+8,BUFFER	; If "short" report was requested...
+	BEQL	110$			; ...then BR to omit the message
+	PUSHL	R9			; Save parameter count
+	MOVL	SP,R11			; Save the pointer to the PRMLST
+	$FAOL_S	CTRSTR = NODE_LIST_MSG,- ; Form a message with node names
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		PRMLST = (R11)
+	POPR	#^M<R0>			; Remove parameter count
+	$PUTMSG_S -			; List the node names for the user
+		MSGVEC = NODE_LIST_MSG_PTR
+110$:
+	ADDL2	#<4+4+2+4+1+4>*MAX_NODES,SP ; Clean up the stack
+	RSB				; We're done
+
+	.SBTTL	START_TALKING - Start Communications Between Master and Slaves
+;++
+; FUNCTIONAL DESCRIPTION:
+;	Start communicating with the tasks established by GET_NODES.  (Those
+;	tasks will be running this same image, but take a different execution
+;	path because there will be a translation for the logical name SYS$NET.)
+;	We start communicating with each "slave" by exchanging greetings.
+;	
+; IMPLICIT INPUTS:
+;	NODE_CHAN list of channels on which we have DECnet links.
+;	NODE_NAMES list of pointers to descriptors of node names with which
+;		we've established a link.
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; SIDE EFFECTS:
+;	Messages to tasks on those nodes.
+;
+;--
+
+START_TALKING:
+	MOVAW	NODE_CHANS,R7		; Used to loop through DECnet channels
+	MOVAQ	NODE_NAMES,R8		; Used to loop through node name descs
+	MOVAL	HELLO_MSG,R9		; Set up convenience registers...
+	MOVAL	IMOK_MSG,R10		; ...
+	MOVC3	(R9),2(R9),MESSAGE_BUFFER ; Set up msg to tell each slave...
+	MOVC3	#NODE_LENGTH,SCSNODE,(R3) ; ...the name of the master node
+10$:
+	TSTW	(R7)			; Have we another channel?
+	BNEQ	20$			; BR if so - send a message
+	RSB				; Return if not
+20$:
+	MOVZWL	(R7),-(SP)		; Set up the channel...
+	PUSHL	R8			; ...the node name...
+	PUSHL	R9			; ...and our message name
+	CALLS	#3,MASTER_WRITE		; Say "HI!" to the next node
+	BLBC	R0,40$			; Skip the rest if this node died
+	MOVZWL	(R7),-(SP)		; Set up the channel...
+	PUSHL	R8			; ...the node name...
+	PUSHL	R10			; ...and our message name
+	CALLS	#3,MASTER_READ		; See if this node knows us
+	BLBC	R0,40$			; Skip the rest if no reply
+	CMPC3	(R10),2(R10),BUFFER	; Did we get the reply we wanted?
+	BNEQ	30$			; BR if not
+	CMPC3	(R8),@4(R8),(R3)	; Was reply from the node we wanted?
+	BEQL	40$			; BR if it was
+30$:
+	PUSHAL	EXCLUDE_MSG		; Complain that we got back trash
+	PUSHL	R8
+	PUSHL	R10
+	CALLS	#3,GARBLED_TRANS
+	BISW2	#CLIG_M_DEADNODE,2(R8)	; Indicate that we're done with node
+40$:
+	TSTW	(R7)+			; Point to the next possible channel
+	TSTD	(R8)+			; Point to the next possible name desc
+	BRB	10$			; Loop to say hi to the next one
+
+	.SBTTL	SET_UP_SLAVE - Complete DECnet Link to Master
+;++
+; FUNCTIONAL DESCRIPTION:
+;	We've been started up as a DECnet task.  Complete the link to the
+;	process which started us.
+;	
+; IMPLICIT INPUTS:
+;	SYS$NET logical name is defined.
+;
+; IMPLICIT OUTPUTS:
+;	NODE_CHANS gets DECnet channel number
+;
+; SIDE EFFECTS:
+;	DECnet link is completed.
+;
+;--
+
+SET_UP_SLAVE:
+	MOVAL	HELLO_MSG,R9		; Set up convenience registers...
+	MOVAL	IMOK_MSG,R10		; ...
+	$ASSIGN_S DEVNAM = SYS$NET,-	; Complete DECnet link to master process
+		  CHAN   = NODE_CHANS
+	PUSHL	R9			; Define the type of message we want
+	CALLS	#1,SLAVE_READ		; Get the master node's "HELLO" message
+	CMPC3	(R9),2(R9),MESSAGE_BUFFER ; What does the message say?
+	BEQL	10$			; BR if it says "HELLO"
+	PUSHAL	NULL			; Otherwise,...
+	PUSHAL	MASTER
+	PUSHL	R9
+	CALLS	#3,GARBLED_TRANS	; ...signal the error
+	$EXIT_S	CODE = #UETP$_ABENDD!STS$K_ERROR!STS$M_INHIB_MSG
+10$:
+	MOVC3	#NODE_LENGTH,(R3),-	; Save the master node's name
+		MASTER_NODE
+	MOVC3	(R10),2(R10),-		; Set up msg telling master node...
+		MESSAGE_BUFFER
+	MOVC3	#NODE_LENGTH,-		; ...that I'm an OK node
+		SCSNODE,(R3)
+	PUSHL	R10			; Define the type of message we want
+	CALLS	#1,SLAVE_WRITE		; Tell the master node that I'm OK
+	RSB
+
+	.SBTTL	CHECK_LOCKS - See If Locks are Cluster Visible
+;++
+; FUNCTIONAL DESCRIPTION:
+;	Take out a lock and see that it's visible from the master node.  To
+;	allow for the possibility of the test being run simultaneously from
+;	mode than one node in a cluster, choose a lock name that we can
+;	guarantee will be unique amongst cooperating tests.  Lock names will
+;	be an identifying string, concatenated with the master node name
+;	(already known to slave nodes), concatenated with the name of the node
+;	taking the lock, concatenated with a string supplied by the master.
+;	For this step, the string will repeat the name of the node taking the
+;	lock.  (See the deadlock detection section for a later use of this
+;	lock.)  Check that the lock is visible.  Take out a corresponding
+;	lock for the master node.
+;	
+; IMPLICIT INPUTS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; SIDE EFFECTS:
+;	A set of locks, one for each slave process.  The resource names
+;		have the form, "id-string_master-node_slave-node_slave-node",
+;		where all node names are assumed to be NODE_LENGTH characters.
+;
+;--
+
+CHECK_LOCKS:
+	MOVAW	NODE_CHANS,R7		; Used to loop through DECnet channels
+	MOVAQ	NODE_NAMES,R8		; Used to loop through node name descs
+	MOVAL	TAKELOCK_MSG,R9		; Set up convenience registers...
+	MOVAL	GOTLOCK_MSG,R10		; ...
+	MOVC5	(R9),2(R9),#0,-		; Set up msg telling slaves...
+		#TEXTB_SIZE,-		; ...to take out a lock
+		MESSAGE_BUFFER
+10$:
+	TSTW	(R7)			; Have we another channel?
+	BNEQ	20$			; BR if so - send a message
+	RSB				; Return if not
+20$:
+	BBSW	#CLIG_V_DEADNODE,2(R8),60$ ; BR to next node if this one is dead
+	MOVZWL	(R9),R0			 ; Append node name to the message...
+	MOVAB	MESSAGE_BUFFER[R0],R0	 ; ...
+	MOVC3	#NODE_LENGTH,@4(R8),(R0) ; ...so slave knows resource to lock
+	MOVZWL	(R7),-(SP)		; Set up the channel...
+	PUSHL	R8			; ...the node name...
+	PUSHL	R9			; ...and our message name
+	CALLS	#3,MASTER_WRITE		; Tell this node to get a lock
+	BLBCW	R0,60$			; Skip the rest if this node died
+	MOVZWL	(R7),-(SP)		; Set up the channel...
+	PUSHL	R8			; ...the node name...
+	PUSHL	R10			; ...and our message name
+	CALLS	#3,MASTER_READ		; See if this node got the lock
+	BLBCW	R0,60$			; Error in sending, skip the rest
+	CMPC3	(R10),2(R10),BUFFER	; Did we get the reply we wanted?
+	BNEQ	30$			; BR if not
+	CMPC3	(R8),@4(R8),(R3)	; Was reply from the node we wanted?
+	BEQL	40$			; BR if it was
+30$:
+	PUSHAL	EXCLUDE_MSG		; Complain that we got back trash
+	PUSHL	R8
+	PUSHL	R10
+	CALLS	#3,GARBLED_TRANS
+	BISW2	#CLIG_M_DEADNODE,2(R8)	; Indicate that we're done with node
+	BRW	60$			; Skip the rest
+40$:
+	MOVC3	UETP$CLIG,UETP$CLIG+8,-	 ; Get the full name...
+		BUFFER
+	MOVC3	#NODE_LENGTH,SCSNODE,(R3); ...
+	MOVB	#^A/_/,(R3)+		 ; ...
+	MOVC3	#NODE_LENGTH,@4(R8),(R3) ; ...of the resource...
+	MOVB	#^A/_/,(R3)+		 ; ...that the slave...
+	MOVC3	#NODE_LENGTH,@4(R8),(R3) ; ...supposedly just locked
+	MOVAL	BUFFER,R4		; Fix up a descriptor...
+	SUBL3	R4,R3,BUFFER_PTR	; ...to the resource name
+	MOVAL	BUFFER_PTR,R0
+	$FAO_S	CTRSTR = DEBUG_REQ_LOCK_MSG,- ; Set up a program trace msg
+		OUTLEN = DEBUG_PTR,-
+		OUTBUF = DEBUG_FAO_BUF,-
+		P1     = R8,-
+		P2     = R0
+	BSBW	GIVE_DEBUG_MSG		; Issue it, if appropriate
+	$ENQ_S	LKMODE = #LCK$K_EXMODE,- ; Is it a true lock?
+		LKSB   = QUAD_STATUS,-
+		FLAGS  = #LCK$M_NOQUEUE,-
+		RESNAM = BUFFER_PTR
+	CMPW	#SS$_NOTQUEUED,R0	; It will be...
+	BEQL	60$			; ..if we can't get it
+	PUSHL	R0
+	CALLS	#1,STATUS_TO_TEXT	; Get text for our result
+	$FAO_S	CTRSTR = WRONG_ENQ,-	; Form an explanatory message...
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R8
+	PUSHAL	STATUS_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	PUSHAL	BUFFER_PTR
+	PUSHL	#^XF0001
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	CALLS	#6,ERROR_SIGNAL		; ...and signal the error
+60$:
+	TSTW	(R7)+			; Point to the next possible channel
+	TSTD	(R8)+			; Point to the next possible name desc
+	BRW	10$			; Loop to request the next lock
+
+	.SBTTL	TAKE_OUT_LOCK - Get a Lock at Master's Request
+;++
+; FUNCTIONAL DESCRIPTION:
+;	To test that locks are indeed cluster-wide the master process will
+;	request us to get a lock.  Report back the eventual status of that lock.
+;	
+; IMPLICIT INPUTS:
+;	Name of a resource for us to lock, by way of message from master
+;		process.
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; SIDE EFFECTS:
+;	Resource name is locked.
+;
+;--
+
+TAKE_OUT_LOCK:
+	MOVAL	TAKELOCK_MSG,R9		; Set up convenience registers...
+	MOVAL	GOTLOCK_MSG,R10		; ...
+	PUSHL	R9			; Define the type of message we want
+	CALLS	#1,SLAVE_READ		; Get the master node's message
+	CMPC3	(R9),2(R9),MESSAGE_BUFFER ; What does the message say?
+	BEQL	10$			; BR if it says "TAKELOCK"
+	PUSHAL	NULL			; Otherwise,...
+	PUSHAL	MASTER_NODE_DESC
+	PUSHL	R9
+	CALLS	#3,GARBLED_TRANS	; ...signal the error
+	$EXIT_S	CODE = #UETP$_ABENDD!STS$K_ERROR!STS$M_INHIB_MSG
+10$:
+	MOVL	R3,R11			; Save ptr to resource name in msg
+	MOVC3	UETP$CLIG,UETP$CLIG+8,-	; Set up...
+		BUFFER
+	MOVC3	#NODE_LENGTH,-		; ...
+		MASTER_NODE,(R3)
+	MOVB	#^A/_/,(R3)+		; ...
+	MOVC3	#NODE_LENGTH,(R11),(R3)	; ...the resource name...
+	MOVB	#^A/_/,(R3)+		; ...
+	MOVC3	#NODE_LENGTH,(R11),(R3)	; ...that we're supposed to lock
+	MOVAL	BUFFER,R4		; Set up a pointer...
+	SUBL3	R4,R3,BUFFER_PTR	; ...to that name
+	MOVAL	BUFFER_PTR,R0
+	$FAO_S	CTRSTR = DEBUG_TAK_LOCK_MSG,- ; Set up a program trace msg
+		OUTLEN = DEBUG_PTR,-
+		OUTBUF = DEBUG_FAO_BUF,-
+		P1     = R0
+	BSBW	GIVE_DEBUG_MSG		; Issue it, if appropriate
+	$ENQ_S	LKMODE = #LCK$K_EXMODE,- ; Try to lock the resource
+		LKSB   = QUAD_STATUS,-
+		FLAGS  = #LCK$M_NOQUEUE,-
+		RESNAM = BUFFER_PTR
+	CMPW	S^#SS$_NORMAL,QUAD_STATUS ; Did we ge the lock?
+	BEQL	20$			; BR if so - we're OK
+	MOVZWL	QUAD_STATUS,-(SP)
+	CALLS	#1,STATUS_TO_TEXT	; Get text for our result
+	PUSHAL	STATUS_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	PUSHAL	NO_LOCK_ENQ
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	PUSHL	#6
+	BRW	ERROR_EXIT		; Signal error and exit
+20$:
+	MOVC3	(R10),2(R10),-		  ; Set up msg telling master node...
+		MESSAGE_BUFFER
+	MOVC3	#NODE_LENGTH,SCSNODE,(R3) ; ...that I got the lock
+	PUSHL	R10			; Define the type of message we want
+	CALLS	#1,SLAVE_WRITE		; Tell master node the lock is OK
+	RSB
+
+	.SBTTL	CHECK_DEADLOCK - See If Deadlock Detection Works
+;++
+; FUNCTIONAL DESCRIPTION:
+;	Using the locks taken out by CHECK_LOCKS, assign to each node a lock
+;	taken by another node.  This should result in a a chain of locks
+;	leading to a deadlock.  Check for a victim or timeout.  Ensure that
+;	deadlock detection was consistent throughout the cluster.  Use blocking
+;	ASTs to minimize the wait ot see if deadlock detection has occurred.
+;	
+; IMPLICIT INPUTS:
+;	Set of locks taken during CHECK_LOCKS
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+CHECK_DEADLOCK:
+	TSTL	DEADLOCK_WAIT		; Is deadlock detection...
+	BNEQ	5$			; ...enabled for this node?  BR if so
+	MOVAL	SCSNODE,R5
+	$FAO_S	CTRSTR = DEADLOCK_OFF_MSG,- ; Warn if not
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = #NODE_LENGTH,-
+		P2     = R5
+	$PUTMSG_S MSGVEC = DEADLOCK_OFF_PTR
+5$:
+	CLRL	R6			; This will index through nodes...
+					; ...for the resource a slave is...
+					; ...to lock during this step
+	CLRL	R7			; This will index through nodes...
+					; ...for the slave that is to...
+					; ...take out the lock
+	CLRL	R12			; If non-zero, we have found...
+					; ...some nodes for deadlock check
+	CLRL	DEADLOCK_COUNT		; Counts deadlock participants who...
+					; ...have not yet caused us a...
+					; ...blocking AST
+	MOVAL	TAKELOCK_MSG,R9		; Set up convenience registers...
+	MOVAL	QUEUELOCK_MSG,R10	; ...
+	MOVC5	(R9),2(R9),#0,-		; Set up msg telling slaves...
+		#TEXTB_SIZE,-		; ...to take out a lock
+		MESSAGE_BUFFER
+	MOVC3	UETP$CLIG,UETP$CLIG+8,-	  ; Form a name...
+		BUFFER
+	MOVC3	#NODE_LENGTH,SCSNODE,(R3) ; ...for a lock that we'll hold...
+	MOVC3	BLOCK,@BLOCK+4,(R3)	  ; ...which will result in...
+	MOVAL	BUFFER,R4		  ; ...a blocking AST...
+	SUBL3	R4,R3,BUFFER_PTR	  ; ...whenever a slave tries to get it
+	$ENQ_S	LKMODE = #LCK$K_EXMODE,- ; We'll use this lock...
+		LKSB   = QUAD_STATUS,-	 ; ...and the blocking ASTs from it...
+		FLAGS  = #LCK$M_NOQUEUE,-
+		RESNAM = BUFFER_PTR,-	 ; ...to count slaves who don't yet...
+		BLKAST = 200$		 ; ...know if they are deadlock victims
+	MOVL	QUAD_STATUS+4,-		; Save lock id so we can requeue BLKAST
+		DEADLOCK_LOCKID
+	BLBS	QUAD_STATUS,10$		; BR if we're correctly set up
+	PUSHL	QUAD_STATUS
+	CALLS	#1,STATUS_TO_TEXT	; Get text of error status
+	PUSHAL	STATUS_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	PUSHAL	NO_BLOCK_LOCK		; It won't affect deadlock detection...
+	PUSHL	#^XF0001
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	CALLS	#6,ERROR_SIGNAL		; ...but it's worth letting users know
+10$:
+	TSTW	NODE_CHANS[R7]		; Have we another channel?
+	BEQLW	100$			; BR if not - check deadlock
+	MOVAQ	NODE_NAMES[R7],R4
+	BBSW	#CLIG_V_DEADNODE,2(R4),90$ ; BR to next node if this one is dead
+;
+; Note that if we get here there exists at least one node such that we have
+; a DECnet channel assigned to it and that we know the node is not dead.  That
+; means that we need have no concern over an endless loop in picking a
+; resource name to lock, given that the resource name will be the name of
+; some node.
+;
+	INCL	R12			; Indicate that a node was found
+	INCL	DEADLOCK_COUNT		; This node hasn't casued us an AST yet
+	INCL	R6			; Init to choose the node name...
+					; ...for next resource to lock
+20$:
+	TSTW	NODE_CHANS[R6]		; Have we reached the end of the list?
+	BEQL	30$			; BR if so - we'll wrap around
+	MOVAQ	NODE_NAMES[R6],R4
+	BBC	#CLIG_V_DEADNODE,-	; BR if this node will be available...
+		2(R4),40$		; ...to take a lock of its own
+	AOBLSS	#MAX_NODES,R6,20$	; Point to the next possible node
+30$:
+	CLRL	R6			; We've wrapped around in our chain
+	BRB	20$			; Wrap around in our search
+;
+; We have a slave node ([R7]) available to take out a lock and a slave node
+; ([R6], possibly the same one in a one-node cluster or if there have been
+; errors) which should already have that lock.
+;
+40$:
+	MOVAQ	NODE_NAMES[R6],R4
+	MOVZWL	(R9),R0			 ; Append node name to the message...
+	MOVAB	MESSAGE_BUFFER[R0],R0	 ; ...
+	MOVC3	#NODE_LENGTH,@4(R4),(R0) ; ...so slave knows resource to lock
+	MOVZWL	NODE_CHANS[R7],-(SP)	; Set up the channel...
+	PUSHAQ	NODE_NAMES[R7]		; ...the node name...
+	PUSHL	R9			; ...and our message name
+	CALLS	#3,MASTER_WRITE		; Tell this node to get a lock
+	BLBCW	R0,80$			; Skip the rest if this node died
+	MOVZWL	NODE_CHANS[R7],-(SP)	; Set up the channel...
+	PUSHAQ	NODE_NAMES[R7]		; ...the node name...
+	PUSHL	R10			; ...and our message name
+	CALLS	#3,MASTER_READ		; See if this node got the lock
+	BLBCW	R0,80$			; Error in sending, skip the rest
+	CMPC3	(R10),2(R10),BUFFER	; Did we get the reply we wanted?
+	BNEQ	50$			; BR if not
+	MOVAQ	NODE_NAMES[R7],R4
+	CMPC3	(R4),@4(R4),(R3)	; Was reply from the node we wanted?
+	BEQL	60$			; BR if it was
+50$:
+	PUSHAL	EXCLUDE_MSG		; Complain that we got back trash
+	PUSHAQ	NODE_NAMES[R7]
+	PUSHL	R10
+	CALLS	#3,GARBLED_TRANS
+	MOVAQ	NODE_NAMES[R7],R4
+	BISW2	#CLIG_M_DEADNODE,2(R4)	; Indicate that we're done with node
+	BRW	80$			; Skip the rest
+60$:
+	MOVL	BUFFER+QUEUELOCK_LENGTH+- ; Get this node's dlock wait interval
+		NODE_LENGTH,R3
+	MOVAQ	NODE_NAMES[R7],R4	; Set up for possible message
+	CMPL	DEADLOCK_WAIT,R3	; Is deadlock checking consistent?
+	BEQL	70$			; BR if it is
+	MOVAL	SCSNODE,R5
+	$FAO_S	CTRSTR = DEADLOCK_WAIT_MSG,- ; Complain if it isn't
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R3,-
+		P2     = R4,-
+		P3     = DEADLOCK_WAIT,-
+		P4     = #NODE_LENGTH,-
+		P5     = R5
+	PUSHAL	BUFFER_PTR
+	PUSHL	#^XF0001
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	CALLS	#3,ERROR_SIGNAL
+70$:
+	TSTL	R3			; Is deadlock detection...
+	BNEQ	75$			; ...enabled for this node?  BR if so
+	$FAO_S	CTRSTR = DEADLOCK_OFF_MSG,- ; Warn if not
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = (R4),-
+		P2     = 4(R4)
+	$PUTMSG_S MSGVEC = DEADLOCK_OFF_PTR
+75$:
+	MOVC3	UETP$CLIG,UETP$CLIG+8,-	  ; Get the full name...
+		BUFFER
+	MOVC3	#NODE_LENGTH,SCSNODE,(R3) ; ...
+	MOVB	#^A/_/,(R3)+		  ; ...
+	MOVAQ	NODE_NAMES[R6],R8	  ; ...
+	MOVC3	#NODE_LENGTH,@4(R8),(R3)  ; ...of the resource...
+	MOVB	#^A/_/,(R3)+		  ; ...that the slave...
+	MOVC3	#NODE_LENGTH,@4(R8),(R3)  ; ...supposedly just locked
+	MOVAL	BUFFER,R4		; Fix up a descriptor...
+	SUBL3	R4,R3,BUFFER_PTR	; ...to the resource name
+	MOVAL	BUFFER_PTR,R0
+	MOVAQ	NODE_NAMES[R7],R4	; Get address of node name desc
+	$FAO_S	CTRSTR = DEBUG_REQ_LOCK_MSG,- ; Set up a program trace msg
+		OUTLEN = DEBUG_PTR,-
+		OUTBUF = DEBUG_FAO_BUF,-
+		P1     = R4,-
+		P2     = R0
+	BSBW	GIVE_DEBUG_MSG		; Issue it, if appropriate
+	$ENQ_S	LKMODE = #LCK$K_EXMODE,- ; Is it a true lock?
+		LKSB   = QUAD_STATUS,-
+		FLAGS  = #LCK$M_NOQUEUE,-
+		RESNAM = BUFFER_PTR
+	CMPW	#SS$_NOTQUEUED,R0	; It will be...
+	BEQL	90$			; ..if we can't get it
+	PUSHL	R0
+	CALLS	#1,STATUS_TO_TEXT	; Get text for our result
+	$FAO_S	CTRSTR = WRONG_ENQ,-	; Form an explanatory message...
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R4
+	PUSHAL	STATUS_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	PUSHAL	BUFFER_PTR
+	PUSHL	#^XF0001
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	CALLS	#6,ERROR_SIGNAL		; ...and signal the error
+80$:
+	
+	$PUTMSG_S MSGVEC = -		; Warn that deadlock detection...
+		    NO_DLOCK_SETUP_PTR	; ...testing may fail
+90$:
+	INCL	R7			; Point to the next possible node
+	BRW	10$			; Loop to request the next lock
+; Deadlock detection checking continues on next page
+
+;
+; Each surviving node has been told to take out a lock on a resource held
+; by some other node, a situation that should result in deadlock.  Wait
+; long enough for deadlock to have been detected and a message sent to us
+; to that effect.  See if deadlock was properly detected.
+;
+100$:
+	TSTL	R12			; Did we find any nodes for deadlock?
+	BEQLW	140$			; BR if not
+	ADDL3	#2*QIO_TIMEOUT,-	; Compute a time to wait...
+		DEADLOCK_WAIT,R0	; ...to hear about a victim process
+	EMUL	#-10000000,R0,#0,-	; Convert seconds to delta time
+		DEADLOCK_MSG_TIME
+	$SCHDWK_S DAYTIM = -		; Wait for some process to be chosen
+		    DEADLOCK_MSG_TIME
+	$SETAST_S ENBFLG = #0		; BLKAST during next code would be bad
+	TSTL	DEADLOCK_COUNT		; Any slaves who don't yet know if...
+	BEQL	105$			; ...they're deadlock victim? BR if not
+	MNEGL	DEADLOCK_COUNT,-	; Indicate that we can $WAKE from $HIBER
+		DEADLOCK_COUNT
+	$SETAST_S ENBFLG = #1		; End of non-interruptible code
+	$HIBER_S
+
+105$:
+	$SETAST_S ENBFLG = #1		; DEADLOCK_COUNT is consistent again
+	$CANWAK_S			; We may have aWAKEned early from $HIBER
+	MOVAW	NODE_CHANS,R7		; Used to loop through DECnet channels
+	MOVAQ	NODE_NAMES,R8		; Used to loop through node name descs
+	MOVAL	DEADLOCK_MSG,R10	; Set up convenience register
+110$:
+	TSTW	(R7)			; Have we another channel?
+	BEQL	130$			; BR if not - check results of our poll
+	BBS	#CLIG_V_DEADNODE,-	; Skip trying to read from this node...
+		2(R8),120$		; ...if we already know it's broken
+	MOVZWL	(R7),-(SP)		; Set up the channel...
+	PUSHL	R8			; ...the node name...
+	PUSHL	R10			; ...and our message name
+	CALLS	#3,MASTER_READ		; See if this node was deadlock victim
+	BLBC	R0,120$			; Skip the rest if DECnet error
+	CMPC3	(R10),2(R10),BUFFER	; Was this node a victim?
+	BNEQ	120$			; BR if not
+	INCL	DEADLOCK_VICTIMS	; Count it if it was
+120$:
+	TSTW	(R7)+			; Point to the next possible channel
+	TSTD	(R8)+			; Point ot the next possible name desc
+	BRB	110$			; Loop to poll the next one
+
+130$:
+	CMPL	#1,DEADLOCK_VICTIMS	; Have we exactly one deadlock victim?
+	BEQL	140$			; BR if so - all is OK
+	$FAO_S	CTRSTR = VICTIMS_MSG,-	; Make a noise if not
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = DEADLOCK_VICTIMS
+	PUSHAL	BUFFER_PTR
+	PUSHL	#^XF0001
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	CALLS	#3,ERROR_SIGNAL
+140$:
+	RSB
+
+;
+; AST routine for blocking AST from a slave process when that slave has
+; discovered whether or not it's a deadlock victim.  We'll keep track of
+; the number of slaves who don't yet know and limit the time the master
+; process $HIBERnates while waiting to be told.
+;
+200$:
+	.WORD	^M<>
+
+	BBC	#31,DEADLOCK_COUNT,210$	; BR if master is not going to $HIBER
+	INCL	DEADLOCK_COUNT		; We're $HIBERnating. Count down...
+	BNEQ	220$			; ...and BR if tally is not final
+	$WAKE_S				; All slaves have reported back
+	RET
+210$:
+	DECL	DEADLOCK_COUNT		; Slave reported back quickly
+220$:					; We don't know if we have final...
+	MOVL	DEADLOCK_LOCKID,-	; ...yet, so we must re-enable...
+		QUAD_STATUS+4		; ...BLKAST for other slaves
+	$ENQW_S	EFN    = #SS_SYNCH_EFN,- ; Set up BLKAST for another slave
+		LKMODE = #LCK$K_EXMODE,-
+		LKSB   = QUAD_STATUS,-
+		FLAGS  = #LCK$M_CONVERT,-
+		BLKAST = 200$
+	RET
+
+	.SBTTL	GET_DEADLOCK - Participate in a Cluster-Wide Deadlock
+;++
+; FUNCTIONAL DESCRIPTION:
+;	See if cluster-wide deadlock detection works.  Take out another lock
+;	at the master's request.  This one should ultimately result in a
+;	deadlock, though.
+;	
+; IMPLICIT INPUTS:
+;	Name of a resource for us to lock, by way of message from master
+;		process.
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; SIDE EFFECTS:
+;	Resource name is locked.
+;	Deadlock or timeout.
+;
+;--
+
+GET_DEADLOCK:
+	MOVAL	TAKELOCK_MSG,R9		; Set up convenience registers...
+	MOVAL	QUEUELOCK_MSG,R10	; ...
+	PUSHL	R9			; Define the type of message we want
+	CALLS	#1,SLAVE_READ		; Get the master node's message
+	CMPC3	(R9),2(R9),MESSAGE_BUFFER ; What does the message say?
+	BEQL	10$			; BR if it says "TAKELOCK"
+	PUSHAL	NULL			; Otherwise,...
+	PUSHAL	MASTER_NODE_DESC
+	PUSHL	R9
+	CALLS	#3,GARBLED_TRANS	; ...signal the error
+	$EXIT_S	CODE = #UETP$_ABENDD!STS$K_ERROR!STS$M_INHIB_MSG
+10$:
+	MOVL	R3,R11			; Save ptr to resource name in msg
+	MOVC3	UETP$CLIG,UETP$CLIG+8,-	; Set up...
+		BUFFER
+	MOVC3	#NODE_LENGTH,-		; ...
+		MASTER_NODE,(R3)
+	MOVB	#^A/_/,(R3)+		; ...
+	MOVC3	#NODE_LENGTH,(R11),(R3)	; ...the resource name...
+	MOVB	#^A/_/,(R3)+		; ...
+	MOVC3	#NODE_LENGTH,(R11),(R3)	; ...that we're supposed to lock
+	MOVAL	BUFFER,R4		; Set up a pointer...
+	SUBL3	R4,R3,BUFFER_PTR	; ...to that name
+	MOVAL	BUFFER_PTR,R0
+	$FAO_S	CTRSTR = DEBUG_TAK_LOCK_MSG,- ; Set up a program trace msg
+		OUTLEN = DEBUG_PTR,-
+		OUTBUF = DEBUG_FAO_BUF,-
+		P1     = R0
+	BSBW	GIVE_DEBUG_MSG		; Issue it, if appropriate
+	$SETAST_S ENBFLG = #0		; Synch lock AST with DECnet writes
+	$ENQ_S	LKMODE = #LCK$K_EXMODE,- ; Try to lock the resource
+		LKSB   = QUAD_STATUS,-
+		RESNAM = BUFFER_PTR,-
+		ASTADR = 100$
+	CMPW	S^#SS$_NORMAL,R0	; Are we queued for the lock?
+	BEQL	20$			; BR if so - we're OK
+	PUSHL	R0
+	CALLS	#1,STATUS_TO_TEXT	; Get text for our result
+	PUSHAL	STATUS_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	PUSHAL	DLOCK_ENQ
+	PUSHL	#^XF0001
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	CALLS	#6,ERROR_SIGNAL		; Don't exit - we may be holding a...
+					; ...lock needed for deadlock
+20$:
+	MOVC3	(R10),2(R10),-		  ; Set up msg telling master node...
+		MESSAGE_BUFFER
+	MOVC3	#NODE_LENGTH,SCSNODE,(R3) ; ...that I'm queued for the lock
+	MOVL	DEADLOCK_WAIT,(R3)	; Include deadlock checking interval
+	PUSHL	R10			; Define the type of message we want
+	CALLS	#1,SLAVE_WRITE		; Tell master node that we're OK
+	$SETAST_S ENBFLG = #1		; Synch lock AST with DECnet writes
+	ADDL3	#2*QIO_TIMEOUT,-	; Compute a time to wait...
+		DEADLOCK_WAIT,R0	; ...to see if we got the lock
+	EMUL	#-10000000,R0,#0,-	; Convert seconds to delta time
+		DEADLOCK_MSG_TIME
+	$SETIMR_S EFN  = #SS_SYNCH_EFN,- ; Wait for deadlock resolution
+		DAYTIM = DEADLOCK_MSG_TIME,-
+		ASTADR = 200$
+	$HIBER_S
+	$CANTIM_S			; Deadlock resolved or timer went off
+	MOVC3	UETP$CLIG,UETP$CLIG+8,-	; Set up...
+		BUFFER
+	MOVC3	#NODE_LENGTH,-		; ...the resource name...
+		MASTER_NODE,(R3)
+	MOVC3	BLOCK,@BLOCK+4,(R3)	; ...that the master has locked...
+	MOVAL	BUFFER,R4		; ...in order to get blocking ASTs
+	SUBL3	R4,R3,BUFFER_PTR
+	$ENQ_S	LKMODE = #LCK$K_EXMODE,- ; Try to lock the resource
+		LKSB   = QUAD_STATUS,-
+		RESNAM = BUFFER_PTR
+	CMPW	S^#SS$_NORMAL,R0	; Are we queued for the lock?
+	BEQL	30$			; BR if so - we're OK
+	PUSHL	R0
+	CALLS	#1,STATUS_TO_TEXT	; Get text for our result
+	PUSHAL	STATUS_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	PUSHAL	NO_SLAVE_BLOCK
+	PUSHL	#^XF0001
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	CALLS	#6,ERROR_SIGNAL		; Don't exit - we may be holding a...
+					; ...lock needed for deadlock
+30$:
+	RSB
+
+;
+; AST routine for when deadlock is detected or lock request is otherwise
+; resolved.  If we timed out and already dequeued our locks, either deadlock
+; was not detected or other systems have been slow to dequeue their locks.
+; If we're the victim, everything is fine.  If we get our lock, some other
+; system must be the victim and everything is still fine.  In any case,
+; dequeue all locks.
+;
+100$:
+	.WORD	^M<R2,R3,R4,R5,R9,R10>
+
+	MOVAL	DEADLOCK_MSG,R10	; Assume we're deadlock victim
+	MOVAQ	BLANK_LINE,R9
+	CMPW	#SS$_DEADLOCK,QUAD_STATUS ; But are we?
+	BEQL	110$			; BR if we are
+	MOVAL	QUEUELOCK_MSG,R10	; Anything else is of no importance
+	MOVAQ	NOT_MSG,R9
+110$:
+	MOVAL	SCSNODE,R0
+	$FAO_S	CTRSTR = DEBUG_DLOCK_VICTIM_MSG,- ; Set up a program trace msg
+		OUTLEN = DEBUG_PTR,-
+		OUTBUF = DEBUG_FAO_BUF,-
+		P1     = #NODE_LENGTH,-
+		P2     = R0,-
+		P3     = R9
+	BSBW	GIVE_DEBUG_MSG		; Issue it, if appropriate
+	MOVC3	(R10),2(R10),MESSAGE_BUFFER ; Set up the message
+	PUSHL	R10			; Send our status...
+	CALLS	#1,SLAVE_WRITE		; ...to the master node
+	$DEQ_S	FLAGS = #LCK$M_DEQALL	; Allow other nodes to get locks
+	$WAKE_S				; Allow the test to get going again
+	RET
+
+
+
+
+;
+; The timer used to allow deadlock detection to occur has gone off.
+; If we're not the victim or deadlock was not detected, releasing locks allows
+; the AST from the $ENQ to be delivered.  We'll send a message to the
+; master process from that AST routine.
+;
+200$:
+	.WORD	^M<>
+
+	$DEQ_S	FLAGS = #LCK$M_DEQALL	; Allow other nodes to get locks
+	RET
+
+	.SBTTL	FILE_ACCESS - See If We Can Get to Cluster Files
+;++
+; FUNCTIONAL DESCRIPTION:
+;	For each node in the cluster (NOT necessarily VMS node), create a
+;	file on some disk local to that node.  The file will be in the
+;	[SYSTEST] directory, which may or may not be in a rooted directory
+;	(same algorithm as the UETP disk device test).  Warn if for some
+;	reason we could not create the file.  Write, read, extend, share
+;	access with a friend, and delete the file.
+;	
+; IMPLICIT INPUTS:
+;	The list of cluster nodes and devices from UETP$CLSIODB
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; SIDE EFFECTS:
+;	Temporary file on various cluster accessible disks.  The file spec
+;		will look like:  test-node$ddcu:UETP$CLIG_master-node.TEST;1.
+;
+;--
+
+; R6 through R10 have specific purposes by this upper level routine.  They
+; may be updated by some of the subroutines, but not trashed.
+FILE_ACCESS:
+	MOVL	CLSPTR,R6		; Point to SID records
+10$:
+	CMPL	VMS,UIDSID$T_SWTYPE(R6)	; Is this a VAX/VMS node?
+	BNEQW	20$			; BR if it is not - fewer tests
+	$SETSFM_S ENBFLG = #0		   ; Turn off SS errors
+	PUSHAB	UIDSID$T_NODENAME+1(R6)	    ; Fix up a temp string descriptor...
+	MOVZBL	UIDSID$T_NODENAME(R6),-(SP) ; ...for the node name...
+	MOVL	SP,R2			    ; ...and a pointer to it
+	$GETSYIW_S EFN   = #SS_SYNCH_EFN,- ; ...while checking to see...
+		IOSB     = QUAD_STATUS,-   ; ...if this node is in our cluster
+		ITMLST   = OTHERNODE_ITMLST,-
+		NODENAME = (R2)
+	ADDL2	#8,SP			; Pop temp string descriptor from stack
+	MOVL	R0,R2			; Preserve the return status...
+	$SETSFM_S ENBFLG = #1		; ...while resuming SS error checking
+	BLBC	R2,30$			; BR if it is not a member
+	BLBC	QUAD_STATUS,30$		; BR if it is not
+	BLBC	CLUSTER_MEMBER,30$	; BR if it is not
+20$:
+	MOVL	UIDSID$L_PBFL(R6),R5	; Have we any path to the node?
+	BEQL	30$			; BR if not
+	CMPW	#PB$C_OPEN,-		; Is the path to this node open?
+		UIDPATH$W_STATE(R5)
+	BNEQ	30$			; BR if not
+	EXTZV	#PB$V_STATE,#PB$S_STATE,- ; Is the path...
+		UIDPATH$B_RSTATE(R5),R4
+	CMPB	#PB$C_ENAB,R4		  ; ...to this node enabled?
+	BEQL	40$			; BR if it is
+30$:	MOVZBL	UIDSID$T_NODENAME(R6),R10  ; Get the length of the node name...
+	MOVAB	UIDSID$T_NODENAME+1(R6),R9 ; ...and its address
+	$FAO_S	CTRSTR = MEMB_PATH,-	; Complain that we can't...
+		OUTLEN = BUFFER_PTR,-	; ...test this node...
+		OUTBUF = FAO_BUF,-	; ...for remote file access
+		P1     = R10,-
+		P2     = R9
+	$PUTMSG_S MSGVEC = MEMB_PATH_PTR
+	BRB	80$			; Loop for the next node
+40$:
+	MOVL	UIDSID$L_DDB(R6),R7	; Get first possible DDB attached to SID
+	BEQL	55$			; Don't process it if there are no DDBs
+	MOVL	UIDDDB$L_UCB(R7),R8	; Get the first UCB attached to DDB
+50$:
+	BSBB	100$			; Set up a FAB for a likely file
+	BLBS	R0,60$			; BR if we have a candidate
+55$:
+	MOVZBL	UIDSID$T_NODENAME(R6),R10  ; Get the length of the node name...
+	MOVAB	UIDSID$T_NODENAME+1(R6),R9 ; ...and its address
+	$FAO_S	CTRSTR = NO_FILE_NODE,-	; Complain that we can't...
+		OUTLEN = BUFFER_PTR,-	; ...test this node...
+		OUTBUF = FAO_BUF,-	; ...for remote file access
+		P1     = R10,-
+		P2     = R9
+	$PUTMSG_S MSGVEC = NO_FILE_NODE_PTR
+	BRB	80$			; Loop to the next node
+60$:
+	BSBW	200$			; See if we can create a file
+	BLBC	R0,50$			; Get the next candidate if we can't
+	BSBW	300$			; Write and read a block of the file
+	BLBC	R0,70$			; Get rid of the file if we've an error
+	BSBW	400$			; Choose a slave to share access to file
+	BLBC	R0,70$			; We're done with file if no sharing
+	PUSHL	R1			; Value from 400$ routine is in R1
+	CALLS	#1,500$			; Share access with a slave
+70$:
+	$CLOSE	FAB = RF_FAB,-		; We're done with this file...
+		ERR = RMS_ERROR
+	$ERASE	FAB = RF_FAB,-		; ...so get rid of it
+		ERR = RMS_ERROR
+80$:
+	MOVL	UIDSID$A_FLINK(R6),R6	; Point to the next possible SID record
+	BNEQW	10$			; Loop for another node if there is one
+	BSBW	600$			; Tell all slaves to end file access
+	RSB
+
+100$:					; Set up a FAB for a likely file
+	TSTL	R8			; Have we run out of UCBs on this DDB?
+	BEQL	110$			; BR if we have
+	CMPB	S^#DC$_DISK,-		; Is this UCB for a disk?
+		UIDUCB$B_DEVCLASS(R8)
+	BNEQ	110$			; BR if not
+	BBS	S^#DEV$V_CLU,-		; BR if the disk is cluster available
+		UIDUCB$L_DEVCHAR2(R8),130$
+	MOVL	UIDUCB$A_FLINK(R8),R8	; It's not,...
+	BRB	100$			; ...so try the next disk
+110$:
+	MOVL	UIDDDB$A_FLINK(R7),R7	; Get next DDB - no shared disk UCB
+	TSTL	R7			; Have we run out of DDBs on this node?
+	BNEQ	120$			; BR if not
+	CLRL	R0			; Indicate a problem if we have...
+	RSB				; ...and return with that error
+120$:
+	MOVL	UIDDDB$L_UCB(R7),R8	; Get the first UCB for this DDB
+	BRB	100$			; Check to see if it's OK
+130$:
+	MOVZBW	UIDSID$T_NODENAME(R6),R0 ; Get the length of the node name
+	ADDB3	#2,R0,RF_FAB+FAB$B_FNS	; Keep running count of it + overhead
+	MOVC3	R0,UIDSID$T_NODENAME+1(R6),- ; Move the nodename into filespec
+		RF_FILESPEC
+	MOVB	#^A/$/,(R3)+		; Append delimiter (overhead)
+	MOVZBW	UIDDDB$T_NAME(R7),R0	; Get the length of the device name
+	ADDB2	R0,RF_FAB+FAB$B_FNS	; Keep a running count of spec length
+	MOVC3	R0,UIDDDB$T_NAME+1(R7),(R3) ; Concatenate the device name
+	MOVZWL	#UNIT_LENGTH,BUFFER_PTR	; We have to get...
+	PUSHL	#2			; ...
+	PUSHL	#1			; ...
+	PUSHAQ	BUFFER_PTR		; ...
+	PUSHAW	UIDUCB$W_NUMBER(R8)	; ...the device unit number...
+	CALLS	#4,G^OTS$CVT_L_TI	; ...converted to text
+	SKPC	#^A/ /,#UNIT_LENGTH,BUFFER ; Strip leading blanks
+	ADDB2	R0,RF_FAB+FAB$B_FNS	; Keep a running count of spec length
+	MOVC3	R0,(R1),(R3)		; Concatenate the unit number
+	MOVB	#^A/:/,(R3)+		; Append delimiter (overhead)
+	ADDB2	UETP$CLIG,RF_FAB+FAB$B_FNS ; Keep the running count
+	MOVC3	UETP$CLIG,UETP$CLIG+8,(R3) ; Concatenate part of filename
+	LOCC	#^A/ /,#NODE_LENGTH,-	; Strip trailing blanks...
+		SCSNODE			; ...from the master node name
+	SUBL3	R0,#NODE_LENGTH,R0	; Get its true length
+	ADDB2	R0,RF_FAB+FAB$B_FNS	; Keep a running count of spec length
+	MOVC3	R0,SCSNODE,(R3)		; Concatenate rest of the filename
+	ADDB2	DOTTEST,RF_FAB+FAB$B_FNS ; Keep a running count of spec length
+	MOVC3	DOTTEST,DOTTEST+8,(R3)	; Concatenate the file type
+	MOVZBW	RF_FAB+FAB$B_FNS,-	; Save the length...
+		RF_FILESPEC_DESC	; ...in case we need it for error msg
+
+	MOVB	SYSTEST_DIR,-		; Set up a default directory
+		RF_FAB+FAB$B_DNS
+	MOVAB	SYSTEST_DIR+8,-		; This allows change without...
+		RF_FAB+FAB$L_DNA	; ...having to re-form the filespec
+	MOVL	#1,RF_FAB+FAB$L_ALQ	; Get a minimum allocation
+	MOVL	#1,R0			; Indicate that we have a candidate
+	MOVL	UIDUCB$A_FLINK(R8),R8	; Point to the next UCB on controller
+	RSB
+
+200$:					; See if we can create a file
+	MOVC5	#0,#0,#0,#NAM$C_MAXRSS,- ; Ensure that the result of any...
+		RESULT_FILESPEC		 ; ...previous $CREATE is gone
+	$CREATE	FAB = RF_FAB		; Make a file (we hope)
+	BLBS	R0,210$			; BR if we succeeded
+	CMPL	#RMS$_DNF,RF_FAB+FAB$L_STS ; Did we get directory not found?
+	BNEQ	220$			; BR if not - we have no hopes
+	MOVB	SYS0_SYSTEST_DIR,-	; We did. Try for rooted directory...
+		RF_FAB+FAB$B_DNS
+	MOVAB	SYS0_SYSTEST_DIR+8,-	; ...
+		RF_FAB+FAB$L_DNA
+	MOVC5	#0,#0,#0,#NAM$C_MAXRSS,- ; Ensure that the result of the...
+		RESULT_FILESPEC		 ; ...previous $CREATE is gone
+	$CREATE	FAB = RF_FAB		; Try again for the file
+	BLBC	R0,220$			; Finish up with message if error
+210$:
+	$CONNECT RAB = RF_RAB,-		; Attach a RAB to our FAB
+		 ERR = RMS_ERROR
+220$:
+	PUSHR	#^M<R0>			; Save RMS status
+	MOVAL	DEBUG_FILE_MSG,R1	; Assume we created the file
+	BLBS	R0,230$			; BR if that was the case
+	MOVAL	DEBUG_NOFILE_MSG,R1	; Get a different message if not
+230$:
+	MOVAL	RF_FILESPEC_DESC,R2
+	$FAO_S	CTRSTR = (R1),-		; Form a debugging message
+		OUTLEN = DEBUG_PTR,-
+		OUTBUF = DEBUG_FAO_BUF,-
+		P1     = R2,-
+		P2     = R0
+	BSBW	GIVE_DEBUG_MSG
+	POPR	#^M<R0>			; Restore RMS status
+	RSB				; Exit with the last RMS status in R0
+
+300$:					; Write and read a block of the file
+	MOVC5	#0,#0,#PATTERN_1,-	; Write some garbage...
+		#TEXTB_SIZE,BUFFER
+	$PUT	RAB = RF_RAB,-		; ...to the file...
+		ERR = RMS_ERROR
+	BLBC	R0,320$
+	$REWIND	RAB = RF_RAB,-		; ...and see if...
+		ERR = RMS_ERROR
+	BLBC	R0,320$
+	$GET	RAB = RF_RAB,-		; ...we can reread it...
+		ERR = RMS_ERROR
+	BLBC	R0,320$
+	CMPC5	#0,#0,#PATTERN_1,-	; ...correctly
+		#TEXTB_SIZE,BUFFER
+	BEQL	310$			; BR to clean exit
+	MOVZBL	(R3),-(SP)		; Save the bad data...
+	PUSHL	#PATTERN_1		; ...the good data...
+	SUBL3	R2,#TEXTB_SIZE,-(SP)	; ...the offset of the bad data...
+	PUSHAL	RF_FILESPEC_DESC	; ...the device...
+	PUSHL	#^XF0004		; ...
+	PUSHL	#UETP$_DATADEVERR	; ...and the error code...
+	CALLS	#6,ERROR_SIGNAL		; ...so we can warn of the error
+	CLRL	R0			; Indicate that we had an error
+	BRB	320$
+310$:
+	MOVL	#1,R0			; Indicate success
+320$:
+	RSB
+
+400$:					; Choose a slave to share file access
+					; R1 returns an index for chosen node
+;
+; Use the filespec as the input to a hashing function so we can pick a
+; "random" slave node for shared access.
+;
+	MOVZWL	RF_FILESPEC_DESC,R3	; We will...
+	MOVAL	RF_FILESPEC,R4		; ...
+;	CLRL	R1			; ...use a "random" seed...
+410$:
+	ADDB2	(R4)+,R1		; ...to sum the filespec chars
+	SOBGTR	R3,410$			; (Note that R3=0 when we fall thru)
+;	CLRL	R3			; Start counting assigned channels
+420$:
+	TSTW	NODE_CHANS[R3]		; Is this the first unassigned channel?
+	BEQL	430$			; We've finished counting, if so
+	AOBLEQ	#MAX_NODES,R3,420$	; Keep counting up to end of list
+430$:
+	TSTL	R3			; Have we any assigned channel?
+	BEQL	460$			; BR if not - no slave to share access
+	CLRL	R2			; Set up for EDIV dividend operand
+	EDIV	R3,R1,R1,R1		; Normalize "random" channel
+	MOVL	R1,R4			; Prevent endless loop searching
+440$:
+	MOVAQ	NODE_NAMES[R1],R2
+	BBC	#CLIG_V_DEADNODE,-	; BR if the slave is OK...
+		2(R2),470$		; ...to check shared access
+	AOBLSS	R3,R1,450$		; It's not, point to next possible slave
+	CLRL	R1			; Wrap around if we're beyond valid ones
+450$:
+	CMPL	R1,R4			; Have we an endless loop?
+	BNEQ	440$			; BR if not - do further checks
+460$:
+	MOVAL	RF_FILESPEC_DESC,R1	; We're out of possible slaves...
+	$FAO_S	CTRSTR = DEBUG_NOSHARE_MSG,-
+		OUTLEN = DEBUG_PTR,-
+		OUTBUF = DEBUG_FAO_BUF,-
+		P1     = R1
+	BSBW	GIVE_DEBUG_MSG		; ...let user know if debugging...
+	CLRL	R0			; ...and indicate that we've failed
+	RSB
+470$:
+	MOVL	#1,R0			; Indicate that we have a candidate
+					; R1 has the index of the slave
+	RSB
+
+500$:					; Have a slave share access to a file
+	.WORD	^M<R6,R7,R8,R9,R10>	; R2 through R5 may be trashed
+
+	MOVL	04(AP),R1		; Recall index for node to share access
+	MOVAW	NODE_CHANS[R1],R7	; Point to our DECnet channel
+	MOVAQ	NODE_NAMES[R1],R8	; Point to our node name
+	MOVAL	ACCESS_MSG,R9		; Set up convenience registers...
+	MOVAL	CONTINUE_MSG,R10	; ...
+	MOVC3	(R9),2(R9),MESSAGE_BUFFER ; Set up message type
+	SUBW3	(R9),#TEXTB_SIZE,R0	; Figure space available for message
+	MOVZBW	RF_NAM+NAM$B_RSL,R1	; Figure length of filespec
+;	CMPW	R0,R1			; Have we enough room?
+;	BLSS				; Should never be problem, by definition
+	MOVC5	R1,@RF_NAM+NAM$L_RSA,-	; Pass the filespec as our message
+		#0,R0,(R3)
+	MOVZWL	(R7),-(SP)		; Set up the channel...
+	PUSHL	R8			; ...the node name...
+	PUSHL	R9			; ...and our message name
+	CALLS	#3,MASTER_WRITE		; Tell this node to access our file
+	BLBCW	R0,550$			; Skip the rest if this node died
+	MOVZWL	(R7),-(SP)		; Set up the channel...
+	PUSHL	R8			; ...the node name...
+	PUSHL	R9			; ...and our message name
+	CALLS	#3,MASTER_READ		; See if the node got to our file
+	BLBCW	R0,550$			; Some error, skip the rest
+	CMPC3	(R9),2(R9),BUFFER	; Did we get the reply we expected?
+	BEQL	510$			; BR if we did
+	PUSHAL	EXCLUDE_MSG		; Complain if we did not
+	PUSHL	R8
+	PUSHL	R9
+	CALLS	#3,GARBLED_TRANS
+	BISW2	#CLIG_M_DEADNODE,2(R8)	; Mark the node as unuseable
+	CLRL	R0			; Indicate that we failed
+	BRW	550$			; Skip the rest - node is incoherent
+510$:
+	BLBS	(R3),520$		; BR if node could access the file
+	PUSHL	(R3)			; Otherwise get the error status
+	CALLS	#1,STATUS_TO_TEXT	; Convert it to something we can type
+	MOVAQ	RF_FILESPEC_DESC,R4
+	$FAO_S	CTRSTR = SLAVE_NO_ACCESS,- ; Tell the user what happened
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R8,-
+		P2     = R4
+	PUSHAL	STATUS_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	PUSHAL	BUFFER_PTR
+	PUSHL	#^XF0001
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	CALLS	#6,ERROR_SIGNAL
+	CLRL	R0			; Indicate a failure
+	BRW	550$			; Skip the rest for this file
+520$:
+	MOVC5	#0,#0,#PATTERN_2,-	; Set up a second record for the file
+		#TEXTB_SIZE,BUFFER
+	$PUT	RAB = RF_RAB,-		; Write that garbage, too
+		ERR = RMS_ERROR
+;	BLBC	R0,550$			; No point in checking errors - ...
+					; ...the slave must try to read
+	$FLUSH	RAB = RF_RAB,-		; Ensure that it gets out to our file
+		ERR = RMS_ERROR
+;	BLBC	R0,550$			; No point in checking errors - ...
+					; ...the slave must try to read
+	MOVC3	(R10),2(R10),MESSAGE_BUFFER ; Tell slave to read the next block
+	MOVZWL	(R7),-(SP)		; Set up the channel...
+	PUSHL	R8			; ...the node name...
+	PUSHL	R10			; ...and our message name
+	CALLS	#3,MASTER_WRITE		; Tell the slave to read second block
+	BLBC	R0,550$			; Skip the rest if there's an error
+	MOVZWL	(R7),-(SP)		; Set up the channel...
+	PUSHL	R8			; ...the node name...
+	PUSHL	R10			; ...and our message name
+	CALLS	#3,MASTER_READ		; See if slave read second block
+	BLBC	R0,550$			; BR if slave had trouble
+	CMPC3	(R10),2(R10),BUFFER	; Did we get the reply we expected?
+	BEQL	530$			; BR if we did
+	PUSHAL	EXCLUDE_MSG		; Complain if we did not
+	PUSHL	R8
+	PUSHL	R10
+	CALLS	#3,GARBLED_TRANS
+	BISW2	#CLIG_M_DEADNODE,2(R8)	; Mark the node as unuseable
+	CLRL	R0			; Indicate that we failed
+	BRB	550$			; Skip the rest - node is incoherent
+530$:
+	BLBS	(R3),540$		; BR if node could read extended file
+	PUSHL	(R3)			; Otherwise get the error status
+	CALLS	#1,STATUS_TO_TEXT	; Convert it to something we can type
+	MOVAQ	RF_FILESPEC_DESC,R4
+	$FAO_S	CTRSTR = SLAVE_EXT_FAIL,- ; Tell the user what happened
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R8,-
+		P2     = R4
+	PUSHAL	STATUS_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	PUSHAL	BUFFER_PTR
+	PUSHL	#^XF0001
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	CALLS	#6,ERROR_SIGNAL
+	CLRL	R0			; Indicate a failure
+	BRB	550$			; Skip the rest for this file
+540$:
+	MOVL	#1,R0			; Indicate success
+550$:
+	RET				; That's it for shared access
+
+600$:					; Tell all slaves to end file access
+	MOVAW	NODE_CHANS,R7		; Used to loop through DECnet channels
+	MOVAQ	NODE_NAMES,R8		; Used to loop through node name descs
+	MOVAL	MOVE_ON_MSG,R9		; Set up convenience register
+	MOVC3	(R9),2(R9),MESSAGE_BUFFER ; Set up message
+610$:
+	TSTW	(R7)			; Have we another channel?
+	BNEQ	620$			; BR if so - tell node to move on
+	RSB
+620$:
+	MOVZWL	(R7)+,-(SP)		; Set up channel (and point to next)...
+	PUSHL	R8			; ...the node name...
+	PUSHL	R9			; ...and our message
+	CALLS	#3,MASTER_WRITE		; Tell node to move on after file access
+	TSTD	(R8)+			; Point to the next possible name desc
+	BRB	610$			; Loop for the next node
+
+	.SBTTL	SHARE_ACCESS - See If We can Share File Access
+;++
+; FUNCTIONAL DESCRIPTION:
+;	See if a slave can read a file or files that is being written by the
+;	master process.
+;
+; IMPLICIT INPUTS:
+;	Name of a file, by way of a message from the master process.
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; SIDE EFFECTS:
+;	File is read and deaccessed.
+;
+;--
+
+SHARE_ACCESS:
+	MOVAL	ACCESS_MSG,R9		; Set up convenience registers...
+	MOVAL	CONTINUE_MSG,R10	; ...
+	MOVAL	MOVE_ON_MSG,R11		; ...
+10$:
+	PUSHL	R9			; Define the type of message we expect
+	CALLS	#1,SLAVE_READ		; Get the master node's message
+	CMPC3	(R9),2(R9),MESSAGE_BUFFER ; What does the message say?
+	BEQL	30$			; BR if we're to access a file
+	CMPC3	(R11),2(R11),MESSAGE_BUFFER ; Are we done with this section?
+	BEQL	20$			; BR if so
+	PUSHAL	NULL			; Otherwise...
+	PUSHAL	MASTER_NODE_DESC
+	PUSHL	R9			; ...we're confused...
+	CALLS	#3,GARBLED_TRANS	; ...and can't do anything about it
+	$EXIT_S	CODE = #UETP$_ABENDD!STS$K_ERROR!STS$M_INHIB_MSG
+20$:
+	$CLOSE	FAB = RF_FAB		; Blindly deaccess any possible file
+	RSB
+30$:
+	MOVC3	#NAM$C_MAXRSS,(R3),-	; Set up the filespec - name...
+		RF_FILESPEC
+	LOCC	#0,#NAM$C_MAXRSS,-	; ...
+		RF_FILESPEC
+	SUBW3	R0,#NAM$C_MAXRSS,-	; ...and length
+		RF_FILESPEC_DESC
+	MOVB	RF_FILESPEC_DESC,-	; Set the length...
+		RF_FAB+FAB$B_FNS	; ...where RMS expects it
+	MOVC5	#0,#0,#0,#NAM$C_MAXRSS,- ; Clear out remnants...
+		RESULT_FILESPEC		 ; ...of any previous $OPEN...
+	BICB	#FAB$M_PUT,-		 ; ...and be honest about our access
+		RF_FAB+FAB$B_FAC
+	$OPEN	FAB = RF_FAB,-		; See if we can get to the file
+		ERR = RMS_ERROR
+	BLBCW	R0,40$			; Skip the rest if we get an error
+	MOVAL	SCSNODE,R0
+	MOVAL	RF_FILESPEC_DESC,R1
+	$FAO_S	CTRSTR = DEBUG_SHARE_MSG,- ; If we're tracing, say...
+		OUTLEN = DEBUG_PTR,-
+		OUTBUF = DEBUG_FAO_BUF,-
+		P1     = #NODE_LENGTH,-
+		P2     = R0,-
+		P3     = R1
+	BSBW	GIVE_DEBUG_MSG		; ...that we've gotten to the file
+	$CONNECT RAB = RF_RAB,-
+		ERR = RMS_ERROR
+	BLBC	R0,40$			; Skip the rest if we get an error
+	$GET	RAB = RF_RAB,-		; Try to read the file
+		ERR = RMS_ERROR
+	BLBC	R0,40$			; Skip the rest if we get an error
+	CMPC5	#0,#0,#PATTERN_1,-	; Did we read the correct data?
+		#TEXTB_SIZE,BUFFER
+	BEQL	50$			; BR if we did
+	MOVZBL	(R3),-(SP)		; Save the bad data...
+	MOVZBL	#PATTERN_1,-(SP)	; ...the good data...
+	SUBL3	R2,#TEXTB_SIZE,-(SP)	; ...the offset of the bad data...
+	PUSHAL	RF_FILESPEC_DESC	; ...the device...
+	PUSHL	#^XF0004		; ...
+	PUSHL	#UETP$_DATADEVERR	; ...and the error code...
+	CALLS	#6,ERROR_SIGNAL		; ...so we can indicate the problem...
+	MOVL	#UETP$_DATADEVERR,R0	; ...and warn of the error
+40$:
+	MOVL	R0,MESSAGE_BUFFER+-	; Use our error code as a message
+		ACCESS_LENGTH
+	$CLOSE	FAB = RF_FAB		; Deaccess this file
+	PUSHL	R9			; Save the type of message...
+	CALLS	#1,SLAVE_WRITE		; ...and tell master we had problems
+	BRW	10$
+50$:
+	MOVL	#1,MESSAGE_BUFFER+-	; Reply to master - MESSAGE_BUFFER...
+		ACCESS_LENGTH
+	PUSHL	R9			; ...still has correct message type...
+	CALLS	#1,SLAVE_WRITE		; ...to which we append success
+	PUSHL	R10			; Define the type of message we want
+	CALLS	#1,SLAVE_READ		; Let master tell us to read next block
+	CMPC3	(R10),2(R10),MESSAGE_BUFFER ; What does the message say?
+	BEQL	70$			; BR if we're to continue access
+	CMPC3	(R11),2(R11),MESSAGE_BUFFER ; Did master tell us to move on?
+	BEQL	60$			; BR if so - clean up
+	PUSHAL	NULL			; Otherwise...
+	PUSHAL	MASTER_NODE_DESC
+	PUSHL	R10			; ...we're confused...
+	CALLS	#3,GARBLED_TRANS	; ...and can't do anything about it
+	$EXIT_S	CODE = #UETP$_ABENDD!STS$K_ERROR!STS$M_INHIB_MSG
+60$:
+	$CLOSE	FAB = RF_FAB		; Get out as easily as possible
+	RSB
+70$:
+	$CLOSE	FAB = RF_FAB,-
+		ERR = RMS_ERROR
+	BLBCW	R0,80$			; Skip the rest if we get an error
+	$OPEN	FAB = RF_FAB,-		; Update our knowledge of the file
+		ERR = RMS_ERROR
+	BLBC	R0,80$			; Skip the rest if we get an error
+	$CONNECT RAB = RF_RAB,-
+		 ERR = RMS_ERROR
+	BLBC	R0,80$			; Skip the rest if we get an error
+	$GET	RAB = RF_RAB,-		; Reread the first record
+		ERR = RMS_ERROR
+	BLBC	R0,80$			; Skip the rest if we get an error
+	$GET	RAB = RF_RAB,-		; Try to read a second record
+		ERR = RMS_ERROR
+	BLBC	R0,80$			; Skip the rest if we get an error
+	CMPC5	#0,#0,#PATTERN_2,-	; Did we read the correct data?
+		#TEXTB_SIZE,BUFFER
+	BEQL	80$			; BR if we did - note that R0 = 0
+	MOVZBL	(R3),-(SP)		; Save the bad data...
+	MOVZBL	#PATTERN_2,-(SP)	; ...the good data...
+	SUBL3	R2,#TEXTB_SIZE,-(SP)	; ...the offset of the bad data...
+	PUSHAL	RF_FILESPEC_DESC	; ...the "device"...
+	PUSHL	#^XF0004		; ...
+	PUSHL	#UETP$_DATADEVERR	; ...and the error code...
+	CALLS	#6,ERROR_SIGNAL		; ...so we can indicate the problem...
+	MOVL	#UETP$_DATADEVERR,R0	; ...and warn of the error
+80$:
+	TSTL	R0			; R0 = 0 if all OK, else error code
+	BNEQ	90$			; BR if we had a problem
+	MOVAL	SCSNODE,R0
+	MOVAL	RF_FILESPEC_DESC,R1
+	$FAO_S	CTRSTR = DEBUG_EXTEND_MSG,-
+		OUTLEN = DEBUG_PTR,-
+		OUTBUF = DEBUG_FAO_BUF,-
+		P1     = #NODE_LENGTH,-
+		P2     = R0,-
+		P3     = R1
+	BSBW	GIVE_DEBUG_MSG		; Let debugging user know...
+	MOVL	#1,R0			; ...that we read the extended file
+90$:
+	MOVL	R0,MESSAGE_BUFFER+-	; Use status code as our message
+		CONTINUE_LENGTH
+	$CLOSE	FAB = RF_FAB		; We've accessed the file
+;		ERR = RMS_ERROR		; Get here on error as well as success
+	PUSHL	R10			; Message says we're finished with file
+	CALLS	#1,SLAVE_WRITE		; Return result of sharing access
+	BRW	10$			; Loop in case we have to do another
+
+	.SBTTL	WIND_DOWN - Terminate Slaves and Clean Up
+;++
+; FUNCTIONAL DESCRIPTION:
+;	Allow the slave processes to exit.  Each of the slave processes will
+;	relay its copy of SYS$ERROR.LOG back to us; we will copy the relevant
+;	parts of it to our own SYS$OUTPUT.  Announce the end of testing to
+;	the operators' consoles in the cluster.
+;	
+; IMPLICIT INPUTS:
+;	NODE_CHAN list of channels on which we have DECnet links
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; SIDE EFFECTS:
+;	DECnet tasks are terminated.
+;	Slave SYS$ERROR files copied to our SYS$OUTPUT.
+;	Message to various operator consoles.
+;
+;--
+
+WIND_DOWN:
+	MOVAW	NODE_CHANS,R7		; Used to loop through DECnet channels
+	MOVAQ	NODE_NAMES,R8		; Used to loop through node name descs
+	MOVAL	ERRORLOG_MSG,R10	; Set up convenience registers...
+	MOVAL	ERRORLOG_ENDED_MSG,R9	; ...
+10$:
+	TSTW	(R7)			; Have we another channel?
+	BEQLW	40$			; BR if not - all SYS$ERROR.LOGs copied
+
+	$PUTMSG_S MSGVEC = BLANK_LINE_PTR ; Set off logs with a blank line
+	PUSHL	R8			; Set up a message...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_COPY_LOG
+	PUSHL	#^XF0003
+	MOVL	SP,R0
+	$PUTMSG_S MSGVEC = (R0)		; ...which log we're copying
+	POPR	#^M<R0,R1,R2,R3>	; Clean MSGVEC from the stack
+20$:
+	MOVZWL	(R7),-(SP)		; Set up the channel...
+	PUSHL	R8			; ...the node name...
+	PUSHL	R10			; ...and our message name
+	CALLS	#3,MASTER_ERRORLOG_READ	; Get a slave's non-success message
+	BLBC	R0,30$			; Give up if an error
+	CMPC3	(R9),2(R9),BUFFER	; Is it an ERRORLOG_ENDED message?
+	BEQL	30$			; BR if so - we've finished this slave
+	CMPC3	(R10),2(R10),BUFFER	; Is it an ERRORLOG message?
+	BNEQ	20$			; BR if not - we're out of synch
+	LOCC	#0,#2*TEXTB_SIZE,-	; Find the end of the message
+		BUFFER+ERRORLOG_LENGTH
+	SUBL3	R0,#2*TEXTB_SIZE,-	; Use it to compute the message length
+		BUFFER_PTR
+	BEQL	20$			; Don't print slave's empty message
+	MOVAL	BUFFER+ERRORLOG_LENGTH,- ; Point past the message type...
+		BUFFER_PTR+4		 ; ...so that the message is clear
+	BSBW	100$			; Indent the line(s) of the message
+	$PUTMSG_S MSGVEC = ERRORLOG_PTR	; Copy slave SYS$ERROR to our SYS$OUTPUT
+	MOVAL	BUFFER,BUFFER_PTR+4	; Reset buffer pointer to buffer's start
+	BRB	20$			; Loop for the next message
+30$:
+	PUSHL	R8			; Set up a message...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_COPY_LOG_ENDED
+	PUSHL	#^XF0003		; ...to say...
+	MOVL	SP,R0
+	$PUTMSG_S MSGVEC = (R0)		; ...which log we've copied
+	POPR	#^M<R0,R1,R2,R3>	; Clean MSGVEC from the stack
+	TSTW	(R7)+			; Point to the next possible channel
+	TSTD	(R8)+			; Point to the next possible name desc
+	BRW	10$			; Loop for the next slave's SYS$ERROR
+40$:
+	MOVAL	SCSNODE,R0
+	$FAO_S	CTRSTR = END_OF_TESTING,-
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = #NODE_LENGTH,-
+		P2     = R0,-
+		P3     = #0
+	$BRKTHRUW_S -			; Warn other nodes by a console message
+		MSGBUF = BUFFER_PTR,-
+		EFN    = #SS_SYNCH_EFN,-
+		SENDTO = OPA0,-
+		SNDTYP = #BRK$C_DEVICE,-
+		FLAGS  = #BRK$M_CLUSTER,-
+		TIMOUT = #BRKTHRU_TIMOUT,-
+		IOSB   = QUAD_STATUS
+	BLBC	QUAD_STATUS,50$		; BR if there was any error in sending
+	ADDW3	QUAD_STATUS+4,-		; Did all nodes see the warning?
+		QUAD_STATUS+6,R1
+	BEQL	60$			; Skip the message if so
+50$:
+	MOVZWL	QUAD_STATUS,-(SP)	; Get the text...
+	CALLS	#1,STATUS_TO_TEXT	; ...associated with any error
+	MOVZWL	QUAD_STATUS+4,R1
+	MOVZWL	QUAD_STATUS+6,R2
+	$FAO_S	CTRSTR = BRKTHRU_ERRORS,- ; Form a message
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R1,-
+		P2     = R2
+	PUSHAL	STATUS_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	PUSHAL	BUFFER_PTR
+	PUSHL	#^XF0001
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	CALLS	#6,ERROR_SIGNAL
+60$:
+	RSB
+
+;
+; Massage a record from the slave's SYS$ERROR file so that it is uniformly
+; indented from the left margin, even if the record contains embedded carriage
+; returns, line feeds and tabs.
+;
+100$:
+	MOVL	BUFFER_PTR+4,R1		; R1 and R0 are a string desc...
+	MOVZWL	BUFFER_PTR,R0		; ...for the remainder of the record
+	MOVW	R0,-(SP)		; Counts chars as indentation is done
+	BRB	130$			; BR inside loop - indent string's start
+110$:
+	LOCC	#13,R0,(R1)		; Is there a <RET> in rest of string?
+	BEQL	140$			; Exit loop if not - no more indent
+	DECL	R0			; Found one. LOCC has us pointing at it
+	INCL	R1			; Point past the <RET>
+	CMPB	#10,(R1)		; Is there a <LINEFEED>?
+	BNEQ	120$			; BR if we need not skip <LINEFEED>
+	DECL	R0			; Must pass over <LF>...
+	INCL	R1			; ...since they're new line to printers
+120$:
+	CMPB	#9,(R1)			; Is there a tab at start of line?
+	BNEQ	130$			; BR if not - we can start indenting
+	DECL	R0			; Must pass over the tab
+	INCL	R1			; More of passing over the tab
+	BRB	120$			; Inner loop to find multiple tabs
+130$:
+	TSTL	R0			; If we're at the end of the string...
+	BEQL	140$			; ...we can exit the outer loop
+	PUSHR	#^M<R0,R1>		; Save desc to rest of string
+	MOVC3	R0,(R1),INDENT(R1)	; Indent the rest of the string
+	MOVC5	#0,#0,#^A/ /,#INDENT,@4(SP) ; Fill indented spaces with blanks
+	POPR	#^M<R0,R1>		; Restore desc to rest of string
+	ADDL2	#INDENT,R1		; Point beyond the spaces just inserted
+	ADDW2	#INDENT,(SP)		; Count total length incl. indentation
+	BRB	110$			; Loop to see if we need indent again
+140$:
+	MOVW	(SP)+,BUFFER_PTR	; Set new record size
+	RSB				; Return with finished record
+
+	.SBTTL	Read and Write DECnet
+;++
+; FUNCTIONAL DESCRIPTION:
+;	A set of common routines to read from and write to DECnet.  They handle
+;	master and slave reading and writing as well as minimal error checking.
+;
+; CALLING SEQUENCE:
+;	CALLS	#3,MASTER_access
+;		- or -
+;	CALLS	#1,SLAVE_access
+;		and access is either READ or WRITE
+;
+; INPUT PARAMETERS:
+;	04(AP)	address of MESSAGE_NAMES message (count word followed by text)
+;	08(AP)	address of node name (master routines only)
+;	12(AP)	DECnet channel (master routines only)
+;
+; IMPLICIT INPUTS:
+;	NODE_CHANS has the DECnet channel (slave routines only)
+;	MESSAGE_BUFFER has the message to write (write routines only)
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	QUAD_STATUS receives the status of the operation
+;	MESSAGE_BUFFER receives the message (slave read routine only)
+;	BUFFER receives the message (master read routine only)
+;
+; COMPLETION CODES:
+;	I/O status block status from $QIO
+;
+; SIDE EFFECTS:
+;	DECnet read or written
+;	Node no longer accessible (master routines only)
+;	Error message if there were problems
+;	Slave process may also exit if problems
+;
+;--
+
+SLAVE_READ:
+	.WORD	^M<R2>
+
+	$SETIMR_S DAYTIM = SLAVE_QIO_DELTA,- ; Prevent hangs waiting for DECnet
+		  ASTADR = TIME_OUT,-
+		  REQIDT = AP
+	$QIOW_S	EFN    = #SS_SYNCH_EFN,- ; Get the master node's message
+		CHAN   = NODE_CHANS,-
+		FUNC   = #IO$_READVBLK,-
+		IOSB   = QUAD_STATUS,-
+		P1     = MESSAGE_BUFFER,-
+		P2     = #TEXTB_SIZE
+	$CANTIM_S REQIDT = AP		; We returned from the DECnet QIO
+	BLBS	QUAD_STATUS,10$		; BR if message received correctly
+	PUSHAL	NULL			; Otherwise,...
+	PUSHAL	MASTER_NODE_DESC
+	PUSHL	04(AP)
+	CALLS	#3,READ_FAILED		; ...signal the error
+	$EXIT_S	CODE = #UETP$_ABENDD!STS$K_ERROR!STS$M_INHIB_MSG
+10$:
+	MOVL	04(AP),R0		; Point to the message
+	MOVZWL	(R0),R1			; Get the message length
+	MOVAL	2(R0),R0		; Point to the message text
+	MOVAL	MASTER_NODE_DESC,R2
+	$FAO_S	CTRSTR = DEBUG_READ_MSG,- ; Form debug message
+		OUTLEN = DEBUG_PTR,-
+		OUTBUF = DEBUG_FAO_BUF,-
+		P1     = R1,-
+		P2     = R0,-
+		P3     = R2
+	BSBW	GIVE_DEBUG_MSG		; Let a debugging user see it
+	MOVZWL	QUAD_STATUS,R0		; Return $QIO result
+	RET
+
+;+
+;	One of the DECnet read/write routines.
+;-
+SLAVE_WRITE:
+	.WORD	^M<R2>
+
+	$SETIMR_S DAYTIM = SLAVE_QIO_DELTA,- ; Prevent hangs waiting for DECnet
+		  ASTADR = TIME_OUT,-
+		  REQIDT = AP
+	$QIOW_S	EFN    = #SS_SYNCH_EFN,- ; Answer the master node's message
+		CHAN   = NODE_CHANS,-
+		FUNC   = #IO$_WRITEVBLK,-
+		IOSB   = QUAD_STATUS,-
+		P1     = MESSAGE_BUFFER,-
+		P2     = #TEXTB_SIZE
+	$CANTIM_S REQIDT = AP		; We returned from the DECnet QIO
+	BLBS	QUAD_STATUS,10$		; BR if message was sent correctly
+	PUSHAL	NULL			; Otherwise...
+	PUSHAL	MASTER_NODE_DESC
+	PUSHL	04(AP)
+	CALLS	#3,WRITE_FAILED
+	$EXIT_S	CODE = #UETP$_ABENDD!STS$K_ERROR!STS$M_INHIB_MSG
+10$:
+	MOVL	04(AP),R0		; Point to the message
+	MOVZWL	(R0),R1			; Get the message length
+	MOVAL	2(R0),R0		; Point to the message text
+	MOVAL	MASTER_NODE_DESC,R2
+	$FAO_S	CTRSTR = DEBUG_WRITE_MSG,- ; Form debugging message
+		OUTLEN = DEBUG_PTR,-
+		OUTBUF = DEBUG_FAO_BUF,-
+		P1     = R1,-
+		P2     = R0,-
+		P3     = R2
+	BSBW	GIVE_DEBUG_MSG		; Let a debugging user see it
+	MOVZWL	QUAD_STATUS,R0		; Return $QIO result
+	RET
+
+;+
+;	One of the DECnet read/write routines.  We have special conditions
+;	here:  we are in our exit handler with System Service Failure mode
+;	and ASTs turned off and we are reading the very file we we would
+;	ordinarily be writing if we encounter an error.  We must therefore
+;	make some assumptions and process errors locally.
+;-
+SLAVE_EXIT_WRITE:
+	.WORD	^M<R2,R3,R4,R5,R6>
+
+	$QIO_S	EFN    = #SS_SYNCH_EFN,- ; Copy a line of our error log file
+		CHAN   = NODE_CHANS,-
+		FUNC   = #IO$_WRITEVBLK,-
+		IOSB   = QUAD_STATUS,-
+		P1     = MESSAGE_BUFFER,-
+		P2     = #2*TEXTB_SIZE
+	$SCHDWK_S DAYTIM = FIVE_SECONDS	; Allow a nominal time for the $QIO
+	$HIBER_S			; Assume it will complete when we awaken
+	TSTW	QUAD_STATUS		; Did it complete though?
+	BNEQ	10$			; BR if it did
+	MOVW	#1,QUAD_STATUS		; Fool us into success - we can't wait
+10$:
+	BLBSW	QUAD_STATUS,20$		; BR if $QIO worked
+	MOVZWL	QUAD_STATUS,-(SP)	; Otherwise...
+	CALLS	#1,STATUS_TO_TEXT	; ...set up...
+	MOVL	04(AP),R4		; ...for an error message..
+	MOVZWL	(R4),R3			; ...just as though...
+	MOVAL	2(R4),R4		; ...we'd called...
+	MOVAL	MASTER_NODE_DESC,R5	; ...our regular error routines...
+	MOVAL	NULL,R6			; ...
+	$FAO_S	CTRSTR = WRITE_MSG,-	; ...
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R3,-
+		P2     = R4,-
+		P3     = R5,-
+		P4     = R6
+	MOVL	SP,R6			; (This will clean up stack)
+	PUSHAL	STATUS_PTR		; ...
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	PUSHAL	BUFFER_PTR
+	PUSHL	#^XF0001
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	INCL	ERROR_COUNT
+	PUSHL	ERROR_COUNT
+	PUSHAL	NEWNAM_DESC
+	PUSHL	#^X10002
+	PUSHL	#UETP$_ERBOXPROC!STS$K_ERROR
+	PUSHL	#10
+	MOVL	SP,R5
+	$PUTMSG_S MSGVEC = (R5)		; ...but use no AST and don't log it!
+	MOVL	R6,SP			; Clean up the stack
+20$:
+	MOVL	04(AP),R0		; Point to the message
+	MOVZWL	(R0),R1			; Get the message length
+	MOVAL	2(R0),R0		; Point to the message text
+	MOVAL	MASTER_NODE_DESC,R2
+	$FAO_S	CTRSTR = DEBUG_WRITE_MSG,- ; Form debugging message
+		OUTLEN = DEBUG_PTR,-
+		OUTBUF = DEBUG_FAO_BUF,-
+		P1     = R1,-
+		P2     = R0,-
+		P3     = R2
+	BBC	#CLIG_V_DEBUG,FLAGS,30$	; Skip message if not debugging
+	$PUTMSG_S MSGVEC = DEBUG_QIO_MSG_PTR ; Print but don't log message!
+30$:
+	MOVZWL	QUAD_STATUS,R0		; Return $QIO result
+	RET
+
+;+
+;	One of the DECnet read/write routines.
+;-
+MASTER_WRITE:
+	.WORD	^M<>
+
+	$SETIMR_S DAYTIM = QIO_DELTA,-	; Prevent hangs waiting for DECnet
+		  ASTADR = TIME_OUT,-
+		  REQIDT = AP
+	$QIOW_S	EFN    = #SS_SYNCH_EFN,- 
+		CHAN   = 12(AP),-
+		FUNC   = #IO$_WRITEVBLK,-
+		IOSB   = QUAD_STATUS,-
+		P1     = MESSAGE_BUFFER,-
+		P2     = #TEXTB_SIZE
+	$CANTIM_S REQIDT = AP		; We returned from the DECnet QIO
+	BLBS	QUAD_STATUS,10$		; BR if message sent correctly
+	PUSHAL	EXCLUDE_MSG		; Complain if it was not
+	PUSHL	08(AP)
+	PUSHL	04(AP)
+	CALLS	#3,WRITE_FAILED
+	MOVL	08(AP),R0
+	BISW2	#CLIG_M_DEADNODE,2(R0)	; We're done with this node
+10$:
+	MOVL	04(AP),R0		; Point to the message
+	MOVZWL	(R0),R1			; Get the message length
+	MOVAL	2(R0),R0		; Point to the message text
+	$FAO_S	CTRSTR = DEBUG_WRITE_MSG,- ; Form debug message
+		OUTLEN = DEBUG_PTR,-
+		OUTBUF = DEBUG_FAO_BUF,-
+		P1     = R1,-
+		P2     = R0,-
+		P3     = 08(AP)
+	BSBW	GIVE_DEBUG_MSG		; Let a debugging user see it
+	MOVZWL	QUAD_STATUS,R0		; Return $QIO result
+	RET
+
+;+
+;	One of the DECnet read/write routines.
+;-
+MASTER_READ:
+	.WORD	^M<>
+
+	$SETIMR_S DAYTIM = QIO_DELTA,-	; Prevent hangs waiting for DECnet
+		  ASTADR = TIME_OUT,-
+		  REQIDT = AP
+	$QIOW_S	EFN    = #SS_SYNCH_EFN,- ; See if other node acknowledges us
+		CHAN   = 12(AP),-
+		FUNC   = #IO$_READVBLK,-
+		IOSB   = QUAD_STATUS,-
+		P1     = BUFFER,-
+		P2     = #TEXTB_SIZE
+	$CANTIM_S REQIDT = AP		; We returned from the DECnet QIO
+	BLBS	QUAD_STATUS,10$		; BR if message received correctly
+	PUSHAL	EXCLUDE_MSG		; Complain if it was not
+	PUSHL	08(AP)
+	PUSHL	04(AP)
+	CALLS	#3,READ_FAILED
+	MOVL	08(AP),R0
+	BISW2	#CLIG_M_DEADNODE,2(R0)	; We're done with this node
+10$:
+	MOVL	04(AP),R0		; Point to the message
+	MOVZWL	(R0),R1			; Get the message length
+	MOVAL	2(R0),R0		; Point to the message text
+	$FAO_S	CTRSTR = DEBUG_READ_MSG,- ; Form debug message
+		OUTLEN = DEBUG_PTR,-
+		OUTBUF = DEBUG_FAO_BUF,-
+		P1     = R1,-
+		P2     = R0,-
+		P3     = 08(AP)
+	BSBW	GIVE_DEBUG_MSG		; Let debugging user see it
+	MOVZWL	QUAD_STATUS,R0		; Return $QIO result
+	RET
+
+;+
+;	One of the DECnet read/write routines.
+;-
+MASTER_ERRORLOG_READ:
+	.WORD	^M<>
+
+	$SETIMR_S DAYTIM = QIO_DELTA,-	; Prevent hangs waiting for DECnet
+		  ASTADR = 100$,-
+		  REQIDT = AP
+	$QIOW_S	EFN    = #SS_SYNCH_EFN,- ; See if other node acknowledges us
+		CHAN   = 12(AP),-
+		FUNC   = #IO$_READVBLK,-
+		IOSB   = QUAD_STATUS,-
+		P1     = BUFFER,-
+		P2     = #2*TEXTB_SIZE
+	$CANTIM_S REQIDT = AP		; We returned from the DECnet QIO
+	BLBS	QUAD_STATUS,10$		; BR if message received correctly
+	PUSHAL	PLEASE_CHECK_MSG	; Complain if it was not
+	PUSHL	08(AP)
+	PUSHL	04(AP)
+	CALLS	#3,READ_FAILED
+10$:
+	MOVL	04(AP),R0		; Point to the message
+	MOVZWL	(R0),R1			; Get the message length
+	MOVAL	2(R0),R0		; Point to the message text
+	$FAO_S	CTRSTR = DEBUG_READ_MSG,- ; Form debugging message
+		OUTLEN = DEBUG_PTR,-
+		OUTBUF = DEBUG_FAO_BUF,-
+		P1     = R1,-
+		P2     = R0,-
+		P3     = 08(AP)
+	BSBW	GIVE_DEBUG_MSG		; Let debugging user see it
+	MOVZWL	QUAD_STATUS,R0		; Return $QIO result
+	RET
+
+
+100$:					; Catch DECnet timeouts
+	.WORD	^M<>
+
+	MOVL	04(AP),AP		; Get AP from DECnet read routine
+	MOVZWL	12(AP),R0		; Get the DECnet channel...
+	$CANCEL_S CHAN = R0		; ...because we can't wait forever
+	RET
+
+	.SBTTL	Timer Expiration Routine
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine will be called only if the timer goes off which was set to 
+;	prevent program hangs while waiting for the completion of a DECnet $QIO.
+;
+; CALLING SEQUENCE:
+;	Called via AST at $SETIMR expiration.
+;
+; INPUT PARAMETERS:
+;	04(AP)	Contents of AP when the $QIO was issued.  See "Read and Write
+;		DECnet" routines.
+;
+; IMPLICIT INPUTS:
+;	NODE_CHANS has the DECnet channel (slave routines only)
+;	Because we will use the AP from the DECnet read/write routines, we
+;		will have the DECnet channel for the master routines as 12(AP).
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	Message saying that the $QIO was cancelled.
+;	QUAD_STATUS gets SS$_CANCEL or SS$_ABORT.
+;
+;--
+
+TIME_OUT:
+	.WORD	^M<R2>
+
+	MOVL	04(AP),AP		; Get AP from DECnet read/write routine
+	MOVZWL	NODE_CHANS,R0		; Get DECnet channel assuming a slave
+	MOVAL	MASTER_NODE_DESC,R2	; Get node name assuming a slave
+	CMPL	#1,00(AP)		; But was it?  Slaves have only 1 arg
+	BEQL	10$			; BR if so - we're set up
+	MOVZWL	12(AP),R0		; It was master - get DECnet channel...
+	MOVL	08(AP),R2		; ...and node name
+10$:
+	$CANCEL_S CHAN = R0		; We can't wait forever for DECnet
+	$FAO_S	CTRSTR = CANCEL_MSG,-	; Let the user know what happened
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R2
+	$PUTMSG_S MSGVEC = CANCEL_MSG_PTR,-
+		  ACTRTN = SE_COPY
+	RET
+
+	.SBTTL	Form DECnet Error Messages
+;++
+; FUNCTIONAL DESCRIPTION:
+;	A set of common routines to format and issue typical error messages
+;	from reading or writing to DECnet.
+;
+; CALLING SEQUENCE:
+;	CALLS	#3,READ_FAILED or WRITE_FAILED or GARBLED_TRANS
+;
+; INPUT PARAMETERS:
+;	12(AP)	address of .ASCID giving consequence of error
+;	08(AP)	address of .ASCID node name from which error occurred
+;	04(AP)	MESSAGE_NAMES message name (count word followed by text)
+;
+; IMPLICIT INPUTS:
+;	QUAD_STATUS has failure code if this was called after a $QIO
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	NONE (R0 is garbage)
+;
+; SIDE EFFECTS:
+;	Error message signalled.
+;	STATUS_PTR, STATUS_BUFFER, BUFFER_PTR, BUFFER written over.
+;--
+
+READ_FAILED:
+	.WORD	^M<R2,R3,R4,R5>
+
+	MOVAQ	READ_MSG,R5		; Get the address of the message
+	BSBB	COMMON_MSG		; Join common code
+	CALLS	#6,ERROR_SIGNAL		; Signal the error
+	RET
+
+WRITE_FAILED:
+	.WORD	^M<R2,R3,R4,R5>
+
+	MOVAQ	WRITE_MSG,R5		; Get the address of the message
+	BSBB	COMMON_MSG		; Join common code
+	CALLS	#6,ERROR_SIGNAL		; Signal the error
+	RET
+
+GARBLED_TRANS:
+	.WORD	^M<R2,R3,R4,R5>
+
+	MOVAQ	GARBLE_MSG,R5		; Get the address of the message
+	BSBB	COMMON_MSG		; Join common code
+	CALLS	#3,ERROR_SIGNAL		; Signal the error
+	ADDL2	#12,SP			; Get rid of extra COMMON_MSG args
+	RET
+
+COMMON_MSG:
+	POPR	#^M<R2>			; Get return PC
+	MOVZWL	QUAD_STATUS,-(SP)	; Set up $QIO status if msg needs it
+	CALLS	#1,STATUS_TO_TEXT	; Get message text for that status
+	MOVL	04(AP),R4		; Point to MESSAGE_NAMES length
+	MOVZWL	(R4),R3			; Get the length of message type
+	MOVAL	2(R4),R4		; Point to the text naming the message
+	$FAO_S	CTRSTR = (R5),-		; Form the message text
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R3,-
+		P2     = R4,-
+		P3     = 08(AP),-
+		P4     = 12(AP)
+	PUSHAL	STATUS_PTR		; Set up SIGNAL info for $QIO status
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	PUSHAL	BUFFER_PTR		; Set up rest of SIGNAL info
+	PUSHL	#^XF0001
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	JMP	(R2)			; Subroutine return
+
+	.SBTTL	Tracing Messages Routine
+;++
+; FUNCTIONAL DESCRIPTION:
+;	Outputs a trace message for debugging purposes, if appropriate.
+;
+; IMPLICIT INPUTS:
+;	DEBUG_PTR is a descriptor for the message.
+;	FLAGS has a switch to indicate debugging mode
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; SIDE EFFECTS:
+;	Message to SYS$OUTPUT/SYS$ERROR if we are in debugging mode
+;	Message copied to slave's SYS$ERROR.LOG, if appropriate
+;
+;--
+
+GIVE_DEBUG_MSG:
+	BBC	#CLIG_V_DEBUG,FLAGS,10$	; Skip message if not tracing
+	$PUTMSG_S MSGVEC = DEBUG_QIO_MSG_PTR,-
+		  ACTRTN = SE_COPY
+10$:
+	RSB
+
+	.SBTTL	STATUS_TO_TEXT - Get Text Associated with a Status Value
+;++
+; FUNCTIONAL DESCRIPTION:
+;	To enable more useful error messages, we'd like to print out the
+;	message associated with failures as well as the messages we provide
+;	ourself.  Some of the messages have $FAO arguments, the values
+;	for which are lost.  Provide the fac-s-abbrev,text for each message,
+;	but with the $FAO directives intact.
+;
+; CALLING SEQUENCE:
+;	PUSHL	status
+;	CALLS	#1,STATUS_TO_TEXT
+;
+; INPUT PARAMETERS:
+;	04(AP)	VMS status (message number and severity)
+;
+; IMPLICIT INPUTS:
+;	STATUS_STRING has an introductory message
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	STATUS_PTR has a descriptor for our message in STATUS_BUFFER
+;
+; COMPLETION CODES:
+;	Status from $GETMSG
+;
+; SIDE EFFECTS:
+;	NONE
+;--
+
+STATUS_TO_TEXT:
+	.WORD	^M<R2,R3,R4,R5,R6,R7>	; Entry mask
+
+	MOVZWL	#TEXTB_SIZE,STATUS_PTR	; Set the size of our return buffer
+	$GETMSG_S MSGID = 04(AP),-	; Get the message
+		 MSGLEN = STATUS_PTR,-
+		 BUFADR = STATUS_PTR
+	PUSHR	#^M<R0>			; Save this as final status
+	MOVZWL	STATUS_STRING,R6	; Get the length of our intro text
+	MOVAL	STATUS_BUFFER,R7	; Point to just beyond where...
+	ADDL2	R6,R7			; ...the intro would end in our buffer
+	MOVC3	STATUS_PTR,-		; Shift the message...
+		STATUS_BUFFER,(R7)	; ...by the length of the intro...
+	MOVL	R3,R7
+	MOVC3	R6,STATUS_STRING+8,-	; ...so we may surround message...
+		STATUS_BUFFER
+	MOVB	#^A/"/,(R7)+		; ...with our intro
+	MOVAL	STATUS_BUFFER,R6	; Get the length...
+	SUBL3	R6,R7,STATUS_PTR	; ...of the entire mess
+	POPR	#^M<R0>			; Restore $GETMSG status
+	RET
+
+	.SBTTL	System Service Exception Handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine is executed if a software or hardware exception occurs or
+;	if a LIB$SIGNAL system service is used to output a message.
+;
+; CALLING SEQUENCE:
+;	Entered via an exception from the system
+;
+; INPUT PARAMETERS:
+;	Signal and mechanism arrays from an exception vector
+;
+; IMPLICIT INPUTS:
+;	ERROR_COUNT has the previous cumulative error count
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	EXIT_STATUS contains error code if we exit
+;
+; COMPLETION CODES:
+;	SS$_NORMAL if it's a UETP condition or RMS error.
+;	Error status from exception, otherwise.
+;
+; SIDE EFFECTS:
+;	STATUS_PTR, STATUS_BUFFER get used.
+;	May branch to ERROR_EXIT.
+;	May print a message.
+;--
+
+SSERROR:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	$SETAST_S ENBFLG = #0		; Disable AST delivery
+	PUSHL	#1			; Assume ASTs were enabled
+	CMPL	S^#SS$_WASSET,R0	; Were ASTs enabled?
+	BEQL	10$			; BR if they were
+	CLRL	(SP)			; Set ASTs to remain disabled
+10$:
+	$SETSFM_S ENBFLG = #0		; Disable SS failure mode
+	PUSHL	#1			; Assume SS failure mode was enabled
+	CMPL	S^#SS$_WASSET,R0	; Was SS failure mode enabled?
+	BEQL	20$			; BR if it was
+	CLRL	(SP)			; Set SS failure mode to remain off
+20$:
+	MOVL	CHF$L_SIGARGLST(AP),R6	; Get the signal array pointer
+	MOVQ	CHF$L_SIG_NAME(R6),R9	; Get NAME in R9 and ARG1 in R10
+	CMPZV	#STS$V_FAC_NO,-		; Is this a message from LIB$SIGNAL?
+		#STS$S_FAC_NO,-
+		R9,#UETP$_FACILITY
+	BNEQ	30$			; BR if this is not a UETP exception
+	SUBL2	#2,CHF$L_SIG_ARGS(R6)	; Drop the PC and PSL
+	$PUTMSG_S MSGVEC = -		; Print the message
+		    CHF$L_SIG_ARGS(R6),-
+		  ACTRTN = SE_COPY
+	BRB	40$			; Restore ASTs and SS fail mode
+30$:
+	CMPL	#SS$_SSFAIL,R9		; RMS failures are SysSvc failures
+	BNEQ	50$			; BR if this can't be an RMS failure
+	CMPZV	#STS$V_FAC_NO,-		; Is it an RMS failure?
+		#STS$S_FAC_NO,-
+		R10,#RMS$_FACILITY
+	BNEQ	50$			; BR if not
+	BICL2	#^XF0000000,R10		; Strip control bits from status code
+	MATCHC	#4,CHF$L_SIG_ARG1(R6),-	; Is it an RMS failure for which...
+		#NRAT_LENGTH,-
+		NO_RMS_AST_TABLE	; ...no AST can be delivered?
+	BEQL	50$			; BR if so - must give error here
+40$:
+	POPR	#^M<R0>			; Restore SS failure mode...
+	$SETSFM_S ENBFLG = R0		; ...
+	POPR	#^M<R0>			; Restore AST enable...
+	$SETAST_S ENBFLG = R0		; ...
+	MOVL	S^#SS$_NORMAL,R0	; Supply a standard status for exit
+	RET				; Resume processing (or goto RMS_ERROR)
+50$:
+	MOVL	R9,EXIT_STATUS		; Save the status
+	CLRL	R8			; Assume for now it's not SS failure
+	CMPL	#SS$_SSFAIL,EXIT_STATUS	; But is it a System Service failure?
+	BNEQ	60$			; BR if not - no special case message
+	PUSHL	R10			; Get the text...
+	CALLS	#1,STATUS_TO_TEXT	; ...associated with this specific error
+	PUSHAL	STATUS_PTR		; Build up a message describing...
+	PUSHL	#1			; ...why the System Service failed
+	EXTZV	#STS$V_SEVERITY,-	  ; Give the message...
+		#STS$S_SEVERITY,R10,-(SP) ; ...the correct severity code,...
+	BISL2	#UETP$_TEXT,(SP)	  ; ...facility and id
+	MOVL	#3,R8			; Count the number of args we pushed
+60$:
+	MULL3	#4,CHF$L_SIG_ARGS(R6),R7 ; Get arglist length in bytes
+	SUBL2	R7,SP			   ; Save the current signal array...
+	MOVC3	R7,CHF$L_SIG_NAME(R6),(SP) ; ...on the stack
+	ADDL3	R8,CHF$L_SIG_ARGS(R6),-(SP) ; Push the current arg count
+	BRW	ERROR_EXIT
+
+	.SBTTL	Action Routine for Slave's SYS$ERROR.LOG
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine decides if a message is to be written to SYS$ERROR.LOG
+;	(a slave's copy of its SYS$ERROR which will be relayed to the master
+;	process at the end of testing) and writes it there if appropriate.
+;
+; CALLING SEQUENCE:
+;	Called as a $PUTMSG action routine.
+;
+; INPUT PARAMETERS:
+;	04(AP)	Address of a string descriptor for the message $PUTMSG
+;		intends to write
+;
+; IMPLICIT INPUTS
+;	FLAGS(CLIG_M_SLAVE) is on iff we're a slave process.
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	R0 contains an odd number so $PUTMSG may write its message
+;
+; SIDE EFFECTS:
+;	Slave's SYS$ERROR.LOG written if appropriate
+;--
+
+SE_COPY:
+	.WORD	^M<>
+
+	BBC	#CLIG_V_SLAVE,FLAGS,10$	; Skip this if we're the master node
+	BBS	#CLIG_V_SE_DEAD,FLAGS,10$ ; Also skip if we can't write to log
+	MOVL	04(AP),R0		; Point to the message buffer desc
+	MOVW	(R0),SE_RAB+RAB$W_RSZ	; Set up the message size...
+	MOVL	4(R0),SE_RAB+RAB$L_RBF	; ...and address
+	$PUT	RAB = SE_RAB,-		; Write the message
+		ERR = RMS_ERROR
+10$:
+	MOVL	#1,R0			; Supply an exit status for $PUTMSG 
+	RET
+
+	.SBTTL	RMS Error Handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine handles error returns from RMS calls.
+;
+; CALLING SEQUENCE:
+;	Called by RMS when a file processing error is found.
+;
+; INPUT PARAMETERS:
+;	The FAB or RAB associated with the RMS call.
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	Error message
+;
+;--
+
+RMS_ERROR:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	MOVL	4(AP),R6		 ; See whether we're dealing with...
+	CMPB	#FAB$C_BID,FAB$B_BID(R6) ; ...a FAB or a RAB
+	BNEQ	10$			 ; BR if it's a RAB
+	MOVAL	FILE,R7			 ; FAB-specific code:  text string...
+	MOVL	R6,R8			 ; ...address of FAB...
+	PUSHL	FAB$L_STV(R6)		 ; ...STV field for error...
+	PUSHL	FAB$L_STS(R6)		 ; ...and STS field for error
+	BRB	20$			 ; FAB and RAB share other code
+10$:
+	MOVAL	RECORD,R7		 ; RAB-specific code:  text string...
+	MOVL	RAB$L_FAB(R6),R8	 ; ...address of associated FAB...
+	PUSHL	RAB$L_STV(R6)		 ; ...STV field for error...
+	PUSHL	RAB$L_STS(R6)		 ; ...and STS field for error
+20$:
+	MOVAL	SE_FAB,R0		; Check to see...
+	CMPL	R0,R8			; ...if the error was in SYS$ERROR.LOG
+	BNEQ	30$			; BR if it was not
+	BISL2	#CLIG_M_SE_DEAD,FLAGS	; Prevent endless loop trying to log it
+30$:
+	MOVZBL	FAB$B_FNS(R8),R10	; Get the file name size
+	$FAO_S	CTRSTR = RMS_ERR_STRING,- ; Common code, prepare error msg...
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R7,-
+		P2     = R10,-
+		P3     = FAB$L_FNA(R8)
+	PUSHAL	BUFFER_PTR		; ...
+	PUSHL	#^XF0001		; ...
+	PUSHL	#UETP$_TEXT!STS$K_ERROR	; ...and arguments for ERROR_SIGNAL
+	CALLS	#5,ERROR_SIGNAL		; Give the message
+	RET
+
+	.SBTTL	CTRL/C Handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine handles CTRL/C AST's
+;
+; CALLING SEQUENCE:
+;	Called via AST
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	SS$_CONTROLC with warning status
+;
+; SIDE EFFECTS:
+;	Control-C message is signalled.
+;	Program exits.
+;
+;--
+
+CCASTHAND:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	MOVZWL	#SS$_CONTROLC,-(SP)
+	PUSHL	#0			; Indicate an abnormal termination
+	PUSHAL	PROCESS_NAME		; ...
+	PUSHL	#2			; ...
+	PUSHL	#UETP$_ABENDD!STS$K_WARNING ; ...
+	CALLS	#5,G^LIB$SIGNAL		; Output the message
+	MOVL	#<STS$M_INHIB_MSG!-	; Set the exit status
+		SS$_CONTROLC--
+		STS$K_SUCCESS+STS$K_WARNING>,-
+		EXIT_STATUS
+	$EXIT_S	CODE = EXIT_STATUS	; Terminate program cleanly
+
+	.SBTTL	ERROR_SIGNAL
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine prints an error message with the standard UETP error box.
+;
+; CALLING SEQUENCE:
+;	PUSHL	arguments to LIB$SIGNAL
+;	CALLS	count of above,ERROR_SIGNAL
+;
+; INPUT PARAMETERS:
+;	Arguments to LIB$SIGNAL, as above
+;
+; IMPLICIT INPUTS:
+;	ERROR_COUNT has a cumulative count of errors we've seen
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	ERROR_COUNT is incremented
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	Message to SYS$OUTPUT and SYS$ERROR
+;
+;--
+
+ERROR_SIGNAL:
+	.WORD	^M<R2,R3,R4,R5>
+
+	$SETAST_S ENBFLG = #0		; ASTs can play havoc with messages
+	PUSHL	#1			; Assume ASTs were enabled
+	CMPW	S^#SS$_WASSET,R0	; Were ASTs enabled?
+	BEQL	10$			; BR if they were
+	CLRL	(SP)			; Set ASTs to remain disabled
+10$:
+	ADDL3	00(AP),#4,ARG_COUNT	; Get total number of args
+	MULL3	00(AP),#4,R0		; Figure its length in bytes...
+	SUBL2	R0,SP			; ...so we can...
+	MOVC3	R0,04(AP),(SP)		; ...set up a list for LIB$SIGNAL
+	INCL	ERROR_COUNT		; Keep running error count
+	PUSHL	ERROR_COUNT		; Finish off arg list...
+	PUSHAL	NEWNAM_DESC		; ...
+	PUSHL	#^X10002		; ...
+	PUSHL	#UETP$_ERBOXPROC!STS$K_ERROR ; ...for error box message
+	CALLS	ARG_COUNT,G^LIB$SIGNAL	; Truly bitch
+	POPR	#^M<R0>			; Restore AST enable...
+	$SETAST_S ENBFLG = R0		; ...to its previous situation
+	RET
+
+	.SBTTL	Error Exit
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine prints an error message and exits.
+;
+; CALLING SEQUENCE:
+;	MOVx  error status value,EXIT_STATUS
+;	PUSHx error specific information on the stack
+;	PUSHL current argument count
+;	BRW   ERROR_EXIT
+;
+; INPUT PARAMETERS:
+;	Arguments to LIB$SIGNAL, as above
+;
+; IMPLICIT INPUTS:
+;	ERROR_COUNT has a cumulative count of errors we've seen
+;
+; OUTPUT PARAMETERS:
+;	Message to SYS$OUTPUT and SYS$ERROR
+;
+; IMPLICIT OUTPUTS:
+;	ERROR_COUNT is incremented
+;
+; COMPLETION CODES:
+;	UETP$_ABENDD with error status as a default
+;
+; SIDE EFFECTS:
+;	Program exits
+;
+;--
+
+ERROR_EXIT:
+
+	$SETAST_S ENBFLG = #0		; ASTs can play havoc with messages
+	BBS	#CLIG_V_BEGINMSG,FLAGS,10$ ; BR if "begin" msg already given
+	$PUTMSG_S MSGVEC = CLIG_ANNOUNCE,- ; Give a beginning message if not
+		  ACTRTN = SE_COPY
+10$:
+	ADDL3	(SP)+,#8,ARG_COUNT	; Get total # args, pop partial count
+	INCL	ERROR_COUNT		; Keep running error count
+	PUSHL	#0			; Push the time parameter
+	PUSHAL	PROCESS_NAME		; Push test name...
+	PUSHL	#^XF0002		; ...arg count...
+	PUSHL	#UETP$_ABENDD!STS$K_ERROR ; ...and signal name
+	PUSHL	ERROR_COUNT		; Finish off arg list...
+	PUSHAL	NEWNAM_DESC		; ...
+	PUSHL	#^X10002		; ...
+	PUSHL	#UETP$_ERBOXPROC!STS$K_ERROR
+	PUSHL	ARG_COUNT		; ...for error box message
+	MOVL	SP,R2			; Keep a pointer to the MSGVEC
+	$PUTMSG_S MSGVEC = (R2),-	; Truly bitch
+		  ACTRTN = SE_COPY
+
+	TSTL	EXIT_STATUS		; Did we exit with an error code?
+	BNEQ	20$			; BR if we did
+	MOVL	#UETP$_ABENDD!STS$K_ERROR,- ; Supply a generic one otherwise
+		EXIT_STATUS
+20$:
+	BISL	#STS$M_INHIB_MSG,-	; Don't print messages twice!
+		EXIT_STATUS
+	$EXIT_S	CODE = EXIT_STATUS	; Exit in error
+
+	.SBTTL	Exit Handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine handles cleanup at exit.  For slave processes, it also
+;	copies SYS$ERROR.LOG file to the master process.
+;
+; CALLING SEQUENCE:
+;	Invoked automatically by $EXIT System Service.
+;
+; INPUT PARAMETERS:
+;	EXIT_STATUS  contains the exit status.
+;
+; IMPLICIT INPUTS:
+;	SYS$ERROR.LOG contains all slave messages that have gone to SYS$ERROR
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	Message announcing the end of the test.
+;	For slave processes, SYS$ERROR.LOG gets copied to the master.
+;
+;--
+
+EXIT_HANDLER:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	$SETSFM_S ENBFLG = #0		; Turn off System Service failure mode
+	$SETAST_S ENBFLG = #0		; An AST now could confuse us
+	EXTZV	#STS$V_SEVERITY,-	; Save the proper exit severity...
+		#STS$S_SEVERITY,-
+		EXIT_STATUS,R0
+	BLBC	R0,10$			; ...as modified by the need to see...
+	MOVL	#STS$K_INFO,R0		; ...our message go into SYS$ERROR
+10$:
+	BISL2	#UETP$_ENDEDD,R0	; ...and use it in our message code
+	MOVL	R0,CLIG_ANNOUNCE+4
+	$PUTMSG_S MSGVEC = CLIG_ANNOUNCE,- ; Output the ending message
+		  ACTRTN = SE_COPY
+	BBCW	#CLIG_V_SLAVE,FLAGS,40$	; Skip this if we're the master proc
+;
+; Send our logged copy of SYS$ERROR to the master process.
+;
+	$REWIND	RAB = SE_RAB		; Set up to relay non-success msgs
+	MOVAL	ERRORLOG_MSG,R10	; Set up convenience registers...
+	MOVAL	ERRORLOG_ENDED_MSG,R9	; ...
+	MOVC3	(R10),2(R10),MESSAGE_BUFFER ; Set up message preamble
+	SUBW3	(R10),#2*TEXTB_SIZE,R4	; Figure length of buffer remaining
+	MOVL	R3,SE_RAB+RAB$L_UBF	; Set up RAB to automatically...
+	MOVW	R4,SE_RAB+RAB$W_USZ	; ...concatenate data with preamble
+;
+; Send a dummy ERRORLOG message.  If messages are out of synch, this will
+; cause the master to think it got a "garbled message", and the only messages
+; it will attempt to read after that will be further ERRORLOG messages.  It
+; also means that the first real ERRORLOG message will not be forgotten as
+; a "garbled" message.  The master knows enough to ignore empty messages.
+;
+	MOVC5	#0,#0,#0,R4,(R3)	; Clear out miscellaneous trash
+20$:
+	PUSHL	R10			; Define the type of message we want
+	CALLS	#1,SLAVE_EXIT_WRITE	; Pass a message to the master
+	BLBC	R0,30$			; Exit loop if error
+	MOVC5	#0,#0,#0,-		; Clear out miscellaneous trash
+		SE_RAB+RAB$W_USZ,-
+		@SE_RAB+RAB$L_UBF
+	$GET	RAB = SE_RAB		; Get the next non-success message
+	BLBS	R0,20$			; Loop to write next msg if all is well
+	CMPL	#RMS$_EOF,R0		; Have we finished copying?
+	BEQL	30$			; BR if so - send ending message
+	MOVC3	PLEASE_CHECK_MSG,-	; We have trouble with SYS$ERROR.LOG...
+		PLEASE_CHECK_MSG+8,-
+		@SE_RAB+RAB$L_UBF
+	PUSHL	R10
+	CALLS	#1,SLAVE_EXIT_WRITE	; ...do our best to pass a warning
+30$:
+	MOVC5	(R9),2(R9),#0,-		; Insert our last message & clear rest
+		#2*TEXTB_SIZE,-
+		MESSAGE_BUFFER
+	PUSHL	R9			; Send a line to say that we're done
+	CALLS	#1,SLAVE_EXIT_WRITE
+	$CLOSE	FAB = SE_FAB		; Clean up after ourself
+	$ERASE	FAB = SE_FAB		; Clean up after ourself
+40$:
+	$SETPRN_S PRCNAM = CURNAM_DESC	; Reset our process name
+	RET				; That's all folks!
+
+	.END	UETCLIG00

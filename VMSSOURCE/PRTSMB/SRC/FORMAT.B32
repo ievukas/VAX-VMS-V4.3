@@ -1,0 +1,1074 @@
+MODULE FORMAT (	%TITLE 'Print Symbiont format routines'
+	IDENT = 'V04-000',
+	ADDRESSING_MODE (EXTERNAL = GENERAL)
+	) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:
+!	Print Symbiont.
+!
+! ABSTRACT:
+!	Output formatting routines.
+!
+! ENVIRONMENT:
+!	VAX/VMS user mode.
+!--
+!
+! AUTHOR: G. Robert, CREATION DATE: 31-Aug-1982
+!
+! MODIFIED BY:
+!
+!	V03-010	GRR0012		Gregory R. Robert	25-Jul-1984
+!		Add a check to determine if the call to format_line_number
+!		originated from the psm$k_main_input.  If it did then
+!		we surely wish to format the line number otherwise it
+!		could be call from the page header routine(or some such)
+!		where line numbers are not allowed.
+!
+!	V03-009	GRR0011		Gregory R. Robert	11-Jul-1984
+!		Change conditional format effector logic to only
+!		suppress form feeds allowing line feeds and vertical
+!		tabs to pass.  Fix column setting in FORMAT_LINE_NUMBER
+!		to correct a tab computation problem.
+!
+!	V03-008	GRR0010		Gregory R. Robert	09-May-1984
+!		Fix PSM$FORMAT interface to correspond to new user interface.
+!
+!	V03-007	GRR0009		Gregory R. Robert	29-Apr-1984
+!		FT2 bugfixes and margins.
+!
+!	V03-006	GRR0008		Gregory R. Robert	12-Apr-1984
+!		Backoff form feed fix of preceeding update, requires
+!		complimentary fix in cursor update for form feeds.
+!
+!	V03-005	GRR0007		Gregory R. Robert	12-Apr-1984
+!		Fix tab computation and fix conditional form feeds
+!		for the case of only one line on the page.
+!
+!	V03-004	GRR0006		Gregory R. Robert	26-Sep-1983
+!		Fix ACCVIO when printing files with sequence numbers.
+!
+!	3B-003	GRR3003		Gregory R. Robert	23-Aug-1983
+!		Bugfixes, page_setup_modules, form_setup_modules,
+!		sheet_feed, symbiont initiated pause_task and stop_stream,
+!		hangup code, read and write item services
+!
+!	3B-002	GRR3002		Gregory R. Robert	03-Aug-1983
+!		Rewrite for new design.
+!
+!	3B-001	GRR3001		Gregory R. Robert	22-Jul-1983
+!		Created separate module.
+!
+!
+!**
+
+LIBRARY 'SYS$LIBRARY:LIB';
+REQUIRE 'LIB$:SMBDEF';
+REQUIRE 'SRC$:SMBREQ';
+
+EXTERNAL ROUTINE
+	PSM$INCLUDE_MODULES,
+	PSM$STORE_ERRORS;
+
+FORWARD ROUTINE
+	PSM$MAIN_FORMAT		,
+
+	FORMAT_CHARACTER	,
+	FORMAT_ESCAPE_SEQUENCE	,
+	FORMAT_FIRST_CHARACTER	,
+	FORMAT_LINE_NUMBER	,
+	FORMAT_LINE_OVERFLOW	,
+	FORMAT_NEW_PAGE
+	;
+
+LITERAL
+	S_VMS_OSC = %CHARCOUNT (%CHAR(PSM$K_CHAR_ESC, PSM$K_CHAR_OSC), 'VMS;1;')
+	;
+
+
+%SBTTL 'FORMAT -- Main format routine'
+! Functional Description:
+!		This routine controls the formatting of output records.
+!		To the original input record the appropriate carriage
+!		control is applied, as well as line numbers if sequenced.
+!		All format effectors (LF, CR, FF, VT, BS) are scanned
+!		and the current line/column position is updated.
+!
+!		Wrap and truncate are handled.
+!
+!		Escape sequences are detected and processed.
+!
+!		New page is detected and reported.
+!
+! Formal Parameters:
+!		SCB	: SCB address
+!
+! Implicit Inputs:
+!		various fields from the SCB.
+!
+! Implicit Outputs:
+!		The input record is formatted and copied to the output buffer.
+!
+! Returned Value:
+!		SS$_NORMAL	- normal successful completion
+!		PSM$_BUFFEROVF	- output buffer full
+!		PSM$_NEWPAGE	- new page detected
+!		PSM$_ESCAPE	- escape sequence detected
+!
+! Side Effects:
+!		none
+!--
+GLOBAL ROUTINE PSM$MAIN_FORMAT ( 
+	SMB_CONTEXT	: REF $LONGWORD,	! SCB address
+	USER_CONTEXT	: REF VECTOR,		! - not used
+	FUNCTION	: REF $LONGWORD,	! service request code
+	DESC_1		: REF VECTOR,		! Input record descriptor
+	ARG_1		: REF $LONGWORD,	! Input carriage control
+	DESC_2		: REF VECTOR,		! Output record descriptor
+	ARG_2		: REF $LONGWORD		! - not used
+	)	=
+BEGIN
+
+LOCAL
+	REMAINDER	,
+	SCB		: REF $BBLOCK,
+	USED		,
+	XLATE_LIMIT
+	;
+
+
+! If not a FORMAT call then ignore it
+!
+IF .FUNCTION[] NEQ PSM$K_FORMAT THEN RETURN PSM$_FUNNOTSUP;
+
+
+! Get the SCB address
+!
+SCB = .SMB_CONTEXT[];
+
+
+! See if there is anything to do
+!
+IF .SCB[PSM$B_PREFIX_COUNT] EQL 0
+AND .SCB_SIZE_ (INPUT_RECORD) EQL 0
+AND .SCB[PSM$B_POSTFIX_COUNT] EQL 0
+THEN
+    RETURN SS$_NORMAL;
+
+
+! Check for first record of input service
+!
+IF .SCB[PSM$V_FIRST_RECORD]
+THEN
+    BEGIN
+    RETURN_IF_ERROR_ (FORMAT_FIRST_CHARACTER (.SCB));
+    SCB[PSM$V_FIRST_RECORD] = 0;
+    END;
+
+
+! Output any leading carriage control
+!
+WHILE .SCB[PSM$B_PREFIX_COUNT] NEQ 0
+DO
+    BEGIN
+    RETURN_IF_ERROR_ (FORMAT_CHARACTER (.SCB, .SCB[PSM$B_PREFIX_CHAR]));
+    DECREMENT_ (SCB[PSM$B_PREFIX_COUNT]);
+    END;
+
+
+! If escape in progress then call the escape formatting routine
+!
+IF .SCB[PSM$V_ESCAPE_IN_PROGRESS]
+THEN
+    RETURN_IF_ERROR_ (FORMAT_ESCAPE_SEQUENCE (.SCB));
+
+
+! If starting new record see if sequence number required
+!
+IF .SCB[PSM$V_NEW_RECORD]
+THEN
+    BEGIN
+    IF .PRINT_FLAG_ (SEQUENCED)
+    AND .SCB[PSM$B_SERVICE_INDEX] EQL PSM$K_MAIN_INPUT
+    THEN
+	RETURN_IF_ERROR_ (FORMAT_LINE_NUMBER (.SCB));
+    SCB[PSM$V_NEW_RECORD] = 0;
+    END;
+
+
+! Output any record contents
+!
+WHILE .SCB_SIZE_ (INPUT_RECORD) NEQ 0
+DO
+    BEGIN
+
+    ! While we are in the top margin area, or are starting a new line
+    ! let the format_character routine handle things
+    !
+    WHILE (
+		(.SCB[PSM$L_LINE] LEQU .SCB[PSM$L_T_MARGIN])
+	    OR	(.SCB[PSM$L_COLUMN] EQLU 0)
+	  )
+    AND .SCB_SIZE_ (INPUT_RECORD) NEQ 0
+    DO
+	BEGIN
+	RETURN_IF_ERROR_ (
+	    FORMAT_CHARACTER (.SCB, CH$RCHAR (.SCB_ADDR_ (INPUT_RECORD))));
+	READ_CHAR_ ;
+	END;
+
+    ! If in top margin area then we are starting a new page
+    !
+    IF .SCB[PSM$L_LINE] LEQU .SCB[PSM$L_T_MARGIN]
+    THEN
+	RETURN FORMAT_NEW_PAGE (.SCB);
+
+    ! Compute the maximun translation as the smaller of columns remaining,
+    ! output buffer remaining, and input record remaining
+    !
+    XLATE_LIMIT = .SCB[PSM$L_FORM_WIDTH] -
+	.SCB[PSM$L_RIGHT_MARGIN] - .SCB[PSM$L_COLUMN] + 1;
+
+    IF (.SCB[PSM$L_PRINT_FLAGS] AND (SMBMSG$M_TRUNCATE OR SMBMSG$M_WRAP)) EQL 0
+    THEN
+	XLATE_LIMIT = %X '7FFFFFFF';
+
+    IF .SCB_SIZE_ (INPUT_RECORD) LSSU .XLATE_LIMIT
+    THEN
+	XLATE_LIMIT = .SCB_SIZE_ (INPUT_RECORD);
+
+    ! Move the input record to the output buffer translating enroute.  Stop
+    ! if any format effectors sensed or when limit reached.
+    !
+    MOVTUC	(
+	XLATE_LIMIT,			! - smaller of input size and line size
+	.SCB_ADDR_ (INPUT_RECORD),	! - remaining input address
+	UPLIT BYTE (255),		! - stop translation character
+	.SCB[PSM$A_XLATE_TABLE],	! - translation table address
+	SCB_SIZE_ (OUTPUT_BUFFER),	! - remaining buffer size
+	.SCB_ADDR_ (OUTPUT_BUFFER)	! - remainging output address
+	  ;
+	REMAINDER,			! - R0 = unused input size
+	SCB_ADDR_ (INPUT_RECORD),	! - R1 = updated input address
+	,				! - R2 = <not used>
+	,				! - R3 = <not used>
+	SCB_SIZE_ (OUTPUT_BUFFER),	! - R4 = unused output size
+	SCB_ADDR_ (OUTPUT_BUFFER)	! - R5 = updated output address
+	);
+
+
+    ! Update counts and position
+    !
+    USED = .XLATE_LIMIT - .REMAINDER;
+    SCB[PSM$L_COLUMN] = .SCB[PSM$L_COLUMN] + .USED;
+    SCB_SIZE_ (INPUT_RECORD) = .SCB_SIZE_ (INPUT_RECORD) - .USED;
+
+
+    ! If remaining output buffer zero then return buffer overflow.
+    !
+    IF .SCB_SIZE_ (OUTPUT_BUFFER) EQL 0 THEN RETURN PSM$_BUFFEROVF;
+
+
+    ! If input remains we must have stopped due to a format effector --
+    ! let the format character routine handle it.
+    !
+    IF .SCB_SIZE_ (INPUT_RECORD) NEQ 0
+    THEN
+	BEGIN
+	RETURN_IF_ERROR_ (
+	    FORMAT_CHARACTER (.SCB, CH$RCHAR (.SCB_ADDR_ (INPUT_RECORD))));
+	READ_CHAR_ ;
+	END;
+    END;
+
+
+! Output any trailing carriage control
+!
+WHILE .SCB[PSM$B_POSTFIX_COUNT] NEQ 0
+DO
+    BEGIN
+    RETURN_IF_ERROR_ (FORMAT_CHARACTER (.SCB, .SCB[PSM$B_POSTFIX_CHAR]));
+    DECREMENT_ (SCB[PSM$B_POSTFIX_COUNT]);
+    END;
+
+SS$_NORMAL
+
+END;
+
+%SBTTL 'FORMAT_CHARACTER - format one character'
+! Functional Description:
+!		Handles special characters such as format effectors.
+!
+! Formal Parameters:
+!		SCB	: SCB address
+!		CHAR	: character to be output
+!
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		The character is formated and placed in the output buffer.
+!
+! Returned Value:
+!		SS$_NORMAL or any error
+!
+! Side Effects:
+!		none
+!--
+ROUTINE FORMAT_CHARACTER ( 
+	SCB	: REF $BBLOCK,
+	CHAR	: BYTE
+	) =
+BEGIN
+
+LOCAL
+	COLUMNS_LEFT	: SIGNED,
+	LINES_LEFT	: SIGNED
+	;
+
+
+! If line number is zero then we are attempt to write to a new page
+!
+IF .SCB[PSM$L_LINE] EQLU 0
+THEN
+    RETURN FORMAT_NEW_PAGE (.SCB);
+
+
+! Make sure there is ample room in the output buffer
+!
+IF .SCB_SIZE_ (OUTPUT_BUFFER) LSSU 50
+THEN
+    RETURN PSM$_BUFFEROVF;
+
+
+! If the column is zero we are starting a new line -- handle the 
+! left margin
+!
+IF .SCB[PSM$L_COLUMN] EQLU 0
+THEN
+    BEGIN
+    SCB_ADDR_(OUTPUT_BUFFER) =
+	CH$FILL (%C ' ', .SCB[PSM$L_L_MARGIN], .SCB_ADDR_(OUTPUT_BUFFER));
+    SCB_SIZE_(OUTPUT_BUFFER) =.SCB_SIZE_(OUTPUT_BUFFER) - .SCB[PSM$L_L_MARGIN];
+    SCB[PSM$L_COLUMN] = .SCB[PSM$L_L_MARGIN] + 1;
+    END;
+
+
+! Compute columns remaining on this line
+!
+COLUMNS_LEFT = .SCB[PSM$L_FORM_WIDTH] -
+    .SCB[PSM$L_RIGHT_MARGIN] - .SCB[PSM$L_COLUMN] + 1;
+
+IF (.SCB[PSM$L_PRINT_FLAGS] AND (SMBMSG$M_TRUNCATE OR SMBMSG$M_WRAP)) EQL 0
+THEN
+    COLUMNS_LEFT = %X '7FFFFFFF';
+
+
+! Compute lines remaining on this page
+!
+LINES_LEFT = .SCB[PSM$L_FORM_LENGTH] - .SCB[PSM$L_LINE];
+IF .PRINT_FLAG_ (PAGINATE)
+THEN
+    LINES_LEFT = .LINES_LEFT - .SCB[PSM$L_BOTTOM_MARGIN];
+
+
+! Case on the character to be formatted
+!
+CASE .CHAR FROM PSM$K_CHAR_BS TO PSM$K_CHAR_CR OF
+    SET
+
+    [OUTRANGE]:
+	BEGIN
+
+	! Exit if starting an escape sequence
+	!
+	IF .CHAR EQL PSM$K_CHAR_ESC
+	THEN
+	    RETURN PSM$_ESCAPE;
+
+
+	! Non-special character, probably we are in wrap/truncate
+	!
+	IF .COLUMNS_LEFT LEQ 0
+	THEN
+	    RETURN FORMAT_LINE_OVERFLOW (.SCB, .CHAR)
+	ELSE
+	    INCREMENT_ (SCB[PSM$L_COLUMN]);
+	END;
+
+
+    ! Backspace -- decrement column and output character
+    !
+    [PSM$K_CHAR_BS]:
+	IF .SCB[PSM$L_COLUMN] GTRU 1
+	THEN
+	    DECREMENT_ (SCB[PSM$L_COLUMN]);
+
+
+    ! Horizontal tab -- compute tab expansion and update column.  If we
+    ! are expanding tabs then convert to spaces, else allow as imbedded
+    ! format effector
+    !
+    [PSM$K_CHAR_HT]:
+	BEGIN
+	LOCAL SPACE_COUNT;
+	IF .COLUMNS_LEFT EQL 0
+	THEN
+	    RETURN FORMAT_LINE_OVERFLOW (.SCB, .CHAR);
+	SPACE_COUNT = 8 - ((.SCB[PSM$L_COLUMN] - 1) AND %B '111');
+
+	IF .SPACE_COUNT GTRU .COLUMNS_LEFT
+	THEN
+	    SPACE_COUNT = .COLUMNS_LEFT;
+
+	SCB[PSM$L_COLUMN] = .SCB[PSM$L_COLUMN] + .SPACE_COUNT;
+
+	IF .SCB[PSM$V_EXPAND_TABS]
+	THEN
+	    BEGIN
+	    SCB_ADDR_(OUTPUT_BUFFER) =
+		CH$FILL (%C ' ', .SPACE_COUNT, .SCB_ADDR_(OUTPUT_BUFFER));
+	    SCB_SIZE_(OUTPUT_BUFFER) = .SCB_SIZE_(OUTPUT_BUFFER) - .SPACE_COUNT;
+	    RETURN SS$_NORMAL;
+	    END;
+
+	END;
+
+
+    ! Line feed -- handle double spacing and page overflow
+    !
+    [PSM$K_CHAR_LF]:
+	BEGIN
+	IF .LINES_LEFT LEQ 0
+	OR (.PRINT_FLAG_ (DOUBLE_SPACE) AND .LINES_LEFT LEQ 1)
+	THEN
+	    IF .PRINT_FLAG_ (PAGINATE)
+	    THEN
+		RETURN FORMAT_CHARACTER (.SCB, PSM$K_CHAR_FF)
+	    ELSE
+		BEGIN
+		SCB[PSM$L_LINE] = 0;
+		SCB[PSM$L_COLUMN] = 0;
+		INCREMENT_ (SCB[PSM$L_PAGE]);
+		END
+	ELSE
+	    INCREMENT_ (SCB[PSM$L_LINE]);
+
+	IF .PRINT_FLAG_ (DOUBLE_SPACE)
+	THEN
+	    BEGIN
+	    WRITE_CHAR_ (.CHAR);
+	    INCREMENT_ (SCB[PSM$L_LINE]);
+	    END;
+
+	SCB[PSM$L_COLUMN] = 0;
+	END;
+
+
+    ! Vertical tab -- update line number and allow as imbedded format effector
+    !
+    [PSM$K_CHAR_VT]:
+	BEGIN
+	IF .LINES_LEFT LEQ 3
+	THEN
+	    IF .PRINT_FLAG_ (PAGINATE)
+	    THEN
+		RETURN FORMAT_CHARACTER (.SCB, PSM$K_CHAR_FF)
+	    ELSE
+		BEGIN
+		SCB[PSM$L_LINE] = 0;
+		INCREMENT_ (SCB[PSM$L_PAGE]);
+		SCB[PSM$L_COLUMN] = 0;
+		END;
+
+	SCB[PSM$L_LINE] = .SCB[PSM$L_LINE] + 4;
+	SCB[PSM$L_COLUMN] = 0;
+	END;
+
+
+    ! Form feed -- update page number, reset line and column, update
+    ! accounting.
+    !
+    [PSM$K_CHAR_FF]:
+	BEGIN
+	! Increment the internal page number and, unless searching,
+	! the accounting page number
+	!
+	INCREMENT_ (SCB[PSM$L_PAGE]);
+	IF NOT .SCB[PSM$V_SUPPRESS_OUTPUT]
+	THEN
+	    INCREMENT_ (ACC_DATA_ (PAGES_PRINTED));
+
+	! Reset the column number and update the line number
+	!
+	SCB[PSM$L_COLUMN] = 0;
+	SCB[PSM$L_LINE] = 0;
+
+	END;
+
+
+    ! Carriage return -- update column number
+    !
+    [PSM$K_CHAR_CR]:
+	IF .SCB[PSM$L_COLUMN] NEQ 0
+	THEN
+	    SCB[PSM$L_COLUMN] = 1;
+
+    TES;
+
+
+! Place the character in the output buffer
+!
+WRITE_CHAR_ (.CHAR);
+
+
+! Return success
+!
+SS$_NORMAL
+
+END;
+
+%SBTTL 'FORMAT_ESCAPE_SEQUENCE -- parse and process escape sequences'
+! Functional Description:
+!		This routine parses and processes standard ANSI escape
+!		sequences.  Escapes sequences are sent to printer in
+!		passall mode to avoid modification.  OSC (operating system
+!		commands) are watched for the special DEC private command
+!		that requests inclusion of a module sequence.
+!
+! Formal Parameters:
+!		SCB	: SCB address
+!
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		Data is copied from input to output buffer
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		none
+!--
+ROUTINE FORMAT_ESCAPE_SEQUENCE ( 
+	SCB	: REF $BBLOCK
+	) =
+BEGIN
+
+LITERAL
+	FIRST	= 0,		! First byte (escape)
+	SECOND	= 1,		! Second byte (APC, CSI, DCS, OSC, PM, or other)
+	CSI	= 2,		! Control String in progress
+	DCS	= 3,		! Device control string in progress
+	DCS_TRM	= 4,		! DCS String terminator in progress	(\)
+	ESC_SEQ	= 5,		! Ordinary escape sequence in progress
+	OSC_V	= 6,		! OSC System name first character	(V)
+	OSC_M	= 7,		! OSC System name second character	(M)
+	OSC_S	= 8,		! OSC System name third character	(S)
+	OSC_SC1	= 9,		! OSC System name terminator		(;)
+	OSC_1	= 10,		! OSC Command number			(1)
+	OSC_SC2	= 11,		! OSC Command number terminator		(;)
+	OSC_ML	= 12,		! Module List in progress
+	OSC_TRM	= 13,		! OSC String terminator in progress	(\)
+	PAS_MSG	= 14,		! Pass through message in progress
+	PAS_TRM	= 15		! Pass through terminator in progess	(\)
+	;
+
+LOCAL
+	CHAR
+	;
+
+WHILE .SCB_SIZE_ (INPUT_RECORD) NEQ 0
+DO
+    BEGIN
+
+    IF .SCB[PSM$L_LINE] EQL 0
+    THEN
+	RETURN FORMAT_NEW_PAGE (.SCB);
+
+    CHAR = READ_CHAR_ ;
+
+    CASE .SCB[PSM$B_ESCAPE_STATE] FROM 0 TO PAS_TRM OF
+	SET
+
+	[FIRST]:
+	    SCB[PSM$B_ESCAPE_STATE] = SECOND;
+
+	[SECOND]:
+	    SELECTONEU .CHAR OF
+		SET
+
+		[PSM$K_CHAR_CSI]:
+		    SCB[PSM$B_ESCAPE_STATE] = CSI;
+
+		[PSM$K_CHAR_DCS]:
+		    BEGIN
+		    SCB_SIZE_ (OUTPUT_BUFFER) = 1;
+		    SCB[PSM$B_ESCAPE_STATE] = DCS;
+		    END;
+
+		[PSM$K_CHAR_OSC]:
+		    BEGIN
+		    INCREMENT_ (SCB_SIZE_ (OUTPUT_BUFFER));
+		    DECREMENT_ (SCB_ADDR_ (OUTPUT_BUFFER));
+		    SCB[PSM$B_ESCAPE_STATE] = OSC_V;
+		    RETURN PSM$_BUFFEROVF;
+		    END;
+
+		[PSM$K_CHAR_APC, PSM$K_CHAR_PM]:
+		    SCB[PSM$B_ESCAPE_STATE] = PAS_MSG;
+
+		[OTHERWISE]:
+		    BEGIN
+		    SCB[PSM$B_ESCAPE_STATE] = ESC_SEQ;
+		    IF .CHAR GEQU %X '30'	! ANSI column/row 3/0 through
+		    AND .CHAR LEQU %X '7D'	! ANSI column/row 7/14 inclusive
+		    THEN
+			SCB[PSM$V_ESCAPE_IN_PROGRESS] = 0;
+		    END;
+
+		TES;
+
+	[CSI]:
+	    IF .CHAR GEQU %X '40'	! ANSI column/row 4/0 through
+	    AND .CHAR LEQU %X '7D'	! ANSI column/row 7/14 inclusive
+	    THEN
+		SCB[PSM$V_ESCAPE_IN_PROGRESS] = 0;
+
+	[DCS]:
+	    BEGIN
+	    $BBLOCK [.SCB[PSM$A_IOB],IOB_V_PASSALL] = 1;
+	    IF .CHAR EQL PSM$K_CHAR_ESC
+	    THEN
+		SCB[PSM$B_ESCAPE_STATE] = DCS_TRM;
+	    END;
+
+	[DCS_TRM]:
+
+	    IF .CHAR EQL PSM$K_CHAR_ST
+	    THEN
+		BEGIN
+		SCB_SIZE_ (OUTPUT_BUFFER) = 1;
+		SCB[PSM$V_ESCAPE_IN_PROGRESS] = 0;
+		END
+	    ELSE
+		SCB[PSM$B_ESCAPE_STATE] = DCS;
+
+	[ESC_SEQ]:
+	    IF .CHAR GEQU %X '30'	! ANSI column/row 3/0 through
+	    AND .CHAR LEQU %X '7D'	! ANSI column/row 7/14 inclusive
+	    THEN
+		SCB[PSM$V_ESCAPE_IN_PROGRESS] = 0;
+
+	[OSC_V]:
+	    BEGIN
+	    WRITE_CHAR_ (PSM$K_CHAR_ESC);
+	    WRITE_CHAR_ (PSM$K_CHAR_OSC);
+	    IF .CHAR EQL 'V'
+	    THEN
+		SCB[PSM$B_ESCAPE_STATE] = OSC_M
+	    ELSE
+		IF .CHAR EQL PSM$K_CHAR_ESC
+		THEN
+		    SCB[PSM$B_ESCAPE_STATE] = PAS_TRM
+		ELSE
+		    SCB[PSM$B_ESCAPE_STATE] = PAS_MSG;
+	    END;
+
+	[OSC_M]:
+	    IF .CHAR EQL 'M'
+	    THEN
+		SCB[PSM$B_ESCAPE_STATE] = OSC_S
+	    ELSE
+		IF .CHAR EQL PSM$K_CHAR_ESC
+		THEN
+		    SCB[PSM$B_ESCAPE_STATE] = PAS_TRM
+		ELSE
+		    SCB[PSM$B_ESCAPE_STATE] = PAS_MSG;
+
+	[OSC_S]:
+	    IF .CHAR EQL 'S'
+	    THEN
+		SCB[PSM$B_ESCAPE_STATE] = OSC_SC1
+	    ELSE
+		IF .CHAR EQL PSM$K_CHAR_ESC
+		THEN
+		    SCB[PSM$B_ESCAPE_STATE] = PAS_TRM
+		ELSE
+		    SCB[PSM$B_ESCAPE_STATE] = PAS_MSG;
+
+	[OSC_SC1]:
+	    IF .CHAR EQL ';'
+	    THEN
+		SCB[PSM$B_ESCAPE_STATE] = OSC_1
+	    ELSE
+		IF .CHAR EQL PSM$K_CHAR_ESC
+		THEN
+		    SCB[PSM$B_ESCAPE_STATE] = PAS_TRM
+		ELSE
+		    SCB[PSM$B_ESCAPE_STATE] = PAS_MSG;
+
+	[OSC_1]:
+	    IF .CHAR EQL '1'
+	    THEN
+		SCB[PSM$B_ESCAPE_STATE] = OSC_SC2
+	    ELSE
+		IF .CHAR EQL PSM$K_CHAR_ESC
+		THEN
+		    SCB[PSM$B_ESCAPE_STATE] = PAS_TRM
+		ELSE
+		    SCB[PSM$B_ESCAPE_STATE] = PAS_MSG;
+
+	[OSC_SC2]:
+	    IF .CHAR EQL ';'
+	    THEN
+		SCB[PSM$B_ESCAPE_STATE] = OSC_ML
+	    ELSE
+		IF .CHAR EQL PSM$K_CHAR_ESC
+		THEN
+		    SCB[PSM$B_ESCAPE_STATE] = PAS_TRM
+		ELSE
+		    SCB[PSM$B_ESCAPE_STATE] = PAS_MSG;
+
+	[OSC_ML]:
+	    BEGIN
+	    IF .SCB_SIZE_ (OUTPUT_BUFFER) LEQU 1
+	    THEN
+		BEGIN
+		PSM$STORE_ERRORS (.SCB,
+		    PSM$_OSCTOOLON, 1, .SCB[PSM$L_RECORD_NUMBER]);
+		RETURN PSM$_BUFFEROVF;
+		END;
+	    IF .CHAR EQL PSM$K_CHAR_ESC
+	    THEN
+		SCB[PSM$B_ESCAPE_STATE] = OSC_TRM;
+	    END;
+
+	[OSC_TRM]:
+	    IF .CHAR EQL PSM$K_CHAR_ST
+	    THEN
+		BEGIN
+		LOCAL	DESC : VECTOR [2], IOB : REF $BBLOCK;
+		IOB = .SCB[PSM$A_IOB];
+		DESC[0] = .SCB_ADDR_ (OUTPUT_BUFFER) -
+		    .DESC_ADDR_ (IOB[IOB_Q_BUFFER]) - S_VMS_OSC - 1;
+		DESC[1] = .DESC_ADDR_ (IOB[IOB_Q_BUFFER]) + S_VMS_OSC;
+		PSM$INCLUDE_MODULES (SCB, DESC);
+		SCB_SIZE_ (OUTPUT_BUFFER) = .DESC_SIZE_ (IOB[IOB_Q_BUFFER]);
+		SCB_ADDR_ (OUTPUT_BUFFER) = .DESC_ADDR_ (IOB[IOB_Q_BUFFER]);
+		SCB[PSM$V_ESCAPE_IN_PROGRESS] = 0;
+		RETURN PSM$_SUSPEND;
+		END
+	    ELSE
+		BEGIN
+		PSM$STORE_ERRORS (.SCB,
+		    PSM$_INVVMSOSC, 1, .SCB[PSM$L_RECORD_NUMBER]);
+		RETURN PSM$_BUFFEROVF;
+		END;
+
+	[PAS_MSG]:
+	    IF .CHAR EQL PSM$K_CHAR_ESC
+	    THEN
+		SCB[PSM$B_ESCAPE_STATE] = PAS_TRM;
+
+	[PAS_TRM]:
+	    IF .CHAR EQL PSM$K_CHAR_ST
+	    THEN
+		SCB[PSM$V_ESCAPE_IN_PROGRESS] = 0
+	    ELSE
+		SCB[PSM$B_ESCAPE_STATE] = PAS_MSG;
+
+	TES;
+
+    WRITE_CHAR_ (.CHAR);
+    IF .SCB_SIZE_ (OUTPUT_BUFFER) LEQU 0
+    THEN
+ 	RETURN PSM$_BUFFEROVF;
+
+    END;
+
+SS$_NORMAL
+
+END;
+
+%SBTTL 'FORMAT_FIRST_CHARACTER - format first character from an input service'
+! Functional Description:
+!		Processes the first character derived from each input service.
+!		If the character is a form feed and we are currently at line
+!		one column one, then it is discarded.
+!
+! Formal Parameters:
+!		SCB	: SCB address
+!
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		The first character may be discarded.
+!--
+ROUTINE FORMAT_FIRST_CHARACTER ( 
+	SCB	: REF $BBLOCK
+	)	=
+BEGIN
+
+
+! If not at line/column 1 then return
+!
+IF .SCB[PSM$L_COLUMN] GTRU 0
+OR .SCB[PSM$L_LINE] GTRU 1
+THEN
+    RETURN SS$_NORMAL;
+
+
+! Check the prefix carriage control for any data
+!
+IF .SCB[PSM$B_PREFIX_COUNT] GTRU 0
+THEN
+    BEGIN
+    IF .SCB[PSM$B_PREFIX_CHAR] EQL PSM$K_CHAR_FF
+    THEN
+	DECREMENT_ (SCB[PSM$B_PREFIX_COUNT]);
+    RETURN SS$_NORMAL;
+    END;
+
+
+! Check the data record for any data
+!
+IF .SCB_SIZE_ (INPUT_RECORD) GTRU 0
+THEN
+    BEGIN
+    LOCAL CHAR;
+    CHAR = CH$RCHAR (.SCB_ADDR_ (INPUT_RECORD));
+    IF .CHAR EQL PSM$K_CHAR_FF
+    THEN
+	READ_CHAR_ ;
+    RETURN SS$_NORMAL;
+    END;
+
+
+! Check the postfix carriage control for any data
+!
+IF .SCB[PSM$B_POSTFIX_COUNT] GTRU 0
+THEN
+    BEGIN
+    IF .SCB[PSM$B_POSTFIX_CHAR] EQL PSM$K_CHAR_FF
+    THEN
+	DECREMENT_ (SCB[PSM$B_POSTFIX_COUNT]);
+    RETURN SS$_NORMAL;
+    END;
+
+SS$_NORMAL
+
+END;
+
+%SBTTL 'FORMAT_LINE_NUMBER -- print line numbers'
+! Functional Description:
+!		This routine formats the line numbers for seqeuenced files.
+!
+! Formal Parameters:
+!		SCB	: SCB address
+!
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		The binary line number is converted to an ASCII string and
+!		placed in the output buffer.
+!
+! Returned Value:
+!		SS$_NORMAL
+!
+! Side Effects:
+!		none
+!--
+ROUTINE FORMAT_LINE_NUMBER ( 
+	SCB	: REF $BBLOCK
+	)	=
+BEGIN
+
+! If starting a new page then report that
+!
+IF .SCB[PSM$L_LINE] EQL 0
+THEN
+    RETURN FORMAT_NEW_PAGE (.SCB);
+
+
+! If column is zero we are starting a new line -- however new lines
+! currently receive no special processing
+!
+IF .SCB[PSM$L_COLUMN] EQL 0
+THEN
+    INCREMENT_ (SCB[PSM$L_COLUMN]);
+
+
+! Insure adequate room in the output buffer
+!
+IF .SCB_SIZE_ (OUTPUT_BUFFER) LSSU 8
+THEN
+    RETURN PSM$_BUFFEROVF;
+
+
+! Expand the line number to text
+!
+SIGNAL_IF_ERROR_ ($FAO (
+	$DESCRIPTOR ('!8<!5UW!>'),		! - format string
+	0,					! - don't return length
+	SCB[PSM$Q_OUTPUT_BUFFER],		! - outbuf desc
+	.SCB[PSM$L_RECORD_HEADER]));		! - sequence number
+
+
+! Update the output buffer descriptor and column number
+!
+SCB_SIZE_ (OUTPUT_BUFFER) = .SCB_SIZE_ (OUTPUT_BUFFER) - 8;
+SCB_ADDR_ (OUTPUT_BUFFER) = .SCB_ADDR_ (OUTPUT_BUFFER) + 8;
+SCB[PSM$L_COLUMN] = .SCB[PSM$L_COLUMN] + 8;
+
+SS$_NORMAL
+
+END;
+
+%SBTTL 'FORMAT_LINE_OVERFLOW - handle line overflow'
+! Functional Description:
+!		This routine is called when the right margin is exceeded.
+!		It truncates the line, wraps the line, or allows the overflow
+!		depending on the settings of /WRAP and /TRUNCATE as specified
+!		with DEFINE/FORM
+!
+! Formal Parameters:
+!		SCB	: SCB address
+!
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		none
+!--
+ROUTINE FORMAT_LINE_OVERFLOW  ( 
+	SCB	: REF $BBLOCK,
+	CHAR	: BYTE
+	)	=
+BEGIN
+
+! If we are wrapping then insert a <CR><LF> pair in the output buffer
+!
+IF .PRINT_FLAG_ (WRAP)
+THEN
+    BEGIN
+    FORMAT_CHARACTER (.SCB, PSM$K_CHAR_CR);
+    FORMAT_CHARACTER (.SCB, PSM$K_CHAR_LF);
+    RETURN (FORMAT_CHARACTER (.SCB, .CHAR));
+    END;
+
+! Else do nothing special -- truncate handled elsewhere
+
+SS$_NORMAL
+
+END;
+
+%SBTTL 'FORMAT_NEW_PAGE - handles the start of a new page'
+! Functional Description:
+!		This routine is called when an attempt to place data into
+!		a page never written to before is detected.  Top margins
+!		are handled by inserting <LF>'s as necessary.  An LP11
+!		controller problem with dropping line feeds that follow
+!		form feeds is also handled.
+!
+! Formal Parameters:
+!		SCB	: SCB address
+!
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		none
+!--
+ROUTINE FORMAT_NEW_PAGE ( 
+	SCB	: REF $BBLOCK
+	)	=
+BEGIN
+
+! Assure adeqate room for the top margin sequence
+!
+IF .SCB_SIZE_ (OUTPUT_BUFFER) LSSU .SCB[PSM$L_T_MARGIN] + 5
+THEN
+    RETURN PSM$_BUFFEROVF;
+
+
+! Output a space, carriage return sequence to workaround
+! LP111 controller bug that drops line feeds that follow
+! form feeds too quickly
+!
+IF .SCB[PSM$L_T_MARGIN] NEQU 0
+THEN
+    BEGIN
+    WRITE_CHAR_ (%C ' ');
+    WRITE_CHAR_ (PSM$K_CHAR_CR);
+    END;
+
+
+! Place TOP_MARGIN line feeds in output buffer
+!
+SCB_ADDR_(OUTPUT_BUFFER) = CH$FILL (PSM$K_CHAR_LF,
+	.SCB[PSM$L_T_MARGIN], .SCB_ADDR_(OUTPUT_BUFFER));
+SCB_SIZE_(OUTPUT_BUFFER) =
+	.SCB_SIZE_(OUTPUT_BUFFER) - .SCB[PSM$L_T_MARGIN];
+
+
+! Set the current line to top margin plus 1
+!
+SCB[PSM$L_LINE] = .SCB[PSM$L_T_MARGIN] + 1;
+
+
+! Return new page status to trigger page headers
+!
+PSM$_NEWPAGE
+
+END;
+
+END
+ELUDOM

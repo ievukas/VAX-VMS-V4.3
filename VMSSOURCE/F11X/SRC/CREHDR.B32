@@ -1,0 +1,962 @@
+MODULE CREHDR (
+		LANGUAGE (BLISS32),
+		IDENT = 'V04-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 2
+!
+! ABSTRACT:
+!
+!	This routine creates a new file ID by allocating a file number from the
+!	index file bitmap. It returns an empty file header, verified for use.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  28-Mar-1977  13:49
+!
+! MODIFIED BY:
+!
+!	V03-022	CDS0017		Christian D. Saether	20-Aug-1984
+!		Force fcb for indexf to be stale always before
+!		attempting to map vbns.
+!
+!	V03-021	CDS0016		Christian D. Saether	13-Aug-1984
+!		Back off an extra dot in ACG0438.
+!
+!	V03-020	ACG0438		Andrew C. Goldstein,	1-Aug-1984  11:55
+!		Add cache interlock logic on FID cache; use central
+!		dequeue routine.
+!
+!	V03-019	LMP0278		L. Mark Pilant,		12-Jul-1984  10:58
+!		Fix a bug that caused the EXBYTLM error if it was necessary
+!		to turn the index file window.
+!
+!	V03-018	CDS0015		Christian D. Saether	17-Apr-1984
+!		Have MAP_IDX check to see whether curr_lckindx is
+!		for the index file to avoid releasing it if so.
+!
+!	V03-017	CDS0014		Christian D. Saether	11-Apr-1984
+!		Release allocation lock prior to serializing on
+!		new primary header.  This eliminates potential
+!		deadlocks when the new primary header is a valid
+!		header that someone else is messing with.
+!
+!	V03-016	CDS0013		Christian D. Saether	 1-Apr-1984
+!		ACG0409 forgot to rewrite indexf bitmap buffer.  No joke.
+!
+!	V03-015	ACG0409		Andrew C. Goldstein,	21-Mar-1984  19:40
+!		Redesign file ID cacheing algorithm so that file ID's
+!		beyond the index file EOF are not cached. Eliminate
+!		BASH_HEADERS routine; general code cleanup to remove
+!		kernel calls. CHECK_HEADER2 no longer writes USER_STATUS.
+!
+!	V03-014	ACG0404		Andrew C. Goldstein,	15-Mar-1984  17:37
+!		Correct releasing of file sync lock when retrying for a header
+!
+!	V03-013	CDS0012		Christian D. Saether	23-Feb-1984
+!		Eliminate references to FLUSH_LOCK_BASIS.
+!
+!	V03-012	CDS0011		Christian D. Saether	27-Dec-1983
+!		Use BIND_COMMON macro.
+!
+!	V03-011	CDS0010		Christian D. Saether	12-Dec-1983
+!		Start of XQP code is at symbol INITXQP now.
+!
+!	V03-010	CDS0009		Christian D. Saether	 5-Oct-1983
+!		Fix bug restoring privileges to the PCB.
+!
+!	V03-009	CDS0008		Christian D. Saether	 3-Oct-1983
+!		Save/restore CURR_LCKINDX where necessary rather
+!		than PRIM_LCKINDX.
+!
+!	V03-008	CDS0007		Christian D. Saether	13-Sep-1983
+!		Modify interface to allocation serialization.
+!
+!	V03-007	CDS0006		Christian D. Saether	12-May-1983
+!		Serialize header creation.
+!
+!	V03-006	CDS0005		Christian D. Saether	 1-Mar-1983
+!		Need BYPASS privilege also.
+!
+!	V03-005	CDS0004		Christian D. Saether	20-Feb-1983
+!		Call MAP_VBN before checking FILESIZE so that
+!		header is checked before deciding to extend
+!		index file.
+!		Also make READ_IDX_HEADER insensitive to headers that
+!		map more than the FCB knows about.
+!		Totally punt figuring out what to do with EFBLK
+!		for the index file.
+!
+!	V03-004	CDS0003		Christian D. Saether	13-Jan-1983
+!		Separately save and restore PHD privs.
+!
+!	V03-003	CDS0002		Christian D. Saether	28-Dec-1982
+!		Give priv around QIO.
+!
+!	V03-002	CDS0001		C Saether		 3-Aug-1982
+!		Change QIOW to QIO with completion AST.
+!
+!	V03-001	ACG0273		Andrew C. Goldstein,	23-Mar-1982  10:50
+!		Use random file sequence number if old header is junk,
+!		use alternate index file header if primary is suspect
+!
+!	V02-007	ACG0229		Andrew C. Goldstein,	23-Dec-1981  21:53
+!		Count file ID cache hits and misses
+!
+!	V02-006	ACG0167		Andrew C. Goldstein,	16-Apr-1980  19:25
+!		Previous revision history moved to F11B.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+
+FORWARD ROUTINE
+	CREATE_HEADER	: L_NORM,	! create file ID and header
+	FILL_FID_CACHE	: L_NORM NOVALUE, ! load file ID cache from bitmap
+	INIT_FID_CACHE	: L_NORM NOVALUE, ! initialize file ID cache lock
+	READ_NEW_HEADER	: L_NORM,	! read new file header block
+	HANDLER,			! local condition handler
+	READ_IDX_HEADER	: L_NORM,	! read index file header
+	MAP_IDX		: L_NORM;	! map vbn for index file.
+
+GLOBAL ROUTINE CREATE_HEADER (FILE_ID) : L_NORM =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine creates a new file ID by searching the volume's index
+!	file bitmap for the first free file number. It also checks that a
+!	header for the file number is present in the index file. It reads
+!	the old header and establishes the file sequence number for the
+!	new one.
+!
+! CALLING SEQUENCE:
+!	CREATE_HEADER (ARG1)
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: address of volume's VCB
+!
+! OUTPUT PARAMETERS:
+!	ARG1: address to store file ID of created header
+!
+! IMPLICIT OUTPUTS:
+!	NEW_FID: file number of header created
+!	NEW_FID_RVN: RVN of above
+!
+! ROUTINE VALUE:
+!	address of buffer containing new header
+!
+! SIDE EFFECTS:
+!	VCB and index file bitmap altered, header block read
+!
+!--
+
+BEGIN
+
+MAP
+	FILE_ID		: REF BBLOCK;	! new file ID of header
+
+LABEL
+	GET_FILE_NUM;			! acquire a file number
+
+LOCAL
+	CACHE_FLUSHED,			! flag indicating cluster caches flushed
+	NEW_LCKINDX	: INITIAL (0),
+	TEMP,				! temp storage for current lock index
+	VCB		: REF BBLOCK,	! local copy of VCB address
+	FID_CACHE	: REF BBLOCK,	! pointer to file ID cache
+	VBN,				! relative block number in bitmap
+	BUFFER		: REF BITVECTOR, ! address of index file bitmap buffer
+	ADDRESS		: REF BITVECTOR, ! address of byte in buffer
+	CURRENT_EOF,			! current EOF of index file
+	COUNT,				! number of index blocks to bash
+	FILE_NUMBER,			! file number allocated
+	IDX_FCB		: REF BBLOCK,	! FCB of index file
+	LBN,				! LBN of new file header
+	HEADER		: REF BBLOCK,	! address of header buffer
+	STATUS;				! value of CHECK_HEADER call
+
+EXTERNAL
+	PMS$GL_FIDHIT	: ADDRESSING_MODE (GENERAL),
+					! count of file ID cache hits
+	PMS$GL_FIDMISS	: ADDRESSING_MODE (GENERAL),
+					! count of file ID cache misses
+	EXE$GQ_SYSTIME	: ADDRESSING_MODE (GENERAL);
+					! system time of day
+BIND_COMMON;
+
+EXTERNAL ROUTINE
+	ALLOCATION_LOCK	: L_NORM NOVALUE, ! interlock allocation
+	ALLOCATION_UNLOCK : L_NORM NOVALUE, ! release allocation lock.
+	SERIAL_FILE	: L_NORM,	! serialize file processing
+	RELEASE_SERIAL_LOCK : L_NORM NOVALUE, ! release processing lock
+	DEQ_LOCK	: L_NORM,	! dequeue a lock
+	READ_BLOCK	: L_NORM,	! read block from disk
+	WRITE_BLOCK	: L_NORM,	! write block to disk
+	DELETE_FID	: L_NORM,	! flush file ID cache and release lock
+	RELEASE_LOCKBASIS : L_NORM,	! release buffers under specified lock
+	CACHE_LOCK	: L_NORM,	! acquire cache sync lock
+	EXTEND_INDEX	: L_NORM,	! extend the index file
+	ERASE_BLOCKS	: L_NORM,	! erase blocks on disk
+	CHECKSUM	: L_NORM,	! compute file header checksum
+	WRITE_HEADER	: L_NORM,	! write current file header
+	RESET_LBN	: L_NORM,	! change backing LBN of buffer
+	INVALIDATE	: L_NORM,	! invalidate a buffer
+	CREATE_BLOCK	: L_NORM,	! materialize a block buffer
+	CHECK_HEADER2	: L_NORM,	! verify file header
+	MARK_DIRTY	: L_NORM;	! mark buffer for write-back
+
+! Serialize further file header creation processing.
+!
+
+ALLOCATION_LOCK ();
+
+! The outer loop performs retries if blocks in the index file are bad or
+! are valid file headers. A block containing a valid file header is never
+! used to create a new file; it is simply left marked in use for recovery.
+! Bad header blocks are simply left marked in use in the index file bitmap;
+! they will show up in a verify but are otherwise harmless.
+!
+
+VCB = .CURRENT_VCB;
+FID_CACHE = .BBLOCK [.VCB[VCB$L_CACHE], VCA$L_FIDCACHE];
+CACHE_FLUSHED = 0;
+WHILE 1 DO
+    GET_FILE_NUM: BEGIN
+
+! See if a file number is available in the file number cache. If not,
+! we scan the index file bitmap for the first free (zero) bit. This is done
+! by starting with the block recorded in the VCB and looking at each block
+! with a character scan.
+!
+
+    IF .FID_CACHE[VCA$W_FIDCOUNT] EQL 0
+    THEN
+	BEGIN
+	PMS$GL_FIDMISS = .PMS$GL_FIDMISS + 1;
+	VBN = .VCB[VCB$B_IBMAPVBN];
+
+	IF NOT
+	    BEGIN
+	    UNTIL .VBN GEQ .VCB[VCB$B_IBMAPSIZE] DO
+		BEGIN
+		BUFFER = READ_BLOCK (.VBN + .VCB[VCB$L_IBMAPLBN], 1, INDEX_TYPE);
+		IF NOT CH$FAIL (ADDRESS = CH$FIND_NOT_CH (512, .BUFFER, 255))
+		THEN EXITLOOP 0;
+		VBN = .VBN + 1;
+		END
+	    END
+
+! Having found a bitmap block with free files in it, attempt to fill the
+! file ID cache. If it refuses to fill, it's because we're at the index
+! file EOF. 
+!
+
+	THEN FILL_FID_CACHE (.VCB, .BUFFER, .VBN);
+	IF .FID_CACHE[VCA$W_FIDCOUNT] EQL 0
+	THEN
+	    BEGIN
+
+! If the index file EOF coincides with the physical end of file, we have to
+! extend the index file. Otherwise, we just have to push the EOF. Before
+! extending the index file, if we are in a cluster, ask for a cluster-wide
+! flush of the file ID caches.
+!
+
+	    IDX_FCB = .VCB[VCB$L_FCBFL];
+	    CURRENT_EOF = .IDX_FCB[FCB$L_EFBLK];
+	    IF .CURRENT_EOF GEQU .IDX_FCB[FCB$L_FILESIZE]
+	    THEN
+		BEGIN
+		IF NOT .BBLOCK [CURRENT_UCB[UCB$L_DEVCHAR2], DEV$V_CLU]
+		AND NOT .CACHE_FLUSHED
+		THEN
+		    BEGIN
+		    LOCAL IDX_FILE_ID, LOCK_ID;
+		    DELETE_FID (0);
+		    RELEASE_LOCKBASIS (-1);
+		    ALLOCATION_UNLOCK ();
+		    IDX_FILE_ID = FID$C_INDEXF OR .CURRENT_VCB[VCB$W_RVN] ^ 24;
+		    LOCK_ID = 0;
+		    CACHE_LOCK (.IDX_FILE_ID, LOCK_ID, 1);
+		    ALLOCATION_LOCK ();
+		    DEQ_LOCK (.LOCK_ID);
+		    CACHE_FLUSHED = -1;
+		    LEAVE GET_FILE_NUM;
+		    END
+		ELSE
+		    EXTEND_INDEX ();
+		END
+
+! Move the EOF and zero the intervening blocks. Note that this version
+! of the file system always sets the index file EOF to be physical end
+! of file, because the index file is zeroed on extend. This code is
+! present for compatibility with past and future file systems that may
+! not zero the index file on extend. Serialize activity on the index
+! file header.
+!
+
+	    ELSE
+		BEGIN
+		TEMP = .CURR_LCKINDX;
+		SERIAL_FILE (IDX_FCB [FCB$W_FID]);
+
+		LBN = MAP_IDX (.CURRENT_EOF+1, COUNT);
+		ERASE_BLOCKS (.LBN, .COUNT, .IO_CHANNEL);
+		CURRENT_EOF = .CURRENT_EOF + .COUNT;
+
+		HEADER = READ_IDX_HEADER ();
+		BBLOCK [HEADER[FH2$W_RECATTR], FAT$L_EFBLK] = ROT (.CURRENT_EOF+1, 16);
+		BBLOCK [HEADER[FH2$W_RECATTR], FAT$W_FFBYTE] = 0;
+		IF .HEADER [FH2$B_IDOFFSET] GEQU ($BYTEOFFSET (FH2$L_HIGHWATER)+4)/2
+		THEN HEADER [FH2$L_HIGHWATER] = .CURRENT_EOF + 1;
+
+		CHECKSUM (.HEADER);
+		WRITE_HEADER ();
+		IDX_FCB[FCB$L_EFBLK] = .CURRENT_EOF;
+		RESET_LBN (.HEADER, .VCB[VCB$L_IXHDR2LBN]);
+		WRITE_BLOCK (.HEADER);
+		INVALIDATE (.HEADER);
+
+		RELEASE_SERIAL_LOCK (.CURR_LCKINDX);
+		CURR_LCKINDX = .TEMP;
+		END;
+
+! Go around the loop to try to allocate a file number again.
+!
+
+	    LEAVE GET_FILE_NUM;
+	    END
+	ELSE
+
+! We successfully filled the file ID cache from the bitmap.  Write back
+! the index file bitmap buffer.
+!
+
+	    WRITE_BLOCK (.BUFFER);
+
+	END
+
+! If the file ID cache had entries in it, all we have to do is check one out.
+!
+
+    ELSE
+	PMS$GL_FIDHIT = .PMS$GL_FIDHIT + 1;
+
+    FILE_NUMBER = .FID_CACHE[VCA$L_FIDLIST];
+    FID_CACHE[VCA$W_FIDCOUNT] = .FID_CACHE[VCA$W_FIDCOUNT] - 1;
+    CH$MOVE (.FID_CACHE[VCA$W_FIDCOUNT]*4,
+	      FID_CACHE[VCA$L_FIDLIST]+4,
+	      FID_CACHE[VCA$L_FIDLIST]);
+
+    NEW_FID = .FILE_NUMBER;
+    NEW_FID_RVN = .CURRENT_RVN;		! record for cleanup
+
+! Map the file header. If it fails to map, we have screwed up badly.
+!
+
+    VBN = .FILE_NUMBER + .VCB[VCB$B_IBMAPSIZE] + .VCB[VCB$W_CLUSTER]*4;
+    LBN = MAP_IDX (.VBN);
+    IF .LBN EQL -1 THEN BUG_CHECK (HDRNOTMAP, FATAL, 'Allocated file header not mapped');
+
+    FILE_ID[FID$W_NUM] = .FILE_NUMBER<0,16>;
+    FILE_ID[FID$B_NMX] = .FILE_NUMBER<16,8>;
+    FILE_ID[FID$B_RVN] = .CURRENT_RVN;
+
+! If this is the creation of a new primary header, PRIM_LCKINDX will
+! be zero.  In that case, serialize further processing on that header.
+! If extension headers are being allocated, the primary lock index has
+! already been established.
+!
+
+    IF .PRIM_LCKINDX EQL 0
+    THEN
+	BEGIN
+
+! Release the allocation lock prior to serializing on this file id.
+! This could be a valid header that another process is trying to modify
+! allocation on, and if so, we would deadlock if the allocation lock
+! were not released now.
+!
+
+	ALLOCATION_UNLOCK ();
+	PRIM_LCKINDX = SERIAL_FILE (.FILE_ID);
+	NEW_LCKINDX = 1;
+	END;
+
+! Read the header; then check the block read for resemblence to a file header.
+!
+
+    HEADER = READ_NEW_HEADER (.LBN);
+
+    IF .HEADER NEQ 0
+    THEN
+	BEGIN
+	FILE_ID[FID$W_SEQ] = .HEADER[FH2$W_FID_SEQ];
+	STATUS = CHECK_HEADER2 (.HEADER, .FILE_ID);
+
+! Make the final checks that the block is acceptable as a file header. We do
+! not use valid file headers. Also, we skip file numbers with the low 16 bits
+! all zero to avoid confusing the old FCS-11. Also skip file numbers in the
+! reserved file number range to avoid total confusion if the volume is damaged.
+!
+
+	IF .FILE_ID[FID$W_NUM] EQL 0
+	THEN
+	    WRITE_BLOCK (.HEADER)
+	ELSE
+	    IF NOT .STATUS
+	    AND NOT (.FILE_ID[FID$B_NMX] EQL 0
+		     AND .FILE_ID[FID$W_NUM] LEQU .CURRENT_VCB[VCB$B_RESFILES])
+	    THEN EXITLOOP;
+	END;
+
+! If we got this far, i.e., did not exit the loop, we do not want to use
+! this file header for some reason.  Before going around another time,
+! release the serialization lock if we got one in this routine, and then
+! reacquire the allocation lock for another pass around the loop.
+!
+
+    IF .NEW_LCKINDX
+    THEN
+	BEGIN
+	IF .HEADER NEQ 0
+	THEN INVALIDATE (.HEADER);
+	RELEASE_SERIAL_LOCK (.PRIM_LCKINDX);
+	PRIM_LCKINDX = 0;
+	ALLOCATION_LOCK ();
+	END;
+
+    END;				! end of file number allocation loop
+
+HEADER_LBN = .LBN;			! record LBN of new header
+
+IF .STATUS EQL 0
+AND .(.HEADER)<0,32> NEQ 0
+THEN FILE_ID[FID$W_SEQ] = .EXE$GQ_SYSTIME<16,16>;
+FILE_ID[FID$W_SEQ] = .FILE_ID[FID$W_SEQ] + 1;
+CH$MOVE (FID$C_LENGTH, .FILE_ID, HEADER[FH2$W_FID]);
+HEADER[FH2$B_FID_RVN] = 0;
+
+MARK_DIRTY (.HEADER);
+.HEADER
+
+END;					! end of routine CREATE_HEADER
+
+ROUTINE FILL_FID_CACHE (VCB, BUFFER, VBN) : L_NORM NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine refills the cache from the supplied bitmap buffer.
+!	It will not fill the cache with file ID's that represent
+!	headers past the current index file EOF.
+!
+!
+! CALLING SEQUENCE:
+!	FILL_FID_CACHE (ARG1, ARG2, ARG3)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of volume VCB
+!	ARG2: address of bitmap buffer
+!	ARG3: relative block number in bitmap
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	file ID cache modified
+!
+!--
+
+BEGIN
+
+MAP
+	VCB		: REF BBLOCK,	! local copy of VCB address
+	BUFFER		: REF BITVECTOR; ! address of index file bitmap buffer
+
+LOCAL
+	CACHE		: REF BBLOCK,	! pointer to cache block
+	FID_CACHE	: REF BBLOCK,	! pointer to file ID cache
+	ADDRESS		: REF BITVECTOR, ! address of byte in buffer
+	FREE_COUNT,			! count of cache entries to fill
+	BITPOS,				! bit positon of free bit within byte
+	BITPOS2,			! bit positon of first used bit
+	FILE_NUMBER,			! file number found
+	IDX_VBN;			! current block in index bitmap
+
+BIND_COMMON;
+
+
+! If the cache is not currently marked valid, attempt to take out the
+! cache lock if we are in a cluster and may do so.
+!
+
+CACHE = .VCB[VCB$L_CACHE];
+FID_CACHE = .CACHE[VCA$L_FIDCACHE];
+IF NOT .CACHE[VCA$V_FIDC_VALID]
+THEN INIT_FID_CACHE (.CACHE);
+
+! Fill the cache from the supplied bitmap buffer. Find each byte containing
+! a free bit, and then find the free bit.
+!
+
+ADDRESS = .BUFFER;
+FREE_COUNT = .FID_CACHE[VCA$W_FIDSIZE]/2 - .FID_CACHE[VCA$W_FIDCOUNT] + 1;
+
+WHILE 1 DO
+    BEGIN
+    IF CH$FAIL (ADDRESS = CH$FIND_NOT_CH (.BUFFER+512-.ADDRESS, .ADDRESS, 255))
+    THEN EXITLOOP;
+    FFC (%REF (0), %REF (8), .ADDRESS, BITPOS);
+    FILE_NUMBER = .VBN*4096 + (.ADDRESS-.BUFFER)*8 + .BITPOS + 1;
+
+! Check file number against index file EOF and the maximum file limit.
+!
+
+    IF .FILE_NUMBER + .VCB[VCB$B_IBMAPSIZE] + .VCB[VCB$W_CLUSTER]*4
+	GTRU .BBLOCK [.VCB[VCB$L_FCBFL], FCB$L_EFBLK]
+    OR .FILE_NUMBER GTRU .VCB[VCB$L_MAXFILES]
+    THEN EXITLOOP;
+
+! Enter the file number in the cache and mark it busy in the bitmap.
+! Exit the loop if the cache is now full enough.
+!
+
+    ADDRESS[.BITPOS] = 1;
+    FID_CACHE[VCA$W_FIDCOUNT] = .FID_CACHE[VCA$W_FIDCOUNT] + 1;
+    VECTOR [FID_CACHE[VCA$L_FIDLIST], .FID_CACHE[VCA$W_FIDCOUNT]-1] = .FILE_NUMBER;
+    FREE_COUNT = .FREE_COUNT - 1;
+    IF .FREE_COUNT LEQ 0
+    OR NOT .CACHE[VCA$V_FIDC_VALID]
+    THEN EXITLOOP;
+    END;				! end of bitmap processing loop
+
+IDX_VBN = .VBN;				! update current VBN of index file bitmap
+IF .FILE_NUMBER<0,12> EQL 0
+THEN IDX_VBN = .IDX_VBN + 1;
+VCB[VCB$B_IBMAPVBN] = .IDX_VBN;
+
+END;					! end of routine FILL_FID_CACHE
+
+GLOBAL ROUTINE INIT_FID_CACHE (CACHE) : L_NORM NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine refills the cache from the supplied bitmap buffer.
+!	It will not fill the cache with file ID's that represent
+!	headers past the current index file EOF.
+!
+!
+! CALLING SEQUENCE:
+!	INIT_FID_CACHE (CACHE)
+!
+! INPUT PARAMETERS:
+!	CACHE: pointer to main cache block
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	cache marked valid, lock taken out
+!
+!--
+
+BEGIN
+
+MAP
+	CACHE		: REF BBLOCK;	! pointer to cache block
+
+LOCAL
+	FID_CACHE	: REF BBLOCK,	! pointer to file ID cache
+	INDEX_FID;			! lock basis for index file
+
+BIND_COMMON;
+
+EXTERNAL ROUTINE
+	CACHE_LOCK	: L_NORM;	! acquire special cache lock
+
+
+! If the cache is not currently marked valid, attempt to take out the
+! cache lock if we are in a cluster and may do so.
+!
+
+FID_CACHE = .CACHE[VCA$L_FIDCACHE];
+IF NOT .BBLOCK [CURRENT_UCB[UCB$L_DEVCHAR], DEV$V_DMT]
+AND NOT .CURRENT_VCB[VCB$V_WRITE_IF]
+AND .FID_CACHE[VCA$W_FIDSIZE] GTRU 1
+THEN
+    BEGIN
+    IF .BBLOCK [CURRENT_UCB[UCB$L_DEVCHAR2], DEV$V_CLU]
+    THEN
+	BEGIN
+	INDEX_FID = FID$C_INDEXF OR .CURRENT_VCB[VCB$W_RVN] ^ 24;
+	IF CACHE_LOCK (.INDEX_FID, FID_CACHE[VCA$L_FIDCLKID], 0)
+	THEN CACHE[VCA$V_FIDC_VALID] = 1;
+	END
+    ELSE
+	CACHE[VCA$V_FIDC_VALID] = 1;
+    END;
+
+END;					! end of routine INIT_FID_CACHE
+
+ROUTINE READ_NEW_HEADER (LBN) : L_NORM =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine reads the block about to be used for a new file header.
+!	It uses a local condition handler to fix up errors.
+!
+!
+! CALLING SEQUENCE:
+!	READ_NEW_HEADER (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: LBN of block to read
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	address of buffer containing block or 0 if bad
+!
+! SIDE EFFECTS:
+!	block read and/or written
+!
+!--
+
+BEGIN
+
+LOCAL
+	HEADER		: REF BBLOCK;	! address of block read
+
+BASE_REGISTER;
+
+EXTERNAL ROUTINE
+	READ_BLOCK	: L_NORM,	! read a block
+	WRITE_BLOCK	: L_NORM,	! write a block
+	INVALIDATE	: L_NORM,	! invalidate a buffer
+	CREATE_BLOCK	: L_NORM;	! create a new block buffer
+
+! Under control of the condition handler, we read the block. If the read
+! fails, we attempt to rewrite the block and then read it again. If either
+! of the latter fails, we return failure.
+!
+
+ENABLE HANDLER;
+
+HEADER = READ_BLOCK (.LBN, 1, HEADER_TYPE);
+
+IF .HEADER EQL 0
+THEN
+    BEGIN
+    HEADER = CREATE_BLOCK (.LBN, 1, HEADER_TYPE);
+    (.HEADER)<0,32> = 1;
+    WRITE_BLOCK (.HEADER);
+    INVALIDATE (.HEADER);
+    HEADER = READ_BLOCK (.LBN, 1, HEADER_TYPE);
+    END;
+
+RETURN .HEADER;
+
+END;					! end of routine READ_NEW_HEADER
+
+ROUTINE HANDLER (SIGNAL, MECHANISM) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is the condition handler for the initial header read.
+!	On surface errors, it unwinds and causes a return of 0 to the caller
+!	of the I/O routine to indicate error. Hard drive errors cause the
+!	usual error exit.
+!
+! CALLING SEQUENCE:
+!	HANDLER (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of signal array
+!	ARG2: address of mechanism array
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	SS$_RESIGNAL or none if unwind
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+
+BEGIN
+
+MAP
+	SIGNAL		: REF BBLOCK,	! signal arg array
+	MECHANISM	: REF BBLOCK;	! mechanism arg array
+
+
+! If the condition is change mode to user (error exit) and the status is
+! read error, zero the return R0 and unwind to the the establisher. On
+! most write errors, zero the return R0 and unwind to the caller.
+! Otherwise, just resignal the condition.
+!
+
+IF .SIGNAL[CHF$L_SIG_NAME] EQL SS$_CMODUSER
+THEN
+    BEGIN
+    MECHANISM[CHF$L_MCH_SAVR0] = 0;
+
+    IF SURFACE_ERROR (.SIGNAL[CHF$L_SIG_ARG1])
+    THEN
+	$UNWIND (DEPADR = MECHANISM[CHF$L_MCH_DEPTH])
+    END;
+
+RETURN SS$_RESIGNAL;			! status is irrelevant if unwinding
+
+END;					! end of routine HANDLER
+
+GLOBAL ROUTINE READ_IDX_HEADER : L_NORM =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine reads the volume's index file header, using the
+!	alternate if it seems appropriate.
+!
+! CALLING SEQUENCE:
+!	READ_IDX_HEADER ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: VCB of volume
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	address of file header read
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+
+LOCAL
+	HEADER		: REF BBLOCK,	! address of header read
+	FCB		: REF BBLOCK;	! address of index file FCB
+
+BIND_COMMON;
+
+EXTERNAL ROUTINE
+	FILE_SIZE	: L_NORM,	! compute file header file size
+	READ_HEADER	: L_NORM,	! read file header
+	READ_BLOCK	: L_NORM,	! read a disk block
+	CHECK_HEADER2	: L_NORM,	! validate file header
+	RESET_LBN	: L_NORM,	! reassign LBN of buffer
+	INVALIDATE	: L_NORM;	! invalidate buffer
+
+
+! Read the index file header. Check the file size against the
+! file size in the FCB. A mismatch indicates a failure in writing the
+! header the last time; if this occurs, try the alternate header instead.
+!
+
+SAVE_STATUS = .USER_STATUS;
+
+FCB = .CURRENT_VCB[VCB$L_FCBFL];
+HEADER = READ_HEADER (0, .FCB);
+IF FILE_SIZE (.HEADER) LSSU .FCB[FCB$L_FILESIZE]
+THEN
+    BEGIN
+    FILE_HEADER = 0;
+    INVALIDATE (.HEADER);
+    HEADER = READ_BLOCK (.CURRENT_VCB[VCB$L_IXHDR2LBN], 1, HEADER_TYPE);
+    IF NOT CHECK_HEADER2 (.HEADER, UPLIT WORD (FID$C_INDEXF, FID$C_INDEXF, 0))
+    THEN
+	BEGIN
+	INVALIDATE (.HEADER);
+	ERR_EXIT (0);
+	END;
+    IF FILE_SIZE (.HEADER) LSSU .FCB[FCB$L_FILESIZE]
+    THEN ERR_EXIT (SS$_BADFILEHDR);
+    FILE_HEADER = .HEADER;
+    RESET_LBN (.HEADER, .FCB[FCB$L_HDLBN]);
+    END;
+
+USER_STATUS = .SAVE_STATUS;
+
+.HEADER
+END;					! end of routine READ_IDX_HEADER
+
+
+GLOBAL ROUTINE MAP_IDX (VBN, COUNT) : L_NORM =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine maps a virtual block in the index file.
+!
+! CALLING SEQUENCE:
+!	MAP_IDX (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: VBN of block to map
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	COUNT: (optional) address to store count of contiguous blocks
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	LBN of blocks mapped or -1 if failure
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+EXTERNAL ROUTINE
+	MAP_VBN		: L_NORM,	! map VBN and turn window if necessary
+	MAP_WINDOW	: L_NORM,	! map VBN with current window
+	RELEASE_SERIAL_LOCK : L_NORM,	! release sync lock on file
+	SERIAL_FILE	: L_NORM;	! get sync lock on file
+
+LOCAL
+	INCOMPLETE_FLAG,		! Saved state of CLF_INCOMPLETE
+	IDX_FCB		: REF BBLOCK,	! address of index file FCB
+	LBN,				! resulting LBN from map
+	UNMAPPED,			! received count of unmapped blocks
+	TEMP;				! dummy to store resulting UCB
+
+BIND_COMMON;
+
+! Try to map with the existing window first. This can be done without
+! taking out the sync lock on the index file.
+!
+
+IDX_FCB = .CURRENT_VCB [VCB$L_FCBFL];
+
+IF (LBN = MAP_WINDOW (.VBN, .IDX_FCB [FCB$L_WLFL], 1000, UNMAPPED, TEMP))
+    EQL -1
+THEN
+    BEGIN
+    TEMP = .CURR_LCKINDX;
+    SERIAL_FILE (IDX_FCB [FCB$W_FID]);
+    INCOMPLETE_FLAG = .CLEANUP_FLAGS[CLF_INCOMPLETE];	! Save current state
+    IDX_FCB [FCB$V_STALE] = 1;
+    LBN = MAP_VBN (.VBN, .IDX_FCB [FCB$L_WLFL], 1000, UNMAPPED);
+    CLEANUP_FLAGS[CLF_INCOMPLETE] = .INCOMPLETE_FLAG;	! Restore saved state
+
+    IF .TEMP NEQ .CURR_LCKINDX
+    THEN
+	BEGIN
+	RELEASE_SERIAL_LOCK (.CURR_LCKINDX);
+	CURR_LCKINDX = .TEMP;
+	END;
+
+    END;
+
+! Return the block count if asked for.
+!
+
+IF ACTUALCOUNT GEQU 2
+THEN .COUNT = 1000 - .UNMAPPED;
+.LBN
+
+END;					! of routine MAP_IDX
+
+END
+ELUDOM

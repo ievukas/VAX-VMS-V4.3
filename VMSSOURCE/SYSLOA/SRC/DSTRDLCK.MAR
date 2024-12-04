@@ -1,0 +1,1433 @@
+	.TITLE	DSTRDLCK - DISTRIBUTED DEADLOCK DETECTION AND RESOLUTION
+	.IDENT	'V04-000'
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+
+;++
+; FACILITY: EXECUTIVE, SYSTEM SERVICES
+;
+; ABSTRACT: 
+;	This module implements distributed deadlock detection (and resolution)
+;	for the VMS lock manager system services ($ENQ and $DEQ) when
+;	operating in a VAXcluster environment.
+;
+; ENVIRONMENT: VAX/VMS, VAXcluster loadable code
+;
+; AUTHOR: Steve Beckhardt,	 CREATION DATE: 28-Feb-1984
+;
+; MODIFIED BY:
+;
+;	V03-006	SRB0143		Steve Beckhardt			9-Jul-1984
+;		Changed handling of repeated failures to complete a deadlock
+;		search.  Instead of calling it a deadlock, the lock is now
+;		placed back on the end of the time out queue with a fresh
+;		wait time and retry count.  This should eliminate the 
+;		occasional false deadlocks.  As a result, the maximum
+;		timestamp lifetime was reduced to 5 (1.6 secs.)
+;
+;	V03-005	SRB0137		Steve Beckhardt			9-Jul-1984
+;		Fixed bugs in timestamp lifetime code.  Increased
+;		maximum timestamp lifetime to 6 (3.2 secs.)
+;
+;	V03-004	SRB0134		Steve Beckhardt			22-Jun-1984
+;		Fixed bug in stack handling in insufficient pool code.
+;
+;	V03-003	SRB0130		Steve Beckhardt			18-May-1984
+;		Fixed bug involving location of test for NODLCKWT flag.
+;
+;	V03-002	SRB0125		Steve Beckhardt			2-May-1984
+;		Fixed bug involving race between process level handling
+;		of lock granted message (getting lock on PCB queue) and
+;		receiving deadlock search message.
+;
+;	V03-001	SRB0119		Steve Beckhardt			10-Mar-1984
+;		Fixed bugs, added support for LCK$M_NODLCKWT flag.
+;		Added support for waiting for pool.
+;
+;--
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+
+;
+; EXTERNAL SYMBOLS:
+;
+
+	$CADEF				; Conditional assembly switches
+	$CDRPDEF			; CDRP offsets
+	$CLSMSGDEF			; Cluster message offsets
+	$CLUBDEF			; CLUB offsets
+	$CSBDEF				; CSB offsets
+	$DYNDEF				; Structure type code definitions
+	$FKBDEF				; Fork block offsets
+	$IPLDEF				; IPL definitions
+	$LCKDEF				; LCK definitions
+	$LKBDEF				; LKB offsets
+	$PCBDEF				; PCB offsets
+	$RSBDEF				; RSB offsets
+	$SSDEF				; System status code definitions
+
+;
+; MACROS:
+;
+
+;
+; EQUATED SYMBOLS:
+;
+
+TSLT_UNITS = 50*1000*10			; Time stamp lifetime units (50 ms.)
+MAX_TSLT = 5				; Maximum timestamp lifetime shift count
+					; (represents 1.6 secs.)
+					; This also represents the interval
+					; that must elapse before local searches
+					; can proceed without timestamps
+
+LOCKFRAME = 24				; Number of bytes pushed onto
+					; stack for each recursive call
+					; of SEARCH_RESDLCK  (5 registers
+					; plus return address).  This
+					; cannot be changes without making
+					; corresponding coding changes
+					; This must also agree with the
+					; symbol of the same name in 
+					; DEADLOCK.MAR.
+
+;
+; OWN STORAGE:
+;
+
+	.PSECT	$$$040,LONG
+
+	.ALIGN	LONG
+
+;
+; NOTE:  The fork block and lock message buffer must be adjacent
+;
+LKMSG_FKB:
+	.QUAD	0			; Queue links
+	.WORD	FKB$K_LENGTH		; Size
+	.BYTE	DYN$C_FRK		; Type
+	.BYTE	IPL$_SYNCH		; Fork IPL
+	.BLKB	FKB$K_LENGTH-12		; Remainder of fork block
+LKMSG_BFR:				; Buffer to use for lock messages
+	.BLKB	LKMSG$K_DLM_LENGTH
+
+;*******************************************************************************
+;
+; NOTE:  The following assumptions are in effect for this entire module
+;
+;*******************************************************************************
+
+	ASSUME	LKMSG$B_TSLT		EQ	2+LKMSG$W_MEMSEQ
+	ASSUME	LKMSG$L_ORIGEPID	EQ	2+LKMSG$B_TSLT
+	ASSUME	LKMSG$L_ORIGLKID	EQ	4+LKMSG$L_ORIGEPID
+	ASSUME	LKMSG$L_ORIGCSID	EQ	4+LKMSG$L_ORIGLKID
+	ASSUME	LKMSG$Q_BITMAP_EXP	EQ	4+LKMSG$L_ORIGCSID
+	ASSUME	LKMSG$L_VCTMPRI		EQ	8+LKMSG$Q_BITMAP_EXP
+	ASSUME	LKMSG$L_VCTMLKID	EQ	4+LKMSG$L_VCTMPRI
+	ASSUME	LKMSG$L_VCTMCSID	EQ	4+LKMSG$L_VCTMLKID
+	ASSUME	LKMSG$L_NEXTLKID	EQ	4+LKMSG$L_VCTMCSID
+
+
+	.PSECT	$$$020
+
+	.SBTTL	LCK$SND_TIMESTAMP_RQST
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine sends a timestamp request to the system issuing 
+;	timestamps unless this system is issuing timestamps.  If a message
+;	is actually sent, then this routine does not return to it's caller.
+;	Instead, the stack is unwound and we exit deadlock detection.
+;	This routine only returns to its caller if this system
+;	is issuing timestamps and we successfully get one.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	LCK$SND_TIMESTAMP_RQST
+;	Note:   This routine only returns to its caller if a timestamp
+;		is issued locally.  In all other cases, the stack is
+;		reset and we exit from deadlock detection.
+;
+; INPUT PARAMETERS:
+;
+;	R8	EPID of original process
+;	R10	Stack position to unwind to
+;
+; IMPLICIT INPUTS:
+;
+;	It is assumed that the lock that started the deadlock search is
+;	still at the head of the timeout queue.
+;
+; OUTPUT PARAMETERS:
+;
+;	R9	Address of a message buffer template to be used instead
+;		of a real message buffer if a timestamp is assigned locally
+;
+; SIDE EFFECTS:
+;
+;	The bitmap is cleared if we issue a time stamp
+;--
+
+
+LCK$SND_TIMESTAMP_RQST::
+	MOVL	G^LCK$GL_TIMOUTQ,R4	; Get original lock (from head of queue)
+	MOVL	LCK$GL_TS_CSID,R3	; Get CSID of system issuing timestamps
+	BEQL	40$			; It's us
+	BSBW	LCK$ALLOC_LONGCDRP	; Allocate a CDRP 
+	BLBC	R0,70$			; Error
+
+	; Store necessary info. in CDRP to be able to start a deadlock
+	; search later.
+
+	MOVAB	CDRP$L_VAL1(R5),R2	; Point into CDRP data area
+	BSBB	80$			; Store data in CDRP
+	MOVL	R0,CDRP$L_VAL9(R5)	; Store victim CSID
+	MOVL	LKB$L_LKID(R4),-	; Store next lockid
+		CDRP$L_VAL10(R5)
+	MOVAB	W^BLD_TIMESTAMP_RQST,-	; Store address of message build routine
+		CDRP$L_MSGBLD(R5)
+
+	; Remove lock from timeout queue, reset the stack, and send the message.
+
+	REMQUE	LKB$L_ASTQFL(R4),R0	; Remove LKB from timeout queue
+	BICW	#LKB$M_TIMOUTQ,-	; Clear corresponding status bit
+		LKB$W_STATUS(R4)
+	BSBW	SEND_DLCK_MSG		; Send the message
+	BRB	70$
+
+40$:	; We are issuing timestamps
+
+	MOVL	R4,R5			; Save LKB address
+	MOVZBL	LKB$B_TSLT(R4),R4	; Get timestamp lifetime
+	BSBB	GET_TIMESTAMP
+	BLBC	R4,70$			; Bitmap in use
+	MOVL	R5,R4			; Restore LKB address
+	MOVAB	W^LKMSG_BFR,R9		; Point to internal message buffer
+	TSTL	-FKB$K_LENGTH(R9)	; Is it in use?
+	BNEQ	70$			; Yes
+	MOVW	#LKMSG$K_SRCHDLCK@8-	; Store facility and function codes
+		!CLSMSG$K_FAC_LCK,CLSMSG$B_FACILITY(R9)
+	MOVAB	LKMSG$W_MEMSEQ(R9),R2	; Point to data area
+	BSBB	80$			; Fill in fields
+	MOVL	LKB$L_LKID(R4),R1	; Get next lockid to search (this one)
+	MOVQ	R0,LKMSG$L_VCTMCSID(R9)	; Store victim CSID and next lockid
+	RSB				; Return to caller
+
+70$:	; This exit unwinds the stack and exits deadlock detection.
+	; If we sent a message then the original lock has been removed
+	; from the timeout queue.  We want to exit deadlock detection rather
+	; than trying to search for another deadlock because we will be
+	; unable to get another timestamp.  If we were unable to allocate a CDRP
+	; or the bitmap was in use then we leave the lock on the timeout queue
+	; so that we will retry this operation 1 second from now.
+
+	MOVL	R10,SP			; Reset stack
+	JMP	G^LCK$DLCKEXIT		; Return
+
+;
+; Local subroutine to store message data in either CDRP or internal
+; message template
+;
+;	Inputs:	R0,R1	Timestamp expiration (if assigned locally)
+;		R2	Address of data area in CDRP or internal message bfr
+;		R4	Address of original LKB
+;		R8	Original EPID
+;
+;	Outputs:
+;		R0	Victim CSID (not stored in data area because
+;			CDRP$L_VAL9 is not contiguous with CDRP$L_VAL8.)
+;
+
+80$:	PUSHL	R5
+	MOVL	G^CLU$GL_CLUB,R5	; Get address of CLUB
+	MOVW	CLUB$W_MEMSEQ(R5),(R2)+	; Store memseq
+	MOVZBW	LKB$B_TSLT(R4),(R2)+	; Store timestamp lifetime
+	MOVL	R8,(R2)+		; Store original EPID
+	MOVL	LKB$L_LKID(R4),(R2)+	; Store original lockid
+	MOVL	CLUB$L_LOCAL_CSID(R5),(R2)+ ; Store CSID of this system
+	MOVQ	R0,(R2)+		; Store timestamp
+	MNEGL	#1,(R2)+		; Initialize victim priority
+	MOVL	LKB$L_LKID(R4),R1	; Get local lockid
+	MOVL	CLUB$L_LOCAL_CSID(R5),R0; and local CSID
+	BBC	#LKB$V_MSTCPY,-		; Branch if not master copy
+		LKB$W_STATUS(R4),85$
+	MOVL	LKB$L_REMLKID(R4),R1	; Get remote lockid instead
+	MOVL	LKB$L_CSID(R4),R0	; and remote CSID
+85$:	MOVL	R1,(R2)+		; Store victim lockid; return victim
+	POPL	R5			; CSID in R0
+	RSB
+
+
+	.SBTTL	GET_TIMESTAMP - Get a bitmap time stamp
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine returns a bitmap timestamp with a specified lifetime.
+;	The timestamp lifetime is encoded as a shift count that represents
+;	the number of bits the basic lifetime should be shifted.
+;	For example, if the basic lifetime unit is 50 ms. (TSLT_UNITS) then
+;	a specified lifetime (R4) of 2 would return a timestamp with
+;	an expiration time 200 ms. from now.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	GET_TIMESTAMP
+;
+; INPUT PARAMETERS:
+;
+;	R4	Timestamp lifetime (encoded as a shift count)
+;
+;
+; OUTPUT PARAMETERS:
+;
+;	R0,R1	Quadword expiration time (success only)
+;	R4	Completion code:  0 = failure
+;				  1 = success
+; SIDE EFFECTS:
+;
+;	On success, bitmap is cleared, new expiration time is 
+;	stored as both local and exact expiration time
+;--
+
+GET_TIMESTAMP:
+	; Determine if the previous timestamp has expired yet.
+	; Note that normally, this test should be performed at the IPL
+	; of the hardware clock interrupt (IPL$_HWCLK).  However, we can
+	; tolerate the race condition here.  The result would be to think
+	; that the bitmap is in use when it really wasn't.  If this occurs,
+	; we will simply try again later.
+
+	PUSHR	#^M<R2,R3,R5>
+	MOVAQ	G^LCK$GQ_BITMAP_EXP,R2	; Get address of expiration time
+	MOVAQ	G^EXE$GQ_SYSTIME,R0	; Get address of system time
+	CMPL	4(R2),4(R0)		; Compare low order time
+	BLSSU	20$			; Bitmap is available
+	BGTRU	10$			; Bitmap is in use
+	CMPL	(R2),(R0)		; Compare high order time
+	BLEQU	20$			; Bitmap is available
+
+10$:	; Bitmap is in use.  Return failure.
+
+	CLRL	R4
+	POPR	#^M<R2,R3,R5>
+	RSB
+
+20$:	; Bitmap is available.  Compute new expiration times and clear bitmap.
+
+	ASHL	R4,#TSLT_UNITS,R4	; Compute time stamp lifetime 
+	MOVQ	(R0),R0			; Get current time
+	ADDL	R4,R0			; Compute expiration time
+	ADWC	#0,R1
+	MOVQ	R0,(R2)			; Store expiration time
+	MOVQ	R0,8(R2)		; Store local expiration time
+	MOVQ	R0,-(SP)		; Save timestamp for return to caller
+	MOVL	G^LCK$GL_PRCMAP,R0	; Get address of bitmap
+	MOVC5	#0,(R0),#0,-8(R0),(R0)	; Clear it
+	MOVL	#1,R4			; Return success
+	POPR	#^M<R0,R1,R2,R3,R5>
+	RSB
+
+	.SBTTL	LCK$RCV_TIMESTAMP_RQST
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called by the received message dispatcher when
+;	we receive a request for a timestamp.  If we can assign a timestamp
+;	then we send a message that starts the deadlock search.  If we
+;	cannot assign a timestamp (because the previous one has not
+;	expired yet), then we send a message that will cause the original
+;	lock to be requeued to the timeout queue.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	LCK$RCV_TIMESTAMP_RQST  (called by received message dispatcher)
+;
+; INPUT PARAMETERS:
+;
+;	R2	Address of message buffer
+;	R3	Address of CSB
+;
+; OUTPUT PARAMETERS:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+;	R0 - R5 not preserved
+;
+;	If a timestamp is assigned, the bitmap is cleared and the new
+;	expiration time is stored as both the local and exact expiration time.
+;--
+
+LCK$RCV_TIMESTAMP_RQST::
+	BSBW	RCV_DLCK_MSG
+	PUSHR	#^M<R2,R3>
+	TSTL	W^LCK$GL_TS_CSID	; Verify we are assigning timestamps
+	BNEQ	70$			; Error!
+
+	; Get a timestamp
+
+	MOVZBL	LKMSG$B_TSLT(R2),R4	; Get timestamp lifetime
+	BSBB	GET_TIMESTAMP
+	BLBS	R4,20$			; Success
+	BSBW	LCK$SND_REDO_SRCH	; Failure - redo deadlock search
+	BRB	50$
+
+20$:	; Have a timestamp.  Send a message that will initiate the deadlock
+	; search.  Store all necessary fields in the CDRP.
+
+	MOVQ	R0,R3			; Move timestamp
+	BSBW	LCK$ALLOC_LONGCDRP	; Allocate a CDRP
+	BLBS	R0,30$			; Have one		
+	BSBW	WAIT_FOR_POOL
+	BRB	50$
+
+30$:	MOVAB	W^BLD_SRCHDLCK,-	; Store address of message build routine
+		CDRP$L_MSGBLD(R5)
+	MOVQ	LKMSG$W_MEMSEQ(R2),-	; Store memseq, timestamp lifetime,
+		CDRP$L_VAL1(R5)		; and original EPID
+	MOVQ	LKMSG$L_ORIGLKID(R2),-	; Store original lockid and CSID
+		CDRP$L_VAL3(R5)
+	MOVQ	R3,CDRP$L_VAL5(R5)	; Store timestamp
+	MOVQ	LKMSG$L_VCTMPRI(R2),-	; Store deadlock victim priority
+		CDRP$L_VAL7(R5)		; and lockid
+	MOVQ	LKMSG$L_VCTMCSID(R2),-	; Store deadlock victim CSID and
+		CDRP$L_VAL9(R5)		; next lockid
+
+	; Send the message
+
+	MOVL	LKMSG$L_ORIGCSID(R2),R3	; Get CSID of original system
+	BSBW	SEND_DLCK_MSG
+
+50$:	; Deallocate the message buffer and return
+
+	POPR	#^M<R2,R3>
+	BRW	DEALL_DLCK_MSG
+
+
+70$:	BUG_CHECK	LOCKMGRERR,FATAL; This system is not issuing timestamps
+
+	.SBTTL	CHECK_TIMESTAMP - Check bitmap timestamp
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called when an incoming deadlock search message
+;	arrives and needs to use this system's bitmap.  If the 
+;	expiration timestamp in the message is newer (greater than)
+;	than the timestamp for this system's bitmap, then the bitmap
+;	is cleared and the newer timestamp is stored.  If they are equal,
+;	then the bitmap can be used immediately.  If the timestamp
+;	in the message is older than the one for the bitmap, then this
+;	indicates that the bitmap has been preempted by a newer request
+;	and therefore this deadlock search is aborted for now, but
+;	retried later, most likely with a timestamp with a longer lifetime.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	CHECK_TIMESTAMP
+;
+; INPUT PARAMETERS:
+;
+;	R2	Address of message buffer
+;
+; OUTPUT PARAMETERS:
+;
+;	R0	Completion code:  0 = abort deadlock search
+;				  1 = use bitmap
+;	R7	Address of bitmap
+;
+; SIDE EFFECTS:
+;
+;	If the bitmap is cleared, then the local expiration time
+;	is reset.
+;	R1 is not preserved
+;--
+
+CHECK_TIMESTAMP:
+	MOVL	G^LCK$GL_PRCMAP,R7	; Get address of bitmap
+	MOVAQ	G^LCK$GQ_BITMAP_EXP,R1	; Get address of bitmap timestamp
+	CMPL	4(R1),LKMSG$Q_BITMAP_EXP+4(R2) ; Compare high order times
+	BLSSU	10$			; Reuse bitmap
+	BGTRU	40$			; Bitmap has been preempted
+	CMPL	(R1),LKMSG$Q_BITMAP_EXP(R2) ; Compare low order times
+	BGTRU	40$			; Bitmap has been preempted
+	BEQL	20$			; Continue using bitmap
+
+10$:	; Bitmap may be used after it is initialized.  Store new timestamps.
+	; The expiration timestamp is the one in the message.  The local
+	; timestamp is the current system time plus the maximum timestamp
+	; lifetime.
+
+	MOVQ	LKMSG$Q_BITMAP_EXP(R2),(R1) ; Store new expiration timestamp
+	PUSHR	#^M<R2,R3,R4,R5>
+	MOVQ	G^EXE$GQ_SYSTIME,R2	; Get this system's time
+	ADDL	#<TSLT_UNITS@MAX_TSLT>,R2; Add maximum timestamp lifetime
+	ADWC	#0,R3
+	MOVQ	R2,8(R1)		; Store local expiration time
+	MOVC5	#0,(R7),#0,-8(R7),(R7)	; Clear it
+	POPR	#^M<R2,R3,R4,R5>
+20$:	MOVL	#1,R0
+	RSB
+
+40$:	CLRL	R0			; Bitmap was preempted
+	RSB
+
+	.SBTTL	LCK$SND_SRCHDLCK - Send deadlock search message
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine sends a search for deadlock message when either
+;	a master copy lock is blocking another lock or a waiting
+;	lock is found that is mastered on another system.  In effect,
+;	this message serves to "follow an edge" of the "wait-for" graph.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	LCK$SND_SRCHDLCK
+;	Note:	This routine may not return to its caller if called
+;		without a timestamp assigned (R9=0).  In this case,
+;		a message requesting a timestamp is sent and the stack 
+;		is unwound and we exit the deadlock search.
+;		Also, if we fail to allocate a CDRP, we also unwind the
+;		stack and exit the deadlock search.
+;
+; INPUT PARAMETERS:
+;
+;	R6	Address of LKB 
+;	R9	Address of Message buffer or 0 indicating none
+;	R10	Bottom of stack
+;
+; IMPLICIT INPUTS:
+;
+;	The region of stack bounded by R10 and SP contains a series
+;	of stack frames that describe that current "wait-for" cycle
+;	(see description below)
+;
+; OUTPUT PARAMETERS:
+;
+;	R0	Completion code:
+;		0 = exit normally
+;		-1 = exit due to failure to allocate a CDRP; stack
+;		     has been unwound back to original caller.
+;	R9	Address of message buffer if timestamp assigned
+;
+; SIDE EFFECTS:
+;
+;	R1 not preserved
+;--
+
+LCK$SND_SRCHDLCK::
+	PUSHR	#^M<R2,R3,R4,R5,R6>	; Can't change this without also
+					; changing value of LOCKFRAME and
+					; deadlock resolution code
+
+	; Determine if a timestamp has been assigned.  R9 = 0 indicates
+	; none was assigned.  R9 <> 0 indicates it points
+	; to a message buffer and therefore, a timestamp has been assigned.
+
+	TSTL	R9			; Is there a timestamp assigned?
+	BNEQ	10$			; Yes
+	BSBW	LCK$SND_TIMESTAMP_RQST	; No, get one (may not return here)
+
+10$:	; Allocate a CDRP
+
+	BSBW	LCK$ALLOC_LONGCDRP
+	BLBS	R0,15$			; Have one
+	MOVL	R9,R2			; Move address of message buffer
+	BSBW	WAIT_FOR_POOL
+	SUBL3	#4,R10,SP		; Unwind stack
+	MNEGL	#1,R0			; Set completion code
+	RSB				; Return to original caller
+
+15$:
+;
+;	 The stack consists of a series of stack frames, one for each lock 
+;	 involved in the current wait-for cycle.  Each stack frame consists 
+;	 of the 5 saved registers (R2 - R6) and a return address.  Note 
+;	 that in each stack frame the saved R6 points to the lock and the
+;	 saved R4 points to the respective PCB lock queue (if the lock
+;	 is not master copy).  Only the first and last frames should contain
+;	 master copy locks.  
+;	 The stack frames are bounded by R10 and the current SP.
+;	 The following diagram shows the stack with three frames.
+;	
+;	
+;	  SP -> +---------------+	     .  +-----------------------+
+;		|---------------|	   .	|       Saved R2        |
+;		|---------------|        .	|                       |
+;		|---------------|      .	+-----------------------+
+;		|---------------|    .		|       Saved R3        |
+;		|---------------|  .		|                       |
+;		+---------------+.		+-----------------------+
+;		|---------------|		|       Saved R4        |
+;		|---------------|		| (PCB + PCB$L_LOCKQFL) |
+;		|---------------|		+-----------------------+
+;		|---------------|		|       Saved R5        |
+;		|---------------|.		|                       |
+;		+---------------+  .            +-----------------------+
+;		|---------------|    .		|       Saved R6        |
+;		|---------------|      .	|    (Address of LKB)   |
+;		|---------------|	 .	+-----------------------+
+;		|---------------|	   .	|     Return Address    |
+;		|---------------|	     .  |                       |
+;	 	+---------------+	        +-----------------------+
+;	 R10 ->
+;	
+;	We will now search the frames looking for the process with
+;	the smallest deadlock priority.  When found, the respective
+;	deadlock priority will be compared with that in the input message.
+;	The objective is to find the best candidate for a deadlock victim
+;	if a deadlock is later found.  This candidate will be included in the
+;	message we send to the other system.  Note that a deadlock priority 
+;	of zero causes an immediate exit from the loop.  Register usage will be:
+;	
+;		R0	Current deadlock priority
+;		R1	Current lock frame pointer
+;		R2	Minimum deadlock priority, so far
+;		R3	Best victim frame, so far
+;		R4	Address of PCB lock queue (current frame)
+;		R5	Address of CDRP
+;		R9	Address of message buffer
+;		R10	Bottom of stack (start search here)
+;		SP	Top of stack (end search here)
+;	
+;	 Note that the following code makes a number of assumptions
+;	 regarding the order of registers saved on the stack and their
+;	 contents.
+
+	TSTL	LKMSG$L_VCTMPRI(R9)	; Don't bother searching if the priority
+	BEQL	50$			; in the message is zero
+
+	SUBL3	#LOCKFRAME,R10,R1	; Initialize current frame pointer
+	MOVL	R1,R3			; Initialize "best" frame pointer
+	MNEGL	#1,R2			; Initialize "best" deadlock priority
+20$:	MOVL	16(R1),R0		; Get LKB address
+	BBC	#LKB$V_MSTCPY,-		; Branch if not master copy
+		LKB$W_STATUS(R0),25$
+	MOVL	LKB$L_DLCKPRI(R0),R0	; Get deadlock priority from master copy
+	BRB	28$
+25$:	MOVL	8(R1),R4		; Get pointer to PCB lock queue
+	MOVL	PCB$L_DLCKPRI-PCB$L_LOCKQFL(R4),R0 ; Get current deadlock pri.
+28$:	BEQL	35$			; Branch if zero - have best victim
+	CMPL	R0,R2			; Compare current priority with 
+	BGEQU	30$			; previous minimum.
+	MOVQ	R0,R2			; This frame becomes "best so far"
+30$:	SUBL	#LOCKFRAME,R1		; Move to next frame
+	CMPL	R1,SP			; Reached top of stack yet?
+	BGEQU	20$			; No, repeat for next frame
+	BRB	40$
+35$:	MOVQ	R0,R2			; Move priority and frame pointer
+
+40$:	; Compare lowest deadlock priority so far (R2) with that in the
+	; input message and select the lower.  R3 contains address of "best" 
+	; frame.
+
+	CMPL	R2,LKMSG$L_VCTMPRI(R9)	; Compare priorities
+	BGTRU	50$			; The one in the message was lower
+
+	; The one on the stack was lower.  R3 points to relevant frame.
+
+	MOVL	16(R3),R1		; Get address of LKB
+	BBC	#LKB$V_MSTCPY,-		; Branch if not master copy
+		LKB$W_STATUS(R1),45$
+	MOVL	LKB$L_REMLKID(R1),R3	; Get remote lockid
+	MOVL	LKB$L_CSID(R1),R4	; and CSID
+	BRB	60$
+45$:	MOVL	LKB$L_LKID(R1),R3	; Get lockid
+	MOVL	G^CLU$GL_CLUB,R0	; Get address of CLUB
+	MOVL	CLUB$L_LOCAL_CSID(R0),R4; Get local CSID
+	BRB	60$
+
+50$:	; The one in the message was lower.
+
+	MOVQ	LKMSG$L_VCTMPRI(R9),R2	; Get victim priority and lockid
+	MOVL	LKMSG$L_VCTMCSID(R9),R4	; and CSID
+
+60$:	; Store info. in CDRP
+
+	MOVQ	R2,CDRP$L_VAL7(R5)	; Store victim priority and lockid
+	MOVL	R4,CDRP$L_VAL9(R5)	; and CSID
+	MOVL	LKB$L_REMLKID(R6),-	; and next lockid to continue search
+		CDRP$L_VAL10(R5)
+	PUSHL	R5
+	MOVC3	#24,LKMSG$W_MEMSEQ(R9),-; and other fields
+		CDRP$L_VAL1(R5)
+	POPL	R5
+	MOVAB	B^BLD_SRCHDLCK,-	; Store address of message build routine
+		CDRP$L_MSGBLD(R5)
+
+	; Send the message
+
+	BBC	#LKB$V_MSTCPY,-		; Branch if not master copy
+		LKB$W_STATUS(R6),70$
+	MOVL	LKB$L_CSID(R6),R3	; Get CSID
+	BRB	75$
+70$:	MOVL	LKB$L_RSB(R6),R0	; Get RSB address
+	MOVL	RSB$L_CSID(R0),R3	; Get CSID
+75$:	BSBW	SEND_DLCK_MSG
+	POPR	#^M<R2,R3,R4,R5,R6>
+	CLRL	R0			; Set completion code
+	RSB
+;
+; Message build routine
+;
+;	Inputs:	R2	Address of message buffer
+;		R5	Address of CDRP
+;
+
+BLD_REDO_SRCH:
+	MOVW	#LKMSG$K_REDO_SRCH@8-	; Store facility and function codes
+		!CLSMSG$K_FAC_LCK,CLSMSG$B_FACILITY(R2)
+	BRB	BLD_COMMON
+
+BLD_TIMESTAMP_RQST:
+	MOVW	#LKMSG$K_TSRQST@8-	; Store facility and function codes
+		!CLSMSG$K_FAC_LCK,CLSMSG$B_FACILITY(R2)
+	BRB	BLD_COMMON
+
+BLD_SRCHDLCK:
+	MOVW	#LKMSG$K_SRCHDLCK@8-	; Store facility and function codes
+		!CLSMSG$K_FAC_LCK,CLSMSG$B_FACILITY(R2)
+BLD_COMMON:
+	PUSHR	#^M<R2,R3,R4,R5>
+	MOVC3	#32,CDRP$L_VAL1(R5),-	; Move data from CDRP to message buffer
+		LKMSG$W_MEMSEQ(R2)
+	POPR	#^M<R2,R3,R4,R5>
+	MOVQ	CDRP$L_VAL9(R5),-
+		LKMSG$L_VCTMCSID(R2)
+	RSB
+
+	.SBTTL	LCK$RCV_SRCHDLCK - Receive search deadlock message
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called when we receive a deadlock search message
+;	for either a lock mastered on this system or a waiting lock owned
+;	by this system.  We continue searching using this lock as our 
+;	starting point.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	LCK$RCV_SRCHDLCK (called from input message dispatcher)
+;
+; INPUT PARAMETERS:
+;
+;	R2	Address of message buffer
+;	R3	Address of CSB
+;
+; OUTPUT PARAMETERS:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+;	Other deadlock search messages may be sent to other systems.
+;	R0 and R1 are not preserved.
+;--
+
+LCK$RCV_SRCHDLCK::
+	BSBW	RCV_DLCK_MSG
+	PUSHR	#^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	MOVL	R2,R9			; Move address of input message
+
+	; Get lockid of lock to start search with.  Convert to LKB address.
+
+	MOVL	LKMSG$L_NEXTLKID(R2),R4	; Get lockid
+	BSBW	LCK$CVT_ID_TO_LKB	; Convert to LKB address
+	BLBC	R0,10$			; No LKB found; ignore message
+
+	; Check bitmap expiration timestamp before we start using bitmap
+
+	BSBW	CHECK_TIMESTAMP		; Returns address of bitmap in R7
+	BLBS	R0,20$			; We can use bitmap
+
+	; Bitmap has been preempted by a later deadlock search.
+	; Double the bitmap lifetime requested and send back a message to 
+	; redo the original deadlock search.  
+
+	INCB	LKMSG$B_TSLT(R2)	; This will double the lifetime
+	BSBW	LCK$SND_REDO_SRCH
+10$:	BRW	70$
+
+20$:	; Set up registers 
+
+	MOVL	LKMSG$L_ORIGEPID(R2),R8	; Original EPID
+	MOVL	SP,R10			; Current stack position
+	ADDL3	G^LCK$GL_EXTRASTK,-	; Compute stack limit
+		G^EXE$GL_INTSTKLM,R11
+	ADDL	#LOCKFRAME,R11
+	MOVZWL	LKB$L_PID(R6),R2	; Get process index
+	BEQL	25$			; Branch if master copy or system owned 
+	MOVL	G^SCH$GL_PCBVEC,R1	; Convert to PCB address
+	MOVL	(R1)[R2],R4
+
+25$:	; The way in which we resume the deadlock search depends on 
+	; whether this lock is a master (or local) or process copy.  
+
+	MOVL	LKB$L_RSB(R6),R0	; Get RSB address
+	TSTL	RSB$L_CSID(R0)		; Is lock mastered here?
+	BEQL	60$			; Yes
+
+	; This is a process copy lock.  For each lock this procress
+	; has in either CONVERT or WAITING state, see who is blocking
+	; those locks.
+
+	MOVL	R6,R5			; Move LKB address
+	TSTL	R2			; If process index is 0 then lock is
+	BEQL	70$			; system owned
+	BBSS	R2,(R7),70$		; Br. if we've already done this process
+	MOVAL	PCB$L_LOCKQFL(R4),R4	; Point to lock queue header
+	MOVL	4(R4),R6		; Get last lock in list
+30$:	CMPL	R6,R4			; Reached end of list?
+	BEQL	70$			; Yes
+	MOVAL	-LKB$L_OWNQFL(R6),R6	; Point to start of LKB
+	CMPL	R5,R6			; Is this the one we have in R5?
+	BEQL	35$			; Yes, move on to next one
+	DISPATCH	LKB$B_STATE(R6),TYPE=B,PREFIX=LKB$K_,-
+		<-
+		<CONVERT,32$>,-
+		<WAITING,32$>-
+		>
+	BRB	70$			; Exit for all other states
+32$:	BBS	#LCK$V_NODLCKWT,-	; Branch if this lock should not be
+		LKB$W_FLAGS(R6),35$	; considered as waiting for other locks
+	MOVL	LKB$L_RSB(R6),R0	; Get RSB for this lock
+	TSTL	RSB$L_CSID(R0)		; Is it managed elsewhere?
+	BEQL	33$			; No
+	JSB	G^LCK$SND_SRCHDLCK	; Yes, send a message to keep looking
+	BRB	34$			; Continue on this PCB
+33$:	JSB	G^LCK$SRCH_RESDLCK	; No, recursively search
+34$:	BLBS	R0,70$			; If LBS, exit search
+35$:	MOVL	LKB$L_OWNQBL(R6),R6	; Get previous lock
+	BRB	30$			; Repeat
+
+60$:	; This lock is a local or master copy.  Just determine who is blocking
+	; this lock after verifying that the lock is not granted.
+
+	ASSUME	LKB$K_GRANTED  GT  0
+	TSTB	LKB$B_STATE(R6)		; Ignore message if lock is granted
+	BGTR	70$
+	JSB	G^LCK$SRCH_RESDLCK	; Search for deadlock
+	
+70$:	; Deallocate the original message buffer and exit
+
+	POPR	#^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	BRW	DEALL_DLCK_MSG		; Deallocate message buffer and return
+
+	.SBTTL	LCK$SND_DLCKFND - Send deadlock found message
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine sends a message informing another system that a
+;	specified lock has been chosen as a deadlock victim.  The lock
+;	on the destination system is either a local copy or a process
+;	because it is on that system the the dequeue/cancel function
+;	must be issued.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	LCK$SND_DLCKFND
+;	IPL must be a IPL$_SCS
+;	Note:	If we don't have an input message and we are unable
+;		to allocate a CDRP, then we will unwind the stack
+;		and exit from deadlock detection.
+;
+; INPUT PARAMETERS:
+;
+;	R2	Lock id. of victim lock
+;	R3	CSID of destination system
+;	R9	Address of input message or 0 indicating no message
+;	R10	Bottom of stack
+;
+; OUTPUT PARAMETERS:
+;
+;	R0	Completion code of -1 if we unwind the stack and exit
+;		from deadlock searching.
+;
+; SIDE EFFECTS:
+;
+;	R0 - R5 not preserved
+;--
+
+LCK$SND_DLCKFND::
+
+	BSBW	LCK$ALLOC_LONGCDRP	; Alloc. CDRP 
+	BLBC	R0,80$			; Unable to allocate one
+
+	; Store necessary information to build message in CDRP.
+	; The original lockid and CSID are stored only if we have
+	; an input message.  This will be used by the destination system
+	; to redo a deadlock search.  If we don't have an input message
+	; then this system will automatically redo the search.
+
+	MOVL	G^CLU$GL_CLUB,R0
+	MOVW	CLUB$W_MEMSEQ(R0),-	; Store memseq.
+		CDRP$L_VAL1(R5)
+	TSTL	R9			; Is there an input message?
+	BEQL	10$			; No
+	MOVQ	LKMSG$L_ORIGLKID(R9),-	; Yes, store original lockid and
+		CDRP$L_VAL3(R5)		; CSID in CDRP
+	MOVB	LKMSG$B_TSLT(R9),-	; and timestamp lifetime
+		CDRP$L_VAL1+2(R5)
+	BRB	20$
+10$:	CLRQ	CDRP$L_VAL3(R5)		; Indicate no original message
+20$:	MOVQ	R2,CDRP$L_VAL5(R5)	; Store victim lockid and CSID
+	MOVAB	B^BLD_DLCKFND,-		; Store address of message build routine
+		CDRP$L_MSGBLD(R5)
+	BSBW	SEND_DLCK_MSG		; Send the message
+	RSB
+
+80$:	MOVL	R9,R2			; Move address of message
+	BEQL	90$			; No message
+	BSBW	WAIT_FOR_POOL
+	RSB
+
+90$:	MNEGL	#1,R0			; Set completion status
+	ADDL3	#4,R10,SP		; Unwind stack
+	RSB
+
+
+; Action routine to build deadlock found message.  Inputs are:
+;
+;	R2	Address of message buffer
+;	R5	Address of CDRP
+;	CDRP$L_VAL1	MEMSEQ and timestamp lifetime
+;	CDRP$L_VAL3	Original lockid (or 0)
+;	CDRP$L_VAL4	Original CSID (or 0)
+;	CDRP$L_VAL5	Lockid of victim lock
+;	CDRP$L_VAL6	CSID of victim lock
+;
+
+BLD_DLCKFND:
+	ASSUME	CLSMSG$B_FUNC	EQ	1+CLSMSG$B_FACILITY
+	MOVW	#LKMSG$K_DLCKFND@8-	; Store function and facility codes
+		!CLSMSG$K_FAC_LCK,CLSMSG$B_FACILITY(R2)
+	MOVL	CDRP$L_VAL1(R5),-	; Store MEMSEQ and timestamp lifetime
+		LKMSG$W_MEMSEQ(R2)
+	MOVQ	CDRP$L_VAL3(R5),-	; Store original lockid and CSID
+		LKMSG$L_ORIGLKID(R2)
+	MOVQ	CDRP$L_VAL5(R5),-	; Store victim lockid and CSID
+		LKMSG$L_VCTMLKID(R2)
+	RSB
+
+	.SBTTL	LCK$RCV_DLCKFND - Receive deadlock found message
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called when we receive a deadlock found message.
+;	The message specifies a particular lock chosen to be a deadlock
+;	The lock must be either a local or process copy on this system.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	LCK$RCV_DLCKFND  (called from received message dispatcher)
+;	IPL must be at IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	R2	Address of message buffer
+;	R3	Address of CSB
+;
+; OUTPUT PARAMETERS:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+;	R0 - R5 not preserved
+;--
+
+LCK$RCV_DLCKFND::
+	BSBW	RCV_DLCK_MSG
+	PUSHR	#^M<R2,R3,R6,R7,R8,R9>
+	MOVL	R2,R9			; Move address of message
+	MOVQ	LKMSG$L_VCTMLKID(R9),R2	; Get victim lockid and CSID
+	JSB	G^LCK$BREAK_DEADLOCK	; Cancel the lock request
+
+	POPR	#^M<R2,R3,R6,R7,R8,R9>
+	BRW	DEALL_DLCK_MSG		; Deallocate message buffer and return
+
+	.SBTTL	LCK$SND_REDO_SRCH - Send a redo deadlock search message
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called when it is necessary to redo a deadlock
+;	search.  It sends a message to the system mastering the lock
+;	unless that system is this system.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	LCK$SND_REDO_SRCH
+;
+; INPUT PARAMETERS:
+;
+;	R2	Address of message buffer
+;
+; IMPLICIT INPUTS:
+;
+;	LKMSG$B_TSLT(R2)	Timestamp lifetime
+;	LKMSG$L_ORIGLKID(R2)	Lockid of lock to repeat deadlock search
+;	LKMSG$L_ORIGCSID(R2)	CSID of system mastering above lock
+;				(0 indicates original CSID and lockid
+;				are unknown, but it is not necessary
+;				to send the redo message - see LCK$SND_DLCKFND)
+;
+; OUTPUT PARAMETERS:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+; 	R0 - R5 are not preserved
+;--
+
+LCK$SND_REDO_SRCH::
+	; Determine if the lock is mastered on this system
+
+	MOVL	LKMSG$L_ORIGCSID(R2),R3	; Get original CSID
+	BEQL	10$			; Not present
+	MOVL	G^CLU$GL_CLUB,R0	; Get address of CLUB
+	CMPL	R3,CLUB$L_LOCAL_CSID(R0); Is it the CSID of this system?
+	BNEQ	20$			; No
+
+	; Lock is mastered on this system
+
+	BSBW	REDO_SRCH		; Requeue it to the timeout queue
+10$:	RSB
+
+20$:	; Lock is mastered elsewhere
+
+	BSBW	LCK$ALLOC_LONGCDRP	; Allocate CDRP
+	BLBC	R0,80$			; Unable to allocate one
+	MOVL	LKMSG$W_MEMSEQ(R2),-	; Store MEMSEQ and timestamp lifetime
+		CDRP$L_VAL1(R5)
+	MOVL	LKMSG$L_ORIGLKID(R2),-	; Store lockid
+		CDRP$L_VAL3(R5)
+	MOVAB	W^BLD_REDO_SRCH,-	; Store address of message build routine
+		CDRP$L_MSGBLD(R5)
+	BSBW	SEND_DLCK_MSG		; Send the message
+	RSB
+
+80$:	BSBW	WAIT_FOR_POOL
+	RSB
+
+	.SBTTL	LCK$RCV_REDO_SRCH
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called when we receive a message to redo a deadlock
+;	search for a lock mastered on this system.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	LCK$RCV_REDO_SRCH  (called from input message dispatcher)
+;
+; INPUT PARAMETERS:
+;
+;	R2	Address of message buffer
+;	R3	Address of CSB
+;
+; OUTPUT PARAMETERS:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+;	R0, R1 and R4 not preserved
+;--
+
+LCK$RCV_REDO_SRCH::
+	BSBW	RCV_DLCK_MSG
+	BSBB	REDO_SRCH		; Do the work
+	BRW	DEALL_DLCK_MSG		; Deallocate message buffer and return
+
+	.SBTTL	REDO_SRCH - Redo deadlock search
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called to requeue a lock back on the timeout
+;	queue when a deadlock search must be repeated.  Deadlock searches
+;	are repeated for reasons such as:
+;
+;		o  One deadlock has already been found for this lock
+;		o  A timestamp could not be issued
+;		o  The deadlock search was incomplete for some reason
+;		   (e.g. unable to allocate pool or our timestamp was
+;		    superseded)
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	REDO_SRCH
+;
+; INPUT PARAMETERS:
+;
+;	R2	Address of message buffer
+;
+; IMPLICIT INPUTS:
+;
+;	LKMSG$B_TSLT(R2)	Timestamp lifetime
+;	LKMSG$L_ORIGLKID(R2)	Lockid of lock to repeat deadlock search
+;
+; OUTPUT PARAMETERS:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+;	R0, R1 and R4 not preserved
+;--
+
+REDO_SRCH:
+	PUSHL	R6			; Save R6
+	MOVL	LKMSG$L_ORIGLKID(R2),R4	; Get lockid
+	BSBW	LCK$CVT_ID_TO_LKB	; Convert to LKB address
+	BLBC	R0,60$			; No LKB
+	MOVL	LKB$L_RSB(R6),R0	; Get RSB address
+	TSTL	RSB$L_CSID(R0)		; Verify it's mastered here
+	BNEQ	90$			; Error!
+
+	; Only requeue lock if it's in either CONVERT or WAITING state
+	; and it's not already queued.
+
+	DISPATCH	LKB$B_STATE(R6),TYPE=B,PREFIX=LKB$K_,-
+	<-
+	<CONVERT,30$>,-
+	<WAITING,30$>,-
+	>
+	BRB	60$			; Ignore for other states
+
+30$:	; If we haven't used up all the retries (MAX_TSLT) then the lock
+	; is requeued at the front of the timeout queue.  If we have
+	; used up all retries, then the retry count is cleared, and the
+	; lock is queued at the back of the timeout queue with another
+	; wait time applied.  The result is to retry a deadlock search for
+	; this lock later.
+
+	BBSS	#LKB$V_TIMOUTQ,-	; Branch if already on the queue;
+		LKB$W_STATUS(R6),60$	; set bit otherwise
+	MOVL	G^EXE$GL_ABSTIM,-	; Store immediate timeout time
+		LKB$L_DUETIME(R6)
+	MOVAL	G^LCK$GL_TIMOUTQ,R0	; Get address of timeout queue
+	MOVB	LKMSG$B_TSLT(R2),-	; Store timestamp lifetime
+		LKB$B_TSLT(R6)
+	CMPB	LKB$B_TSLT(R6),-	; Have we exceeded the maximum
+		#MAX_TSLT		; number of retries?
+	BGTR	40$			; Yes
+	INSQUE	LKB$L_ASTQFL(R6),(R0)	; No, insert at the head of the queue
+	BRB	60$
+
+40$:	CLRB	LKB$B_TSLT(R6)		; Reset retry count
+	ADDL	G^LCK$GL_WAITTIME,-	; Add another wait time to due time
+		LKB$L_DUETIME(R6)
+	INSQUE	LKB$L_ASTQFL(R6),@4(R0)	; Insert at the tail of the queue
+
+60$:	POPL	R6
+	RSB
+
+90$:	BUG_CHECK	LOCKMGRERR,FATAL; Not mastered here
+
+	.SBTTL	LCK$CVT_ID_TO_LKB - Convert a lockid to LKB address
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine converts a lockid to a LKB address, if possible.
+;	The verification check of comparing remote lockids is not
+;	performed as both lockids are not available.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	LCK$CVT_ID_TO_LKB
+;
+; INPUT PARAMETERS:
+;
+;	R4	Lockid
+;
+; OUTPUT PARAMETERS:
+;
+;	R0	Completion code (0 = failure; 1 = success)
+;	R6	Address of LKB (success only)
+;
+; SIDE EFFECTS:
+;
+;	None
+;--
+
+
+LCK$CVT_ID_TO_LKB::
+	MOVZWL	R4,R6			; Put lockid index in R6
+	CMPL	R6,G^LCK$GL_MAXID	; Is the lock id too big?
+	BGTRU	60$			; Yes
+	MOVL	G^LCK$GL_IDTBL,R0	; Get address of lockid table
+	MOVL	(R0)[R6],R6		; Get LKB address
+	BGEQ	60$			; Unallocated id
+	CMPL	R4,LKB$L_LKID(R6)	; Check sequence number
+	BNEQ	60$			; Not valid
+	MOVL	#1,R0
+	RSB
+
+60$:	CLRL	R0
+	RSB
+
+	.SBTTL	SEND_DLCK_MSG - Send any deadlock detection message
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called to send any message when the caller
+;	wants control returned to it as opposed to it's caller.
+;	After the message has been acknowledged, the CDRP is deallocated.
+;	Note that all errors are ignored.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	SEND_DLCK_MSG
+;
+; INPUT PARAMETERS:
+;
+;	R3	CSID of destination system
+;	R5	Address of CDRP
+;
+; OUTPUT PARAMETERS:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+; 	R0 - R2 and R4 are destroyed.
+;--
+
+SEND_DLCK_MSG:
+	.IF NE	CA$_MEASURE
+	INCL	G^PMS$GL_DLCKMSGS_OUT
+	.ENDC
+
+	BSBW	CNX$SEND_MSG
+	MOVL	R5,R0			; Address of CDRP
+	JMP	G^EXE$DEANONPAGED	; Deallocate it and return
+
+	.SBTTL	RCV_DLCK_MSG - Receive a deadlock message
+
+;++
+; FUNCTIONAL DESCRIPTION
+;
+;	This routine is called whenever we receive a deadlock message.
+;	Its purpose is to verify that the internal message buffer
+;	is available (i.e. not in use waiting for pool).  If it is
+;	in use, then we reject this message and break the connection.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	RCV_DLCK_MSG
+;	NOTE:	If we break the connection, then we return to our caller's
+;		caller, usually, the input message dispatcher.
+;
+; INPUT PARAMETERS:
+;
+;	R2	Address of message buffer
+;	R3	Address of CSB
+;
+; OUTPUT PARAMETERS:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+;	None if we return to our caller.
+;	The message buffer is deallocated if we break the connection.
+;--
+
+RCV_DLCK_MSG:
+	TSTL	W^LKMSG_FKB		; Is fork block in use?
+	BNEQ	10$			; Yes
+
+	.IF NE	CA$_MEASURE
+	INCL	G^PMS$GL_DLCKMSGS_IN
+	.ENDC
+
+	RSB
+
+10$:	ADDL	#4,SP			; Pop caller's return address off stack
+	BRW	CNX$RCV_REJECT		; Reject message
+
+	.SBTTL	DEALL_DLCK_MSG - Deallocate deadlock message buffer
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called to deallocate received deadlock message
+;	buffers.  However, it distinguishes between real message buffers
+;	and our internal buffer which is not deallocated.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	DEALL_DLCK_MSG
+;
+; INPUT PARAMETERS:
+;
+;	R2	Address of message buffer
+;	R3	Address of CSB
+;
+; OUTPUT PARAMETERS:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+;	R0 - R2 destroyed
+;--
+
+DEALL_DLCK_MSG:
+	MOVAB	W^LKMSG_BFR,R0		; Get address of internal buffer
+	CMPL	R0,R2			; Is it our internal message buffer?
+	BEQL	10$			; Yes
+	BSBW	CNX$DEALL_MSG_BUF_CSB	; No, deallocate real message buffer
+10$:	RSB
+
+	.SBTTL	LCK$ALLOC_LONGCDRP - Allocate a long CDRP
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is used to allocate a longer CDRP than is normally
+;	used for connection purposes.  The reason is because deadlock
+;	messages have more context than can fit into a regular sized
+;	CDRP.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	LCK$ALLOC_LONGCDRP
+;
+; INPUT PARAMETERS:
+;
+;	None
+;
+; OUTPUT PARAMETERS:
+;
+;	R0	Completion code
+;	R5	Address of CDRP
+;
+; COMPLETION CODES:
+;
+;	SS$_NORMAL	CDRP allocated
+;	SS$_INSFEM	Insufficient memory
+;
+; SIDE EFFECTS:
+;
+;	R0 and R1 not preserved.
+;--
+
+LCK$ALLOC_LONGCDRP:
+	PUSHL	R2
+	MOVZWL	#CDRP$K_CM_LONG_LENGTH,R1; Size of CDRP
+	JSB	G^EXE$ALONONPAGED	; Allocate pool
+	BLBC	R0,80$			; Insufficient memory
+	MOVL	R2,R5			; Move address of CDRP
+	MOVW	R1,CDRP$W_CDRPSIZE(R5)	; Store size
+	BSBW	CNX$INIT_CDRP		; Initialize CDRP
+80$:	POPL	R2
+	RSB
+
+	.SBTTL	WAIT_FOR_POOL - Wait for pool
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine copies an input message into the internal
+;	message buffer and does a FORK_WAIT.  Upon resumption,
+;	we simulate receiving the same message again.  If another
+;	input message is received while the fork block is queued,
+;	then we reject the message and break the connection (see
+;	RCV_DLCK_MSG).
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	WAIT_FOR_POOL
+;	NOTE:	If no input message is specified, then we unwind the
+;		stack and return to LCK$DLCKEXIT.
+;
+; INPUT PARAMETERS:
+;
+;	R2	Address of input message (or 0 indicating no input message)
+;	R10	Address of stack position to unwind to if R2=0
+;
+; OUTPUT PARAMETERS:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+;	R0 and R1 not preserved.
+; 	A fork block is queued that when resumed will call the input
+;	message dispatcher.
+;--
+
+WAIT_FOR_POOL:
+	TSTL	R2			; Do we have an input message?
+	BNEQ	10$			; Yes
+	MOVL	R10,SP			; No, unwind stack
+	JMP	G^LCK$DLCKEXIT		; Exit deadlock detection
+
+10$:	PUSHR	#^M<R2,R3,R4,R5,R6>	; Save registers
+	MOVAB	W^LKMSG_FKB,R6		; Get address of fork block
+	TSTL	(R6)			; Verify it's not in use
+	BNEQ	90$			; Error
+	MOVAB	FKB$K_LENGTH(R6),R5	; Get address of message buffer
+	MOVC3	#LKMSG$K_DLM_LENGTH,(R2),(R5)	; Copy message
+	MOVL	R6,R5			; Move fork block address
+	BSBB	50$			; Queue fork block
+	POPR	#^M<R2,R3,R4,R5,R6>
+	RSB
+
+50$:	FORK_WAIT			; Fork and wait
+	CLRQ	(R5)			; Indicate fork block is not is use
+	MOVAB	FKB$K_LENGTH(R5),R2	; Get address of message buffer
+	CLRL	R3			; Indicate no CSB address
+	MOVL	G^CLU$GL_CLUB,R0	; Get address of CLUB
+	CMPW	CLUB$W_MEMSEQ(R0),-	; Has memseq changed?
+		LKMSG$W_MEMSEQ(R2)
+	BNEQ	60$			; Yes, ignore this message
+	BSBW	LCK$DISPATCH		; No, dispatch on this message
+60$:	RSB
+
+90$:	BUG_CHECK	LOCKMGRERR,FATAL
+
+
+
+
+	.END
+

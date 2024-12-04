@@ -1,0 +1,1249 @@
+MODULE DBGDPC 	( IDENT = 'V04-000') =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	DEBUG (DBG)
+!
+! ABSTRACT:
+!	Analyzes PC correlation tables for DEBUG.
+!
+! ENVIRONMENT:	VAX/VMS, user mode, interrupts disabled.
+!
+! AUTHOR:	Carol Peters, CREATION DATE:	16 September 1977
+!
+! Version	3.01
+!
+! MODIFIED BY:
+!	(PS = Ping Sager, RT = Rich Title, JF = John Francis)
+!
+! 3.01  15-Sep-81       PS      Correct LINE_END PC address calculation in
+!                               PC_TO_LINE_LOOKUP.
+! 3.02	23-Apr-82	RT	Fixed a bug in DBG$PC_TO_LINE_LOOKUP: the routine
+!				was assuming that chasing upscope pointers will
+!				always get you to a routine RST entry.
+! 4.0   13-Dec-82       PS      Switched some old symbolization routines to
+!				use new code.
+!	 1-Mar-83	JF	Changed return values from DBG$PC_TO_LINE_LOOKUP
+!				so that SUCCESS and FAILURE are shown properly
+!	12-Apr-83	RT	Fixed a bug in PC_TO_LINE
+!	24-Dec-83	RT	Added comments and did some general cleanup
+!--
+
+! TABLE OF CONTENTS:
+!
+FORWARD ROUTINE
+	dbg$line_to_pc_lookup,	! Given line number associated it to a PC
+	dbg$pc_to_line,		! Matches a PC to a line number
+	dbg$pc_to_line_lookup,	! Given PC looks up associated line number
+	proc_pc_cmd,		! Processes a string of PC correlation commands
+    	find_eol,		! Find end of line
+    	give_line_info: NOVALUE;! Give more info about line number
+
+
+! INCLUDE FILES:
+!
+REQUIRE 'SRC$:DBGPROLOG.REQ';
+LIBRARY 'LIB$:DBGGEN.L32';
+
+
+! MACROS:
+!
+MACRO
+	current_byte	= 0, 0, 8, 1%,		! current top of record
+	next_uns_byte	= 1, 0, 8, 0%,		! byte argument to command
+	next_uns_word	= 1, 0, 16, 0%,		! word argument to command
+	next_uns_long	= 1, 0, 32, 0%,		! longword argument to command
+	add_one_byte	= 1, 0, 8, 0%,		! increment for top of record
+	add_two_bytes	= 2, 0, 8, 0%,		! ditto
+	add_three_bytes	= 3, 0, 8, 0%,		! ditto
+	add_five_bytes	= 5, 0, 8, 0%;		! ditto
+
+
+! EQUATED SYMBOLS:
+!
+LITERAL
+	line_open	= 1,
+	line_closed	= 2;
+
+
+! OWN STORAGE:
+!
+OWN
+	dst_entry	: REF dst$record,
+	dpc_entry	: REF BLOCK [, BYTE],
+	start_pc,
+	current_line,
+	current_stmt,
+	current_incr,
+	current_pc,
+	current_stmt_mode,
+	current_mark,
+	prev_line,
+	prev_stmt,
+	prev_incr,
+	prev_pc,
+	prev_stmt_mode,
+	prev_mark,
+    	NUM_PC_TBLS,			! The number of PC-Correlation DST
+    					!	records for the current module
+    	current_table,
+    	report_next_line,
+    	report_next_stmt,
+    	report_prev_line,
+    	report_prev_stmt,
+	pctbl_count;
+
+
+! EXTERNAL REFERENCES:
+!
+EXTERNAL ROUTINE
+    	dbg$format_fao_out: NOVALUE,	! Forward FAO string
+    	dbg$pc_to_symid;		! Search Moudle SAT to locate RST
+
+
+ROUTINE dbg$pc_to_line (match_pc_ptr, modpctbl,    pctbl_base, 
+			line_no_ptr,  stmt_no_ptr, line_pc) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine matches an address to a line number.
+!	The caller, DBG$PC_TO_LINE_LOOKUP, does the work of finding
+!	the PC/LINE table for the module containing the address.
+!	A pointer to this table is passed to this routine.
+!
+!	Each PC correlation record that exists for the module
+!	is sequentially analyzed until the desired address
+!	is seen.
+!
+!	See the comments in DBG$PC_TO_LINE_LOOKUP for more details
+!	about how this routine is used.
+!
+! FORMAL PARAMETERS:
+!
+!	match_pc_ptr	- The address to be matched.
+!	modpctbl	- The address of the table of pointers to
+!			  PC/LINE tables in this module. The first
+!			  longword of the table is a count of PC/LINE
+!			  tables, and the remaining longwords are
+!			  pointers to the DST records containing the tables.
+!	pctbl_base	- The address which is the base address for
+!			  the PC/LINE tables
+!	line_no_ptr	- An output parameter for the line number.
+!	stmt_no_ptr	- An output parameter for the statement number.
+!	line_pc		- An output parameter for the start pc of the 
+!			  selected line/stmt.
+!
+! ROUTINE VALUE:
+!
+!	This routine returns one of three values: 0, 1, or 2.
+!	Note that the caller, DBG$PC_TO_LINE_LOOKUP, may change
+!	return status "1" to return status "3" if we did not get
+!	an exact match. See that routine for further details
+!	on how the return status is used.
+!
+!	0	- If no match can be made because pc/line tables are
+!		  not available for the given address. This may occur
+!		  because the module containing the address was not
+!		  set or was compiled /NODEBUG, or because the address
+!		  is in system space or in an RTL shareable image.
+!	1	- If a line number/stmt number was found.
+!	2       - If there are pc/line tables available for the
+!		  module containing the given address, but no match
+!		  was found. This occurs if the address is not within
+!		  any line in the module. The use of the "TERM" record
+!		  in PC/LINE tables terminates an address range for
+!		  a line without starting a new line, and this can
+!		  give rise to addresses without line numbers.
+!--
+    BEGIN
+    MAP
+    	MODPCTBL: REF VECTOR[,LONG];
+
+
+    ! If we do not have a PC/LINE table, just return 0.
+    !
+    IF .MODPCTBL EQL 0 THEN RETURN 0;
+
+
+    ! Set up the OWN variables that we use for reading the PC/LINE tables.
+    ! This includes a count of the number of PC/LINE DST records in this
+    ! module we have looked at so far (initialized to 1 here), a count
+    ! of the total number of PC/LINE DST records in the module, a pointer
+    ! to our position in the table of PC/LINE DST records,
+    ! and a pointer to the first such DST record.
+    ! If there are zero PC/LINE tables in this module, return 0 here.
+    !
+    PCTBL_COUNT = 1;
+    NUM_PC_TBLS = .MODPCTBL[0];
+    CURRENT_TABLE = MODPCTBL[1];
+    DST_ENTRY = .MODPCTBL[1];
+    IF .NUM_PC_TBLS EQL 0 THEN RETURN 0;
+
+
+    ! Initialize the state variables (OWN variables in this module)
+    ! that are used by PROC_PC_CMD.
+    !
+    current_line = 0;
+    current_stmt = 1;
+    current_incr = 1;
+    current_stmt_mode = FALSE;
+    current_pc = start_pc = .pctbl_base;
+    current_mark = line_closed;
+
+
+    ! Call a routine that processes all PC correlation commands
+    ! until a delta-PC command is seen. Then process that
+    ! delta-PC command and return to this routine. If the processing
+    ! is generally successful, return 1, otherwise return 0.
+    !
+    dpc_entry = dst_entry [dst$b_vflags];
+    REPEAT
+	BEGIN
+	prev_line = .current_line;
+	prev_stmt = .current_stmt;
+	prev_incr = .current_incr;
+	prev_stmt_mode = .current_stmt_mode;
+	prev_pc = .current_pc;
+	prev_mark = .current_mark;
+
+
+    	! If we PROC_PC_CMD fails we have come to the end
+    	! of the PC/LINE table for this module, without finding
+    	! a match. In this case, return 2, indicating that we
+    	! are in a module with PC/LINE tables, but we could not
+    	! match the given PC.
+    	!
+	IF NOT proc_pc_cmd ( )
+	THEN
+	    RETURN 2;
+
+
+	! Report a match to a line if:
+	! - the PC is within the range given by 
+    	!   the previous PC and the current PC, and
+    	! - the line is marked as being OPEN.
+    	!
+	IF (.prev_pc LEQA .match_pc_ptr) AND
+	   (.match_pc_ptr LSSA .current_pc) AND
+    	   (.prev_mark EQL line_open)
+	THEN 
+	    BEGIN
+	    .stmt_no_ptr = (IF .prev_stmt EQL 1 THEN 0
+					        ELSE .prev_stmt); ! Huh?
+	    .line_no_ptr = .prev_line;
+	    .line_pc = .prev_pc;
+	    RETURN 1;
+	    END;
+
+
+	! Found nothing this round; continue trying.
+    	!
+	END;		! End of REPEAT.
+
+
+    ! We have not found a match - return 2, indicating that we
+    ! are in a module with PC/LINE tables, but we could not
+    ! match the given PC.
+    !
+    RETURN 2;
+    END;
+
+GLOBAL ROUTINE DBG$LINE_TO_PC_LOOKUP (LINE_NUM, STMT_NUM, MC_PTR,
+				LINE_PC, LINE_END, FLAG) =
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine finds the absolute PC address associated with
+!	a line number/statement number.
+!
+!	Each PC correlation record that exists for a single routine
+!	is sequentially analyzed until the desired line number
+!	is seen.
+!
+!	If a match cannot be made because an end of routine record or
+!	an invalid record is recognized, then this routine returns
+!	FALSE.
+!
+! FORMAL PARAMETERS:
+!	line_num	- the line number to find.
+!	stmt_num	- the statement number to find.
+!	mc_ptr		- module rstptr
+!	line_pc		- where to store the computed address.
+!	line_end	- a copy-back pointer for the line-end pc value.
+!	flag		- flag set to indicate more line information is needed.
+!
+! ROUTINE VALUE:
+!	The routine value is TRUE if the desired line was successfully
+!		found; it is FALSE otherwise.
+!
+!
+
+    BEGIN
+    MAP
+    	MC_PTR: REF RST$ENTRY;
+
+    LOCAL
+    	MODPCTBL: REF VECTOR[,LONG];
+
+
+    ! Adjust a statement number of 1 to 0 (%LINE 10.1 is equivalent
+    ! to %LINE 10, and the algorithm below coughs at statement numbers of 1
+    !
+    IF .STMT_NUM EQL 1 THEN STMT_NUM = 0;
+
+
+    ! Set up the OWN variables that we use for reading the PC/LINE tables.
+    ! This includes a count of the number of PC/LINE DST records in this
+    ! module we have looked at so far (initialized to 1 here), a count
+    ! of the total number of PC/LINE DST records in the module, a pointer
+    ! to our position in the table of PC/LINE DST records,
+    ! and a pointer to the first such DST record.
+    ! If there are zero PC/LINE tables in this module, return 0 here.
+    !
+    PCTBL_COUNT = 1;
+    MODPCTBL = .MC_PTR[RST$L_MODPCTBL];
+    IF .MODPCTBL EQL 0 THEN RETURN FALSE;
+    NUM_PC_TBLS = .MODPCTBL[0];
+    CURRENT_TABLE = MODPCTBL[1];
+    DST_ENTRY = .MODPCTBL[1];
+    IF .NUM_PC_TBLS EQL 0 THEN RETURN 0;
+
+
+    ! Initialize state variables. These are OWN variables that
+    ! are used by PROC_PC_CMD.
+    !
+    current_line = 0;
+    current_stmt = 1;
+    current_incr = 1;
+    current_stmt_mode = FALSE;
+    current_pc = start_pc = .mc_ptr[rst$l_pctbl_base];
+    current_mark = line_closed;
+
+
+    ! Loop through the PC Correlation Tables for this module until the
+    ! desired line number is found or the table ends.  To do this, we call
+    ! PROC_PC_CMD to process all PC Correlation commands until a delta-PC
+    ! command is found.  It then returns a PC and a line number and we
+    ! check whether that is the line number we are looking for.  If not,
+    ! we loop for the next line until the desired line is found or no PC
+    ! Correlation commands remain.
+    !
+    dpc_entry = dst_entry [dst$b_vflags];
+    REPORT_PREV_LINE = 0;
+    REPORT_PREV_STMT = 1;
+    REPORT_NEXT_LINE = .LINE_NUM;
+    REPORT_NEXT_STMT = .STMT_NUM;
+    WHILE TRUE DO
+	BEGIN
+
+
+	! Remember the previous values of all the state variables
+	! before getting the current values this time around.
+	!
+	PREV_LINE = .CURRENT_LINE;
+	PREV_STMT = .CURRENT_STMT;
+	PREV_INCR = .CURRENT_INCR;
+	PREV_STMT_MODE = .CURRENT_STMT_MODE;
+	PREV_PC = .CURRENT_PC;
+	PREV_MARK = .CURRENT_MARK;
+
+
+	! Call PROC_PC_CMD to get the next PC - line number pair.
+	! When there are no more lines, exit this loop.
+	!
+	IF NOT PROC_PC_CMD() THEN EXITLOOP;
+
+
+    	! Set report next line and stmt for the first time.
+    	!
+    	IF (.REPORT_NEXT_LINE EQL .LINE_NUM) AND
+    	   (.REPORT_NEXT_STMT EQL .STMT_NUM)
+    	THEN
+    	    BEGIN
+    	    IF (.CURRENT_LINE GTR .LINE_NUM) OR
+    	       ((.CURRENT_LINE EQL .LINE_NUM) AND
+    	        (.CURRENT_STMT GTR .STMT_NUM))
+    	    THEN
+    		BEGIN
+    		REPORT_NEXT_LINE = .CURRENT_LINE;
+    		REPORT_NEXT_STMT = .CURRENT_STMT;
+    		END;
+
+    	    END;
+
+
+    	! At this point we have Prev. line, current line, and given line info.
+    	! So we define the reporting line information centered around given line.
+    	! (we choose the closest two ends value).
+    	!
+    	! Define report prev. line.
+    	!
+    	IF .REPORT_PREV_LINE LSS .LINE_NUM 
+    	THEN
+    	    BEGIN
+    	    IF .PREV_LINE LSS .LINE_NUM
+    	    THEN
+    		REPORT_PREV_LINE = MAX(.REPORT_PREV_LINE, .PREV_LINE)
+    	    ELSE
+    		BEGIN
+    		IF ((.PREV_LINE EQL .LINE_NUM) AND
+    		    (.PREV_STMT LSS .STMT_NUM))
+    		THEN
+    		    BEGIN
+    		    REPORT_PREV_LINE = .PREV_LINE;
+    		    REPORT_PREV_STMT = .PREV_STMT;
+    		    END;
+
+    		END;
+
+    	    END
+
+    	ELSE
+    	    BEGIN
+    	    IF ((.REPORT_PREV_LINE EQL .LINE_NUM) AND
+    	        (.REPORT_PREV_STMT LSS .STMT_NUM))
+    	    THEN
+    	        BEGIN
+    		IF (.PREV_LINE EQL .LINE_NUM) AND
+    		   (.PREV_STMT LSS .STMT_NUM)
+    		THEN
+    		    REPORT_PREV_STMT = MAX(.PREV_STMT, .REPORT_PREV_STMT);
+
+    	        END;
+
+    	    END;
+
+
+    	! Define report next line.
+    	!
+    	IF .REPORT_NEXT_LINE GTR .LINE_NUM 
+    	THEN
+    	    BEGIN
+    	    IF .CURRENT_LINE GTR .LINE_NUM
+    	    THEN
+    		REPORT_NEXT_LINE = MIN(.REPORT_NEXT_LINE, .CURRENT_LINE)
+    	    ELSE
+    		BEGIN
+    		IF ((.CURRENT_LINE EQL .LINE_NUM) AND
+    		    (.CURRENT_STMT GTR .STMT_NUM))
+    		THEN
+    		    BEGIN
+    		    REPORT_NEXT_LINE = .CURRENT_LINE;
+    		    REPORT_NEXT_STMT = .CURRENT_STMT;
+    		    END;
+
+    		END;
+
+    	    END
+
+    	ELSE
+    	    BEGIN
+    	    IF ((.REPORT_NEXT_LINE EQL .LINE_NUM) AND
+    	        (.REPORT_NEXT_STMT GTR .STMT_NUM))
+    	    THEN
+    	        BEGIN
+    		IF (.CURRENT_LINE EQL .LINE_NUM) AND
+    		   (.CURRENT_STMT GTR .STMT_NUM)
+    		THEN
+    		    REPORT_PREV_STMT = MIN(.CURRENT_STMT, .REPORT_NEXT_STMT);
+
+    	        END;
+
+    	    END;
+
+
+    	! Note that: above code did not take care of the equality condition.
+    	! it should be set up here and tested in give_line_info.
+    	!
+	! If the current line number is equivalent to the one we were
+	! passed (and this includes the statement number), then we
+	! return the corresponding PC to LINE_PC and we return TRUE.
+	! If we are at the right line but there is no such statement
+	! number, we clear LINE_PC and return FALSE.
+	!
+	IF .CURRENT_LINE EQL .LINE_NUM
+	THEN 
+	    BEGIN
+	    IF  MAX (.CURRENT_STMT, 1) EQL MAX(.STMT_NUM, 1)
+	    THEN
+		BEGIN
+		.LINE_PC = .CURRENT_PC;
+    		IF NOT FIND_EOL(.LINE_END) 
+    		THEN 
+    		    BEGIN
+    		    IF .FLAG THEN GIVE_LINE_INFO(.LINE_NUM, .STMT_NUM);
+    		    RETURN FALSE;
+    		    END;
+
+		RETURN TRUE;
+		END
+
+	    ELSE
+		BEGIN
+		IF MAX(.CURRENT_STMT,1) GTR MAX(.STMT_NUM,1) 
+		THEN
+		    BEGIN
+		    .LINE_PC = 0;
+    		    IF .FLAG THEN GIVE_LINE_INFO(.LINE_NUM, .STMT_NUM);
+		    RETURN FALSE;
+		    END;
+
+		END;
+
+	    END;
+
+	END;				! End of WHILE loop over PC Corr Tbl
+
+
+    ! The desired line number was not found.  Clear LINE_PC and return FALSE
+    ! as the routine value.
+    !
+    IF .FLAG THEN GIVE_LINE_INFO(.LINE_NUM, .STMT_NUM);
+    .LINE_PC = 0;
+    RETURN FALSE;
+    END;
+
+GLOBAL ROUTINE dbg$pc_to_line_lookup (match_pc_ptr,line_no_ptr, stmt_no_ptr,
+				      line_start,  line_end,    mod_symid) =
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine matches an address to a line number.
+!	We need to do this in several situations:
+!
+!	1. When stepping by line, to determine when to stop stepping. (DBGEVENT)
+!	2. When symbolizing a code address to put out "%LINE XX" (DBGSYMBLZ)
+!	3. Putting out the SHOW CALLS display (DBGTBK)
+!	4. Finding the start of the line for "EX/INS ^" (DBGLEVEL3)
+!	5. Source display, as in EX/SOURCE .PC (DBGSOURCE)
+!
+!	The line number (and statement number, for BASIC) is returned.
+!	Also returned are: the start and end address of the line,
+!	and a pointer to the module RST entry for the module containing
+!	the given address.
+!
+!	Each PC correlation record that exists for the module
+!	is sequentially analyzed until the desired address is seen.
+!
+!	This routine is actually just a cover routine for DBG$PC_TO_LINE,
+!	where the real work is done.
+!
+! FORMAL PARAMETERS:
+!
+!	match_pc_ptr	- the address to be matched.
+!	line_no_ptr	- an output parameter for the line number.
+!	stmt_no_ptr	- an output parameter for the statement number.
+!	line_start	- an output parameter for the start pc of the 
+!			  selected line/stmt.
+!	line_end	- an output parameter for the end pc of the
+!			  selected line/stmt.
+!	mod_symid	- An in/out parameter, as follows:
+!
+!			  If the caller has a SYMID for a block, routine,
+!			  or module which contains the given address, then
+!			  this symid can be passed in here. This saves
+!			  a search of the Static Address Table.
+!			  If the caller
+!			  does not have a symid, then zero is passed in.
+!			  Note that these are passed in with an extra level
+!			  of indirection, e.g.,
+!			  SYMID = 0;
+!			  STATUS = DBG$PC_TO_LINE_LOOKUP(.ADDRESS,...,SYMID);
+!
+!			  In either case, this parameter is filled in with
+!			  the address of the module containing MATCH_PC_PTR.
+!
+! ROUTINE VALUE:
+!
+!	This routine can return four values: 0, 1, 2, or 3.
+!	Most of the callers just test the result for
+!	TRUE (meaning a match was found), or FALSE (meaning a match
+!	was not found). So for these callers, 0 and 2 are the same,
+!	and 1 and 3 are the same.
+!
+!	DBGEVENT needs more detailed information than just whether
+!	a match was found, in order to decide whether to continue
+!	stepping. It needs to know why a match was not found, or
+!	if one was found, whether or not it was an exact match.
+!	So for the DBGEVENT call, we return the following:
+! 
+!	0	- If no match can be made because pc/line tables are
+!		  not available for the given address. This may occur
+!		  because the module containing the address was not
+!		  set or was compiled /NODEBUG, or because the address
+!		  is in system space or in an RTL shareable image.
+!	1	- If a line number/stmt number was found, and we
+!		  have an exact match to that line number.
+!	2       - If there are pc/line tables available for the
+!		  module containing the given address, but no match
+!		  was found. This occurs if the address is not within
+!		  any line in the module. The use of the "TERM" record
+!		  in PC/LINE tables terminates an address range for
+!		  a line without starting a new line, and this can
+!		  give rise to addresses without line numbers.
+!	3	- If there is a line number associated with the address, but
+!		  it is not an exact match.
+!
+    BEGIN
+    LOCAL
+    	rstptr: REF rst$entry,	! Module RST pointer
+	status;			! Return Status
+
+
+    ! If we do not know an RST entry for a program unit
+    ! containing the given address, we'll look
+    ! it up through the Program-level SAT.  
+    ! If we already have the information
+    ! (passed in from the caller) then just set it up.
+    !
+    IF ..mod_symid EQL 0
+    THEN
+        BEGIN
+    	status = dbg$pc_to_symid(.match_pc_ptr, rstptr);
+
+
+    	! If PC_TO_SYMID failed, then we do not have a module containing
+    	! the address in our module chain. Thus, return zero.
+    	!
+    	IF NOT .status THEN RETURN 0;
+    	END
+
+    ELSE
+        rstptr = ..mod_symid;
+
+
+    ! Go upscope to the module level, just in case a caller passed in
+    ! a routine or block RST entry. 
+    !
+    WHILE (.rstptr[rst$b_kind] NEQ rst$k_module) DO
+        rstptr = .rstptr[rst$l_upscopeptr];
+
+
+    ! Set the return module RST.
+    !
+    .mod_symid = .rstptr;
+
+
+    ! Now call the routine to do the real work. Pass along the three
+    ! output parameters LINE_NO_PTR, STMT_NO_PTR, and LINE_START,
+    ! to be filled in by DBG$PC_TO_LINE.
+    !	
+    status = dbg$pc_to_line(.match_pc_ptr, .rstptr[rst$l_modpctbl],
+    			    .rstptr[rst$l_pctbl_base],
+			    .line_no_ptr,  .stmt_no_ptr, .line_start);
+
+
+    ! We get the return code from DBG$PC_TO_LINE. Here we check
+    ! for the PC being an exact match. If not, we change the "1"
+    ! return status to a "3" to indicate this. We also fill in the
+    ! LINE_END output parameter, using the OWN variable CURRENT_PC
+    ! that gets set in the processing of PC/LINE records.
+    !
+    IF .status EQL 1
+    THEN
+     	BEGIN
+    	.line_end = .current_pc - 1;
+    	IF ..line_start NEQA .match_pc_ptr
+	THEN
+    	    status = 3;		! not exact match.
+    	END;
+
+    RETURN .status;
+    END;
+
+ROUTINE PROC_PC_CMD =
+!++
+! Functional description:
+!
+!	This routine processes PC correlation commands until a
+!	delta-Pc command is seen. The delta-PC command is also processed.
+!	Then this routine returns with all the contents of the
+!	parameter pointers updated appropriately.
+!
+!	This routine moves from PC record to PC record as necessary. If
+!	no more records are seen, this routine returns false. If
+!	an error is seen in a PC correlation record, then this
+!	routine sets the contents of line_ptr to zero and
+!	returns false.
+!
+! Inputs:
+!
+! Implicit inputs:
+!	None
+!
+! Implicit outputs:
+!	the contents of the line pointer, the increment pointer, the
+!	statement pointer, the next_pc pointer, dpc_entry, and possible
+!	dst_entry are updated to new values.
+!
+! Routine value:
+!	TRUE if all goes well, otherwise FALSE.
+!
+! Side effects:
+!	More of the correlation records for this routine are read.
+!--
+
+	BEGIN
+
+	REPEAT
+		BEGIN
+
+
+		! See whether the current record is exhausted. If
+		! so, get a new record. If none are available,
+		! return FALSE. Otherwise, set dpc_entry to point to
+		! the address of the third byte of the correlation record.
+		!
+		IF dpc_entry[current_byte] GTR (.dst_entry[dst$b_length] +
+				dst_entry[dst$b_length])
+		THEN
+			BEGIN
+    			PCTBL_COUNT = .PCTBL_COUNT + 1;
+    			IF .PCTBL_COUNT GTR .NUM_PC_TBLS THEN RETURN FALSE;
+			current_table = .current_table + 4;
+			dst_entry = ..current_table;
+			dpc_entry = dst_entry [dst$b_vflags];
+			END;
+
+
+		! Now process each command, either PC correlation or
+		! delta-PC one at a time. Once a delta-PC command is
+		! processed, control returns from this routine to its
+		! caller.
+    		!
+		CASE .dpc_entry [current_byte] FROM 1 TO dst$k_pccor_high OF
+			SET
+
+
+			! Read the next two bytes as an unsigned word 
+    			! representing a delta-PC value.  Update the next_pc 
+    			! and update the dpc_entry address.
+			!
+			[dst$k_delta_pc_w]:
+    				BEGIN
+				IF .current_stmt_mode
+				THEN
+					current_stmt = .current_stmt + 1
+				ELSE
+					current_line = .current_line +
+								.current_incr;
+
+				current_mark = line_open;
+				current_pc = .current_pc +
+						.dpc_entry [next_uns_word];
+				dpc_entry = dpc_entry [add_three_bytes];
+				RETURN TRUE;
+				END;
+
+
+			! Read the next four bytes as an unsigned longword 
+    			! representing a delta-PC value.  Update the next_pc 
+    			! and update the dpc_entry address.
+			!
+			[dst$k_delta_pc_l]:
+    				BEGIN
+				IF .current_stmt_mode
+				THEN
+					current_stmt = .current_stmt + 1
+				ELSE
+					current_line = .current_line +
+								.current_incr;
+
+				current_mark = line_open;
+				current_pc = .current_pc +
+						.dpc_entry [next_uns_long];
+				dpc_entry = dpc_entry [add_five_bytes];
+				RETURN TRUE;
+				END;
+
+
+			! Increase the current line number by the value 
+    			! contained in the next unsigned byte.
+			!
+			[dst$k_incr_linum]:
+    				BEGIN
+				current_line = .current_line + .dpc_entry [next_uns_byte];
+				IF .current_stmt_mode THEN current_stmt = 1;
+				dpc_entry = dpc_entry [add_two_bytes];
+				END;
+
+
+			! Increase the current line number by the value 
+    			! contained in the next unsigned word.
+			!
+			[dst$k_incr_linum_w]:
+				BEGIN
+				IF .current_stmt_mode THEN current_stmt = 1;
+				current_line = .current_line + .dpc_entry [next_uns_word];
+				dpc_entry = dpc_entry [add_three_bytes];
+				END;
+
+
+			! Increase the current line number by the value 
+    			! contained in the next unsigned longword.
+			!
+			[dst$k_incr_linum_l]:
+				BEGIN
+				IF .current_stmt_mode THEN current_stmt = 1;
+				current_line = .current_line + .dpc_entry [next_uns_long];
+				dpc_entry = dpc_entry [add_five_bytes];
+				END;
+
+
+			! Change the line increment from its present value to 
+    			! the value contained in the next unsigned byte.
+			!
+			[dst$k_set_linum_incr]:
+    				BEGIN
+				IF .current_stmt_mode THEN current_stmt = 1;
+				current_incr = .dpc_entry [next_uns_byte];
+				dpc_entry = dpc_entry [add_two_bytes];
+				END;
+
+
+			! Change the line increment from its present value to 
+    			! the value contained in the next word.
+			!
+			[dst$k_set_linum_incr_w]:
+    				BEGIN
+				IF .current_stmt_mode THEN current_stmt = 1;
+				current_incr = .dpc_entry [next_uns_word];
+				dpc_entry = dpc_entry [add_three_bytes];
+				END;
+
+
+			! Revert to a line increment of value 1.
+			!
+			[dst$k_reset_linum_incr]:
+    				BEGIN
+				IF .current_stmt_mode THEN current_stmt = 1;
+				current_incr = 1;
+				dpc_entry = dpc_entry [add_one_byte];
+				END;
+
+			[dst$k_beg_stmt_mode]:
+				BEGIN
+				IF .current_mark NEQ line_open
+				THEN
+					SIGNAL(dbg$_invdstrec);
+
+				current_stmt = 1;
+				current_stmt_mode = TRUE;
+				dpc_entry = dpc_entry[add_one_byte];
+				END;
+
+			[dst$k_end_stmt_mode]:
+				BEGIN
+				current_stmt = 1;
+				current_stmt_mode = FALSE;
+				dpc_entry = dpc_entry[add_one_byte];
+				END;
+
+			[dst$k_set_linum_b]:
+				BEGIN
+				current_line = .dpc_entry[next_uns_byte];
+				dpc_entry = dpc_entry[add_two_bytes];
+				END;
+
+			[dst$k_set_linum]:
+				BEGIN
+				current_line = .dpc_entry[next_uns_word];
+				dpc_entry = dpc_entry[add_three_bytes];
+				END;
+
+			[dst$k_set_linum_l]:
+				BEGIN
+				current_line = .dpc_entry[next_uns_long];
+				dpc_entry = dpc_entry[add_five_bytes];
+				END;
+
+			[dst$k_set_stmtnum]:
+				BEGIN
+				current_stmt = .dpc_entry[next_uns_word];
+				dpc_entry = dpc_entry[add_three_bytes];
+				END;
+
+			[dst$k_set_pc]:
+				BEGIN
+				IF .current_mark NEQ line_closed
+				THEN
+					SIGNAL (dbg$_invdstrec);
+
+				current_pc = .start_pc +
+						.dpc_entry[next_uns_byte];
+				dpc_entry = dpc_entry[add_two_bytes];
+				END;
+
+			[dst$k_set_pc_w]:
+				BEGIN
+				IF .current_mark NEQ line_closed
+				THEN
+					SIGNAL (dbg$_invdstrec);
+
+				current_pc = .start_pc +
+						.dpc_entry[next_uns_word];
+				dpc_entry = dpc_entry[add_three_bytes];
+				END;
+
+			[dst$k_set_pc_l]:
+				BEGIN
+				IF .current_mark NEQ line_closed
+				THEN
+					SIGNAL (dbg$_invdstrec);
+
+				current_pc = .start_pc +
+						.dpc_entry[next_uns_long];
+				dpc_entry = dpc_entry[add_five_bytes];
+				END;
+
+
+			! Set the current PC value to an absolute address.
+			!
+			[DST$K_SET_ABS_PC]:
+				BEGIN
+				IF .CURRENT_MARK NEQ LINE_CLOSED
+				THEN
+				    SIGNAL(DBG$_INVDSTREC);
+
+				CURRENT_PC = .DPC_ENTRY[NEXT_UNS_LONG];
+				DPC_ENTRY = DPC_ENTRY[ADD_FIVE_BYTES];
+				END;
+
+			[dst$k_term]:
+				BEGIN
+				current_pc = .current_pc +
+						.dpc_entry[next_uns_byte];
+				current_mark = line_closed;
+				dpc_entry = dpc_entry[add_two_bytes];
+				RETURN TRUE;
+				END;
+
+			[dst$k_term_w]:
+				BEGIN
+				current_pc = .current_pc +
+						.dpc_entry[next_uns_word];
+				current_mark = line_closed;
+				dpc_entry = dpc_entry[add_three_bytes];
+				RETURN TRUE;
+				END;
+
+
+			[dst$k_term_l]:
+				BEGIN
+				current_pc = .current_pc +
+						.dpc_entry[next_uns_long];
+				current_mark = line_closed;
+				dpc_entry = dpc_entry[add_five_bytes];
+				RETURN TRUE;
+				END;
+
+
+			! This is a standard delta_PC command if the value is 
+    			! less than or equal to zero. Otherwise it is an error. 
+    			! If okay, set next_pc value, update the dpc_entry,
+			! and return with success.
+			!
+			[OUTRANGE]:
+				BEGIN
+				IF .dpc_entry [current_byte] LSS
+							dst$k_delta_pc_low
+				OR .dpc_entry[current_byte] GTR
+							dst$k_delta_pc_high
+				THEN
+					SIGNAL (dbg$_invdstrec);
+
+				IF .current_stmt_mode
+				THEN
+					current_stmt = .current_stmt + 1
+				ELSE
+					current_line = .current_line +
+								.current_incr;
+
+				current_pc = .current_pc -
+						.dpc_entry [current_byte];
+				current_mark = line_open;
+				dpc_entry = dpc_entry [add_one_byte];
+				RETURN TRUE;
+				END;
+
+			TES;
+		END;
+
+    	RETURN 0;
+	END;
+
+ROUTINE FIND_EOL(LINE_END) =
+!++
+! Functional description:
+!	This routine processes PC correlation commands until 
+!	an end of line is found.
+!
+! Inputs:
+!	line_end	- a copy-back pointer for the value of the end-of-line
+!
+! Implicit inputs:
+!	None
+!
+! Implicit outputs:
+!	the contents of the line pointer, the increment pointer, the
+!	statement pointer, the next_pc pointer, dpc_entry, and possible
+!	dst_entry are updated to new values.
+!
+! Routine value:
+!	TRUE if all goes well, otherwise FALSE.
+!
+! Side effects:
+!	More of the correlation records for this routine are read.
+!--
+
+	BEGIN
+
+	REPEAT
+		BEGIN
+
+
+		! See whether the current record is exhausted. If
+		! so, get a new record. If none are available,
+		! return FALSE. Otherwise, set dpc_entry to point to
+		! the address of the third byte of the correlation record.
+		!
+		IF dpc_entry[current_byte] GTR (.dst_entry[dst$b_length] +
+				dst_entry[dst$b_length])
+		THEN
+			BEGIN
+    			PCTBL_COUNT = .PCTBL_COUNT + 1;
+    			IF .PCTBL_COUNT GTR .NUM_PC_TBLS THEN RETURN FALSE;
+			current_table = .current_table + 4;
+			dst_entry = ..current_table;
+			dpc_entry = dst_entry [dst$b_vflags];
+			END;
+
+
+		! Now process each command, either PC correlation or
+		! delta-PC one at a time.
+    		!
+		CASE .dpc_entry [current_byte] FROM 1 TO dst$k_pccor_high OF
+			SET
+			[dst$k_delta_pc_w]:
+				BEGIN
+				.line_end = (.current_pc - 1) +
+						.dpc_entry [next_uns_word];
+				RETURN TRUE;
+				END;
+
+			[dst$k_delta_pc_l]:
+				BEGIN
+				.line_end = (.current_pc - 1) +
+						.dpc_entry [next_uns_long];
+				RETURN TRUE;
+				END;
+
+			[dst$k_incr_linum]:
+				dpc_entry = dpc_entry [add_two_bytes];
+
+			[dst$k_incr_linum_w]:
+				dpc_entry = dpc_entry [add_three_bytes];
+
+			[dst$k_incr_linum_l]:
+				dpc_entry = dpc_entry [add_five_bytes];
+
+			[dst$k_set_linum_incr]:
+				dpc_entry = dpc_entry [add_two_bytes];
+
+			[dst$k_set_linum_incr_w]:
+				dpc_entry = dpc_entry [add_three_bytes];
+
+			[dst$k_reset_linum_incr]:
+				dpc_entry = dpc_entry [add_one_byte];
+
+			[dst$k_beg_stmt_mode]:
+				dpc_entry = dpc_entry[add_one_byte];
+
+			[dst$k_end_stmt_mode]:
+				dpc_entry = dpc_entry[add_one_byte];
+
+			[dst$k_set_linum_b]:
+				dpc_entry = dpc_entry[add_two_bytes];
+
+			[dst$k_set_linum]:
+				dpc_entry = dpc_entry[add_three_bytes];
+
+			[dst$k_set_linum_l]:
+				dpc_entry = dpc_entry[add_five_bytes];
+
+			[dst$k_set_stmtnum]:
+				dpc_entry = dpc_entry[add_three_bytes];
+
+			[dst$k_set_pc]:
+				BEGIN
+				.line_end = (.start_pc - 1) +
+						.dpc_entry[next_uns_byte];
+				RETURN TRUE;
+				END;
+
+			[dst$k_set_pc_w]:
+				BEGIN
+				.line_end = (.start_pc - 1) +
+						.dpc_entry[next_uns_word];
+				RETURN TRUE;
+				END;
+
+			[dst$k_set_pc_l]:
+				BEGIN
+				.line_end = (.start_pc - 1) +
+						.dpc_entry[next_uns_long];
+				RETURN TRUE;
+				END;
+
+			[DST$K_SET_ABS_PC]:
+				BEGIN
+				.LINE_END = .DPC_ENTRY[NEXT_UNS_LONG] - 1;
+				RETURN TRUE;
+				END;
+
+			[dst$k_term]:
+				BEGIN
+				.line_end = (.current_pc - 1) +
+						.dpc_entry[next_uns_byte];
+				RETURN TRUE;
+				END;
+
+			[dst$k_term_w]:
+				BEGIN
+				.line_end = (.current_pc - 1) +
+						.dpc_entry[next_uns_word];
+				RETURN TRUE;
+				END;
+
+			[dst$k_term_l]:
+				BEGIN
+				.line_end = (.current_pc - 1) +
+						.dpc_entry[next_uns_long];
+				RETURN TRUE;
+				END;
+
+			[OUTRANGE]:
+				BEGIN
+				IF .dpc_entry [current_byte] LSS
+							dst$k_delta_pc_low
+				OR .dpc_entry[current_byte] GTR
+							dst$k_delta_pc_high
+				THEN
+					SIGNAL (dbg$_invdstrec);
+
+				.line_end = (.current_pc - 1) -
+						.dpc_entry [current_byte];
+				RETURN TRUE;
+				END;
+
+			TES;
+
+		END;
+
+    	RETURN 0;
+	END;
+
+ROUTINE GIVE_LINE_INFO(LINE_NUM, STMT_NUM): NOVALUE =
+!
+! FUNCTION
+!	This routine gives prev., current, next line information to the user
+!	when the desired line is not found.
+!
+! INPUTS
+!	REPORT_PREV_LINE - Previous line
+!	REPORT_PREV_STMT - Previous statement
+!	LINE_NUM         - Current line
+!	STMT_NUM	 - Current statement
+!	REPORT_NEXT_LINE - Next line
+!	REPORT_NEXT_STMT - Next statement
+!
+! OUTPUTS
+!	Informational message is displayed.  No return value.
+!
+
+    BEGIN
+
+    LOCAL
+    	BUFFER: VECTOR[80, BYTE],	! Output buffer
+    	BUF_DESC: VECTOR[2, LONG];	! Output buffer string descriptor
+
+
+    IF .STMT_NUM EQL 0 THEN STMT_NUM = 1;
+    IF .REPORT_PREV_STMT EQL 0 THEN REPORT_PREV_STMT = 1;
+    IF .REPORT_NEXT_STMT EQL 0 THEN REPORT_NEXT_STMT = 1;
+
+    BUF_DESC[0] = 79;
+    BUF_DESC[1] = BUFFER[1];
+
+    IF (.REPORT_PREV_LINE EQL 0) AND
+       (.LINE_NUM EQL .REPORT_NEXT_LINE) AND
+       (.REPORT_PREV_STMT EQL 1) AND
+       (.STMT_NUM EQL .REPORT_NEXT_STMT)
+    THEN
+    	BEGIN
+    	DBG$FORMAT_FAO_OUT(BUF_DESC, UPLIT BYTE
+    	    (%ASCIC 'no line information available'));
+    	BUFFER[0] = 79 - .BUF_DESC[0];
+    	SIGNAL(DBG$_LINEINFO, 1, BUFFER);
+    	RETURN 0;
+    	END;
+
+    DBG$FORMAT_FAO_OUT(BUF_DESC, UPLIT BYTE(%ASCIC 'no line !UL'), .LINE_NUM);
+    IF .STMT_NUM GTR 1
+    THEN
+    	DBG$FORMAT_FAO_OUT(BUF_DESC, UPLIT BYTE(%ASCIC '.!UL'), .STMT_NUM);
+
+    IF NOT (.REPORT_PREV_LINE EQL 0 AND .REPORT_PREV_STMT EQL 1)
+    THEN
+    	BEGIN
+    	DBG$FORMAT_FAO_OUT(BUF_DESC, UPLIT BYTE
+    		(%ASCIC ', previous line is !UL'), .REPORT_PREV_LINE);
+
+        IF .REPORT_PREV_STMT GTR 1
+        THEN
+            DBG$FORMAT_FAO_OUT(BUF_DESC, UPLIT BYTE(%ASCIC '.!UL'), .REPORT_PREV_STMT);
+    	END;
+
+    IF NOT (.REPORT_NEXT_LINE EQL .LINE_NUM  AND
+    	    .REPORT_NEXT_STMT EQL .STMT_NUM)
+    THEN
+    	BEGIN
+    	DBG$FORMAT_FAO_OUT(BUF_DESC, UPLIT BYTE
+    		(%ASCIC ', next line is !UL'), .REPORT_NEXT_LINE);
+
+        IF .REPORT_NEXT_STMT GTR 1
+        THEN
+            DBG$FORMAT_FAO_OUT(BUF_DESC, UPLIT BYTE(%ASCIC '.!UL'), .REPORT_NEXT_STMT);
+    	END;
+
+    BUFFER[0] = 79 - .BUF_DESC[0];
+    SIGNAL(DBG$_LINEINFO, 1, BUFFER);
+    RETURN 0;
+    END;
+
+END
+ELUDOM

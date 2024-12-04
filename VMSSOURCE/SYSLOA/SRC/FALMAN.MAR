@@ -1,0 +1,1206 @@
+	.TITLE	FALMAN - Cluster Failover Manager
+	.IDENT	'V04-000'
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; FACILITY: EXECUTIVE, CLUSTER MANAGEMENT
+;
+; ABSTRACT: 
+;	This module contains the routines that direct failover in a
+;	VAXcluster.
+;
+; ENVIRONMENT: VAX/VMS
+;
+; AUTHOR: David W. Thiel,	 CREATION DATE: 24-May-1983
+;
+; MODIFIED BY:
+;
+;	V03-014	DWT0225		David W. Thiel		11-Jul-1984
+;		Change call to temporary name EXE$MNTVERSP2 to
+;		real name EXE$CLUTRANIO.
+;
+;	V03-013	DWT0222		David W. Thiel		25-Jun-1984
+;		Revise CNX$FAILO_SYNC to minimize time delays
+;		in synchronizing failover steps.
+;
+;	V03-012	DWT0220		David W. Thiel		8-May-1984
+;		Correct previous fix to handle reference to symbol
+;		outside of this image.
+;
+;	V03-011	DWT0219		David W. Thiel		8-May-1984
+;		Add synchronization between I/O and lock manager
+;		clusters.
+;
+;	V03-010	DWT0188		David W. Thiel		9-Mar-1984
+;		Correct synchronization routine to correctly drop
+;		thread when it is discovered that another failover
+;		has begun.
+;
+;	V03-009	SRB0110		Steve Beckhardt		2-Feb-1984
+;		Added more failover table entries for improved
+;		consistency checking.
+;
+;	V03-008	DWT0154		David W. Thiel		29-Dec-1983
+;		Use single table for addition and removal of nodes.
+;		Change names of CNX$BEGIN_FAILIN and
+;		CNX$BEGIN_FAILOVER to CNX$MEMBERSHIP_CHANGE.
+;		Remove obsolete failover table entries and
+;		CNX$FAILO_QWAIT routine.
+;
+;	V03-007	DWT0137		David W. Thiel		07-Oct-1983
+;		Differentiate cases of a certain future failover
+;		(based on existence of a broken connection to a
+;		cluster member) and a pending failover (node has
+;		been failed out, but failover table processing
+;		has not begun due to the state of a previous
+;		instance of failover table processing) using the
+;		CLUB$V_LOST_CNX bit.
+;
+;	V03-006	DWT0121		David W. Thiel		20-Aug-1983
+;		Add failover table entry to start journal recovery.
+;
+;	V03-005	DWT0116		David W. Thiel		1-Aug-1983
+;		Correct synchronization logic.  Correct quorum
+;		waiting after a failover.
+;
+;	V03-004	DWT0111		David W. Thiel		27-July-1983
+;		Add fail-in table.
+;		Convert interface to failover routines from JMP to
+;		JSB.
+;
+;	V03-003	SRB0095		Steve Beckhardt		9-Jun-1983
+;		Add entries to failover table.
+;
+;	V03-002	DWT0104		David W. Thiel		8-June-1983
+;		Add failover routine CNX$FAILO_QWAIT that waits for
+;		quorum before completing.
+;		Add CNX$CHECK_FAILOVER to test for and initiate
+;		a pending failover.
+;		
+;	V03-001	DWT0103		David W. Thiel		27-May-1983
+;		Add index definition argument to FSTEP macro.
+;		Add jacket routines for calling existing failover
+;		routines.
+;		Avoid trying to send message to a local node.
+;		Fix logic error in synchronization code.
+;
+;--
+
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+	$CDRPDEF			; CDRP offsets
+	$CLSMSGDEF			; Cluster message definitions
+	$CLUBDEF			; CLUster Block offsets
+	$CSBDEF				; CSB Offsets
+	$FKBDEF				; Fork block offsets
+	$IPLDEF				; IPL definitions
+	$SSDEF				; Status code definitions
+
+;
+; MACRO DEFINITIONS:
+;
+
+	.MACRO	FSTEP	ADDR,STEP_INDEX,?LABEL
+	.SHOW	BINARY
+		; Self relative address
+		LABEL:	.LONG	ADDR-LABEL
+	.IF NB	STEP_INDEX
+	.SHOW	EXPANSIONS
+		STEP_INDEX=	<LABEL-CNX$FAILOVER_TABLE>@<-2>
+	.NOSHOW	EXPANSIONS
+	.ENDC
+	.NOSHOW	BINARY
+	.ENDM	FSTEP
+
+;***************** T E M P O R A R Y   D E F I N I T I O N S : *********
+;
+.IIF NOT_DEFINED CLUFCB$V_WAITING,	CLUFCB$V_WAITING=	CLUFCB$V_FKB_BUSY+1
+.IIF NOT_DEFINED CLUFCB$M_WAITING,	CLUFCB$M_WAITING=	1@CLUFCB$V_WAITING
+;
+;***********************************************************************
+
+
+;***********************************************************************
+;
+; NOTE:	The following assumptions are in effect for this entire module.
+;
+;************************************************************************
+
+	ASSUME	IPL$_SYNCH  EQ  IPL$_SCS
+	ASSUME	IPL$_SYNCH  EQ  IPL$_TIMER
+
+	.SBTTL	CNX$FAILOVER_TABLE - Failover Sequencing Table
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	The failover table lists the sequence of steps in failing nodes
+;	out of a cluster.  Each table entry is the self-relative address
+;	of a routine that performs one step.
+;
+;	If any failover step breaks the thread of IPL SYNC execution, it
+;	is possible that another failover may be needed at that point.
+;	The way in which this is handled depends on a mode of failover
+;	table processing.  In NOREFAIL mode, handling of a subsequent
+;	failover until either this mode is left or the end of table 
+;	processing is reached.  In REFAIL mode, this failover is
+;	abandoned and processing of the table entries is reinitiated
+;	from the beginning.
+;
+;	The table is processed as follows.  Each node independently
+;	executes the steps in the failover table, synchronized only at
+;	the begining and when specific requests for synchronization
+;	are made.  Control of synchronization and other aspects of
+;	failover processing are themselves controlled by table entries.
+;	These special tables entries are described next.
+;
+;    CNX$FAILO_NOP -- No Operation
+;
+;	NOP entry.  Used to reserve space for patching.
+;
+;    CNX$FAILO_END -- End of Table
+;
+;	Marks the end of the table and terminates table processing.
+;
+;    CNX$FAILO_REFAIL -- Set Re-failoverable Mode
+;
+;	Specifies that this failover may be abandoned at any time and
+;	another begun.  In this mode, any suspended thread must save
+;	the failover identification and validate it upon being
+;	resumed.  If the ID has changed, the thread must be terminated;
+;	otherwise, it may proceed.
+;
+;    CNX$FAILO_NOREFAIL -- Clear Re-failoverable Mode
+;
+;	Specifies that this failover may not be abandoned and that
+;	no new failover may be begun.  While in this mode, failover
+;	routines MAY NOT suspend themselves without a guarantee of
+;	resumption.  In particular, a routine MAY NOT wait for a
+;	message to arrive from the corresponding routine on another
+;	node.  Furthermore, a routine MAY NOT wait for process
+;	execution.
+;
+;    CNX$FAILO_SYNC -- Synchronize Failover Steps
+;
+;	Requests synchronization at this step.  One node is selected
+;	as the synchronizer when failover table processing is
+;	initiated.  When this table entry is encountered, every
+;	node sends a READY message to the synchronizing node.  When
+;	the synchronizing node executes this entry, it waits for a
+;	READY from every other node involved in the failover and
+;	then sends a DOSTEP message to every involved node.  It
+;	and the other nodes then complete this step and proceed to
+;	the next.
+;
+;	Following a synchronization step, it is guaranteed that every
+;	other involved node has completed the step preceding the
+;	synchronization step.  Due to delays and queuing of messages,
+;	it is still possible to receive a message from another node
+;	that was queued before the synchronization step.
+;
+;	Requesting a synchronization step ALWAYS puts the failover
+;	into Re-Failoverable Mode.  This results in the very substantial
+;	simplification which allows any communications problems during
+;	synchronization to be handled as part of a subsequent failover.
+;
+; The following description applies to every failover routine:
+;
+; CALLING SEQUENCE:
+;
+;	Invoked by:
+;		JSB failover_routine
+;	IPL is IPL$_SYNC = IPL$_SCS = IPL$_TIMER
+;	To continue failover processing, return with:
+;		RSB
+;	To abandon failover processing in REFAIL mode:
+;		ADDL	#4,SP
+;		RSB
+;	To terminate failover processing in either mode:
+;		ADDL	#4,SP
+;		JMP	CNX$END_FAILOVER
+;
+;	A failover routine runs as a fork process and must
+;	behave according to the general rules for fork processes.
+;
+; INPUT PARAMETERS:
+;
+;	04(SP):	Address of caller's caller -- return here if thread
+;			is suspended
+;	00(SP):	Return here to continue failover processing
+;
+;	R5:	Address of CLUster Failover Control Block (CLUFCB)
+;	R4:	Address of CLUster Block (CLUB)
+;	R3:	Failover ID (copy of CLUFCB$L_ID(R5))
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	Registers R0-R5 need not be preserved.  Everything interesting
+;	that a failover does is a side effect of some sort.
+;
+;--
+
+	.PSECT	$$$060,LONG		; Read only Data PSECT
+
+CNX$FAILOVER_TABLE::
+	FSTEP	CNX$FAILO_NOREFAIL	; Must be first entry
+
+	FSTEP	LCK$STALL_ALL		; Stall lock requests
+;
+; Everything up to this point must be synchronous with the beginning
+; of failover table execution.  Note that the beginning of failover
+; table execution is not necessarily synchronous with the receipt of
+; the phase 2 message in the case when a failover is already in
+; progress.
+;
+	FSTEP	CNX$FAILO_REFAIL	; Must precede synchronize
+	FSTEP	CNX$FAILO_SYNC		; Synchronize
+	FSTEP	CNX$FAILO_NOREFAIL	; Don't allow re-failovers
+
+	FSTEP	CNX$IO_SYNCH		; Serialize I/O
+
+	FSTEP	LCK$SET_STATE1		; Set rebuild state 1
+
+	FSTEP	CNX$FAILO_REFAIL	; Must precede synchronize
+	FSTEP	CNX$FAILO_SYNC		; Synchronize
+	FSTEP	CNX$FAILO_NOREFAIL	; Don't allow re-failovers
+
+	FSTEP	LCK$INIT_REBUILD	; Remove all master copy locks
+					;  and directory entries
+
+	FSTEP	CNX$FAILO_REFAIL	; Must precede synchronize
+	FSTEP	CNX$FAILO_SYNC		; Synchronize
+	FSTEP	CNX$FAILO_NOREFAIL	; Don't allow re-failovers
+
+	FSTEP	LCK$SET_STATE2		; Set rebuild state 2
+
+	FSTEP	CNX$FAILO_REFAIL	; Must precede synchronize
+	FSTEP	CNX$FAILO_SYNC		; Synchronize
+	FSTEP	CNX$FAILO_NOREFAIL	; Don't allow re-failovers
+
+	FSTEP	LCK$REBUILD_LKBS	; Rebuild locks
+
+	FSTEP	CNX$FAILO_REFAIL	; Must precede synchronize
+	FSTEP	CNX$FAILO_SYNC		; Synchronize
+	FSTEP	CNX$FAILO_NOREFAIL	; Don't allow re-failovers
+
+	FSTEP	LCK$SET_STATE3		; Set rebuild state 3
+
+	FSTEP	CNX$FAILO_REFAIL	; Must precede synchronize
+	FSTEP	CNX$FAILO_SYNC		; Synchronize
+	FSTEP	CNX$FAILO_NOREFAIL	; Don't allow re-failovers
+
+	FSTEP	LCK$REBUILD_RSBS	; Rebuild resources, grant 
+					; unprotected locks
+
+	FSTEP	CNX$FAILO_REFAIL	; Must precede synchronize
+	FSTEP	CNX$FAILO_SYNC		; Synchronize
+	FSTEP	CNX$FAILO_NOREFAIL	; Don't allow re-failovers
+
+	FSTEP	LCK$SET_STATE0		; Set rebuild state 0
+
+	FSTEP	CNX$FAILO_REFAIL	; Must precede synchronize
+	FSTEP	CNX$FAILO_SYNC		; Synchronize
+
+	FSTEP	LCK$RESUME_UNPROT	; Resume processes waiting for 
+					; unprotected locks
+
+	FSTEP	CNX$FAILO_JNL		; CSP/RCP recovery initiation
+
+	FSTEP	CNX$FAILO_SYNC		; Synchronize
+
+	FSTEP	LCK$RESUME_ALL		; Resume processes waiting for any
+					;  type of lock request
+
+	FSTEP	CNX$FAILO_NOREFAIL	; Don't allow re-failovers
+
+	FSTEP	LCK$REBUILD_RSBS	; Rebuild resources, grant 
+					;  protected (all) locks
+
+	FSTEP	CNX$FAILO_REFAIL,FORCE_END	; Ending point
+	FSTEP	CNX$FAILO_END		; End of table
+;
+	.BLKL	8			; Reserve patch space
+;
+;
+	.PSECT	$$$100,LONG
+
+	.DEFAULT	DISPLACEMENT,WORD
+
+	.SBTTL	CNX$MEMBERSHIP_CHANGE - Begin membership change actions
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;  CNX$MEMBERSHIP_CHANGE
+;	This routine is called whenever a node or nodes are added to
+;	or removed from a cluster, including initial cluster formation.
+;	Actions are undertaking by the members of the cluster to
+;	adjust to the new cluster membership.  If an uninterruptible
+;	action is already in progress, handling of the new event is deferred.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$MEMBERSHIP_CHANGE
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	R0-R5 are destroyed.
+;
+;--
+
+	.ENABLE	LSB
+CNX$MEMBERSHIP_CHANGE::
+1$:	MOVL	G^CLU$GL_CLUB,R4	; Address of CLUB
+	MOVAB	CLUB$B_CLUFCB(R4),R5	; Address of failover control block
+	BBC	#CLUFCB$V_ACTIVE, -	; Branch if no active failover and
+		CLUFCB$L_STATUS(R5),10$	;   set active failover flag
+	BISL2	#CLUFCB$M_PENDING, -	; Set failover pending flag
+		CLUFCB$L_STATUS(R5)
+	RSB				; Return, will do failover later
+
+10$:	BICL2	#<CLUFCB$M_PENDING ! -	; Clear failover pending flag
+		  CLUFCB$M_SYNC_NODE>, - ;  and local synchronizing node flags
+		CLUFCB$L_STATUS(R5)
+	MOVL	CLUB$L_LST_XTN(R4), -	; Make last transition ID the failover
+		CLUFCB$L_ID(R5)		;   identifier
+	CLRL	CLUFCB$L_STEP(R5)	; Initialize failover step
+	MOVL	CLUB$L_COORD(R4), -	; Set up CSB address of synchronizer node
+		CLUFCB$L_SYNC_CSB(R5)
+	CMPL	CLUB$L_COORD(R4), -	; Was this node the failover coordinator?
+		CLUB$L_LOCAL_CSB(R4)
+	BNEQ	20$			; Branch if no
+	BISL2	#CLUFCB$M_SYNC_NODE, -	; Make this node the failover sync node
+		CLUFCB$L_STATUS(R5)
+20$:	PUSHL	R5			; Save CLUFCB address
+	ASSUME	<CLUFCB$B_NODEMAP+CLUFCB$S_NODEMAP> EQ CLUFCB$B_RESPMAP
+	MOVC5	#0,(SP),#0, -		; Clear node map and response map
+		#CLUFCB$S_NODEMAP+CLUFCB$S_RESPMAP, -
+		CLUFCB$B_NODEMAP(R5)
+	POPR	#^M<R5>			; Restore CLUFCB address
+	BSBW	CNX$SCAN_CSBS		; Iterate over all CSBs
+	BLBC	R0,40$			; Branch when done
+	BBC	#CSB$V_MEMBER, -	; Branch if CSB is not for a member node
+		CSB$L_STATUS(R3),30$
+	BBS	#CSB$V_LONG_BREAK, -	; Branch if connection permanently broken
+		CSB$L_STATUS(R3),30$
+	MOVZWL	CSB$W_CSID_IDX(R3),R0	; CSID index of member node
+	BBCS	R0, -			; Mark node present
+		CLUFCB$B_NODEMAP(R5),30$
+30$:	RSB
+
+;
+; Failover routine may jump here to exit failover processing
+;
+CNX$END_FAILOVER::
+	MOVL	G^CLU$GL_CLUB,R4	; Address of CLUB
+	MOVAB	CLUB$B_CLUFCB(R4),R5	; Address of failover control block
+	MOVL	#FORCE_END, -		; Set index to force end of table processing
+		CLUFCB$L_STEP(R5)
+;
+; Begin a failover step
+;
+40$:	MOVL	CLUFCB$L_ID(R5),R3	; Failover ID
+	MOVL	CLUFCB$L_STEP(R5),R0	; Get index of next failover step
+	MOVAL	W^CNX$FAILOVER_TABLE[R0],R0 ; Get table entry
+;
+;	R5:	Address of failover control block (with available fork block at head)
+;	R4:	Address of CLUB
+;	R3:	Failover ID
+;
+	JSB	@(R0)[R0]		; Convert self relative to absolute address
+	MOVL	G^CLU$GL_CLUB,R4	; Address of CLUB
+	MOVAB	CLUB$B_CLUFCB(R4),R5	; Address of failover control block
+;
+; Use the bits CLUFCB$V_ACTIVE, CLUFDB$V_PENDING, and CLUB$V_LOST_CNX to decide whether
+; to continue this failover, start again at the beginning of the table, or drop everything
+; knowing that a new failover will begin soon (the last case is assured if a connection
+; to a cluster member is broken).
+;
+	BBS	#CLUFCB$V_ACTIVE, -	; Branch if new failover may not
+		CLUFCB$L_STATUS(R5),50$	;  commence here
+	BBS	#CLUFCB$V_PENDING, -	; Branch if another failover is pending
+		CLUFCB$L_STATUS(R5),60$	;  and initiate it
+	BBS	#CLUB$V_LOST_CNX, -	; Branch if a connection has been lost and
+		CLUB$L_FLAGS(R4),70$	;  and new failover will soon happen
+50$:	INCL	CLUFCB$L_STEP(R5)	; Advance to next failover routine
+	BRB	40$			; Do next step
+
+60$:	BRW	1$			; Start a new failover
+
+70$:	RSB				; Drop thread -- another failover will come along
+
+	.DISABLE	LSB
+
+	.SBTTL	CNX$FAILO_REFAIL - Allow new failovers to start
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Enter REFAIL mode in which new executions of the failover
+;	table may be initiated.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$FAILO_REFAIL
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	R5:	Address of Failover Control Block
+;	R4:	Address of CLUB
+;	R3:	Failover ID
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+;--
+
+CNX$FAILO_REFAIL::
+	BICL2	#CLUFCB$M_ACTIVE, -	; Clear active bit
+		CLUFCB$L_STATUS(R5)
+	RSB
+
+	.SBTTL	CNX$FAILO_NOREFAIL - Prevent second entrance to failover table
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;
+;	Stop allowing new failovers to begin.
+;	Terminate any previous failover that may have been in progress.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$FAILO_NOREFAIL
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	R5:	Address of Failover Control Block
+;	R4:	Address of CLUB
+;	R3:	Failover ID
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+;--
+
+CNX$FAILO_NOREFAIL::
+	BBSS	#CLUFCB$V_ACTIVE, -	; Set active bit and branch
+		CLUFCB$L_STATUS(R5),10$	;   if it was already set
+	BBCC	#CLUFCB$V_FKB_BUSY, -	; Branch if fork block free
+		CLUFCB$L_STATUS(R5),10$	;   and mark it free
+	REMQUE	(R5),R0			; Remove from queue
+	BICL2	#CLUFCB$M_WAITING, -	; Clear waiting bit
+		CLUFCB$L_STATUS(R5)
+10$:	RSB
+
+	.SBTTL	CNX$FAILO_NOP - Null failover routine
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Null failover routine.  A legitimate failover routine that does
+;	absolutely nothing.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$FAILO_NOP
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	R5:	Address of Failover Control Block
+;	R4:	Address of CLUB
+;	R3:	Failover ID
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+;--
+
+CNX$FAILO_NOP::
+	RSB
+
+	.SBTTL	CNX$FAILO_END - End failover table processing
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	End failover table processing.  This assumes that REFAIL
+;	mode is in effect.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$FAILO_END
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	R5:	Address of Failover Control Block
+;	R4:	Address of CLUB
+;	R3:	Failover ID
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+;--
+
+CNX$FAILO_END::
+	ADDL2	#4,SP			; Remove caller's address
+	RSB				; Return to caller's caller
+
+
+	.SBTTL	CNX$IO_SYNCH - Synchronize with I/O cluster
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Synchronize with the I/O cluster.
+;
+;	Serialize I/O to multi-host disks to ensure that I/O issued under current locks is
+;	completed before I/O issued under locks granted after some locks have been revoked
+;	as the result of removing nodes from the cluster.
+;
+;	Note that it is unnecessary to do this operation if nodes are being added and none
+;	are being removed.
+;
+;	This entry is called following a synchronization call to ensure that all nodes
+;	have disconnected from a node being removed before this call is made.  It is
+;	important that the node being removed has either lost quorum or crashed and
+;	therefore ceased to issue I/O's before this call is made.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$IO_SYNCH
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	R5:	Address of Failover Control Block
+;	R4:	Address of CLUB
+;	R3:	Failover ID
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	Disks are thrown into mount verification.
+;
+;--
+
+CNX$IO_SYNCH:
+	JMP	G^EXE$CLUTRANIO		; Synchronize with I/O cluster and return
+
+
+	.SBTTL	CNX$FAILO_SYNC - Inter-Node Synchronization Failover Routine
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine synchronizes failover action over all involved nodes.
+;	This failover routine does not complete until all nodes have completed
+;	the previous failover step.
+;	A new failover may be begun while this routine is in progress.
+;
+;	The synchronization algorithm is a follows:
+;
+;	One node is chosen as the node to drive the synchronization.  All other
+;	nodes send a message to the sync node when this routine is executed.
+;	If the sync node NAKs the message, the node waits and tries again.  If
+;	the message fails, the node drops its thread, confident that a new
+;	failover will begin sometime and start the whole thing over.  If the
+;	message succeeds, the node then waits for a DOSTEP message, upon
+;	receipt of which it exits from this failover step.
+;
+;	Meanwhile, the sync node waits for all other nodes to report in.  When
+;	a message is received for the right failover, it is noted and ACKed.
+;	If a message is not for the current failover, it is NAKed.  After all
+;	nodes has reported, a DOSTEP message is sent to every other node.
+;	When a connection breaks the CNX$CON_BREAK routine sets a bit that
+;	eliminates that node from consideration by this routine.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$FAILO_SYNC
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	R5:	Address of Failover Control Block
+;	R4:	Address of CLUB
+;	R3:	Failover ID
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+;--
+
+CNX$FAILO_SYNC::
+	BBS	#CLUFCB$V_SYNC_NODE, -	; Branch if this is the
+		CLUFCB$L_STATUS(R5), -	;   synchronizing node
+		5$
+	BRW	100$			; Branch to code for other nodes
+
+5$:	MOVZWL	CLUB$W_LOCAL_CSID_IDX(R4),R0 ; Local CSID index field
+	BBCS	R0, -			; Mark local node responded
+		CLUFCB$B_RESPMAP(R5),7$
+7$:	BRB	14$			; Branch to base of loop
+
+10$:	BISL2	#CLUFCB$M_WAITING, -	; Set waiting bit
+		CLUFCB$L_STATUS(R5)
+	BSBW	DELAY			; Wait for 0-1 second
+	BICL2	#CLUFCB$M_WAITING, -	; Clear waiting bit
+		CLUFCB$L_STATUS(R5)
+14$:	MOVL	#CLUFCB$S_RESPMAP-1,R1	; Byte counter
+15$:	BICB3	CLUFCB$B_RESPMAP(R5)[R1], - ; See if all currently involved
+		CLUFCB$B_NODEMAP(R5)[R1], - ;   nodes have responded
+		R0
+	BNEQ	10$			; Found unresponded node(s)
+	SOBGEQ	R1,15$			; Iterate over all nodes
+	PUSHL	R5			; Save register
+	MOVC5	#0,(SP),#0, -		; Zero out RESPMAP for next use
+		#CLUFCB$S_RESPMAP, -
+		CLUFCB$B_RESPMAP(R5)
+	POPR	#^M<R5>			; Restore register
+;
+; All reponses have been received.  Send a message to every
+; node telling it to proceed with the next step.
+;
+	MOVZWL	#<CLUFCB$S_NODEMAP*8>-1,R4 ; Index in bitmap
+	BRB	30$			; Branch to loop entrance
+
+19$:	BUG_CHECK	CNXMGRERR,FATAL	; Consistency check
+
+20$:	POPR	#^M<R4,R5>		; Restore index and CLUFCB addresses
+	BSBW	DELAY			; Wait 0-1 seconds
+30$:	BBS	R4,CLUFCB$B_NODEMAP(R5),50$ ; Branch if in map
+40$:	SOBGEQ	R4,30$			; Iterate over all possible bits
+	RSB				; All done, return to caller
+
+50$:	MOVL	G^CLU$GL_CLUSVEC,R1	; Address of cluster vector
+	MOVL	(R1)[R4],R3		; Address of CSB
+	BGEQ	19$			; Not a CSB -- consistency check
+	BBS	#CSB$V_LOCAL, -		; Branch if local node to avoid
+		CSB$L_STATUS(R3),40$	;   trying to send message to self
+	PUSHR	#^M<R4,R5>		; Save context
+	BSBW	CNX$ALLOC_CDRP_ONLY	; Get a fork block
+	BSBW	CNX$RESOURCE_CHECK	; Watch resource availability
+	BLBC	R0,20$			; Branch if no memory available
+	MOVL	4(SP),R4		; Restore CLUFCB address
+	MOVZBL	#CLMCNX$K_FNC_DOSTEP, -	; Function code for message
+		CDRP$L_VAL1(R5)
+	BSBW	300$			; Initialize CDRP for mesage building
+	BSBW	CNX$SEND_FORGET		; Send message to remote node and return immediately
+	POPR	#^M<R4,R5>		; Restore index and CLUFCB addresses
+	BBSS	#CLUFCB$V_FKB_BUSY, -	; Branch if busy and mark busy
+		CLUFCB$L_STATUS(R5),19$
+	MOVB	#IPL$_SCS, -		; Store IPL in fork block
+		FKB$B_FIPL(R5) 
+	POPR	#^M<R3>			; Save caller's address
+	JSB	G^EXE$FORK		; Release control momentarily
+	PUSHL	R3			; Restore caller's address
+	BICL2	#CLUFCB$M_FKB_BUSY, -	; Clear busy bit
+		CLUFCB$L_STATUS(R5)
+	BBC	#CLUFCB$V_PENDING, -	; Branch if no failover is
+		CLUFCB$L_STATUS(R5),40$	;  pending
+	RSB				; Return - new failover is pending
+
+;
+; This concludes the code that executes in the synchronizing node.
+; Here begins the code that executes in the non-synchronizing nodes.
+;
+90$:	POPR	#^M<R5>			; Restore CLUFCB addresses
+95$:	BSBB	DELAY			; Wait 0-1 seconds
+;
+; Send message to synchronizing node telling it that we are ready for
+; a command to finish a failover step.
+;
+100$:	MOVL	CLUFCB$L_SYNC_CSB(R5),R3 ; CSB address of synchronizing node
+	PUSHL	R5			; Save context
+	BSBW	CNX$ALLOC_WARMCDRP_CSB	; Get a fork block
+	BSBW	CNX$RESOURCE_CHECK	; Check for pool exhaustion
+	BLBC	R0,90$			; Branch if no memory available
+	POPR	#^M<R4>			; Restore CLUFCB address into R4
+	MOVL	R4,CDRP$L_VAL6(R5)	; Save CLUFCB address
+	POPL	CDRP$L_VAL7(R5)		; Completion address
+	MOVZBL	#CLMCNX$K_FNC_READY, -	; Function code for message
+		CDRP$L_VAL1(R5)
+	BSBB	300$			; Set up CDRP for message
+	BSBW	CNX$SEND_MSG_CSB	; Send message to remote node
+;
+;	Resume here when the response message arrives or the connection
+;	breaks.
+;	Registers contain:
+;		R0:	Status
+;		R2:	Address of message buffer
+;		R3:	Address of CSB
+;		R4:	Address of PDT
+;		R5:	Address of CDRP
+;
+	PUSHL	CDRP$L_VAL7(R5)		; Completion address
+	PUSHL	CDRP$L_VAL2(R5)		; Failover sequence number
+	PUSHL	CDRP$L_VAL6(R5)		; CLUFCB address
+	BSBW	CNX$PROCESS_RESPONSE	; Standard response processing
+	POPR	#^M<R5>			; CLUFCB address
+	CMPL	(SP)+,CLUFCB$L_ID(R5)	; Same step?
+	BNEQ	110$			; Abandon this failover
+	CMPL	R0,#1			; Test return status
+	BLSSU	95$			; Branch on NAK
+	BGTRU	110$			; Connection is broken
+;
+; ACK received
+;
+	BBSS	#CLUFCB$V_FKB_BUSY, -	; Branch if busy and mark busy
+		CLUFCB$L_STATUS(R5),140$
+	BISL2	#CLUFCB$M_WAITING, -	; Set waiting bit, error if
+		CLUFCB$L_STATUS(R5)	;  already set
+	MOVL	(SP),R3			; Save return PC
+	ASSUME	FKB$L_FR4,EQ,<FKB$L_FR3+4>
+	MOVQ	R3,FKB$L_FR3(R5)	; Save R3 and R4
+	MOVAB	B^120$,FKB$L_FPC(R5)	; Restart PC
+	MOVL	R5,(R5)			; Link to self
+	MOVL	R5,4(R5)
+110$:	ADDL2	#4,SP			; Forget return address
+	RSB
+
+120$:	PUSHL	R3			; Restore caller's address
+	BBCC	#CLUFCB$V_FKB_BUSY, -	; Clear busy flag
+		CLUFCB$L_STATUS(R5),140$
+	BICL2	#CLUFCB$M_WAITING, -	; Clear waiting bit
+		CLUFCB$L_STATUS(R5)
+	RSB
+
+140$:	BUG_CHECK	CNXMGRERR,FATAL	; Consistency check
+
+;
+;	Initialize CDRP for building messages
+;
+;	R5:	Address of CDRP
+;	R4:	Address of CLUFCB
+;
+300$:	MOVAB	B^BLD_STEP_MSG, -	; Message build routine address
+		CDRP$L_MSGBLD(R5)
+	MOVL	CLUFCB$L_ID(R4), -	; Failover sequence number
+		CDRP$L_VAL2(R5)
+	MOVL	CLUFCB$L_STEP(R4), -	; Failover routine index
+		CDRP$L_VAL3(R5)
+	RSB
+
+;
+;	Wait 0-1 second on fork and wait queue
+;	If a new failover is requested, return to caller's caller
+;
+;	R5:	Address of CLUFCB fork block
+;	R0-R4 are destroyed.
+;
+DELAY:
+	BBSS	#CLUFCB$V_FKB_BUSY, -	; Branch if busy and mark busy
+		CLUFCB$L_STATUS(R5),20$
+	MOVB	#IPL$_SCS, -		; Store IPL in fork block
+		FKB$B_FIPL(R5) 
+	POPR	#^M<R4>			; Save return address
+	POPR	#^M<R3>			; Save caller's caller's address
+	FORK_WAIT			; Wait and hope some responses appear
+	PUSHL	R3			; Restore caller's caller's address
+	BBCC	#CLUFCB$V_FKB_BUSY, -	; Clear busy bit
+		CLUFCB$L_STATUS(R5),20$
+	BBS	#CLUFCB$V_PENDING, -	; Branch if another failover is
+		CLUFCB$L_STATUS(R5),10$	;   pending and do it
+	PUSHL	R4			; Restore return address
+10$:	RSB
+
+20$:	BUG_CHECK	CNXMGRERR,FATAL	; Consistency check
+
+	.SBTTL	BLD_STEP_MSG - Build Message to Step Failover
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine builds the messages used to sequence failover steps
+;	from data in the CDRP.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	BLD_STEP_MSG
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	R2:	Address of message buffer
+;	R3:	Address of CSB
+;	R4:	Address of PDT
+;	R5:	Address of CDRP
+;		CDRP$L_VAL1(R5): Byte 0 contains facility specific function code
+;		CDRP$L_VAL2(R5): Failover sequence number
+;		CDRP$L_VAL3(R5): Failover step index
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	R0 and R1 are destroyed
+;
+;--
+
+BLD_STEP_MSG:
+	MOVB	#CLSMSG$K_FAC_CNX, -	; Facility code
+		CLSMSG$B_FACILITY(R2)
+	MOVB	CDRP$L_VAL1(R5), -	; Facility specific function code
+		CLSMSG$B_FUNC(R2)
+	MOVL	CDRP$L_VAL2(R5), -	; Failover sequence number 
+		CLMSTP$L_ID(R2)
+	MOVL	CDRP$L_VAL3(R5), -	; Failover step index
+		CLMSTP$L_STEP(R2)
+	RSB
+
+	.SBTTL	CNX$RCVD_READY - Ready for Failover Step Message Received
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called when a message from a node ready to perform
+;	a failover step is received.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$RCVD_READY
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	R2:	Message address
+;	R3:	CSB of sending system
+;	R4:	PDT address
+;	R5:	CDRP address (uninitialized)
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	R0-R5 may be destroyed.
+;--
+
+CNX$RCVD_READY::
+	PUSHL	R2			; Message buffer address
+	BSBW	CNX$INIT_CDRP		; Initialize the CDRP for the response
+	POPR	#^M<R2>			; Restore message buffer address
+	MOVL	CSB$L_CLUB(R3),R4	; Address of CLUB
+	MOVAB	CLUB$B_CLUFCB(R4),R4	; Address of failover block
+	CLRL	R0			; Assume failure
+	CMPL	CLMSTP$L_ID(R2), -	; Is the expected failover in progress?
+		CLUFCB$L_ID(R4)
+	BNEQ	20$			; Branch if not and ignore message
+	CMPL	CLMSTP$L_STEP(R2), -	; Has this step been passed?
+		CLUFCB$L_STEP(R4)
+	BLSSU	90$			; Branch if yes -- something is wrong
+	BBC	#CLUFCB$V_SYNC_NODE, -	; Branch if this is not the synchronizing
+		CLUFCB$L_STATUS(R4),90$	;   node
+	MOVL	#1,R0			; Set success
+	MOVZWL	CSB$W_CSID_IDX(R3),R1	; CSID index of sending system
+	BBSS	R1, -			; Set the response bit corresponding
+		CLUFCB$B_RESPMAP(R4),90$ ;  to the sending node
+20$:	PUSHR	#^M<R0,R4>		; Save status and CLUFCB address
+	MOVL	CSB$L_CLUB(R3),R4	; Address of CLUB
+	MOVZBL	#CLMCNX$K_FNC_READY,R0	; Message ID
+	BSBW	CNX$INIT_STD_RESP	; Set up response message
+	MOVB	(SP),CDRP$L_VAL3+2(R5)	; Store status flag
+	BSBW	CNX$RESP_FORGET		; Send response and exit
+	POPR	#^M<R0,R5>		; Restore status and CLUFCB address
+	BLBC	R0,30$			; Branch if message NAKed
+	BBC	#CLUFCB$V_WAITING, -	; Branch if not waiting for responses
+		CLUFCB$L_STATUS(R5),30$
+	;
+	; Synchronizing node waiting for nodes to respond.
+	; Wake it up.
+	;
+	REMQUE	(R5),R5			; Dequeue fork block
+	ASSUME	FKB$L_FR4,EQ,<FKB$L_FR3+4>
+	MOVQ	FKB$L_FR3(R5),R3	; Restore R3 and R4
+	JSB	@FKB$L_FPC(R5)		; Call fork routine
+30$:	RSB				; Return
+
+90$:	BUG_CHECK	CNXMGRERR,FATAL	; Consistency check
+
+	.SBTTL	CNX$RCVD_DOSTEP - Do Failover Step Message Received
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called when a message from the synchronizing node is
+;	received requesting that a failover step be performed.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$RCVD_DOSTEP
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	R2:	Message address
+;	R3:	CSB of sending system
+;	R4:	PDT address
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	R0-R5 may be destroyed.
+;--
+
+CNX$RCVD_DOSTEP::
+	PUSHL	CLMSTP$L_ID(R2)		; Failover sequence number
+	PUSHL	CLMSTP$L_STEP(R2)	; Failover step index
+	BSBW	CNX$DEALL_MSG_BUF_CSB	; Deallocate message buffer
+	MOVL	CSB$L_CLUB(R3),R4	; Address of CLUB
+	MOVAB	CLUB$B_CLUFCB(R4),R5	; Address of failover block
+	POPR	#^M<R0,R1>		; SEQ to R1, INDEX to R0
+	CMPL	R1,CLUFCB$L_ID(R5)	; Is the expected failover in progress?
+	BNEQ	20$			; Branch if not and ignore message
+	CMPL	R0,CLUFCB$L_STEP(R5)	; Check step number consistency
+	BNEQ	90$			; Branch if different -- something is wrong
+	BBS	#CLUFCB$V_SYNC_NODE, -	; Branch if this is the synchronizing
+		CLUFCB$L_STATUS(R5),90$	;   node -- can't happen
+	BBC	#CLUFCB$V_WAITING, -	; Branch if this node not waiting for response
+		CLUFCB$L_STATUS(R5),90$
+	ASSUME	FKB$L_FR4,EQ,<FKB$L_FR3+4>
+	MOVQ	FKB$L_FR3(R5),R3	; Resume fork block
+	JSB	@FKB$L_FPC(R5)		;   and continue table
+20$:	RSB				; Return
+
+90$:	BUG_CHECK	CNXMGRERR,FATAL	; Consistency check
+
+	.SBTTL	CNX$FAILO_JNL - Initiate journal recovery
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine find and invokes the journal recovery routine.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$FAILO_JNL
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	R5:	Address of Failover Control Block
+;	R4:	Address of CLUB
+;	R3:	Failover ID
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+;--
+
+CNX$FAILO_JNL::
+	MOVL	CLUB$L_JNL_FAIL(R4),R0	; Fetch and test routine address
+	BEQL	10$			; No routine found, complete failover step
+	JMP	(R0)			; Jump to routine -- it sees standard
+					;   failover routine environment
+
+10$:	RSB
+
+	.SBTTL	CNX$CHECK_FAILOVER - Test for and begin pending failover
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine tests for a pending failover and initiates the pending
+;	failover.  If no failover is pending, a check is made for a certain
+;	future failover.  It is is known that a failover will soon happen, the
+;	thread is dropped (return to caller's caller).  If no failover is
+;	pending and no future failover is certain, return to the caller.
+;	It is assumed that failover table processing is in NOREFAIL mode.
+;
+;	This routine is used by failover routines that operate in NOREFAIL
+;	mode to determine whether or not to continue failover processing or
+;	to abandon it in favor of starting over (immediately or in the near
+;	future).  If a decision is made to abandon processing, no return
+;	is made to the caller.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$CHECK_FAILOVER
+;	IPL is IPL$_SCS
+;	4(SP) : Address of caller's caller
+;
+; INPUT PARAMETERS:
+;
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	If return is to caller, R0 and R1 are destroyed.
+;	If return is to caller's caller, R0-R5 are destroyed.
+;--
+
+CNX$CHECK_FAILOVER::
+	MOVL	G^CLU$GL_CLUB,R0	; Address of CLUB
+	BBC	#CLUFCB$V_ACTIVE, -	; Branch if in REFAIL mode and
+		CLUB$B_CLUFCB+CLUFCB$L_STATUS(R0), -
+		30$			;   bugcheck
+	BBC	#CLUFCB$V_PENDING, -	; Branch if no failover is pending
+		CLUB$B_CLUFCB+CLUFCB$L_STATUS(R0), -
+		10$
+	BICL2	#CLUFCB$M_ACTIVE, -	; Clear failover active bit
+		CLUB$B_CLUFCB+CLUFCB$L_STATUS(R0)
+	ADDL2	#4,SP			; Remove caller's return address
+	BRW	CNX$MEMBERSHIP_CHANGE	; Initiate new membership change
+
+10$:	BBC	#CLUB$V_LOST_CNX, -	; Branch if no cluster connections broken
+		CLUB$L_FLAGS(R0),20$
+	BICL2	#CLUFCB$M_ACTIVE, -	; Clear failover active bit
+		CLUB$B_CLUFCB+CLUFCB$L_STATUS(R0)
+	ADDL2	#4,SP			; Return to caller's caller
+20$:	RSB				; No pending failover, return
+
+30$:	BUG_CHECK	CNXMGRERR,FATAL	; Consistency check
+
+	.END
+

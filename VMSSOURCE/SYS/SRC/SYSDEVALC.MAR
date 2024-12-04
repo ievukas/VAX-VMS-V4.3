@@ -1,0 +1,413 @@
+	.TITLE	SYSDEVALC - SYSTEM SERVICES FOR DEVICE ALLOCATION
+	.IDENT	'V04-000'
+ 
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+; D. N. CUTLER 9-SEP-76
+;
+; MODIFIED BY:
+;
+;	V03-013	ACG0411		Andrew C. Goldstein,	22-Mar-1984  17:13
+;		Unlock device if result buffer probe fails
+;
+;	V03-012	ACG0399		Andrew C. Goldstein,	24-Feb-1984  18:25
+;		Rewrite I/O database search to handle cluster device
+;		allocation correctly, move device lock routines to
+;		IOSUBPAGD, allow devices with channels assigned to be
+;		deallocated, rework "media_type" to use device name string
+;		as the device type name, general code cleanup.
+;
+;	V03-011	LMP0185		L. Mark Pilant,		1-Feb-1984  14:02
+;		Add support for device ACLs.
+;
+;	V03-010	ROW0240		Ralph O. Weber		11-OCT-1983
+;		Correct calling sequence to IOC$CVT_DEVNAM used to create 
+;		physical device name to supply a R4, name-type, argument.  
+;		Use R4=-1 which produces the same results at the previous R4 
+;		PCB address value produced.
+;
+;	V03-009	TCM0005		Trudy C. Matthews	12-Sep-1983
+;		Only take out a lock on the device if the system is
+;		participating in a cluster.
+;
+;	V03-008	TCM0004		Trudy C. Matthews	15-Aug-1983
+;		Take advantage of an $ENQ optimization that allows the
+;		original device lock and its conversion to be collapsed into
+;		one call to $ENQ.
+;
+;	V03-007	TCM0003		Trudy C. Matthews	24-Jun-1983
+;		Move code that constructs allocation class name from
+;		EXE$LOCK_DEV to routine	IOC$CVT_DEVNAM, so that it is
+;		available for use by other routines.  Move zeroing of
+;		UCB$L_LOCKID field from EXE$DALLOC_DEV to EXE$UNLOCK_DEV.
+;
+;	V03-006	TCM0002		Trudy C. Matthews	10-Jun-1983
+;		Fix bug in setting up input R4 register in calls to
+;		IOC$CVT_DEVNAM.  Add system facility name SYS$ to lock
+;		resource name.  Allow caller of EXE$LOCK_DEV to specify
+;		the address of a lock value block.
+;
+;	V03-005	TCM0001		Trudy C. Matthews	21-Apr-1983
+;		Use the lock manager to enforce cluster-wide device allocation.
+;
+;	V03-004	KTA3042		Kerbey T. Altmann	20-Mar-1983
+;		Fix scan of device data base in DEALL to include
+;		cluster-wide devices.
+;
+;	V03-003	ROW0135		Ralph O. Weber		21-OCT-1982
+;		Add test for UCB$V_TEMPLATE in UCB$L_STS of device to be 
+;		allocated.  If bit is set (indicating a template UCB), return 
+;		SS$_TEMPLATEDEV, "Template device cannot be allocated" error 
+;		status.  Also move SS$_ACCVIO error return setup to fix broken 
+;		branch destinations.
+;
+;	V03-002	KTA0101		Kerbey T. Altmann	07-Jun-1982
+;		Add support for optional 4th parameter, MEDIA_TYPE
+;
+;	V03-001	STJ0258		Steven T. Jeffreys,	12-Apr-1982
+;		If the device is mounted, do not deallocate it, and
+;		return SS$_DEVMOUNT as the status code.
+;
+;**
+;
+; System services for device allocation
+;
+;	Allocate device
+;	Deallocate device
+;
+; Macro library calls
+;
+ 
+	$CANDEF				; define cancel reason codes
+	$DDTDEF				; define DDT offsets
+	$DEVDEF				; define device characteristics
+	$IOCDEF				; define search routine flags
+	$PCBDEF				; define PCB offsets
+	$SSDEF				; define system status values
+	$UCBDEF				; define UCB offsets
+ 
+;
+; Local symbols
+;
+; Argument list offset definitions for allocate device
+;
+ 
+DEVNAM=4				; address of device name string descriptor
+PHYLEN=8				; address to store length of physical name
+PHYBUF=12				; address of physical name buffer descriptor
+ALACMODE=16				; access mode
+FLAGS=20				; flags longword, containing
+	DEVICE_TYPE=0			; device name is a device type string
+ 
+;
+; Argument list offset definitions for deallocate device
+;
+ 
+DEVNAM=4				; address of device name string descriptor
+DLACMODE=8				; access mode
+
+
+	.PSECT	Y$EXEPAGED
+
+	.SBTTL	Allocate Device
+
+;+
+;
+; EXE$ALLOC - allocate device
+;
+; This service provides the capability to reserve a device for exclusive
+; use.
+;
+; INPUTS:
+;
+;	DEVNAM(AP) = address of device name string descriptor.
+;	PHYLEN(AP) = address to store length of physical name.
+;	PHYBUF(AP) = address of physical name buffer descriptor.
+;	ALACMODE(AP) = access mode device is to be allocated to.
+;	FLAGS(AP)  = flags longword (optional)
+;
+;	R4 = current process PCB address.
+;
+; OUTPUTS:
+;
+;	R0 low bit clear indicates failure to allocate device.
+;
+;		R0 = SS$_ACCVIO - device name string, device name string
+;			descriptor, or physical name buffer descriptor 
+;			cannot be read by calling access mode, or physical
+;			name buffer cannot be written by calling access
+;			mode.
+;
+;		R0 = SS$_IVSTSFLG - invalid flag bits set
+;
+;		R0 = SS$_IVLOGNAM - zero or greater than maximum length
+;			device name string specified.
+;
+;		R0 = SS$_IVDEVNAM - device name string contains invalid
+;			characters or no device name string descriptor
+;			specified.
+;
+;		R0 = SS$_NONLOCAL - specified device exists on a remote
+;			system.
+;
+;		R0 = SS$_NOSUCHDEV - specified device does not exist on
+;			host system.
+;
+;		R0 = SS$_NODEVAVL - no allocatable unit can be found.
+;
+;		R0 = SS$_DEVALLOC - device already allocated to another
+;			process.
+;
+;		R0 = SS$_DEVMOUNT - device currently mounted and cannot
+;			be allocated.
+;
+;		R0 = SS$_DEVOFFLINE - device is marked offline or
+;			unavailable.
+;
+;		R0 = SS$_TEMPLATEDEV - device is a template and cannot
+;			be allocated
+;
+;		R0 = SS$_NOPRIV - device currently spooled and process does
+;			not have privilege to allocate, or device is
+;			protected against allocation.
+;
+;		R0 = SS$_EXENQLM - couldn't take out cluster-wide lock
+;			because process exceded its enqueue limit.
+;
+;		R0 = SS$_INSFMEM - couldn't take out cluster-wide lock
+;			because of insufficient dynamic memory to create
+;			the necessary data structures.
+;
+;	R0 low bit set indicates successful completion.
+;
+;		R0 = SS$_DEVALRALLOC - device is already allocated to calling
+;			process.
+;
+;		R0 = SS$_BUFFEROVF - normal completion, physical name over-
+;			flowed physical name buffer.
+;
+;		R0 = SS$_NORMAL - normal completion, physical name transfered
+;			to physical name buffer.
+;-
+
+	.ENABLE	LSB
+
+10$:	BSBW	IOC$UNLOCK_DEV		; unlock the device
+15$:	BRW	ACCVIO			; common ACCVIO handling
+ 
+	.ENTRY	EXE$ALLOC,^M<R2,R3,R4,R5,R6>
+	MOVZWL	#SS$_IVDEVNAM,R6	; assume invalid device name
+	BSBW	LOCK			; lock I/O data base and get device name
+	BEQL	40$			; if eql no device name specified
+	CLRQ	R2			; zero flags and value block
+	CMPB	(AP),#FLAGS/4		; see if flags argument is present
+	BLSSU	20$			; branch if not
+	IFNORD	#4,FLAGS(AP),15$	; probe it, since it's optional
+	MOVZWL	#SS$_IVSTSFLG,R6	; assume invalid flags
+	CMPL	FLAGS(AP),#1		; test for valid bits
+	BLSSU	20$			; zero - OK
+	BGTRU	90$			; invalid bits set
+	BISB	#IOC$M_TYPE,R2		; set device type mode
+20$:	BSBW	IOC$SEARCH		; search for generic allocatable device
+					; note all checks made by search routine
+30$:	MOVL	R0,R6			; save search status
+40$:	BLBC	R6,90$			; if lbc search failure
+	MOVL	R1,R5			; save device UCB address
+;
+; Return physical device name
+;
+	MOVL	PHYBUF(AP),R1		; get address of name buffer descriptor
+	BEQL	70$			; if eql none
+ 	IFNORD	#8,(R1),10$		; can name buffer descriptor be read?
+	MOVZWL	(R1),R0			; get length of name buffer
+	BEQL	70$			; if eql zero length buffer
+	CMPW	R0,#255			; was buffer size reasonable?
+	BLEQU	50$			; branch if ok
+	MOVZBL	#255,R0			; use smaller, but still absurd size
+50$:	MOVL	4(R1),R1		; get address of name buffer
+ 	IFNOWRT	R0,(R1),10$		; can name buffer be written?
+	MOVL	PHYLEN(AP),R3		; get address to store name length
+	BEQL	60$			; if eql none
+ 	IFNOWRT	#2,(R3),10$		; can name length be written?
+60$:	MNEGL	#1,R4			; use display format device name
+	BSBW	IOC$CVT_DEVNAM		; convert device name and unit
+	MOVL	CTL$GL_PCB,R4		; restore PCB address in R4
+	MOVL	R0,R6			; save completion status
+	TSTL	R3			; address to store length specified?
+	BEQL	70$			; if eql none specified
+	MOVW	R1,(R3)			; insert length of converted string
+;
+; Finish allocating the device. The lock, if any, was taken out by IOC$SEARCH.
+; All we have to do is mark up the UCB.
+;
+70$:	BBCS	#DEV$V_ALL,UCB$L_DEVCHAR(R5),80$ ; if clr, device not allocated
+	MOVZWL	#SS$_DEVALRALLOC,R6	; set device already allocated status
+	BRB	90$
+
+80$:	EXTZV	#0,#2,ALACMODE(AP),R0	; get specified access mode
+	BSBW	EXE$MAXACMODE		; maximize access mode
+	MOVB	R0,UCB$B_AMOD(R5)	; set allocating access mode
+	INCW	UCB$W_REFC(R5)		; count a reference
+	MOVL	PCB$L_PID(R4),UCB$L_PID(R5) ; store owner PID
+90$:	MOVL	R6,R0			; set completion status
+	BRW	IOC$UNLOCK		;
+
+	.DISABLE LSB
+
+	.SBTTL	Deallocate Device
+
+;+
+;
+; EXE$DALLOC - deallocate device
+;
+; This service provides the capability to relinquish exclusive use of a
+; device.
+;
+; INPUTS:
+;
+;	DEVNAM(AP) = address of device name string descriptor. Zero
+;		implies all.
+;	DLACMODE(AP) = access mode for deallocation.
+;
+;	R4 = current process PCB address.
+;
+; OUTPUTS:
+;
+;	R0 low bit clear indicates failure to deallocate device.
+;
+;		R0 = SS$_ACCVIO - device name string or device name string
+;			descriptor cannot be read by calling access mode.
+;
+;		R0 = SS$_DEVASSIGN - device cannot be deallocated because
+;			process still has channels assigned.
+;
+;		R0 = SS$_DEVMOUNT - device cannot be deallocated because it
+;			is still mounted.
+;
+;		R0 = SS$_DEVNOTALLOC - device not allocated or not allocated
+;			to process.
+;
+;		R0 = SS$_IVDEVNAM - device name string contains invalid
+;			characters.
+;
+;		R0 = SS$_IVLOGNAM - zero or greater than maximum length
+;			device name string specified.
+;
+;		R0 = SS$_NOPRIV - calling access mode does not have privilege
+;			to deallocate device.
+;
+;		R0 = SS$_NOSUCHDEV - specified device does not exist on
+;			host system.
+;
+;	R0 low bit set indicates successful completion.
+;
+;		R0 = SS$_NORMAL - normal completion.
+;-
+ 
+	.ENTRY	EXE$DALLOC,^M<R2,R3,R4,R5,R8>
+	EXTZV	#0,#2,DLACMODE(AP),R0	; get deallocation access mode
+	BSBW	EXE$MAXACMODE		; maximize access mode
+	MOVL	R0,R5			; save maximized access mode
+	BSBB	LOCK			; lock I/O data base and search for device
+	BEQL	20$			; if eql no device name specified
+	BSBW	IOC$SEARCHDEV		; search for physical device
+	BLBC	R0,60$			; if lbc search failure
+	CMPL	UCB$L_PID(R1),PCB$L_PID(R4) ; device allocated to current process?
+	BNEQ	50$			; if neq no
+	CMPB	R5,UCB$B_AMOD(R1)	; can specifed access mode deallocate device?
+	BLEQ	10$			; if leq yes
+	BRB	NOPRIV			; if gtr no
+
+10$:	BBC	#DEV$V_ALL,UCB$L_DEVCHAR(R1),50$ ; if clr, device not allocated
+	BSBB	DECREF			; decrement reference count and call driver
+	BRB	UNLOCK			;
+
+;
+; Null device name - deallocate all devices
+;
+20$:	MOVQ	R10,-(SP)		; save some registers
+	CLRQ	R10			; initial conditions
+30$:	BSBW	IOC$SCAN_IODB		; scan the IO database
+	BLBS	R0,40$			; got a good UCB
+	MOVQ	(SP)+,R10		; end of the line, restore registers
+	BRW	NORMAL			; and get out
+
+40$:	CMPL	UCB$L_PID(R10),-
+		PCB$L_PID(R4) 		; device allocated to current process?
+	BNEQ	30$			; if neq no
+	CMPB	R5,UCB$B_AMOD(R10)	; can access mode deallocate device?
+	BGTR	30$			; if gtr no
+	BBC	#DEV$V_ALL,-
+		UCB$L_DEVCHAR(R10),30$	; if clr, device not allocated
+	MOVL	R10,R1			; transfer UCB pointer
+	BSBB	DECREF			; decrement reference count and call driver
+	BRB	30$			;
+
+50$:	MOVZWL	#SS$_DEVNOTALLOC,R0	; set device not allocated to process
+60$:	BRB	UNLOCK			;
+
+	.SBTTL	Lock I/O Database and Probe Name Descriptor
+
+;
+; Subroutine to lock I/O data base, search for device, and check for mailbox.
+;
+ 
+LOCK:					; lock I/O data base and search for device
+	JSB	SCH$IOLOCKW		; lock I/O database for write access
+	MOVL	DEVNAM(AP),R1		; get address of device name string descriptor
+	BEQL	10$			; if eql none
+	IFNORD	#8,(R1),ACCVIO		; can device name descriptor be read?
+10$:	RSB				;
+;
+; Miscellaneous exits
+;
+ACCVIO:	MOVZWL	#SS$_ACCVIO,R0		; set access violation status
+	BRB	UNLOCK			;
+
+NOPRIV:	MOVZWL	#SS$_NOPRIV,R0		; set no privilege
+	BRB	UNLOCK			;
+
+NORMAL:	MOVZWL	#SS$_NORMAL,R0		; set normal completion
+UNLOCK:	BRW	IOC$UNLOCK		; unlock I/O data base and return
+
+	.SBTTL	Decrement Reference Count, Clear Ownership, and Call Driver
+
+;
+; Subroutine to decrement reference count, clear ownership, and call driver
+;
+ 
+DECREF:					;
+	MOVZWL	#SS$_DEVMOUNT,R0	; assume device mounted
+	BBS	#DEV$V_MNT,-		; branch if device mounted
+		UCB$L_DEVCHAR(R1),10$	;
+	PUSHL	R5			; save R5
+	MOVL	R1,R5			; set address of device UCB
+	BSBW	IOC$DALLOC_DEV		; clear device allocation
+	MOVL	(SP)+,R5		; restore R5
+10$:	RSB				;
+
+
+
+	.END

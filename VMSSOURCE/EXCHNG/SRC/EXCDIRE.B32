@@ -1,0 +1,1557 @@
+MODULE	exch$dire 				%TITLE 'DIRECTORY verb dispatch and misc routines'
+		(
+		IDENT = 'V04-000',
+		ADDRESSING_MODE (EXTERNAL=LONG_RELATIVE, NONEXTERNAL=WORD_RELATIVE)
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:	EXCHANGE - Foreign volume interchange facility
+!
+! ABSTRACT:	Primary action routines for DIRECTORY verb
+!
+! ENVIRONMENT:	VAX/VMS User mode
+!
+! AUTHOR:	CW Hobbs	 CREATION DATE: 8-July-1982
+!
+! MODIFIED BY:
+!
+!	V03-002	CWH3002		CW Hobbs		12-Apr-1984
+!		Signal a specific error for an attempt to do a directory
+!		on a remote node, simply saying "not permitted for files-11"
+!		could be confusing.
+!
+!
+!--
+
+! Include files:
+!
+MACRO $module_name_string = 'exch$dire' %;	! The require file needs to know our module name
+REQUIRE 'SRC$:EXCREQ'				! Facility-wide require file
+    ;
+
+%SBTTL 'Module table of contents'
+
+! Module table of contents:
+!
+FORWARD ROUTINE
+	 dire_close_output,			! Close the output file
+    exch$dire_directory,			! Main action routine
+    exch$dire_get_columns	: NOVALUE,	! Get number of columns for listing
+    exch$dire_get_width,			! Get output device line width
+	 dire_open_output,			! Open output file
+	 dire_process_parameters,		! Loop through the parameters
+    exch$dire_put		: NOVALUE,	! Put a record to the listing file
+	 dire_rt11_directory,			! RT-11 directory
+	 dire_rt11_put_item	: NOVALUE,	! Put one directory item
+	 dire_rt11_summary			! RT-11 directory summary
+    ;
+
+! EXCHANGE facility routines
+!
+EXTERNAL ROUTINE
+    exch$cmd_cli_get_integer,			! Get an integer value
+    exch$cmd_match_filename,			! Match filename against wildcarded name
+    exch$cmd_parse_filespec,			! Parse a file specification
+    exch$dos11_directory,			! Directory command for DOS-11
+    exch$moun_implied_mount,			! Do a default mount
+    exch$rt11_expand_filename,			! Expand the RT11 file name		!?? not needed
+    exch$rt11_dirseg_get,			! Get pointer to RT11 directory segment	!?? not needed
+    exch$rtacp_next_entry,			! Get pointer to next directory entry
+    exch$util_fao_buffer,			! Perform the $fao service
+    exch$util_file_error,			! Signal RMS error
+    exch$util_namb_release	: NOVALUE,	! Release name block
+    exch$util_rmsb_allocate,			! Allocate Files-11 control block
+    exch$util_rmsb_release	: NOVALUE,	! Release Files-11 block
+    exch$util_rt11ctx_allocate,			! Allocate RT-11 control block
+    exch$util_rt11ctx_release	: NOVALUE,	! Release RT-11 control block
+    exch$util_vm_allocate_zeroed		! Allocate virtual memory
+    ;
+
+! Equated symbols:
+!
+!LITERAL
+!    ;
+
+! Bound declarations:
+!
+BIND
+    null_string = %ASCID '',
+    output_str  = %ASCID 'OUTPUT'
+    ;
+
+GLOBAL ROUTINE dire_close_output =	%SBTTL 'dire_close_output'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Close the output file described by dire [dire$a_outfab].
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	dire - pointer to work area
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('dire_close_output> ');
+
+LOCAL
+    status
+    ;
+
+BIND
+    dire = exch$a_gbl [excg$a_dire_work]	: $ref_bblock,	! Pointer to work area
+    fab  = dire [dire$a_outfab]		: $ref_bblock	! Pointer to fab for output file
+    ;
+
+$block_check (2, .dire, dire, 417);
+
+! Close the file
+!
+IF NOT (status = $close (fab = .fab))
+THEN
+    exch$util_file_error (exch$_closeout, .status, .fab, .fab [fab$l_stv]);
+
+! Put an RMS structure back on the available queue
+!
+exch$util_rmsb_release (.dire [dire$a_outrmsb]);
+
+$debug_print_lit ('file closed');
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE exch$dire_directory =	%SBTTL 'exch$dire_directory'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Action routine for the DIRECTORY verb, parses and performs main control functions for DIRECTORY
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	Command parameters and qualifiers as returned from CLI$xxx routines.
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	A directory of files may be displayed
+!--
+
+$dbgtrc_prefix ('dire_directory> ');
+
+LOCAL
+    status,
+    stat_2
+    ;
+
+BIND
+    dire = exch$a_gbl [excg$a_dire_work] : $ref_bblock	! Pointer to work area
+    ;
+
+
+! If our pointer is null, we need to allocate and initialize the work area
+!
+IF .dire EQL 0
+THEN
+    BEGIN
+
+    ! Get the right sized chunk of memory, conveniently set to nulls
+    !
+    dire = exch$util_vm_allocate_zeroed (exchblk$s_dire);
+
+    ! Set the ident fields
+    !
+    $block_init (.dire, dire);
+
+    ! Set the descriptors up
+    !
+    $dyn_str_desc_init (dire [dire$q_filename]);
+    $dyn_str_desc_init (dire [dire$q_output_file]);
+    $dyn_str_desc_init (dire [dire$q_default_name]);
+
+    END;
+
+! Get some confidence that our work area is valid
+!
+$block_check (2, .dire, dire, 418);
+
+! Set the last part of the block to nulls
+!
+CH$FILL (0, exchblk$s_dire - dire$k_start_zero, .dire + dire$k_start_zero);
+
+! Get individual boolean qualifiers
+!
+dire [dire$v_q_all]	  = cli$present (%ASCID 'ALL');
+!\ dire [dire$v_q_badblocks] = cli$present (%ASCID 'BADBLOCKS');
+dire [dire$v_q_blocks]	  = cli$present (%ASCID 'BLOCKS');
+dire [dire$v_q_brief]	  = cli$present (%ASCID 'BRIEF');
+dire [dire$v_q_date]	  = cli$present (%ASCID 'DATE');
+dire [dire$v_q_deleted]	  = cli$present (%ASCID 'DELETED');
+dire [dire$v_q_free]	  = cli$present (%ASCID 'FREE');
+dire [dire$v_q_full]	  = cli$present (%ASCID 'FULL');
+dire [dire$v_q_octal]	  = cli$present (%ASCID 'OCTAL');
+dire [dire$v_q_owner]	  = cli$present (%ASCID 'OWNER');
+dire [dire$v_q_printer]	  = cli$present (%ASCID 'PRINTER');
+dire [dire$v_q_size]	  = cli$present (%ASCID 'SIZE');
+dire [dire$v_q_summary]	  = cli$present (%ASCID 'SUMMARY');
+
+! Get individual integer-valued qualifiers, routine signals on errors
+!
+IF NOT (status = exch$cmd_cli_get_integer (%ASCID 'COLUMNS', dire [dire$l_q_columns]))
+THEN
+    RETURN .status;
+
+! Set any implied flags
+!
+IF .dire [dire$v_q_full]
+THEN
+    dire [dire$v_q_blocks] = dire [dire$v_q_date] = dire [dire$v_q_size] = dire [dire$v_q_owner] = true;
+IF .dire [dire$v_q_brief]
+THEN
+    dire [dire$v_q_blocks] = dire [dire$v_q_date] = dire [dire$v_q_size] = dire [dire$v_q_owner] = false;
+
+! Assume output to the SYS$OUTPUT device
+!
+dire [dire$a_outfab] = .exch$a_gbl [excg$a_sysout_fab];
+dire [dire$a_outrab] = .exch$a_gbl [excg$a_sysout_rab];
+
+! Get the output filename if requested
+!
+IF   (dire [dire$v_q_output] = cli$present (output_str))	! /OUTPUT=<filespec>
+  OR
+     .dire [dire$v_q_printer]			! /PRINTER
+THEN
+    IF NOT (status = dire_open_output (.dire [dire$v_q_printer]))	! Open the output file, return on error
+    THEN
+	RETURN .status;
+
+! Get the listing width by doing a $getdvi on the output device
+!
+dire [dire$l_list_width] = exch$dire_get_width (.dire [dire$a_outfab]);
+
+! Loop through the list of file specifications
+!
+status = dire_process_parameters ();
+
+! Close the output file if we opened one
+!
+IF (.dire [dire$v_q_output] OR .dire [dire$v_q_printer])
+THEN
+    BEGIN
+    stat_2 = dire_close_output ();
+    IF .status THEN status = .stat_2;		! Make the output status the worse of process_para and close
+    END;
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE exch$dire_get_columns : NOVALUE =	%SBTTL 'exch$dire_get_columns'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Determine the number of columns for the listing
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	dire block
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('dire_get_columns> ');
+
+REGISTER
+    cols,
+    override
+    ;
+
+BIND
+    dire = exch$a_gbl [excg$a_dire_work] : $ref_bblock
+    ;
+
+
+! Make of copy of the number of columns
+!
+cols = .dire [dire$l_q_columns];
+
+! Compare listing width with requested value
+!
+IF   (.cols GTR 0 )
+  AND
+     (((.cols * .dire [dire$l_item_width]) + ((.cols-1) * dire$k_item_spacing)) GTRU .dire [dire$l_list_width])
+THEN
+    BEGIN
+    override = true;
+    $exch_signal (exch$_toomanycol);
+    END
+ELSE
+    override = false;
+
+! If /COLUMNS defaulted or needs to be fixed, compute the number of columns
+!
+IF (.cols EQL 0) OR .override
+THEN
+    BEGIN
+
+    ! First guess, just divide listing width by item width
+    !
+    cols = .dire [dire$l_list_width] / .dire [dire$l_item_width];
+
+    ! Now, include the spacing, and decrement cols until it fits
+    !
+    WHILE ((.cols * .dire [dire$l_item_width]) + ((.cols-1) * dire$k_item_spacing)) GTRU .dire [dire$l_list_width]
+    DO
+	cols = .cols - 1;
+
+    $logic_check (2, (.cols GTRU 0), 108);
+
+    dire [dire$l_q_columns] = .cols;
+
+    END;
+
+$debug_print_fao ('number of columns !UL', .cols);
+
+RETURN;
+END;
+
+GLOBAL ROUTINE exch$dire_get_width (fab : $ref_bblock) =	%SBTTL 'exch$dire_get_width'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Get the line width of the output device
+!
+! INPUTS:
+!
+!	fab - pointer to a fab with the opened output file
+!
+! IMPLICIT INPUTS:
+!
+!	nam block hanging from the fab
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	width of output line
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('dire_get_width> ');
+
+LOCAL
+    dev_item : VECTOR [4, LONG],
+    dev_name : VECTOR [2, LONG],
+    status,
+    width
+    ;
+
+BIND
+    nam = .fab [fab$l_nam] : $bblock		! Nam block for this fab
+    ;
+
+
+! Initialize the item list for the $GETDVI
+!
+%IF switch_variant GEQ 3 %THEN width = 0; %FI		! Suppress uninit reference message while debugging
+dev_item [0] = (dvi$_devbufsiz^16 OR 4);	! Device buffer size, output length 4
+dev_item [1] = width;				! Address of output buffer
+dev_item [2] = 0;				! No returned length
+dev_item [3] = 0;				! End of GETDVI item list
+
+! Pull the device name from the name block
+!
+dev_name [0] = .nam [nam$b_dev];		! Get the size
+dev_name [1] = .nam [nam$l_dev];		!  and the address
+
+$debug_print_fao ('Attempting GETDVI on !AS', dev_name);
+
+! Get the device information
+!
+IF NOT (status = $getdviw (efn=0, devnam=dev_name, itmlst=dev_item))
+THEN
+    $exch_signal_stop (.status);
+
+! If the output is a disk, the buffer will show up as 512.  Reduce it to 132
+!
+IF .width EQL 512
+THEN
+    width = 132;
+
+$debug_print_fao ('Device width is !UL', .width);
+
+RETURN .width
+END;
+
+GLOBAL ROUTINE dire_open_output (spool_output) =	%SBTTL 'dire_open_output'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Open the output file described on the /OUTPUT qualifier.  Memory is allocated for RMS data structures.
+!
+! INPUTS:
+!
+!	spool_output - True if the file should be spooled and deleted
+!
+! IMPLICIT INPUTS:
+!
+!	Command qualifier value as returned from CLI$xxx routines.
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	dire [dire$a_outfab] - a module-wide pointer to the fab which has the opened output file
+!	dire [dire$a_outrab] - a module-wide pointer to the rab which has the connected output stream
+!
+! ROUTINE VALUE:
+!
+!	true, or error code if one occurred
+!
+! SIDE EFFECTS:
+!
+!	Memory is allocated, a file is opened
+!--
+
+$dbgtrc_prefix ('dire_open_output> ');
+
+LOCAL
+    status
+    ;
+
+BIND
+    dire = exch$a_gbl [excg$a_dire_work] : $ref_bblock,	! Pointer to work area
+    fab  = dire [dire$a_outfab]		: $ref_bblock,	! Pointer to fab for output file
+    outdesc = dire [dire$q_output_file] : $bblock,	! Descriptor for name of output file
+    rab  = dire [dire$a_outrab]		: $ref_bblock,	! Pointer to rab for output file
+    rmsb = dire [dire$a_outrmsb]	: $ref_bblock	! Pointer to $RMSB for output file
+    ;
+
+$block_check (2, .dire, dire, 419);
+
+! Get the output filename, it can be null and we don't care
+!
+cli$get_value (output_str, outdesc);
+
+$debug_print_fao ('original output file name is "!AS"', outdesc);
+
+! Get a pointer to the RMS structures for the output file
+!
+rmsb = exch$util_rmsb_allocate ();
+
+! Set the FAB and RAB pointers for the listing file to what we are opening
+!
+fab = .rmsb [rmsb$a_fab];
+rab = .rmsb [rmsb$a_rab];
+
+! Initialize the RMS structures
+!
+$fab_init (
+	FAB = .rmsb [rmsb$a_fab],		! Output file FAB
+	DNA = UPLIT BYTE ('EXCHDIRE.LIS'),	!  Default name address
+	DNS = 12,				!  Default name size
+	FNA = .outdesc [dsc$a_pointer],		!  Set name addr
+	FNS = .outdesc [dsc$w_length],		!  Set name size
+	FOP = (NAM,SQO),			!  Sequential only
+	MRS = 132,				!  Maximum record size
+	RAT = CR,				!  Carriage return record attribute
+	NAM = .rmsb [rmsb$a_nam]);		!  Name block
+$rab_init (
+	RAB = .rmsb [rmsb$a_rab],		! Output file RAB
+	MBF = 2,				!  Multi-buffer count
+	RAC = SEQ,				!  Sequential only
+	ROP = WBH,				!  Write behind
+	FAB = .rmsb [rmsb$a_fab]);		!  FAB addr
+$nam_init (
+	NAM = .rmsb [rmsb$a_nam],		! File name block
+	RSA = .rmsb [rmsb$a_rsbuf],		!  Result name addr
+	RSS = nam$c_maxrss,			!  Result name size
+	ESA = .rmsb [rmsb$a_esbuf],		!  Expanded name addr
+	ESS = nam$c_maxrss);			!  Expanded name size
+
+! If the file is to be spooled, then set some more bits in the fab (Delete,Name block,Spool,Sequential only)
+!
+IF .spool_output
+THEN
+    fab [fab$l_fop] = (fab$m_dlt OR fab$m_nam OR fab$m_spl OR fab$m_sqo);
+
+! Create and connect to the output file, free memory if any errors
+!
+IF NOT (status = $create (fab = .fab))
+THEN
+    BEGIN
+    exch$util_file_error (exch$_openout, .status, .fab, .fab [fab$l_stv]);
+    exch$util_rmsb_release (.rmsb);		! Free the RMS structure
+    RETURN exch$_openout;
+    END;
+IF NOT (status = $connect (rab = .rab))
+THEN
+    BEGIN
+    exch$util_file_error (exch$_openout, .status, .fab, .rab [rab$l_stv]);
+    exch$util_rmsb_release (.rmsb);		! Free the RMS structure
+    RETURN exch$_openout;
+    END;
+
+BEGIN
+    BIND
+	nam = .rmsb [rmsb$a_nam] : $bblock;
+    $trace_print_fao ('output file name is "!AF"', .nam [nam$b_rsl], .nam [nam$l_rsa]);
+END;
+
+RETURN true;
+END;
+
+GLOBAL ROUTINE dire_process_parameters =	%SBTTL 'dire_process_parameters'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Process the list of directory parameters.
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	Command qualifier value as returned from CLI$xxx routines.
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('dire_process_parameters> ');
+
+LOCAL
+    namb : $ref_bblock,
+    volb : $ref_bblock,
+    namb_head : $ref_bblock,
+    namb_tail : $ref_bblock,
+    format,
+    status
+    ;
+
+BIND
+    dire = exch$a_gbl [excg$a_dire_work] : $ref_bblock,	! Pointer to work area
+    fab  = dire [dire$a_outfab]		 : $ref_bblock	! Pointer to fab for output file
+    ;
+
+$block_check (2, .dire, dire, 420);
+
+status = $severe_stat_copy (exch$_badlogic);	! If no parameter then we have a problem
+
+! Get the work list of nambs by reading all filename parameters and placing the items in a list
+!
+str$copy_dx (dire [dire$q_default_name], %ASCID '*.*');		! Init sticky name
+namb_head = 0;
+%IF switch_variant GEQ 3 %THEN namb_tail = 0; %FI	! Suppress uninit reference message while debugging
+
+!?? The following loops do not clean up nambs when they see an error - should be cleaned up
+!
+WHILE 1
+DO
+    BEGIN
+
+    ! Fetch the filename and a pointer to a namb
+    !
+    status = exch$cmd_parse_filespec (%ASCID 'FILENAME', dire [dire$q_default_name], 0, dire [dire$q_filename], namb);
+    IF  .status EQL 0
+      OR
+	.exch$a_gbl [excg$v_control_c]
+    THEN
+	EXITLOOP;				! No more files in the list
+    IF NOT .status
+    THEN
+	$exch_signal_return (exch$_parseerr, 1, dire [dire$q_filename], .status);
+    $debug_print_fao ('input parameter is "!AS"', dire [dire$q_filename]);
+
+    ! If the device is not mounted, then perform an implied mount
+    !
+    IF .namb [namb$a_assoc_volb] EQL 0
+      AND
+	 (BEGIN
+	  BIND
+	    dev = namb [namb$l_fabdev] : $bblock;
+	  .dev [dev$v_for] OR (NOT (.dev [dev$v_mnt]))
+	  END)
+    THEN
+	IF NOT (status = exch$moun_implied_mount (.namb))
+	THEN
+	    RETURN .status;
+
+    ! Now make sure that we can do a directory of this volume type
+    !
+    volb = .namb [namb$a_assoc_volb];
+    IF .volb NEQ 0				! If the volb is there, then the interesting format
+    THEN
+	format = .volb [volb$b_vol_format]	!  is that of the volb.  Otherwise, it
+    ELSE
+	format = .namb [namb$b_vol_format];	!  is that of the namb.
+
+    CASE .format FROM volb$k_vfmt_lobound TO volb$k_vfmt_hibound OF
+    SET
+	[volb$k_vfmt_files11] :
+				BEGIN
+				LOCAL
+				    errstat;
+				IF .namb [namb$v_explicit_node]
+				THEN
+				    BEGIN
+				    errstat = exch$_noremote;
+				    $exch_signal (.errstat, 1, dire [dire$q_filename]);
+				    END
+				ELSE
+				    BEGIN
+				    errstat = exch$_opnotperf11;
+				    $exch_signal (.errstat, 1, namb [namb$q_device]);
+				    END;
+				exch$util_namb_release (.namb);			! Release the bad namb
+				WHILE .namb_head NEQ 0				! Release any other nambs
+				DO
+				    BEGIN
+				    REGISTER
+					temp;
+				    temp = .namb_head;				! Save current namb
+				    namb_head = .namb_head [namb$a_next];	! Advance to next namb
+				    exch$util_namb_release (.temp);		! Release the saved namb
+				    END;
+				RETURN .errstat;
+				END;
+	[INRANGE] :		;						! These we can do
+	[volb$k_vfmt_invalid, OUTRANGE]	:
+				$logic_check (0, (false), 239);
+    TES;
+
+    ! We should now have a valid volb, but we still should check
+    !
+    $block_check (2, .volb, volb, 421);
+
+    ! Now copy the full name to the default name for proper stickiness
+    !
+    str$copy_dx (dire [dire$q_default_name], namb [namb$q_fullname]);
+
+    ! Add this namb to the tail of the work list
+    !
+    IF .namb_head EQL 0
+    THEN
+	BEGIN
+	namb_head = .namb;
+	namb_tail = .namb;
+	END
+    ELSE
+	BEGIN
+	namb_tail [namb$a_next] = .namb;	! Ignore uninit reference message on this assignment
+	namb_tail = .namb;
+	END;
+
+    END;
+
+! Now print the volumes.  We collect nambs for a given volume by chaining them from the volb.  We then print that
+! volume.  Repeat until the work list is done.
+!
+WHILE .namb_head NEQ 0
+DO
+    BEGIN
+
+    ! Pull the first namb from the work list
+    !
+    namb = .namb_head;				! Grab a pointer to it
+    namb_head = .namb [namb$a_next];		!  and remove it from the work list
+
+    ! Get the volb for this first namb
+    !
+    volb = .namb [namb$a_assoc_volb];		! The namb has a pointer to its volb
+    volb [volb$a_namb_head] = .namb;		!  and now the volb can find the namb
+    namb_tail = .namb;				! Tail of the chain on this volb now
+    namb_tail [namb$a_next] = 0;		! End of the chain
+
+    ! Now, chain any additional nambs which reference this same volb, onto this volb
+    !
+    WHILE 1					! This could have been coded as
+    DO						!  " WHILE  ((.namb_head NEQ 0) AND
+	BEGIN					!       (.namb_head [namb$a_assoc_volb] EQL .volb)) "
+	IF .namb_head EQL 0			!  except that we must control the order of the tests
+	THEN
+	    EXITLOOP;
+	IF .namb_head [namb$a_assoc_volb] NEQ .volb
+	THEN
+	    EXITLOOP;
+
+	! This namb is for the same volume, add it to the end of the chain
+	!
+	namb = .namb_head;			! Remove the namb from the work list
+	namb_head = .namb [namb$a_next];
+	namb_tail [namb$a_next] = .namb;	! Add it to the tail of the chain hanging from the volb
+	namb_tail = .namb;
+	namb_tail [namb$a_next] = 0;		! It is the end of the chain
+	END;
+
+    ! Now print the directory
+    !
+    CASE .volb [volb$b_vol_format] FROM volb$k_vfmt_lobound TO volb$k_vfmt_hibound OF
+    SET
+	[volb$k_vfmt_dos11]	: status = exch$dos11_directory (.volb);
+	[volb$k_vfmt_rt11]	: status = dire_rt11_directory (.volb);
+!\ 	[volb$k_vfmt_rtmt]	: $exch_signal_stop (exch$_notimplement);
+	[OUTRANGE,INRANGE]	: $logic_check (0, (false), 240);
+    TES;
+
+    ! Now release all the nambs hanging off this volb
+    !
+    namb = .volb [volb$a_namb_head];
+    WHILE .namb NEQ 0
+    DO
+	BEGIN
+	REGISTER
+	    temp;
+	temp = .namb;
+	namb = .namb [namb$a_next];
+	exch$util_namb_release (.temp);
+	END;
+
+    END;
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE exch$dire_put (desc : $ref_bblock, cancel_ctrl_o) : NOVALUE =	%SBTTL 'exch$dire_put (desc, cancel_ctrl_o)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Put a single record to the output listing file
+!
+! INPUTS:
+!
+!	desc - a string descriptor for the record
+!	cancel_ctrl_o - flag describing whether to cancel control o (optional)
+!
+! IMPLICIT INPUTS:
+!
+!	dire - directory work area
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true if put succeeded, false if not
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('dire_put> ');
+
+BUILTIN
+    ACTUALCOUNT
+    ;
+
+LOCAL
+    status
+    ;
+
+BIND
+    dire = exch$a_gbl [excg$a_dire_work]	: $ref_bblock,	! Pointer to work area
+    fab  = dire [dire$a_outfab]		: $ref_bblock,	! Pointer to fab for output file
+    rab  = dire [dire$a_outrab]		: $ref_bblock	! Pointer to rab for output file
+    ;
+
+
+$block_check (2, .dire, dire, 422);
+
+! Copy the record size and address to the RAB
+!
+rab [rab$w_rsz] = .desc [dsc$w_length];
+rab [rab$l_rbf] = .desc [dsc$a_pointer];
+
+! Set the bit for control o
+!
+IF ACTUALCOUNT () EQL 2
+THEN
+    rab [rab$v_cco] = .cancel_ctrl_o;
+
+! Now write the record
+!
+IF NOT (status = $put (rab = .rab))
+THEN
+    exch$util_file_error ($severe_stat_copy (exch$_writeerr), .status, .fab, .rab [rab$l_stv]);
+
+rab [rab$v_cco] = false;			! Force it off
+
+RETURN;
+END;
+
+GLOBAL ROUTINE dire_rt11_directory (volb : $ref_bblock) =	%SBTTL 'dire_rt11_directory'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Traverse the directory and display the contents
+!
+! INPUTS:
+!
+!	volb - pointer to volb which has been connected to the RT-11 device
+!
+! IMPLICIT INPUTS:
+!
+!	dire - directory work area
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true if valid, false if not
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('dire_rt11_directory> ');
+
+LOCAL
+    ent : $ref_bblock,				! a pointer to the current directory entry
+    nam : $ref_bblock,				! a pointer to the namb block
+    ctx : $ref_bblock,				! a pointer to an RT-11 context block
+    wid,
+    blocks_displayed,
+    blocks_avail,
+    large_avail,
+    files_displayed,
+    faop : $ref_bblock,				! pointer to an fao output
+    status,
+    flags
+    ;
+
+BIND
+    dire = exch$a_gbl [excg$a_dire_work]	: $ref_bblock,	! pointer to work area
+    fab  = dire [dire$a_outfab]		: $ref_bblock,	! pointer to fab for output file
+    rab  = dire [dire$a_outrab]		: $ref_bblock,	! pointer to rab for output file
+    rtv  = volb [volb$a_vfmt_specific]	: $ref_bblock	! pointer to rt-11 specific information
+    ;
+
+$block_check (2, .dire, dire, 423);		! Check that the directory work area is valid
+$block_check (2, .volb, volb, 424);		! Check the input parameter to make sure it is a volb
+$block_check (2, .rtv,  rt11, 430);		! And make sure it is an rt-11 volb
+
+%IF switch_check				! If checking is on look at all the nambs
+%THEN
+    nam = .volb [volb$a_namb_head];		! Get the address of the first namb chained to the volb
+    $logic_check (2, (.nam NEQ 0), 109);
+    WHILE .nam NEQ 0
+    DO
+	BEGIN
+	$block_check (2, .nam, namb, 425);
+	nam = .nam [namb$a_next];
+	END;
+%FI
+
+! Determine the width of a directory item
+!
+wid = rt11ctx$s_exp_fullname + rt11ctx$s_exp_protected;		! "P " and name are always there
+IF .dire [dire$v_q_size]					! Is /SIZE present?
+THEN
+    wid = .wid + (IF .dire [dire$v_q_octal] THEN 7 ELSE 5);
+IF .dire [dire$v_q_date]					!  or /DATE?
+THEN
+    wid = .wid + 12;
+IF .dire [dire$v_q_blocks]					!  or /BLOCKS?
+THEN
+    wid = .wid + (IF .dire [dire$v_q_octal] THEN 7 ELSE 6);
+dire [dire$l_item_width] = .wid;				! Put the value in the work area
+
+exch$dire_get_columns ();				! Fetch the number of columns
+
+! Print the header information
+!
+exch$dire_put (null_string);						! Print a blank line
+faop = exch$util_fao_buffer (%ASCID 'Directory of RT-11 volume !AF      !%D',	! Format the header line
+		.volb [volb$l_vol_ident_len], volb [volb$t_vol_ident], 0);
+faop [dsc$w_length] = .faop [dsc$w_length] - 6;			! Remove the seconds field from the date-time
+exch$dire_put (.faop);						! Print the header line
+IF .volb [volb$v_virtual]					! If virtual, then give the file name too
+THEN
+    BEGIN
+    BIND
+	nam = .volb [volb$a_nam] : $bblock;					! RMS nam block for the opened file
+    faop = exch$util_fao_buffer (%ASCID '                    using !AF',	! Format the header line
+			.nam [nam$b_rsl], .nam [nam$l_rsa]);
+    exch$dire_put (.faop);							! Print the header line
+    END;
+IF .dire [dire$v_q_owner]
+THEN
+    BEGIN
+    faop = exch$util_fao_buffer (
+		%ASCID 'Volume ID: !AF   Volume Owner: !AF   System ID: !AF',	! FAO string
+		rt11$s_volume_id, rtv [rt11$t_volume_id],			! Volume id string
+		rt11$s_owner_name, rtv [rt11$t_owner_name],			! Owner name string
+		rt11$s_system_id, rtv [rt11$t_system_id]);			! System id string
+    exch$dire_put (.faop);							! Print the id line
+    END;
+exch$dire_put (null_string);							! And print another blank line
+
+! If we are doing a summary, call the summary routine
+!
+IF .dire [dire$v_q_summary]
+THEN
+    RETURN dire_rt11_summary (.volb);
+
+! Initialize the local variables
+!
+status = true;					! Assume that we will find some files
+blocks_displayed = 0;
+blocks_avail = 0;
+large_avail = 0;
+files_displayed = 0;
+
+! Purchase an RT11 context block
+!
+ctx = exch$util_rt11ctx_allocate (.volb, 0);
+
+! Loop through all the segments in the directory
+!
+flags = rtnxt$m_permanent OR rtnxt$m_empty OR rtnxt$m_tentative OR rtnxt$m_unknown OR rtnxt$m_skip_check;
+WHILE ((ent = exch$rtacp_next_entry (.ctx, .flags)) NEQ 0)
+DO
+    BEGIN
+
+    ! Print this file if that is what is called for
+    !
+    CASE .ent [rt11ent$v_type] FROM 0 TO rt11ent$m_typ_end_segment OF
+    SET
+
+    [rt11ent$m_typ_tentative, rt11ent$m_typ_empty] :
+	    BEGIN
+
+	    blocks_avail = .blocks_avail + .ent [rt11ent$w_blocks];		! Update our statistics
+	    IF .ent [rt11ent$w_blocks] GTRU .large_avail
+	    THEN
+		large_avail = .ent [rt11ent$w_blocks];
+
+	    IF .dire [dire$v_q_deleted]					! For /DELETED we display whatever
+	    THEN								!  filename is in the entry
+		BEGIN
+
+		IF .ctx [rt11ctx$l_exp_fullname_len] EQL 1			! If we have a namelen of 1, then
+		THEN								!  it is the period alone.  Replace
+		    BEGIN							!  these with "< noname >".
+		    ctx [rt11ctx$l_exp_fullname_len] = 10;
+		    CH$MOVE (10, UPLIT BYTE ('< noname >'), ctx [rt11ctx$t_exp_fullname]);
+		    END;
+
+		dire_rt11_put_item (.ctx);					! print the item
+		files_displayed = .files_displayed + 1;				! update trailer statistics
+		blocks_displayed = .blocks_displayed + .ent [rt11ent$w_blocks];
+
+		END
+
+	    ELSE IF .dire [dire$v_q_free] OR .dire [dire$v_q_all]		! For /FREE or /ALL we list the
+	    THEN								!  file as "< unused >".
+		BEGIN
+		ctx [rt11ctx$l_exp_fullname_len] = 10;
+		CH$MOVE (10, UPLIT BYTE ('< unused >'), ctx [rt11ctx$t_exp_fullname]);
+		dire_rt11_put_item (.ctx);
+		files_displayed = .files_displayed + 1;				! update trailer statistics
+		blocks_displayed = .blocks_displayed + .ent [rt11ent$w_blocks];
+		END;
+	    END;
+
+    [rt11ent$m_typ_permanent] :
+	    BEGIN
+
+	    IF    ((NOT .dire [dire$v_q_free])					! Don't print permanent files
+	       AND 								!  if we've seen /FREE or /DELETED
+		   (NOT .dire [dire$v_q_deleted]))
+	    THEN
+		BEGIN
+
+		nam = .volb [volb$a_namb_head];					! Get first namb
+		WHILE .nam NEQ 0						!  and loop through them all
+		DO
+		    BEGIN
+		    BIND							! Need the name and type from the
+			nam_nam = nam [namb$q_name] : $desc_block,		!  command input because we need
+			nam_typ = nam [namb$q_type] : $desc_block;		!  to compare this name against
+										!  any selections in the command
+		    IF exch$cmd_match_filename
+			    (.ctx [rt11ctx$l_exp_fullname_len], ctx [rt11ctx$t_exp_fullname],
+			    .nam_nam [dsc$w_length] + .nam_typ [dsc$w_length], .nam_nam [dsc$a_pointer])
+		    THEN
+			BEGIN
+			dire_rt11_put_item (.ctx);
+			files_displayed = .files_displayed + 1;			! update trailer statistics
+			blocks_displayed = .blocks_displayed + .ent [rt11ent$w_blocks];
+			EXITLOOP;
+			END;
+		    nam = .nam [namb$a_next];					! to next namb in chain
+		    END;
+		END;
+	    END;
+
+    [INRANGE, OUTRANGE] :
+	    ;
+
+    TES;
+
+    ! Leave the loop if control/c has been hit
+    !
+    IF .exch$a_gbl [excg$v_control_c]
+    THEN
+	EXITLOOP;
+    END;
+
+! If we aborted, make the signal
+!
+IF .exch$a_gbl [excg$v_control_c]
+THEN
+    $exch_signal ($info_stat_copy (exch$_canceled))
+
+! Otherwise, finish the directory
+!
+ELSE
+    BEGIN
+
+    IF .dire [dire$l_cur_column] NEQ 0		! If anything is waiting, print it
+    THEN
+	dire_rt11_put_item (0);
+
+    ! If we printed some items, then add an extra blank line
+    !
+    IF .dire [dire$v_items_printed]
+    THEN
+	exch$dire_put (null_string, true)		! Cancel CTRL/O with second parm
+
+    ! Nothing was printed, return a warning status so that command procedures can see whether files were found.
+    !
+    ELSE
+	status = $info_stat_copy (rms$_fnf);	! Let a guy see that $ EXC DIR CS1:DEFBOO.CMD didn't work
+
+    ! Print the statistics line
+    !
+    faop = (IF .dire [dire$v_q_octal]
+	    THEN
+		%ASCID 'Total of !OW file!%S, !OW block!%S.  Free space !OW block!%S, largest !OW (octal).'
+	    ELSE
+		%ASCID 'Total of !UL file!%S, !UL block!%S.  Free space !UL block!%S, largest !UL.');
+    faop = exch$util_fao_buffer (.faop, .files_displayed, .blocks_displayed, .blocks_avail, .large_avail);
+    exch$dire_put (.faop);
+    END;
+
+! Free up the context block.
+!
+exch$util_rt11ctx_release (.ctx);
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE dire_rt11_summary (volb : $ref_bblock) =	%SBTTL 'dire_rt11_summary'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Display a summary of the directory
+!
+! INPUTS:
+!
+!	volb - pointer to volb which has been connected to the RT-11 device
+!
+! IMPLICIT INPUTS:
+!
+!	dire - directory work area
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true if valid, false if not
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('dire_rt11_summary> ');
+
+LOCAL
+    seg : $ref_bblock,				! a pointer to the current directory segment
+    ent : $ref_bblock,				! a pointer to the current directory entry
+    ctx : $ref_bblock,				! a pointer to an RT-11 context block
+    seg_num,
+    faop : $ref_bblock,				! pointer to an fao output
+    flags,
+    max_ent,					! entries per segment for summary
+    empt_cnt,					! count of empty entries
+    perm_cnt,					! count of permanent entries
+    unkn_cnt,					! count of unknown entries
+    empt_tot,					! total count of empty entries
+    perm_tot,					! total count of permanent entries
+    unkn_tot					! total count of unknown entries
+    ;
+
+BIND
+    dire = exch$a_gbl [excg$a_dire_work]	: $ref_bblock,	! pointer to work area
+    fab  = dire [dire$a_outfab]		: $ref_bblock,	! pointer to fab for output file
+    rab  = dire [dire$a_outrab]		: $ref_bblock	! pointer to rab for output file
+    ;
+
+ROUTINE seg_stat (num, perm, empt, unkn, maxe) : NOVALUE =
+BEGIN
+LOCAL
+    faop : $ref_bblock,				! pointer to an fao output
+    use;
+
+faop = (IF .num EQL 0
+	THEN
+	    %ASCID '        Total for all segments:'
+	ELSE
+	    exch$util_fao_buffer (%ASCID '        Segment !2UL', .num));
+exch$dire_put (.faop, (.num EQL 0));
+
+faop = exch$util_fao_buffer (%ASCID '                     Permanent files: !4UL', .perm);
+exch$dire_put (.faop);
+
+faop = exch$util_fao_buffer (%ASCID '                     Unused files:    !4UL', .empt);
+exch$dire_put (.faop);
+
+IF .unkn NEQ 0
+THEN
+    BEGIN
+    faop = exch$util_fao_buffer (%ASCID '                     Unknown entries: !4UL', .unkn);
+    exch$dire_put (.faop);
+    END;
+
+use = .perm + .empt + .unkn;
+faop = exch$util_fao_buffer (%ASCID '                     Entries in use:  !4UL     Entries available: !UL',
+				.use, .maxe - .use);
+exch$dire_put (.faop);
+
+exch$dire_put (null_string);		! Print a blank line
+
+RETURN;
+END;
+
+! Get a context block for the loop
+!
+ctx = exch$util_rt11ctx_allocate (.volb, 0);
+
+! Initialize the local variables
+!
+seg_num = 1;					! Start with the first directory segment
+empt_cnt = 0;
+perm_cnt = 0;
+unkn_cnt = 0;
+empt_tot = 0;
+perm_tot = 0;
+unkn_tot = 0;
+
+! Need some info from the root segment, grab a pointer
+!
+seg = exch$rt11_dirseg_get (.volb, 1);
+$logic_check (2, (.seg NEQ 0), 126);
+
+! Print the header for the summary
+!
+max_ent =  (rt11$k_dirseglen -			! Maximum number of entries is the length of entire segment
+	    rt11hdr$k_length -			!  less the length of the segment header
+	    2)					!  less two bytes for the end-of-segment marker
+	    /  					! Divided by 
+	    (rt11ent$k_length + 		!  the length of an entry - the standard length
+	    .seg [rt11hdr$w_extra_bytes]);	!  plus any extra bytes
+faop = exch$util_fao_buffer (%ASCID '    Directory segments allocated: !2UL     Maximum files per segment:!4UL',
+						.seg [rt11hdr$w_num_segs], .max_ent);
+exch$dire_put (.faop);				! Print the header line
+faop = exch$util_fao_buffer (%ASCID '    Directory segments in use:    !2UL     Maximum files per volume: !4UL',
+						.seg [rt11hdr$w_high_seg], .max_ent * .seg [rt11hdr$w_num_segs]);
+exch$dire_put (.faop);				! Print the header line
+exch$dire_put (null_string);				!  and another blank line
+
+! Loop through all the segments in the directory
+!
+flags = rtnxt$m_permanent OR rtnxt$m_empty OR rtnxt$m_tentative OR rtnxt$m_unknown OR rtnxt$m_skip_check;
+WHILE ((ent = exch$rtacp_next_entry (.ctx, .flags)) NEQ 0)
+DO
+    BEGIN
+
+    ! If we have been canceled, leave the loop
+    !
+    IF .exch$a_gbl [excg$v_control_c]
+    THEN
+	EXITLOOP;
+
+    ! Look for the split between segments
+    !
+    IF .seg_num NEQ .ctx [rt11ctx$l_seg_number]
+    THEN
+	BEGIN
+	seg_stat (.seg_num, .perm_cnt, .empt_cnt, .unkn_cnt, .max_ent);
+	empt_cnt = 0;
+	perm_cnt = 0;
+	unkn_cnt = 0;
+	seg_num = .ctx [rt11ctx$l_seg_number];
+	END;
+
+    ! Now print this file if that is what is called for
+    !
+    CASE .ent [rt11ent$v_type] FROM 0 TO rt11ent$m_typ_end_segment OF
+    SET
+
+	[rt11ent$m_typ_tentative, rt11ent$m_typ_empty] :
+		BEGIN
+		empt_cnt = .empt_cnt + 1;
+		empt_tot = .empt_tot + 1;
+		END;
+
+	[rt11ent$m_typ_permanent] :
+		BEGIN
+		perm_cnt = .perm_cnt + 1;
+		perm_tot = .perm_tot + 1;
+		END;
+
+	[INRANGE, OUTRANGE] :
+		BEGIN
+		unkn_cnt = .unkn_cnt + 1;
+		unkn_tot = .unkn_tot + 1;
+		END;
+	TES;
+    END;
+
+! If we have been canceled, print the message
+!
+IF .exch$a_gbl [excg$v_control_c]
+THEN
+    $exch_signal ($info_stat_copy (exch$_canceled))
+
+ELSE
+    BEGIN
+
+    ! Print the stats for the last segment
+    !
+    seg_stat (.seg_num, .perm_cnt, .empt_cnt, .unkn_cnt, .max_ent);
+
+    ! If we have more than one segment, print the grand total
+    !
+    IF .seg_num NEQ 1				! Will be equal if we only have 1 segment
+    THEN
+	seg_stat (0, .perm_tot, .empt_tot, .unkn_tot, .max_ent * .seg [rt11hdr$w_num_segs]);
+    END;
+
+! Free up the context block.
+!
+exch$util_rt11ctx_release (.ctx);
+
+RETURN true;
+END;
+
+GLOBAL ROUTINE dire_rt11_put_item (ctx : $ref_bblock) : NOVALUE =	%SBTTL 'dire_rt11_put_item'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Add a single item to the output listing, writing the record if we hit the column count
+!
+! INPUTS:
+!
+!	ctx  - an RT11 directory entry context block, if address is zero, means write buffer.
+!
+! IMPLICIT INPUTS:
+!
+!	dire - directory work area
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true if put succeeded, false if not
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('dire_rt11_put_item> ');
+
+LOCAL
+    desc : VECTOR [2, LONG],
+    status
+    ;
+
+REGISTER
+    wid						! current listing width
+    ;
+
+BIND
+    dire = exch$a_gbl [excg$a_dire_work]	: $ref_bblock,			! pointer to work area
+    buf = dire [dire$t_list_buffer] : VECTOR [dire$s_list_buffer, BYTE]	! output buffer
+    ;
+
+
+$block_check (2, .dire, dire, 427);
+
+! Perform a couple of sanity checks
+!
+$logic_check (2, (.dire [dire$l_cur_column] LSSU .dire [dire$l_q_columns]), 110);
+$logic_check (2, (.dire [dire$l_cur_width]  LSSU .dire [dire$l_list_width]), 111);
+
+! Perform required initializations
+!
+dire [dire$v_items_printed] = true;		! one or more items has been printed
+wid = .dire [dire$l_cur_width];			! a fast register for the current width
+
+! An input address of 0 means that we should flush the buffer
+!
+IF (.ctx EQL 0)
+THEN
+    BEGIN
+
+    IF .wid GTR 0
+    THEN
+	BEGIN
+	desc [0] = .wid;
+	desc [1] = buf [0];
+	exch$dire_put (desc);
+	END;
+
+    dire [dire$l_cur_column] = 0;
+    dire [dire$l_cur_width] = 0;
+    RETURN true;
+    END;
+
+! Add the separator to the buffer
+!
+IF .dire [dire$l_cur_column] NEQ 0
+THEN
+    BEGIN
+    CH$FILL (%C ' ', dire$k_item_spacing, buf [.wid]);
+    wid = .wid + dire$k_item_spacing;
+    END;
+
+! We always add the protection and filename to the buffer
+!
+CH$MOVE (12, ctx [rt11ctx$t_exp_protected], buf [.wid]);
+wid = .wid + 12;
+
+! Add the file size if requested
+!
+IF .dire [dire$v_q_size]
+THEN
+    BEGIN
+    LOCAL
+	addwid,
+	ctrstr;
+    IF .dire [dire$v_q_octal]
+    THEN
+	BEGIN
+	addwid = 7;
+	ctrstr = %ASCID ' !6OW';
+	END
+    ELSE
+	BEGIN
+	addwid = 5;
+	ctrstr = %ASCID '!5UL';
+	END;
+    desc [0] = .addwid;
+    desc [1] = buf [.wid];
+    IF NOT (status = $fao (.ctrstr, 0, desc, .ctx [rt11ctx$w_blocks]))
+    THEN
+	$exch_signal_stop (.status);
+
+    wid = .wid + .addwid;
+    END;
+
+! Add the date if requested
+!
+IF .dire [dire$v_q_date]
+THEN
+    BEGIN
+    CH$MOVE (1, UPLIT BYTE (' '), buf [.wid]);
+    wid = .wid + 1;
+    CH$MOVE (rt11ctx$s_exp_date, ctx [rt11ctx$t_exp_date], buf [.wid]);
+    wid = .wid + rt11ctx$s_exp_date;
+    END;
+
+! Add the start block if requested
+!
+IF .dire [dire$v_q_blocks]
+THEN
+    BEGIN
+    LOCAL
+	addwid,
+	ctrstr;
+    IF .dire [dire$v_q_octal]
+    THEN
+	BEGIN
+	addwid = 7;
+	ctrstr = %ASCID ' !6OW';
+	END
+    ELSE
+	BEGIN
+	addwid = 6;
+	ctrstr = %ASCID ' !5UL';
+	END;
+    desc [0] = .addwid;
+    desc [1] = buf [.wid];
+    IF NOT (status = $fao (.ctrstr, 0, desc, .ctx [rt11ctx$l_start_block]))
+    THEN
+	$exch_signal_stop (.status);
+
+    wid = .wid + .addwid;
+
+    END;
+
+! Do we need to flush?
+!
+IF (dire [dire$l_cur_column] = .dire [dire$l_cur_column] + 1) GEQU .dire [dire$l_q_columns]
+THEN
+    BEGIN
+
+    desc [0] = .wid;
+    desc [1] = buf [0];
+    exch$dire_put (desc);
+    dire [dire$l_cur_column] = 0;
+    wid = 0;
+    END;
+
+dire [dire$l_cur_width] = .wid;
+
+RETURN;
+END;
+
+END
+ELUDOM

@@ -1,0 +1,590 @@
+%TITLE 'MOM Network I/O module'
+MODULE MOMACPIO (
+		LANGUAGE (BLISS32),
+		ADDRESSING_MODE (NONEXTERNAL=GENERAL),
+		ADDRESSING_MODE (EXTERNAL=GENERAL),
+		IDENT = 'V04-000'
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  DECnet-VAX Network Management Maintenance Operations Module (MOM)
+!
+! ABSTRACT:
+!	This module contains routines to handle all network I/O
+!	with NETACP (NETDRIVER).
+!
+! ENVIRONMENT:  VAX/VMS Operating System
+!
+! AUTHOR:  Kathy Perko
+!
+! CREATION DATE:  11-Jan-1983
+!
+! MODIFIED BY:
+!	V03-001	MKP0001		Kathy Perko		2-June-1983
+!		Fix code that maps parameter IDs from NETUSR values
+!		to NICE values.
+!
+!--
+
+
+%SBTTL 'Declarations'
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+    mom$build_p2: NOVALUE,
+    mom$netacp_qio,
+    mom$mapqioerror,
+    mom_mapentity,
+    mom_mapparamid;
+
+!
+! INCLUDE FILES:
+!
+
+LIBRARY 'LIB$:MOMLIB';			! Facility-wide definitions
+LIBRARY 'SHRLIB$:NMALIBRY';		! NICE definitions
+LIBRARY 'SHRLIB$:NET';			! NETACP QIO interface
+LIBRARY 'SYS$LIBRARY:STARLET';		! VMS common definitions
+
+!
+! OWN STORAGE:
+!
+
+!
+! EXTERNAL REFERENCES:
+!
+
+$mom_externals;
+
+EXTERNAL
+    mom$gq_netnamdsc,
+    mom$gw_acp_chan;
+
+EXTERNAL LITERAL
+    mom$_qiobfovf;
+
+EXTERNAL ROUTINE
+    mom$debug_qio,
+    mom$bld_reply;
+
+
+%SBTTL 'mom$build_p2      Build P2 buffer and descriptor'
+GLOBAL ROUTINE mom$build_p2 (len1, adr1, len2, adr2, p2dsc, resdsc) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine builds the P2 buffer and descriptor for operations to
+!	NETACP.  The buffer contains one or two search key values.  These
+!	values are compared to fields in NETACPs database entries (the database
+!	and the fields (search keys) are specified in the NFB buffer).  When
+!	an entry is found in which the specified field(s) match the search
+!	key value(s), NETACP performs the operation requested by the rest of
+!	the NFB (set, show, etc.)
+!
+! FORMAL PARAMETERS:
+!
+!	LEN1		First search key length.  If LEN1 is:
+!			    - zero then ADR1 contains a longword search key.
+!			    - >0 it contains the length of a string which
+!				ADR1 points to.
+!			    - -1 then search key ID is a wildcard, and nothing
+!			      needs to be put into the P2 buffer for it.
+!			    - -2 then ADR1 contains a word search key.
+!	ADR1		First search key address.  If LEN1 is zero then this
+!			is the longword value of the search key.  If LEN1 is -1 then
+!			the search key is omitted.
+!	LEN2		Second search  key length.  Same rules apply as for
+!			LEN1.
+!	ADR2		Second search key address. Same rules apply as for
+!			ADR1.
+!	P2DSC		Address of P2 descriptor.  This routine assumes that
+!			the buffer is large enough to handle the result.
+!			The maximum P2 buffer required by NML is 36 bytes.
+!	RESDSC		Address of descriptor to hold resulting P2.
+!
+! IMPLICIT OUTPUTS:
+!	The buffer described by P2DSC contains the search key and
+!	start key information.
+!
+!--
+
+BEGIN
+
+MAP
+    p2dsc  : REF VECTOR,
+    resdsc : REF VECTOR;
+
+OWN
+    collate_start_value: VECTOR [nfb$c_ctx_size, BYTE]
+			INITIAL ( REP nfb$c_ctx_size OF BYTE (0));
+
+LOCAL
+    msgsize,
+    count,    				! P2 buffer length
+    ptr;				! P2 buffer pointer
+
+!
+! Calculate the length of the resulting P2 buffer, and signal if
+! the buffer supplied isn't big enough.
+!
+count = 4;			! Account for count at beginning of buffer.
+SELECTONE .len1 OF
+    SET
+    [-2]: count = .count + 2;			! It's a word
+    [0]: count = .count + 4;			! It's a longword
+    [1 to 255]: count = .count + .len1 + 2	! It's a string.
+    TES;
+
+SELECTONE .len2 OF
+    SET
+    [-2]: count = .count + 2;			! It's a word
+    [0]: count = .count + 4;			! It's a longword
+    [1 to 255]: count = .count + .len2 + 2	! It's a string.
+    TES;
+
+count = .count + nfb$c_ctx_size;
+IF .count GTR .p2dsc [0] THEN
+    !
+    ! The P2 buffer will overflow.  Signal a MOM error.
+    !
+    BEGIN
+    mom$ab_msgblock [msb$l_flags] = msb$m_msg_fld;	! Set message text flag.
+    mom$ab_msgblock [msb$b_code] = nma$c_sts_mpr;
+    mom$ab_msgblock [msb$l_text] = mom$_qiobfovf;
+    mom$bld_reply (mom$ab_msgblock, msgsize);    	! Build message
+    $signal_msg (mom$ab_nice_xmit_buf, .msgsize);	! Signal it.
+    END;
+
+ptr = .p2dsc [1] + 4;	! Skip over return count
+
+!
+! Add first search key value to the P2 buffer.
+!
+SELECTONE .len1 OF
+    SET
+    [-2]: ptr = CH$MOVE (2, adr1, .ptr);	! It's a word
+    [0]: ptr = CH$MOVE (4, adr1, .ptr);		! It's a longword
+    [1 TO 255]: 				! It's a string.
+	BEGIN
+	CH$WCHAR_A (.len1<0,8>, ptr);
+	CH$WCHAR_A (.len1<8,8>, ptr);
+	ptr = CH$MOVE (.len1, .adr1, .ptr);
+	END
+    TES;
+
+!
+! Add search key two to buffer.
+!
+SELECTONE .len2 OF
+    SET
+    [-2]: ptr = CH$MOVE (2, adr2, .ptr);	! It's a word
+    [0]: ptr = CH$MOVE (4, adr2, .ptr);		! It's a longword
+    [1 TO 255]: 				! It's a string.
+	BEGIN
+	CH$WCHAR_A (.len2<0,8>, ptr);
+	CH$WCHAR_A (.len2<8,8>, ptr);
+	ptr = CH$MOVE (.len2, .adr2, .ptr);
+	END
+    TES;
+
+!
+! Set up a context area of a string of nulls.  NETACP will
+! replace the null string with a start value of the last database
+! entry matched by the search key.  
+!
+ptr = CH$MOVE ( nfb$c_ctx_size, collate_start_value, .ptr);
+!
+! Set up resulting descriptor for return.
+!
+resdsc [0] = .ptr - .p2dsc [1];
+resdsc [1] = .p2dsc [1];
+
+END;				! End of mom$build_p2
+
+%SBTTL 'mom$netacp_qio  General network QIO routine'
+GLOBAL ROUTINE mom$netacp_qio (nfbdsc, p2, p3, bufdsc) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine issues QIO function requests to NETACP to perform
+!	volatile data base operations.
+!
+! FORMAL PARAMETERS:
+!
+!	NFBDSC		Descriptor of NFB data.
+!	P2		Descriptor of P2 data.
+!	P3		Address of word to contain resulting length.
+!	BUFDSC		Descriptor of data buffer
+!
+! IMPLICIT INPUTS:
+!
+!	MOM$GW_ACP_CHAN	Channel assigned to the command process link.
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	This routine returns an MOM status code that has been mapped from
+!	the QIO status code.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+BEGIN
+
+MAP
+    nfbdsc : REF VECTOR,
+    bufdsc : REF VECTOR;
+
+LOCAL
+    iosb     : $iosb,			! I/O status block
+    database,				! Database ID
+    status;				! Temporary return status
+!
+! If it hasn't already been done, establish channel to NETACP for QIO control
+! functions. The channel is to NET:, the pseudo device to which volatile
+! database commands are issued.  Doing the assing here allows NCP commands to
+! the permanent data base to be processed even if NETACP is not mounted.
+!
+status = ss$_normal;
+IF .mom$gw_acp_chan EQL 0 THEN
+    status = $ASSIGN(DEVNAM = mom$gq_netnamdsc,
+		     CHAN = mom$gw_acp_chan);
+IF .status THEN
+    BEGIN
+    !
+    ! Issue the QIO.
+    !
+    status = $QIOW (CHAN = .mom$gw_acp_chan,	! Channel
+		    FUNC = io$_acpcontrol,	! Function
+		    IOSB = iosb,		! I/O status block
+		    P1   = .nfbdsc,		! P1 descriptor (NFB)
+		    P2   = .p2,			! P2 descriptor (component id)
+		    P3   = .p3,			! Address for resulting length
+		    P4   = .bufdsc);		! P4 (data buffer) descriptor
+    !
+    ! Log the QIO function.
+    !
+    mom$debug_qio (dbg$c_acpqio,		! Log type code
+		   .status,			! QIO status value
+		   iosb,			! Address of I/O status block
+		   .nfbdsc,			! NFB descriptor
+		   .p2,				! P2 descriptor
+		   .p3,				! Address of P3 word
+		   .bufdsc,			! Data buffer descriptor
+		   $ASCID('SET, SHOW, or CLEAR NETACPs database'));
+    !
+    ! Map the operation status into an MOM code.
+    !
+    database = .bblock [.nfbdsc [1], nfb$b_database];
+    END;
+status = mom$mapqioerror (.database, .status, iosb);
+!
+! Return the mapped status code.
+!
+RETURN .status
+
+END;					! End of mom$netqio
+
+%SBTTL 'mom$mapqioerror      Map QIO error to MOM error'
+GLOBAL ROUTINE mom$mapqioerror (database, qiostatus, iosb) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine translates QIO errors into network management
+!	errors and makes the appropriate entries in the message
+!	block.
+!
+! FORMAL PARAMETERS:
+!
+!	DATABASE	Database ID
+!	QIOSTATUS	QIO status return.
+!	IOSB		Address of I/O status block.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	MOM$AB_MSGBLOCK contains the appropriate error code and detail
+!	if applicable.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	The return status is the MOM error that corresponds to the QIO error.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+BEGIN
+
+MAP
+    iosb : REF $iosb;
+
+LOCAL
+    code   : BYTE,    			! NICE status code
+    detail : WORD,			! NICE detail code
+    flags,				! Message flags
+    status,				! Return status
+    text;				! Optional text code
+!
+! Set up the default message information.
+!
+code = nma$c_sts_ope;			! Management program error
+detail = -1;				! No detail
+flags = msb$m_det_fld;			! Detail flag
+!
+! Check the QIO status and the I/O status block.
+!
+IF NOT .qiostatus THEN
+    BEGIN
+!
+! The QIO was in error.  This indicates a program or a system error.
+!
+    text = .qiostatus;			! Use system message as optional text
+    flags = .flags OR			! Default flags
+	    msb$m_msg_fld;		!  and optional text
+    status = failure;			! Return status
+
+    END
+ELSE
+    BEGIN
+    !
+    ! The QIO status was successful so check the I/O status block.
+    ! If it indicates success the just return.  Otherwise, attempt to map
+    ! the error code to an MOM error code.
+    !
+    IF .iosb [ios$w_status] THEN
+	RETURN success;
+
+    SELECTONE .iosb [ios$w_status] OF
+	SET
+	[ss$_insfarg]:				! Missing parameter
+	    BEGIN
+	    code = nma$c_sts_pms;
+	    detail = mom_mapparamid (.iosb [ios$l_info]);
+	    status = failure;
+	    END;
+
+	[ss$_badparam,				! Parameter value error
+	ss$_devactive]:
+	    BEGIN
+	    code = nma$c_sts_pva;
+	    detail = mom_mapparamid (.iosb [ios$l_info]);
+	    status = failure;
+	    END;
+
+	[ss$_writlck]:				! Component in wrong state
+	    BEGIN
+	    code = nma$c_sts_sta;
+	    detail = mom_mapentity (.database);
+	    status = failure;
+	    END;
+
+	[ss$_insfmem]:				! No room for new entry
+	    BEGIN
+	    code = nma$c_sts_roo;
+	    status = failure;
+	    END;
+
+	[ss$_endoffile]:			! Unrecognized component
+	    BEGIN
+	    code = nma$c_sts_cmp;
+	    detail = mom_mapentity (.database);
+	    status = nma$c_sts_cmp;
+	    END;
+
+	[ss$_nopriv]:				! Privilege violation
+	    BEGIN
+	    code = nma$c_sts_pri;
+	    status = failure;
+	    END;
+
+	[ss$_nosuchdev]:			! No such device
+	    BEGIN
+	    code = nma$c_sts_cmp;
+	    detail = mom_mapentity (.database);
+	    text = .iosb [ios$w_status];
+	    flags = .flags OR msb$m_msg_fld;
+	    status = failure;
+	    END;
+
+	[ss$_devinact]:				! Device inactive
+	    BEGIN
+	    code = nma$c_sts_sta;
+	    detail = mom_mapparamid (.iosb [ios$l_info]);
+	    text = .iosb [ios$w_status];
+	    flags = .flags OR msb$m_msg_fld;
+	    status = failure;
+	    END;		
+
+	[ss$_ivdevnam]:				! Invalid device name.
+	    BEGIN
+	    code = nma$c_sts_ide;
+	    detail = mom_mapentity (.database);
+	    text = .iosb [ios$w_status];
+	    flags = .flags OR msb$m_msg_fld;
+	    status = failure;
+	    END;
+
+	[ss$_nolicense]:			! Customer doesn't have a
+	    BEGIN
+	    code = nma$c_sts_ope;
+	    text = .iosb [ios$w_status];
+	    flags = .flags OR msb$m_msg_fld;
+	    status = failure;
+	    END;
+
+	[OTHERWISE]:				! Operation failure
+	    BEGIN
+	    code = nma$c_sts_ope;
+	    detail = .iosb [ios$l_info];
+	    text = .iosb [ios$w_status];
+	    flags = .flags OR
+		    msb$m_msg_fld;
+	    status = failure;
+	    END;
+
+	TES;
+    END;
+!
+! Set up the message information.
+!
+mom$ab_msgblock [msb$l_flags]  = .flags;
+mom$ab_msgblock [msb$b_code]   = .code;
+mom$ab_msgblock [msb$w_detail] = .detail;
+mom$ab_msgblock [msb$l_text]   = .text;
+!
+! Return the mapped status.
+!
+RETURN .status
+
+END;					! End of mom$mapqioerror
+
+%SBTTL 'mom_mapentity      Map NETACP database ID into entity type'
+ROUTINE mom_mapentity (database) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine translates the QIO database ID into a network
+!	management entity detail code.
+!
+! INPUTS:
+!
+!	DATABASE	NETACP database ID
+!
+! OUTPUTS:
+!
+!	The return value is the detail code.
+!--
+
+BEGIN
+
+LOCAL
+    detail : WORD;
+
+detail = (
+    SELECTONE .database OF
+	SET
+	[nfb$c_db_pli]: nma$c_ent_lin;
+
+	[nfb$c_db_lni,
+	nfb$c_db_ndi]: nma$c_ent_nod;
+
+
+	[nfb$c_db_cri]: nma$c_ent_cir;
+
+	[nfb$c_db_aji]: nma$c_ent_nod;
+
+	[OTHERWISE]:    -1;
+
+	TES);
+
+RETURN .detail
+
+END;					! End of mom_mapentity
+
+%SBTTL 'mom_mapparamid      Map QIO parameter ID into management code'
+ROUTINE mom_mapparamid (netacp_param_id) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine translates the NETACP QIO parameter ID code into network
+!	management parameter code.
+!
+! INPUTS:
+!	NETACP_PARAM_ID		NETACP NFB ID for parameter.  Returned in
+!				second longword of IOSB for some ACP QIO
+!				errors.
+!
+! OUTPUTS:
+!
+!	The return value is the detail code.
+!--
+
+BEGIN
+
+MAP
+    netacp_param_id: BBLOCK;
+
+INCR svd_index FROM 0 TO svd$c_entry_count DO
+    BEGIN
+    IF .mom$ab_service_data [.svd_index, svd$l_nfb_id]
+					EQL .netacp_param_id THEN
+	RETURN .mom$ab_service_data [.svd_index, svd$w_nice_id];
+    END;
+
+!
+! The parameter doesn't map to any NICE parameter.  Simply return
+! a null parameter value.
+!
+RETURN -1;
+
+END;					! End of mom_mapparamid
+
+END						! End of module
+
+ELUDOM

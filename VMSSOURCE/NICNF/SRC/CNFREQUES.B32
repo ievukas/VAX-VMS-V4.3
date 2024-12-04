@@ -1,0 +1,1085 @@
+%TITLE	'DECnet Ethernet Configurator Module'
+MODULE CNFREQUES	(
+			LANGUAGE (BLISS32),
+			IDENT = 'V04-000'
+			) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	DECnet Configurator Module (NICONFIG)
+!
+! ABSTRACT:
+!
+!	This module contains the routines to process incoming requests
+!	by parsing them and dispatching to the appropriate routines.
+!
+! ENVIRONMENT:	VAX/VMS Operating System
+!
+! AUTHOR:	Bob Grosso, 	CREATION DATE:  13-Oct-1982
+!
+! MODIFIED BY:
+!
+!	V03-002	RPG0002		Bob Grosso		16-May-1983
+!		Correct the arguement list to a call to Signal.
+!
+!	V03-001	RPG0001		Bob Grosso		02-May-1983
+!		Check state of UNA.
+!--
+
+%SBTTL	'Definitions'
+
+!
+! INCLUDE FILES:
+!
+
+LIBRARY 'SYS$LIBRARY:STARLET';			! VMS common definitions
+
+LIBRARY 'SHRLIB$:NET';				! Network definitions
+
+LIBRARY 'SHRLIB$:NMALIBRY';			! NICE code definitions
+
+REQUIRE 'LIB$:CNFDEF.R32';
+
+REQUIRE 'SRC$:CNFPREFIX.REQ';
+    
+
+!
+! BUILTIN functions
+!
+
+BUILTIN
+    INSQUE,				! INSQUE instruction
+    REMQUE;				! REMQUE instruction
+
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+
+	CNF$PROCESS_REQUEST : NOVALUE,	! Jacket routine for Process_request
+	PROCESS_REQUEST,		! Parse NICE and dispatch
+	CNF_ENABLE_SURVEILLANCE,	! Jacket routine for enable_surveillance
+	ENABLE_SURVEILLANCE,		! Set-up to prepare for setting surveillance
+	SURVEIL,			! Begin surveillance of a circuit
+	CNF$LOCATE_CIR_BLK,		! Match an ASCII circuit name with a CIR control block
+	CNF_DISABLE_SURVEILLANCE,	! Jacket routine for disable_surveillance
+	DISABLE_SURVEILLANCE,		! set-up to prepare to discontinue circuit surveillance
+	CNF$DISABLE_SURVEIL;		! disabled surveillance of a circuit
+
+
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL ROUTINE
+
+
+!   Module CNFMAIN
+	CNF$EXIT,				! Clean up and exit
+	CNF$TRACE,				! Log messages to log file
+	CNF$LOG_DATA,				! Log messages to log file
+	CNF$GET_ZVM,				! Get zeroed virtual memory
+	CNF$FREE_VM,				! Free virtual memory
+
+!   Module CNFSTORE
+
+	CNF$READ_SYSIDM,			! Issue QIO to listen on the NI
+
+!   Module CNFSHOW
+
+	CNF$PROCESS_SHOW,			! Show Circuit and system IDs
+
+!   Module CNFSEND
+
+	CNF$BUFR_NICE_MSG,
+	CNF$BUFR_ERR_MSG,
+	CNF$SEND_NICE_MSG,
+
+!   Module CNFWORKQ
+
+	WKQ$ADD_WORK_ITEM;			! Add work to work queue
+
+EXTERNAL ROUTINE
+
+	STR$COMPARE		: ADDRESSING_MODE (GENERAL);
+
+
+EXTERNAL LITERAL
+
+	CNF$_CHAN,		! Error assigning or deassigning channel
+	CNF$_DRVRSTRT,		! Error while issuing startup command to driver
+	CNF$_LOGIC,		! Program logic error or unexpected condition
+
+!   From CNFSTORE
+	SYSIDM_BUFSIZ,
+	ADRTYP_BUFSIZ,
+
+	CNF$C_SYNCH_EFN,
+	CNF$C_ASYNCH_EFN;
+
+
+EXTERNAL
+
+	CNF$B_SURVEILLANCE_SET,			! Boolean: mark if anything is under surveillance
+	CNF$W_NETCHAN : WORD,			! Channel opened to network
+	CNF$GQ_CIRSURLST : VECTOR [2];		! List of circuit under surveillance
+
+OWN
+    SUCCESS_NICE_DSC :
+	BBLOCK [DSC$C_S_BLN] INITIAL
+	(
+	    4,
+	    UPLIT (
+		BYTE (%X'01'),
+		WORD (%X'FFFF'),
+		BYTE (%X'00')
+		)
+	);
+
+%SBTTL	'cnf$process_request'
+GLOBAL ROUTINE CNF$PROCESS_REQUEST (IRB) : NOVALUE =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!  This routine is executed off the work queue.
+!  Parse the NICE message to determine the type of operation,
+!  and the circuits to be affected.  Dispatch to appropriate
+!  routine if entire message is correct.
+!
+! FORMAL PARAMETERS:
+!
+!	irb	Interrupt request block, contains all the info for a connection
+!		to NICONFIG.  The IRB contains the NICE command which will
+!		be parsed.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!	Success
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+ 
+    BEGIN
+    LOCAL
+	CIRCUIT_DSC : BBLOCK [DSC$C_S_BLN],	! Allocate circuit name descriptor here, whether it will be needed
+						!  or not, it makes book keeping much simpler.
+	STATUS;
+
+    CH$FILL (0, DSC$C_S_BLN, CIRCUIT_DSC);		! Zero the descriptor
+    STATUS = PROCESS_REQUEST (.IRB, CIRCUIT_DSC);	! Parse and act upon the command
+    IF NOT .STATUS					! If unsuccessful, buffer an error message for return
+    THEN
+	CNF$BUFR_ERR_MSG (.IRB, NMA$C_STS_RES, 0, .STATUS, 0);
+
+    CNF$SEND_NICE_MSG (.IRB);				! Issue QIO's to send NICE messages buffered
+
+    IF .CIRCUIT_DSC [DSC$W_LENGTH] NEQ 0 		! If a buffer was allocated to the descriptor, return it
+    THEN
+	CNF$FREE_VM (CIRCUIT_DSC [DSC$W_LENGTH], CIRCUIT_DSC [DSC$A_POINTER]);
+
+    RETURN TRUE;					! Always return success, errors are sent via QIO back to connectee
+    END;						! Routine cnf$process_request
+
+%SBTTL	'process_request'
+ROUTINE PROCESS_REQUEST (IRB, CIRNAM_DSC) =
+ 
+!++
+!
+!  This routine is called by CNF$PROCESS_REQUEST which is
+!  executed off the work queue.
+!  Parse the NICE message to determine the type of operation,
+!  and the circuits to be affected.  Dispatch to appropriate
+!  routine if entire message is correct.
+!
+!
+!	irb		Interrupt request block, contains all the info for 
+!			a connection to NICONFIG.  The IRB contains the 
+!			NICE command which will be parsed.
+!
+!	cirnam_dsc	Descriptor for storing of circuit name if one is 
+!			specified in command.
+!
+!--
+ 
+    BEGIN
+    MAP
+	CIRNAM_DSC : REF BBLOCK [DSC$C_S_BLN],
+	IRB : REF BBLOCK;		! Interrupt request block
+
+    LOCAL
+	KNOWN,				! Was KNOWN CIRCUITS present in command
+	NICE : REF BBLOCK,		! Pointer into NICE command
+	FUNCTION : BBLOCK [1],
+	OPTION : BBLOCK [1],
+	PROCESSING_SHOW,		! Boolean, true = SHOW, false = SET
+	SHOW_INFO,			! Coded for CHAR, SUMMARY or STATUS
+	LEN_REMAINING,
+	NICE_SURVEILLANCE : REF BBLOCK;	! Locate section of NICE command
+					!  containing the SURVEILLANCE parameter
+
+    BIND
+	CONF = UPLIT (%ASCIC 'CONFIGURATOR') : VECTOR [,BYTE];
+
+    CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR('TRACE'), 
+	$DESCRIPTOR ('process_request'));
+
+    NICE = IRB [IRB$T_REQUEST];			! Beginning of NICE command
+
+    IF .IRB [IRB$W_IOSB1] 			! The size of the NICE message was returned in the IOSB
+	LSS 18					! NICE message too short to contain
+    THEN					! function, option, and "CONFIGURATOR", and Circuit
+	BEGIN
+	CNF$BUFR_ERR_MSG (.IRB, NMA$C_STS_INV, 0, 0, 0);
+	RETURN TRUE;
+	END;
+
+!
+!	An Acceptable NICE message must conform with the following
+!
+!   Byte 1	Function byte, accept either CHANGE or READ
+!   Byte 2	Option Byte, 
+!		  bits 0-2 contain the entity type. Accept only MODULE
+!		  For Function READ
+!		    bits 4-6 indicate summary/status/characteristics
+!		  For Function CHANGE
+!		    bit 6 indicates whether set/define or clear/purge
+!		    bit 7 indicates whether permanent or volatile, 
+!		          accept only volatile
+!   Bytes 3-17	Module name ASCIC string, "CONFIGURATOR"
+!   Bytes 18,19	Code for circuit
+!   Byte 20	Code for Known, or count for circuit name
+!   Bytes 21-22 or Next two bytes after circuit name:
+!		code for surveillance
+!   Next byte	surveillance code, 0-Enabled, 1-Disabled
+!
+
+!
+!   Check the specified option and accept only SET or SHOW
+!
+    FUNCTION = .NICE [0,0,8,0];
+    OPTION = .NICE [0,8,8,0];
+
+    IF .OPTION [NMA$V_OPT_PER]			! There is no permanent data base so
+    THEN					! DEFINE, LIST or PURGE not permitted
+	BEGIN
+	CNF$BUFR_ERR_MSG (.IRB, NMA$C_STS_FUN, 0, 0, 0);
+	RETURN TRUE;
+	END;
+
+    IF .FUNCTION EQL NMA$C_FNC_CHA		! If function is CHANGE, accept only SET
+    THEN
+	BEGIN
+	IF .OPTION [NMA$V_OPT_CLE]
+	THEN
+	    BEGIN				! CLEAR not permitted
+	    CNF$BUFR_ERR_MSG (.IRB, NMA$C_STS_FUN, 0, 0, 0);
+	    RETURN TRUE;
+	    END;
+
+	PROCESSING_SHOW = FALSE;		! Must be a SET
+	END
+    ELSE
+	BEGIN
+	IF .FUNCTION EQL NMA$C_FNC_REA
+	THEN
+	    BEGIN
+	    PROCESSING_SHOW = TRUE;		! It's a SHOW
+	    SHOW_INFO = .OPTION [NMA$V_OPT_INF];  ! Characteristics, Summary or Status
+	    END
+	ELSE					! Only accept SET or SHOW
+	    BEGIN
+	    CNF$BUFR_ERR_MSG (.IRB, NMA$C_STS_FUN, 0, 0, 0);
+	    RETURN TRUE;
+	    END;
+	END;
+
+!
+!   Ensure that MODULE CONFIGURATOR was specified
+!
+    IF .OPTION [NMA$V_OPT_ENT] NEQ NMA$C_ENT_MOD 
+    THEN
+	BEGIN
+	CNF$BUFR_ERR_MSG (.IRB, NMA$C_STS_FUN, 0, 0, 0);
+	RETURN TRUE;
+	END;
+
+    IF NOT CH$EQL (.NICE [0,16,8,0], NICE [0,24,8,0], .CONF [0], CONF [1])
+    THEN
+	BEGIN
+	CNF$BUFR_ERR_MSG (.IRB, NMA$C_STS_FUN, 0, 0, 0);
+	RETURN TRUE;
+	END;
+
+!
+!   Check for CIRCUIT Circuit-name, or for KNOWN CIRCUITS
+!
+
+    If .NICE [15,0,16,0] NEQ NMA$C_PCCN_CIR
+    THEN
+	BEGIN
+	CNF$BUFR_ERR_MSG (.IRB, NMA$C_STS_IDE, NMA$C_ENT_CIR, 0, 0);
+	RETURN TRUE;
+	END;
+    IF .NICE [16,8,8,1] EQL NMA$C_ENT_KNO
+    THEN					! Known circuits
+	BEGIN
+	KNOWN = TRUE;
+	NICE_SURVEILLANCE = NICE [16,16,8,0];
+	END
+    ELSE					! Parse and store ASCIC circuit name
+	BEGIN
+	LOCAL
+	    CIRNAM_LEN,				! Use temp store, so that if CNF$GET_ZVM returns a failure, the
+						!  calling routine won't erroneously attempt to deallocate 
+	    CIRCUIT_PTR;
+
+	KNOWN = FALSE;
+	CIRNAM_LEN = .NICE [16,8,8,0];
+	EXECUTE ( 
+	  CNF$GET_ZVM ( CIRNAM_LEN, CIRNAM_DSC [DSC$A_POINTER]) );
+	CIRNAM_DSC [DSC$W_LENGTH] = .CIRNAM_LEN;
+	CIRCUIT_PTR = NICE [16,16,8,0];
+
+	!
+	!   Check the length of the circuit name and ensure that it does 
+	!   not extend past the end of the NICE message.
+	!
+	IF  (.CIRCUIT_PTR - .NICE) 		! Address of circuit minus start of NICE gives length of NICE to start of circuit
+	    + .CIRNAM_DSC [DSC$W_LENGTH] 	! plus length of circuit name gives length of NICE message up to end of circuit
+		GTR .IRB [IRB$W_IOSB1]		! Does circuit name extend off end of NICE message?
+	THEN
+	    BEGIN
+	    CNF$BUFR_ERR_MSG (.IRB, NMA$C_STS_IDE, NMA$C_ENT_CIR, 0, 0);
+	    RETURN TRUE;
+	    END;
+
+	CH$MOVE ( .CIRNAM_DSC [DSC$W_LENGTH], .CIRCUIT_PTR, .CIRNAM_DSC [DSC$A_POINTER]);
+
+
+	!
+	!   Surveillance code and value follows after circuit name
+	!
+	NICE_SURVEILLANCE = .CIRCUIT_PTR + . CIRNAM_DSC [DSC$W_LENGTH];
+	END;
+
+    !
+    !   Compute length of remaining unparsed NICE message.
+    !
+    LEN_REMAINING = .IRB [IRB$W_IOSB1] - (.NICE_SURVEILLANCE - .NICE);
+
+!
+!   If SHOW then check that nothing is left unprocessed
+!
+    IF .PROCESSING_SHOW
+    THEN
+	BEGIN
+	IF .LEN_REMAINING NEQ 0				! There is excess NICE message left unprocessed for a SHOW
+	THEN
+	    BEGIN
+	    CNF$BUFR_ERR_MSG (.IRB, NMA$C_STS_SIZ, 0, 0, 0);
+	    RETURN TRUE;
+	    END
+	ELSE
+	    EXECUTE (CNF$PROCESS_SHOW (.IRB, .KNOWN, .CIRNAM_DSC, .SHOW_INFO));
+	END
+    ELSE
+
+    !
+    !   For SET, check for SURVEILLANCE TYPE (enabled = 0, disabled = 1)
+    !   and dispatch to either enable or disable surveillance.
+    !
+	BEGIN
+	IF .LEN_REMAINING NEQ 0				! If SURVEILLANCE not given, default to ENABLE
+	THEN
+	    BEGIN
+	    IF .LEN_REMAINING NEQ 3
+	    THEN 					! Must be a word for surveillance code and 
+		BEGIN					! a byte for the surveillance value.
+		CNF$BUFR_ERR_MSG (.IRB, NMA$C_STS_PMS, NMA$C_PCCN_SUR, 0, 0);
+		RETURN TRUE;
+		END;
+	    IF .NICE_SURVEILLANCE [0,0,16,0] NEQ NMA$C_PCCN_SUR
+	    THEN
+		BEGIN
+		CNF$BUFR_ERR_MSG (.IRB, NMA$C_STS_PMS, NMA$C_PCCN_SUR, 0, 0);
+		RETURN TRUE;
+		END;
+
+	    IF .NICE_SURVEILLANCE [0,16,8,0] EQL NMA$C_SUR_ENA
+	    THEN
+		EXECUTE (CNF_ENABLE_SURVEILLANCE (.IRB, .KNOWN, .CIRNAM_DSC))
+	    ELSE
+		EXECUTE (CNF_DISABLE_SURVEILLANCE (.IRB, .KNOWN, .CIRNAM_DSC));
+	    END
+	ELSE						! Default to setting surveillance enabled
+	    EXECUTE (CNF_ENABLE_SURVEILLANCE (.IRB, .KNOWN, .CIRNAM_DSC));
+	END;
+
+    RETURN TRUE;
+    END;						! Routine process_request
+
+%SBTTL	'cnf_enable_surveillance  '
+ROUTINE CNF_ENABLE_SURVEILLANCE (IRB, KNOWN, CIRCUITNAM_DSC) =
+ 
+!++
+!
+!  Jacket routine to ensure common error recovery and memory
+!  deallocation for the enabling of surveillance logic.
+!
+!	irb		Interrupt request block, containing request context
+!
+!	known		If true, then set surveillance for all circuits
+!
+!	circuitnam_dsc	Descriptor for name of circuit to set surveillance on.
+!
+!  Always return success, any errors are buffered and then sent to 
+!  connectee.
+!--
+ 
+    BEGIN
+    LOCAL
+	CIRCUIT : REF BBLOCK,
+	STATUS;
+    MAP
+	CIRCUITNAM_DSC : REF BBLOCK;
+
+    CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR('TRACE'), 
+	$DESCRIPTOR ('cnf_enable_surveillance'));
+
+    STATUS = ENABLE_SURVEILLANCE (.IRB, .KNOWN, .CIRCUITNAM_DSC);
+    IF NOT .STATUS
+    THEN				! buffer up an error response
+	CNF$BUFR_ERR_MSG (.IRB, NMA$C_STS_MPR, 0, .STATUS)
+    ELSE				! Buffer up the 'Success' NICE response
+	CNF$BUFR_NICE_MSG (.IRB, SUCCESS_NICE_DSC, 0);
+
+    !
+    !	Check to ensure that there is still something under surveillance,
+    !	otherwise, clear flag so that when execution returns to primary loop 
+    !	in CNFMAIN it will terminate.
+    !
+    CNF$B_SURVEILLANCE_SET = FALSE;	! Assume none has been set
+    CIRCUIT = .CNF$GQ_CIRSURLST;	! first circuit in list
+    WHILE .CIRCUIT NEQ CNF$GQ_CIRSURLST DO		! For every circuit
+	BEGIN
+	IF .CIRCUIT [CIR$B_SURVEIL] EQL NMA$C_SUR_ENA	! If surveillance is enabled
+	THEN CNF$B_SURVEILLANCE_SET = TRUE;		! Then ensure that image execution will continue
+	CIRCUIT = .CIRCUIT [CIR$L_LINK];		! Next circuit in list
+	END;				! WHILE traversing Circuit linked list
+
+    RETURN TRUE;
+    END;				! Routine cnf_enable_surveillance
+
+%SBTTL	'enable_surveillance  '
+ROUTINE ENABLE_SURVEILLANCE (IRB, KNOWN, CIRCUITNAM_DSC) =
+ 
+!++
+!
+!  Perform some checking before calling the routine which will
+!  handle the actual establishing of surveillance on a circuit by
+!  first determining if the requested circuit is an NI circuit.
+!  If known was specified, then discover all the NI circuits available.
+!
+!	irb		Interrupt request block, containing request context
+!
+!	known		If true, then set surveillance for all circuits
+!
+!	circuitnam_dsc	Descriptor for name of circuit to set surveillance on.
+!
+!--
+    BEGIN
+    MAP
+	CIRCUITNAM_DSC : REF BBLOCK;
+
+    MACRO
+	STRINGS_ARE_EQUAL (COMMAND) = NOT (COMMAND)%;
+
+    LITERAL
+	NFB_ARGS = 4,
+	NFBSIZ = NFB$C_LENGTH + NFB_ARGS * 4,		! Network function block size
+	P2BUFSIZ = 4 + NFB$C_CTX_SIZE,
+	P4BUFSIZ = 512;
+
+    LOCAL
+	CIRNAM_DSC :	VECTOR [2],
+	DEVNAM_DSC :	VECTOR [2],
+	IOSB :		BBLOCK [8],		! IO status block
+	NFB : BBLOCK [NFBSIZ],			! Network function block 
+						! with 4 optional field ID longwords
+	NFB_DESC :	VECTOR [2],		! Descriptor of NFB
+	PTR,
+	P2BUF_DSC :	VECTOR [2],		! Descriptor of P2 buffer
+	P2BUF :	BBLOCK [P2BUFSIZ],
+	P4BUF_DSC :	VECTOR [2],		! Descriptor of P4 buffer
+	P4BUF :	BBLOCK [P4BUFSIZ],
+	SEARCHING,
+	STATUS,
+	STATE,					! Store circuit state
+	TYPE;					! Store circuit type
+
+    CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR('TRACE'), 
+	$DESCRIPTOR ('enable_surveillance'));
+
+
+!
+!   Translate circuit name to physical device name
+!
+    CH$FILL (0, NFBSIZ, NFB);
+
+    NFB [NFB$B_FCT] 	   = NFB$C_FC_SHOW;		! Set function to SHOW
+    NFB [NFB$B_DATABASE]   = NFB$C_DB_CRI;		! Circuit database
+    NFB [NFB$B_OPER] 	   = NFB$C_OP_EQL;		! Criteria for a match
+    NFB [NFB$V_MULT] 	   = TRUE;			! 
+    NFB [NFB$L_SRCH_KEY]   = NFB$C_WILDCARD;		! 
+!   NFB [NFB$L_SRCH2_KEY]  = NFB$C_WILDCARD;		! 
+!   NFB [NFB$B_OPER2] 	   = NFB$C_OP_EQL;		! Criteria for a match
+    NFB [NFB$L_FLDID] 	   = NFB$C_CRI_TYP;		! Circuit type
+    NFB [NFB$L_FLDID] + 4  = NFB$C_CRI_STA;		! Circuit state
+    NFB [NFB$L_FLDID] + 8  = NFB$C_CRI_NAM;		! Circuit name
+    NFB [NFB$L_FLDID] + 12  = NFB$C_CRI_VMSNAM;		! Circuit device name
+
+
+    NFB_DESC [0] = NFBSIZ;	! Set up descriptor for NFB
+    NFB_DESC [1] = NFB;
+
+    P2BUF_DSC [0] = P2BUFSIZ;
+    P2BUF_DSC [1] = P2BUF;
+    CH$FILL (0, P2BUFSIZ, P2BUF);
+    P4BUF_DSC [0] = P4BUFSIZ;
+    P4BUF_DSC [1] = P4BUF;
+
+    SEARCHING = TRUE;				! If searching for specific
+						!  circuit, keep calling NETACP
+
+    !
+    !	Call the NETACP and get a buffer full of circuit names and
+    !	corresponding devices.  Keep calling until it returns
+    !	SS$_ENDOFFILE.
+    !
+    WHILE .SEARCHING DO
+	BEGIN
+
+	CH$FILL (0, P4BUFSIZ, P4BUF);
+
+	STATUS = $QIOW ( FUNC = IO$_ACPCONTROL,	! Obtain circuit name and circuit device name
+		CHAN = .CNF$W_NETCHAN,		! Use assigned channel
+		EFN = CNF$C_SYNCH_EFN,		! Synchronous Event flag number
+		IOSB = IOSB,
+		P1 = NFB_DESC,			! Network function block
+		P2 = P2BUF_DSC,			! Work space
+		P4 = P4BUF_DSC);		! Buffer for return strings
+
+	IF .STATUS
+	THEN					! successful submission
+	    STATUS = .IOSB [0,0,16,0];		! pick up final status
+
+	IF NOT .STATUS
+	THEN
+	    BEGIN
+	    IF .STATUS EQL SS$_ENDOFFILE
+	    THEN 
+		BEGIN
+		IF NOT .KNOWN
+		THEN 
+		    BEGIN	! We were looking for a specific circuit and didn't find it.
+		    CNF$BUFR_ERR_MSG (.IRB, NMA$C_STS_IDE, NMA$C_ENT_CIR, 0, CIRCUITNAM_DSC);
+		    RETURN TRUE;
+		    END;
+		SEARCHING = FALSE;	! That's all she wrote, so quit the loop
+		EXITLOOP;
+		END;
+	    SIGNAL (CNF$_LOGIC, 0, .STATUS);	! Otherwise, there was an error we'd better report
+	    RETURN .STATUS;
+	    END;
+
+	PTR = P4BUF;
+
+	!
+	!   Cycle through circuit names returned in P4 buffer and
+	!   if KNOWN is selection criteria then set surveillance on all NI 
+	!   circuit devices otherwise search for the requested circuit
+	!   and set surveillance on it if it is an NI circuit.
+	!
+	INCR CIRCUITS FROM 1 TO .P2BUF DO
+
+	    BEGIN
+	    TYPE = .(.PTR) < 0, 32 >;
+	    PTR = .PTR + 4;
+
+	    STATE = .(.PTR) < 0, 32 >;			! Get circuit state
+	    PTR = .PTR + 4;
+
+	    CIRNAM_DSC [0] = .(.PTR) < 0, 16 >;		! Length of circuit name
+	    CIRNAM_DSC [1] = (.PTR) < 16, 8 >;		! Address of start of circuit name
+
+	    PTR = .PTR + 2 + .CIRNAM_DSC [0];
+
+	    DEVNAM_DSC [0] = .(.PTR) < 0, 16 >;		! Length of circuit name
+	    DEVNAM_DSC [1] = (.PTR) < 16, 8 >;		! Address of start of circuit name
+
+	    PTR = .PTR + 2 + .DEVNAM_DSC [0];
+
+	    !
+	    !	Only interested in NI circuits with State ON
+	    !
+	    IF .TYPE EQL NMA$C_CIRTY_NI AND .STATE EQL NMA$C_STATE_ON
+	    THEN
+	        IF .KNOWN
+		THEN
+		    BEGIN				! Set surveillance on all NI circuits
+		    EXECUTE (SURVEIL (CIRNAM_DSC, DEVNAM_DSC));
+		    END
+		ELSE
+		    BEGIN				! Looking for a specific circuit
+		    IF STRINGS_ARE_EQUAL (STR$COMPARE (.CIRCUITNAM_DSC, CIRNAM_DSC))
+		    THEN
+			BEGIN
+			EXECUTE (SURVEIL (CIRNAM_DSC, DEVNAM_DSC));
+			SEARCHING = FALSE;		! We got it and can quit now
+			EXITLOOP;
+			END;
+		    END;
+	    END;		! while INCRementing through QIO return buffer
+	END;			! WHILE performing QIOs to NETACP 
+
+    RETURN TRUE;
+    END;			! Routine enable_surveillance
+
+%SBTTL	'surveil  Begin surveillance of circuit'
+ROUTINE SURVEIL (CIRNAM_DSC, DEVNAM_DSC) =
+ 
+!++
+!
+!  This is the routine that actually initiates surveillance of a circuit.
+!  Place circuit name and device in circuit list and initiate surveillance.
+!
+!	cirnam_dsc	For checking if this circuit is already in our list 
+!			of circuits that we know about.
+!
+!	devnam_dsc	Physical device name corresponding to the circuit
+!			for communicating with the driver.
+!
+!--
+ 
+    BEGIN
+    LOCAL
+	CIR :		REF BBLOCK,
+	P2_DESC : 	BBLOCK [DSC$C_S_BLN],
+	STATUS;
+
+    LITERAL
+	P2BUFLEN = 72,
+	REMOTE_CONSOLE_PROTOCOL = %X'260';
+
+    OWN
+	!
+	!   P2 buffer for talking with the device driver
+	!
+	P2BUF : BBLOCK [P2BUFLEN]
+		INITIAL (
+			WORD (NMA$C_PCLI_BUS), 64,
+			WORD (NMA$C_PCLI_BFN), 1,
+			WORD (NMA$C_PCLI_PRM), NMA$C_STATE_OFF,
+			WORD (NMA$C_PCLI_MLT), NMA$C_STATE_OFF,
+			WORD (NMA$C_PCLI_DCH), NMA$C_STATE_OFF,
+			WORD (NMA$C_PCLI_CRC), NMA$C_STATE_ON,
+			WORD (NMA$C_PCLI_PAD), NMA$C_STATE_ON,
+			WORD (NMA$C_PCLI_PTY), REMOTE_CONSOLE_PROTOCOL,
+			WORD (NMA$C_PCLI_CON), NMA$C_LINCN_NOR,
+			WORD (NMA$C_PCLI_ACC), NMA$C_ACC_SHR,
+			WORD (NMA$C_PCLI_MCA),
+				WORD (8), WORD (NMA$C_LINMC_SET),
+				BYTE (%X'AB'), BYTE (%X'00'),
+				BYTE (%X'00'), BYTE (%X'02'),
+				BYTE (%X'00'), BYTE (%X'00')
+			);
+
+			
+
+    MAP
+	CIRNAM_DSC :	REF BBLOCK,
+	DEVNAM_DSC :	REF BBLOCK;
+
+
+    CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR('TRACE'), 
+	$DESCRIPTOR ('surveil'));
+
+    !
+    !	Check and see if we already know about this circuit.
+    !
+    IF CNF$LOCATE_CIR_BLK (.CIRNAM_DSC, CIR)
+    THEN
+	BEGIN					! Its in our list
+	IF .CIR [CIR$B_SURVEIL] EQL NMA$C_SUR_ENA
+	THEN RETURN TRUE;			! And surveillance is already set
+	!
+	!   Else, make sure the buffers were deallocated, since CNF$READ_SYSIDM
+	!   will report an error if the buffers are there when it goes to
+	!   allocate new ones.
+	!   Then skip the circuit block allocation and go to the set up.
+	!
+	IF .CIR [CIR$L_SYSIDMBUF] NEQ 0 	! If the buffer there?
+	THEN
+	    BEGIN				! If this happens, there is probably a timing bug around
+	    CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR('TRACE *** ERROR'), 
+		$DESCRIPTOR ('surveil  buffers in place on re-activation'));
+	    EXECUTE (CNF$FREE_VM (%REF(SYSIDM_BUFSIZ), CIR [CIR$L_SYSIDMBUF]) );
+	    EXECUTE (CNF$FREE_VM (%REF(ADRTYP_BUFSIZ), CIR [CIR$L_ADRTYPBUF]) );
+	    END;
+	END
+    ELSE
+	!
+	!   This is the first we've heard of this circuit, so create a
+	!   control block for it and fill it in.
+	!
+	BEGIN
+	EXECUTE ( CNF$GET_ZVM ( %REF(CIR$C_LENGTH), CIR));
+
+	CIR [CIR$W_SIZE] = CIR$C_LENGTH;
+
+	CIR [CIR$W_CIRNAMLEN] = .CIRNAM_DSC [DSC$W_LENGTH];	! Save the name
+	CH$MOVE ( .CIRNAM_DSC [DSC$W_LENGTH], .CIRNAM_DSC [DSC$A_POINTER],
+	    CIR [CIR$T_CIRNAM]);
+	CIR [CIR$W_DEVNAMLEN] = .DEVNAM_DSC [DSC$W_LENGTH];	! Save the device name
+	CH$MOVE ( .DEVNAM_DSC [DSC$W_LENGTH], .DEVNAM_DSC [DSC$A_POINTER],
+	    CIR [CIR$T_DEVNAM]);
+
+	!
+	!   Initialize the linked list for holding the system ID messages
+	!   that will be gathered for this circuit.
+	!
+	CIR [CIR$L_SIDFLINK] = CIR [CIR$L_SIDFLINK];
+	CIR [CIR$L_SIDBLINK] = CIR [CIR$L_SIDFLINK];
+
+	!
+	!   Place in on our list of circuits
+	!
+	INSQUE (.CIR, .CNF$GQ_CIRSURLST [1]);
+	END;
+
+    CIR [CIR$B_SURVEIL] = NMA$C_SUR_ENA;	! Record that surveillance is enabled
+
+    !
+    !   Assign channel to NI driver
+    !
+    STATUS = $ASSIGN (CHAN = CIR [CIR$W_CHAN], DEVNAM = .DEVNAM_DSC);
+    IF NOT .STATUS
+    THEN
+	BEGIN
+	SIGNAL (CNF$_CHAN, 0, .STATUS);
+	CIR [CIR$B_SURVEIL] = NMA$C_SUR_DIS;	! Record that surveillance is disabled
+	RETURN .STATUS;
+	END;
+
+    !
+    !   Get ready to talk to device driver
+    !
+    P2_DESC = 0;				! Zero first longword
+    P2_DESC [DSC$W_LENGTH] = P2BUFLEN;		! Set buffer size
+    P2_DESC [DSC$A_POINTER] = P2BUF;		! Pointer to buffer
+
+    !
+    !   Issue startup info to driver so that future reads will get only
+    !	the system ID messages that are broadcast
+    !
+    STATUS = $QIOW 
+	(
+	FUNC = (IO$_SETCHAR OR IO$M_CTRL OR IO$M_STARTUP),
+	CHAN = .CIR [CIR$W_CHAN],
+	EFN = CNF$C_SYNCH_EFN,			! Synchronous Event flag number
+	IOSB = CIR [CIR$W_IOSB],
+	P2 = P2_DESC
+	);
+
+    IF NOT .STATUS
+    THEN
+	BEGIN
+	SIGNAL (CNF$_DRVRSTRT, 0, .STATUS);
+	CIR [CIR$B_SURVEIL] = NMA$C_SUR_DIS;	! Record that surveillance is disabled
+	RETURN .STATUS;
+	END;
+
+    STATUS = .CIR [CIR$W_IOSB];			! pick up final status
+    IF NOT .STATUS
+    THEN
+	BEGIN
+	SIGNAL (CNF$_DRVRSTRT, 0, .STATUS);
+	RETURN .STATUS;
+	END;
+
+
+    !
+    !	Record the system time when surveillance began since this
+    !	info is required on a SHOW request.
+    !
+    EXECUTE ($GETTIM (TIMADR = CIR [CIR$Q_ELAPSDTIM]) );
+
+    !
+    !   Issue QIO to device driver to request broadcast messages
+    !	and set AST for processing System ID messages as they are read.
+    !
+    EXECUTE (CNF$READ_SYSIDM (.CIR));
+
+    RETURN TRUE;
+    END;			! Routine surveil
+
+%SBTTL	'CNF$LOCATE_CIR_BLK   Locate and return circuit block'
+GLOBAL ROUTINE CNF$LOCATE_CIR_BLK (CIRNAMDSC, CIRBLK) =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!  Using the descriptor of the ASCII circuit name, search the
+!  linked list of circuit blocks to determine the address of 
+!  the circuit block for the requested circuit name.  If block
+!  is not present, return false, else return true.
+!
+! FORMAL PARAMETERS:
+!
+!	cirnamdsc	Descriptor of circuit name
+!
+!	cirblk		Address of longword in which to the return the
+!			address of the circuit block if it is located
+!
+! IMPLICIT INPUTS:
+!	cnf$gq_cirsurlst	List of circuits
+!
+! ROUTINE VALUE:
+!
+!  True	   Circuit block was found and address was returned in
+!	   cirblk.
+!
+!  False   Circuit block was not found
+!--
+ 
+    BEGIN
+    LOCAL
+	CIRCUIT :	REF BBLOCK;
+    MAP 
+	CIRNAMDSC : 	REF BBLOCK;
+
+    CIRCUIT = .CNF$GQ_CIRSURLST;		! First circuit in list
+    WHILE .CIRCUIT NEQ CNF$GQ_CIRSURLST DO	! For all circuits in list
+	BEGIN
+	IF CH$EQL (.CIRCUIT [CIR$W_CIRNAMLEN], CIRCUIT [CIR$T_CIRNAM],
+			.CIRNAMDSC [DSC$W_LENGTH], .CIRNAMDSC [DSC$A_POINTER])
+	THEN
+	    BEGIN
+	    .CIRBLK = .CIRCUIT;			! Return address of matching block
+	    RETURN TRUE;
+	    END
+	ELSE
+	    CIRCUIT = .CIRCUIT [CIR$L_LINK];	! Get next block
+	END;			! WHILE traversing Circuit linked list
+
+    RETURN FALSE;
+    END;			! Routine CNF$LOCATE_CIR_BLK
+
+%SBTTL	'cnf_disable_surveillance  '
+ROUTINE CNF_DISABLE_SURVEILLANCE (IRB, KNOWN, CIRCUITNAM_DSC) =
+ 
+!++
+!
+!  Jacket routine to ensure common error recovery and memory
+!  deallocation for the disabling of surveillance logic.
+!
+!	irb		Interrupt request block, containing request context
+!
+!	known		If true, then clear surveillance for all circuits
+!
+!	circuitnam_dsc	Descriptor for name of circuit to clear surveillance on.
+!
+!  Always return success, any errors are buffered and then sent to 
+!  connectee.
+!--
+ 
+    BEGIN
+    MAP
+	CIRCUITNAM_DSC : REF BBLOCK;
+    LOCAL
+	CIRCUIT : REF BBLOCK,
+	STATUS;
+
+    CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR('TRACE'), 
+	$DESCRIPTOR ('cnf_disable_surveillance'));
+
+    STATUS = DISABLE_SURVEILLANCE (.IRB, .KNOWN, .CIRCUITNAM_DSC);
+    IF NOT .STATUS
+    THEN
+	CNF$BUFR_ERR_MSG (.IRB, NMA$C_STS_MPR, 0, .STATUS)
+    ELSE
+	CNF$BUFR_NICE_MSG (.IRB, SUCCESS_NICE_DSC, 0);
+
+    !
+    !	Check to ensure that there is still something under surveillance,
+    !	otherwise, clear flag so that when execution returns to primary loop 
+    !	in CNFMAIN it will terminate.
+    !
+    CNF$B_SURVEILLANCE_SET = FALSE;
+    CIRCUIT = .CNF$GQ_CIRSURLST;
+    WHILE .CIRCUIT NEQ CNF$GQ_CIRSURLST DO
+	BEGIN
+	IF .CIRCUIT [CIR$B_SURVEIL] EQL NMA$C_SUR_ENA
+	THEN CNF$B_SURVEILLANCE_SET = TRUE;
+	CIRCUIT = .CIRCUIT [CIR$L_LINK];
+	END;			! WHILE traversing Circuit linked list
+
+    RETURN TRUE;
+    END;			! Routine cnf_disable_surveillance
+
+%SBTTL	'disable_surveillance  '
+ROUTINE DISABLE_SURVEILLANCE (IRB, KNOWN, CIRCUITNAM_DSC) =
+!++
+!
+!  Perform some checking before calling the routine which will
+!  handle the actual disabling of surveillance on a circuit by
+!  first determining if the requested circuit has surveillance set.
+!  If known was specified, then discover all the NI circuits available.
+!
+!	irb		Interrupt request block, containing request context
+!
+!	known		If true, then clear surveillance for all circuits
+!
+!	circuitnam_dsc 	For checking if this circuit is in our list 
+!			of circuits.
+!--
+    BEGIN
+    LOCAL
+	CIRCUIT :	REF BBLOCK; 
+    MAP
+	CIRCUITNAM_DSC : REF BBLOCK;
+
+    CNF$TRACE (DBG$C_TRACE, $DESCRIPTOR('TRACE'), 
+	$DESCRIPTOR ('disable_surveillance'));
+
+    IF .KNOWN
+    THEN
+	!
+	!   For every circuit in the list, disable surveillance
+	!
+	BEGIN
+	CIRCUIT = .CNF$GQ_CIRSURLST;
+	WHILE .CIRCUIT NEQ CNF$GQ_CIRSURLST DO
+	    BEGIN
+	    EXECUTE (CNF$DISABLE_SURVEIL (.CIRCUIT));
+	    CIRCUIT = .CIRCUIT [CIR$L_LINK];
+	    END;			! WHILE traversing circuit linked list
+	END
+    ELSE
+	!
+	!   If the circuit is in our list, then disable surveillance,
+	!   otherwise buffer an error for return to connectee.
+	!
+	BEGIN
+	IF CNF$LOCATE_CIR_BLK (.CIRCUITNAM_DSC, CIRCUIT)
+	THEN
+	    EXECUTE (CNF$DISABLE_SURVEIL (.CIRCUIT))
+	ELSE
+	    BEGIN			! This circuit not in data base
+	    CNF$BUFR_ERR_MSG (.IRB, NMA$C_STS_IDE, NMA$C_ENT_CIR, 0,
+		.CIRCUITNAM_DSC);
+	    RETURN TRUE;
+	    END;
+	END;
+
+    RETURN TRUE;
+    END;			! Routine disable_surveillance
+
+%SBTTL	'CNF$DISABLE_SURVEIL:  clean up circuit block entry and quit surveillance'
+GLOBAL ROUTINE CNF$DISABLE_SURVEIL (CIR) =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!  This is the routine that actually terminates surveillance of a circuit.
+!
+! FORMAL PARAMETERS:
+!
+!	cir	Circuit control block.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+ 
+    BEGIN
+    MAP
+	CIR : REF BBLOCK;
+    LOCAL
+	SID : REF BBLOCK,
+	STATUS;
+
+
+    CIR [CIR$B_SURVEIL] = NMA$C_SUR_DIS;	! Mark surveillance disabled
+
+    EXECUTE ( $DASSGN (CHAN = .CIR [CIR$W_CHAN]) );	! Terminate read of System ID's
+
+    !
+    !	Deallocate all the memory used to store system ID messages
+    !	gathered for the circuit
+    !
+    SID = .CIR [CIR$L_SIDFLINK];
+    WHILE .SID NEQ CIR [CIR$L_SIDFLINK] DO
+	BEGIN
+	REMQUE (.SID, STATUS);
+	EXECUTE (CNF$FREE_VM (%REF(SID$C_LENGTH), SID));
+	SID = .CIR [CIR$L_SIDFLINK];
+	END;
+
+    !
+    !	Record time when surveillance was discontinued
+    !
+    EXECUTE ($GETTIM (TIMADR = CIR [CIR$Q_ELAPSDTIM]) );
+
+    RETURN TRUE;
+    END;			! Routine cnf$disable_surveil
+
+END				! End of module CNFREQUES
+ELUDOM

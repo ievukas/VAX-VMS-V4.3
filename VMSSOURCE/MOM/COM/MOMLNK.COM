@@ -1,0 +1,8 @@
+$ !
+$ !	Link the DECnet VAX Maintenance Operations Module
+$ !
+$ QUAL := NOTRACE
+$ IF P1 .NES. "" THEN QUAL := DEBUG
+$ DELETE EXE$:MOM.EXE;*, MAP$:MOM.MAP;*
+$ LINK/EXE=OBJ$:MOM /MAP=MAP$:MOM/FULL/CROSS /'QUAL' -
+	LIB$:MOM/LIBRARY/INCLUDE=MOMMAIN

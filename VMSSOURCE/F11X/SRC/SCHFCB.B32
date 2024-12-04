@@ -1,0 +1,220 @@
+MODULE SCHFCB (
+		LANGUAGE (BLISS32),
+		IDENT = 'V04-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 1
+!
+! ABSTRACT:
+!
+!	This routine searches the current volume's FCB list for the
+!	FCB representing the desired file number.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  13-Dec-1976  15:41
+!
+! MODIFIED BY:
+!
+!	V03-007	CDS0006		Christian D. Saether	16-Aug-1984
+!		Mark a nolock accessed fcb as stale always.
+!
+!	V03-006	CDS0005		Christian D. Saether	 7-Aug-1984
+!		Modify test for directory fcb to test fcb$l_dirindx.
+!
+!	V03-005	CDS0004		Christian D. Saether	20-July-1984
+!		Take out backlink checking as a performance help.
+!		Unconditionally clear FCB$V_DIR when an fcb is found.
+!
+!	V03-004	CDS0003		Christian D. Saether	19-Apr-1984
+!		Use REFCNT instead of ACNT.
+!
+!	V03-003	ACG0401		Andrew C. Goldstein,	12-Mar-1984  17:27
+!		Don't acknowledge the existence of zero access FCB's
+!
+!	V03-002	CDS0002		Christian D. Saether	30-Dec-1983
+!		Use L_NORM linkage and BIND_COMMON macro.
+!
+!	V03-001	CDS0001		Christian D. Saether	12-May-1983
+!		Lock scan routine and raise to sched ipl to do search.
+!
+!	A0101	ACG26369	Andrew C. Goldstein,	31-Dec-1979  17:35
+!		Fix multi-header file interlock bug
+!
+!	A0100	ACG00001	Andrew C. Goldstein,  10-Oct-1978  20:03
+!	Previous revision history moved to F11A.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+! Code must be locked down.
+!
+
+LOCK_CODE;
+
+
+GLOBAL ROUTINE SEARCH_FCB (FILE_ID) : L_NORM =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine searches the current volume's FCB list for the
+!	FCB representing the desired file number.
+!
+!
+! CALLING SEQUENCE:
+!	SEARCH_FCB (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of desired file ID
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: VCB address of volume
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	FCB address if found
+!	zero if not
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+MAP
+	FILE_ID		: REF BBLOCK;	! file ID arg
+
+LOCAL
+	FCB		: REF BBLOCK,	! current FCB being looked at
+	FIDNUM		: WORD,
+	FIDNMX		: BYTE,
+	CURVCB		: REF BBLOCK;
+
+BIND_COMMON;
+
+LABEL
+	SCAN;
+
+! Init the pointers and start scanning the FCB list, which is a double
+! linked list. Check for consistency of pointers and the block ID for each
+! FCB. We win when the FCB containing the desired file number is found;
+! we lose at end of list (pointing back to the VCB). Note that we ignore
+! FCB's with a zero access count that are not directory FCB's. These are
+! temporary and on their way out. Any FCB on its way in that looks idle
+! is protected by the file's synchronization lock, and we will never see it.
+! Raise IPL to SCHED to block other processes from changing FCB list
+! while we scan it.
+!
+
+FIDNUM = .FILE_ID [FID$W_NUM];
+FIDNMX = .FILE_ID [FID$B_NMX];
+
+SET_IPL (IPL$_SCHED);
+
+CURVCB = .CURRENT_VCB;
+FCB = .CURVCB [VCB$L_FCBFL];
+
+SCAN:
+BEGIN
+
+UNTIL .FCB EQL .CURVCB DO
+    IF .FCB[FCB$B_TYPE] EQL DYN$C_FCB
+    THEN
+	BEGIN
+	IF  .FIDNUM EQL .FCB[FCB$W_FID_NUM]
+	AND .FIDNMX EQL .FCB[FCB$B_FID_NMX]
+	AND (.FCB[FCB$W_REFCNT] NEQ 0 OR (.FCB [FCB$L_DIRINDX] NEQ 0))
+	THEN
+	    BEGIN
+
+! FCB$V_DIR is used to indicate that an fcb with a refcnt of zero
+! may be tossed from the cache due to directory index cache replacement
+! at any time, regardless of whether a synchonization lock is held
+! for that file number (which should always be the case by the time
+! this routine is called).
+! By clearing the flag while at ipl$_sched, we prevent another
+! process from deallocating it after this time.  Checks for whether
+! the flag should be set again and the setting thereof are also
+! done at ipl$_sched, so that this flag changes state atomically
+! with regard to other processes doing an otherwise uninterlocked
+! testbitsc test on it to determine whether or not to deallocate it.
+!
+
+	    FCB [FCB$V_DIR] = 0;
+
+! If there is an access lock for this fcb, but it is held in
+! nl mode, then mark the fcb stale to force rebuild of it
+! because we cannot get stale blocking routines in nl mode,
+! and must therefore always assume it is stale.
+!
+
+	    IF .FCB [FCB$B_ACCLKMODE] EQL LCK$K_NLMODE
+		AND .FCB [FCB$L_ACCLKID] NEQ 0
+	    THEN
+		FCB [FCB$V_STALE] = 1;
+
+	    LEAVE SCAN;
+	    END;
+
+	FCB = .FCB[FCB$L_FCBFL];
+	END
+    ELSE
+	BUG_CHECK (NOTFCBFCB, FATAL, 'FCB linkage broken');
+
+! FCB not found, i.e., we dropped out of the loop.
+!
+
+FCB = 0;
+END;					! of block SCAN
+
+SET_IPL (0);				! lower ipl back to 0.
+
+RETURN .FCB				! return fcb (or 0 if not found).
+
+END;					! end of routine SEARCH_FCB
+
+END
+ELUDOM

@@ -1,0 +1,942 @@
+ 	.TITLE	SHODEF	- MONITOR SHOW DEFAULT Command
+	.IDENT	'V04-000'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+
+;++
+; FACILITY:  VAX/VMS MONITOR Utility
+;
+; ABSTRACT:
+;
+;	The SHODEF module executes the SHOW DEFAULT subcommand
+;	of the MONITOR utility. It is called by the CLE (Command
+;	Language Editor).
+;
+; ENVIRONMENT:
+;
+;	User mode, IPL 0, unprivileged.
+;
+; AUTHOR: Thomas L. Cafarella, March, 1983
+;
+; MODIFIED BY:
+;
+;	V03-003	PRS1016		Paul R. Senn		04-Apr-1984	14:00
+;		Use $PARSE to expand filespecs and hide passwords.
+;
+;	V03-003	PRS1013		Paul R. Senn		28-Mar-1984	14:00
+;		Give SHOW DEFAULT the ability to handle multiple input files.
+;
+;	V03-002	PRS1011		Paul R. Senn		29-Feb-1984	14:00
+;		add /FLUSH_INTERVAL qualifier
+;
+;	V03-001	PRS1001		Paul R. Senn		27-Dec-1983	16:00
+;		Make default interval = 6 for ALL classes Pseudo-class		
+;		live requests.
+;
+;--
+
+	.SBTTL	DECLARATIONS
+	.PSECT	MONDATA,QUAD,NOEXE
+;
+; INCLUDE FILES:
+;
+
+	$CDBDEF				; Define Class Descriptor Block
+	$MRBDEF				; Define Monitor Request Block
+	$MONDEF				; Monitor Recording File Definitions
+	$DSCDEF				; Descriptor Definitions
+	$IFBDEF				; File descriptor table definitions
+
+;
+; MACROS:
+;
+
+;
+; Local Macro Definitions
+;
+
+;
+; ALLOC Macro - Dynamically allocate space on the stack.
+;
+
+	.MACRO	ALLOC	LENGTH,RSLDESC,RSLBUF
+	SUBL	#<LENGTH+3>&<^C3>,SP
+	.IF	NB,RSLBUF
+	MOVL	SP,RSLBUF
+	.ENDC
+	PUSHL	SP
+	PUSHL	#LENGTH
+	MOVL	SP,RSLDESC
+	.ENDM	ALLOC
+
+;
+; EQUATED SYMBOLS:
+;
+
+
+;
+; OWN STORAGE 
+;
+
+RV_STR:		.ASCIC	\recorded value\    ; Text for playback values
+CT_STR:		.ASCIC	\current time\	    ; Text for /BEGINNING
+ID_STR:		.ASCIC	\indefinite\	    ; Text for /ENDING	
+CS_SEG1:	.ASCID	\/!9<!AS!> = !27<!\ ; Fixed segment 1 of FAOL control str
+CS_SEG2:	.ASCID	\!>/!12<!AS!> = !\  ; Fixed segment 2 of FAOL control str
+CS_SEG3:	.ASCID	\/!9<\		    ; Fixed segment 3 of FAOL control str
+CS_SEG4:	.ASCID	\!AS!>\		    ; Fixed segment 4 of FAOL control str
+CS_SEG5:	.ASCID	\ = !AS\	    ; Fixed segment 5 of FAOL control str
+CS_SEG6:	.ASCID	\/!14<!AS!> = !\    ; Fixed segment 6 of FAOL control str
+CS_SEG7:	.ASCID	\             !AS\  ; Fixed segment 7 of FAOL control str
+
+CL_SEG1:	.ASCID	\!26<!AC!>\	    ; Fixed seg 1 of classes FAOL ctrl str
+CL_SEG2:	.ASCID	\!26<!AC/!AS!>\	    ; Fixed seg 2 of classes FAOL ctrl str
+CLASS_HDG:	.ASCID	\Classes:\	    ; Heading line for classes
+NO_CLASS_HDG:	.ASCID	\Classes: none\	    ; Heading line for "no classes"
+
+SHOW_FAB:	$FAB, -			    ; FAB for $PARSE to show filespecs
+		FOP=NAM,-
+		NAM=SHOW_NAM
+SHOW_NAM:	$NAM, -			    ; NAM for $PARSE
+		ESA=SHOW_FILESPEC,-
+		ESS=NAM$C_MAXRSS,-
+		NOP=SYNCHK		    ; syntax check only (don't open file)
+
+SHOW_FILESPEC:	.BLKB	NAM$C_MAXRSS	    ; space for expanded filespec
+	
+SHOW_SPEC_D:	.LONG	. - SHOW_FILESPEC   ; descriptor for expanded filespec
+		.LONG	SHOW_FILESPEC
+
+ERROR_QUAL:	.LONG 	0		    ; address of qualifier for filespec
+					    ; which contains a syntax error.
+
+
+	.SBTTL	SHODEF_CMD - MONITOR SHOW DEFAULT command
+	.PSECT	$$MONCODE,NOWRT,EXE
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine uses the SCRPKG to display lines in response
+;	to a SHOW subcommand. All qualifiers and their current values
+;	are shown, as well as all selected classes.
+;
+; INPUTS:
+;
+;	None
+;
+; IMPLICIT INPUTS:
+;
+;	SCRDSC - quadword string descriptor for buffer required by SCRPKG.
+;	CURR_MRBPTR - pointer to the "current" MRB (Monitor Request Block).
+;	QUALPTR     - pointer to the Qualifier Descriptors block.
+;	INTERVAL_DEFAULT - default value for /INTERVAL qualifier.
+;	ALLCL_INT_DEFAULT - default value for /INTERVAL qualifier for ALL class.
+;	VIEWING_DEFAULT  - default value for /VIEWING_TIME qualifier.
+;	MAX_CLASS_NO     - highest MONITOR class number.
+;
+; OUTPUTS:
+;
+;	None
+;
+; IMPLICIT OUTPUTS:
+;
+;	SHOW command display is sent to the terminal.
+;
+; ROUTINE VALUE:
+;
+;	R0 = SS$_NORMAL, or called routine error status
+;
+; SIDE EFFECTS:
+;
+;	none
+;
+; REGISTER USAGE:
+;
+;	R0,R1,R2,R4,R5 = scratch, used by MOVC3
+;	R3  = FAOL control string index
+;	R7  = pointer to MRB (Monitor Request Block)
+;	R8  = pointer to Qualifier Descriptors
+;	R9  = FAOL parameter list index
+;	R10 = address of descriptor for FAOL parameter list
+;	R11 = address of descriptor for FAOL control string
+;
+;--
+
+
+
+.ENTRY	SHODEF_CMD, ^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+
+	
+	MOVL	#MNR$_SHOWERR,CURR_ERRCODE ; Set up signaled error code
+	CLRL	ERROR_QUAL		   ; clear address of bad qualifier
+;
+; Set up a SCRPKG buffered output stream directed to SYS$OUTPUT
+;
+
+	PUSHL	#0			; Stack stream identifier
+	CALLS	#1,G^SCR$SET_OUTPUT	; Establish output stream
+	BLBS	R0,10$			; Branch if status OK
+	BRW	SHD_ERR			; Else go exit with error
+
+10$:
+	PUSHAQ	SCRDSC			; Push this routine's buffer addr
+	CALLS	#1,G^LIB$SET_BUFFER	; Set buffering mode
+	BLBS	R0,20$			; Branch if status OK
+	BRW	SHD_ERR			; Else go exit with error
+
+20$:
+	ALLOC	40,R10,R9		; Allocate an FAOL parameter list
+	ALLOC	80,R11,R3		; Allocate an FAOL control string
+	MOVL	CURR_MRBPTR,R7		; Load up ptr to MRB
+	MOVL	QUALPTR,R8		; ... and ptr to qualifier descriptors
+
+;
+; Show /BEGINNING qualifier
+;
+
+	MOVW	#^A\!/\,(R3)+		; Move "new-line" to FAOL control string
+	MOVC3	CS_SEG1,CS_SEG1+8,(R3)	; Move fixed segment into control string
+	MOVAL	QUAL$L_BEG(R8),(R9)+	; /BEGINNING qual name to FAOL prmlst
+	MOVQ	MRB$Q_BEGINNING(R7),R0	; Test /BEGINNING defaulted ?
+	BEQL	30$			; Branch if so
+	MOVW	#^A/%D/,(R3)+		; FAO date-time directive to ctrstr
+	MOVAL	MRB$Q_BEGINNING(R7),(R9)+ ; BEGINNING time to FAOL prmlst
+	BRB	SHO_INT			; Go set up /INTERVAL
+30$:					; /BEGINNING defaulted
+	MOVW	#^A/AC/,(R3)+		; FAO cstring directive to ctrstr
+	TSTL	MRB$A_INPUT(R7)		; Live or Playback ?
+	BEQL	40$			; Go do live
+	MOVAL	RV_STR,(R9)+		; Playback -- cstring ptr to FAOL prmlst
+	BRB	SHO_INT			; Go set up /INTERVAL
+40$:					; Live
+	MOVAL	CT_STR,(R9)+		; "Current time" cstring ptr to prmlst
+
+;
+; Show /INTERVAL qualifier
+;
+
+SHO_INT:
+	MOVC3	CS_SEG2,CS_SEG2+8,(R3)	; Move fixed segment into control string
+	MOVAL	QUAL$L_INT(R8),(R9)+	; /INTERVAL qual name to FAOL prmlst
+	TSTL	MRB$L_INTERVAL(R7)	; /INTERVAL defaulted ?
+	BEQL	10$			; Branch if so
+	MOVW	#^A/ZL/,(R3)+		; FAO decimal directive to ctrstr
+	MOVL	MRB$L_INTERVAL(R7),(R9)+ ; INTERVAL value to FAOL prmlst
+	BRB	30$			; Continue.....
+10$:					; /INTERVAL defaulted
+	TSTL	MRB$A_INPUT(R7)		; Live or Playback ?
+	BEQL	20$			; Go do live
+	MOVW	#^A/AC/,(R3)+		; FAO cstring directive to ctrstr
+	MOVAL	RV_STR,(R9)+		; Playback -- cstring ptr to FAOL prmlst
+	BRB	30$			; Continue.....
+20$:					; Live
+	MOVW	#^A/ZL/,(R3)+		; FAO decimal directive to ctrstr
+	BBS	#MRB$V_ALL_CLASS,MRB$W_FLAGS(R7),25$ ; Special default for ALL 
+	MOVL	#INTERVAL_DEFAULT,(R9)+	; Default INTERVAL value to prmlst
+	BRB	30$			; Continue.....
+25$:
+	MOVL	#ALLCL_INT_DEFAULT,(R9)+ ; Default INTERVAL value for ALL class
+	
+30$:
+	PUSHL	-4(R9)			; Save interval val for /VIEWING_TIME
+
+;
+; Display a line showing /BEGINNING and /INTERVAL
+;
+
+	BSBW	SHOW_SINGLE		; Show the line, single-spaced
+	BLBS	R0,SHO_END		; Go on to /ENDING if status OK
+	BRW	SHD_ERR			; Otherwise, go exit
+
+;
+; Show /ENDING qualifier
+;
+
+SHO_END:
+	MOVL	4(R11),R3		; Point to beginning of FAOL ctrl string
+	MOVL	4(R10),R9		; Point to beginning of FAOL parm list
+
+	MOVC3	CS_SEG1,CS_SEG1+8,(R3)	; Move fixed segment into control string
+	MOVAL	QUAL$L_END(R8),(R9)+	; /ENDING qual name to FAOL prmlst
+	MOVQ	MRB$Q_ENDING(R7),R0	; Test /ENDING defaulted ?
+	BEQL	10$			; Branch if so
+	MOVW	#^A/%D/,(R3)+		; FAO date-time directive to ctrstr
+	MOVAL	MRB$Q_ENDING(R7),(R9)+	; ENDING time to FAOL prmlst
+	BRB	SHO_VIEW		; Go set up /VIEWING_TIME
+10$:					; /ENDING defaulted
+	MOVW	#^A/AC/,(R3)+		; FAO cstring directive to ctrstr
+	TSTL	MRB$A_INPUT(R7)		; Live or Playback ?
+	BEQL	20$			; Go do live
+	MOVAL	RV_STR,(R9)+		; Playback -- cstring ptr to FAOL prmlst
+	BRB	SHO_VIEW		; Go set up /VIEWING_TIME
+20$:					; Live
+	MOVAL	ID_STR,(R9)+		; "Indefinite" cstring ptr to prmlst
+
+;
+; Show /VIEWING_TIME qualifier
+;
+
+SHO_VIEW:
+	MOVC3	CS_SEG2,CS_SEG2+8,(R3)	; Move fixed segment into control string
+	MOVAL	QUAL$L_VIEW(R8),(R9)+	; Qualifier name to FAOL prmlst
+	MOVW	#^A/ZL/,(R3)+		; FAO decimal directive to ctrstr
+	TSTL	MRB$L_VIEWING_TIME(R7)	; /VIEWING_TIME defaulted ?
+	BEQL	10$			; Branch if so
+	MOVL	MRB$L_VIEWING_TIME(R7),(R9)+ ; VIEWING_TIME value to FAOL prmlst
+	BRB	30$			; Continue.....
+10$:					; /VIEWING_TIME defaulted
+	TSTL	MRB$A_INPUT(R7)		; Live or Playback ?
+	BEQL	20$			; Go do live
+	MOVL	#VIEWING_DEFAULT,(R9)+	; Default VIEWING_TIME value to prmlst
+	BRB	30$			; Continue.....
+20$:					; Live
+	MOVL	(SP)+,(R9)+		; Pop saved /INTERVAL value to prmlst
+30$:
+
+;
+; Display a line showing /ENDING and /VIEWING_TIME
+;
+
+	BSBW	SHOW_DOUBLE		; Show the line, double-spaced
+	BLBS	R0,SHO_FLUSH		; Go on to file qualifiers if status OK
+	BRW	SHD_ERR			; Otherwise, go exit
+
+
+;
+; Show /FLUSH_INTERVAL qualifier
+;
+
+SHO_FLUSH:
+	MOVL	4(R11),R3		; Point to beginning of FAOL ctrl string
+	MOVL	4(R10),R9		; Point to beginning of FAOL parm list
+
+	MOVC3	CS_SEG6,CS_SEG6+8,(R3)	; Move fixed segment into control string
+	MOVAL	QUAL$L_FLUSH(R8),(R9)+	; Qualifier name to FAOL prmlst
+	MOVW	#^A/ZL/,(R3)+		; FAO decimal directive to ctrstr
+	TSTL	MRB$L_FLUSH(R7)		; /FLUSH defaulted ?
+	BEQL	10$			; Branch if so
+	MOVL	MRB$L_FLUSH(R7),(R9)+   ; FLUSH value to FAOL prmlst
+	BRB	30$			; Continue.....
+10$:					; /FLUSH defaulted
+	MOVL	#FLUSH_INT_DEFAULT,(R9)+ ; Default FLUSH value to prmlst
+30$:
+
+;
+; Display a line showing /FLUSH_INTERVAL
+;
+
+	BSBW	SHOW_DOUBLE		; Show the line, double-spaced
+	BLBS	R0,SHO_FILES		; Go on to file qualifiers if status OK
+	BRW	SHD_ERR			; Otherwise, go exit
+
+;
+; Show qualifiers which always have string values
+; (if they are present). These are typically qualifiers
+; with file specs as values.
+;
+
+SHO_FILES:
+
+	ALLOC	8,R0,R6			; Allocate a pair of longwords to pass
+					; ... as input parameter in R6 to
+					; ... SHOW_FILE_QUAL
+;
+; At this point, MRB$A_INPUT contains the address of the IFB table, or 0
+; if there is no current default. (Later, MRB$A_INPUT will be changed
+; to be the address of a single file spec descriptor, unless we are
+; doing a multi-file summary.)
+; 
+	MOVL	MRB$A_INPUT(R7),(R6)	; Load addr of qualifier value descr
+	MOVAL	QUAL$L_INP(R8),4(R6)	; Load addr of qualifier name descr
+	BSBW	SHOW_INPUT_QUAL		; display input qualifier 
+	BLBC	R0,SF_ERR		; Go return if error
+
+	MOVL	MRB$A_RECORD(R7),(R6)	; Load addr of qualifier value descr
+	MOVAL	QUAL$L_REC(R8),4(R6)	; Load addr of qualifier name descr
+	BSBW	SHOW_FILE_QUAL		; Show a line for /RECORD
+	BLBC	R0,SF_ERR		; Go return if error
+
+	MOVL	MRB$A_DISPLAY(R7),(R6)	; Load addr of qualifier value descr
+	MOVAL	QUAL$L_DISP(R8),4(R6)	; Load addr of qualifier name descr
+	BSBW	SHOW_FILE_QUAL		; Show a line for /DISPLAY
+	BLBC	R0,SF_ERR		; Go return if error
+
+	MOVL	MRB$A_SUMMARY(R7),(R6)	; Load addr of qualifier value descr
+	MOVAL	QUAL$L_SUMM(R8),4(R6)	; Load addr of qualifier name descr
+	BSBW	SHOW_FILE_QUAL		; Show a line for /SUMMARY
+	BLBC	R0,SF_ERR		; Go return if error
+
+	MOVL	MRB$A_COMMENT(R7),(R6)	; Load addr of qualifier value descr
+	MOVAL	QUAL$L_COMM(R8),4(R6)	; Load addr of qualifier name descr
+	BSBW	SHOW_QUAL		; Show a line for /COMMENT
+	BLBC	R0,SF_ERR		; Branch on error
+	BRW	SCAN_CLASSES		; Go on to show classes if no errors
+
+SF_ERR:
+	BRW	SHD_ERR			; Go log error and return
+
+SHOW_INPUT_QUAL:
+	PUSHL	R8			; save R8 so we can use it as scratch
+	MOVL	#1,R8			; init input file counter
+	MOVL	4(R11),R3		; Point to beginning of FAOL ctrl string
+	MOVL	4(R10),R9		; Point to beginning of FAOL parm list
+	MOVC3	CS_SEG3,CS_SEG3+8,(R3)	; Move fixed segment into control string
+	TSTL	(R6)			; Qualifier present?
+	BNEQ	5$			; Branch if yes
+	MOVW	#^A/NO/,(R3)+		; No -- move NO to control string
+5$:
+	MOVC3	CS_SEG4,CS_SEG4+8,(R3)	; Move fixed segment into control string
+	MOVL	4(R6),(R9)+		; Qualifier name descr to FAOL prmlst
+	TSTL	(R6)			; Qualifier present?
+	BNEQ	7$			; Branch if yes
+	BRB	10$			; No, go straight to SHOW_DOUBLE call
+7$:
+	MOVZBL	MRB$B_INP_FILES(R7),R5	; Number of input files to R5
+	CMPL	R5,#1			; How many input files?
+	BGTR	12$			; branch if there are > 1 input files
+;
+; If we got here, only one file was specified for /INPUT, so just
+; do a SHOW_DOUBLE for that file and the /INPUT qualifier, and get out.
+;
+	MOVC3	CS_SEG5,CS_SEG5+8,(R3)	; Move fixed segment into control string
+	MOVL	@(R6),(R9)+		; Qual value descr to FAOL prmlst
+10$:
+
+;
+; At this point, either 0 (/NOINPUT case) or 1 file was specified for input.
+;
+
+	BSBW	SHOW_DOUBLE		; Show the line, double-spaced
+	BRW	25$			; get out
+
+;
+; Begin multi-file summary loop
+;
+12$:
+	PUSHL	R5			; Save count of # of input files
+	CMPL	R8,#1			; Are we on file #1?
+	BNEQ	15$			; Branch if we have passed file #1
+;
+; If we got here, we are doing a multi-file summary and we are processing
+; input file #1. 
+;
+	MOVC3	CS_SEG5,CS_SEG5+8,(R3)	; Move fixed segment into control string
+	BRB	18$			; skip past alternate control string
+15$:
+;
+; If we got here, this is a multi-file summary 
+; and we have processed the first file in the list already,
+; so we use a different FAO control string
+;
+	MOVC3	CS_SEG7,CS_SEG7+8,(R3)	; Move fixed segment into control string
+18$:
+	POPL	R5			; get R5 back (pushed to save from MOVC)
+	MOVL	@(R6),(R9)+		; Qual value descr to FAOL prmlst
+	ADDL2	#IFB$K_SIZE,(R6)	; move to next IFB
+
+20$:
+	CMPL	R5,R8			; Is this the last input file?
+	BNEQ	23$			; branch if not
+	BSBW	SHOW_DOUBLE		; Show the last line, double-spaced
+	BRB	25$			; and get out
+23$:
+	BSBW	SHOW_SINGLE		; Show the line, single-spaced
+	MOVL	4(R11),R3		; Point to beginning of FAOL ctrl string
+	MOVL	4(R10),R9		; Point to beginning of FAOL parm list
+	INCL	R8			; on to next input file.
+	BRW	12$			; Loop
+
+25$:
+	POPL	R8			; Restore R8
+	RSB				; Return with status in R0
+
+SHOW_FILE_QUAL:
+	TSTL	(R6)			; Qualifier present?
+	BEQL	SHOW_QUAL		; Branch if not
+
+;
+; Use $PARSE to get filespec with defaults applied 
+; and password removed from access control string.  Note that the file
+; does not exist yet, but $PARSE will still do the work of
+; applying defaults and removing the password, if necessary
+;
+	MOVL	#1,R0			; set up for post-indexing
+	MOVB	@(R6),-
+		SHOW_FAB + FAB$B_FNS	; plug FAB with filespec length
+	MOVL	@(R6)[R0],-
+		SHOW_FAB + FAB$L_FNA	; plug FAB with filespec address
+	$PARSE	FAB=SHOW_FAB		; do the parse
+	BLBS	R0,10$			; Branch if OK
+	CMPL	R0,#RMS$_SYN		; Filespec syntax error?
+	BEQL	5$			; Branch if so
+	RSB				; unknown error, return with status
+;
+; file specification syntax error processing: save the bad qualifier name,
+; to be reported after SHOW display finishes. Note that we can only
+; report on one syntax error per SHOW.
+;
+5$:	TSTL	ERROR_QUAL		; has there already been a syntax error?
+	BNEQ	SHOW_QUAL		; branch if so (we can only report first error)
+	MOVL	4(R6), -		; load address of offending qualifier
+		ERROR_QUAL		
+	BRB	SHOW_QUAL		; display unparsed spec containing error
+10$:
+	MOVZBL	SHOW_NAM+NAM$B_ESL,-	; Plug descriptor with length
+		SHOW_SPEC_D		; passed back from $PARSE
+	MOVAL	SHOW_SPEC_D,(R6)	; point to parsed spec descriptor
+					; and fall through to SHOW_QUAL
+SHOW_QUAL:
+	
+	MOVL	4(R11),R3		; Point to beginning of FAOL ctrl string
+	MOVL	4(R10),R9		; Point to beginning of FAOL parm list
+
+	MOVC3	CS_SEG3,CS_SEG3+8,(R3)	; Move fixed segment into control string
+	TSTL	(R6)			; Qualifier present?
+	BNEQ	10$			; Branch if yes
+	MOVW	#^A/NO/,(R3)+		; No -- move NO to control string
+10$:
+	MOVC3	CS_SEG4,CS_SEG4+8,(R3)	; Move fixed segment into control string
+	MOVL	4(R6),(R9)+		; Qualifier name descr to FAOL prmlst
+	TSTL	(R6)			; Qualifier present?
+	BEQL	20$			; Branch if no
+	MOVC3	CS_SEG5,CS_SEG5+8,(R3)	; Move fixed segment into control string
+	MOVL	(R6),(R9)+		; Qual value descr to FAOL prmlst
+
+;
+; Display a line showing current qualifier
+;
+
+20$:
+	BSBW	SHOW_DOUBLE		; Show the line, double-spaced
+
+	RSB				; Return with status in R0
+
+SCAN_CLASSES:
+
+;
+; Scan the MRB$O_CLASSBITS field of the MRB to determine the selected
+; classes. Create a vector of bytes containing a class number for each
+; selected class. Then show the selected classes by calling SHOW_CLASSES
+; with the vector as input.
+;
+;
+; REGISTER USAGE:
+;
+;	R0,R1 = scratch
+;	R2  = bit field starting position for FFS instruction
+;	R3  = bit field size for FFS instruction
+;	R4  = class number determined by FFS instruction
+;	R5  = index into MRB$O_CLASSBITS
+;	R6  = pointer to byte vector of class numbers
+;	R7  = pointer to MRB (Monitor Request Block)
+;	R8  = pointer to Qualifier Descriptors
+;	R9  = class counter
+;	R10 = address of descriptor for FAOL parameter list
+;	R11 = address of descriptor for FAOL control string
+;
+
+	ALLOC	MAX_CLASS_NO+1,R0,R6	; Get a byte vector for class numbers
+					; ... to be shown, and point R6 to it
+	CLRL	R9			; Init class counter
+
+;
+; Use FFS instruction to scan the class bits in the MRB, filling
+; the above byte vector with a class number for each class found.
+; R9 contains the count of classes found.
+;
+
+	CLRL	R5			; Init starting bit position
+20$:
+	MOVL	#32,R3			; Init bit field size
+					; NOTE -- must handle in 32-bit chunks
+	MOVL	R5,R2			; Init start position of next chunk
+30$:
+	FFS	R2,R3,MRB$O_CLASSBITS(R7),R4 ; Search for next class number
+					; R4 contains class no. if found
+	BEQL	40$			; Branch if none found this chunk
+	MOVB	R4,(R6)[R9]		; Move class no. into byte vector
+	INCL	R9			; Count this class
+
+	ADDL2	R2,R3			; Compute next starting
+	ADDL3	#1,R4,R2		; ... position and field size
+	SUBL2	R2,R3			; ... for this chunk
+	BRB	30$			; Go search rest of chunk
+40$:
+	ACBW	#MAX_CLASS_NO,#32,R5,20$ ; Loop to process next chunk
+
+;
+; At this point, R6 points to a byte vector consisting of the
+; class numbers for classes to show. R9 contains the count of
+; classes to show.
+;
+
+;
+; Show class-names and their associated display qualifiers.
+;
+
+	PUSHL	R11			; Stack addr of descr for FAOL ctrl str
+	PUSHL	R10			; Stack addr of descr for FAOL prm list
+	PUSHL	R6			; Stack addr of byte vector of class nos.
+	PUSHL	R9			; Stack count of classes to show
+	CALLS	#4,SHOW_CLASSES		; Show all classes and their ...
+					; ... associated display qualifiers
+	BLBC	R0,SHD_ERR		; Exit if error
+
+;
+; Print one final blank line for readability
+;
+
+	ALLOC	8,R0,R1			; Get quadword for dummy descr
+	CLRL	(R1)			; Make length 0
+	MOVAL	4(R1),4(R1)		; ... and point it to itself
+	PUSHL	#1			; Stack single spacing indicator
+	PUSHL	R1			; ... and dummy text descriptor
+	CALLS	#2,G^SCR$PUT_LINE	; Put blank line to the terminal
+	BLBC	R0,SHD_ERR		; Exit if error
+
+
+;
+; SHOW subcommand processing complete
+;
+
+
+;
+; See if we encountered a filespec syntax error on SHOW_FILE_QUAL parse,
+; and if so, report it.
+;
+	MOVL	#SS$_NORMAL,R0		; Assume success status
+	TSTL	ERROR_QUAL		; was there a syntax error?
+	BEQL	SHD_RET			; no, return with success
+	PUSHL	ERROR_QUAL		; push address of qualifier descriptor
+	CLRL	-(SP)			; no secondary code
+	PUSHL	#MNR$_FILSYNERR		; Push syntax error status code
+	CALLS	#3,MON_ERR
+	MOVL	#MNR$_FILSYNERR,R0	; Get status to caller
+	BRB	SHD_RET			; Go return
+
+SHD_ERR:				; Log error and return
+	PUSHL	R0			; Bad status on stack
+	PUSHAL	(SP)			; Stack pointer to bad status
+	PUSHL	#MNR$_SHOWERR		; Stack MONITOR failing status code
+	CALLS	#2,MON_ERR		; Log the error
+	MOVL	#MNR$_SHOWERR,R0	; Get status to caller
+
+SHD_RET:				; Return point from SHODEF_CMD routine
+
+	PUSHR	#^M<R0>			; Save return status
+
+	CALLS	#0,G^LIB$PUT_BUFFER	; Output SCRPKG buffer & stop buffering
+
+	PUSHL	#0			; Indicate "clear buffer mode"
+	CALLS	#1,G^LIB$SET_BUFFER	; ... and tell SCRPKG to clear it
+	CALLS	#0,G^SCR$STOP_OUTPUT	; Stop output stream
+
+	POPR	#^M<R0>			; Get back SHODEF_CMD return status
+	RET				; Return with status in R0
+
+	.SBTTL	SHOW_CLASSES - Show all selected classes
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	SHOW_CLASSES fills out the FAOL parameter list and 
+;	control string with the information required to
+;	display each of the classes followed by the display
+;	qualifier for each. It accepts as input a count of
+;	the number of classes to show and a byte vector
+;	containing a class number for each class.
+;
+; INPUTS:
+;
+;	 4(AP) - count of classes to be shown
+;
+;	 8(AP) - address of byte vector containing a class number
+;		 for each selected class
+;
+;	12(AP) - address of descriptor for FAOL parameter list
+;
+;	16(AP) - address of descriptor for FAOL control string
+;
+;
+; IMPLICIT INPUTS:
+;
+;	CDBHEAD      - table of contiguous CDB's, one for each class.
+;
+;	CLASSTABLE   - table of contiguous quadwords, one for each class.
+;			Each quadword consists of a pointer to a counted
+;			ASCII string for the class name followed by a
+;			longword containing the class number.
+;
+;	PROCD_TABLE  - table of contiguous longword pointers, one for
+;			each PROCESSES display qualifier. Each pointer
+;			points to a string descriptor for the qualifier
+;			name.
+;
+;	STAT_TABLE   - table similar to PROCD_TABLE but instead points
+;			to statistic qualifiers for standard classes.
+;
+; OUTPUTS:
+;
+;	none
+;
+; IMPLICIT OUTPUTS:
+;
+;	FAOL control string and parameter list updated.
+;
+; ROUTINE VALUE:
+;
+;	R0 = SS$_NORMAL, or called routine error status.
+;
+; SIDE EFFECTS:
+;
+;	none
+;
+;--
+
+
+
+.ENTRY	SHOW_CLASSES, ^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+
+	MOVL	12(AP),R10		; Load ptr to descr for FAOL parm list
+	MOVL	16(AP),R11		; Load ptr to descr for FAOL ctrl str
+
+	TSTL	4(AP)			; Test number of classes
+	BNEQ	10$			; Branch if at least one
+	BRW	50$			; None -- go tell user
+
+;
+; Display "Classes:" heading
+;
+
+10$:
+	PUSHL	#1			; Stack "single-spacing" indicator
+	PUSHAL	CLASS_HDG		; ... and text descriptor
+	CALLS	#2,G^SCR$PUT_LINE	; Put header to the terminal
+	BLBC	R0,SHC_RET		; Exit if error
+
+	CLRL	R7			; Init byte vector index
+	CLRL	R8			; Indicate this class at beg of line
+20$:
+	TSTL	R8			; Need to start this class on new line?
+	BNEQ	30$			; Branch if not
+
+	MOVL	4(R10),R9		; Point to beginning of FAOL parm list
+	MOVL	4(R11),R3		; Point to beginning of FAOL ctrl string
+	MOVB	#^A/ /,(R3)+		; Start classes in column 2 of screen
+	MOVL	#3,R8			; Init "classes per line" count
+30$:
+	MOVL	8(AP),R0		; Get addr of byte vector
+	MOVZBL	(R0)[R7],R2		; Get class number for BUILD_FAOL_ARGS
+	BSBW	BUILD_FAOL_ARGS		; Bld FAOL prmlst & ctrstr 4 this class
+					; NOTE -- this rtn destroys REGS R0-R2
+					; ... and R4-R6. Also updates R3 and R9
+	DECL	R8			; Update "classes left this line"
+	BNEQ	40$			; Branch if at least one left
+
+;
+; Show a line of 3 classes
+;
+
+	BSBW	SHOW_SINGLE		; Show the line, single-spaced
+	BLBC	R0,SHC_RET		; Exit if error
+40$:
+	AOBLSS	4(AP),R7,20$		; Loop back to do next class
+
+	TSTL	R8			; Classes remaining to be shown?
+	BEQL	SHC_NORM		; Branch if not
+
+;
+; Show final class line
+;
+
+	BSBW	SHOW_SINGLE		; Show the line, single-spaced
+	BRB	SHC_NORM		; ... and return with normal status
+
+;
+; Show "No classes" heading
+;
+
+50$:
+	PUSHL	#1			; Stack "single-spacing" indicator
+	PUSHAL	NO_CLASS_HDG		; ... and text descriptor
+	CALLS	#2,G^SCR$PUT_LINE	; Put header to the terminal
+	BLBC	R0,SHC_RET		; Exit if error
+
+SHC_NORM:
+	MOVL	#SS$_NORMAL,R0		; No failing status hit
+
+SHC_RET:
+	RET				; Return with status already in R0
+
+;
+; BUILD_FAOL_ARGS subroutine.
+;
+; This subroutine annexes FAOL directives to the control
+; string, and parameters to the parameter list for the
+; current class.
+;
+;
+; REGISTER USAGE:
+;
+;	R0,R1    = scratch
+;	R2       = class number of current class (input)
+;	R3       = next available byte in FAOL control string (input)
+;	R4,R5,R6 = scratch
+;	R9       = next available longword in FAOL parameter list (input)
+;
+;	NOTE -- R3 and R9 are updated. R0-R2 and R4-R6 are destroyed.
+;
+
+BUILD_FAOL_ARGS:
+
+;
+; Move class-name cstring pointer to FAOL parameter list
+;
+
+	MOVAL	CLASSTABLE+4,R0		; Get addr of table of class quadwords
+	MOVQ	(R0)[R2],R0		; R0 gets class-name cstring ptr
+	MOVL	R0,(R9)+		; Move it to FAOL parm list
+
+;
+; Obtain CDB address for this class
+;
+
+	MULL3	#CDB$K_SIZE,R2,R6	; Get CDB offset from class number
+					; NOTE - this rtn no longer needs class num
+	MOVAB	CDBHEAD[R6],R6		; Get CDB address
+
+;
+; Move appropriate segment of FAO directives into FAO control string
+; and move address of descriptor for display qualifier to FAOL parm list,
+; if one exists.
+;
+
+	MOVZBL	CDB$B_ST_CUR(R6),R0	; R0 gets display qualifier index
+	BBS	#CDB$V_STD,CDB$L_FLAGS(R6),10$ ; Branch if standard class
+	MOVAL	PROCD_TABLE,R6		; Get ptr to PROCESSES display qual table
+	BRB	20$			; ... and go get desired element
+10$:
+	MOVAL	STAT_TABLE,R6		; Get ptr to statistic qualifier ...
+					; ... table for standard classes
+20$:
+	TSTL	(R6)[R0]		; Is there a qual defined for this stat?
+	BEQL	30$			; Branch if no
+	MOVL	(R6)[R0],(R9)+		; Move descr ptr to FAOL prmlst
+	MOVC3	CL_SEG2,CL_SEG2+8,(R3)	; Move fixed segment into ctrl string
+	BRB	40$			; Go return
+
+30$:
+	MOVC3	CL_SEG1,CL_SEG1+8,(R3)	; Move fixed segment into control ...
+					; ... string (no display qualifier)
+40$:
+	RSB
+
+;
+; SHOW_SINGLE and SHOW_DOUBLE subroutine.
+; The 2 routine names are alternate entry points to show a line with
+; single-spacing and double-spacing, respectively. 
+; Upon entry, R10 points to the FAOL parameter list descriptor,
+; R11 points to the FAOL control string descriptor and R3 to the next
+; available byte in the control string. The routine updates the control
+; string descriptor, destroys R1, and returns status in R0.
+;
+
+SHOW_SINGLE:				; Show a line and advance one line
+	PUSHL	#1			; Stack "single-space" indicator
+	BRB	SHOW_COMM		; Join common code
+
+SHOW_DOUBLE:				; Show a line and advance two lines
+	PUSHL	#2			; Stack "double-space: indicator
+
+SHOW_COMM:				; Common point for 2 entry points
+	MOVL	4(R11),R0		; Get address of FAOL control string
+	SUBL3	R0,R3,(R11)		; Compute actual length
+	PUSHL	4(R10)			; Stack addr of FAOL parm list
+	PUSHAL	(R11)			; Stack addr of FAOL ctr str descr
+	CALLS	#3,SHOW_A_LINE		; Display one line of SHOW output
+	RSB				; Return with status in R0
+
+	.SBTTL	SHOW_A_LINE - Put a line of SHOW to terminal
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	SHOW_A_LINE sends one display line of SHOW output to the
+;	terminal via the SCRPKG. The line to display is defined
+;	by an $FAOL control string and parameter list, both of
+;	which are input to this routine.
+;
+; INPUTS:
+;
+;	 4(AP) - address of descriptor for $FAOL control string.
+;
+;	 8(AP) - address of $FAOL parameter list.
+;
+;	12(AP) - number of display lines to advance after showing a line.
+;
+; IMPLICIT INPUTS:
+;
+;	OUTDSC - quadword string descriptor for $FAOL output buffer.
+;
+; OUTPUTS:
+;
+;	none
+;
+; IMPLICIT OUTPUTS:
+;
+;	SHOW line sent to Screen Package.
+;
+; ROUTINE VALUE:
+;
+;	R0 = SS$_NORMAL, or called routine error status.
+;
+; SIDE EFFECTS:
+;
+;	none
+;
+;--
+
+.ENTRY	SHOW_A_LINE,^M<R2>
+
+	ALLOC	10,R1,R2		; Allocate a descriptor & a word
+	$FAOL_S CTRSTR=@4(AP), OUTLEN=8(R2), - ; Format the SHOW line
+		OUTBUF=OUTDSC, PRMLST=@8(AP) 
+	BLBC	R0,SAL_RET		; Exit if error
+	MOVZWL	8(R2),(R2)		; Move actual text len to descr
+	MOVL	OUTDSC+4,4(R2)		; Move addr of text to descr
+	PUSHL	12(AP)			; Stack spacing indicator
+	PUSHAL	(R2)			; ... and text descriptor
+	CALLS	#2,G^SCR$PUT_LINE	; Put the SHOW line to the terminal
+
+	BLBC	R0,SAL_RET		; Exit if error
+	MOVL	#SS$_NORMAL,R0		; No failing status hit
+
+SAL_RET:
+	RET				; Return with status in R0
+
+.END

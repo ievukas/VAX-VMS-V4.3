@@ -1,0 +1,928 @@
+MODULE lib$$read_object (		! File: LIBFNDIMG.B32 Edit: STAN3004
+		LANGUAGE (BLISS32),
+		ADDRESSING_MODE(EXTERNAL=GENERAL),
+		IDENT = 'V03-004'
+		) =
+BEGIN
+%TITLE	'Read and dissect object file';
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  Run time library
+!
+! ABSTRACT:
+!
+!	This procedure reads an object file and returns the symbols
+!
+! ENVIRONMENT:
+!
+!	VAX native, user mode.
+!
+!--
+!
+!
+! AUTHOR:  Benn Schreiber
+!
+! CREATION DATE: 23-Jan-1981
+!
+! MODIFIED BY:
+!
+!	V03-004 STAN3004	Stanley Rabinowitz	24-Jul-1984
+!
+!	V03-003	BLS0277		Benn Schreiber		 7-FEB-1984
+!		Convert to internal RTL routine.
+!
+!	V03-002	BLS0225		Benn Schreiber		16-Jun-1983
+!		Add flags argument and 1MOD flag
+!
+!	V03-001	BLS0209		Benn Schreiber		27-Feb-1983
+!		Correct PSECT name for read/only OWN data
+!--
+
+%SBTTL	'Declarations';
+!
+! BLISS Libraries
+!
+LIBRARY
+    'RTLSTARLE';
+REQUIRE
+    'RTLIN:RTLPSECT';
+
+DECLARE_PSECTS (LIB);			!Declare psects for LIB facility
+!
+! Data structure to describe object module
+!
+FIELD
+    obc_fields =
+	SET
+	obc_l_gblrtn =	[0,0,32,0],		!Address of globals routine
+	obc_l_pscrtn =	[4,0,32,0],		!Address of psect routine
+	obc_l_eomrtn =	[8,0,32,0],		!Address of eom rec routine
+	obc_l_ogsrtn =	[12,0,32,0],		!Address of other GSD routine
+	obc_l_orcrtn =	[16,0,32,0],		!Address of other record routine
+	obc_q_desc =	[20,0,0,0],		!Dynamic string descriptor
+	obc_l_usrdata =	[28,0,32,0],		!User data to pass to routines
+	obc_w_maxreclng = [32,0,16,0],		!Max rec length allowed by caller
+	obc_b_flags =	[34,0,8,0],		!Flags
+	obc_v_mhdseen =	[34,0,1,0],		! module header seen
+	obc_v_lnmseen =	[34,1,1,0],		! lang. name record seen
+	obc_v_1mod =	[34,2,1,0],		! only process one module
+	obc_b_currectyp = [35,0,8,0],		!Current record type
+	obc_b_lstrectyp = [36,0,8,0],		!Last record type
+	obc_b_modnamlng = [37,0,8,0],		!Length of module name
+	obc_t_modname =	[38,0,0,0]		!Length 31
+	TES;
+
+LITERAL
+	obc_c_size = 38+31;			!Size of OBC structure
+
+GLOBAL LITERAL
+	lib$m_lnk_1mod = 1;			!Bit mask for flags
+
+LINKAGE
+    context_11 = CALL : GLOBAL (context = 11);
+
+FORWARD ROUTINE
+    dealloc_context : context_11,		!Deallocate context block
+    prohdr : context_11,			!Process module header records
+    progsd : context_11,			!Process GSD records
+    proeom : context_11,			!Process end of module records
+    sequence_check : context_11;		!Check sequence of object records
+
+EXTERNAL ROUTINE
+    lib$free_vm,				!Deallocate virtual memory
+    lib$get_vm,					!Allocate virtual memory
+    str$free1_dx;				!Deallocate dynamic string
+
+EXTERNAL LITERAL
+    lib$_badccc,				!Illegal compilation completion code
+    lib$_eomerror,				!Errors in eom compilation code
+    lib$_eomfatal,				!Fatal errors in eom compilation code
+    lib$_eomwarn,				!Warnings in eom compilation code
+    lib$_gsdtyp,				!Illegal gsd type
+    lib$_illfmlcnt,				!Illegal formals count
+    lib$_illmodnam,				!Illegal module name length
+    lib$_illpsclen,				!Illegal psect length
+    lib$_illreclen,				!Illegal record length
+    lib$_illrecln2,				!Illegal record length
+    lib$_illrectyp,				!Illegal record type
+    lib$_illrecty2,				!Illegal record type
+    lib$_illsymlen,				!Illegal symbol length
+    lib$_noeom,					!No end of module record in file
+    lib$_rectoosml,				!Record too small to hold data
+    lib$_sequence,				!Illegal record sequence
+    lib$_sequence2,				!Illegal record sequence
+    lib$_strlvl;				!Illegal structure level
+
+LITERAL
+    true = 1,
+    false = 0;
+
+GLOBAL
+    LIB$$gl_objctx : REF $BBLOCK FIELD(obc_fields);!pointer to context block
+
+PSECT OWN = _LIB$CODE;				!Read-only data
+
+OWN
+    compilecodes : VECTOR[3,LONG]		!Translate eom compile codes into messages
+		INITIAL (lib$_eomwarn,
+			lib$_eomerror,
+			lib$_eomfatal);
+PSECT OWN = _LIB$DATA;
+
+%SBTTL	'lib$$getfilename - Get descriptor of file spec from FAB';
+GLOBAL ROUTINE lib$$getfilename (fab) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine returns a string descriptor for a file.
+!
+! Inputs:
+!
+!	fab		Address of the fab
+!
+! Outputs:
+!
+!	Routine value is address of string descriptor for file name
+!
+!--
+
+MAP
+    fab : REF $BBLOCK;
+
+LOCAL
+    nam : REF $BBLOCK;
+
+OWN
+    filedesc : $BBLOCK[dsc$c_s_bln];
+
+nam = .fab[fab$l_nam];
+IF (.nam EQL 0)
+    OR (IF (filedesc [dsc$w_length] = .nam [nam$b_rsl]) NEQ 0
+	    THEN filedesc [dsc$a_pointer] = .nam [nam$l_rsa]
+	    ELSE IF (filedesc [dsc$w_length] = .nam [nam$b_esl]) NEQ 0
+		THEN filedesc [dsc$a_pointer] = .nam [nam$l_esa];
+	.filedesc[dsc$w_length] EQL 0)
+THEN BEGIN
+    filedesc [dsc$w_length] = .fab [fab$b_fns];	!Use filename string
+    filedesc [dsc$a_pointer] = .fab [fab$l_fna];! if all else fails
+    END;
+
+RETURN filedesc
+END;							!Of lib$$getfilename
+
+%SBTTL	'lib$$report_io_error - Report I/O error on FAB or RAB';
+GLOBAL ROUTINE lib$$report_io_error (frab) =
+BEGIN
+!+++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine signals an I/O error.
+!
+! Inputs:
+!
+!	frab		The FAB or the RAB which got the error
+!			The $L_CTX field of the FAB/RAB must contain the
+!			error code to signal
+!			 (SHR$_OPENIN/OPENOUT/READERR/WRITEERR/CLOSEIN/CLOSEOUT)
+!			If frab is a RAB, then RAB$L_FAB must point to the FAB
+!			In either case, the FAB must point to a valid NAM block
+!			 with both the expanded and resultant name strings in
+!			 order for consistent error reporting
+!
+! Outputs:
+!
+!	The error is signalled.  RMS$_EOF is not signalled
+!
+! Routine value:
+!
+!	The $L_STS field of frab is returned
+!
+!---
+
+MAP
+    frab : REF $BBLOCK;
+
+IF .frab[rab$l_sts] NEQ rms$_eof
+    THEN SIGNAL(.frab[fab$l_ctx],1,
+	lib$$getfilename((IF .frab[fab$b_bid] EQL fab$c_bid
+			THEN .frab
+			ELSE .frab[rab$l_fab])),
+	.frab[fab$l_sts],.frab[fab$l_stv]);
+
+RETURN .frab[fab$l_sts]
+END;
+
+%SBTTL	'dealloc_context -- deallocate context block';
+ROUTINE dealloc_context : context_11 =
+BEGIN
+!
+! This routine deallocates the context block
+!
+EXTERNAL REGISTER
+    context = 11 : REF $BBLOCK FIELD(obc_fields);
+
+LOCAL
+    status;
+
+IF .context NEQ 0
+THEN BEGIN
+    str$free1_dx(lib$$gl_objctx[obc_q_desc]);
+    status = lib$free_vm(%REF(obc_c_size),lib$$gl_objctx);
+    lib$$gl_objctx = context = 0;
+    RETURN .status
+    END
+ELSE RETURN true
+
+END;
+
+%SBTTL	'sequence_check -- check record type sequence';
+ROUTINE sequence_check : context_11 =
+BEGIN
+!
+! Check that the record sequence is correct
+!
+ROUTINE sequence_error : context_11 =
+BEGIN
+!
+! Signal a record sequence error
+!
+EXTERNAL REGISTER
+    context = 11 : REF $BBLOCK FIELD(obc_fields);
+
+IF .context[obc_b_modnamlng] NEQ 0
+    THEN SIGNAL(lib$_sequence,1,context[obc_b_modnamlng])
+    ELSE SIGNAL(lib$_sequence2);
+
+RETURN lib$_sequence
+END;
+!
+! Main body of sequence_check
+!
+EXTERNAL REGISTER
+    context = 11 : REF $BBLOCK FIELD(obc_fields);
+
+BIND
+    recdesc = context[obc_q_desc] : $BBLOCK,
+    objrec = .recdesc[dsc$a_pointer] : $BBLOCK;
+
+IF .context[obc_b_currectyp] EQL obj$c_hdr
+    THEN BEGIN
+	IF .objrec[obj$b_subtyp] EQL obj$c_hdr_mhd
+	THEN BEGIN
+	    IF .context[obc_b_lstrectyp] EQL obj$c_eom
+	    THEN BEGIN
+		context[obc_v_mhdseen] = true;			!Main mhd record has just followed eom record
+		context[obc_v_lnmseen] = false;			!Flag no lnm mhd seen
+		RETURN true
+		END
+	    ELSE RETURN sequence_error()			!Last record was not eom, signal the error
+	    END
+	ELSE IF .context[obc_v_mhdseen]
+	    THEN BEGIN
+		IF .objrec[obj$b_subtyp] EQL obj$c_hdr_lnm
+		    THEN context[obc_v_lnmseen] = true;
+		RETURN true
+		END
+	    ELSE RETURN sequence_error()
+	END
+    ELSE IF .context[obc_v_mhdseen]
+		AND .context[obc_v_lnmseen]
+	    THEN BEGIN
+		IF .context[obc_b_currectyp] EQL obj$c_eom	!If current record is end of module
+		    THEN context[obc_v_mhdseen] = false;	! then we have no mhd record
+		RETURN true
+		END
+	    ELSE RETURN sequence_error();
+
+END;
+
+%SBTTL	'prohdr -- process MHD records';
+ROUTINE prohdr : context_11 =
+BEGIN
+!
+! This routine processes MHD records
+!
+! Inputs:
+!
+!	recdesc		Address of string descriptor for mhd record
+!
+
+EXTERNAL REGISTER
+    context = 11 : REF $BBLOCK FIELD(obc_fields);
+
+BIND
+    recdesc = context[obc_q_desc] : $BBLOCK,
+    objrec = .recdesc[dsc$a_pointer] : $BBLOCK;
+
+LOCAL
+    status;
+
+!
+! Check record sequence
+!
+IF NOT (status = sequence_check())
+    THEN RETURN .status;
+!
+! Skip all but main module header records
+!
+IF .objrec[obj$b_subtyp] NEQ obj$c_hdr_mhd
+    THEN RETURN true;
+!
+! Check for legal structure level
+!
+IF .objrec[mhd$b_strlvl] GTRU obj$c_strlvl
+THEN BEGIN
+    SIGNAL(lib$_strlvl,1,objrec[mhd$b_namlng]);
+    RETURN lib$_strlvl
+    END;
+!
+! Check max record length supplied
+!
+IF (context[obc_w_maxreclng] = .objrec[mhd$w_recsiz]) GTRU obj$c_maxrecsiz
+THEN BEGIN
+    SIGNAL(lib$_illreclen,2,.objrec[mhd$w_recsiz],objrec[mhd$b_namlng]);
+    RETURN lib$_illreclen
+    END;
+!
+! Check module name length
+!
+IF .objrec[mhd$b_namlng] GTRU obj$c_symsiz
+    OR .objrec[mhd$b_namlng] EQL 0
+THEN BEGIN
+    SIGNAL(lib$_illmodnam,.objrec[mhd$b_namlng],objrec[mhd$b_namlng]);
+    RETURN lib$_illmodnam
+    END;
+!
+! Copy module name into context block for error messages
+!
+context[obc_b_modnamlng] = .objrec[mhd$b_namlng];
+CH$MOVE(.objrec[mhd$b_namlng],objrec[mhd$t_name],context[obc_t_modname]);
+!
+! Call user action routine for "other records" if specified
+!
+IF .context[obc_l_orcrtn] NEQ 0
+    THEN status = (.context[obc_l_orcrtn])(recdesc,.context[obc_l_usrdata])
+    ELSE status = true;
+
+RETURN .status
+END;
+
+%SBTTL	'progsd -- process GSD records';
+ROUTINE progsd : context_11 =
+BEGIN
+!
+! This routine processes GSD records
+!
+! Inputs:
+!
+!	recdesc		Address of string descriptor for gsd record
+!
+!
+BUILTIN
+    NULLPARAMETER;
+
+EXTERNAL REGISTER
+    context = 11 : REF $BBLOCK FIELD(obc_fields);
+
+LOCAL
+    symboldesc : $BBLOCK[dsc$c_s_bln],			!String descriptor for symbol name
+    symbolvalue,					!Value of symbol
+    symbolflags,					!Symbol flags
+    gsd_desc : $BBLOCK[dsc$c_s_bln],			!String descriptor for gsd subrecord
+    status,						!Status from processing entry point
+    length,						!Length of def/ref
+    gsdoffset,						!Offset into record
+    objrec : REF $BBLOCK;				!pointer to object record
+
+BIND
+    recdesc = context[obc_q_desc] : $BBLOCK,
+    objvec = .recdesc[dsc$a_pointer] : VECTOR[,BYTE];	!Name record as byte vector
+
+IF .context[obc_l_gblrtn] EQL 0				!If no routine to process them
+    THEN RETURN true;					! then don't bother with the record
+
+gsd_desc[dsc$b_dtype] = gsd_desc[dsc$b_class] = 0;
+gsdoffset = obj$c_subtyp;				!Init pointer into record
+
+!
+! Process the GSD record
+!
+WHILE .gsdoffset LSSU .recdesc[dsc$w_length]		!Loop through the record
+DO BEGIN
+    LOCAL
+	recordtype,
+	wordpsectgsd;					!Contains word of psect rather than byte
+
+    objrec = .recdesc[dsc$a_pointer] + .gsdoffset;	!Update record pointer
+    wordpsectgsd = ((.objrec[gsd$b_gsdtyp] GEQU gsd$c_symw) !Test for word of psect number
+				AND (.objrec[gsd$b_gsdtyp] LEQU gsd$c_prow)); 
+
+    CASE (recordtype = .objvec[.gsdoffset])		!Dispatch to process GSD
+			FROM gsd$c_psc TO gsd$c_maxrectyp OF
+    SET
+
+    [gsd$c_psc,gsd$c_spsc] :				!Psect definition
+    !
+    ! PSECT definitions
+    !
+	BEGIN
+	    BIND
+		psectdef = objvec[.gsdoffset] : $BBLOCK;	!Name the definition
+
+	    LOCAL
+		psectdesc : $BBLOCK[dsc$c_s_bln],
+		psectalign,
+		psectflags,
+		psectalloc;
+
+	    IF (.gsdoffset + gps$c_name + 1) GEQU .recdesc[dsc$w_length]
+	    THEN BEGIN
+		SIGNAL(lib$_rectoosml,1,context[obc_b_modnamlng]);
+		RETURN lib$_rectoosml
+		END;
+	    psectdesc[dsc$b_dtype] = psectdesc[dsc$b_class] = 0;
+	    IF .recordtype EQL gsd$c_psc
+	    THEN BEGIN
+		psectdesc[dsc$w_length] = .psectdef[gps$b_namlng];
+		psectdesc[dsc$a_pointer] = psectdef[gps$t_name];
+		length = gps$c_name + .psectdesc[dsc$w_length];	!Compute length of psect def.
+		END
+	    ELSE BEGIN
+		psectdesc[dsc$w_length] = .psectdef[sgps$b_namlng];
+		psectdesc[dsc$a_pointer] = psectdef[sgps$t_name];
+		length = sgps$c_name + .psectdesc[dsc$w_length];
+		END;
+	    IF .psectdesc[dsc$w_length] EQL 0			!Check length of psect name
+		OR .psectdesc[dsc$w_length] GTRU obj$c_symsiz
+	    THEN BEGIN
+		SIGNAL(lib$_illpsclen,3,(IF .recordtype EQL gsd$c_psc
+						THEN psectdef[gps$b_namlng]
+						ELSE psectdef[sgps$b_namlng]),
+			.psectdesc[dsc$w_length],context[obc_b_modnamlng]);
+		RETURN lib$_illpsclen
+		END;
+	    IF .context[obc_l_pscrtn] NEQ 0			!If user psect routine supplied
+	    THEN BEGIN						! then set up and call it now
+		psectalign = .psectdef[gps$b_align];
+		psectflags = .psectdef[gps$w_flags];
+		psectalloc = .psectdef[gps$l_alloc];
+		gsd_desc[dsc$w_length] = .length;		!Set up descriptor for psect def.
+		gsd_desc[dsc$a_pointer] = .objrec;
+		(.context[obc_l_pscrtn])(psectdesc,		!Call the user routine now
+				psectalign,psectflags,psectalloc,
+				.context[obc_l_usrdata],gsd_desc);
+		END;
+	    gsdoffset = .gsdoffset + .length;			!Update pointer into record
+	    END;
+
+    !
+    ! All types of symbols
+    !
+    [gsd$c_sym TO gsd$c_prow] :						!All symbols
+	BEGIN
+	    BIND
+		symbolrec = objvec[.gsdoffset] : $BBLOCK;		!Name the symbol gsd
+
+	    LOCAL
+		entrymask,
+		symbolstring : REF VECTOR[,BYTE];			!Pointer to symbol ascic name
+
+	    IF .recordtype EQL gsd$c_epm				!Process entry points and procedures
+		OR .recordtype EQL gsd$c_epmw
+		OR .recordtype EQL gsd$c_pro
+		OR .recordtype EQL gsd$c_prow
+	    THEN BEGIN
+		!
+		! Process entry points and procedure definitions
+		!
+		IF .wordpsectgsd
+		THEN BEGIN
+		    !
+		    ! Entry point with word of psect
+		    !
+		    entrymask = .symbolrec[epmw$w_mask];
+		    length = epmw$c_name + .symbolrec[epmw$b_namlng];
+		    symbolvalue = .symbolrec[epmw$l_addrs];
+		    symbolstring = symbolrec[epmw$b_namlng];
+		    END
+		ELSE BEGIN
+		    !
+		    ! Entry point with byte of psect
+		    !
+		    entrymask = .symbolrec[epm$w_mask];
+		    length = epm$c_name + .symbolrec[epm$b_namlng];
+		    symbolvalue = .symbolrec[epm$l_addrs];
+		    symbolstring = symbolrec[epm$b_namlng];
+		    END;
+		!
+		! If this is procedure definition, then skip the argument
+		!  descriptors
+		!
+		IF .recordtype EQL gsd$c_pro
+		    OR .recordtype EQL gsd$c_prow
+		THEN BEGIN
+		    BIND
+			formals = objvec[.gsdoffset+.length] : $BBLOCK;	!Name formal argument descriptors
+
+		    LOCAL
+			argcount;
+
+		    IF .formals[fml$b_minargs] GTRU .formals[fml$b_maxargs]
+		    THEN BEGIN
+			SIGNAL(lib$_illfmlcnt,2,.symbolstring,context[obc_b_modnamlng]);
+			RETURN lib$_illfmlcnt
+			END;
+		    IF (.gsdoffset + .length + fml$c_size) GEQU .recdesc[dsc$w_length]
+		    THEN BEGIN
+			SIGNAL(lib$_rectoosml,1,context[obc_b_modnamlng]);
+			RETURN lib$_rectoosml
+			END;
+		    length = .length + fml$c_size;			!Skip fixed part of formals
+		    IF (argcount = .formals[fml$b_maxargs]) NEQ 0	!If there are argument descriptors
+		    THEN INCR i FROM 1 TO .argcount			! then process them
+		    DO BEGIN
+			BIND
+			    argdesc = objvec[.gsdoffset+.length] :	!Name the argument descriptor
+							$BBLOCK;
+
+			length = .length + .argdesc[arg$b_bytecnt] + arg$c_size;
+			END;
+		    END;
+		END;
+	    !
+	    ! Process ordinary symbol definitions and references
+	    !
+	    IF .recordtype EQL gsd$c_sym
+		OR .recordtype EQL gsd$c_symw
+	    THEN BEGIN
+		!
+		! Ordinary symbol definitions and references
+		!
+		entrymask = 0;						!No entry mask
+		IF NOT .symbolrec[gsy$v_def]				!If a reference
+		THEN BEGIN
+		    !
+		    ! Symbol reference
+		    !
+		    length = srf$c_name + .symbolrec[srf$b_namlng];	!Simply compute length of ref
+		    symbolvalue = 0;					!Value is 0 if a reference
+		    symbolstring = symbolrec[srf$b_namlng];
+		    END
+		ELSE BEGIN
+		    !
+		    ! Symbol definition
+		    !
+		    IF .wordpsectgsd					!If a word of psect number
+		    THEN BEGIN
+			!
+			! ...with word of psect number
+			!
+			length = sdfw$c_name + .symbolrec[sdfw$b_namlng];
+			symbolvalue = .symbolrec[sdfw$l_value];		!Point to value
+    			symbolstring = symbolrec[sdfw$b_namlng];	!Point to the symbol name
+			END
+		    ELSE BEGIN
+			!
+			! ...with byte of psect number
+			!
+			length = sdf$c_name + .symbolrec[sdf$b_namlng];
+			symbolvalue = .symbolrec[sdf$l_value];		!Point to symbol value
+			symbolstring = symbolrec[sdf$b_namlng];		!Point to the symbol name
+			END;
+		    END;
+		END;							!Symbol definition
+	    !
+	    ! Check length of symbol name
+	    !
+	    IF .symbolstring[0] EQL 0					!Check validity of symbol name
+		OR .symbolstring[0] GTRU obj$c_symsiz
+	    THEN BEGIN
+		SIGNAL(lib$_illsymlen,3,.symbolstring,			!Signal illegal symbol name
+			.symbolstring[0],context[obc_b_modnamlng]);
+		RETURN lib$_illsymlen
+		END;
+	    !
+	    ! Create string descriptor for symbol name
+	    !
+	    symbolflags = .symbolrec[sdf$w_flags];			!Get the symbol flags
+	    symboldesc[dsc$w_length] = .symbolstring[0];
+	    symboldesc[dsc$b_dtype] = 0;
+	    symboldesc[dsc$b_class] = 0;
+	    symboldesc[dsc$a_pointer] = symbolstring[1];
+	    gsd_desc[dsc$w_length] = .length;
+	    gsd_desc[dsc$a_pointer] = .objrec;
+
+	    (.context[obc_l_gblrtn])				!Call the user global symbol routine
+		(symboldesc,symbolvalue,symbolflags,entrymask,
+				.context[obc_l_usrdata],gsd_desc);	
+	    gsdoffset = .gsdoffset + .length;			!Update the pointer into the record
+	    END;
+
+    [gsd$c_idc] :						!Entity ident check
+	BEGIN
+!	    BIND
+!		entity_name = ,
+!		entity_ident =,
+!		object_name =;
+
+	    true
+
+	    END;
+    [INRANGE] :
+	BEGIN
+	    true
+	    END;
+    TES;
+    END;							!GSD record
+
+RETURN true
+
+END;								!of progsd
+
+%SBTTL	'proeom -- process EOM records';
+ROUTINE proeom : context_11 =
+BEGIN
+!
+! Process end of module records
+!
+EXTERNAL REGISTER
+    context = 11 : REF $BBLOCK FIELD(obc_fields);
+
+BIND
+    recdesc = context[obc_q_desc] : $BBLOCK,
+    objrec = .recdesc[dsc$a_pointer] : $BBLOCK;
+
+
+LOCAL
+    eomflags,
+    transfer_psect,
+    transfer_address,
+    comcode,
+    wordpsecteom,
+    status;
+
+context[obc_w_maxreclng] = obj$c_maxrecsiz;			!Reset to maximum allowed by language
+!
+! Check record sequence
+!
+IF NOT (status = sequence_check())
+    THEN RETURN .status;
+
+wordpsecteom = (.objrec[obj$b_rectyp] EQL obj$c_eomw);
+!
+! Check record length and determine if a transfer address is present
+!
+IF (IF .wordpsecteom
+	THEN ((transfer_address = .recdesc[dsc$w_length] NEQ eomw$c_eommin)
+		AND ((.recdesc[dsc$w_length] LSS eomw$c_eommx1)
+			OR (.recdesc[dsc$w_length] GTR eomw$c_eommax)))
+	ELSE ((transfer_address = .recdesc[dsc$w_length] NEQ eom$c_eommin)
+		AND ((.recdesc[dsc$w_length] LSS eom$c_eommx1)
+			OR (.recdesc[dsc$w_length] GTR eom$c_eommax))))
+THEN BEGIN
+    SIGNAL(lib$_illreclen,2,.recdesc[dsc$w_length],context[obc_b_modnamlng]);
+    RETURN lib$_illreclen
+    END;
+!
+! Check the module compilation completion code
+!
+IF (comcode = .objrec[eom$b_comcod]) NEQ 0
+THEN BEGIN
+    IF .comcode GTRU 3
+    THEN BEGIN
+	SIGNAL(lib$_badccc,2,.comcode,context[obc_b_modnamlng]);
+	RETURN lib$_badccc
+	END
+    ELSE SIGNAL(.compilecodes[.comcode-1],1,context[obc_b_modnamlng]);
+    END;
+!
+! Get transfer address info if present
+!
+IF NOT .transfer_address
+THEN transfer_psect = 0
+ELSE IF .wordpsecteom
+THEN BEGIN
+    transfer_psect = .objrec[eomw$w_psindx];
+    transfer_address = .objrec[eomw$l_tfradr];
+    eomflags = .objrec[eomw$b_tfrflg];
+    END
+ELSE BEGIN
+    transfer_psect = .objrec[eom$b_psindx];
+    transfer_address = .objrec[eom$l_tfradr];
+    eomflags = .objrec[eom$b_tfrflg];
+    END;
+!
+! Call user routine if supplied
+!
+IF .context[obc_l_eomrtn] NEQ 0
+    THEN status = (.context[obc_l_eomrtn])(eomflags,transfer_psect,
+					transfer_address,comcode,recdesc)
+    ELSE status = true;
+
+RETURN .status
+END;
+
+%SBTTL	'LIB$$READ_OBJECT - read an object file';
+GLOBAL ROUTINE lib$$read_object (read_routine,flags,user_context,
+				global_routine,	psect_routine,eomrec_routine,
+				othgsd_routine,othrec_routine) =
+BEGIN
+!
+! This routine is called to read an object file and return the contents
+! 
+! INPUTS:
+!
+!	read_routine	Routine to read the next record of an object file
+!			It is called with onw argument as follows:
+!
+!			 (.read_routine)(user_context,record_descriptor);
+!
+!	flags		OPTIONAL - Address of longword of user-requested flags
+!				LIB$M_LNK_1MOD - only process one module
+!
+!	user_context	OPTIONAL - Longword of context which is passed
+!			to all called routines.
+!
+!	global_routine	OPTIONAL - Routine that is called with the name
+!			and value of a global symbol.  It is called as:
+!
+!			(.global_routine)(symbol_desc,symbol_value,
+!					symbol_flags,entry_mask,
+!					user_context,gsdrec);
+!
+!	   WHERE:
+!		symbol_desc		is the address of a string descriptor
+!					 for symbol name
+!		symbol_value		is the address of the symbol value
+!		symbol_flags		is the address of the symbol flags
+!		entry_mask		is the address of the entry mask
+!		user_context		is the context passed in
+!		gsdrec			is the address of a string descriptor
+!					 for the symbol record
+!
+!	psect_routine	OPTIONAL - routine that is called for a psect
+!			definition.
+!
+!			(.psect_routine)(psectname,psectalign,psectflags,
+!						psectalloc,user_context,gsdrec)
+!
+!	eomrec_routine	OPTIONAL - routine that is called for end of module
+!			records
+!
+!			(.eomrec_routine)(eomflags, transfer_psect,
+!					transfer_address,comcode,
+!					user_context,eomdesc)
+!
+!	othgsd_routine	OPTIONAL - routine that is called for all other
+!			GSD types
+!
+!			(.othgsd_routine)()
+!
+!	othrec_routine	OPTIONAL - routine that is called for all other
+!			record types
+!
+!			(.othrec_routine)()
+!
+! OUTPUTS:
+!
+!	global_routine is called for each symbol definition
+!
+BUILTIN
+    NULLPARAMETER;
+
+GLOBAL REGISTER
+    context = 11 : REF $BBLOCK FIELD(obc_fields);
+
+LOCAL
+    status,
+    recdesc : REF $BBLOCK;
+
+!
+! If a context block already exists, then use it. Else allocate one
+!
+IF .lib$$gl_objctx EQL 0
+THEN IF NOT (status = lib$get_vm(%REF(obc_c_size),
+				lib$$gl_objctx))
+    THEN BEGIN
+	SIGNAL(.status);
+	RETURN .status
+	END;
+!
+! Initialize the context block
+!
+context = .lib$$gl_objctx;
+CH$FILL(0,obc_c_size,.context);			!Zero the context block
+context[obc_w_maxreclng] = obj$c_maxrecsiz;
+context[obc_b_currectyp] = obj$c_eom;		!Initialize current record type as end of module
+IF NOT NULLPARAMETER(2)
+    THEN context[obc_v_1mod] = ..flags AND lib$m_lnk_1mod;
+!
+! Fill in routine addresses
+!
+IF NOT NULLPARAMETER(3)
+    THEN context[obc_l_usrdata] = .user_context;
+IF NOT NULLPARAMETER(4)
+    THEN context[obc_l_gblrtn] = .global_routine;
+IF NOT NULLPARAMETER(5)
+    THEN context[obc_l_pscrtn] = .psect_routine;
+IF NOT NULLPARAMETER(6)
+    THEN context[obc_l_eomrtn] = .eomrec_routine;
+IF NOT NULLPARAMETER(7)
+    THEN context[obc_l_ogsrtn] = .othgsd_routine;
+IF NOT NULLPARAMETER(8)
+    THEN context[obc_l_orcrtn] = .othrec_routine;
+
+recdesc = context[obc_q_desc];				!Point to descriptor
+recdesc[dsc$b_class] = dsc$k_class_d;
+!
+! Call user routine to read file until eof returned
+!
+WHILE (.read_routine)(.context[obc_l_usrdata],.recdesc) NEQ rms$_eof
+DO BEGIN
+    BIND
+	objrec = .recdesc[dsc$a_pointer] : $BBLOCK;
+
+    IF .recdesc[dsc$w_length] GTRU .context[obc_w_maxreclng]
+	OR .recdesc[dsc$w_length] EQL 0
+    THEN BEGIN
+	IF .context[obc_b_modnamlng] EQL 0
+	    THEN SIGNAL(lib$_illrecln2,1,.recdesc[dsc$w_length])
+	    ELSE SIGNAL(lib$_illreclen,2,.recdesc[dsc$w_length],
+					context[obc_b_modnamlng]);
+	dealloc_context();
+	RETURN lib$_illreclen
+	END;
+
+    context[obc_b_lstrectyp] = .context[obc_b_currectyp];		!Current record becomes last record
+    context[obc_b_currectyp] = .objrec[obj$b_rectyp];			!Set current record type
+
+    IF NOT (status = 
+		(CASE .objrec[obj$b_rectyp]
+			FROM obj$c_hdr TO obj$c_maxrectyp OF
+    SET
+
+    [obj$c_hdr] : prohdr();					!Process hdr record
+    [obj$c_gsd] : progsd();					!Process GSD record
+    [obj$c_eom] : BEGIN						!Process eom record
+		    status=proeom();
+		    IF .context[obc_v_1mod]			!Exit if 1 module
+			THEN EXITLOOP;
+		    .status
+		    END;
+    [INRANGE] : true;
+    [OUTRANGE] : BEGIN
+		    IF .context[obc_b_modnamlng] NEQ 0
+			THEN SIGNAL(lib$_illrectyp,2,.objrec[obj$b_rectyp],
+					context[obc_b_modnamlng])
+			ELSE SIGNAL(lib$_illrecty2,1,.objrec[obj$b_rectyp]);
+		    lib$_illrectyp
+		    END;
+
+    TES))
+	THEN BEGIN
+	    dealloc_context();
+	    RETURN .status
+	    END;
+    END;
+!
+! Check that last record was eom record
+!
+IF .context[obc_b_currectyp] NEQ obj$c_eom
+THEN BEGIN
+    SIGNAL(lib$_noeom,1,context[obc_b_modnamlng]);
+    dealloc_context();
+    RETURN lib$_noeom
+    END;
+
+dealloc_context();
+
+RETURN true
+
+END;							!Of lib$$read_object
+
+END ELUDOM

@@ -1,0 +1,480 @@
+MODULE symbols		(IDENT='V04-000',
+			ADDRESSING_MODE(EXTERNAL=GENERAL))
+= BEGIN
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! Facility:	Command Definition Utility, Symbol Table Module
+!
+! Abstract:	This module contains the routines necessary to create a
+!		symbol table file for use by the old CLI interface.
+!		Symbols are generated for each verb, syntax, or type
+!		definition which includes a PREFIX clause.  These symbols
+!		specify the number of each qualifier or keyword defined.
+!
+! Environment:	Standard CDU environment.
+!
+! Author:	Paul C. Anagnostopoulos
+! Creation:	16 February 1983
+!
+! Modifications:
+!--
+
+
+library 'sys$library:lib';
+require 'clitabdef';
+require 'cdureq';
+
+!	T A B L E   O F   C O N T E N T S
+!	---------   ---   ---------------
+
+forward routine
+	cdu$write_symbol_table_file: novalue,
+	cdu$close_symbol_table_file: novalue,
+	write_header_records: novalue,
+	write_psect_record: novalue,
+	write_symbol_records: novalue,
+	write_eom_record: novalue;
+
+
+!	E X T E R N A L   R E F E R E N C E S
+!	---------------   -------------------
+
+external routine
+	cdu$lookup_child,
+	cdu$report_rms_error,
+	cli$get_value,
+	lib$free_vm,
+	lib$get_vm;
+
+external
+	cdu$facility_string: descriptor,
+	cdu$gl_root_node: ref node;
+
+$shr_msgdef(cdu,17,local,
+	(openout,severe),
+	(writeerr,severe)
+	);
+
+!	S Y M B O L   T A B L E   F I L E   C O N T R O L   B L O C K S
+!	-----------   ---------   -------   -------------   -----------
+
+! The following items define the RMS control blocks needed to create and 
+! write the symbol table file.
+
+own
+	stb_esa: block[nam$c_maxrss,byte],
+	stb_rsa: block[nam$c_maxrss,byte],
+	stb_nam: $nam(
+			esa=stb_esa,
+			ess=%allocation(stb_esa),
+			rsa=stb_rsa,
+			rss=%allocation(stb_rsa)
+			),
+
+	dbuffer(stb_spec,nam$c_maxrss),
+	stb_fab: $fab(
+			dnm='.STB',
+			fna=stb_spec+8,
+			fns=%allocation(stb_spec)-8,
+			fac=put,
+			fop=<sqo,nam,ofp>,
+			nam=stb_nam,
+			org=seq,
+			rat=cr,
+			rfm=var
+			),
+
+	stb_rab: $rab(
+			fab=stb_fab,
+			rac=seq,
+			rop=wbh
+			);
+
+!++
+! Description:	This routine is called after a CLD file has been compiled
+!		into its intermediate representation.  We must determine
+!		all of the symbols that need to be added to the symbol
+!		table file and write them.
+!
+!		Upon first call, we create the symbol table file and write
+!		the records needed to start it off.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$write_symbol_table_file	: novalue
+= BEGIN
+
+local
+	status: long;
+
+
+! If we haven't yet created the symbol table file, let's do it.
+
+if .stb_fab[fab$w_ifi] eqlu 0 then (
+
+	! Get the value specified on the /SYMBOLS qualifier to use as
+	! the spec for the symbol table file.
+
+	cli$get_value(dtext('SYMBOLS'),stb_spec);
+
+	! Create and connect to the symbol table file.  Any errors are fatal.
+
+	status = $create(fab=stb_fab);
+	if not .status then
+		cdu$report_rms_error(msg(cdu$_openout),stb_fab);
+	status = $connect(rab=stb_rab);
+	if not .status then
+		cdu$report_rms_error(msg(cdu$_openout),stb_rab);
+
+	! Write the header records.
+
+	write_header_records();
+
+	! Write the absolute psect definition record.
+
+	write_psect_record();
+);
+
+! Now we can write the symbol definition records.
+
+write_symbol_records();
+
+return;
+
+END;
+
+!++
+! Description:	This routine is called when all CLDs have been processed and
+!		we are done writing the symbols.  We write the
+!		end-of-module record in the symbol table file.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$close_symbol_table_file	: novalue
+= BEGIN
+
+
+! Write the end-of-module record.
+
+write_eom_record();
+
+return;
+
+END;
+
+!++
+! Description:	This routine is responsible for writing the header records
+!		in the symbol table file.  We write the mandatory module
+!		record, along with a language name record.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+ROUTINE write_header_records	: novalue
+= BEGIN
+
+local
+	status: long,
+	hdr: block[256,byte],
+	variable_ptr: pointer,
+	child: ref node,
+	work_dsc: descriptor;
+
+
+! Set up the fixed portion of a module header record.
+
+hdr[obj$b_rectyp] = obj$c_hdr;
+hdr[mhd$b_hdrtyp] = mhd$c_mhd;
+hdr[mhd$b_strlvl] = obj$c_strlvl;
+hdr[mhd$w_recsiz] = obj$c_maxrecsiz;
+
+! Now we want to include the module name.  If there is a MODULE statement
+! in the CLD, use it.  Otherwise use the name of the symbol table file.  While
+! we're at it, set up a pointer to the next available byte in the header.
+
+child = cdu$lookup_child(.cdu$gl_root_node,node_k_module);
+if .child neqa 0 then (
+	ch$move(1+.child[node_b_text_length],child[node_b_text_length], hdr[mhd$b_namlng]);
+	variable_ptr = hdr[mhd$t_name] + .child[node_b_text_length];
+) else (
+	hdr[mhd$b_namlng] = .stb_nam[nam$b_name];
+	ch$move(.stb_nam[nam$b_name],.stb_nam[nam$l_name], hdr[mhd$t_name]);
+	variable_ptr = hdr[mhd$t_name] + .stb_nam[nam$b_name];
+);
+
+! Now we want to include the module ident string.  If there is an IDENT
+! statement, then use it.  Otherwise use a string of "0-0".
+
+child = cdu$lookup_child(.cdu$gl_root_node,node_k_ident);
+if .child neqa 0 then (
+	ch$move(1+.child[node_b_text_length],child[node_b_text_length], .variable_ptr);
+	variable_ptr = .variable_ptr + 1+.child[node_b_text_length];
+) else (
+	ch$move(4,ctext('0-0'), .variable_ptr);
+	variable_ptr = .variable_ptr + 4;
+);
+
+! Finally, we want to include the current date and time.
+
+build_descriptor(work_dsc,17,.variable_ptr);
+status = $asctim(timbuf=work_dsc);
+check(.status, .status);
+variable_ptr = .variable_ptr + 17;
+
+! Write the module header into the symbol table file.  Any error is fatal.
+
+stb_rab[rab$l_rbf] = hdr;
+stb_rab[rab$w_rsz] = .variable_ptr - hdr;
+status = $put(rab=stb_rab);
+if not .status then
+	cdu$report_rms_error(msg(cdu$_writeerr),stb_rab);
+
+! Set up the fixed portion of a language name record.
+
+hdr[obj$b_rectyp] = obj$c_hdr;
+hdr[mhd$b_hdrtyp] = mhd$c_lnm;
+
+! Move in our language name.
+
+ch$move(.cdu$facility_string[len],.cdu$facility_string[ptr], hdr + 2);
+
+! Write the language name record in the symbol table file.
+
+stb_rab[rab$w_rsz] = 2 + .cdu$facility_string[len];
+status = $put(rab=stb_rab);
+if not .status then
+	cdu$report_rms_error(msg(cdu$_writeerr),stb_rab);
+
+return;
+
+END;
+
+!++
+! Description:	This routine is responsible for writing the absolute psect
+!		definition, which is needed so that all the symbols can
+!		reside in it.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+ROUTINE write_psect_record		: novalue
+= BEGIN
+
+local
+	status: long,
+	gsd: block[256,byte];
+
+bind
+	gsd_psc = gsd + 1: block[,byte];
+
+
+! Set up the fixed portion of the psect record.
+
+gsd[obj$b_rectyp] = obj$c_gsd;
+gsd_psc[gps$b_gsdtyp] = gsd$c_psc;
+gsd_psc[gps$b_align] = 0;
+gsd_psc[gps$w_flags] = gps$m_rd + gps$m_wrt + gps$m_exe;
+gsd_psc[gps$l_alloc] = 0;
+
+! Now we want the psect name.
+
+begin
+bind
+	name = ctext('$ABS$'): vector[,byte];
+
+ch$move(1+.name[0],name[0], gsd_psc[gps$b_namlng]);
+end;
+
+! Write the psect definition record into the symbol table file.
+! Errors are fatal.
+
+stb_rab[rab$l_rbf] = gsd;
+stb_rab[rab$w_rsz] = 1 + 8 + 1+.gsd_psc[gps$b_namlng];
+status = $put(rab=stb_rab);
+if not .status then
+	cdu$report_rms_error(msg(cdu$_writeerr),stb_rab);
+
+return;
+
+END;
+
+!++
+! Description:	This routine is responsible for writing out the symbol
+!		definition records.  This is done by traversing the
+!		intermediate representation tree to locate any verb,
+!		syntax, or type definitions that specify a PREFIX clause.
+!		A symbol is then generated for every subordinate qualifier
+!		or keyword, but not for parameters.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+ROUTINE write_symbol_records		: novalue
+= BEGIN
+
+local
+	status: long,
+	gsd: block[256,byte],
+	definition: ref node,
+	prefix: ref node,
+	entity_type: long,
+	entity_number: long,
+	entity: ref node;
+
+bind
+	gsd_sym = gsd + 1: block[,byte];
+
+
+! Scan the intermediate representation tree, looking for definitions.
+
+scan_children(cdu$gl_root_node,definition,
+
+	! If we have a definition, then determine whether that definition
+	! includes a PREFIX clause.
+
+	if (prefix = cdu$lookup_child(.definition,node_k_prefix)) neqa 0 then (
+
+		! If we have a prefix clause, then we want to generate symbols
+		! for this definition.  If a verb or syntax, then we want
+		! symbols for the qualifiers.  If a type, symbols for the
+		! keywords.
+
+		entity_type =	(if .definition[node_w_type] eqlu node_k_define_type then
+					node_k_keyword
+				else
+					node_k_qualifier);
+
+		! Scan the children of the definition node looking for the
+		! entities that need symbols defined.  As we go, we will count
+		! the relevent entities.
+
+		entity_number = 0;
+		scan_children(definition,entity,
+
+			if .entity[node_w_type] eqlu .entity_type then (
+
+				! Increment the entity number.
+
+				increment(entity_number);
+
+				! We have an entity for which a symbol must be
+				! generated.  Begin by building the fixed
+				! portion of a GSD symbol definition record.
+				! The symbol value is the entity number.
+
+				gsd[obj$b_rectyp] = obj$c_gsd;
+				gsd_sym[sdf$b_gsdtyp] = gsd$c_sym;
+				gsd_sym[sdf$b_datyp] = 0;
+				gsd_sym[sdf$w_flags] = gsy$m_def;
+				gsd_sym[sdf$b_psindx] = 0;
+				gsd_sym[sdf$l_value] = .entity_number;
+
+				! Now we can build the symbol name out of the
+				! prefix and the first four characters of the
+				! entity name.
+
+				gsd_sym[sdf$b_namlng] = .prefix[node_b_text_length] +
+							minu(.entity[node_b_text_length],4);
+				ch$copy(.prefix[node_b_text_length],prefix[node_t_text],
+					minu(.entity[node_b_text_length],4),entity[node_t_text],
+					' ',.gsd_sym[sdf$b_namlng],gsd_sym[sdf$t_name]);
+
+				! Write the record into the symbol table file.
+				! Any error is fatal.
+
+				stb_rab[rab$l_rbf] = gsd;
+				stb_rab[rab$w_rsz] = 1 + 9 + 1+.gsd_sym[sdf$b_namlng];
+				status = $put(rab=stb_rab);
+				if not .status then
+					cdu$report_rms_error(msg(cdu$_writeerr),stb_rab);
+			);
+		);
+	);
+);
+
+return;
+
+END;
+
+!++
+! Description:	This routine is responsible for writing the end-of-module
+!		record at the end of the symbol table file.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+ROUTINE write_eom_record	: novalue
+= BEGIN
+
+local
+	status: long,
+	eom: block[256,byte];
+
+! Format the end-of-module record.
+
+eom[obj$b_rectyp] = obj$c_eom;
+eom[eom$b_comcod] = 0;
+
+! Write the record.  All errors are fatal.
+
+stb_rab[rab$l_rbf] = eom;
+stb_rab[rab$w_rsz] = 2;
+status = $put(rab=stb_rab);
+if not .status then
+	cdu$report_rms_error(msg(cdu$_writeerr),stb_rab);
+
+return;
+
+END;
+
+END
+ELUDOM

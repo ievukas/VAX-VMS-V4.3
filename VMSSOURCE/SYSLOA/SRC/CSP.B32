@@ -1,0 +1,786 @@
+!
+! - CSP$$WAIT does not return status!  What if LIB$GET_VM fails?
+!
+
+MODULE	CSP
+		(IDENT = 'V04-000'
+		,MAIN  = CLUSTER_SERVER
+		,LANGUAGE (BLISS32)
+		,ADDRESSING_MODE (EXTERNAL=GENERAL)
+		) =
+BEGIN
+%TITLE	'Cluster Server Process - Main Routine'
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!++
+!
+! FACILITY:	Cluster Server Process
+!
+! ABSTRACT:	Process context for coordinating the actions of cluster
+!		servers and event logging in a VAXcluster.
+!
+! AUTHOR:	Paul R. Beck
+!
+! DATE:		03-MAR-1983 	Last Edit:  24-AUG-1983 10:32
+!
+! REVISION HISTORY:
+!
+!	V03-010	ADE0003		Alan D. Eldridge	24-Apr-1984
+!		Cleaned up some error paths.  Use CSP$GL_CURCTX instead
+!		of CLX where appropriate.
+!
+!	V03-009	RSH0125		R. Scott Hanna		22-Mar-1984
+!		Remove call to CSP$QUORUM_INIT.
+!
+!	V03-008	ADE0002		Alan D. Eldridge	28-Feb-1983
+!		Change name of CSP$QUORUM to CSP$QUORUM_INIT.  Change name
+!		of CSP$$OPCOM to CSP$TELL_OPCOM.
+!
+!	V03-007	ADE0001		Alan D. Eldridge	 1-Dec-1983
+!		Use the ACKMSG service of the connection manager instead
+!		of DECnet for inter-node communication.
+!
+!	V03-006	PRB0248		Paul Beck		 8-Sep-1983
+!		Fix problem with the way CSP waits for DECnet availability.
+!
+!	V03-005	RSH0060		R. Scott Hanna		24-AUG-1983
+!		Add call to CSP$QUORUM during initialization.
+!
+!	V03-004	PRB0226		Paul Beck		 19-AUG-1983 18:48
+!		Start up DECnet object asynchronously from the rest of the 
+!		initialization, so the scheduler can be running before 
+!		DECnet has started. Also, remove some excess baggage which
+!		would only be needed if DECnet were the permanent mechanism
+!		instead of just a holding action.
+!
+!	V03-003	PRB0226		Paul Beck		 9-JUL-1983 16:39
+!		Get requests from CLUB$L_CSPFL, and allow for nonpaged pool
+!		(system addresses) therein. Get CSPDEF from LIB$.
+!
+!	V03-002	PRB0214		Paul Beck		 24-JUN-1983 14:34
+!		Change SRC$:CSPDEF to SHRLIB$:CSPDEF
+!
+!	V03-001	PRB0200		Paul Beck		 6-JUN-1983 21:05
+!		Change CTX$ symbols to CLX$ to prevent conflict with RCP.
+!--
+
+!
+! External References:
+!
+    
+
+REQUIRE
+    'LIB$:CSPDEF.R32' ;			! CSP common definitions
+LIBRARY
+    'SYS$LIBRARY:LIB' ;
+
+SWITCHES LIST (NOSOURCE) ;		! don't print out REQUIRE files
+
+
+SWITCHES LIST (SOURCE) ;
+
+MACRO
+    !
+    !  Define offsets for lock_status.
+    !
+    LKSB$W_STATUS	= 0,0,16,0 %,		! completion status
+    LKSB$W_RESERVED	= 2,0,16,0 %,		! 
+    LKSB$L_LKID		= 4,0,32,0 %,		! lock identification
+    LKSB$AB_VALBLK	= 8,0,0,0  %,		! value block
+    LKSB$L_VALBLK_KEY	= 8,0,32,0 % ;		! storage cell for random key
+
+
+!
+!  Linkages used
+!
+LINKAGE
+    NO_REGISTERS	= CALL: NOPRESERVE (0,1,2,3,4,5,6,7,8,9,10,11),
+    JSB_2		= JSB (REGISTER=2),
+    JSB_12		= JSB (REGISTER=1,REGISTER=2),
+    JSB_LINKAGE		= JSB,
+    LINKDEANONPAGED	= JSB (REGISTER=0): NOPRESERVE(0,1,2,3) ;
+
+BUILTIN
+    INSQUE,
+    REMQUE,
+    CALLG,
+    TESTBITCC,
+    TESTBITCS,
+    TESTBITSC,
+    TESTBITSS ;
+
+
+!
+!  External References:
+!
+EXTERNAL ROUTINE
+    LIB$FREE_VM,			! Free virtual memory
+    LIB$GET_VM,				! Get virtual memory
+    LIB$GET_EF,				! Get event flag
+    EXE$DEANONPAGED	: LINKDEANONPAGED, ! deallocated nonpaged pool
+    EXE$CSP_COMMAND	: JSB_12,	! Issue commands to loadable CSP code
+    CSP$$CALL_ACTION	: JSB_2,	! Action Routine dispatcher
+    CSP$$WAIT,				! Wait for completion AST
+    CSP$$CREATE_CTX 	: JSB_LINKAGE,	! Create new context block
+    CSP$$DELETE_CTX 	: JSB_LINKAGE,	! Delete current context block
+    CSP$$SAVE_STACK 	: JSB_LINKAGE,	! Save current stack in context block
+    CSP$$RESUME	    	: NOVALUE;	! Internal completion AST completion
+
+!
+! Forward References:
+!
+FORWARD ROUTINE
+    EXIT_HANDLER    	: NOVALUE,	! Exit handler
+    KERNEL_INIT,			! kernel mode initialization
+    KERNEL_CLEANUP  	: NOVALUE,	! kernel mode exit handler cleanup
+    SCHEDULE	    	: NO_REGISTERS,	! Scheduler for multithreading
+    REMQUE_CSD,				! Get local request from CLUB, if any
+    DEANONPAGED,			! Kernel routine to call EXE$DEANONPAGED
+    CSP$TELL_OPCOM,			! Report error to OPCOM
+    RESUME_THREAD,			! Resume execution of thread
+    NEW_REQUEST	    	: JSB_LINKAGE NOVALUE, ! Process new client request
+    REPLY,				! Tell loadable Exec code to reply
+    KERNEL_ENQW,			! $ENQW call from kernel mode
+    CSP$$CRASH,				! Report bug
+    MUMBLE ;
+
+
+!
+! Fixed storage
+!
+GLOBAL
+    CSP$GL_BASE_FP: LONG,		! save base FP for scheduler
+    CSP$GL_CSPQ	  : LONG,		! addr of CLUB$GL_CSPFL queue
+    CSP$GQ_RESUME : VECTOR [2,LONG]	! queue of scheduled context blocks
+    		    INITIAL (CSP$GQ_RESUME
+			    ,CSP$GQ_RESUME
+			    ),
+    CSP$GQ_WAIT   : VECTOR [2,LONG]	! queue of suspended context blocks
+    		    INITIAL (CSP$GQ_WAIT
+			    ,CSP$GQ_WAIT
+			    ),
+    CSP$GL_CURCTX : REF BLOCK [,BYTE] ;	! Current context block
+
+OWN
+    CSP$Q_CLX_CSD: VECTOR [2,LONG]	! queue of free CLX/CSD blocks
+    		    INITIAL (CSP$Q_CLX_CSD
+			    ,CSP$Q_CLX_CSD
+			    ),
+    EXIT_REASON	  : LONG,		! reason returned to exit handler
+    EXIT_HANDLER_BLOCK
+    		  : VECTOR [4,LONG] 	! define exit handler
+		    INITIAL (0,EXIT_HANDLER 
+			    ,1,EXIT_REASON
+			    ),
+    LOCK_STATUS	  : BLOCK  [24,BYTE],	! lock status block plus value block
+    LOCK_BUFFER	  : VECTOR [31,BYTE],	! text of lock resource name
+    LOCK_NAME	  : VECTOR [2,LONG]	! working descriptor for lock_buffer
+    		    INITIAL (0,LOCK_BUFFER),
+    LOCK_NAME_DESC: VECTOR [2,LONG] 	! initial descriptor for lock_buffer
+    		    INITIAL (31,LOCK_BUFFER),
+    STARTUP_TIME  : VECTOR [2,LONG],	! system time for value block
+    BASE_IOSB	  : VECTOR [2,LONG], 	! IOSB for CSP's QIOs
+    BASE_EFN	  : BYTE ;	   	! allocated event flag for use by CSP
+
+
+!
+! Macro to issue call with arguments from kernel mode.
+!
+MACRO	KRNL_CALL (K_ROUTINE) =
+    BEGIN
+    EXTERNAL ROUTINE  SYS$CMKRNL   : ADDRESSING_MODE (ABSOLUTE) ;
+    BUILTIN SP  ;
+    
+    SYS$CMKRNL (K_ROUTINE , .SP , %LENGTH - 1
+		%IF %LENGTH GTR 1 %THEN , %REMAINING %FI)
+    END% ;
+
+MACRO	ELSEIF = ELSE IF % ;
+
+ROUTINE	FLUSH_LISTING : NOVALUE =	! Force output to .LIS file during
+RETURN ;				! compile
+
+
+ROUTINE CLUSTER_SERVER: NOVALUE =
+BEGIN
+
+LOCAL
+    STATUS,				! All-purpose completion status
+    CLX	   : REF BLOCK [,BYTE] ;	! Ptr to CLX block
+
+!
+!  The maximum number of requests and the maximum CSD size for each
+!  request are each fixed values.  Therefore, allocate and queue one
+!  CSD per request.
+!
+INCR I FROM 1 TO CSP$K_MAX_FLWCTL
+DO
+    IF (CLX = CSP$$CREATE_CTX ())  EQL  0
+    THEN
+	RETURN (SS$_INSFMEM)
+    ELSE
+	IF (STATUS = LIB$GET_VM (%REF (CSP$K_MAX_CSDLNG), CLX [CLX$A_P0_CSD]))
+	THEN
+	    INSQUE (.CLX, .CSP$Q_CLX_CSD)
+	ELSE
+	    RETURN (.STATUS) ;
+
+!
+!  Perform kernel-mode initialization as needed.
+!
+IF  NOT KRNL_CALL (KERNEL_INIT)
+THEN
+    BEGIN
+    CSP$TELL_OPCOM 
+	(%ASCID '%CSP-E-NOCLUSTER, Cluster Server Process exiting: no cluster') ;
+    $EXIT (CODE = SS$_ABORT) ;
+    END ;
+
+!
+!  Grab an event flag
+!
+IF NOT (STATUS = LIB$GET_EF (BASE_EFN) ) THEN RETURN .STATUS ;
+
+!
+!  Declare an exit handler to deal with emergencies. In particular, it should
+!  empty the queue CLUB$GL_CSPFL and restore the blocks to nonpaged pool.
+!
+IF NOT (STATUS = $DCLEXH (DESBLK = EXIT_HANDLER_BLOCK))
+THEN 
+    RETURN .STATUS ;
+
+!
+!  Set up a condition handler to deal with problems. (Needed?)
+!
+!MUMBLE ;
+
+!
+!  Request notification of cluster events.
+!
+!MUMBLE ;
+
+!
+!  Wait for a request. A request will arrive as an incoming connect
+!  request, which is validated, followed by a buffer of data. This
+!  data is passed along to the server associated with the connect
+!  request.
+!
+WHILE 1 DO SCHEDULE () ;
+END ;
+
+
+%SBTTL 'SCHEDULE - schedule new requests, resume suspended threads'
+ROUTINE SCHEDULE: NO_REGISTERS =
+
+!++
+!
+!  SCHEDULE is the thread scheduler.  It hibernates when there is nothing to do.
+!  When wakened, it removes items from one of the following queues: 
+!
+!	1. New Requests		- containing buffers which are 	sent off to the
+!				  appropriate servers.
+!	2. Thread Resumptions	- containing context blocks to be resumed.
+!
+!  It continues to service these queues until both are empty, then
+!  hibernates once more.
+!
+!  CALLING SEQUENCE:
+!	CALL
+!
+!  FORMAL PARAMETERS:
+!	None.
+!
+!  COMPLETION CODES:
+!	None. SCHEDULE runs ad nauseum.
+!--
+BEGIN
+LOCAL
+    CSD		: REF BLOCK [,BYTE],	! new local request
+    STATUS ;
+
+BUILTIN  FP ;
+!
+!  Save the frame pointer, enabling the scheduler to be reentered from 
+!  the context save routines.
+!
+CSP$GL_BASE_FP = .FP ;
+
+!
+!  Try for something to do, and hibernate if there's nothing.
+!  If a thread is active (CSP$GL_CURCTX non-zero) then there's a bug.
+!
+WHILE .CSP$GL_CURCTX EQL 0 	
+DO
+    IF  NOT REMQUE (.CSP$GQ_RESUME, CSP$GL_CURCTX)  THEN
+	!
+	!  Resume a suspended thread. Context block has been placed in the
+	!  grant queue by an AST.
+	!
+	!	**   Note that RESUME_THREAD does not return in-line   **
+	!	**   the scheduler will be reentered from the top      **
+	!
+	IF TESTBITCC (CSP$GL_CURCTX [CLX$V_QUEUED]) 
+	THEN CSP$$CRASH (SS$_NOPRIVSTRT + 16) 
+	ELSE RESUME_THREAD ()
+    ELSE
+	!
+	!  If we have a free process space CSD then service a new request
+	!
+	IF  KRNL_CALL (REMQUE_CSD) THEN
+	    NEW_REQUEST ()
+	ELSE
+	    $HIBER ;
+
+CSP$$CRASH (SS$_BADPARAM);
+RETURN 0 ;
+END ;
+
+
+%SBTTL	'NEW_REQUEST - process a new request'
+ROUTINE  NEW_REQUEST : JSB_LINKAGE NOVALUE =
+!++
+!
+!  Dispatch a new execution thread .
+!
+!
+!  CALLING SEQUENCE:
+!	JSB
+!
+! FORMAL PARAMETERS:
+!	None
+!
+!--
+BEGIN
+LOCAL
+    CSD		: REF BLOCK [,BYTE],		! Context block
+    STATUS ;
+
+CSD = .CSP$GL_CURCTX [CLX$A_P0_CSD] ;		! Get the P0 space CSD
+
+!
+!  Relocate pointers in CSD, dispatch to action routine for this client,
+!  respond to EXE$CSP_COMMAND when done.
+!
+CSD [CSD$L_SENDOFF] = .CSD [CSD$L_SENDOFF] + .CSD ;
+CSD [CSD$L_RECVOFF] = .CSD [CSD$L_RECVOFF] + .CSD ;
+
+STATUS = CSP$$CALL_ACTION (.CSD) ;
+    
+KRNL_CALL (REPLY) ;
+
+INSQUE (.CSP$GL_CURCTX, CSP$Q_CLX_CSD) ;
+CSP$GL_CURCTX = 0 ;
+
+RETURN
+END ;
+
+
+%SBTTL	'REPLY	- Call loadable Exec code to finish block transfer'
+ROUTINE  REPLY =
+!++
+!
+!  Client is done.  Copy the response (if any) and give then S0 space CSD back 
+!  to the loadable Exec code.
+!
+!
+! CALLING SEQUENCE:
+!	CALL in kernel mode at IPL 0
+!
+! FORMAL PARAMETERS:
+!	None
+!
+!--
+BEGIN
+BIND	S0_CSD = .CSP$GL_CURCTX [CLX$A_S0_CSD] : BLOCK [,BYTE],
+	P0_CSD = .CSP$GL_CURCTX [CLX$A_P0_CSD] : BLOCK [,BYTE] ;
+
+LOCAL	SIZE, COMMAND ;
+
+SIZE = .P0_CSD [CSD$L_RECVLEN] ;
+
+!
+!
+!  S0_CSD [CSD$L_RECVOFF] contains a real offset, but P0_CSD [CSD$L_RECVOFF]
+!  has been converted to a pointer.
+!
+!  Determine the proper response code and move whatever data needs moving.
+!
+!
+IF  (.SIZE + .S0_CSD [CSD$L_RECVOFF])  GTRU  .S0_CSD [CSD$W_SIZE]  THEN
+    BEGIN
+    SIZE    = .S0_CSD [CSD$W_SIZE] - .S0_CSD [CSD$L_RECVOFF] ;
+    COMMAND = CSP$_BADCSD ;
+    END
+
+ELSEIF .P0_CSD [CSD$L_RECVLEN] NEQ 0  THEN 
+    COMMAND = CSP$_REPLY 
+ELSE 
+    COMMAND = CSP$_DONE ;
+    
+CH$MOVE (.SIZE
+	,.P0_CSD [CSD$L_RECVOFF]			! Already a pointer
+	,.S0_CSD [CSD$L_RECVOFF] + .S0_CSD		! Calculate pointer
+	) ;
+!
+!
+!  Pass the CSD back to the loadable Exec CSD code and erase the CSD pointer
+!
+!
+EXE$CSP_COMMAND (.COMMAND, .CSP$GL_CURCTX [CLX$A_S0_CSD]) ;
+
+CSP$GL_CURCTX [CLX$A_S0_CSD] = 0 ;
+
+RETURN 1 ;
+END ;
+
+
+%SBTTL	'RESUME_THREAD - resume execution of suspended thread'
+ROUTINE  RESUME_THREAD =
+
+!++
+!  Restore the context of a thread and resume its execution.  The context 
+!  consists of the stack and registers.  The top of the saved stack contains a
+!  call frame which points to the resume PC and contains the thread's registers.
+!  So by restoring the stack and "return"ing, we resume the thread.
+!
+!  CALLING SEQUENCE:
+!	CALL (from SCHEDULE only!)
+!
+!  FORMAL PARAMETERS:
+!	None
+!
+!  COMPLETION CODES:
+!	NA, R0 is restored from its saved state.
+!
+!--
+BEGIN
+
+REGISTER
+    SAVE_R0,SAVE_R1,		! temp save registers R0,R1
+    STATUS ;			! completion status
+
+BUILTIN
+    R0,R1,FP,SP ;
+
+!
+!  Thread resumption consists of simply restoring the exact stack as it existed
+!  for the suspended thread, by copying it from the context block. Then kill the
+!  context block and restore R0,R1. The other registers are restored by the
+!  RETURN, which is logically a RETURN from CSP$$WAIT. 
+!
+!
+
+SAVE_R0 = .CSP$GL_CURCTX [CLX$L_R0] ;
+SAVE_R1 = .CSP$GL_CURCTX [CLX$L_R1] ;
+
+SP = .CSP$GL_BASE_FP - .CSP$GL_CURCTX [CLX$L_STACKSIZE] ;
+FP = .SP ;
+
+CH$MOVE (.CSP$GL_CURCTX [CLX$L_STACKSIZE], .CSP$GL_CURCTX [CLX$A_STACK], .FP) ;
+
+!
+!  Deallocate the saved stack, then restore the saved context by
+!  simply returning to it.
+!
+IF  TESTBITCC (CSP$GL_CURCTX [CLX$V_LOCAL_STACK]) THEN
+    LIB$FREE_VM (CSP$GL_CURCTX [CLX$L_STACKSIZE], CSP$GL_CURCTX [CLX$A_STACK]) ;
+
+R0 = .SAVE_R0 ;
+R1 = .SAVE_R1 ;
+
+RETURN (.R0) ;			! This restores reg's and resumes thread
+END ;
+
+
+
+%SBTTL	'KERNEL_ENQW - $ENQW call from kernel mode'
+
+GLOBAL ROUTINE KERNEL_ENQW =
+
+!++
+!
+!  Issues $ENQW call from kernel mode.
+!
+!  CALLING SEQUENCE:
+!	CALL 
+!
+!  FORMAL PARAMETERS:
+!	Call parameters identical to those for $ENQW;
+!	the argument list is simply passed on.
+!
+!  COMPLETION CODES:
+!	As from $ENQW, plus SS$_NOPRIV if process lacks CMKRNL.
+!
+!--
+BEGIN
+EXTERNAL ROUTINE  SYS$ENQW ;
+BUILTIN    	  AP ;
+
+!RETURN $CMKRNL ( ROUTIN = SYS$ENQW, ARGLST = .AP ) ;
+RETURN CALLG (.AP, SYS$ENQW) ;
+END ;
+
+
+%SBTTL	'CSP$TELL_OPCOM - operator communications'
+
+GLOBAL ROUTINE CSP$TELL_OPCOM 
+		(MESSAGE : REF VECTOR [2,LONG]) = 
+!++
+!
+!  Send indicated message to operator.
+! 
+!  CALLING SEQUENCE:
+!	CALL
+!
+!  FORMAL PARAMETERS:
+!	P1 =	Address of descriptor of message to send.
+!
+!  COMPLETION CODES:
+!	N.A.
+!--
+BEGIN
+OWN
+    OP_BUF	: BLOCK [128,BYTE]		! buffer for output
+		  PRESET ( [OPC$B_MS_TYPE]   = OPC$_RQ_RQST,
+			   [OPC$B_MS_TARGET] = OPC$M_NM_CENTRL,
+			   [OPC$L_MS_RQSTID] = 0 ),
+    OP_DESC	: VECTOR [2,LONG]		! descriptor of op_buf
+    		  INITIAL (128,OP_BUF) ;
+
+!
+!  Copy the message into the message buffer.
+!
+CH$MOVE (.MESSAGE [0], .MESSAGE [1], OP_BUF [OPC$L_MS_TEXT]) ;
+
+!
+!  Adjust the descriptor according to the size of the message
+!
+OP_DESC [0] = .MESSAGE [0] + (OP_BUF [OPC$L_MS_TEXT] - OP_BUF) ;
+
+!
+!  Send the message to the operator. Status of $SNDOPR is returned to caller.
+!
+RETURN $SNDOPR ( MSGBUF = OP_DESC ) ;
+END ;
+
+
+%SBTTL	'EXIT_HANDLER'
+ROUTINE  EXIT_HANDLER : NOVALUE =
+
+!++
+!
+!  Image exit handler; return excess items in CLUB$GL_CSPFL to nonpaged pool. 
+!  Also report the problem.
+! 
+!  CALLING SEQUENCE:
+!
+!  FORMAL PARAMETERS:
+!
+!  COMPLETION CODES:
+!
+!--
+BEGIN
+LOCAL
+    CSD ;
+
+CSP$TELL_OPCOM ( %ASCID 'CSP-E-EXIT, Cluster Server Process exiting' ) ;
+KRNL_CALL ( KERNEL_CLEANUP ) ;
+
+RETURN
+END ;
+
+
+%SBTTL	'KERNEL_INIT'
+ROUTINE  KERNEL_INIT =
+
+!++
+!
+!  Perform kernel mode initialization:
+!
+!	Initialize queue in CLUB structure, fill in CLUB$GL_CSPIPID.
+!
+!  CALLING SEQUENCE:
+!	$CMKRNL ( KERNEL_INIT )
+!
+!  FORMAL PARAMETERS:
+!	none
+!
+!  COMPLETION CODES:
+!
+!--
+BEGIN
+EXTERNAL
+    CLU$GL_CLUB	: REF BLOCK [,BYTE],		! cluster block
+    SCH$GL_CURPCB
+    		: REF BLOCK [,BYTE] ;		! current PCB.
+
+IF .CLU$GL_CLUB NEQ 0 THEN 
+    BEGIN
+    !
+    !  Init the queue
+    !
+    CSP$GL_CSPQ = 
+	    	CLU$GL_CLUB [CLUB$L_CSPFL] = 
+		CLU$GL_CLUB [CLUB$L_CSPBL] = 
+					    CLU$GL_CLUB [CLUB$L_CSPFL] ;
+
+    CLU$GL_CLUB [CLUB$L_CSPIPID] = .SCH$GL_CURPCB [PCB$L_PID] ;
+
+    RETURN 1 ;
+    END
+ELSE
+    !
+    !  Not in the cluster
+    !
+    RETURN 0 ;
+END ;
+
+
+%SBTTL	'KERNEL_CLEANUP'
+ROUTINE  KERNEL_CLEANUP : NOVALUE =
+
+!++
+!
+!  Perform kernel-mode exit handler stuff: reset the CLUB so that
+!  it's clear the CSP has disappeared.
+!
+!  CALLING SEQUENCE:
+!
+!  FORMAL PARAMETERS:
+!
+!  COMPLETION CODES:
+!
+!--
+BEGIN
+EXTERNAL
+    CLU$GL_CLUB		: REF BLOCK [,BYTE] ;
+
+LOCAL
+    CSD ;
+
+CLU$GL_CLUB [CLUB$L_CSPIPID] = 0 ;
+UNTIL REMQUE (.CLU$GL_CLUB [CLUB$L_CSPFL], CSD)
+DO
+    EXE$CSP_COMMAND (CSP$_ABORT, .CSD) ;
+
+RETURN ;
+END ;
+
+
+%SBTTL	'REMQUE_CSD'
+ROUTINE  REMQUE_CSD =
+
+!++
+!
+!  Go to kernel mode and read an entry from the queue CLUB$GL_CSPFL in the 
+!  system CLUB structure. If we get one, copy it to the CSD structure and 
+!  deallocate the nonpaged pool.
+!
+!  CALLING SEQUENCE:
+!	STATUS = REMQUE_CSD ()
+!
+!  FORMAL PARAMETERS:
+!	None
+!
+!  IMPLICIT OUTPUTS:
+!	CSP$GL_CURCTX	Address of CLX block if work was found
+!			0 if there's nothing to do
+!
+!  COMPLETION CODES:
+!	0	= queue was empty (should not happen).
+!	1	= got an entry
+!
+!--
+BEGIN
+LOCAL   QUIT	: INITIAL (0), 
+	S0_CSD	: REF BLOCK [,BYTE] ;		! Nonpaged pool CSD ptr
+
+IF ..CSP$GL_CSPQ EQL 0 THEN RETURN 0 ;		! Not in cluster yet
+
+IF NOT REMQUE (.CSP$Q_CLX_CSD, CSP$GL_CURCTX) 
+THEN BEGIN
+     UNTIL .QUIT
+     DO	IF   REMQUE (..CSP$GL_CSPQ, S0_CSD)
+	THEN QUIT = 1
+	ELSE IF .S0_CSD [CSD$B_TYPE] NEQ DYN$C_CLU
+	     OR .S0_CSD [CSD$W_SIZE] GTRU CSP$K_MAX_CSDLNG
+	     THEN EXE$CSP_COMMAND (CSP$_BADCSD, .S0_CSD)
+	     ELSE BEGIN
+		  CSP$GL_CURCTX [CLX$A_S0_CSD] = .S0_CSD ;
+		  CSP$GL_CURCTX [CLX$B_FLAGS]  = 0 ;	
+		  CH$MOVE (.S0_CSD [CSD$W_SIZE]
+			  ,.S0_CSD
+			  ,.CSP$GL_CURCTX [CLX$A_P0_CSD]
+			  ) ;
+		  RETURN 1 ;
+		  END ;
+
+     INSQUE (.CSP$GL_CURCTX, CSP$Q_CLX_CSD) ;
+     END ;
+
+CSP$GL_CURCTX = 0 ;
+RETURN 0 ;
+END ;
+
+
+%SBTTL	'DEANONPAGED - call EXE$DEANONPAGED from kernel mode'
+ROUTINE  DEANONPAGED (BUFFER) =
+
+!++
+!
+!  Call EXE$DEANONPAGED from kernel mode
+! 
+!  CALLING SEQUENCE:
+!	KRNL_CALL (DEANONPAGED, BUF) in Kernel mode
+!
+!  FORMAL PARAMETERS:
+!	BUF	= address of buffer to deallocate (SIZE field indicates how big)
+!
+!  COMPLETION CODES:
+!
+!--
+RETURN EXE$DEANONPAGED ( .BUFFER ) ;
+
+
+%SBTTL	'MUMBLE - Dummy routine'
+
+GLOBAL ROUTINE MUMBLE = RETURN 1 ;
+
+
+
+
+%SBTTL	'CSP$$CRASH - Report bug'
+
+GLOBAL ROUTINE CSP$$CRASH (CODE) =
+
+BEGIN 
+$EXIT (CODE = .CODE) ;
+RETURN .CODE ;
+END ;
+
+
+
+END
+ELUDOM
+

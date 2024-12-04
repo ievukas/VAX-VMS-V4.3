@@ -1,0 +1,530 @@
+MODULE badmain	( %TITLE 'Analyze/Media Main Module'
+		  IDENT = 'V04-000',
+		  MAIN = bad$main) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!++
+!
+! Facility:
+!
+!	Analyze/Media
+!
+! Abstract:
+!
+!	This module is the main routine or driver for the facility.
+!
+! Environment:
+!
+!	VAX/VMS User Mode, Non-Privileged
+!
+! Author:
+!
+!	Michael T. Rhodes,	CREATION DATE: July, 1982
+!
+! Modified By:
+!
+!	V03-005	MTR0009		Michael T. Rhodes	 3-Jul-1984
+!		Don't produce a listing of non-last track SDBSFs 
+!		if they don't exist and we aren't exercising the medium.
+!
+!	V03-004	BLS0244		Benn Schreiber		26-Oct-1983
+!		Exit with warning severity if bad blocks found.
+!
+!	V03-003	MTR0004		Michael T. Rhodes	 2-Mar-1983
+!		Move routines 'bad$retry' and 'bad$verify_blocks' to
+!		module BADIO.B32.
+!
+!	V03-002	MTR0003		Michael T. Rhodes	11-Feb-1982
+!		Add support for Stand Alone BAD.
+!
+!	V03-001	MTR0001		Michael T. Rhodes	15-Dec-1982
+!		Add the /LOG qualifier, which is processed by the ROUTINE
+!		'total_bad_blocks', in addition to code in 'bad$main'.
+!
+!		Add code to bad$main to replace the "worst case test pattern"
+!		with the user supplied test pattern obtained via:
+!		/EXERCISE=PATTERN=(12345678 [,%O77777777,%D99999999,%XABCDEF])
+!
+!		Modify the retry logic to mark and step past bad blocks.
+!		(NOTE:  This code is RECURSIVE.)
+!
+!--
+
+%SBTTL	'Declarations'
+!
+! Include Files:
+!
+REQUIRE 'lib$:baddef';					! Define BAD's structures etc.
+LIBRARY 'SYS$LIBRARY:LIB';				! Define VMS structures etc.
+
+!
+! Table of Contents:
+!
+FORWARD ROUTINE
+    bad$main		: NOVALUE,			! Main procedure declaration.
+    finish_medium	: NOVALUE,			! Write the updated SDBSF and produce a report (if requested).
+    read_medium		: NOVALUE,			! Read blocks back from medium.
+    total_bad_blocks,					! Compute the total number of bad blocks on the device.
+    write_last_track	: NOVALUE,			! Write the SDBSF to the last track.
+    write_medium	: NOVALUE,			! Write test pattern onto medium.
+    write_new_sdbsf	: NOVALUE,			! Perform house cleaning on SDBSF before writing it to media.
+    write_non_lsttrk	: NOVALUE;			! Write the SDBSF to the last good block on the medium.
+
+!
+! External References:
+!
+EXTERNAL ROUTINE
+    bad$close_files	: ADDRESSING_MODE (GENERAL),	! Close all open files.
+    bad$cvt_nlt_long	: ADDRESSING_MODE (GENERAL),	! Convert a non last track SDBSF entry to longwords.
+    bad$handler		: WEAK,				! Condition Handler for Stand Alone Environment.
+    bad$init		: ADDRESSING_MODE (GENERAL),	! Routines for allocation/initialization of structures.
+    bad$init_buffers	: ADDRESSING_MODE (GENERAL),	! Routine to fill all of the IO buffers with the test pattern in use.
+    bad$produce_report	: ADDRESSING_MODE (GENERAL),	! Generate the report.
+    bad$retry		: ADDRESSING_MODE (GENERAL),	! Mark bad blocks, continuing the IO operation in progress.
+    bad$start_io	: ADDRESSING_MODE (GENERAL),	! Start asynchronous IO operations.
+    bad$sync_io		: ADDRESSING_MODE (GENERAL),	! Perform synchronous IO.
+    bad$verify_blocks	: ADDRESSING_MODE (GENERAL),	! Verify that the pattern read, matches the test pattern written.
+    CHECKSUM2		: ADDRESSING_MODE (GENERAL);	! Perform and generate a checksum on the given buffer (shared routine).
+
+EXTERNAL
+    bad$gb_block_fact	: BYTE,				! Blocking factor (number of sectors per block).
+    bad$ga_bufadr	: VECTOR [2, LONG],		! Data buffer address vector.
+    bad$gl_context	: BITVECTOR [32],		! Context bits.
+    bad$gl_cylinders,					! Number of cylinders.
+    bad$ga_device	: $BBLOCK [dsc$c_s_bln],	! Device name descriptor.
+    bad$gl_devtype,					! Device type identifier.
+    bad$gl_func,					! IO function code.
+    bad$gq_iosb		: VECTOR [4, LONG],		! IO status blocks.
+    bad$gl_maxblock,					! Largest logical block number on device.
+    bad$ga_mdbsf,					! Address if the MDBSF.
+    bad$gl_mdbsf_ptr,					! Starting block number of the last track.
+    bad$gl_pagcnt,					! Number of 512 byte pages per transfer.
+    bad$ga_sdbsf,					! Address of the SDBSF.
+    bad$gl_sdbsf_ptr,					! Address of the next free entry in the SDBSF.
+    bad$gl_sectors,					! Number of sectors per track.
+    bad$gl_sector_siz,					! Size in bytes of the sector.
+    bad$gl_status	: $BBLOCK,			! Global status.
+    bad$gl_tracks,					! Number of tracks per cylinder.
+    bad$gl_trnsfr_cnt;					! Number of bytes per transfer.
+
+!
+! Define message codes...
+!
+EXTERNAL LITERAL
+    bad$_bbfwrt,					! Failed to write the SDBSF to media.
+    bad$_blk0bad,					! Block 0 is bad, do not use media as a system device.
+    bad$_facility,					! BAD's facility number.
+    bad$_lsttotbk,					! Total bad blocks detected.
+    bad$_writeerr;					! Error occurred while trying to write to a device.
+
+!
+! Private Storage:
+!
+OWN
+    blkstrk,						! Blocks per track.
+    first_pattern : BYTE,				! Starting pattern number.
+    lastfull,						! Last LBN for full buffer transfer.
+    remainder,						! Remainder of device to read in bytes.
+    test_pattern : VECTOR [3, LONG]			! Test patterns.
+                   INITIAL (0, -1, %X'DB6DB6DB'),
+    usable;						! Total number of usable (writable) blocks.
+
+LITERAL
+    last_pattern = 2;					! Number of test patterns -1.
+
+
+%SBTTL	'bad$main'
+GLOBAL ROUTINE bad$main : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    The driver is responsible for calling routines which perform such
+!    tasks as allocating and initializing storage and control structures,
+!    parsing the command line (which also involves manipulation of the
+!    structures), analyzing the media, and concluding with the release
+!    of allocated resources (and optionally generating a listing).
+!
+! Implicit Outputs:
+!
+!    The media has been analyzed, and if requested a listing will have
+!    been produced.
+!
+! Completion Codes:
+!
+!    BAD-S-NORMAL	Normal successfull completion.
+!
+!    BAD-W-BLK0BAD	Block zero on the device is bad,
+!			do not use this medium as a system device.
+!
+!
+! SIDE EFFECTS:
+!
+!    Completion codes with severity worse than those listed above will be the
+!    result of a fatal error that was signalled via a SIGNAL_STOP, or one in
+!    which we had manually boosted the severity to SEVERE.
+!
+!    The success/warnings listed above will have the "inhibit" bit set, to
+!    prevent noisy messages from being displayed (or displayed twice as the
+!    case may be).
+!
+!--
+BEGIN
+BUILTIN
+    FP;
+
+LOCAL
+    bad_blocks_found;
+
+IF bad$handler NEQ 0					! Are we executing Stand Alone or under VMS?
+THEN    .FP = bad$handler;				! Stand Alone -- Establish Condition Handler.
+
+WHILE true DO						! Continuously process devices when Stand Alone, however,
+    BEGIN						! under VMS we will perform a normal exit w/status.
+
+    bad$init ();					! Allocate and initialize storage and control structures.
+
+    IF .bad$gl_context [ctx_v_exercise]			! Are we going to analyze the medium?
+    THEN						! Yes...
+        BEGIN
+        IF .bad$gl_context [ctx_v_ltdevice]		! Select the number of usable blocks according to the
+        THEN						! size of the device (as specified by the last track
+            usable = .bad$gl_mdbsf_ptr			! device bit in the context flags).  Note also, that
+        ELSE						! on last track devices the last track is protected ,
+            usable = .bad$gl_maxblock;			! regardless of the setting of the "override" bit.
+
+        lastfull = (.usable / .bad$gl_pagcnt - 1)	! Block number of last full buffer transfer.
+                    * .bad$gl_pagcnt;
+        remainder = (.usable - (.lastfull + .bad$gl_pagcnt))! Bytes remaining to transfer.
+                     * bad$k_page_size;
+
+        IF .bad$gl_context [ctx_v_exercise_full]	! How extensively should the surface be tested?
+        THEN first_pattern = 0				! Use all three test patterns.
+        ELSE first_pattern = 2;				! Only use the "worst case" test pattern.
+
+        INCR pattern FROM .first_pattern TO last_pattern DO ! Note that in all cases the "worst case" test pattern
+            BEGIN					! is left on the medium.
+            IF .bad$gl_context [ctx_v_pattern]		! If the user supplied a test pattern,
+            AND .pattern EQL last_pattern		! and its time to use it, then initilaize
+            THEN bad$init_buffers ()			! the buffers with it (upto 128 bits of pattern).
+            ELSE bad$init_buffers (.test_pattern [.pattern]); ! Otherwise, initialize them with the default pattern(s).
+            write_medium ();				! Write the test pattern onto the medium.
+            read_medium ();				! Read and Verify that the patterns match.
+            END;
+        END;						! End of Analysis...
+
+    finish_medium ();					! Write updated SDBSF to medium produce a listing
+
+    bad_blocks_found = total_bad_blocks();
+    IF .bad$gl_context [ctx_v_log]			! Should we display the total bad block count?
+    THEN						!
+        SIGNAL (bad$_lsttotbk, 3, bad$ga_device, .bad$gl_maxblock, .bad_blocks_found);
+
+    IF .bad$gl_context [ctx_v_blk0bad]
+    THEN							
+        BEGIN						! If block 0 (zero) is bad, then signal the warning
+        bad$gl_status = bad$_blk0bad;			! and exit with warning as our status.
+        SIGNAL (bad$_blk0bad, 1, bad$ga_device);
+        END
+    ELSE						! Otherwise, if we have reached here exit with success
+	IF .bad_blocks_found EQL 0			! if no bad blocks found, else exit with a warning.
+        THEN bad$gl_status = ss$_normal			! This is due to the fact that any serious errors would
+        ELSE bad$gl_status = sts$k_warning;		! have caused us to exit via a SIGNAL_STOP which would
+							! result in a severity of FATAL in the resultant status.
+
+    bad$gl_status [sts$v_fac_no] = bad$_facility;	! Stuff the facility number into the status.
+    bad$gl_status [sts$v_inhib_msg] = TRUE;		! Do not reprint the message.
+
+    IF bad$handler EQL 0				! Are we executing under VMS?
+    THEN    $EXIT (CODE = .bad$gl_status);		! Yes, perform normal exit.
+
+    END; ! of WHILE true DO BEGIN			! No, go back for the next command and continue.
+
+END; ! of GLOBAL ROUTINE bad$main.
+
+
+%SBTTL	'write_medium -- Write the test pattern onto the medium'
+ROUTINE	write_medium : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    Write the test pattern onto the medium.  If any IO errors occur, the IO
+!    procedure is responsible for signalling the error.
+!
+! Side Effects:
+!
+!    Upon completion, the entire surface of the medium (except the last track
+!    for last track devices) will contain the current test pattern.
+!
+!--
+BEGIN
+
+bad$gl_func = IO$_WRITELBLK;
+
+bad$start_io (.lastfull);
+
+IF NOT bad$sync_io (.bad$ga_bufadr [0], .remainder, .lastfull + .bad$gl_pagcnt)
+THEN
+    bad$retry (.lastfull + .bad$gl_pagcnt, .remainder, bad$gq_iosb [0], .bad$ga_bufadr [0]);
+
+END;   ! of ROUTINE write_medium
+
+
+%SBTTL	'read_medium -- Read and Verify the blocks against the test pattern'
+ROUTINE	read_medium : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    Read and Verify the storage blocks from the medium against the test pattern
+!    buffer.
+!
+! Side Effects:
+!
+!    Any mismatched data pages will be retired to the Software Detected Bad Sector File.
+!
+!    Special handling for the TU58 has been added.  This simply adds the function
+!    modifier IO$M_DATACHECK, which increases the read threshold resulting in
+!    weak spots or drop outs to become visible.
+!
+!--
+BEGIN
+
+bad$gl_func = IO$_READLBLK;
+
+IF .bad$gl_devtype EQL dt$_tu58			  	! If the device is a TU-58, read
+THEN						  	! data back with increased threshold
+    bad$gl_func = .bad$gl_func OR IO$M_DATACHECK; 	! (forces weak spots to show up).
+
+bad$start_io (.lastfull);			  	! Read device asychronously.
+
+IF NOT bad$sync_io (.bad$ga_bufadr [0], .remainder, .lastfull + .bad$gl_pagcnt)
+THEN
+    bad$retry (.lastfull + .bad$gl_pagcnt, .remainder, bad$gq_iosb [0], .bad$ga_bufadr [0]);
+
+bad$verify_blocks (.bad$ga_bufadr [0], .remainder, .lastfull + .bad$gl_pagcnt, bad$gq_iosb [0]);
+
+END;    ! of ROUTINE read_medium
+
+
+%SBTTL	'finish_medium -- Perform completion activities'
+ROUTINE finish_medium : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    Write the Software Detected Bad Sector File to the medium if it was
+!    modified, produce a listing if one was requested and close the output
+!    file(s).
+!
+!--
+BEGIN
+IF .bad$gl_context [ctx_v_exercise] OR .bad$gl_context [ctx_v_badblocks]
+THEN
+    write_new_sdbsf ();
+
+IF .bad$gl_context [ctx_v_show_after]
+THEN
+    IF .bad$gl_context [ctx_v_ltdevice] OR .bad$gl_context [ctx_v_nlt_sdbsf]
+    THEN    bad$produce_report ();
+
+IF .bad$gl_context [ctx_v_output]
+THEN
+    bad$close_files ();
+
+END;    ! of ROUTINE finish_medium
+
+
+%SBTTL	'total_bad_blocks -- Compute the total number of bad blocks'
+ROUTINE	total_bad_blocks =
+!++
+!
+! Functional Description:
+!
+!    Compute the total number of bad blocks which have been detected by
+!    either the Manufacturer or BAD and return it to the caller.
+!
+! Implicit Inputs:
+!
+!    bad$gl_context	Context flags to determine [non] last track device.
+!
+!    bad$ga_mdbsf	Manufacturers Detected Bad Sector File buffer.
+!
+!    bad$ga_sdbsf	Software Detected Bad Sector File buffer.
+!
+! Routine Value:
+!
+!    The total number of bad blocks recorded in both the MDBSF and SDBSF,
+!    this includes any blocks which were entered manually by the user via
+!    the /BAD_BLOCKS qualifier.
+!
+!--
+BEGIN
+LOCAL
+    count,
+    lbn,
+    total : INITIAL (0);
+
+IF .bad$gl_context [ctx_v_ltdevice]
+THEN
+    BEGIN
+    INCR entry FROM .bad$ga_mdbsf + ltk_k_headersiz TO .bad$ga_mdbsf + bad$k_page_size - 4 BY 4
+    DO  IF ..entry NEQ -1
+        THEN total = .total + 1
+        ELSE EXITLOOP;
+    total = .total + ((.bad$gl_sdbsf_ptr - .bad$ga_sdbsf - ltk_k_headersiz) / 4);
+    END
+ELSE
+    BEGIN
+    INCR entry FROM .bad$ga_sdbsf + nlt_k_headersiz TO .bad$gl_sdbsf_ptr - 4 BY 4 DO
+        BEGIN
+        bad$cvt_nlt_long (..entry, count, lbn);
+        total = .total + .count + 1;
+        END;
+    END;
+
+RETURN .total;
+
+END;    ! of ROUTINE total_bad_blocks
+
+
+%SBTTL	'write_new_sdbsf -- Write a new SDBSF to the medium'
+ROUTINE	write_new_sdbsf : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    Perform house cleaning on the SDBSF, by filling the remaining unused bad
+!    block descriptors with the selected fill character.  If the device is a 
+!    non last track format device, the bad block file is checksum'd and the
+!    checksum is left in the last word of the file.  If the device is a last
+!    track class device (ie. has more than bad$k_nltmaxblk), then the DATACHECK
+!    feature of the QIO is used to assure that the block was written correctly.
+!
+!--
+BEGIN
+LOCAL
+    fill;
+
+bad$gl_func = IO$_WRITELBLK;
+fill = (IF .bad$gl_context [ctx_v_ltdevice]
+             THEN -1
+             ELSE 0);
+
+IF .bad$gl_context [ctx_v_ltdevice]
+THEN
+    bad$gl_func = .bad$gl_func OR IO$M_DATACHECK;
+
+INCR entry FROM .bad$gl_sdbsf_ptr TO .bad$ga_sdbsf + bad$k_page_size - 4 BY 4 DO
+    .entry = .fill;
+
+IF .bad$gl_context [ctx_v_ltdevice]
+THEN
+    write_last_track ()
+ELSE
+    BEGIN
+    CHECKSUM2 (.bad$ga_sdbsf, bad$k_page_size - 2);
+    write_non_lsttrk ();
+    END;
+
+END;    ! of ROUTINE write_new_sdbsf
+
+
+%SBTTL	'write_last_track -- Write the new SDBSF onto the last track'
+ROUTINE	write_last_track : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    Write the bad block file to the ramainder of the last track, following
+!    the MDBSF.
+!
+! Side Effects:
+!
+!    If we could not write the updated SDBSF to the medium, then signal
+!    a fatal error and terminate the analysis (via SIGNAL_STOP).
+!
+!--
+BEGIN
+INCR block FROM 10 TO .bad$gl_sectors / .bad$gb_block_fact - 1 DO
+    IF NOT (bad$gl_status = bad$sync_io (.bad$ga_sdbsf,
+                                         bad$k_page_size,
+                                        .bad$gl_mdbsf_ptr + .block))
+    THEN
+        SIGNAL_STOP (bad$_bbfwrt, 1, bad$ga_device, .bad$gl_status);
+
+END;    ! of ROUTINE write_last_track
+
+
+%SBTTL	'write_non_lsttrk -- Write the new SDBSF on the last good block'
+ROUTINE	write_non_lsttrk : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    Write the bad block file to the last good block on the device (that is
+!    somewhere within the last 256 block on the device).
+!
+! Side Effects:
+!
+!    If we could not write the updated SDBSF to the medium, then signal
+!    a fatal error and terminate the analysis (via SIGNAL_STOP).
+!    
+!--
+BEGIN
+LOCAL
+    block,
+    write_ok;
+
+write_ok = FALSE;
+
+IF NOT .bad$gl_context [ctx_v_ltdevice]
+THEN							! If this is a true non last track device start
+    block = .bad$gl_maxblock				! at the last block.
+ELSE							! If the device is last track converted by
+    block = .bad$gl_mdbsf_ptr;				! /OVERRIDE, then protect the last track.
+
+INCR offset FROM 1 TO 255 DO				! Write the SDBSF until we get success or run
+    BEGIN						! out of rope!
+    IF (bad$gl_status = bad$sync_io (.bad$ga_sdbsf,
+                                     bad$k_page_size,
+                                     .block - .offset))
+    THEN
+        BEGIN
+        write_ok = TRUE;
+        EXITLOOP;
+        END;
+    END;
+
+IF NOT .write_ok
+THEN
+    SIGNAL_STOP (bad$_bbfwrt, 1, bad$ga_device, .bad$gl_status);
+    
+END;    ! of ROUTINE write_non_lsttrk
+
+END
+ELUDOM

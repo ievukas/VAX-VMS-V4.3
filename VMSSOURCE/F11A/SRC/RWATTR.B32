@@ -1,0 +1,1002 @@
+MODULE RWATTR (
+		LANGUAGE (BLISS32),
+		IDENT = 'V04-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 1
+!
+! ABSTRACT:
+!
+!	This module contains the code and tables to process the read
+!	and write attributes functions.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines. This routine must be executed
+!	in kernel mode.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  6-Jan-1977  21:05
+!
+! MODIFIED BY:
+!
+!	V03-008	LMP0241		L. Mark Pilant,		26-Apr-1984  10:47
+!		Include the FIB in the MAKE_NAMEBLOCK routine call.
+!
+!	V03-007	ACG0415		Andrew C. Goldstein,	9-Apr-1984  16:26
+!		Fix probing of access mode ATR's; extend ascii file name to
+!		86 bytes
+!
+!	V03-006	ACG0410		Andrew C. Goldstein,	22-Mar-1984  22:31
+!		Add support for access mode attribute
+!
+!	V03-005	LMP0154		L. Mark Pilant,		14-Sep-1983  11:21
+!		Bring the attribute table up to the same level as the
+!		attribute definition macro ($ATRDEF).
+!
+!	V03-004	ACG0355		Andrew C. Goldstein,	30-Aug-1983  15:21
+!		Fix bug in high order UIC test in ACG0329
+!
+!	V03-003	ACG0329		Andrew C. Goldstein,	12-Apr-1983  14:18
+!		Fold long UIC's into [377,377] for 16 bit UIC
+!
+!	V03-002	STJ3079		Steven T. Jeffreys,	26-Mar-1983
+!		Add dummy HIGHWATER attribute.
+!
+!	V03-001	LMP0066		L. Mark Pilant,		15-Dec-1982  10:04
+!		Handle ACL attributes gracefully rather than blowing away
+!		with a bad attribute error.
+!
+!	V02-008	ACG0253		Andrew C. Goldstein,	18-Jan-1982  16:23
+!		Add dummy HDR1 accessibility attribute
+!
+!	V02-007	ACG0232		Andrew C. Goldstein,	4-Dec-1981  16:47
+!		Protect HIBLK during write attributes
+!
+!	V02-006	ACG0229		Andrew C. Goldstein,	1-Dec-1981  13:40
+!		Extend statistics block to include full counts
+!
+!	V02-005	ACG0221		Andrew C. Goldstein,	30-Oct-1981  18:07
+!		Add file attribute for journal flags
+!
+!	V02-004	MLJ0029		Martin L. Jack,	11-Jul-1981  23:40
+!		Clean up file header to quadword time conversion so that
+!		hundredths of seconds are taken as zero rather than
+!		propagating from current time, and ensure that zero is
+!		returned for an invalid time string.
+!
+!	A0103	ACG0097		Andrew C. Goldstein,	18-Dec-1979  19:15
+!		Protect SPOOL, BAD, DELETE, etc., file char's
+!
+!	A0102	ACG0093		Andrew C. Goldstein,	6-Dec-1979  19:58
+!		Add dummy backlink attribute, fix user char format
+!
+!	A0101	ACG0023		Andrew C. Goldstein,  19-Feb-1979  13:23
+!	Fix max attribute code to include DIRSEQ
+!
+!	A0100	ACG00001	Andrew C. Goldstein,  10-Oct-1978  20:03
+!	Previous revision history moved to F11A.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+
+FORWARD ROUTINE
+	READ_ATTRIB,			! read attributes
+	FID_TO_SPEC	: NOVALUE,	! convert FID to file-spec
+	WRITE_ATTRIB	: NOVALUE;	! write attributes
+
+!++
+!
+! Attribute control table. The table is indexed by attribute number.
+! The first byte contains random flags.  The second byte contains
+! the attribute location code.  The third byte contains the offset
+! of the attribute from its location origin. The fourth byte contains
+! the index of the action routine to process the attribute.  The fifth
+! and sixth bytes (a word value) contains the maximum size of the
+! attribute.
+!
+!--
+
+! Macros and literals to access the table entries.
+!
+
+MACRO
+	ATC_READ_ONLY	= 0,0,1,0%,	! read only attribute
+	ATC_PROTECTED	= 0,1,1,0%,	! writable by file owner only
+	ATC_LOCKED	= 0,2,1,0%,	! subject to file access locks
+	ATC_LOCATION	= 1,0,8,0%,	! 3 bit location code
+	ATC_OFFSET	= 2,0,8,0%,	! location offset
+	ATC_ACTION	= 3,0,8,0%,	! action routine
+	ATC_MAX_SIZE	= 4,0,16,0%;	! max attribute size
+
+
+! Masks for the flags.
+!
+
+LITERAL
+	M_READ_ONLY	= 1,
+	M_PROTECTED	= 2,
+	M_LOCKED	= 4;
+
+
+! Attribute location codes.
+!
+
+LITERAL
+	ATC_ZERO	= 0,		! zero - no location
+	ATC_FCB		= 1,		! in file control block
+	ATC_HEADER	= 2,		! file header header area
+	ATC_IDENT	= 3,		! file header ident area
+	ATC_MAP		= 4,		! file header map area
+	ATC_ACL		= 5,		! file header Access Control List area
+	ATC_ACPGBL	= 6,		! ACP global storage
+	ATC_FID2NAME	= 7,		! Convert FID to file spec
+
+	ATC_LASTATC	= 7;		! last location code
+
+
+! ACP global storage index codes.
+!
+
+LITERAL
+	GBL_PRV		= 0,		! Privileges used to gain access
+	GBL_ACE		= 1,		! ACE used to gain access
+
+	GBL_LASTGBL	= 1;		! Last index code
+
+
+! Attribute processing action routines.
+!
+
+LITERAL
+	ACT_NOP		= 0,		! ignore attribute
+	ACT_ILLEGAL	= 1,		! illegal attribute code
+	ACT_COPY	= 2,		! simple copy
+	ACT_STATBLK	= 3,		! build statistics block
+	ACT_ZERO	= 4,		! zero valued attribute
+	ACT_BLOCKSIZE	= 5,		! medium block size
+	ACT_ASCNAME	= 6,		! ASCII file name
+	ACT_DATIME	= 7,		! 64 bit date and time
+	ACT_UIC		= 8,		! 4 byte file owner UIC
+	ACT_UCHAR	= 9,		! user controlled characteristics
+	ACT_BLANK	= 10,		! blank character attribute
+	ACT_ACL		= 11,		! Access Control List
+	ACT_ACMODE	= 12,		! buffer access mode
+
+	ACT_LASTACT	= 12;		! highest action routine code
+
+
+! Macro to build table entry.
+!
+
+MACRO
+	ATTRIBUTE (CODE, FLAGS, LOC, OFF1, OFF2, OFF3, OFF4, SIZE, ACTION) =
+		BYTE	(FLAGS,
+			 LOC,
+			 $BYTEOFFSET (OFF1, OFF2, OFF3, OFF4),
+			 ACTION),
+		WORD	(SIZE,
+			 0)
+		%;
+
+MACRO
+	NULL_FIELD	= 0,0,0,0%;
+
+
+! The attribute control table itself.
+!
+
+BIND
+	ATC	= UPLIT BYTE (
+
+ATTRIBUTE (0,			M_PROTECTED,	ATC_HEADER,	FH1$W_FILEOWNER,5,	ACT_COPY),
+ATTRIBUTE (0,			M_PROTECTED,	ATC_HEADER,	FH1$W_FILEPROT,	3,	ACT_COPY),
+ATTRIBUTE (ATR$C_UCHAR,		M_LOCKED,	ATC_HEADER,	FH1$B_USERCHAR,	4,	ACT_UCHAR),
+ATTRIBUTE (ATR$C_RECATTR,	M_LOCKED,	ATC_HEADER,	FH1$W_RECATTR,	32,	ACT_COPY),
+ATTRIBUTE (ATR$C_FILNAM,	0,		ATC_IDENT,	FI1$W_FILENAME,	10,	ACT_COPY),
+ATTRIBUTE (ATR$C_FILTYP,	0,		ATC_IDENT,	FI1$W_FILETYPE,	4,	ACT_COPY),
+ATTRIBUTE (ATR$C_FILVER,	0,		ATC_IDENT,	FI1$W_VERSION,	2,	ACT_COPY),
+ATTRIBUTE (ATR$C_EXPDAT,	M_PROTECTED,	ATC_IDENT,	FI1$T_EXPDATE,	7,	ACT_COPY),
+ATTRIBUTE (ATR$C_STATBLK,	M_READ_ONLY,	ATC_FCB,	NULL_FIELD,	32,	ACT_STATBLK),
+ATTRIBUTE (ATR$C_HEADER,	M_READ_ONLY,	ATC_HEADER,	NULL_FIELD,	512,	ACT_COPY),
+ATTRIBUTE (ATR$C_BLOCKSIZE,	0,		ATC_ZERO,	NULL_FIELD,	2,	ACT_BLOCKSIZE),
+ATTRIBUTE (ATR$C_USERLABEL,	0,		ATC_ZERO,	NULL_FIELD,	80,	ACT_ZERO),
+ATTRIBUTE (ATR$C_ASCDATES,	M_PROTECTED,	ATC_IDENT,	FI1$W_REVISION,	35,	ACT_COPY),
+ATTRIBUTE (ATR$C_ALCONTROL,	0,		ATC_ZERO,	NULL_FIELD,	14,	ACT_NOP),
+ATTRIBUTE (ATR$C_ENDLBLAST,	0,		ATC_ZERO,	NULL_FIELD,	1,	ACT_NOP),
+ATTRIBUTE (ATR$C_ASCNAME,	0,		ATC_IDENT,	FI1$W_FILENAME,	86,	ACT_ASCNAME),
+ATTRIBUTE (ATR$C_CREDATE,	M_PROTECTED,	ATC_IDENT,	FI1$T_CREDATE,	8,	ACT_DATIME),
+ATTRIBUTE (ATR$C_REVDATE,	M_PROTECTED,	ATC_IDENT,	FI1$T_REVDATE,	8,	ACT_DATIME),
+ATTRIBUTE (ATR$C_EXPDATE,	M_PROTECTED,	ATC_IDENT,	FI1$T_EXPDATE,	8,	ACT_DATIME),
+ATTRIBUTE (ATR$C_BAKDATE,	M_PROTECTED,	ATC_ZERO,	NULL_FIELD,	8,	ACT_ZERO),
+ATTRIBUTE (ATR$C_UIC,		M_PROTECTED,	ATC_HEADER,	FH1$W_FILEOWNER,4,	ACT_UIC),
+ATTRIBUTE (ATR$C_FPRO,		M_PROTECTED,	ATC_HEADER,	FH1$W_FILEPROT,	2,	ACT_COPY),
+ATTRIBUTE (ATR$C_RPRO,		M_PROTECTED,	ATC_ZERO,	NULL_FIELD,	2,	ACT_ZERO),
+ATTRIBUTE (ATR$C_ACLEVEL,	M_PROTECTED,	ATC_ZERO,	NULL_FIELD,	2,	ACT_ZERO),
+ATTRIBUTE (ATR$C_SEMASK,	M_PROTECTED,	ATC_ZERO,	NULL_FIELD,	8,	ACT_ZERO),
+ATTRIBUTE (ATR$C_UIC_RO,	M_READ_ONLY,	ATC_HEADER,	FH1$W_FILEOWNER,4,	ACT_UIC),
+ATTRIBUTE (ATR$C_DIRSEQ,	M_READ_ONLY,	ATC_ZERO,	NULL_FIELD,	2,	ACT_ZERO),
+ATTRIBUTE (ATR$C_BACKLINK,	M_PROTECTED,	ATC_ZERO,	NULL_FIELD,	6,	ACT_ZERO),
+ATTRIBUTE (ATR$C_JOURNAL,	M_PROTECTED,	ATC_ZERO,	NULL_FIELD,	2,	ACT_ZERO),
+ATTRIBUTE (ATR$C_HDR1_ACC,	M_PROTECTED,	ATC_ZERO,	NULL_FIELD,	1,	ACT_BLANK),
+ATTRIBUTE (ATR$C_ADDACLENT,	M_LOCKED,	ATC_ZERO,	NULL_FIELD,	255,	ACT_ACL),
+ATTRIBUTE (ATR$C_DELACLENT,	M_LOCKED,	ATC_ACL,	NULL_FIELD,	255,	ACT_ACL),
+ATTRIBUTE (ATR$C_MODACLENT,	M_LOCKED,	ATC_ACL,	NULL_FIELD,	255,	ACT_ACL),
+ATTRIBUTE (ATR$C_FNDACLENT,	M_READ_ONLY,	ATC_ACL,	NULL_FIELD,	255,	ACT_ACL),
+ATTRIBUTE (ATR$C_FNDACETYP,	M_READ_ONLY,	ATC_ACL,	NULL_FIELD,	255,	ACT_ACL),
+ATTRIBUTE (ATR$C_DELETEACL,	M_LOCKED,	ATC_ACL,	NULL_FIELD,	255,	ACT_ACL),
+ATTRIBUTE (ATR$C_READACL,	M_READ_ONLY,	ATC_ACL,	NULL_FIELD,	512,	ACT_ACL),
+ATTRIBUTE (ATR$C_ACLLENGTH,	M_READ_ONLY,	ATC_ACL,	NULL_FIELD,	4,	ACT_ACL),
+ATTRIBUTE (ATR$C_READACE,	M_READ_ONLY,	ATC_ACL,	NULL_FIELD,	255,	ACT_ACL),
+ATTRIBUTE (ATR$C_RESERVED,	M_PROTECTED,	ATC_ZERO,	NULL_FIELD,	380,	ACT_ZERO),
+ATTRIBUTE (ATR$C_HIGHWATER,	M_READ_ONLY,	ATC_HEADER,	NULL_FIELD,	4,	ACT_ZERO),
+ATTRIBUTE (ATR$C_ACCESS_MASK,	M_READ_ONLY,	ATC_ACPGBL,	NULL_FIELD,	4,	ACT_ILLEGAL),
+ATTRIBUTE (ATR$C_PRIVS_USED,	M_READ_ONLY,	ATC_ACPGBL,	GBL_PRV,0,0,0,	4,	ACT_COPY),
+ATTRIBUTE (ATR$C_MATCHING_ACE,	M_READ_ONLY,	ATC_ACPGBL,	GBL_ACE,0,0,0,	255,	ACT_ZERO),
+ATTRIBUTE (ATR$C_ACCESS_MODE,	M_READ_ONLY,	ATC_ZERO,	NULL_FIELD,     1,	ACT_ACMODE),
+ATTRIBUTE (ATR$C_FILE_SPEC,	M_READ_ONLY,	ATC_FID2NAME,	NULL_FIELD,	512,	ACT_COPY),
+ATTRIBUTE (ATR$C_CLASS_MASK,	0,		ATC_ZERO,	NULL_FIELD,	0,	ACT_ZERO),
+ATTRIBUTE (ATR$C_BUFFER_OFFSET,	0,		ATC_ZERO,       NULL_FIELD,	0,	ACT_NOP)
+
+		) : BBLOCKVECTOR [,8];
+
+LITERAL
+	MAX_CODE	= ATR$C_MAX_CODE; ! highest attribute code
+
+
+! Storage for the converted file specification.
+
+OWN
+
+! ***** The following must be adjacent. *****
+
+	FILE_SPEC_LEN	: VECTOR [1,WORD] ALIGN (0),	! File spec length
+	FULL_FILE_SPEC	: VECTOR [510,BYTE] ALIGN (0);	! File spec storage
+
+! ***** The preceeding must be adjacent. *****
+
+!
+! Protected bits in the file characteristics longword. These may not be
+! modified by write attributes calls.
+!
+LITERAL
+	PROTECTED_CHAR	=  $FIELDMASK (FH1$V_CONTIG)
+			OR $FIELDMASK (FH1$V_SPOOL)^8
+			OR $FIELDMASK (FH1$V_BADBLOCK)^8
+			OR $FIELDMASK (FH1$V_MARKDEL)^8;
+
+GLOBAL ROUTINE READ_ATTRIB (HEADER, ABD) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine performs the read attributes function. The
+!	requested attributes are assembled into the buffer packet.
+!
+! CALLING SEQUENCE:
+!	READ_ATTRIB (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of file header
+!	ARG2: address of buffer descriptors
+!
+! IMPLICIT INPUTS:
+!	IO_PACKET: I/O packet for this operation
+!	PRIMARY_FCB: FCB of file
+!
+! OUTPUT PARAMETERS:
+!	ARG2: address of buffer descriptors
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	1 if successful
+!	0 if error
+!
+! SIDE EFFECTS:
+!	attribute data written into buffer packet
+!
+!--
+
+BEGIN
+
+MAP
+	HEADER		: REF BBLOCK,	! file header arg
+	ABD		: REF BBLOCKVECTOR [,ABD$C_LENGTH];
+					! buffer descriptor arg
+
+LITERAL
+	DATLEN		= 23;		! length of date string buffer
+
+LOCAL
+	LOCAL_HEADER	: REF BBLOCK,	! Local copy of header address
+	ACCESS_MODE,			! access mode to set for attribute buffer
+	P,				! pointer to attribute text
+	COUNT,				! attribute size desired
+	ADDRESS		: REF BBLOCK,	! address of attribute
+	CODE,				! attribute code
+	MAX_COUNT,			! max size of attribute
+	DATBUF		: VECTOR [DATLEN, BYTE], ! buffer to build date string
+	DATDESC		: VECTOR [2],	! string descriptor for date string
+	ACTION		: BYTE,		! code of action routine
+	ATT_BUFFER	: BBLOCK [86],	! buffer to build reformatted attribute text
+	ACE_POINTER	: REF BBLOCK,	! address of user ACE
+	STATUS;				! routine exit status
+
+EXTERNAL
+	IO_PACKET	: REF BBLOCK,	! I/O packet in process
+	PRIMARY_FCB	: REF BBLOCK,	! FCB of file
+	CURRENT_WINDOW	: REF BBLOCK,	! window of file
+	FILE_HEADER	: REF BBLOCK;	! address of current file header
+
+EXTERNAL ROUTINE
+	PMS_START_SUB,			! start subfunction metering
+	PMS_END_SUB,			! end subfunction metering
+	MAKE_STRING,			! convert file name block to string
+	SYS$BINTIM	: ADDRESSING_MODE (ABSOLUTE),
+					! convert string to binary time
+	READ_HEADER;			! Read a file header
+
+
+! Start metering for this subfunction.
+!
+
+PMS_START_SUB (PMS_RWATT);
+
+STATUS = 1;				! assume success
+LOCAL_HEADER = .HEADER;		! Copy header address
+
+! Set the buffered read bit in the I/O packet to indicate to IO_DONE that
+! the attribute buffers are valid.
+!
+
+IO_PACKET[IRP$V_FUNC] = 1;
+ACCESS_MODE = .IO_PACKET[IRP$V_MODE];
+
+! Scan the buffer packet, picking up each entry. The first byte of the
+! text is the attribute code, and must be overwritten with the access
+! mode of the request for the I/O completion processing.
+!
+
+INCR I FROM ABD$C_ATTRIB TO .IO_PACKET[IRP$W_BCNT]-1 DO
+    BEGIN
+    P = .ABD[.I, ABD$W_TEXT] + ABD[.I, ABD$W_TEXT];
+    COUNT = .ABD[.I, ABD$W_COUNT];
+    CODE = .(.P)<0,8> - 1;
+    (.P)<0,8> = .ACCESS_MODE;
+    P = .P + 1;
+
+! Check the attribute code for legality, and then check the requested
+! size against the limit. If an error exit is made, first truncate the
+! descriptor count to inhibit return of the unprocessed descriptors.
+!
+
+    IF .CODE GTR MAX_CODE - 1
+    THEN
+	BEGIN
+	IO_PACKET[IRP$W_BCNT] = .I;
+	(ERR_STATUS (SS$_BADATTRIB); RETURN 0);
+	END;
+
+    MAX_COUNT = .ATC[.CODE, ATC_MAX_SIZE];
+    IF .COUNT GTR .MAX_COUNT
+    THEN
+	BEGIN
+	IO_PACKET[IRP$W_BCNT] = .I;
+	(ERR_STATUS (SS$_BADATTRIB); RETURN 0);
+	END;
+
+
+! Get the action routine code first.
+!
+
+    ACTION = .ATC[.CODE, ATC_ACTION];
+
+! Compute the address of the attribute.
+!
+    
+    ADDRESS =
+	(
+	CASE .ATC[.CODE, ATC_LOCATION] FROM 0 TO ATC_LASTATC OF
+	    SET
+	    [ATC_ZERO]:		ATT_BUFFER;
+	    [ATC_FCB]:		.PRIMARY_FCB;
+	    [ATC_HEADER]:	.LOCAL_HEADER;
+	    [ATC_IDENT]:	.LOCAL_HEADER + .LOCAL_HEADER[FH1$B_IDOFFSET]*2;
+	    [ATC_MAP]:		.LOCAL_HEADER + .LOCAL_HEADER[FH1$B_MPOFFSET]*2;
+	    [ATC_ACL]:		.LOCAL_HEADER;
+	    [ATC_ACPGBL]:	BEGIN
+				ACTION = ACT_ZERO;
+				ATT_BUFFER
+				END;
+	    [ATC_FID2NAME]:	BEGIN
+				FID_TO_SPEC ();
+				LOCAL_HEADER = .FILE_HEADER;
+				FILE_SPEC_LEN
+				END;
+	    TES
+	)
+	+ .ATC[.CODE, ATC_OFFSET];
+    
+    
+! Finally execute the action routine.
+!
+    
+    CASE .ACTION FROM 0 TO ACT_LASTACT OF
+	SET
+    
+	[ACT_NOP]:	COUNT = 0;
+    
+	[ACT_ILLEGAL]:	BEGIN
+			IO_PACKET[IRP$W_BCNT] = .I;
+			(ERR_STATUS (SS$_BADATTRIB); RETURN 0);
+			END;
+    
+	[ACT_COPY]:	0;
+    
+	[ACT_UCHAR]:	BEGIN
+			(ATT_BUFFER)<0,32> = .(.ADDRESS)<0,16>;
+			ADDRESS = ATT_BUFFER;
+			END;
+
+	[ACT_STATBLK]:	BEGIN
+			ATT_BUFFER[SBK$L_STLBN] = ROT (.ADDRESS[FCB$L_STLBN], 16);
+			ATT_BUFFER[SBK$L_FILESIZE] = ROT (.ADDRESS[FCB$L_FILESIZE], 16);
+			ATT_BUFFER[SBK$B_ACNT]  = .ADDRESS[FCB$W_ACNT];
+			ATT_BUFFER[SBK$B_LCNT]  = .ADDRESS[FCB$W_LCNT];
+			ATT_BUFFER[SBK$L_FCB] = .ADDRESS;
+			(ATT_BUFFER[SBK$L_FCB]+4)<0,16> = 0; ! unused field
+			ATT_BUFFER[SBK$W_ACNT] = .ADDRESS[FCB$W_ACNT];
+			ATT_BUFFER[SBK$W_LCNT] = .ADDRESS[FCB$W_LCNT];
+			ATT_BUFFER[SBK$W_WCNT] = .ADDRESS[FCB$W_WCNT];
+			ATT_BUFFER[SBK$W_TCNT] = .ADDRESS[FCB$W_TCNT];
+			ATT_BUFFER[SBK$L_READS] = 0;
+			ATT_BUFFER[SBK$L_WRITES] = 0;
+			IF .CURRENT_WINDOW NEQ 0
+			THEN
+			    BEGIN
+			    ATT_BUFFER[SBK$L_READS] = .CURRENT_WINDOW[WCB$L_READS];
+			    ATT_BUFFER[SBK$L_WRITES] = .CURRENT_WINDOW[WCB$L_WRITES];
+			    END;
+			ADDRESS = ATT_BUFFER;
+			END;
+    
+	[ACT_BLOCKSIZE]: ADDRESS = UPLIT (512);
+
+	[ACT_ZERO]:	BEGIN
+			CH$FILL (0, .COUNT, .P);
+			COUNT = 0;
+			END;
+
+	[ACT_BLANK]:	BEGIN
+			ADDRESS = UPLIT BYTE (' ');
+			END;
+
+	[ACT_UIC]:	BEGIN
+			MAP ATT_BUFFER : VECTOR [,WORD];
+			ATT_BUFFER[0] = .(.ADDRESS)<0,8>;
+			ATT_BUFFER[1] = .(.ADDRESS)<8,8>;
+			ADDRESS = ATT_BUFFER;
+			END;
+
+	[ACT_ASCNAME]:	BEGIN
+			CH$FILL (' ', 86, ATT_BUFFER);
+			MAKE_STRING (.ADDRESS-6, ATT_BUFFER);
+			ADDRESS = ATT_BUFFER;
+			END;
+
+	[ACT_DATIME]:	BEGIN
+			(DATBUF+00)<0,16> = .(.ADDRESS);
+			(DATBUF+02)<0,8>  = '-';
+			(DATBUF+03)<0,24> = .(.ADDRESS+2);
+			(DATBUF+06)<0,24> = '-19';
+			(DATBUF+09)<0,16> = .(.ADDRESS+5);
+			(DATBUF+11)<0,8>  = ' ';
+			IF .(.ADDRESS+7)<0,8> NEQ 0
+			THEN
+			    BEGIN
+			    (DATBUF+12)<0,16> = .(.ADDRESS+7);
+			    (DATBUF+14)<0,8>  = ':';
+			    (DATBUF+15)<0,16> = .(.ADDRESS+9);
+			    (DATBUF+17)<0,8>  = ':';
+			    (DATBUF+18)<0,16> = .(.ADDRESS+11);
+			    END
+			ELSE
+			    BEGIN
+			    (DATBUF+12)<0,32> = '00:0';
+			    (DATBUF+16)<0,32> = '0:00';
+			    END;
+			(DATBUF+20)<0,24> = '.00';
+			(ATT_BUFFER) = (ATT_BUFFER+4) = 0;
+			DATDESC[0] = DATLEN;
+			DATDESC[1] = DATBUF;
+			SYS$BINTIM (DATDESC, ATT_BUFFER);
+			ADDRESS = ATT_BUFFER;
+			END;
+
+	[ACT_ACL]:	BEGIN
+			ACE_POINTER = .P;
+			CASE .CODE + 1 FROM ATR$C_ADDACLENT TO ATR$C_READACE OF
+			SET
+			    [ATR$C_ADDACLENT,
+			     ATR$C_DELACLENT,
+			     ATR$C_MODACLENT,
+			     ATR$C_DELETEACL]:	0;
+
+			    [ATR$C_FNDACLENT,
+			     ATR$C_FNDACETYP,
+			     ATR$C_READACL,
+			     ATR$C_READACE]:	BEGIN
+						CH$FILL (0, .COUNT, .ACE_POINTER);
+						ACE_POINTER[ACE$W_FLAGS] = SS$_ACLEMPTY;
+						END;
+
+			    [ATR$C_ACLLENGTH]:	BEGIN
+						CH$FILL (0, .COUNT, .P);
+						END;
+
+			TES;
+			COUNT = 0;
+			END;
+
+	[ACT_ACMODE]:	BEGIN
+			(.P-1)<0,8> = .IO_PACKET[IRP$V_MODE];
+			ACCESS_MODE = MAXU (.IO_PACKET[IRP$V_MODE], .(.P)<0,8>);
+			COUNT = 0;
+			END;
+
+	TES;
+	CH$MOVE (.COUNT, .ADDRESS, .P); ! finally copy the attribute
+
+
+
+    END;				! end of loop
+
+! Stop metering of this subfunction
+!
+
+PMS_END_SUB ();
+
+RETURN .STATUS;				! return success
+
+END;					! end of routine READ_ATTRIB
+
+ROUTINE FID_TO_SPEC : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine converts the specified file-ID (contained in the header
+!	supplied) to a full file specification.  If the directory-ID in
+!	the FIB is non-zero, the directory portion of the spec is filled
+!	in.  Otherwise, it is left blank (e.g., []).
+!
+! CALLING SEQUENCE:
+!	FID_TO_SPEC ()
+!
+! INPUT PARAMETERS:
+!	none
+!
+! IMPLICIT INPUTS:
+!	none
+!
+! OUTPUT PARAMETERS:
+!	none
+!
+! IMPLICIT OUTPUTS:
+!	none
+!
+! ROUTINE VALUE:
+!	none
+!
+! SIDE EFFECTS:
+!	none
+!
+!--
+
+BEGIN
+
+LINKAGE
+	L_CVT_DEVNAM	= JSB (REGISTER = 0,	! Buffer length
+			       REGISTER = 1,	! Buffer address
+			       REGISTER = 4,	! Cluster node conversion flag
+			       REGISTER = 5;	! UCB address
+			       REGISTER = 1);	! Length of converted name
+
+LITERAL
+	NODE_LEN	= 15,			! Maximum cluster node name length
+	DEVNAME_LEN	= 15,			! Maximum device name length
+	UNIT_LEN	= 5,			! Maximum unit number length
+	FILENAME_LEN	= 9,			! Maximun file name length
+	FILETYPE_LEN	= 3,			! Maximum file type length
+	FILEVER_LEN	= 5,			! Maximum version length
+
+	FULLDEV_LEN	= NODE_LEN + 1 +	! Full device spec length
+			  DEVNAME_LEN + UNIT_LEN + 1,
+	FULLDIR_LEN	= 1 + FILENAME_LEN + 1,	! Max dir spec length
+	FULLFILE_LEN	= FILENAME_LEN + 1 +	! Max file name length
+			  FILETYPE_LEN + 1 +	!   including type & version
+			  FILEVER_LEN,
+	FULLSPEC_LEN	= 2 + FULLDEV_LEN +	! Maximum file spec length
+			  FULLDIR_LEN +		! Includes word size prefix
+			  FULLFILE_LEN;
+
+LOCAL
+	DEVICE_LEN,				! Length of the device name
+	DIR_HEADER	: REF BBLOCK,		! Current directory file header
+	IDENT_AREA	: REF BBLOCK;		! Address of header ident area
+
+EXTERNAL
+	FILE_HEADER	: REF BBLOCK,		! Address of current file header
+	IO_PACKET	: REF BBLOCK,		! Address of current I/O packet
+	LOCAL_FIB	: BBLOCK,		! Copy of user's FIB
+	PRIMARY_FCB	: REF BBLOCK;		! Address of primary FCB
+
+EXTERNAL ROUTINE
+	READ_HEADER,				! Read & validate file header
+	MAKE_STRING,				! Convert file name block to string
+	IOC$CVT_DEVNAM	: L_CVT_DEVNAM ADDRESSING_MODE (GENERAL);
+
+BIND
+	DEVICE_NAME	= FULL_FILE_SPEC	: VECTOR [,BYTE],	! Device name spec
+	DIR_NAME	= FULL_FILE_SPEC[FULLDEV_LEN + 1]	: VECTOR [,BYTE],	! Directory name storage
+	FILE_NAME	= FULL_FILE_SPEC[FULLDEV_LEN + 1 +	! File name storage
+					 FULLDIR_LEN]	: VECTOR [,BYTE];
+
+! Initialize all of the necessary storage.
+
+CH$FILL (0, FULLSPEC_LEN, FULL_FILE_SPEC);
+
+! Get the device name.
+
+IOC$CVT_DEVNAM (FULLDEV_LEN, DEVICE_NAME, 0, .IO_PACKET[IRP$L_UCB]; DEVICE_LEN);
+FILE_SPEC_LEN[0] = .DEVICE_LEN;
+
+! Start building the directory specification.
+
+FULL_FILE_SPEC[.FILE_SPEC_LEN[0]] = '[';
+FILE_SPEC_LEN[0] = .FILE_SPEC_LEN[0] + 1;
+
+! If a directory-ID has been given in the FIB, return the diretory spec
+! also.  Otherwise, leave it blank.
+
+IF .LOCAL_FIB[FIB$W_DID_NUM] NEQ 0
+THEN
+    BEGIN
+    DIR_HEADER = READ_HEADER (LOCAL_FIB[FIB$W_DID], 0);
+    IDENT_AREA = .DIR_HEADER + .DIR_HEADER[FH1$B_IDOFFSET]*2;
+    MAKE_STRING (IDENT_AREA[FI1$W_FILENAME] - $BYTEOFFSET (NMB$W_NAME),
+		 FULL_FILE_SPEC[.FILE_SPEC_LEN[0]]);
+    INCR K FROM 0 TO FILENAME_LEN - 1
+    DO
+	BEGIN
+	IF .FULL_FILE_SPEC[.FILE_SPEC_LEN[0]] EQL '.' THEN EXITLOOP;
+	IF .K EQL FILENAME_LEN - 1
+	THEN
+	    BEGIN
+	    FULL_FILE_SPEC[.FILE_SPEC_LEN[0]] = '?';
+	    EXITLOOP;
+	    END;
+	FILE_SPEC_LEN[0]= .FILE_SPEC_LEN[0] + 1;
+	END;
+    READ_HEADER (LOCAL_FIB[FIB$W_FID], .PRIMARY_FCB);
+    END;
+
+! Tie off the directory specification.
+
+FULL_FILE_SPEC[.FILE_SPEC_LEN[0]] = ']';
+FILE_SPEC_LEN[0] = .FILE_SPEC_LEN[0] + 1;
+
+! Now add in the file name.
+
+IDENT_AREA = .FILE_HEADER + .FILE_HEADER[FH1$B_IDOFFSET]*2;
+MAKE_STRING (IDENT_AREA[FI1$W_FILENAME] - $BYTEOFFSET (NMB$W_NAME),
+		  FULL_FILE_SPEC[.FILE_SPEC_LEN[0]]);
+INCR J FROM 0 TO FULLFILE_LEN
+DO
+    BEGIN
+    IF .FULL_FILE_SPEC[.FILE_SPEC_LEN[0]] EQL ' '
+    OR .FULL_FILE_SPEC[.FILE_SPEC_LEN[0]] EQL 0 THEN EXITLOOP;
+    FILE_SPEC_LEN[0] = .FILE_SPEC_LEN[0] + 1;
+    END;
+
+RETURN;
+
+END;						! End of routine FID_TO_SPEC
+
+GLOBAL ROUTINE WRITE_ATTRIB (HEADER, ABD, CONTROL_ACCESS) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine performs the write attributes function. The
+!	requested attributes are taken from the buffer packet.
+!
+! CALLING SEQUENCE:
+!	WRITE_ATTRIB (ARG1, ARG2, ARG3)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of file header
+!	ARG2: address of buffer descriptors
+!	ARG3: 1 = check for control access to the file
+!	      0 = no control access check
+!
+! IMPLICIT INPUTS:
+!	IO_PACKET: I/O packet for this operation
+!	PRIMARY_FCB: FCB of file
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	attribute data written into appropriate places
+!
+!--
+
+BEGIN
+
+MAP
+	HEADER		: REF BBLOCK,	! file header arg
+	ABD		: REF BBLOCKVECTOR [,ABD$C_LENGTH];
+					! buffer descriptor arg
+
+LOCAL
+	CTL_ACC_GRANTED,		! Flag indicating control access granted
+	SAVE_HIBLK,			! saved copy of file's HIBLK
+	SAVE_CHAR,			! initial state of protected attributes
+	ACE_POINTER	: REF BBLOCK;	! address of user ACE
+
+EXTERNAL
+	USER_STATUS	: VECTOR,	! user request status
+	CLEANUP_FLAGS	: BITVECTOR,	! cleanup action flags
+	IO_PACKET	: REF BBLOCK,	! I/O packet in process
+	CURRENT_WINDOW	: REF BBLOCK,	! window of open file
+	LOCAL_FIB	: BBLOCK,	! Copy of user's FIB
+	PRIMARY_FCB	: REF BBLOCK;	! FCB of file
+
+EXTERNAL ROUTINE
+	PMS_START_SUB,			! start subfunction metering
+	PMS_END_SUB,			! end subfunction metering
+	CHECK_PROTECT,			! check file protection
+	CHECKSUM,			! checksum a file header
+	MARK_DIRTY,			! mark buffer for write-back
+	MAKE_NAMEBLOCK,			! convert file string to RAD-50 name block
+	GET_TIME;			! get date/time string
+
+
+! Start metering for this subfunction.
+!
+
+PMS_START_SUB (PMS_RWATT);
+
+CTL_ACC_GRANTED = 0;
+
+! Set the appropriate cleanup flags and save the initial state of the
+! protected file characteristics.
+!
+
+CHECKSUM (.HEADER);
+MARK_DIRTY (.HEADER);
+CLEANUP_FLAGS[CLF_FIXFCB] = 1;
+
+SAVE_CHAR = .HEADER[FH1$W_FILECHAR] AND PROTECTED_CHAR;
+SAVE_HIBLK = .BBLOCK [HEADER[FH1$W_RECATTR], FAT$L_HIBLK];
+
+
+! Scan the buffer packet, picking up each entry. The first byte of the
+! text is the attribute code.
+!
+
+INCR I FROM ABD$C_ATTRIB TO .IO_PACKET[IRP$W_BCNT]-1 DO
+    BEGIN
+
+    LOCAL
+	ACTION		: BYTE,		! action routine code
+	P,				! pointer to attribute text
+	COUNT,				! attribute size desired
+	ADDRESS		: REF BBLOCK,	! address of attribute
+	CODE,				! attribute code
+	MAX_COUNT,			! max size of attribute
+	ATT_BUFFER	: BBLOCK [20],	! attribute copy buffer
+	DATBUF		: VECTOR [13, BYTE]; ! buffer to build date string
+
+    P = .ABD[.I, ABD$W_TEXT] + ABD[.I, ABD$W_TEXT];
+    COUNT = .ABD[.I, ABD$W_COUNT];
+    CODE = .(.P)<0,8> - 1;
+    P = .P + 1;
+
+! Check the attribute code for legality, and then check the requested
+! size against the limit.
+!
+
+    IF .CODE GTR MAX_CODE - 1
+	THEN ERR_EXIT (SS$_BADATTRIB);
+
+    MAX_COUNT = .ATC[.CODE, ATC_MAX_SIZE];
+    IF .COUNT GTR .MAX_COUNT
+	THEN ERR_EXIT (SS$_BADATTRIB);
+
+    IF .ATC[.CODE, ATC_PROTECTED]
+    THEN
+	BEGIN
+	IF NOT .CTL_ACC_GRANTED
+	THEN
+	    BEGIN
+	    BBLOCK [HEADER[FH1$W_RECATTR], FAT$L_HIBLK] = .SAVE_HIBLK;
+	    CHECK_PROTECT (WRATT_ACCESS, .HEADER, .PRIMARY_FCB);
+	    CTL_ACC_GRANTED = 1;
+	    END;
+	END;
+
+! Compute the action routine code.
+!
+
+    ACTION = .ATC[.CODE, ATC_ACTION];
+    IF .ATC[.CODE, ATC_READ_ONLY]
+    THEN ACTION = ACT_NOP;
+
+! Compute the address of the attribute.
+!
+    
+    ADDRESS =
+	(
+	CASE .ATC[.CODE, ATC_LOCATION] FROM 0 TO ATC_LASTATC OF
+	    SET
+	    [ATC_ZERO,
+	     ATC_ACL,
+	     ATC_ACPGBL,
+	     ATC_FID2NAME]:	ATT_BUFFER;
+	    [ATC_FCB]:		.PRIMARY_FCB;
+	    [ATC_HEADER]:	.HEADER;
+	    [ATC_IDENT]:	.HEADER + .HEADER[FH1$B_IDOFFSET]*2;
+	    [ATC_MAP]:		.HEADER + .HEADER[FH1$B_MPOFFSET]*2;
+	    TES
+	)
+	+ .ATC[.CODE, ATC_OFFSET];
+    
+    
+! Finally execute the action routine.
+!
+    
+    CASE .ACTION FROM 0 TO ACT_LASTACT OF
+	SET
+    
+	[ACT_NOP,
+	 ACT_BLOCKSIZE,
+	 ACT_ZERO,
+	 ACT_BLANK,
+	 ACT_ACMODE,
+	 ACT_STATBLK]:	0;
+    
+	[ACT_ILLEGAL]:	ERR_EXIT (SS$_BADATTRIB);
+
+	[ACT_UIC]:	BEGIN
+			IF .COUNT GEQU 4
+			THEN
+			    BEGIN
+			    (.ADDRESS)<0,8> = ..P;
+			    (.ADDRESS)<8,8> = .(.P+2);
+			    IF .(.P+1)<0,8> NEQ 0
+			    OR .(.P+3)<0,8> NEQ 0
+			    THEN (.ADDRESS)<0,16> = -1;
+			    END;
+			END;
+
+	[ACT_UCHAR]:	BEGIN
+			(.ADDRESS)<0,8> = ..P;
+			IF .COUNT GEQ 2
+			THEN (.ADDRESS)<8,8> = .(.P+1);
+			END;
+
+	[ACT_ASCNAME]:	BEGIN
+			MAKE_NAMEBLOCK (LOCAL_FIB, .COUNT, .P, ATT_BUFFER);
+			CH$MOVE (10, ATT_BUFFER[NMB$W_NAME], .ADDRESS);
+			END;
+
+	[ACT_DATIME]:	BEGIN
+			CH$COPY (.COUNT, .P, 0, 8, ATT_BUFFER);
+			GET_TIME (DATBUF, ATT_BUFFER);
+			COUNT = 
+			    (CASE .CODE FROM ATR$C_CREDATE-1 TO ATR$C_BAKDATE-1 OF
+			    SET
+			    [ATR$C_CREDATE-1]:	13;
+			    [ATR$C_REVDATE-1]:	13;
+			    [ATR$C_EXPDATE-1]:	7;
+			    [ATR$C_BAKDATE-1]:	0;
+			    TES);
+			CH$MOVE (.COUNT, DATBUF, .ADDRESS);
+			END;
+
+	[ACT_COPY]:	CH$MOVE (.COUNT, .P, .ADDRESS);
+
+	[ACT_ACL]:	BEGIN
+			ACE_POINTER = .P;
+			CASE .CODE + 1 FROM ATR$C_ADDACLENT TO ATR$C_READACE OF
+			SET
+			    [ATR$C_ADDACLENT]:	0;
+			    [ATR$C_DELACLENT,
+			     ATR$C_MODACLENT,
+			     ATR$C_DELETEACL,
+			     ATR$C_FNDACLENT,
+			     ATR$C_FNDACLTYP,
+			     ATR$C_READACL,
+			     ATR$C_READACE]:	BEGIN
+						CH$FILL (0, .COUNT, .ACE_POINTER);
+						ACE_POINTER[ACE$W_FLAGS] = SS$_ACLEMPTY;
+						END;
+			    [ATR$C_ACLLENGTH]:	BEGIN
+						CH$FILL (0, .COUNT, .ACE_POINTER);
+						END;
+
+			TES;
+			END;
+    
+	TES;
+
+    END;				! end of loop
+
+! Restore the state of the protected file characteristics bits.
+!
+
+HEADER[FH1$W_FILECHAR] = (.HEADER[FH1$W_FILECHAR] AND NOT PROTECTED_CHAR)
+			 OR .SAVE_CHAR;
+BBLOCK [HEADER[FH1$W_RECATTR], FAT$L_HIBLK] = .SAVE_HIBLK;
+
+! Checksum the modified header.
+!
+
+CHECKSUM (.HEADER);
+MARK_DIRTY (.HEADER);
+
+! Stop metering of this subfunction
+!
+
+PMS_END_SUB ();
+
+END;					! end of routine WRITE_ATTRIB
+
+END
+ELUDOM

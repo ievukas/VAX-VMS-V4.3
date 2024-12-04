@@ -1,0 +1,996 @@
+MODULE SUBMIT	(%TITLE	'PRINT and SUBMIT Commands'
+		MAIN = SUBMIT,
+		IDENT = 'V04-000'
+		) =
+BEGIN
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:
+!	PRINT and SUBMIT commands.
+!
+! ABSTRACT:
+!	This module implements the PRINT and SUBMIT commands.
+!
+! ENVIRONMENT:
+!	VAX/VMS user mode.
+!--
+!
+! AUTHOR: M. Jack, CREATION DATE: 30-Apr-1982
+!
+! MODIFIED BY:
+!
+!	V03-009	RRB0021	Rowland R. Bradley	27-Aug-1984
+!		Disallow the submission of command procedures and
+!		and print jobs from sequential devices.  Avoids the
+!		problem described in Crash 201 (symbiont in RWAST state).
+!		We do not support sharing sequential devices (mag tape).
+!		Clean up the error logging associated with PRINT and
+!		SUBMIT.
+!
+!	V03-008	JAK0220	J A Krycka		21-Jul-1984
+!		Make a $SNDJBC item list entry if /FEED is explicitly present.
+!		Before, an item list entry was made only for /NOFEED because
+!		/FEED was the default condition. Now the user can establish a
+!		queue level default value for this attribute, so it is
+!		necessary to be able to override the queue default.
+!
+!	V03-007 RRB0020	Rowland R. Bradley	18-Jun-1984
+!		Add support for common command qualifier processing
+!		This is a late V4 enhancement ask for by customers
+!		to allow dumb user file filtering.
+!		Add enhanced error message handling for /REMOTE
+!		and remove redundant error message when no files
+!		in the job.  Add REMOINSF error code.
+!
+!	V03-006	BLS0267		Benn Schreiber	31-Jan-1984
+!		Use new LIB$FIND_FILE argument.
+!
+!	V03-005	MLJ0115		Martin L. Jack,	29-Jul-1983  13:40
+!		Changes for job controller baselevel.
+!
+!	V03-004	MLJ0113		Martin L. Jack,	26-May-1983  17:00
+!		Changes for job controller baselevel.
+!
+!	V03-003	MLJ0112		Martin L. Jack,	29-Apr-1983  0:17
+!		Changes for job controller baselevel.
+!
+!	V03-002	MLJ0109		Martin L. Jack,	13-Apr-1983  14:44
+!		Disallow node name without /REMOTE.
+!
+!	V03-001	MLJ0106		Martin L. Jack,	1-Mar-1983  5:03
+!		Changes for job controller baselevel.
+!
+!**
+
+LIBRARY 'SYS$LIBRARY:STARLET';
+REQUIRE 'SRC$:JBCPRSDEF';
+
+
+LITERAL
+	TRUE=		1,
+	FALSE=		0;
+
+
+STRUCTURE
+	BBLOCK[O,P,S,E;N]=
+	    [N]
+	    (BBLOCK + O)<P,S,E>;
+
+
+PSECT
+	CODE=		CODE,
+	PLIT=		CODE,
+	OWN=		DATA,
+	GLOBAL=		DATA;
+
+
+FORWARD ROUTINE
+	SUBMIT,
+	GET_COMM_QUAL_CONTEXT:	NOVALUE,
+	EXIT_HANDLER:	NOVALUE,
+	HANDLER;
+
+
+EXTERNAL ROUTINE
+	CLI$GET_VALUE:	ADDRESSING_MODE(GENERAL),
+					! Get a parameter or qualifier value
+	CLI$PRESENT:	ADDRESSING_MODE(GENERAL),
+					! Determine if entity is present
+	LIB$FIND_FILE:	ADDRESSING_MODE(GENERAL),
+					! Scan for wildcard files
+	LIB$SCOPY_DXDX:	ADDRESSING_MODE(GENERAL),
+					! Copy string
+	LIB$QUAL_FILE_MATCH: ADDRESSING_MODE(GENERAL),
+					! Match common qualifiers
+	LIB$QUAL_FILE_PARSE: ADDRESSING_MODE(GENERAL);
+					! Setup common qualifiers
+
+EXTERNAL LITERAL
+	! Common Qualifier return status values.
+	!
+	LIB$_QUIPRO,			! Quit Processing
+	LIB$_NEGANS,			! Negative Answer for this file
+	LIB$_FILFAIMAT,			! File failed to meet criteria
+
+	! Parallel PRINT and SUBMIT messages.
+	!
+	PRINT$_FACILITY,		SUBMIT$_FACILITY,
+	PRINT$_ADDFIL,			SUBMIT$_ADDFIL,
+	PRINT$_CREJOB,			SUBMIT$_CREJOB,
+	PRINT$_INVFILSPE,		SUBMIT$_INVFILSPE,
+	PRINT$_REMOINSF,		SUBMIT$_REMOINSF,
+
+	! SUBMIT only messages.
+	!
+	SUBMIT$_INVLOGFIL;
+
+GLOBAL
+	QUAL_CONTEXT;				! Context for Common Qualifiers
+
+OWN
+	EXIT_STATUS:	BBLOCK[4],		! Most severe error status
+	FLAGS:		BBLOCK[4];		! Flag bits
+
+
+MACRO
+	V_PRINT=	0,0,1,0 %,		! PRINT command
+	V_IDENTIFY=	0,1,1,0 %,		! /IDENTIFY
+	V_REMOTE=	0,2,1,0 %,		! /REMOTE
+	V_NO_LOG_FILE=	0,3,1,0 %;		! /NOLOG_FILE
+
+ROUTINE SUBMIT=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine is the main entry point for the PRINT and SUBMIT commands.
+!
+! INPUT PARAMETERS:
+!	Standard VMS activation parameters (not used).
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	Completion status.
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	CNT:		INITIAL(0),		! Number of files in job
+	FIND_CONTEXT:	REF BBLOCK,		! Context for LIB$FIND_FILE
+	FIND_RESULT:	BBLOCK[DSC$C_S_BLN],	! Result of LIB$FIND_FILE
+	FIND_DEFAULT:	BBLOCK[DSC$C_S_BLN],	! Default file for LIB$FIND_FILE
+	VALUE_DESC:	BBLOCK[DSC$C_S_BLN],	! Qualifier value descriptor
+	INPUT_DESC:	BBLOCK[DSC$C_S_BLN],	! Input file specification
+	LOG_FILE_DESC:	BBLOCK[DSC$C_S_BLN],	! Log file descriptor
+	JSM_BUFFER:	VECTOR[132,BYTE],	! Job status message
+	JSM_DESC:	VECTOR[2],		! Descriptor for status message
+	ITEM_BUFFER:	BBLOCK[1024],		! $SNDJBC item buffer
+	DATA_BUFFER:	BBLOCK[1024],		! $SNDJBC data buffer
+	EXIT_BLOCK:	VECTOR[5];		! Exit control block
+MACRO
+	SD_[A] = BIND %NAME('D_', A) = $DESCRIPTOR(A) %;
+	SD_(
+	    '$VERB',
+	    'P1',
+	    'AFTER',
+	    'BURST',
+	    'CHARACTERISTICS',
+	    'CLI',
+	    'COPIES',
+	    'CPUTIME',
+	    'DELETE',
+	    'DEVICE',
+	    'FEED',
+	    'FLAG',
+	    'FORM',
+	    'HEADER',
+	    'HOLD',
+	    'IDENTIFY',
+	    'JOB_COUNT',
+	    'KEEP',
+	    'LOG_FILE',
+	    'LOWERCASE',
+	    'NAME',
+	    'NOTE',
+	    'NOTIFY',
+	    'OPERATOR',
+	    'PAGES',
+	    'PARAMETERS',
+	    'PASSALL',
+	    'PRINTER',
+	    'PRIORITY',
+	    'QUEUE',
+	    'REMOTE',
+	    'RESTART',
+	    'SETUP',
+	    'SPACE',
+	    'TRAILER',
+	    'USER',
+	    'WSDEFAULT',
+	    'WSEXTENT',
+	    'WSQUOTA');
+BIND
+	D_BURST_ALL=	$DESCRIPTOR('BURST.ALL'),
+	D_BURST_ONE=	$DESCRIPTOR('BURST.ONE'),
+	D_FLAG_ALL=	$DESCRIPTOR('FLAG.ALL'),
+	D_FLAG_ONE=	$DESCRIPTOR('FLAG.ONE'),
+	D_TRAILER_ALL=	$DESCRIPTOR('TRAILER.ALL'),
+	D_TRAILER_ONE=	$DESCRIPTOR('TRAILER.ONE');
+BUILTIN
+	FP;
+
+PARSE_GLOBAL_REGISTERS;
+
+
+! Initialize.
+!
+EXIT_STATUS = SS$_NORMAL;
+.FP = HANDLER;
+
+INPUT_DESC[DSC$B_CLASS] = DSC$K_CLASS_D;
+INPUT_DESC[DSC$B_DTYPE] = DSC$K_DTYPE_T;
+INPUT_DESC[DSC$W_LENGTH] = 0;
+INPUT_DESC[DSC$A_POINTER] = 0;
+
+VALUE_DESC[DSC$B_CLASS] = DSC$K_CLASS_D;
+VALUE_DESC[DSC$B_DTYPE] = DSC$K_DTYPE_T;
+VALUE_DESC[DSC$W_LENGTH] = 0;
+VALUE_DESC[DSC$A_POINTER] = 0;
+
+LOG_FILE_DESC[DSC$B_CLASS] = DSC$K_CLASS_D;
+LOG_FILE_DESC[DSC$B_DTYPE] = DSC$K_DTYPE_T;
+LOG_FILE_DESC[DSC$W_LENGTH] = 0;
+LOG_FILE_DESC[DSC$A_POINTER] = 0;
+
+FIND_RESULT[DSC$B_CLASS] = DSC$K_CLASS_D;
+FIND_RESULT[DSC$B_DTYPE] = DSC$K_DTYPE_T;
+FIND_RESULT[DSC$W_LENGTH] = 0;
+FIND_RESULT[DSC$A_POINTER] = 0;
+
+FIND_CONTEXT = 0;
+
+FIND_DEFAULT[DSC$B_CLASS] = DSC$K_CLASS_S;
+FIND_DEFAULT[DSC$B_DTYPE] = DSC$K_DTYPE_T;
+FIND_DEFAULT[DSC$W_LENGTH] =  %CHARCOUNT('.COM');
+FIND_DEFAULT[DSC$A_POINTER] = UPLIT BYTE('.COM');
+
+FLAGS = 0;
+
+
+! Initialize for command parsing utilities.
+!
+PARSE_GLOBAL_INIT(
+    ICURSOR=	ITEM_BUFFER,
+    DCURSOR=	DATA_BUFFER,
+    MESSAGE=	SUBMIT$_FACILITY^16 + SHR$_INVQUAVAL + STS$K_SEVERE,
+    VALUE_DESC=	VALUE_DESC);
+
+
+! Get the command verb.  If it is PRINT, rather than SUBMIT, change some
+! defaults.
+!
+CLI$GET_VALUE(D_$VERB, VALUE_DESC);
+IF CH$RCHAR(.VALUE_DESC[DSC$A_POINTER]) EQL %C'P'
+THEN
+    BEGIN
+    FLAGS[V_PRINT] = TRUE;
+    FIND_DEFAULT[DSC$A_POINTER] = UPLIT BYTE ('.LIS');
+    END;
+
+! Get the common qualifiers context for the PRINT command
+!
+GET_COMM_QUAL_CONTEXT();
+
+
+! Get the command qualifiers.
+!
+FLAGS[V_IDENTIFY] = CLI$PRESENT(D_IDENTIFY);
+FLAGS[V_REMOTE] = CLI$PRESENT(D_REMOTE);
+
+
+! Get the /AFTER qualifier.
+!
+PARSE_CALL(AFTER, D_AFTER);
+
+
+! Get the /CHARACTERISTICS qualifier.
+!
+PARSE_CALL(CHARACTERISTICS, D_CHARACTERISTICS);
+
+
+! Get the /HOLD qualifier.
+!
+PARSE_CALL(IF_TRUE, D_HOLD,
+    SJC$_HOLD);
+
+
+! Get the /NOTIFY qualifier.
+!
+PARSE_CALL(IF_TRUE, D_NOTIFY,
+    SJC$_NOTIFY);
+
+
+! Get the /PARAMETERS qualifier.
+!
+PARSE_CALL(PARAMETERS, D_PARAMETERS);
+
+
+! Get the /PRIORITY qualifier.
+!
+PARSE_CALL(PRIORITY, D_PRIORITY);
+
+
+! Get the /RESTART qualifier.
+!
+PARSE_CALL(IF_TRUE_FALSE, D_RESTART,
+    SJC$_RESTART, SJC$_NO_RESTART);
+
+
+! Get the /USER qualifier.
+!
+PARSE_CALL(USER, D_USER);
+
+
+IF .FLAGS[V_PRINT]
+THEN
+    BEGIN
+
+    ! Get the command-level /BURST qualifier.
+    !
+    PARSE_CALL(IF_TRUE, D_BURST_ALL, SJC$_FILE_BURST);
+    PARSE_CALL(IF_TRUE, D_BURST_ONE, SJC$_FILE_BURST_ONE);
+    PARSE_CALL(IF_FALSE, D_BURST, SJC$_NO_FILE_BURST);
+
+
+    ! Get the /DEVICE qualifier.
+    !
+    IF CLI$PRESENT(D_DEVICE) AND NOT CLI$PRESENT(D_QUEUE)
+    THEN
+	PARSE_CALL(QUEUE, D_DEVICE, SJC$_QUEUE, $DESCRIPTOR('SYS$PRINT'));
+
+
+    ! Get the command-level /FLAG qualifier.
+    !
+    PARSE_CALL(IF_TRUE, D_FLAG_ALL, SJC$_FILE_FLAG);
+    PARSE_CALL(IF_TRUE, D_FLAG_ONE, SJC$_FILE_FLAG_ONE);
+    PARSE_CALL(IF_FALSE, D_FLAG, SJC$_NO_FILE_FLAG);
+
+
+    ! Get the /FORM qualifier.
+    !
+    PARSE_CALL(FORM, D_FORM);
+
+
+    ! Get the /JOB_COUNT qualifier.
+    !
+    PARSE_CALL(COPIES, D_JOB_COUNT,
+	SJC$_JOB_COPIES);
+
+
+    ! Get the /LOWERCASE qualifier.
+    !
+    PARSE_CALL(IF_TRUE, D_LOWERCASE,
+	SJC$_LOWERCASE);
+
+
+    ! Get the /NAME qualifier.
+    !
+    PARSE_CALL(NAME, D_NAME);
+
+
+    ! Get the /NOTE qualifier.
+    !
+    PARSE_CALL(STRING, D_NOTE,
+	SJC$_NOTE, SJC$_NO_NOTE);
+
+
+    ! Get the /OPERATOR qualifier.
+    !
+    PARSE_CALL(STRING, D_OPERATOR,
+	SJC$_OPERATOR_REQUEST, SJC$_NO_OPERATOR_REQUEST);
+
+
+    ! Get the /QUEUE qualifier.
+    !
+    IF NOT CLI$PRESENT(D_DEVICE)
+    THEN
+	PARSE_CALL(QUEUE, D_QUEUE, SJC$_QUEUE, $DESCRIPTOR('SYS$PRINT'));
+
+
+    ! Get the command-level /TRAILER qualifier.
+    !
+    PARSE_CALL(IF_TRUE, D_TRAILER_ALL, SJC$_FILE_TRAILER);
+    PARSE_CALL(IF_TRUE, D_TRAILER_ONE, SJC$_FILE_TRAILER_ONE);
+    PARSE_CALL(IF_FALSE, D_TRAILER, SJC$_NO_FILE_TRAILER);
+    END
+ELSE
+    BEGIN
+
+    ! Get the /CLI qualifier.
+    !
+    PARSE_CALL(FILENAME, D_CLI,
+	SJC$_CLI, SJC$_NO_CLI);
+
+
+    ! Get the /CPUTIME qualifier.
+    !
+    PARSE_CALL(CPUTIME, D_CPUTIME,
+	SJC$_CPU_LIMIT, SJC$_NO_CPU_LIMIT);
+
+
+    ! Get the /KEEP qualifier.
+    !
+    PARSE_CALL(IF_TRUE, D_KEEP,
+	SJC$_NO_LOG_DELETE);
+
+
+    ! Get the /LOG_FILE qualifier.
+    !
+    Q_VALUE_DESC = LOG_FILE_DESC;
+    FLAGS[V_NO_LOG_FILE] = PARSE_CALL_VALUE(LOG_FILE, D_LOG_FILE);
+
+
+    ! Get the /NAME qualifier.
+    !
+    Q_VALUE_DESC = VALUE_DESC;
+    PARSE_CALL(NAME, D_NAME);
+
+
+    ! Get the log file specification.
+    !
+    IF NOT .FLAGS[V_NO_LOG_FILE]
+    THEN
+	PARSE_CALL(NAME_AND_LOG_FILE,
+	    VALUE_DESC, LOG_FILE_DESC,
+	    $DESCRIPTOR('SYS$LOGIN:.LOG'), SUBMIT$_INVLOGFIL);
+
+
+    ! Get the /PRINTER qualifier.
+    !
+    PARSE_CALL(PRINTER, D_PRINTER);
+
+
+    ! Get the /QUEUE qualifier.
+    !
+    PARSE_CALL(QUEUE, D_QUEUE, SJC$_QUEUE, $DESCRIPTOR('SYS$BATCH'));
+
+
+    ! Get the /WSDEFAULT qualifier.
+    !
+    PARSE_CALL(WORKING_SET, D_WSDEFAULT,
+	SJC$_WSDEFAULT, SJC$_NO_WSDEFAULT);
+
+
+    ! Get the /WSEXTENT qualifier.
+    !
+    PARSE_CALL(WORKING_SET, D_WSEXTENT,
+	SJC$_WSEXTENT, SJC$_NO_WSEXTENT);
+
+
+    ! Get the /WSQUOTA qualifier.
+    !
+    PARSE_CALL(WORKING_SET, D_WSQUOTA,
+	SJC$_WSQUOTA, SJC$_NO_WSQUOTA);
+    END;
+
+
+! Create the job.
+!
+IF NOT .FLAGS[V_REMOTE]
+THEN
+    BEGIN
+    LOCAL
+	IOSB:		VECTOR[4,WORD],	! I/O status block
+	STATUS;				! Status return
+
+
+    ! Finish the list and send the create job request.
+    !
+    Q_ICURSOR[0,0,32,0] = 0;
+    STATUS = $SNDJBCW(
+	FUNC=SJC$_CREATE_JOB,
+	ITMLST=ITEM_BUFFER,
+	IOSB=IOSB);
+    IF .STATUS THEN STATUS = .IOSB;
+    IF NOT .STATUS
+    THEN	
+	SIGNAL_STOP(
+	    SUBMIT$_CREJOB, 0, .STATUS);
+
+
+    ! Establish an exit handler to delete the open job on an abnormal exit.
+    !
+    EXIT_BLOCK[0] = 0;
+    EXIT_BLOCK[1] = EXIT_HANDLER;
+    EXIT_BLOCK[2] = 1;
+    EXIT_BLOCK[3] = EXIT_BLOCK[4];
+    EXIT_BLOCK[4] = 0;
+    $DCLEXH(DESBLK=EXIT_BLOCK);
+    END;
+
+
+! Loop for all elements of the parameter list.
+!
+WHILE CLI$GET_VALUE(D_P1, INPUT_DESC) DO
+    BEGIN
+    LOCAL
+	STATUS_3,
+	STATUS_2;
+
+    ! Set up the message buffer for the ADDFIL request.
+    !
+    Q_ICURSOR = ITEM_BUFFER;
+    Q_DCURSOR = DATA_BUFFER;
+
+
+    ! Get the /DELETE qualifier.
+    !
+    PARSE_CALL(IF_TRUE, D_DELETE,
+	SJC$_DELETE_FILE);
+
+
+    IF .FLAGS[V_PRINT]
+    THEN
+	BEGIN
+
+	! Get the local-level /BURST qualifier.
+	!
+	PARSE_CALL(LOCAL_TRUE_FALSE, D_BURST,
+	    SJC$_FILE_BURST, SJC$_NO_FILE_BURST);
+
+
+	! Get the /COPIES qualifier.
+	!
+	PARSE_CALL(COPIES, D_COPIES,
+	    SJC$_FILE_COPIES);
+
+
+	! Get the /FEED qualifier.
+	!
+	PARSE_CALL(IF_TRUE_FALSE, D_FEED,
+	    SJC$_PAGINATE, SJC$_NO_PAGINATE);
+
+
+	! Get the local-level /FLAG qualifier.
+	!
+	PARSE_CALL(LOCAL_TRUE_FALSE, D_FLAG,
+	    SJC$_FILE_FLAG, SJC$_NO_FILE_FLAG);
+
+
+	! Get the /HEADER qualifier.
+	!
+	PARSE_CALL(IF_TRUE, D_HEADER,
+	    SJC$_PAGE_HEADER);
+
+
+	! Get the /PAGES qualifier.
+	!
+	PARSE_CALL(LOWER_UPPER, D_PAGES,
+	    SJC$_FIRST_PAGE, SJC$_NO_FIRST_PAGE,
+	    SJC$_LAST_PAGE,  SJC$_NO_LAST_PAGE);
+
+
+	! Get the /PASSALL qualifier.
+	!
+	PARSE_CALL(IF_TRUE, D_PASSALL,
+	    SJC$_PASSALL);
+
+
+	! Get the /SETUP qualifier.
+	!
+	PARSE_CALL(COMMA_LIST, D_SETUP,
+	    SJC$_FILE_SETUP_MODULES, SJC$_NO_FILE_SETUP_MODULES);
+
+
+	! Get the /SPACE qualifier.
+	!
+	PARSE_CALL(IF_TRUE, D_SPACE,
+	    SJC$_DOUBLE_SPACE);
+
+
+	! Get the local-level /TRAILER qualifier.
+	!
+	PARSE_CALL(LOCAL_TRUE_FALSE, D_TRAILER,
+	    SJC$_FILE_TRAILER, SJC$_NO_FILE_TRAILER);
+	END;
+
+
+    ! Loop, calling LIB$FIND_FILE to get files matching the input spec.
+    !
+    UNTIL
+	BEGIN
+	STATUS_2 = LIB$FIND_FILE(
+	    INPUT_DESC,
+	    FIND_RESULT,
+	    FIND_CONTEXT,
+	    FIND_DEFAULT,
+	    0,0,%REF(2));		!Request multiple input file processing
+	.STATUS_2 EQL RMS$_NMF
+	END
+    DO
+	BEGIN
+	IF NOT .STATUS_2				! Report error
+	THEN
+	    BEGIN
+	    SIGNAL(
+		(IF .FLAGS[V_PRINT]
+		    THEN SUBMIT$_FACILITY^16 + SHR$_OPENIN + STS$K_ERROR
+		    ELSE SUBMIT$_FACILITY^16 + SHR$_OPENIN + STS$K_SEVERE),
+		1, FIND_RESULT,
+		.FIND_CONTEXT[FAB$L_STS], .FIND_CONTEXT[FAB$L_STV]);
+	    END
+	ELSE
+	    BEGIN
+	    LOCAL
+		PROMPT_DESC;
+
+	    PROMPT_DESC = FIND_RESULT;			! Pointer to a desc of
+							! the filename
+
+	    STATUS_3 = LIB$QUAL_FILE_MATCH (
+			QUAL_CONTEXT,			! Qualifier context
+			.FIND_CONTEXT,			! Fab pointer
+			0,				! No file name
+			( IF .FLAGS[V_PRINT]
+			THEN $DESCRIPTOR('!AS, Print? [N]:')
+			ELSE $DESCRIPTOR('!AS, Submit? [N]:')),
+							! Prompt
+			PROMPT_DESC,			! Descriptor filename
+			0);				! No prompt routine
+
+	    IF NOT (.STATUS_3)
+	    THEN
+		BEGIN
+		IF (.STATUS_3 NEQ LIB$_FILFAIMAT) AND
+		    (.STATUS_3 NEQ LIB$_QUIPRO) AND
+		    (.STATUS_3 NEQ LIB$_NEGANS)
+		THEN
+		    BEGIN
+		    SIGNAL (SUBMIT$_FACILITY^16 + 
+			    SHR$_FILNOTACC + STS$K_WARNING,
+			    1, FIND_RESULT);
+		    END
+		ELSE IF (.STATUS_3 EQL LIB$_QUIPRO)
+		THEN
+		    EXITLOOP;				! Quit Now
+		END
+	    ELSE
+		BEGIN
+
+		FIND_CONTEXT[FAB$V_SPL] = FIND_CONTEXT[FAB$V_SCF] = FALSE;
+
+		IF NOT $OPEN(FAB=.FIND_CONTEXT)
+		THEN
+		    SIGNAL(
+			(IF .FLAGS[V_PRINT]
+			THEN SUBMIT$_FACILITY^16 + SHR$_OPENIN + STS$K_ERROR
+			ELSE SUBMIT$_FACILITY^16 + SHR$_OPENIN + STS$K_SEVERE),
+			    1, FIND_RESULT,
+			    .FIND_CONTEXT[FAB$L_STS], .FIND_CONTEXT[FAB$L_STV])
+		ELSE
+		    BEGIN
+		    IF .FLAGS[V_REMOTE]
+		    THEN
+			BEGIN
+			IF NOT .BBLOCK[FIND_CONTEXT[FAB$L_DEV], DEV$V_NET]
+			THEN
+			    SIGNAL(
+				SUBMIT$_REMOINSF,
+				1, FIND_RESULT)
+			ELSE
+			    IF .FLAGS[V_PRINT]
+			    THEN FIND_CONTEXT[FAB$V_SPL] = TRUE
+			    ELSE FIND_CONTEXT[FAB$V_SCF] = TRUE;
+			END;
+
+
+		    IF NOT $CLOSE(FAB=.FIND_CONTEXT)
+		    THEN
+			SIGNAL(
+			    SUBMIT$_FACILITY^16 + SHR$_CLOSEIN + STS$K_ERROR,
+			    1, FIND_RESULT,
+			    .FIND_CONTEXT[FAB$L_STS], .FIND_CONTEXT[FAB$L_STV]);
+
+
+		    IF NOT .FLAGS[V_REMOTE]
+		    THEN
+			BEGIN
+			IF .BBLOCK[FIND_CONTEXT[FAB$L_DEV], DEV$V_NET]
+			THEN
+			    SIGNAL(
+				SUBMIT$_REMOINSF,
+				1, FIND_RESULT)
+		 	ELSE
+			    BEGIN
+			    IF NOT .BBLOCK[FIND_CONTEXT[FAB$L_DEV], DEV$V_FOD]
+			    OR .BBLOCK[FIND_CONTEXT[FAB$L_DEV], DEV$V_FOR]
+			    OR .BBLOCK[FIND_CONTEXT[FAB$L_DEV], DEV$V_SQD]
+			    THEN
+				SIGNAL (
+				    SUBMIT$_INVFILSPE,
+				    1, FIND_RESULT)
+			    ELSE
+				BEGIN
+				! Add the SJC$_FILE_IDENTIFICATION item.
+				!
+				LOCAL
+				    LEN,		! Filename length
+				    NAM: REF BBLOCK,	! Pointer to NAM block
+				    IOSB:VECTOR[4,WORD],! I/O status block
+				    STATUS;		! Status return
+
+				NAM = .FIND_CONTEXT[FAB$L_NAM];
+				Q_ICURSOR[0,0,16,0] = NAM$S_DVI + NAM$S_FID 
+							+ NAM$S_DID;
+				Q_ICURSOR[2,0,16,0] = SJC$_FILE_IDENTIFICATION;
+				Q_ICURSOR[4,0,32,0] = NAM[NAM$T_DVI];
+				Q_ICURSOR[8,0,32,0] = 0;
+				Q_ICURSOR[12,0,32,0] = 0;
+
+
+				! Send the add file request.
+				!
+				STATUS = $SNDJBCW(
+					FUNC=SJC$_ADD_FILE,
+					ITMLST=ITEM_BUFFER,
+					IOSB=IOSB);
+				IF .STATUS THEN STATUS = .IOSB;
+				IF NOT .STATUS
+				THEN	
+				    SIGNAL(
+					SUBMIT$_ADDFIL, 1, FIND_RESULT, 
+					.STATUS)
+				ELSE
+				    CNT = .CNT + 1;	! Count of files in Job
+				END;
+			    END;
+			END;
+		    END;
+		END;
+	    END;
+	END;
+    END;
+
+IF NOT .FLAGS[V_REMOTE]
+THEN
+    BEGIN
+    LOCAL
+	IOSB:		VECTOR[4,WORD],	! I/O status block
+	STATUS;				! Status return
+
+
+    ! Add the JOB_STATUS_OUTPUT item and finish the list.
+    !
+    Q_ICURSOR = ITEM_BUFFER;
+    IF .FLAGS[V_IDENTIFY]
+    THEN
+	BEGIN
+	JSM_DESC[0] = 0;
+	JSM_DESC[1] = JSM_BUFFER;
+	Q_ICURSOR[0,0,16,0] = %ALLOCATION(JSM_BUFFER);
+	Q_ICURSOR[2,0,16,0] = SJC$_JOB_STATUS_OUTPUT;
+	Q_ICURSOR[4,0,32,0] = JSM_BUFFER;
+	Q_ICURSOR[8,0,32,0] = JSM_DESC;
+	Q_ICURSOR = .Q_ICURSOR + 12;
+	END;
+    Q_ICURSOR[0,0,32,0] = 0;
+
+
+    ! Send the close job request.
+    !
+    STATUS = $SNDJBCW(
+	FUNC=SJC$_CLOSE_JOB,
+	ITMLST=ITEM_BUFFER,
+	IOSB=IOSB);
+
+
+    ! Cancel the exit handler established to delete the job on abnormal exit.
+    !
+    $CANEXH(DESBLK=EXIT_BLOCK);
+
+
+    ! If close job failed and the count of jobs sent indicates that there
+    ! WERE jobs then issue error.
+    !
+    IF .STATUS THEN STATUS = .IOSB;
+    IF NOT .STATUS AND (.CNT NEQ 0)
+    THEN	
+	SIGNAL_STOP(
+	    SUBMIT$_CREJOB, 0, .STATUS);
+
+
+    ! Execute /IDENTIFY only if there WAS a job.  Assume an error
+    ! was issued if no tasks in the job.
+    !
+    IF .FLAGS[V_IDENTIFY] AND (.CNT NEQ 0)
+    THEN
+	SIGNAL(
+	    SUBMIT$_FACILITY^16 + SHR$_TEXT + STS$K_SUCCESS,
+	    1 OR %B'0001'^16,
+	    JSM_DESC);
+    END;
+
+
+! Return with the most severe error encountered.
+!
+.EXIT_STATUS OR STS$M_INHIB_MSG
+END;
+
+ROUTINE GET_COMM_QUAL_CONTEXT: NOVALUE =
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine is gets the common qualifier context.
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	QUAL_CONTEXT	-  defined locally in main routine.
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+LOCAL
+	BITMAP,
+	STATUS;
+
+! Set up the context bitmap
+!
+BITMAP= LIB$M_CQF_CONFIRM OR LIB$M_CQF_EXCLUDE OR
+	LIB$M_CQF_BEFORE OR LIB$M_CQF_SINCE OR
+	LIB$M_CQF_CREATED OR LIB$M_CQF_MODIFIED OR
+	LIB$M_CQF_EXPIRED OR LIB$M_CQF_BACKUP OR
+	LIB$M_CQF_BYOWNER;
+
+! Get the common qualifier context
+!
+IF NOT (STATUS = LIB$QUAL_FILE_PARSE (BITMAP, QUAL_CONTEXT))
+THEN
+    SIGNAL_STOP (.STATUS);
+
+END;
+
+ROUTINE EXIT_HANDLER: NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine is an exit handler that is established as long as the
+!	process owns an open job.  Its function is to delete the open job
+!	if an image exit should occur.
+!
+! INPUT PARAMETERS:
+!	Standard exit handler parameters (not used).
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+$SNDJBC(FUNC=SJC$_CLOSE_DELETE);
+END;
+
+ROUTINE HANDLER(SIG,MECH)=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine is the condition handler for the main routine.  It
+!	saves the most severe condition as the exit status.
+!
+! INPUT PARAMETERS:
+!	Standard VMS condition handler parameters.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	EXIT_STATUS	- Contains the most severe status encountered.
+!
+! ROUTINE VALUE:
+!	SS$_RESIGNAL
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+MAP
+	SIG:		REF BBLOCK,	! Signal parameters
+	MECH:		REF BBLOCK;	! Mechanism parameters
+BIND
+	SIGNAME = SIG[CHF$L_SIG_NAME] : BBLOCK;	! Name of signal
+
+
+! Change the facility code from SUBMIT to PRINT if required.
+!
+IF
+    .FLAGS[V_PRINT]
+    AND NOT .SIGNAME
+    AND .SIGNAME[STS$V_FAC_NO] EQL SUBMIT$_FACILITY
+THEN
+    SIGNAME[STS$V_FAC_NO] = PRINT$_FACILITY;
+
+
+! Save the most severe condition as the exit status.
+!
+IF
+    NOT .SIGNAME				! If an error signal
+    AND ((.SIGNAME[STS$V_SEVERITY]		! and severity is worse
+	GTRU .EXIT_STATUS[STS$V_SEVERITY])
+	OR .EXIT_STATUS[STS$V_SEVERITY])	! or no errors yet
+THEN
+    EXIT_STATUS = .SIGNAME;			! then save it for exit
+
+
+SS$_RESIGNAL					! Resignal to get message
+END;
+
+END
+ELUDOM

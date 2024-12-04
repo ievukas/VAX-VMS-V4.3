@@ -1,0 +1,840 @@
+MODULE EXECUTOR	(%TITLE	'Executor control'
+		IDENT = 'V04-002'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:
+!	Job controller.
+!
+! ABSTRACT:
+!	This module contains the routines that control executors.
+!
+! ENVIRONMENT:
+!	VAX/VMS user and kernel mode.
+!--
+!
+! AUTHOR: M. Jack, CREATION DATE: 16-Feb-1982
+!
+! MODIFIED BY:
+!
+!	V04-002	JAK0234		J A Krycka	11-Sep-1984
+!		Increase process rundown timer to 2 minutes.
+!
+!	V04-001	JAK0233		J A Krycka	10-Sep-1984
+!		Set flag in START_EXECUTOR_JOB if the job could not be
+!		placed in execution and the job header record is released.
+!
+!	V03-005	SHZ0001		Stephen H. Zalewski,	07-Dec-1983
+!		Allow a process 5 seconds to rundown before reissueing
+!		the force exit in the next higher access mode.
+!
+!	V03-004	MLJ0115		Martin L. Jack,	30-Jul-1983  14:41
+!		Changes for job controller baselevel.
+!
+!	V03-003	MLJ0114		Martin L. Jack,	23-Jun-1983  4:58
+!		Changes for job controller baselevel.
+!
+!	V03-002	MLJ0113		Martin L. Jack,	26-May-1983  21:06
+!		Changes for job controller baselevel.
+!
+!	V03-001	MLJ0112		Martin L. Jack,	29-Apr-1983  2:57
+!		Changes for job controller baselevel.
+!
+!**
+
+REQUIRE 'SRC$:JOBCTLDEF';
+
+
+FORWARD ROUTINE
+	START_EXECUTION,
+	START_EXECUTOR_JOB:		NOVALUE,
+	ABORT_EXECUTION,
+	ABORT_EXECUTOR_JOB,
+	PAUSE_EXECUTION,
+	RESUME_EXECUTION,
+	RESET_EXECUTOR_QUEUE:		NOVALUE;
+
+
+EXTERNAL ROUTINE
+	ALLOCATE_MEMORY,
+	COMPLETE_JOB:			NOVALUE,
+	CREATE_SRQ_RECORD,
+	DEALLOCATE_MEMORY:		NOVALUE,
+	ENTER_PROCESS_DATA:		NOVALUE,
+	FIND_PROCESS_DATA:		L_OUTPUT_3,
+	PAUSE_SYMBIONT_TASK:		NOVALUE,
+	READ_RECORD,
+	RELEASE_RECORD:			NOVALUE,
+	RESET_SYMBIONT_STREAM:		NOVALUE,
+	RESUME_SYMBIONT_TASK:		NOVALUE,
+	REWRITE_RECORD:			NOVALUE,
+	START_SYMBIONT_TASK:		NOVALUE,
+	STOP_SYMBIONT_TASK:		NOVALUE,
+	UPDATE_GETQUI_DATA:		NOVALUE;
+
+
+EXTERNAL
+	ALL_PRIVILEGES,
+	NLA0_DESC;
+
+
+LINKAGE
+	EXE$EPID_TO_PCB_LINKAGE =
+	    JSB(REGISTER=0):
+	    PRESERVE(1, 2, 3, 4, 5) NOTUSED(6, 7, 8, 9, 10, 11),
+
+
+	SCH$FORCEDEXIT_LINKAGE =
+	    JSB(REGISTER=0, REGISTER=3, REGISTER=4):
+	    NOPRESERVE(1, 2) PRESERVE(5) NOTUSED(6, 7, 8, 9, 10, 11);
+
+
+EXTERNAL ROUTINE
+	EXE$EPID_TO_PCB: EXE$EPID_TO_PCB_LINKAGE ADDRESSING_MODE(GENERAL),
+	SCH$FORCEDEXIT:	SCH$FORCEDEXIT_LINKAGE ADDRESSING_MODE(GENERAL);
+
+
+FORWARD
+	LOCK_IPL;
+
+
+BUILTIN
+	MTPR;
+
+GLOBAL ROUTINE START_EXECUTION(SMQ_N,SMQ,SJH_N,SJH)=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine performs the actual communication that starts a job on an
+!	executor.
+!
+! INPUT PARAMETERS:
+!	SMQ_N		- Record number of SMQ.
+!	SMQ		- Pointer to SMQ.
+!	SJH_N		- Record number of SJH.
+!	SJH		- Pointer to SJH.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	Completion status.
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+MAP
+	SMQ:		REF BBLOCK,	! Pointer to SMQ
+	SJH:		REF BBLOCK;	! Pointer to SJH
+
+
+IF .SMQ[SMQ$V_BATCH]
+THEN
+    BEGIN
+    LOCAL
+	IMAGE_BUFFER:	VECTOR[63,BYTE],! Buffer for image name
+	IMAGE_DESC:	VECTOR[2],	! Descriptor for image name
+	PRCNAM_BUFFER:	VECTOR[15,BYTE],! Buffer for process name
+	PRCNAM_DESC:	VECTOR[2],	! Descriptor for process name
+	PRCNAM,				! Process name parameter
+	STSFLG:		BBLOCK[4],	! Process status
+	STATUS;				! Status return
+
+
+    ! Set up the process name as "BATCH_n".
+    !
+    PRCNAM_DESC[0] = %ALLOCATION(PRCNAM_BUFFER);
+    PRCNAM_DESC[1] = PRCNAM_BUFFER;
+    $FAO(
+	$DESCRIPTOR('BATCH_!UL'),
+	PRCNAM_DESC,
+	PRCNAM_DESC,
+	.SJH[SYM$L_ENTRY_NUMBER]);
+
+
+    ! Set up the image name as "SYS$SYSTEM:name.EXE".
+    !
+    IMAGE_DESC[0] = %ALLOCATION(IMAGE_BUFFER);
+    IMAGE_DESC[1] = IMAGE_BUFFER;
+    $FAO(
+	$DESCRIPTOR('SYS$SYSTEM:!AC.EXE'),
+	IMAGE_DESC,
+	IMAGE_DESC,
+	(IF CH$RCHAR(SJH[SJH$T_CLI]) EQL 0
+	    THEN UPLIT BYTE (%ASCIC 'LOGINOUT')
+	    ELSE SJH[SJH$T_CLI]));
+
+
+    ! Set up the process status.
+    !
+    STSFLG = PRC$M_BATCH;
+    IF NOT .SMQ[SMQ$V_SWAP] THEN STSFLG[PRC$V_PSWAPM] = TRUE;
+
+
+    ! The following loop is executed at most twice.
+    !
+    PRCNAM = PRCNAM_DESC;
+    WHILE TRUE DO
+	BEGIN
+
+	! Try to create the process.
+	!
+	STATUS = $CREPRC(
+	    PIDADR=SJH[SJH$L_EXECUTOR_PID],
+	    IMAGE=IMAGE_DESC,
+	    INPUT=NLA0_DESC,
+	    OUTPUT=PRCNAM_DESC,
+	    ERROR=PRCNAM_DESC,
+	    PRVADR=ALL_PRIVILEGES,
+	    PRCNAM=.PRCNAM,
+	    BASPRI=.SMQ[SMQ$B_BASE_PRIORITY],
+	    UIC=.JBC_UIC,
+	    STSFLG=.STSFLG);
+
+
+	IF NOT .STATUS
+	THEN
+	    BEGIN
+
+	    ! Create failed.  If the status is not "duplicate process name", or
+	    ! if a create has already been tried with no name, give up.
+	    ! Otherwise, loop to try creation with no name.
+	    !
+	    IF .STATUS<0,16> NEQ SS$_DUPLNAM OR .PRCNAM EQL 0
+		THEN RETURN .STATUS;
+	    PRCNAM = 0;
+	    END
+	ELSE
+	    EXITLOOP;
+	END;
+
+
+    ! Create succeeded.  Record the batch process in the process database
+    ! and mark the job executing.
+    !
+    ENTER_PROCESS_DATA(PDE_K_BATCH, .SJH[SJH$L_EXECUTOR_PID], .SMQ_N, .SJH_N);
+    QUEUE_REFERENCE_COUNT = .QUEUE_REFERENCE_COUNT + 1;
+    SJH[SJH$V_EXECUTING] = TRUE;
+    END
+ELSE
+    BEGIN
+    LOCAL
+	SQR_N,				! Record number of SQR
+	SQR:		REF BBLOCK;	! Pointer to SQR
+
+
+    ! Start the first file in the job.
+    !
+    COPY_TIME(CUR_TIME, SMQ[SMQ$Q_ACM_BEGTIM]);
+    SQR_N = .SJH[SJH$L_CURRENT_FILE_CHKPT];
+    IF .SQR_N EQL 0 THEN SQR_N = .SJH[SJH$L_FILE_LIST];
+    SQR = READ_RECORD(.SQR_N);
+    START_SYMBIONT_TASK(.SMQ_N, .SMQ, .SJH_N, .SJH, .SQR_N, .SQR);
+    RELEASE_RECORD(.SQR_N);
+    END;
+
+
+! Update SJH.
+!
+SJH[SJH$L_CONDITION_1] = 0;
+SJH[SJH$L_CONDITION_2] = 0;
+SJH[SJH$L_CONDITION_3] = 0;
+SS$_NORMAL
+END;
+
+GLOBAL ROUTINE START_EXECUTOR_JOB(SMQ_N,SMQ,SJH_N,SJH): NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine starts a job on an executor.
+!
+! INPUT PARAMETERS:
+!	SMQ_N		- Record number of SMQ.
+!	SMQ		- Pointer to SMQ.
+!	SJH_N		- Record number of SJH.
+!	SJH		- Pointer to SJH.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+MAP
+	SMQ:		REF BBLOCK,	! Pointer to SMQ
+	SJH:		REF BBLOCK;	! Pointer to SJH
+LOCAL
+	STATUS;				! Status return
+
+
+! If this is a remote queue, enter a remote request.
+!
+IF SYSID_NEQ(THIS_SYSID, SMQ[SMQ$T_SYSID])
+THEN
+    STATUS = CREATE_SRQ_RECORD(SRQ$K_START_JOB, .SMQ_N, .SMQ, .SJH_N, .SJH)
+ELSE
+    STATUS = START_EXECUTION(.SMQ_N, .SMQ, .SJH_N, .SJH);
+
+
+IF .STATUS OR .STATUS EQL 0
+THEN
+    BEGIN
+    LOCAL
+	SJH_NP,				! Record number of predecessor of SJH
+	SJH_P:		REF BBLOCK;	! Pointer to predecessor of SJH
+
+
+    ! Enqueue the job to the current queue.
+    !
+    IF .SMQ[SMQ$L_CURRENT_LIST] EQL 0
+    THEN
+	SMQ[SMQ$L_CURRENT_LIST] = .SJH_N
+    ELSE
+	BEGIN
+	SJH_P = READ_RECORD(SJH_NP = .SMQ[SMQ$L_CURRENT_LIST_END]);
+	SJH_P[SYM$L_LINK] = .SJH_N;
+	REWRITE_RECORD(.SJH_NP);
+	END;
+    SMQ[SMQ$L_CURRENT_LIST_END] = .SJH_N;
+    SMQ[SMQ$B_CURRENT_JOB_COUNT] = .SMQ[SMQ$B_CURRENT_JOB_COUNT] + 1;
+    SJH[SYM$L_LINK] = 0;
+    FLAGS[FLAGS_V_INVALID_SJH] = FALSE;
+    END
+ELSE
+    BEGIN
+
+    ! Fail the job.
+    !
+    SJH[SJH$L_CONDITION_1] = .STATUS;
+    COMPLETE_JOB(.SJH_N, .SJH, .SMQ, 0);
+    FLAGS[FLAGS_V_INVALID_SJH] = TRUE;
+    END;
+END;
+
+ROUTINE DELETE_PROCESS_KERNEL(CTX)=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine causes a process to exit with a specified exit status
+!	by using SCH$FORCEDEXIT to exit each access mode in turn.  This routine
+!	executes in kernel mode and partially at IPL$_SYNCH.
+!
+! INPUT PARAMETERS:
+!	CTX		- Context block.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	Completion status.
+!
+! SIDE EFFECTS:
+!	AST queued to process.
+!
+!--
+
+BEGIN
+MAP
+	CTX:		REF VECTOR;	! Pointer to context block
+REGISTER
+	EPID,				! EPID of process to delete
+	PCB:		REF BBLOCK,	! Pointer to PCB
+	STATUS;				! Exit status
+STACKLOCAL
+	MODE;				! Access mode
+
+
+! Load parameters into registers or onto the kernel stack to avoid page fault
+! at elevated IPL.
+!
+EPID = .CTX[0];
+MODE = .CTX[1];
+STATUS = .CTX[2];
+
+
+! Raise IPL to SYNCH.
+!
+MTPR(LOCK_IPL, PR$_IPL);
+
+
+! Do the real work.
+!
+PCB = EXE$EPID_TO_PCB(.EPID);
+IF
+    BEGIN
+    IF .PCB NEQ 0				! Valid PID
+    THEN
+	.PCB[PCB$V_BATCH]		! Ensure a batch process
+    ELSE
+	FALSE
+    END
+THEN
+    BEGIN
+
+    ! Force the specified access mode to exit with the specified status.
+    !
+    SCH$FORCEDEXIT(MODE, .STATUS, .PCB);
+
+
+    ! Lower IPL.
+    !
+    MTPR(%REF(0), PR$_IPL);
+
+
+    ! If we delivered to kernel mode, clean up.  Otherwise set a kernel
+    ! mode timer to reenter this routine in two minutes for the next
+    ! higher access mode.
+    !
+    IF .MODE NEQ PSL$C_KERNEL
+    THEN
+	BEGIN
+	CTX[1] = .MODE - 1;
+	$SETIMR(
+	    DAYTIM=UPLIT(-1200000000, -1),	! 2 minute delta time
+	    ASTADR=DELETE_PROCESS_KERNEL,
+	    REQIDT=.CTX);
+	END
+    ELSE
+	DEALLOCATE_MEMORY(.CTX);
+
+
+    SS$_NORMAL
+    END
+ELSE
+    BEGIN
+
+    ! Lower IPL.
+    !
+    MTPR(%REF(0), PR$_IPL);
+
+
+    ! Clean up and return.
+    !
+    DEALLOCATE_MEMORY(.CTX);
+    SS$_NONEXPR
+    END
+END;
+
+OWN
+	LOCK_IPL:	PSECT(CODE) INITIAL(IPL$_SYNCH);
+
+
+%IF LOCK_IPL + 4 - DELETE_PROCESS_KERNEL GTR 512
+%THEN %ERROR('Possible page fault at elevated IPL') %FI
+
+GLOBAL ROUTINE ABORT_EXECUTION(SMQ_N,SMQ,SJH_N,SJH)=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine performs the actual communication that aborts a job on an
+!	executor.
+!
+! INPUT PARAMETERS:
+!	SMQ_N		- Record number of SMQ.
+!	SMQ		- Pointer to SMQ.
+!	SJH_N		- Record number of SJH.
+!	SJH		- Pointer to SJH.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	Completion status.
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+MAP
+	SMQ:		REF BBLOCK,	! Pointer to SMQ
+	SJH:		REF BBLOCK;	! Pointer to SJH
+LOCAL
+	STATUS;				! Status return
+
+
+IF .SMQ[SMQ$V_BATCH]
+THEN
+    BEGIN
+    LOCAL
+	CTX:		REF VECTOR,	! Pointer to context area
+	ARGLST:		VECTOR[2];	! $CMKRNL argument list
+
+
+    CTX = ALLOCATE_MEMORY();
+    CTX[0] = .SJH[SJH$L_EXECUTOR_PID];
+    CTX[1] = PSL$C_USER;
+    CTX[2] = JBC$_JOBABORT OR STS$K_ERROR;
+    IF .SJH[SJH$V_REQUEUE] THEN CTX[2] = JBC$_JOBREQUEUE OR STS$K_ERROR;
+    ARGLST[0] = 1;
+    ARGLST[1] = .CTX;
+    STATUS = $CMKRNL(ROUTIN=DELETE_PROCESS_KERNEL, ARGLST=ARGLST);
+    IF NOT .STATUS THEN RETURN .STATUS;
+    END
+ELSE
+    STOP_SYMBIONT_TASK(.SMQ_N, .SMQ, .SJH_N, .SJH);
+
+
+! Update SJH.
+!
+SJH[SJH$V_ABORTED] = TRUE;
+SS$_NORMAL
+END;
+
+GLOBAL ROUTINE ABORT_EXECUTOR_JOB(SMQ_N,SMQ,SJH_N,SJH)=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine aborts a job on an executor.
+!
+! INPUT PARAMETERS:
+!	SMQ_N		- Record number of SMQ.
+!	SMQ		- Pointer to SMQ.
+!	SJH_N		- Record number of SJH.
+!	SJH		- Pointer to SJH.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	Completion status.
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+MAP
+	SMQ:		REF BBLOCK,	! Pointer to SMQ
+	SJH:		REF BBLOCK;	! Pointer to SJH
+LOCAL
+	STATUS;				! Status return
+
+
+! If this is a remote queue, enter a remote request.  Otherwise, issue the
+! abort.
+!
+IF SYSID_NEQ(THIS_SYSID, SMQ[SMQ$T_SYSID])
+THEN
+    CREATE_SRQ_RECORD(SRQ$K_ABORT_JOB, .SMQ_N, .SMQ, .SJH_N, .SJH)
+ELSE
+    ABORT_EXECUTION(.SMQ_N, .SMQ, .SJH_N, .SJH)
+END;
+
+GLOBAL ROUTINE PAUSE_EXECUTION(SMQ_N,SMQ)=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine performs the actual communication that pauses a job on an
+!	executor.
+!
+! INPUT PARAMETERS:
+!	SMQ_N		- Record number of SMQ.
+!	SMQ		- Pointer to SMQ.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	Completion status.
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+MAP
+	SMQ:		REF BBLOCK;	! Pointer to SMQ
+LOCAL
+	SJH_N,				! Record number of SJH
+	SJH_NS,				! Record number of successor of SJH
+	SJH:		REF BBLOCK,	! Pointer to SJH
+	FINAL_STATUS,			! Final status return
+	STATUS;				! Status return
+
+
+FINAL_STATUS = SS$_NORMAL;
+
+
+IF .SMQ[SMQ$V_BATCH]
+THEN
+    BEGIN
+
+    ! Issue a suspend for all currently executing jobs.
+    !
+    SJH_N = .SMQ[SMQ$L_CURRENT_LIST];
+    WHILE .SJH_N NEQ 0 DO
+	BEGIN
+	SJH = READ_RECORD(.SJH_N);
+	STATUS = $SUSPND(PIDADR=SJH[SJH$L_EXECUTOR_PID]);
+	IF NOT .STATUS AND .FINAL_STATUS THEN FINAL_STATUS = .STATUS;
+	SJH_NS = .SJH[SYM$L_LINK];
+	RELEASE_RECORD(.SJH_N);
+	SJH_N = .SJH_NS;
+	END;
+    SMQ[SMQ$V_PAUSED] = TRUE;
+    END
+ELSE
+    PAUSE_SYMBIONT_TASK(.SMQ_N, .SMQ);
+
+
+.FINAL_STATUS
+END;
+
+GLOBAL ROUTINE RESUME_EXECUTION(SMQ_N,SMQ,FLAGS,ALIGNMENT_PAGES,RELATIVE_PAGE,SEARCH_LENGTH,SEARCH_ADDRESS)=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine performs the actual communication that resumes a job on an
+!	executor.
+!
+! INPUT PARAMETERS:
+!	SMQ_N		- Record number of SMQ.
+!	SMQ		- Pointer to SMQ.
+!	FLAGS		- Resume control flags.
+!	ALIGNMENT_PAGES	- Number of alignment pages (or 0).
+!	RELATIVE_PAGE	- Relative page offset (or 0).
+!	SEARCH_LENGTH	- Descriptor for search string (or 0).
+!	SEARCH_ADDRESS	-
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	Completion status.
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+MAP
+	SMQ:		REF BBLOCK;	! Pointer to SMQ
+LOCAL
+	SJH_N,				! Record number of SJH
+	SJH_NS,				! Record number of successor of SJH
+	SJH:		REF BBLOCK,	! Pointer to SJH
+	FINAL_STATUS,			! Final status return
+	STATUS;				! Status return
+
+
+FINAL_STATUS = SS$_NORMAL;
+
+
+IF .SMQ[SMQ$V_BATCH]
+THEN
+    BEGIN
+
+    ! Issue a resume for all currently executing jobs.
+    !
+    SJH_N = .SMQ[SMQ$L_CURRENT_LIST];
+    WHILE .SJH_N NEQ 0 DO
+	BEGIN
+	SJH = READ_RECORD(.SJH_N);
+	STATUS = $RESUME(PIDADR=SJH[SJH$L_EXECUTOR_PID]);
+	IF NOT .STATUS AND .FINAL_STATUS THEN FINAL_STATUS = .STATUS;
+	SJH_NS = .SJH[SYM$L_LINK];
+	RELEASE_RECORD(.SJH_N);
+	SJH_N = .SJH_NS;
+	END;
+    SMQ[SMQ$V_PAUSED] = FALSE;
+    END
+ELSE
+    RESUME_SYMBIONT_TASK(
+	.SMQ_N, .SMQ,
+	.FLAGS, .ALIGNMENT_PAGES, .RELATIVE_PAGE,
+	.SEARCH_LENGTH, .SEARCH_ADDRESS);
+
+
+.FINAL_STATUS
+END;
+
+GLOBAL ROUTINE RESET_EXECUTOR_QUEUE(SMQ_N,SMQ): NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine resets an executor queue.
+!
+! INPUT PARAMETERS:
+!	SMQ_N		- Record number of SMQ.
+!	SMQ		- Pointer to SMQ.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	Completion status.
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+MAP
+	SMQ:		REF BBLOCK;	! Pointer to SMQ
+
+
+! If the queue has a symbiont, send the symbiont a reset.
+!
+IF .SMQ[SMQ$L_STREAM_SCT] NEQ 0
+THEN
+    RESET_SYMBIONT_STREAM(.SMQ_N, .SMQ);
+
+
+! Reinitialize the queue header as appropriate.
+!
+SMQ[SMQ$L_STATUS] = 0;
+SMQ[SMQ$V_STOPPED] = TRUE;
+CLEAR_TIME(SMQ[SMQ$Q_ACM_BEGTIM]);
+SMQ[SMQ$L_ACM_GETCNT] = 0;
+SMQ[SMQ$L_ACM_PAGECNT] = 0;
+SMQ[SMQ$L_ACM_QIOCNT] = 0;
+SMQ[SMQ$L_ACM_SYMCPUTIM] = 0;
+SMQ[SMQ$L_STREAM_SCT] = 0;
+SMQ[SMQ$B_CURRENT_JOB_COUNT] = 0;
+SMQ[SMQ$B_STREAM_INDEX] = 0;
+
+
+! Process all current jobs.
+!
+WHILE .SMQ[SMQ$L_CURRENT_LIST] NEQ 0 DO
+    BEGIN
+    LOCAL
+	SJH_N,				! Record number of SJH
+	SJH:		REF BBLOCK;	! Pointer to SJH
+
+
+    ! Read and unlink the job header.
+    !
+    SJH = READ_RECORD(SJH_N = .SMQ[SMQ$L_CURRENT_LIST]);
+    UPDATE_GETQUI_DATA(.SJH_N, .SJH);
+    SMQ[SMQ$L_CURRENT_LIST] = .SJH[SYM$L_LINK];		
+
+
+    ! If this is a batch job, delete the process, but clean up data structures
+    ! and complete the job immediately, as if the process had terminated.
+    !
+    IF .SMQ[SMQ$V_BATCH]
+    THEN
+	BEGIN
+ 	LOCAL
+	    CTX:	REF VECTOR,	! Pointer to context area
+	    ARGLST:	VECTOR[2];	! $CMKRNL argument list
+
+
+	CTX = ALLOCATE_MEMORY();
+	CTX[0] = .SJH[SJH$L_EXECUTOR_PID];
+	CTX[1] = PSL$C_USER;
+	CTX[2] = JBC$_QUERESET OR STS$K_ERROR;
+	ARGLST[0] = 1;
+	ARGLST[1] = .CTX;
+	$CMKRNL(ROUTIN=DELETE_PROCESS_KERNEL, ARGLST=ARGLST);
+	FIND_PROCESS_DATA(PDE_K_BATCH, .SJH[SJH$L_EXECUTOR_PID], TRUE);
+	QUEUE_REFERENCE_COUNT = .QUEUE_REFERENCE_COUNT - 1;
+	END;
+
+
+    SJH[SJH$V_SYSTEM_FAILURE] = TRUE;
+    COMPLETE_JOB(.SJH_N, .SJH, .SMQ, 0, JBC$_QUERESET OR STS$K_ERROR);
+    END;
+SMQ[SMQ$L_CURRENT_LIST_END] = 0;
+END;
+
+END
+ELUDOM

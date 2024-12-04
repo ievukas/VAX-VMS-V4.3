@@ -1,0 +1,294 @@
+MODULE	OPC$SHUTDOWN	(
+			 LANGUAGE (BLISS32),
+			 IDENT = 'V04-000'
+			) =
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:
+!
+!	OPCOM
+!
+! ABSTRACT:
+!
+!	This module contains the specialized logic to service
+!	a particular type of request sent by a user to OPCOM.
+!
+! Environment:
+!
+!	VAX/VMS operating system.
+!
+! Author:
+!
+!	Steven T. Jeffreys
+!
+! Creation date:
+!
+!	March 10, 1981
+!
+! Revision history:
+!
+!	V03-003	CWH3003		CW Hobbs			25-Jul-1984
+!		Improve shutdown by bumping the cluster I/O parameters so that
+!		all the messages can be sent immediately.
+!
+!	V03-002	CWH3169		CW Hobbs			5-May-1984
+!		Second pass for cluster-wide OPCOM:
+!		 - Add code to SHUTDOWN jacket routines to crash the
+!		   cluster on command.
+!
+!	V03-001	CWH3001		CW Hobbs			30-Jul-1983
+!		Various and sundry things to make OPCOM distributed
+!		across the cluster.
+!
+! V02-002	STJ0167		Steven T. Jeffreys,	08-Feb-1982
+!		Removed reference to LIB$PUT_OUTPUT.
+!
+!--
+
+BEGIN						! Start of SHUTDOWN
+
+LIBRARY	'SYS$LIBRARY:LIB.L32';
+LIBRARY 'LIB$:OPCOMLIB';
+
+FORWARD ROUTINE
+	SHUTDOWN_HANDLER	: NOVALUE,
+	SHUTDOWN_CLM_HANDLER	: NOVALUE;
+
+EXTERNAL ROUTINE
+	CLUSCOMM_SEND		: NOVALUE,
+	DUMP_LOG_FILE		: NOVALUE,
+	SHUTDOWN_LOOP		: NOVALUE;
+
+EXTERNAL
+	COD_BUSY_MAX,				! Maximum concurrent messages
+	COD_BUSY_NODE,				! Maximum concurrent messages to single node
+	LCL_CSID;
+
+BUILTIN
+	INSQUE,					! Insert entry onto a queue
+	REMQUE;					! Remove entry from a queue
+
+GLOBAL ROUTINE SHUTDOWN_HANDLER (BUFFER_DESC) : NOVALUE =
+
+!++
+! Functional description:
+!
+!	This routine is the handler for all SHUTDOWN messages received by OPCOM.
+!
+!
+! Input:
+!
+!	BUFFER_DESC : The address of a quadword buffer descriptor that
+!		      describes the buffer containing the message.
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	Some accounting data will be updated 
+!	to reflect the receipt of the message.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of SHUTDOWN_HANDLER
+
+MAP
+	BUFFER_DESC	: $ref_bblock;
+
+BIND
+	PRIV = (.BUFFER_DESC [DSC$A_POINTER])+4 : $bblock;
+
+LOCAL
+        REQ		: $ref_bblock,
+	STATUS		: LONG;
+
+!
+! Require cmkrnl privs to shut it down
+!
+IF NOT .priv [prv$v_cmkrnl]
+THEN
+    RETURN DUMP_LOG_FILE (.buffer_desc, %ASCID 'Shutdown message received without sufficient privs');
+!
+! If the request does not contain enough data,
+! then it cannot be processed.  Ignore it.
+!
+IF .buffer_desc [dsc$w_length] LSS (opc$k_shutdown_min_size + opc$k_comhdrsiz)
+THEN
+    RETURN;
+!
+! Get a pointer to the message from the user
+!
+req = .buffer_desc [dsc$a_pointer] + opc$k_comhdrsiz;
+!
+! If a cluster shutdown, then shut everything down
+!
+IF .$bblock [req [opc$l_rq_options], opc$v_cluster]
+THEN
+    BEGIN
+    LOCAL
+	message : $bblock [shut_k_min_size];
+    CH$FILL (0, shut_k_min_size, message);
+    message [clm_b_rqstcode]	= opc$_x_clusmsg;
+    message [clm_b_clm_code]	= clm__shutdown;
+    message [clm_b_ds_version]	= shut_k_ds_version;
+    message [clm_b_sw_version]	= opc$k_sw_version;
+    message [clm_w_length]	= shut_k_min_size;
+    message [clm_l_csid]	= .lcl_csid;
+    cod_busy_max = 64;
+    cod_busy_node = 4;
+    cluscomm_send (-1, shut_k_min_size, message);
+    END;
+!
+! Now do the evil deed
+!
+$CMKRNL (ROUTIN=shutdown_loop);
+
+RETURN;
+END;						! End of SHUTDOWN_HANDLER
+
+GLOBAL ROUTINE SHUTDOWN_CLM_HANDLER (BUFFER_DESC : $ref_bblock, CLM : $ref_bblock, LEN) : NOVALUE =
+
+!++
+! Functional description:
+!
+!	This routine is the handler for all SHUTDOWN messages received by OPCOM from other nodes.
+!
+!
+! Input:
+!
+!	BUFFER_DESC -	pointer to message from remote node, including $SNDOPR header
+!	CLM -		pointer to CLM structure
+!	LEN -		length of LEN
+!
+! Implicit Input:
+!	None.
+!
+! Output:
+!	None.
+!
+! Routine value:
+!	None.
+!--
+
+BEGIN						! Start of SHUTDOWN_CLM_HANDLER
+
+!
+! Check the version number of the message.  If the message is from any other version,
+! simply ignore it.
+!
+IF .CLM [CLM_B_DS_VERSION] NEQ SHUT_K_DS_VERSION
+THEN
+    RETURN DUMP_LOG_FILE (.BUFFER_DESC, %ASCID 'CLM__SHUTDOWN mismatch');
+
+!
+! Bring things to a halt
+!
+$CMKRNL (ROUTIN=shutdown_loop);
+
+RETURN;
+END;						! End of SHUTDOWN_CLM_HANDLER
+
+END						! End of SHUTDOWN
+ELUDOM
+
+MODULE	OPC$SHUTDOWNL  (LANGUAGE (BLISS32), 
+			IDENT = 'V03-001',
+			ADDRESSING_MODE (EXTERNAL=LONG_RELATIVE, NONEXTERNAL=LONG_RELATIVE)) =
+BEGIN
+
+LIBRARY	'SYS$LIBRARY:LIB.L32';
+LIBRARY 'LIB$:OPCOMLIB';
+
+PSECT						! Need new module to change code psect
+    CODE   = _SHUTDOWN_				!  want it page-aligned so that page
+		(NOWRITE,EXECUTE,ALIGN(9));	!  faults won't occur at high IPL
+
+BUILTIN
+	MTPR;
+
+GLOBAL ROUTINE SHUTDOWN_LOOP : NOVALUE =
+
+!++
+! Functional description:
+!
+!	This routine does the actual shutdown
+!
+! Input:
+!	None.
+!
+! Implicit Input:
+!	None.
+!
+! Output:
+!	None.
+!
+!--
+
+BEGIN
+
+GLOBAL
+    LOOPS : VOLATILE;
+
+BUILTIN
+    BUGW;
+
+EXTERNAL LITERAL
+    BUG$_OPERCRASH;
+
+!
+! Use the MTPR to fault in both our global page and the rest of the code
+!
+loops = ipl$_synch;
+MTPR (loops, PR$_IPL);
+!
+! Loop for a second or so to make sure that our messages made it out through the port
+!
+INCR K FROM 0 TO 500000
+DO
+    loops = .loops + 1;				! Pause for a second
+!
+! Now bring it to a halt with our specific bugcheck
+!
+BUGW (BUG$_OPERCRASH OR 4);
+
+RETURN;
+END;
+
+END						! End of SHUTDOWN
+ELUDOM

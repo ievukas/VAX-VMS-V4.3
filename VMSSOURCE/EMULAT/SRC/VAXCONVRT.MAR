@@ -1,0 +1,1400 @@
+	.TITLE	VAX$DECIMAL_CONVERT - VAX-11 Packed Decimal Instruction Emulator
+	.IDENT	/V04-000/
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; Facility: 
+;
+;	VAX-11 Instruction Emulator
+;
+; Abstract:
+;
+;	The routines in this module emulate the VAX-11 instructions that
+;	convert between packed decimal strings and the various forms of
+;	numeric string. These procedures can be a part of an emulator package
+;	or can be called directly after the input parameters have been loaded
+;	into the architectural registers. 
+;
+;	The input parameters to these routines are the registers that
+;	contain the intermediate instruction state. 
+;
+; Environment: 
+;
+;	These routines run at any access mode, at any IPL, and are AST 
+;	reentrant.
+;
+; Author: 
+;
+;	Lawrence J. Kenah	
+;
+; Creation Date
+;
+;	19 October 1983
+;
+; Modified by:
+;
+;	V01-003	LJK0040		Lawrence J. Kenah	24-Jul-1984
+;		Longword context instructions (INCL and DECL) cannot be used
+;		to modify the sign byte in the destination string for CVTSP.
+;
+;	V01-002	LJK0024		Lawrence J. Kenah	20-Feb-1984
+;		Add code that handles access violations. Perform minor cleanup.
+;
+;	V01-001	LJK0008		Lawrence J. Kenah	19-Oct-1983
+;		The emulation code for CVTPS, CVTPT, CVTSP, and CVTTP
+;		was moved into a separate module.
+;
+;--
+
+	.SUBTITLE	Declarations
+
+; Include files:
+
+	.NOCROSS			; No cross reference for these
+	.ENABLE		SUPPRESSION	; No symbol table entries either
+
+	CVTPS_DEF			; Bit fields in CVTPS registers
+	CVTPT_DEF			; Bit fields in CVTPT registers
+	CVTSP_DEF			; Bit fields in CVTSP registers
+	CVTTP_DEF			; Bit fields in CVTTP registers
+
+	$PSLDEF				; Define bit fields in PSL
+
+	.DISABLE	SUPPRESSION	; Turn on symbol table again
+	.CROSS				; Cross reference is OK now
+
+; External declarations:
+
+	.DISABLE	GLOBAL
+
+	.EXTERNAL -
+			VAX$DECIMAL_EXIT,-
+			VAX$DECIMAL_ACCVIO,-
+			VAX$ROPRAND
+
+; PSECT Declarations:
+
+	.DEFAULT	DISPLACEMENT , WORD
+
+	.PSECT _VAX$CODE PIC, USR, CON, REL, LCL, SHR, EXE, RD, NOWRT, LONG
+
+	BEGIN_MARK_POINT
+
+
+	.SUBTITLE	VAX$CVTPx - Convert Packed to Numeric String
+;+
+; Functional Description:
+;
+;	The conversion from a packed decimal string to a numeric string
+;	(CVTPS and CVTPT instructions) consists of much common code and
+;	two small pieces of code that are instruction specific, the
+;	beginning and a portion of the end processing. The actual routine
+;	exit path is the common exit path from the decimal instruction
+;	emulator, VAX$DECIMAL_EXIT.
+;
+;	The two routines perform instruction-specific operations on the
+;	first byte in the stream. The bulk of the work is done by a common
+;	subroutine. Some instruction-specific end processing is done before
+;	final control is passed to VAX$DECIMAL_EXIT.
+;
+;	The structure is something like the following.
+;
+;		CVTPS					CVTPT
+;		-----					-----
+;
+;	Store sign character			Store table address
+;
+;			|			Unpack registers
+;			|
+;			|				|
+;			 \			       /
+;			  \			      /
+;			   \			     /
+;			    |			    |
+;			    v			    v
+;
+;			Handle unequal srclen and dstlen
+;
+;			Move all digits except last digit
+;
+;			    |			    |
+;			   /			     \
+;			  /			      \
+;			 /			       \
+;			|				|
+;			v				v
+;
+;	Move last digit to output		Use table to move last digit
+;						and sign to output string
+;			|
+;			|				|
+;			 \			       /
+;			  \			      /
+;			   \			     /
+;			    |			    |
+;			    v			    v
+;
+;                               VAX$DECIMAL_EXIT
+;			Set condition codes and registers
+;			to their final values
+;
+; Input Parameters:
+;
+;	See instruction-specific entry points
+;
+; Output Parameters:
+;
+;	R0 = 0
+;	R1 = Address of byte containing most significant digit of
+;	     the source string
+;	R2 = 0
+;	R3 = Address of lowest addressed byte of destination string
+;	     (See instruction-specific header for details)
+;
+; Condition Codes:
+;
+;	N <- source string LSS 0
+;	Z <- source string EQL 0
+;	V <- decimal overflow
+;	C <- 0
+;-
+
+	.SUBTITLE	Data Declarations / Packed to Numeric String
+
+;+
+; The following table makes a correspondence between the sixteen possible
+; packed decimal "digits" and their ASCII representation. It is used to
+; generate the sign character for leading separate numeric strings and
+; to generate all character output for the CVTPx common code.
+;-
+
+CVTPx_TABLE:
+	.ASCII		/0123456789+-+-++/
+
+	.SUBTITLE	VAX$CVTPS - Convert Packed to Leading Separate Numeric 
+;+
+; Functional Description:
+;
+;	The source packed decimal string specified  by  the  source  length  and
+;	source  address  operands  is  converted  to  a leading separate numeric
+;	string.  The destination string specified by the destination length  and
+;	destination address operands is replaced by the result.
+;
+;	Conversion is effected by replacing the lowest  addressed  byte  of  the
+;	destination  string  with  the ASCII character '+' or '-', determined by
+;	the sign of the source string.  The remaining bytes of  the  destination
+;	string  are  replaced  by the ASCII representations of the values of the
+;	corresponding packed decimal digits of the source string.
+;
+; Input Parameters:
+;
+;	R0 = srclen.rw		Length in digits of input decimal string
+;	R1 = srcaddr.ab		Address of input packed decimal string
+;	R2 = dstlen.rw		Number of digits in destination character string
+;	R3 = dstaddr.ab 	Address of destination character string
+;
+; Output Parameters:
+;
+;	R0 = 0
+;	R1 = Address of byte containing most significant digit of
+;	     the source string
+;	R2 = 0
+;	R3 = Address of the sign byte of the destination string
+;
+; Condition Codes:
+;
+;	N <- source string LSS 0
+;	Z <- source string EQL 0
+;	V <- decimal overflow
+;	C <- 0
+;
+; Notes:
+;
+;	Note that the two entry points VAX$CVTPS and VAX$CVTPT must save the
+;	exact same set of registers because the two routines use a common exit
+;	path that includes a POPR instruction that restores registers. In
+;	fact, by saving all registers, even if one or two of them are not
+;	needed, we can use the common exit path from this module. 
+;-
+
+VAX$CVTPS::
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>	; Save the lot
+	ESTABLISH_HANDLER	-	; Store address of access
+		CONVERT_ACCVIO		;  violation handler
+	EXTZV	#1,#4,R0,R8		; R8 is byte offset to sign "digit"
+	MARK_POINT	CVTPS_ACCVIO
+	BICB3	#^B11110000,(R1)[R8],R8	; R8 now contains sign "digit"
+	MARK_POINT	CVTPS_ACCVIO
+	MOVB	CVTPx_TABLE[R8],(R3)+	; Store sign character in output string
+	BSBW	CVTPx_COMMON		; Execute bulk as common code
+
+;+
+; The common code routine returns here with the following relevant input.
+;
+;	R0	Number of digits remaining in source and destination strings
+;	R1	Address of least significant digit and sign of input string
+;	R3	Address of last byte in destination to be loaded
+;	R8	Sign "digit" from input string
+;	R11	Saved PSW with condition codes to date (N=0,Z,V,C=0)
+;
+;	CVTPS_A_DSTADDR(SP)	Saved R3 at input, address of sign character
+;
+;	R4 is a scratch register
+;
+; If the input string was negative zero, the sign of the output string must
+; be changed from "-" to "+". In addition, a check is required to insure that
+; the Z-bit has its correct setting if this digit is the first nonzero digit
+; encountered in the input string. 
+;-
+
+	TSTL	R0			; Check for no remaining input
+	BEQL	20$			; Skip storing digit if nothing left
+	MARK_POINT	CVTPS_ACCVIO
+	EXTZV	#4,#4,(R1),R4		; Get least significant digit	
+	BEQL	10$			; Skip clearing Z-bit if zero
+	BICB	#PSL$M_Z,R11		; Clear saved Z-bit
+
+	MARK_POINT	CVTPS_ACCVIO
+10$:	MOVB	CVTPx_TABLE[R4],(R3)	; Store final output digit
+
+20$:	CASE	R8,LIMIT=#10,TYPE=B,<-	; Dispatch on sign 
+		40$,-			; 10 => +
+		30$,-			; 11 => -
+		40$,-			; 12 => +
+		30$,-			; 13 => -
+		40$,-			; 14 => +
+		40$,-			; 15 => +
+		>
+
+30$:	BISB	#PSL$M_N,R11		; Set N-bit because sign is "-"
+	BBC	#PSL$V_Z,R11,40$	; Skip if N-bit set but Z-bit clear
+	BICB	#PSL$M_N,R11		; Turn off N-bit if negative zero
+	BBS	#PSL$V_V,R11,40$	; Leave sign alone if overflow occurred
+	MARK_POINT	CVTPS_ACCVIO
+	MOVB	#^A"+",@CVTPS_A_DSTADDR(SP)	; Make output sign "+"
+40$:	BRW	VAX$DECIMAL_EXIT	; Exit through common code
+
+	.SUBTITLE	VAX$CVTPT - Convert Packed to Trailing Numeric 
+;+
+; Functional Description:
+;
+;	The source packed decimal string specified  by  the  source  length  and
+;	source  address operands is converted to a trailing numeric string.  The
+;	destination string specified by the destination length  and  destination
+;	address  operands is replaced by the result.  The condition code N and Z
+;	bits are affected by the value of the source packed decimal string.
+;
+;	Conversion is effected by using the highest addressed byte (even if  the
+;	source  string  value  is  -0)  of  the  source  string  (i.e., the byte
+;	containing the sign and the least  significant  digit)  as  an  unsigned
+;	index  into  a 256 byte table whose zeroth entry address is specified by
+;	the table address operand.  The byte read out of the table replaces  the
+;	least  significant  byte of the destination string.  The remaining bytes
+;	of the destination string are replaced by the ASCII  representations  of
+;	the  values  of  the  corresponding  packed decimal digits of the source
+;	string.
+;
+; Input Parameters:
+;
+;	R0 <15:0>  = srclen.rw	Length in digits of input decimal string
+;	R0 <31:16> = dstlen.rw	Number of digits in destination character string
+;	R1         = srcaddr.ab	Address of input packed decimal string
+;	R2         = tbladdr.ab	Address of 256-byte table used for sign conversion
+;	R3         = dstaddr.ab Address of destination character string
+;
+; Output Parameters:
+;
+;	R0 = 0
+;	R3 = Address of byte containing most significant digit of
+;	     the source string
+;	R2 = 0
+;	R3 = Address of most significant digit of the destination string
+;
+; Condition Codes:
+;
+;	N <- source string LSS 0
+;	Z <- source string EQL 0
+;	V <- decimal overflow
+;	C <- 0
+;
+; Notes:
+;
+;   1.	Note that the two entry points VAX$CVTPS and VAX$CVTPT must save the
+;	exact same set of registers because the two routines use a common exit
+;	path that includes a POPR instruction that restores registers. In
+;	fact, by saving all registers, even if one or two of them are not
+;	needed, we can use the common exit path from this module. 
+;
+;   2.	This routine and VAX$CVTTP must have a separate JSB entry point.
+;	(Several other routines could use one but it is not required.) Code
+;	that uses the emulator through its JSB entry points cannot be
+;	redirected to a different entry point when the instruction is
+;	restarted after an access violation. The only way that a restart can
+;	be distinguished from a first pass is through an internal FPD bit. The
+;	original sizes for the five operands for CVTPT and CVTTP require all
+;	the bits in the four general registers. 
+;	
+;	The FPD bit is stored in bit<15> of the "srclen" operand. In order to
+;	insure that instructions that enter the emulator through the
+;	VAX$_OPCDEC exception, rather than through its JSB entry points,
+;	correctly generate reserved operands for lengths in the range 32768 to
+;	65535, the internal FPD bit cannot be tested at the VAX$ entry point.
+;	Thus, the extra entry point is required. 
+;
+;	Note that this implementation has the peculiar effect that a reserved
+;	operand exception will not be generated if R0<15:0> contains a number
+;	in the range 32768 and 32768+31 inclusive. 
+;
+;   3.	The RESTART entry point is needed because information is saved in
+;	R0<31:24> if the instruction is interrupted by an access violation.
+;	This information must be cleared out before the length checks are made
+;	or a spurious reserved operand exception would result. 
+;-
+
+VAX$CVTPT_JSB::
+	BBCC	#CVTPT_V_FPD,R0,VAX$CVTPT	; Have we been here before?
+
+	ASSUME	CVTPT_B_DELTA_PC EQ 3	; Make sure that we clear the right byte
+
+VAX$CVTPT_RESTART::
+	BICL2	#^XFF000000,R0		; Eliminate delta-PC from "dstlen"
+
+VAX$CVTPT::
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>	; Save the lot
+	ESTABLISH_HANDLER	-	; Store address of access
+		CONVERT_ACCVIO		;  violation handler
+	MOVL	R2,R9			; Store table address away
+	ROTL	#16,R0,R2		; Store "dstlen" in R2
+	BSBW	CVTPx_COMMON		; Execute bulk as common code
+
+;+
+; The common code routine returns here with the following relevant input.
+;
+;	R1	Address of least significant digit and sign of input string
+;	R2	Number of digits in destination string (preserved across call)
+;	R3	Address of last byte in destination to be loaded
+;	R9	Address of 256-byte table (preserved across call)
+;	R11	Saved PSW with condition codes to date (N=0,Z,V,C=0)
+;
+;	R4 is a scratch register
+;
+; The CVTPS instruction loads R8 in its initialization code. This instruction
+; does not need R8 except at this time to determine the setting of the N-bit
+; so R8 is loaded here. In addition, a check is required to insure that the
+; Z-bit has its correct setting if the least significant digit is the first
+; nonzero digit encountered in the input string. 
+;-
+
+	TSTL	R2			; Check for no remaining input
+	BEQL	10$			; Skip storing digit if nothing there
+	MARK_POINT	CVTPT_ACCVIO
+	MOVZBL	(R1),R4			; Get last input digit
+	MARK_POINT	CVTPT_ACCVIO
+	MOVB	(R9)[R4],(R3)		; Store associated destination byte
+	MARK_POINT	CVTPT_ACCVIO
+	EXTZV	#4,#4,(R1),R4		; Get least significant digit	
+	BEQL	10$			; Skip clearing Z-bit if zero
+	BICB	#PSL$M_Z,R11		; Clear saved Z-bit
+
+	MARK_POINT	CVTPT_ACCVIO
+10$:	BICB3	#^B11110000,(R1),R8	; Sign "digit" to R8
+
+	CASE	R8,LIMIT=#10,TYPE=B,<-	; Dispatch on sign 
+		30$,-			; 10 => +
+		20$,-			; 11 => -
+		30$,-			; 12 => +
+		20$,-			; 13 => -
+		30$,-			; 14 => +
+		30$,-			; 15 => +
+		>
+
+20$:	BBS	#PSL$V_Z,R11,30$	; Skip if Z-bit set (negative zero)
+	BISB	#PSL$M_N,R11		; Set N-bit because sign is "-"
+30$:	BRW	VAX$DECIMAL_EXIT	; Exit through common code
+
+	.SUBTITLE	CVTPx_COMMON - Common Code / Packed to Numeric String 
+;+
+; Functional Description:
+;
+;	This routine is used by both CVTPS and CVTPT to translate a packed 
+;	decimal string of digits into its ASCII equivalent.
+;
+; Input Parameters:
+;
+;	R0 = srclen.rw		Length in digits of input decimal string
+;	R1 = srcaddr.ab		Address of input packed decimal string
+;	R2 = dstlen.rw		Number of digits in destination character string
+;	R3 = dstaddr.ab 	Address of destination character string
+;
+;	(SP)	Address of instruction-specific completion code in CVTPS
+;		or CVTPT routine
+;
+; Implicit Input:
+;
+;	R10 must contain the address of an access violation handler in the
+;	event that any strings touched by this routine are not accessible.
+;
+; Output Parameters:
+;
+;	R0 = Size in digits of shorter of source and destination strings
+;	R1 = Address of least significant digit and sign of input string
+;	R2 = Number of digits in destination character string (unchanged)
+;	R3 = Address of last byte in destination to be loaded
+;
+;	R11 contains the partial condition codes accumulated by converting
+;		all but the least significant input digit
+;
+; Side Effects:
+;
+;	R4, R5, and R6 are used as scratch registers by this routine.
+;
+;	R7 through R10 are not used.
+;-
+
+	.ENABLE	LOCAL_BLOCK
+
+CVTPx_COMMON:
+	ROPRAND_CHECK	R0		; Insure that R0 LEQU 31
+	ROPRAND_CHECK	R2		; Insure that R2 LEQU 31
+	MOVPSL	R11			; Get initial PSL
+	INSV	#PSL$M_Z,#0,#4,R11	; Set Z-bit, clear the rest
+	SUBL3	R2,R0,R5		; R5 is length difference
+	BEQL	CVTPx_EQUAL		; Life is easy if they're the same
+	BLSS	CVTPx_ZERO_FILL		; Fill output with zeros if too large
+
+;+
+; **********		srclen GTRU dstlen			**********
+;
+; The following code executes if the source string is larger than the 
+; destination string. Excess high order input digits must be discarded. If
+; any of the input digits is not zero, then the V-bit is set in the saved
+; PSW (stored in R11). The low order digits will be moved as in the normal
+; case. A test for whether decimal overflow exceptions are to be generated
+; is made as part of final instruction processing.
+;
+;	R5 = R0 - R2  (R5 GTRU 0)
+;-
+
+CVTPx_OVERFLOW_CHECK:
+	PUSHL	R1			; Save initial input address
+	BLBS	R0,10$			; Skip single digit test for odd length
+	MARK_POINT	CVTPx_SAVED_R1
+	EXTZV	#0,#4,(R1),R4		; First digit to R4 (Set R4<31:8> to 0)
+	BNEQ	40$			; Skip rest if nonzero. Nothing to be
+					;  gained by hanging around.
+	DECL	R5			; One less digit to check
+	INCL	R1			; Point R1 to next byte in input string
+10$:	ASHL	#-1,R5,R5		; Convert digit count to byte count
+	BEQL	30$			; Skip loop if no more double digits
+
+	MARK_POINT	CVTPx_SAVED_R1
+20$:	TSTB	(R1)+			; Do rest two digits at a time
+	BNEQ	40$			; Exit loop is nonzero digit
+	SOBGTR	R5,20$			; Check for end of loop
+
+30$:	BLBS	R2,50$			; No lone digit if R2 odd
+	MARK_POINT	CVTPx_SAVED_R1
+	BITB	#^B11110000,(R1)	; Does upper nibble contain nonzero
+	BEQL	50$			; No, so we're all done
+
+; The following code executes if any of the discarded digits is nonzero. The
+; V-bit is set in the saved PSW, the saved Z-bit is cleared, and R1 is
+; updated to point to the remaining input string. The large comment at the
+; beginning of the module called VAX$DECIMAL explains why the INCL R5
+; instruction is necessary when R0, the length of the shorter string, is odd.
+
+40$:	BICB	#PSL$M_Z,R11		; Clear saved Z-bit
+	BISB	#PSL$M_V,R11		; Set saved V-bit
+50$:	SUBL3	R2,R0,R5		; Recompute difference (R5 GTRU 0)
+
+; The long comment at the beginning of the module explains the reason why
+; we increment R5 when R2, the length of the shorter string, is odd.
+
+	BLBC	R2,60$			; Need adjustment if odd output string
+	INCL	R5			; Adjust difference
+60$:	ASHL	#-1,R5,R5		; Convert digit count to byte count
+	ADDL3	(SP)+,R5,R1		; "Restore" an updated input pointer
+	MOVL	R2,R0			; Enter common code with updated
+					;  "srclen" equal to "dstlen"
+	BRB	CVTPx_EQUAL		; Join common code
+
+;+
+; **********		srclen LSSU dstlen			**********
+;
+; The following code executes if the destination string is longer than the
+; source string. All excess digits in the destination string are filled
+; with zero.
+;-
+
+CVTPx_ZERO_FILL:
+	MNEGL	R5,R5			; Make digit count positive
+
+	MARK_POINT	CVTPx_BSBW
+70$:	MOVB	#^A"0",(R3)+		; Store a "0" in the output
+	SOBGTR	R5,70$			; Check for end of loop
+
+;+
+;**********	 updated srclen EQL updated dstlen		**********
+;
+; The following code is a common meeting point for the three different input
+; cases relating source length and destination length. Excess source or
+; destination digits have already been dealt with. We are effectively
+; dealing with input and output strings of equal length (as measured by
+; number of digits).
+;-
+
+CVTPx_EQUAL:
+	BLBS	R0,90$			; No special first digit if R0 odd
+	TSTL	R0			; Also skip if no remaining digits
+	BEQL	140$
+	MARK_POINT	CVTPx_BSBW
+	EXTZV	#0,#4,(R1),R4		; First digit to R4 (Set R4<31:8> to 0)
+	BEQL	80$			; Leave Z-bit alone if zero
+	BICB	#PSL$M_Z,R11		; Otherwise, clear Z-bit
+
+	MARK_POINT	CVTPx_BSBW
+80$:	MOVB	CVTPx_TABLE[R4],(R3)+	; Move digit to output string
+	INCL	R1			; Advance input string pointer
+	DECL	R0			; One less digit to process
+
+90$:	ASHL	#-1,R0,R5		; Convert digit count to byte count
+	BEQL	120$			; All done if zero
+
+	MARK_POINT	CVTPx_BSBW
+100$:	MOVZBL	(R1)+,R4		; Get next two input digits
+	BEQL	130$			; Step out of line if both are zero
+	BICB	#PSL$M_Z,R11		; Clear saved Z-bit
+	EXTZV	#4,#4,R4,R6		; Get high-order digit
+	MARK_POINT	CVTPx_BSBW
+	MOVB	CVTPx_TABLE[R6],(R3)+	; Move associated character to output
+	BICB3	#^B11110000,R4,R6	; Get low-order digit
+	MARK_POINT	CVTPx_BSBW
+	MOVB	CVTPx_TABLE[R6],(R3)+	; Move associated character to output
+110$:	SOBGTR	R5,100$			; Test for end of loop
+
+120$:	RSB				; Perform instruction-specific
+					;  end processing
+
+; This code is part of the main loop that moves input digits to the output
+; string. This code only executes when a digit pair consisting of two zeros
+; is detected. Note that this is an optimization that recognizes that the
+; individual digits do not have to be translated in order to load the
+; destination string. 
+
+	MARK_POINT	CVTPx_BSBW
+130$:	MOVW	#^A"00",(R3)+		; Move the pair to the output
+	BRB	110$			; Rejoin at the end of the loop
+
+; We have advanced too far in the destination string. Back up by one byte
+; and let the caller correctly load the final output byte.
+
+140$:	DECL	R3
+	RSB
+
+	.DISABLE	LOCAL_BLOCK
+
+	.SUBTITLE	VAX$CVTxP - Convert Numeric String to Packed
+;+
+; Functional Description:
+;
+;	The conversion from a numeric string to a packed decimal string
+;	(CVTSP and CVTTP instructions) consists of much common code and
+;	two small pieces of code that are instruction specific, the
+;	beginning and a portion of the end processing. The actual routine
+;	exit path is the common exit path from this module, VAX$DECIMAL_EXIT.
+;
+;	The two routines perform instruction-specific operations on the
+;	first byte in the stream. The bulk of the work is done by a common
+;	subroutine. Some instruction-specific end processing is done before
+;	final control is passed to VAX$DECIMAL_EXIT.
+;
+;	The structure is something like the following.
+;
+;		CVTSP					CVTTP
+;		-----					-----
+;
+;	Skip over sign character		Store table address
+;
+;			|			Unpack registers
+;			|
+;			|				|
+;			 \			       /
+;			  \			      /
+;			   \			     /
+;			    |			    |
+;			    v			    v
+;
+;			Handle unequal srclen and dstlen
+;
+;			Move all digits except last digit
+;
+;			    |			    |
+;			   /			     \
+;			  /			      \
+;			 /			       \
+;			|				|
+;			v				v
+;
+;	Move last digit to output		Use table to move last digit
+;	Move sign to output			and sign to output string
+;
+;			|				|
+;			 \			       /
+;			  \			      /
+;			   \			     /
+;			    |			    |
+;			    v			    v
+;
+;                               VAX$DECIMAL_EXIT
+;			Set condition codes and registers
+;			to their final values
+;
+; Input Parameters:
+;
+;	See instruction-specific entry points
+;
+; Output Parameters:
+;
+;	R0 = 0
+;	R1 = Address of lowest addressed byte of destination string
+;	     (See instruction-specific header for details)
+;	R2 = 0
+;	R3 = Address of byte containing most significant digit of
+;	     the source string
+;
+; Condition Codes:
+;
+;	N <- destination string LSS 0
+;	Z <- destination string EQL 0
+;	V <- decimal overflow
+;	C <- 0
+;
+; Notes:
+;
+;	Both of these instructions check the input strings for legal decimal 
+;	digits. If a character other than the ASCII representation of a 
+;	decimal digit is detected in the input string, a reserved operand 
+;	abort is generated. This exception is not restartable.
+;
+;	In addition, the CVTSP instruction insures that the sign character is 
+;	one of "+", " ", or "-". 
+;
+;	The CVTTP instruction uses the highest addressed byte as an offset 
+;	into a 256-byte table. The byte that is retrieved from this table is 
+;	checked to determine that its high nibble contains a legal decimal 
+;	digit and its low nibble contains a legal sign.
+;-
+
+	.SUBTITLE	Data Declarations / Numeric String to Packed
+
+;+
+; The following tables contains the decimal equivalents of the ten decimal
+; digits. One table is used if the low nibble of a byte is being loaded 
+; (an even numbered digit). The other table is used when the high nibble 
+; of a byte is being loaded (odd numbered digit).
+;-
+
+; Table for entry into low order nibble
+
+CVTxP_TABLE_LOW:
+	.BYTE	^X00 , ^X01 , ^X02 , ^X03 , ^X04 
+	.BYTE	^X05 , ^X06 , ^X07 , ^X08 , ^X09 
+
+; Table for entry into high order nibble
+
+CVTxP_TABLE_HIGH:
+	.BYTE	^X00 , ^X10 , ^X20 , ^X30 , ^X40 
+	.BYTE	^X50 , ^X60 , ^X70 , ^X80 , ^X90 
+
+	.SUBTITLE	VAX$CVTSP - Convert Leading Separate Numeric to Packed 
+;+
+; Functional Description:
+;
+;	The source numeric string specified by  the  source  length  and  source
+;	address  operands  is  converted  to  a  packed  decimal  string and the
+;	destination string specified by the destination address and  destination
+;	length operands is replaced by the result.
+;
+; Input Parameters:
+;
+;	R0 = srclen.rw		Number of digits in source character string
+;	R1 = srcaddr.ab		Address of input character string
+;	R2 = dstlen.rw		Length in digits of output decimal string
+;	R3 = dstaddr.ab 	Address of destination packed decimal string
+;
+; Output Parameters:
+;
+;	R0 = 0
+;	R1 = Address of the sign byte of the source string
+;	R2 = 0
+;	R3 = Address of byte containing most significant digit of
+;	     the destination string
+;
+; Condition Codes:
+;
+;	N <- destination string LSS 0
+;	Z <- destination string EQL 0
+;	V <- decimal overflow
+;	C <- 0
+;
+; Notes:
+;
+;	Note that the two entry points VAX$CVTSP and VAX$CVTTP must save the
+;	exact same set of registers because the two routines use a common exit
+;	path that includes a POPR instruction that restores registers. In
+;	fact, by saving all registers, even if one or two of them are not
+;	needed, we can use the common exit path from this module. 
+;-
+
+VAX$CVTSP::
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>	; Save the lot
+	INCL	R1			; Skip byte containing sign for now
+	BSBW	CVTxP_COMMON		; Execute bulk as common code
+
+;+
+; The common code routine returns here with the following relevant input.
+;
+;	R0	Number of digits remaining in source and destination strings
+;	R1	Address of last (highest addressed) byte in source string
+;	R3	Address of least significant digit and sign of output string
+;	R4	R4<31:8> must be zero on input to this routine
+;	R11	Saved PSW with condition codes to date (N=0,Z,V,C=0)
+;
+;	CVTSP_A_SRCADDR(SP)	Saved R1 at input, address of sign character
+;
+;	R4 is a scratch register
+;
+; The last input digit is moved to the output stream, after a check that it
+; represents a legal decimal digit. A check is also required to insure that
+; the Z-bit has its correct setting if this digit is the first nonzero digit
+; encountered in the input string. The sign of the input string is checked
+; for a legal value and transformed into one of two legal output signs, 12 
+; for "+" and 13 for "-".
+;-
+
+	MARK_POINT	CVTSP_ACCVIO
+	MOVB	#12,(R3)		; Assume that sign is plus
+	TSTL	R0			; Check for zero length input string
+	BEQL	20$			; Skip storing digit if nothing left
+	MARK_POINT	CVTSP_ACCVIO
+	SUBB3	#^A"0",(R1),R4		; Get least significant digit	
+	BLSSU	30$			; Reserved operand if not a digit
+	BEQL	10$			; Skip clearing Z-bit if zero
+	BICB	#PSL$M_Z,R11		; Clear saved Z-bit
+10$:	CMPB	R4,#9			; Check digit against top of range
+	BGTRU	30$			; Reserved operand if over the top
+	MARK_POINT	CVTSP_ACCVIO
+	ADDB	CVTxP_TABLE_HIGH[R4],(R3)	; Store final output digit
+
+	MARK_POINT	CVTSP_ACCVIO
+20$:	MOVZBL	@CVTSP_A_SRCADDR(SP),R4	; Get sign character from input string
+
+	CASE	R4,LIMIT=#^A"+",TYPE=B,<-	; Dispatch on sign character
+		50$,-			; Character is "+"
+		30$,-			; Sign character is ";" (illegal input)
+		40$,-			; Character is "-"
+		>
+
+	CMPB	R4,#^A" "		; Blank is also legal "plus sign"
+	BEQL	50$
+
+; Error path for all code paths that detect an illegal character in
+; the input stream
+
+30$:	BRW	DECIMAL_ROPRAND_NO_PC	; Reserved operand abort on illegal input
+
+; The sign of the input stream was "-". If something other than negative
+; zero, set the N-bit and adjust the sign.
+
+40$:	BISB	#PSL$M_N,R11		; Set N-bit because sign is "-"
+	MARK_POINT	CVTSP_ACCVIO
+	INCB	(R3)			; Change sign from "+" (12) to "-" (13)
+	BBC	#PSL$V_Z,R11,50$	; All done unless negative zero
+	BICB	#PSL$M_N,R11		; Clear the saved N-bit
+	BBS	#PSL$V_V,R11,50$	; The output sign is ignored if overflow
+	MARK_POINT	CVTSP_ACCVIO
+	DECB	(R3)			; Change sign back so -0 becomes +0
+50$:	BRW	VAX$DECIMAL_EXIT	; Exit through common code
+
+	.SUBTITLE	VAX$CVTTP - Convert Trailing Numeric to Packed 
+;+
+; Functional Description:
+;
+;	The source trailing numeric string specified by the  source  length  and
+;	source  address operands is converted to a packed decimal string and the
+;	destination packed decimal string specified by the  destination  address
+;	and destination length operands is replaced by the result.
+;
+;	Conversion is effected by using the highest addressed (trailing) byte of
+;	the  source  string  as  an  unsigned  index into a 256 byte table whose
+;	zeroth entry is specified by the table address operand.  The  byte  read
+;	out  of the table replaces the highest addressed byte of the destination
+;	string (i.e.  the byte containing the sign  and  the  least  significant
+;	digit).   The  remaining  packed  digits  of  the destination string are
+;	replaced by the low order 4 bits  of  the  corresponding  bytes  in  the
+;	source string.
+;
+; Input Parameters:
+;
+;	R0 <15:0>  = srclen.rw	Number of digits in source character string
+;	R0 <31:16> = dstlen.rw	Length in digits of output decimal string
+;	R1         = srcaddr.ab	Address of input character string
+;	R2         = tbladdr.ab	Address of 256-byte table used for sign conversion
+;	R3         = dstaddr.ab Address of destination packed decimal string
+;
+; Output Parameters:
+;
+;	R0 = 0
+;	R1 = Address of most significant digit of the source string
+;	R2 = 0
+;	R3 = Address of byte containing most significant digit of
+;	     the destination string
+;
+; Condition Codes:
+;
+;	N <- destination string LSS 0
+;	Z <- destination string EQL 0
+;	V <- decimal overflow
+;	C <- 0
+;
+; Notes:
+;
+;   1.	Note that the two entry points VAX$CVTSP and VAX$CVTTP must save the
+;	exact same set of registers because the two routines use a common exit
+;	path that includes a POPR instruction that restores registers. In
+;	fact, by saving all registers, even if one or two of them are not
+;	needed, we can use the common exit path from this module. 
+;
+;   2.  See the routine header for CVTPT for an explanation of the _JSB and
+;	_RESTART entry points.
+;-
+
+; There is a single case where the common subroutine cannot be used. If the
+; output length is zero, then the final character in the input string would
+; be subjected to the rather stringent legality test that it lie between
+; ASCII 0 and ASCII 9. In fact, it is the translated character that must be
+; tested. There are three cases. 
+;
+;	The input length is also zero. In this case, the common code path can
+;	be used because the input and output length are equal. (In fact, the
+;	subroutine does little more than set the condition codes and load
+;	registers. 
+;
+;	The input consists of a single character. In this case, this single
+;	character is translated and tested for legality. Note that the 
+;	subroutine is also called here to set condition codes and the like.
+;
+;	The input size is larger than one. In this case, the common subroutine
+;	is called with the input size reduced by one. The leading characters
+;	are tested by the subroutine which returns here to allow the final
+;	character to be tested. 
+;
+; Note that this is not a commonly travelled code path so that the seemingly
+; excessive amount of code necessary to achieve accuracy is not a performance
+; problem. 
+
+	.ENABLE	LOCAL_BLOCK
+
+1$:	ROPRAND_CHECK	R0		; Insure that R0 LEQU 31
+	BEQL	5$			; Back in line if source length zero	
+	DECL	R0			; Reduce input length by one
+	BSBW	CVTxP_COMMON		; Check leading digits for legality
+	MARK_POINT	CVTTP_ACCVIO
+	MOVZBL	(R1),R4			; Get last input byte
+	MARK_POINT	CVTTP_ACCVIO
+	MOVZBL	(R9)[R4],R4		; Get associated output byte from table
+	MARK_POINT	CVTTP_ACCVIO
+	BICB3	#^B11110000,R4,(R3)	; Only store sign in output string
+	EXTZV	#4,#4,R4,R0		; Get low-order digit
+	BEQL	10$			; Join exit code if zero
+	BISB2	#PSL$M_V,R11		; Set V-bit in saved PSW
+	CMPL	R0,#9			; Is the digit within range?
+	BLEQU	10$			; Yes, join the exit code
+	BRW	DECIMAL_ROPRAND_NO_PC	; Otherwise, report exception
+
+VAX$CVTTP_JSB::
+	BBCC	#CVTTP_V_FPD,R0,VAX$CVTTP	; Have we been here before?
+
+	ASSUME	CVTTP_B_DELTA_PC EQ 3	; Make sure that we clear the right byte
+
+VAX$CVTTP_RESTART::
+	BICL2	#^XFF000000,R0		; Eliminate delta-PC from "dstlen"
+
+VAX$CVTTP::
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>	; Save the lot
+	MOVL	R2,R9			; Store table address away
+	EXTZV	#16,#16,R0,R2		; Store "dstlen" in R2
+	BEQL	1$			; Perform extraordinary check if zero
+5$:	BSBW	CVTxP_COMMON		; Execute bulk as common code
+
+;+
+; The common code routine returns here with the following relevant input.
+;
+;	R0	Number of digits remaining in source and destination strings
+;	R1	Address of last (highest addressed) byte in source string
+;	R3	Address of least significant digit and sign of output string
+;	R9	Address of 256-byte table (preserved across call)
+;	R11	Saved PSW with condition codes to date (N=0,Z,V,C=0)
+;
+;	R4 is a scratch register
+;
+; The last byte of the input string is used as an index into the 256-byte
+; table that contains the last output byte. The contents of this byte are
+; tested for a legal decimal digit in its upper nibble and a legal sign
+; representation (10 through 15) in its low nibble. The Z-bit is cleared
+; if the digit is 1 through 9 to cover the case that this is the first 
+; nonzero digit in the input string.
+;-
+
+	TSTL	R0			; Check for no remaining input
+	BEQL	70$			; Special case if input length now zero
+	MARK_POINT	CVTTP_ACCVIO
+	MOVZBL	(R1),R4			; Get last input byte
+	MARK_POINT	CVTTP_ACCVIO
+	MOVZBL	(R9)[R4],R4		; Get associated output byte from table
+	MARK_POINT	CVTTP_ACCVIO
+	MOVB	R4,(R3)			; Store in destination string
+	EXTZV	#4,#4,R4,R0		; Get least significant digit	
+	BEQL	10$			; Skip clearing Z-bit if zero
+	CMPB	R0,#9			; Check for legal range
+	BGTR	20$			; Reserved operand if 10 through 15
+	BICB	#PSL$M_Z,R11		; Clear saved Z-bit
+10$:	BICB3	#^B11110000,R4,R0	; Sign "digit" to R0
+
+	CASE	R0,LIMIT=#10,TYPE=B,<-	; Dispatch on sign 
+		50$,-			; 10 => +
+		30$,-			; 11 => -
+		60$,-			; 12 => +
+		40$,-			; 13 => -
+		50$,-			; 14 => +
+		50$,-			; 15 => +
+		>
+
+20$:	BRW	DECIMAL_ROPRAND_NO_PC	; Reserved operand if sign is 0 to 9
+
+; A minus sign of 11 must be changed to 13, the preferred minus representation
+
+	MARK_POINT	CVTTP_ACCVIO
+30$:	ADDB2	#2,(R3)			; Change 11 to 13, preferred minus sign
+40$:	BISB	#PSL$M_N,R11		; Set N-bit because sign is "-"
+	BBC	#PSL$V_Z,R11,60$	; All done unless negative zero
+	BICB	#PSL$M_N,R11		; Clear the saved N-bit
+	BBS	#PSL$V_V,R11,60$	; The output sign is ignored if overflow
+
+; If the sign character is a 10, 14, or 15, it must be changed to a 12, the
+; preferred plus sign before joining the exit code.
+
+	MARK_POINT	CVTTP_ACCVIO
+50$:	INSV	#12,#0,#4,(R3)		; Store a 12 as the output sign
+60$:	BRW	VAX$DECIMAL_EXIT	; Exit through common code
+
+; If the source string has zero length, the destination is set identically
+; to zero. The following instruction sequence assumes that the Z-bit was
+; set in the initialization code for this routine.
+
+	MARK_POINT	CVTTP_ACCVIO
+70$:	MOVB	#12,(R3)		; Store "+" in output string
+	BRW	VAX$DECIMAL_EXIT	; Exit through common code
+
+	.DISABLE	LOCAL_BLOCK
+
+	.SUBTITLE	CVTxP_COMMON - Common Code / Numeric String to Packed 
+;+
+; Functional Description:
+;
+;	This routine is shared by both CVTSP and CVTPT to translate an ASCII 
+;	string that contains only the characters "0" to "9" into an equivalent 
+;	packed decimal string. A check is made for legal input digits and a 
+;	reserved operand exception generated if an illegal digit is 
+;	encountered. 
+;
+; Input Parameters:
+;
+;	R0 = srclen.rw		Number of digits in source character string
+;	R1 = srcaddr.ab		Address of first digit in input character string
+;	R2 = dstlen.rw		Length in digits of output decimal string
+;	R3 = dstaddr.ab 	Address of destination packed decimal string
+;
+;	(SP)	Address of instruction-specific completion code in CVTSP
+;		or CVTTP routine
+;
+; Output Parameters:
+;
+;	R0 = Size in digits of shorter of source and destination strings
+;	R1 = Address of lowest addressed byte of source string
+;	     (See instruction-specific header for details)
+;	R2 = Number of digits in destination packed decimal string
+;	R3 = Address of byte containing most significant digit of
+;	     the destination string
+;
+;	R11 contains the partial condition codes accumulated by converting
+;		all but the least significant input digit
+;
+; Implicit Output:
+;
+;	R4<31:8> is zero to insure that CVTSP works correctly
+;
+;	R10 is loaded with the address of an access violation handler in the
+;	event that any strings touched by this routine are not accessible.
+;
+; Side Effects:
+;
+;	R4 and R5 are used as scratch registers by this routine.
+;
+;	R6 through R9 are not used.
+;-
+
+	.ENABLE	LOCAL_BLOCK
+
+CVTxP_COMMON:
+	ROPRAND_CHECK	R0		; Insure that R0 LEQU 31
+	ROPRAND_CHECK	R2		; Insure that R2 LEQU 31
+	MOVPSL	R11			; Get initial PSL
+	INSV	#PSL$M_Z,#0,#4,R11	; Set Z-bit, clear the rest
+	ESTABLISH_HANDLER	-	; Store address of access
+		CONVERT_ACCVIO		;  violation handler
+	SUBL3	R2,R0,R5		; R5 is length difference
+	BEQL	CVTxP_EQUAL		; Life is easy if they're the same
+	BLSS	CVTxP_ZERO_FILL		; Fill output with zeros if its too large
+
+;+
+; **********		srclen GTRU dstlen			**********
+;
+; The following code executes if the source string is larger than the
+; destination string. Excess high order input digits must be discarded. If
+; any of the input digits is not zero, then the V-bit is set in the saved PSW
+; (stored in R11). In addition, digits must be checked for legal values
+; (ASCII 0 through ASCII 9) before they are discarded in order to determine
+; whether to generate a reserved operand abort. The low order digits will be
+; moved as in the normal case. A test for whether decimal overflow exceptions
+; are to be generated is made as part of final instruction processing. 
+;
+;	R5 = R0 - R2  (R5 GTRU 0)
+;-
+
+CVTxP_OVERFLOW_CHECK:
+	MARK_POINT	CVTxP_BSBW
+10$:	CMPB	(R1)+,#^A"0"		; Is digit ASCII zero?
+	BNEQ	30$			; Exit loop if other than zero
+20$:	SOBGTR	R5,10$			; Test for more excess digits
+
+	MOVL	R2,R0			; Update input length for skipped digits
+	BRB	CVTxP_EQUAL		; Join common code
+
+; The following code executes if any of the discarded digits is nonzero.
+; If the digit is the ASCII representation of a decimal digit, then the
+; V-bit is set in the saved PSW and the saved Z-bit is cleared. The loop
+; is reentered where we left it to continue the search for legal input
+; digits. (Note that this is different from the CVTPx case where, once an
+; overflow was detected, the remaining excess input digits could be skipped.)
+
+30$:	BLSSU	40$			; Reserved operand if outside range
+	BISB	#PSL$M_V,R11		; Set saved V-bit
+	MARK_POINT	CVTxP_BSBW
+	CMPB	-1(R1),#^A"9"		; Compare digit to ASCII 9
+	BLEQU	20$			; Back in loop if inside range
+40$:	BRW	DECIMAL_ROPRAND		; Signal illegal digit abort
+
+;+
+; **********		srclen LSSU dstlen			**********
+;
+; The following code executes if the destination string is longer than the
+; source string. All excess digits in the destination string are filled
+; with zero.
+;-
+
+CVTxP_ZERO_FILL:
+	MNEGL	R5,R5			; Make digit count positive
+
+	BLBC	R0,50$			; Different code paths for even and odd
+					;  input string sizes (the shorter one)
+
+; Shorter string has odd number of digits. Note that the divide by two can 
+; never produce zero because R5 is always nonzero before the INCL so that R5
+; is always at least two before the divide takes place. The comment at the 
+; beginning of the module explains the two different code paths based on the
+; parity of the input (shorter) string.
+
+	INCL	R5			; Adjust before divide by two
+	EXTZV	#1,#4,R5,R5		; Convert digit count to byte count
+	BRB	60$			; Join common loop
+
+; Shorter string has an even number of digits.
+
+50$:	EXTZV	#1,#4,R5,R5		; Convert digit count to byte count
+	BEQL	CVTXP_EQUAL		; No loop if byte count is zero
+	
+	MARK_POINT	CVTxP_BSBW
+60$:	CLRB	(R3)+			; Store a pair of zeros in output string
+	SOBGTR	R5,60$			; Test for more bytes to clear
+
+;+
+;**********	 updated srclen EQL updated dstlen		**********
+;
+; The following code is a common meeting point for the three different input
+; cases relating source length and destination length. Excess source or
+; destination digits have already been dealt with. We are effectively
+; dealing with input and output strings of equal length (as measured by
+; number of digits).
+;-
+
+CVTxP_EQUAL:
+	CLRL	R4			; Insure that R4<31:8> is zero
+	EXTZV	#1,#4,R0,R5		; Convert digit count to byte count
+	BEQL	110$			; Down to last digit if zero
+
+; If the count of remaining digits is even, we need to jump into the middle
+; of the loop. But the store operation in the second half of the loop uses a
+; BISB2, assuming that the high order nibble is already cleared (which it is if
+; we also execute the first half of the loop). In order to insure that the high
+; order nibble has a zero stored in it, we jump to the last instruction of the
+; first half of the loop. Because we just cleared R4, the MOVB instruction at
+; 90$ stores a zero in the appropriate byte of the output string. 
+
+	BLBC	R0,90$			; To middle of loop if digit count even
+
+	MARK_POINT	CVTxP_BSBW
+70$:	SUBB3	#^A"0",(R1)+,R4		; Convert ASCII to digit
+	BLSSU	40$			; Abort instruction if out of range
+	BEQL	80$			; Do not clear Z-bit if digit is zero
+	BICB	#PSL$M_Z,R11		; Clear Z-bit when digit is 1 to 9
+80$:	CMPB	R4,#9			; Check for other end of range
+	BGTRU	40$			; Abort if outside the other end, too
+
+	MARK_POINT	CVTxP_BSBW
+90$:	MOVB	CVTxP_TABLE_HIGH[R4],(R3)	; Store digit in high nibble
+
+; Note that the above instruction also clears out the low order four bits in
+; the currently addressed byte in the output packed decimal string.
+
+	MARK_POINT	CVTxP_BSBW
+	SUBB3	#^A"0",(R1)+,R4		; Convert ASCII to digit
+	BLSSU	40$			; Abort instruction if out of range
+	BEQL	100$			; Do not clear Z-bit if digit is zero
+	BICB	#PSL$M_Z,R11		; Clear Z-bit when digit is 1 to 9
+100$:	CMPB	R4,#9			; Check for other end of range
+	BGTRU	40$			; Abort if outside the other end, too
+	MARK_POINT	CVTxP_BSBW
+	BISB2	CVTxP_TABLE_LOW[R4],(R3)+	; Store digit in low nibble
+	
+	SOBGTR	R5,70$			; Test for end of loop
+
+110$:	RSB				; Perform instruction-specific
+					;  end processing
+
+	.DISABLE	LOCAL_BLOCK
+
+	.SUBTITLE	DECIMAL_ROPRAND
+;-
+; Functional Description:
+;
+;	This routine receives control when a digit count larger than 31
+;	is detected. The exception is architecturally defined as an
+;	abort so there is no need to store intermediate state. All of the
+;	routines in this module save all registers R0 through R11 before
+;	performing the digit check. These registers must be restored
+;	before control is passed to VAX$ROPRAND.
+;
+; Input Parameters:
+;
+;	Entry at DECIMAL_ROPRAND
+;
+;		00(SP) - Return PC from common subroutine (discarded)
+;		04(SP) - Saved R0	\
+;		  .			 \
+;		  .			  >  Restored
+;		  .			 /
+;		48(SP) - Saved R11	/
+;		52(SP) - Return PC from VAX$xxxxxx routine
+;
+;	Entry at DECIMAL_ROPRAND_NO_PC
+;
+;		00(SP) - Saved R0	\
+;		  .			 \
+;		  .			  >  Restored
+;		  .			 /
+;		44(SP) - Saved R11	/
+;		48(SP) - Return PC from VAX$xxxxxx routine
+;
+; Output Parameters:
+;
+;	00(SP) - Offset in packed register array to delta PC byte
+;	04(SP) - Return PC from VAX$xxxxxx routine
+;
+;		 The two flags in this longword (PACK_M_FPD and PACK_M_ACCVIO)
+;		 are both clear in the case of a reserved operand abort.
+;
+; Implicit Output:
+;
+;	This routine passes control to VAX$ROPRAND where further
+;	exception processing takes place.
+;
+; Note:
+;
+;	This routine can be entered either from internal subroutines or from
+;	the callers of these subroutines. The DECIMAL_ROPRAND entry point is
+;	used when the return PC is on the stack because that is the name of
+;	the routine that is qutomatically invoked by the ROPRAND_CHECK macro
+;	when an illegal digit count is detected. The other name is arbitrary. 
+;-
+
+	ASSUME CVTPT_B_DELTA_PC EQ CVTPS_B_DELTA_PC 
+	ASSUME CVTSP_B_DELTA_PC EQ CVTPS_B_DELTA_PC 
+	ASSUME CVTTP_B_DELTA_PC EQ CVTPS_B_DELTA_PC 
+
+DECIMAL_ROPRAND:
+	ADDL	#4,SP			; Discard return PC from common routine
+DECIMAL_ROPRAND_NO_PC:
+	POPR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	PUSHL	#CVTPS_B_DELTA_PC	; Store offset to delta PC byte
+	BRW	VAX$ROPRAND		; Pass control along
+
+	.SUBTITLE	CONVERT_ACCVIO - Reflect an Access Violation
+;+
+; Functional Description:
+;
+;	This routine receives control when an access violation occurs while
+;	executing within the emulator routines for CVTPS, CVTPT, CVTSP, or
+;	CVTTP. 
+;
+;	The routine header for ASHP_ACCVIO in module VAX$ASHP contains a
+;	detailed description of access violation handling for the decimal
+;	string instructions. 
+;
+; Input Parameters:
+;
+;	See routine ASHP_ACCVIO in module VAX$ASHP
+;
+; Output Parameters:
+;
+;	See routine ASHP_ACCVIO in module VAX$ASHP
+;-
+
+CONVERT_ACCVIO:
+	CLRL	R2			; Initialize the counter
+	PUSHAB	MODULE_BASE		; Store base address of this module
+	SUBL2	(SP)+,R1		; Get PC relative to this base
+
+10$:	CMPW	R1,PC_TABLE_BASE[R2]	; Is this the right PC?
+	BEQL	30$			; Exit loop if true
+	AOBLSS	#TABLE_SIZE,R2,10$	; Do the entire table
+
+; If we drop through the dispatching based on PC, then the exception is not 
+; one that we want to back up. We simply reflect the exception to the user.
+
+20$:	POPR	#^M<R0,R1,R2,R3>	; Restore saved registers
+	RSB				; Return to exception dispatcher
+
+; The exception PC matched one of the entries in our PC table. R2 contains
+; the index into both the PC table and the handler table. R1 has served
+; its purpose and can be used as a scratch register.
+
+30$:	MOVZWL	HANDLER_TABLE_BASE[R2],R1	; Get the offset to the handler
+	JMP	MODULE_BASE[R1]		; Pass control to the handler
+	
+; In all of the instruction-specific routines, the state of the stack
+; will be shown as it was when the exception occurred. All offsets will
+; be pictured relative to R0. 
+
+	.SUBTITLE	Context-Specific Access Violation Handling 
+;+
+; Functional Description:
+;
+;	It is relatively simple to back out any of these four instructions 
+;	because their use of stack space is so simple. Each of the four 
+;	routines contains a certain amount of initialization or completion 
+;	code that uses no stack space (over and above the saved register 
+;	array). Additional processing occurs one level deep in a subroutine 
+;	where there is a return PC on the stack that must be discarded.
+;
+; Input Parameters:
+;
+;	R0 - Address of top of stack when access violation occurred
+;
+;	See specific entry points for details
+;
+; Output Parameters:
+;
+;	See input parameter list for VAX$DECIMAL_ACCVIO in module VAX$ASHP
+;-
+
+;+
+; CVTPx_SAVED_R1
+;
+; An access violation occurred in routine CVTPx_COMMON along the code path 
+; where the intermediate value of R1 is stored on the stack along with the 
+; return PC. This must be disacrded.
+;
+;	00(R0) - Saved intermediate value of R1
+;	04(R0) - Return PC in mainline of VAX$CVTPS or VAX$CVTPT
+;	08(R0) - Saved R0
+;	12(R0) - Saved R1
+;	 etc.
+;-
+
+CVTPx_SAVED_R1:
+	ADDL	#4,R0			; Skip over saved R1 and drop into ...
+
+;+
+; CONVERT_BSBW
+;
+; An access violation occurred somewhere in CVTPx_COMMON or CVTxP_COMMON.
+; The return PC must be discarded.
+;
+;	00(R0) - Return PC in VAX$CVTPS, VAX$CVTPT, VAX$CVTSP, or VAX$CVTTP
+;	04(R0) - Saved R0
+;	08(R0) - Saved R1
+;	 etc.
+;-
+
+CVTPx_BSBW:
+CVTxP_BSBW:
+	ADDL	#4,R0			; Skip over return PC and drop into ...
+
+;+
+; CONVERT_ACCVIO
+;
+; The access violation occurred in one of the four outer routines where 
+; nothing other than the saved registers has been pushed onto the stack. 
+; Nothing more needs to be done to the registers or the stack before 
+; transferring control to VAX$DECIMAL_ACCVIO. These entry points are merely
+; a convenience.
+;
+;	00(SP) - Saved R0
+;	04(SP) - Saved R1
+;	08(SP) - Saved R2
+;	12(SP) - Saved R3
+;	 etc.
+;-
+
+CVTPS_ACCVIO:
+CVTPT_ACCVIO:
+CVTSP_ACCVIO:
+CVTTP_ACCVIO:
+	BRW	VAX$DECIMAL_ACCVIO	; Join common code to restore registers
+
+	.END

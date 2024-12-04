@@ -1,0 +1,1505 @@
+%TITLE	'VAX-11 CONVERT'
+MODULE	CONV$FSTRC	( IDENT='V04-000'
+			 ,OPTLEVEL=3
+			) =
+
+BEGIN
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! Facility:	VAX-11 CONVERT
+!
+! Abstract:	CONVERT index record processing routines
+!
+! Contents:
+!		CHECK_S_DUP
+!		CHECK_NULL
+!		SPLIT_DATA
+!		IN_SEGMENT
+!		COMPRESS_KEY
+!		COMPRESS_INDEX
+!		MAKE_INDEX
+!		WRITE_VBN
+!		COPY_KEY
+!		CREATE_HIGH_KEY
+!
+! Environment:
+!
+!		VAX/VMS Operating System
+!
+!
+! Author:	Keith B Thompson	Creation date:        	August-1980
+!
+!
+! Modified by:
+!
+!	V03-011	JWT0144		Jim Teague		17-Nov-1983
+!		Fix compare-packed for null keys.
+!
+!	V03-010	KBT0553		Keith B. Thompson	25-Aug-1983
+!		Packed decimal high key fix
+!
+!	V03-009	KBT0480		Keith B. Thompson	31-Jan-1983
+!		Change rec_buf_ptr to rfa_buffer
+!
+!	V03-008	KBT0440		Keith B. Thompson	16-Dec-1982
+!		Add quadword key support
+!
+!	V03-007	KBT0403		Keith B. Thompson	19-Nov-1982
+!		Fix one byte bug in compress_key, change make_index and
+!		check_s_dup
+!
+!	V03-006	KBT0383		Keith B. Thompson	26-Oct-1982
+!		Add support for prologue 3 sidrs
+!
+!	V03-005	KBT0378		Keith B. Thompson	20-Oct-1982
+!		Check for keys out of order in split_data
+!
+!	V03-004	KBT0351		Keith B. Thompson	4-Oct-1982
+!		Use new linkage definitions
+!
+!	V03-003 KBT0038		Keith Thompson		3-Apr-1982
+!		Correct the vbn_size correction
+!
+!	V03-002 KBT0023		Keith Thompson		24-Mar-1982
+!		Correct calculation of vbn_size in write_vbn
+!
+!	V03-001	KBT0013		Keith Thompson		16-Mar-1982
+!		Fix the call to compress_data
+!****
+
+
+PSECT
+	OWN	= _CONV$FAST_D	(PIC),
+	GLOBAL	= _CONV$FAST_D	(PIC),
+	PLIT	= _CONV$PLIT	(SHARE,PIC),
+	CODE	= _CONV$FAST_S	(SHARE,PIC);
+
+LIBRARY	'SYS$LIBRARY:LIB.L32';
+LIBRARY	'SRC$:CONVERT';
+
+DEFINE_ERROR_CODES;
+
+LINKAGE
+
+	CL$COMPARE_KEYS	= JSB : GLOBAL( CTX = 10,
+					KEY_DESC = 11 ),
+
+	CL$IN_SEGMENT	= JSB : GLOBAL( BYTE_OFS = 6,
+					NEXT_SEG = 7,
+					NEXT_LEN = 8,
+					KEY_DESC = 11 )
+					NOTUSED( 3 );
+
+EXTERNAL ROUTINE
+	CONV$$CVT_TO_ASC	: CL$CVT_TO_ASC,
+	CONV$$COMPRESS_DATA	: CL$JSB_LINK;
+
+FORWARD ROUTINE
+	COMPARE_KEYS	: CL$COMPARE_KEYS,
+	IN_SEGMENT	: CL$IN_SEGMENT;
+
+EXTERNAL
+	CONV$GW_OUT_REC_SIZ	: SIGNED WORD,		! Output Rec. Size
+
+	CONV$GL_RFA_BUFFER,
+
+	CONV$AB_OUT_FAB		: $FAB_DECL,
+
+	CONV$GB_PROL_V3		: BYTE,
+
+!	Data Decl. for Fast Load routines
+!
+	CONV$GL_RECORD_PTR,
+	CONV$GL_DUP_BUF;
+
+MACRO
+!	Some needed macros to define the data record for a bucket
+!
+	IRC$L_RRV_VBN	= 3,0,32,0%,	! RRV VBN Pointer
+	IRC$L_RRV_VBN3	= 5,0,32,0%,	! RRV VBN Pointer (Prologue 3)
+	IRC$W_VAR_SIZ	= 7,0,16,0%,	! Var. Rec. Format Size field
+	IRC$L_DUPCOUNT	= 2,0,32,0%,	! Duplicate count field
+	IRC$W_DUPSZ	= 6,0,16,0%,	! Size field when dup. are allowed
+	IRC$W_NODUPSZ	= 2,0,16,0%;	! Size field when dup. are not allowed
+
+%SBTTL	'CHECK_S_DUP'
+GLOBAL ROUTINE	CONV$$CHECK_S_DUP : CL$JSB_REG_9 =
+!++
+!
+! Functional Description:
+!
+!	Checks if the current secondary key is a duplicate of the last key
+!
+! Calling Sequence:
+!
+!	CONV$$CHECK_S_DUP()
+!
+! Input Parameters:
+!	none
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!
+!	1 - Key was a duplicate
+!	0 - Key was NOT a duplicate
+!
+! Routines Called:
+!
+!	CONV$$CVT_TO_ASC
+!
+! Side Effects:
+!	none
+!
+!--
+
+    BEGIN
+
+    DEFINE_CTX;
+    DEFINE_KEY_DESC;
+
+    ! If this is the very first record then just return 0
+    ! else compaire the record with the last one
+    !
+    IF .CTX [ CTX$V_FST ]
+    THEN
+	RETURN 0
+    ELSE
+	RETURN CH$EQL ( .KEY_DESC [ KEY$B_KEYSZ ],		! Key size
+			.CONV$GL_DUP_BUF,			! Old key
+			.KEY_DESC [ KEY$B_KEYSZ ],
+			.CONV$GL_RFA_BUFFER + 6 )		! New key
+
+    END;
+
+%SBTTL	'CHECK_NULL'
+GLOBAL ROUTINE	CONV$$CHECK_NULL : CL$JSB_REG_9 =
+!++
+!
+! Functional Description:
+!
+!	Checks is the current secondary key is a null key value
+!
+! Calling Sequence:
+!
+!	CONV$$CHECK_NULL()
+!
+! Input Parameters:
+!	none
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!
+!	1 - Key was a null value
+!	0 - Key was NOT a null value
+!
+! Routines Called:
+!	none
+!
+! Side Effects:
+!	none
+!
+!--
+
+    BEGIN
+
+    DEFINE_CTX;
+    DEFINE_BUCKET;
+    DEFINE_KEY_DESC;
+
+    BUILTIN
+	CMPP;
+
+    BIND
+	SEG_SIZE = .KEY_DESC + 44 : VECTOR [ ,BYTE ];
+
+    LOCAL 
+	KEYPTR	: REF BLOCK [ ,BYTE ],
+	NUL;
+
+    ! The new key is 6 bytes into the input record
+    !
+    KEYPTR = .CONV$GL_RFA_BUFFER + 6;
+
+    ! Check the record one segment at a time
+    !
+    INCR I FROM 0 TO ( .KEY_DESC [ KEY$B_SEGMENTS ] - 1 ) BY 1
+    DO
+
+	! If we dont have a null then dont bother looking any further
+	!
+	IF ( NUL = ( CASE .KEY_DESC [ KEY$B_DATATYPE ] FROM KEY$C_STRING TO KEY$C_MAX_DATA OF
+		SET
+		[ KEY$C_STRING ]  : CH$EQL( 1,KEY_DESC [ KEY$B_NULLCHAR ],
+					    .SEG_SIZE [ .I ],
+					    .KEYPTR,
+					    .KEY_DESC [ KEY$B_NULLCHAR ] );
+
+		[ KEY$C_SGNWORD,KEY$C_UNSGNWORD ] : .KEYPTR [ 0,WORD_U ] EQLU 0;
+
+		[ KEY$C_SGNLONG,KEY$C_UNSGNLONG ] : .KEYPTR [ 0,LONG_U ] EQLU 0;
+
+		[ KEY$C_PACKED ] :
+
+				BEGIN
+
+				STACKLOCAL NULL;
+
+				NULL = 12;
+
+				! The value returned by CMPP is backwards
+				!
+				IF CMPP( %REF(0), NULL,
+					 %REF (( .SEG_SIZE [ .I ] * 2 ) - 1),
+					 .KEYPTR ) EQLU 0
+				THEN
+				    _SET
+				ELSE
+				    _CLEAR
+
+				END;
+
+		[ KEY$C_SGNQUAD,KEY$C_UNSGNQUAD ] :
+					( .KEYPTR [ 0,LONG_U ] EQLU 0 ) AND
+					( .KEYPTR [ 4,LONG_U ] EQLU 0 );
+
+		TES ) )
+	THEN
+	    KEYPTR = .KEYPTR + .SEG_SIZE [ .I ]
+	ELSE
+	    EXITLOOP;
+
+    RETURN .NUL
+
+
+    END;
+
+%SBTTL	'SPLIT_DATA'
+GLOBAL ROUTINE	CONV$$SPLIT_DATA : CL$JSB_REG_9 =
+!++
+!
+! Functional Description:
+!
+!	Copies the data record returned by GET_RECORD into the primary
+!	key data buffer, for prologue 3 files it also extracts the key
+!	from the data and places it into the record control buffer
+!	Also checks to see if the present record is a duplicate of the
+!	last record
+!
+! Calling Sequence:
+!
+!	CONV$$SPLIT_DATA()
+!
+! Input Parameters:
+!	none
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!
+!	 1 - Key was a duplicate
+!	 0 - Key was NOT a duplicate
+!	-1 - Key was out of order
+!
+! Routines Called:
+!
+!	CONV$$CVT_TO_ASC
+!	IN_SEGMENT
+!	CONV$$COMPRESS_DATA
+!
+! Side Effects:
+!	none
+!
+!--
+
+    BEGIN
+
+    DEFINE_CTX;
+    DEFINE_BUCKET;
+    DEFINE_KEY_DESC;
+
+    BIND
+	SEG_SIZE	= .KEY_DESC + 44 : VECTOR [ ,BYTE ],
+	SEG_POSI	= .KEY_DESC + 28 : VECTOR [ ,WORD ];
+
+    LOCAL
+	DUP	: SIGNED;
+
+    ! For prologue 3 files we must extract the key and
+    ! data from the input record
+    !
+    IF .CONV$GB_PROL_V3
+    THEN
+	BEGIN		! Prologue 3 processing
+
+	BEGIN		! Extract the key
+
+	LOCAL
+	    OFFSET,
+	    REC_PTR;		! Pointer TO the data buffer
+
+	! Find out where the extracted key will go...
+	! If we are doing key compression the start the control buffer + 13
+	! else it's only 11
+	!
+	IF .KEY_DESC [ KEY$V_KEY_COMPR ]
+	THEN
+	    OFFSET = 13
+	ELSE
+
+	    ! If there is no record compression and the file is fixed then
+	    ! there is no size field
+	    !
+	    IF .KEY_DESC [ KEY$V_REC_COMPR ] OR
+		( .CONV$AB_OUT_FAB [ FAB$B_RFM ] EQL FAB$C_VAR )
+	    THEN
+		OFFSET = 11
+	    ELSE
+		OFFSET = 9;
+
+	! Key goes here
+	!
+	REC_PTR = .CTX [ CTX$L_RCP ] + .OFFSET;
+
+	! Move the key to the record buffer where it is suppose to be
+	!
+	INCR I FROM 0 TO ( .KEY_DESC [ KEY$B_SEGMENTS ] - 1 ) BY 1
+	DO
+	    BEGIN
+
+	    ! Move it
+	    !
+	    CH$MOVE( .SEG_SIZE [ .I ],				! Segment size
+		     .CONV$GL_RECORD_PTR + .SEG_POSI [ .I ],	! Source
+		     .REC_PTR );				! Destination
+
+	    ! Increment destination
+	    !
+	    REC_PTR = .REC_PTR + .SEG_SIZE [ .I ]
+
+	    END;
+
+	! The size of the control record is the key size plus the overhead
+	!
+	CTX [ CTX$W_RCS ] = .KEY_DESC [ KEY$B_KEYSZ ] + .OFFSET;
+
+	! Check for a duplicate with the last key
+	!
+	DUP = COMPARE_KEYS( .KEY_DESC [ KEY$B_KEYSZ ],		! Key size
+			    .CTX [ CTX$L_RCP ] + .OFFSET,	! New key
+			    .CTX [ CTX$L_LKP ] )		! Last key
+
+	END;		! Extract the key
+
+	BEGIN		! Process the data
+
+	LOCAL
+	    BUFFER_PTR;
+
+	BEGIN		! Extract the data record
+
+	GLOBAL REGISTER
+	    BYTE_OFS = 6,	! Offset into the data record
+	    NEXT_SEG = 7,	! No. of char. to the next segment
+	    NEXT_LEN = 8;	! Length of next segment
+
+	! Extract the data record
+	!
+	BYTE_OFS = 0;
+
+	! Find out where to put the data record
+	!
+	IF .KEY_DESC [ KEY$V_REC_COMPR ]
+	THEN
+	    BUFFER_PTR = .CTX [ CTX$L_RDP ] + 2
+	ELSE
+	    BUFFER_PTR = .CTX [ CTX$L_RDP ];
+
+	! Loop for the entire length of the record
+	!
+	WHILE .BYTE_OFS LSS .CONV$GW_OUT_REC_SIZ
+	DO
+
+	    ! If the this byte is in a key segment then ignore it and move
+	    ! past this segment
+	    !
+	    IF IN_SEGMENT()
+	    THEN
+		BYTE_OFS = .NEXT_SEG + .NEXT_LEN
+	    ELSE
+
+		BEGIN
+
+		! If the byte is not in a segment then move it into the buffer
+		!
+		CH$MOVE( .NEXT_SEG - .BYTE_OFS,
+			 .CONV$GL_RECORD_PTR + .BYTE_OFS,
+			 .BUFFER_PTR );
+
+		BUFFER_PTR = .BUFFER_PTR + ( .NEXT_SEG - .BYTE_OFS );
+		BYTE_OFS = .NEXT_SEG + .NEXT_LEN
+
+		END
+
+	END;		! Extract the data record
+
+	! If there is record compression then do it
+	!
+	IF .KEY_DESC [ KEY$V_REC_COMPR ]
+	THEN
+	    BEGIN
+
+	    REGISTER
+		NXT_FIELD_PTR	= 6,
+		CNT_FIELD_PTR	= 7,
+		TRU_FIELD_PTR	= 3;
+
+	    NXT_FIELD_PTR = .CTX [ CTX$L_RDP ];
+	    CNT_FIELD_PTR = .BUFFER_PTR;
+
+	    CONV$$COMPRESS_DATA();
+
+	    ! We can now say what the data size might be
+	    !
+	    CTX [ CTX$W_RDS ] = .TRU_FIELD_PTR - .CTX [ CTX$L_RDP ]
+
+	    END
+	ELSE
+
+	    ! If there is no compression then the data size is simular to above
+	    !
+	    CTX [ CTX$W_RDS ] = .BUFFER_PTR - .CTX [ CTX$L_RDP ]
+
+	END		! Process the data
+
+	END		! Prologue 3 processing
+    ELSE
+	BEGIN		! Prologue 2 processing
+
+	LOCAL	    LKP_PTR;
+
+	! For non prologue 3 files the size is simply what was returned by GET_RECORD
+	!
+	CTX [ CTX$W_RDS ] = .CONV$GW_OUT_REC_SIZ;
+
+	! The control is a bit more complicated...
+	!
+	! Other files depend on var or fixed format
+	!
+	IF .CONV$AB_OUT_FAB [ FAB$B_RFM ] EQL FAB$C_FIX
+	THEN
+	    CTX [ CTX$W_RCS ] = IRC$C_FIXOVHDSZ
+	ELSE
+	    CTX [ CTX$W_RCS ] = IRC$C_VAROVHDSZ;
+
+	! Check for duplicate key
+	!
+	! Compaire the index part of the record into the buffer segment by
+	! segment. Since the last key value is in last key pointer
+	! we can use it to compaire with RECORD_PTR  (The current
+	! record).
+	!
+	LKP_PTR = .CTX [ CTX$L_LKP ];
+
+	! Compaire each segment until a key-out-of-order is found
+	!
+	INCR I FROM 0 TO ( .KEY_DESC [ KEY$B_SEGMENTS ] - 1 ) BY 1
+	DO
+	    BEGIN
+
+	    DUP = COMPARE_KEYS( .SEG_SIZE [ .I ],
+				.CONV$GL_RECORD_PTR + .SEG_POSI [ .I ],
+				.LKP_PTR );
+
+	    ! If key is out of order check no more
+	    !
+	    IF .DUP LSS 0
+	    THEN
+		EXITLOOP
+	    ELSE
+		LKP_PTR = .LKP_PTR + .SEG_SIZE [ .I ]
+
+	    END
+
+	END;		! Prologue 2 processing
+
+    RETURN .DUP
+
+    END;
+
+%SBTTL	'COMPARE_KEYS'
+ROUTINE	COMPARE_KEYS ( SIZE,NEW : REF BLOCK [ ,BYTE ],OLD : REF BLOCK [,BYTE ] )
+							: CL$COMPARE_KEYS =
+!++
+!
+! Functional Description:
+!
+!
+! Calling Sequence:
+!
+!	COMPARE_KEYS
+!
+! Input Parameters:
+!	none
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!
+!	 1 - Key/segment is duplicate
+!	 0 - Key/segment is not duplicate
+!	-1 - Key/segment is out of order
+!
+! Routines Called:
+!	none
+!
+! Side Effects:
+!	none
+!
+!--
+
+    BEGIN
+
+    DEFINE_CTX;
+    DEFINE_KEY_DESC;
+
+    BUILTIN
+	CMPP;
+
+    LOCAL
+	DUP	: SIGNED;
+
+    ! If this is the first record it can't be anything
+    !
+    IF .CTX [ CTX$V_FST ]
+    THEN
+	BEGIN
+
+	CTX [ CTX$V_FST ] = _CLEAR;
+
+	RETURN 0
+
+	END;
+
+    DUP = ( CASE .KEY_DESC [ KEY$B_DATATYPE ] FROM KEY$C_STRING TO KEY$C_MAX_DATA OF
+    SET
+	[ KEY$C_STRING ]      : CH$COMPARE( .SIZE,.NEW,.SIZE,.OLD );
+
+	[ KEY$C_SGNWORD ]     : IF .NEW [ 0,WORD_S ] EQL .OLD [ 0,WORD_S ]
+				THEN
+				    0
+				ELSE IF .NEW [ 0,WORD_S ] LSS .OLD [ 0,WORD_S ]
+				THEN
+				    -1
+				ELSE
+				    1;
+
+	[ KEY$C_UNSGNWORD ]   : IF .NEW [ 0,WORD_U ] EQLU .OLD [ 0,WORD_U ]
+				THEN
+				    0
+				ELSE IF .NEW [ 0,WORD_U ] LSSU .OLD [ 0,WORD_U ]
+				THEN
+				    -1
+				ELSE
+				    1;
+
+	[ KEY$C_SGNLONG ]     : IF .NEW [ 0,LONG_S ] EQL .OLD [ 0,LONG_S ]
+				THEN
+				    0
+				ELSE IF .NEW [ 0,LONG_S ] LSS .OLD [ 0,LONG_S ]
+				THEN
+				    -1
+				ELSE
+				    1;
+
+	[ KEY$C_UNSGNLONG ]   : IF .NEW [ 0,LONG_U ] EQLU .OLD [ 0,LONG_U ]
+				THEN
+				    0
+				ELSE IF .NEW [ 0,LONG_U ] LSSU .OLD [ 0,LONG_U ]
+				THEN
+				    -1
+				ELSE
+				    1;
+
+	[ KEY$C_PACKED ]      :	BEGIN
+
+				LOCAL NIBBLES;
+
+				NIBBLES = ( .SIZE * 2 ) - 1;
+
+				CMPP( NIBBLES,.NEW,NIBBLES,.OLD )
+
+				END;
+
+	[ KEY$C_SGNQUAD ]     :
+				! Check the high longword first
+				!
+				IF .NEW [ 4,LONG_S ] EQL .OLD [ 4,LONG_S ]
+				THEN
+
+				    ! If the high long word is eq then check the lower
+				    !
+				    IF .NEW [ 0,LONG_U ] EQL .OLD [ 0,LONG_U ]
+				    THEN
+					0
+				    ELSE IF .NEW [ 0,LONG_U ] LSS .OLD [ 0,LONG_U ]
+				    THEN
+					-1
+				    ELSE
+					1
+				ELSE IF .NEW [ 4,LONG_S ] LSS .OLD [ 4,LONG_S ]
+				THEN
+				    -1
+				ELSE
+				    1;
+
+	[ KEY$C_UNSGNQUAD ]   : IF .NEW [ 4,LONG_U ] EQLU .OLD [ 4,LONG_U ]
+				THEN
+				    IF .NEW [ 0,LONG_U ] EQLU .OLD [ 0,LONG_U ]
+				    THEN
+					0
+				    ELSE IF .NEW [ 0,LONG_U ] LSSU .OLD [ 0,LONG_U ]
+				    THEN
+					-1
+				    ELSE
+					1
+				ELSE IF .NEW [ 4,LONG_U ] LSSU .OLD [ 4,LONG_U ]
+				THEN
+				    -1
+				ELSE
+				    1;
+
+	TES );
+
+    ! Fix the meaning of the flag
+    !
+    IF .DUP EQL 0
+    THEN
+	DUP = 1
+    ELSE
+	IF .DUP EQL 1
+	THEN
+	    DUP = 0;
+
+    ! Return the value
+    !
+    RETURN .DUP
+
+    END;
+
+%SBTTL	'IN_SEGMENT'
+ROUTINE	IN_SEGMENT : CL$IN_SEGMENT =
+!++
+!
+! Functional Description:
+!
+!	Determines if the current position in the data record is in a key
+!	segment or not
+!
+! Calling Sequence:
+!
+!	IN_SEGMENT()
+!
+! Input Parameters:
+!	none
+!
+! Implicit Inputs:
+!
+!	BYTE_OFS - R6	Offset into the data record
+!	NEXT_SEG - R7	Start of the next segment
+!	NEXT_LEN - R8	Length of next segment
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!
+!	1 - Pointer is in a key segment
+!	0 - Pointer is NOT in a key segment
+!
+! Routines Called:
+!	none
+!
+! Side Effects:
+!	none
+!
+!--
+
+    BEGIN
+
+    DEFINE_KEY_DESC;
+
+    EXTERNAL REGISTER
+	    BYTE_OFS = 6,	! Offset into the data record
+	    NEXT_SEG = 7,	! Start of the next segment
+	    NEXT_LEN = 8;	! Length of next segment
+
+    LOCAL	SEGMENT	: SIGNED;
+
+    NEXT_SEG = .CONV$GW_OUT_REC_SIZ;
+    NEXT_LEN = 0;
+
+    SEGMENT = .KEY_DESC [ KEY$B_SEGMENTS ] - 1;
+
+    ! Check all of the segments
+    !
+    WHILE .SEGMENT GEQ 0
+    DO
+	BEGIN
+
+	! See if we  are past a segment if so see if we are in it else
+	! check the next segment
+	!
+	IF .BYTE_OFS GEQ .KEY_DESC [ ( 28 + ( .SEGMENT*2 )),WORD_U ]
+	THEN
+	    BEGIN
+
+	    ! See if we are in the segment.  If so return with the pointers
+	    !
+	    IF .BYTE_OFS LSS ( .KEY_DESC [ ( 44 + .SEGMENT ),BYTE_U ] +
+				.KEY_DESC [ ( 28 + ( .SEGMENT*2 )),WORD_U ] )
+	    THEN
+		BEGIN
+		NEXT_SEG = .KEY_DESC [ ( 28 + ( .SEGMENT*2 )),WORD_U ];
+		NEXT_LEN = .KEY_DESC [ ( 44 + .SEGMENT ),BYTE_U ];
+		RETURN 1
+		END
+	    END
+	ELSE
+
+	    ! If this segment is closer than the last one then change pointers
+	    !
+	    IF .NEXT_SEG GTR .KEY_DESC [ ( 28 + ( .SEGMENT*2 )),WORD_U ]
+	    THEN
+		BEGIN
+		NEXT_SEG = .KEY_DESC [ ( 28 + ( .SEGMENT*2 )),WORD_U ];
+		NEXT_LEN = .KEY_DESC [ ( 44 + .SEGMENT ),BYTE_U ]
+		END;
+
+
+	! Check the next segment
+	!
+	SEGMENT = .SEGMENT - 1
+	END;
+
+    RETURN 0
+
+    END;
+
+%SBTTL	'COMPRESS_KEY'
+GLOBAL ROUTINE	CONV$$COMPRESS_KEY : CL$JSB_REG_9 NOVALUE =
+!++
+!
+! Functional Description:
+!
+!	Does primary data level key compression for prologue 3 files
+!
+! Calling Sequence:
+!
+!	CONV$$COMPRESS_KEY()
+!
+! Input Parameters:
+!	none
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!	none
+!
+! Side Effects:
+!	none
+!
+!--
+
+    BEGIN
+
+    DEFINE_CTX;
+    DEFINE_KEY_DESC;
+
+    LOCAL
+	KEY		: REF VECTOR [ ,BYTE ],
+	LENGTH,
+	COUNT,
+	RECORD_CTRL	: REF BLOCK [ ,BYTE ];
+
+    ! The key is in different place depending on ref
+    !
+    IF .KEY_DESC [ KEY$B_KEYREF ] EQL 0
+    THEN
+	KEY = .CTX [ CTX$L_RCP ] + 13
+    ELSE
+	KEY = .CTX [ CTX$L_RCP ] + 4;
+
+    ! Start with the full length of the key
+    !
+    LENGTH = .KEY_DESC [ KEY$B_KEYSZ ];
+    COUNT = 0;
+
+    ! If this is not the first record in the bucket then compress off the front
+    !
+    IF .CTX [ CTX$W_USE ] NEQU 0
+    THEN
+	BEGIN
+
+	BIND
+	    LASTKEY	= .CTX [ CTX$L_LKP ] : VECTOR [ ,BYTE ];
+
+	! Compaire with the last key
+	!
+	INCR I FROM 0 TO ( .LENGTH - 1 ) BY 1
+	DO
+
+	    ! If this character is the same as the character in the last key
+	    ! then it can be compressed off.
+	    !
+	    IF .LASTKEY [ .I ] EQLU .KEY [ .I ]
+	    THEN
+		COUNT = .COUNT + 1
+	    ELSE
+		EXITLOOP;
+
+	! The key could be a little bit shoter
+	!
+	LENGTH = .LENGTH - .COUNT;
+
+	! If we truncated off bytes we must move what is left of the key in a little
+	!
+	CH$MOVE ( .LENGTH,KEY [ .COUNT ],KEY [ 0 ] )
+
+	END;
+
+    ! If there are some characters left do rear end truncation
+    !
+    IF .LENGTH GTR 1
+    THEN
+
+	! Start looking from the back to compress off trailing dups
+	!
+	DECR I FROM ( .LENGTH - 1 ) TO 1 BY 1
+	DO
+
+	    ! If this character is a dup cut it off by shorting the length
+	    !
+	    IF .KEY [ .I - 1 ] EQLU .KEY [ .I ]
+	    THEN
+		LENGTH = .LENGTH - 1
+	    ELSE
+		EXITLOOP;
+
+    ! Point to the control fields in front of the key
+    !
+    RECORD_CTRL = .KEY - 4;
+
+    ! Set the length field in the record
+    !
+    RECORD_CTRL [ 2,BYTE_U ] = .LENGTH;
+
+    ! Set the count field in the record
+    !
+    RECORD_CTRL [ 3,BYTE_U ] = .COUNT;
+
+    ! Set the record size field in the record
+    !
+    RECORD_CTRL [ 0,WORD_U ] = .RECORD_CTRL [ 0,WORD_U ] -
+				( .KEY_DESC [ KEY$B_KEYSZ ] - .LENGTH );
+
+    ! Set the new size of the control part of the record if needed
+    !
+    CTX [ CTX$W_RCS ] = .CTX [ CTX$W_RCS ] -
+				( .KEY_DESC [ KEY$B_KEYSZ ] - .LENGTH );
+
+    RETURN
+
+    END;
+
+%SBTTL	'COMPRESS_INDEX'
+GLOBAL ROUTINE	CONV$$COMPRESS_INDEX : CL$JSB_REG_9 NOVALUE =
+!++
+!
+! Functional Description:
+!
+!	Does prologue 3 index compression on the index level record
+!
+! Calling Sequence:
+!
+!	CONV$$COMPRESS_INDEX()
+!
+! Input Parameters:
+!	none
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!	none
+!
+! Side Effects:
+!	none
+!
+!--
+
+    BEGIN
+
+    DEFINE_CTX;
+    DEFINE_BUCKET;
+    DEFINE_KEY_DESC;
+
+    LOCAL
+	LENGTH,
+	COUNT,
+	RECORD_CTRL	: REF BLOCK [ ,BYTE ];
+
+    BIND
+	KEY	= .CTX [ CTX$L_RDP ] + 2 : VECTOR [ ,BYTE ];
+
+    ! Init. counts
+    !
+    LENGTH = .KEY_DESC [ KEY$B_KEYSZ ];
+    COUNT = 0;
+
+    ! If this is not the first record in the bucket then do front compression
+    !
+    IF .CTX [ CTX$W_USE ] NEQU 0
+    THEN
+	BEGIN
+
+	BIND
+	    LASTKEY	= .CTX [ CTX$L_LKP ] : VECTOR [ ,BYTE ];
+
+	! Compare this key with the last one
+	!
+	INCR I FROM 0 TO ( .LENGTH - 1 ) BY 1
+	DO
+
+	    ! Count the characters that are the same
+	    !
+	    IF .LASTKEY [ .I ] EQLU .KEY [ .I ]
+	    THEN
+		COUNT = .COUNT + 1
+	    ELSE
+		EXITLOOP;
+
+	! The length of the key is a bit shorter now
+	!
+	LENGTH = .LENGTH - .COUNT
+
+	END;
+
+    ! Copy this key so that we have a last key to look at
+    !
+    CH$MOVE ( .KEY_DESC [ KEY$B_KEYSZ ],
+			.CTX [ CTX$L_RDP ] + 2,
+			.CTX [ CTX$L_LKP ] );
+
+    ! If we shortened the key from the front move it
+    !
+    CH$MOVE ( .LENGTH,KEY [ .COUNT ],KEY [ 0 ] );
+
+    ! If there are some characters left do rear end truncation
+    !
+    IF .LENGTH GTR 1
+    THEN
+
+	! Start looking from the back to compress off trailing dups
+	!
+	DECR I FROM ( .LENGTH - 1 ) TO 1 BY 1
+	DO
+
+	    ! If this character is a dup cut it off by shorting the length
+	    !
+	    IF .KEY [ .I - 1 ] EQLU .KEY [ .I ]
+	    THEN
+		LENGTH = .LENGTH - 1
+	    ELSE
+		EXITLOOP;
+
+    ! Set up the fields in the record
+    !
+    RECORD_CTRL = .CTX [ CTX$L_RDP ];
+
+    ! Set the record size field in the record
+    !
+    RECORD_CTRL [ 0,BYTE_U ] = .LENGTH;
+
+    ! Set the compression count
+    !
+    RECORD_CTRL [ 1,BYTE_U ] = .COUNT;
+
+    ! Set the new size of the data part of the record
+    !
+    CTX [ CTX$W_RDS ] = .LENGTH + 2;
+
+    RETURN
+
+    END;
+
+%SBTTL	'MAKE_INDEX'
+GLOBAL ROUTINE	CONV$$MAKE_INDEX : CL$JSB_REG_9 NOVALUE =
+!++
+!
+! Functional Description:
+!
+!	Makes an index record for the current record being processed
+!	It also copys the key into the last key buffer
+!
+! Calling Sequence:
+!
+!	CONV$$MAKE_INDEX
+!
+! Input Parameters:
+!	none
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!	none
+!
+! Side Effects:
+!	none
+!
+!--
+
+    BEGIN
+
+    DEFINE_CTX;
+    DEFINE_KEY_DESC;
+
+    LOCAL
+	OFFSET,
+	IDX_PTR,
+	CTX_P1	: REF BLOCK [ ,BYTE ];
+
+    ! We need the contex block from the level above
+    !
+    CTX_P1 = .CTX + CTX$K_BLN;
+
+    ! Account for control bytes if any
+    !
+    IF .KEY_DESC [ KEY$V_IDX_COMPR ]
+    THEN
+	OFFSET = 2
+    ELSE
+	OFFSET = 0;
+
+    ! Point to the destination
+    !
+    IDX_PTR = .CTX_P1 [ CTX$L_RDP ] + .OFFSET;
+
+    ! Copy the current key into the index buffer.
+    !
+    IF .KEY_DESC [ KEY$B_KEYREF ] EQLU 0
+    THEN
+	BEGIN
+
+	BIND
+	    SEG_SIZE	= .KEY_DESC + 44 : VECTOR [ ,BYTE ],
+	    SEG_POSI	= .KEY_DESC + 28 : VECTOR [ ,WORD ];
+
+	LOCAL	    REC_PTR;
+
+	! Copy the key into the index key buffer
+	!
+	INCR I FROM 0 TO ( .KEY_DESC [ KEY$B_SEGMENTS ] - 1 ) BY 1
+	DO
+	    BEGIN
+
+	    ! Point to the correct spot in the source string
+	    !
+	    REC_PTR = .CONV$GL_RECORD_PTR + .SEG_POSI [ .I ];
+
+	    CH$MOVE( .SEG_SIZE [ .I ],.REC_PTR,.IDX_PTR );
+
+	    ! Update the destination
+	    !
+	    IDX_PTR = .IDX_PTR + .SEG_SIZE [ .I ]
+
+	    END
+	END
+    ELSE
+	CH$MOVE( .KEY_DESC [ KEY$B_KEYSZ ],
+		 .CONV$GL_DUP_BUF,
+		 .IDX_PTR );
+
+    ! Copy the key from the index record into last key buffer
+    !
+    CH$MOVE( .KEY_DESC [ KEY$B_KEYSZ ],
+	     .CTX_P1 [ CTX$L_RDP ] + .OFFSET,
+	     .CTX [ CTX$L_LKP ] );
+
+    ! Set the index record size
+    !
+    CTX_P1 [ CTX$W_RDS ] = .KEY_DESC [ KEY$B_KEYSZ ] + .OFFSET;
+
+    ! Set the index control size
+    !
+    IF .CONV$GB_PROL_V3
+    THEN
+
+	! The record control size is simply the size of the
+	! VBN pointer to the bucket
+	!
+	CTX_P1 [ CTX$W_RCS ] = .CTX [ CTX$V_VBN ] + 2
+
+    ELSE
+
+	! The record control size is the size of the
+	! VBN pointer to the bucket plus one byte of control info
+	!
+	CTX_P1 [ CTX$W_RCS ] = .CTX [ CTX$V_VBN ] + 3;
+
+    RETURN
+
+    END;
+
+%SBTTL	'WRITE_VBN'
+GLOBAL ROUTINE	CONV$$WRITE_VBN : CL$JSB_REG_9 NOVALUE =
+!++
+!
+! Functional Description:
+!
+!	Writes the vbn pointer into the index record, also sets the control
+!	bytes describing the vbn pointer size
+!
+! Calling Sequence:
+!
+!	CONV$$WRITE_VBN
+!
+! Input Parameters:
+!	none
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!	none
+!
+! Side Effects:
+!	none
+!
+!--
+
+    BEGIN
+
+    DEFINE_CTX;
+    DEFINE_KEY_DESC;
+
+    LOCAL
+	VBN_SIZE,
+	CTX_P1		: REF BLOCK [ ,BYTE ],
+	RECORD_CTRL	: REF BLOCK [ ,BYTE ];
+
+    CTX_P1 = .CTX + CTX$K_BLN;
+
+    RECORD_CTRL = .CTX_P1 [ CTX$L_RCP ];
+
+    ! Get the size in bits of the vbn
+    !
+    VBN_SIZE = ( .CTX [ CTX$V_VBN ] + 2 ) * 8;
+
+    ! The control bytes are different for prologue 3 files
+    !
+    IF .CONV$GB_PROL_V3
+    THEN
+	RECORD_CTRL [ 0,0,.VBN_SIZE,0 ] = .CTX [ CTX$L_CURRENT_VBN ]
+    ELSE
+	BEGIN
+	RECORD_CTRL [ IRC$B_CONTROL ] = .CTX [ CTX$V_VBN ];
+	RECORD_CTRL [ 1,0,.VBN_SIZE,0 ] = .CTX [ CTX$L_CURRENT_VBN ]
+	END;
+
+    RETURN
+
+    END;
+
+%SBTTL	'COPY_KEY'
+GLOBAL ROUTINE	CONV$$COPY_KEY ( OFFSET ) : CL$COPY_KEY NOVALUE =
+!++
+!
+! Functional Description:
+!
+!	Copies the data record for secondary index into the proper
+!	data record buffer and sets RCS
+!
+! Calling Sequence:
+!
+!	CONV$$COPY_KEY()
+!
+! Input Parameters:
+!	none
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!	none
+!
+! Side Effects:
+!	none
+!
+!--
+
+    BEGIN
+
+    DEFINE_CTX;
+    DEFINE_KEY_DESC;
+    DEFINE_RECORD_CTRL;
+
+    ! If this is a prologue 3 file then the offset is either 2 or 4
+    ! depending on compression
+    !
+    IF .CONV$GB_PROL_V3
+    THEN
+	BEGIN
+
+	IF .KEY_DESC [ KEY$V_KEY_COMPR ]
+	THEN
+	    OFFSET = 4
+	ELSE
+	    OFFSET = 2;
+
+	! Set the size of the record here sice it is known, for prologue 1
+	! it is set in load_secondary
+	!
+	RECORD_CTRL [ 0,WORD_U ] = .KEY_DESC [ KEY$B_KEYSZ ] + .OFFSET - 2
+
+	END;
+
+    ! Move the key to the record control buffer
+    !
+    CH$MOVE( .KEY_DESC [ KEY$B_KEYSZ ],
+	     .CONV$GL_RFA_BUFFER + 6,
+	     .CTX [ CTX$L_RCP ] + .OFFSET );
+
+    ! Set the size
+    !
+    CTX [ CTX$W_RCS ] = .KEY_DESC [ KEY$B_KEYSZ ] + .OFFSET;
+
+    RETURN
+
+    END;
+
+%SBTTL	'CREATE_HIGH_KEY'
+GLOBAL ROUTINE	CONV$$CREATE_HIGH_KEY	: CL$JSB_REG_9 NOVALUE =
+!++
+!
+! Functional Description:
+!
+!	Creates a high key vaule index for the current key of reference
+!	and data type
+!
+! Calling Sequence:
+!
+!	CONV$$CREATE_HIGH_KEY()
+!
+! Input Parameters:
+!	none
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!	none
+!
+! Side Effects:
+!	none
+!
+!--
+
+    BEGIN
+
+    DEFINE_CTX;
+    DEFINE_BUCKET;
+    DEFINE_KEY_DESC;
+
+    BUILTIN
+	CVTLP;
+
+    LOCAL
+	CTX_P1		: REF BLOCK [ ,BYTE ],
+	RECORD_DATA	: REF BLOCK [ ,BYTE ];
+
+    ! Set up the control info for the index record
+    !
+    CONV$$WRITE_VBN();
+
+    ! The record we are making is actually for the level above
+    !
+    CTX_P1 = .CTX + CTX$K_BLN;
+
+    ! Get the start where the key should go
+    !
+    IF .KEY_DESC [ KEY$V_IDX_COMPR ]
+    THEN
+	RECORD_DATA = 2
+    ELSE
+	RECORD_DATA = 0;
+
+    ! We know what the size of the finished record is now
+    !
+    CTX_P1 [ CTX$W_RDS ] = .KEY_DESC [ KEY$B_KEYSZ ] + .RECORD_DATA;
+
+    ! Actually point to the record
+    !
+    RECORD_DATA = .RECORD_DATA + .CTX_P1 [ CTX$L_RDP ];
+
+    ! Loop for all of the segments
+    !
+    INCR I FROM 0 TO ( .KEY_DESC [ KEY$B_SEGMENTS ] - 1 ) BY 1
+    DO
+	BEGIN
+
+	! Select the data type
+	!
+	CASE .KEY_DESC [ KEY$B_DATATYPE ] FROM KEY$C_STRING TO KEY$C_MAX_DATA OF
+	SET
+	    [ KEY$C_STRING ]  : BEGIN
+
+				LOCAL HIGH_VALUE : BYTE;
+
+				HIGH_VALUE = %X'FF';
+				CH$FILL ( .HIGH_VALUE,
+					  .KEY_DESC [ ( 44 + .I ),BYTE_U ],
+					  .RECORD_DATA )
+				END;
+
+	    [ KEY$C_SGNWORD ]	: RECORD_DATA [ 0,WORD_S ] = %X'7FFF';
+
+	    [ KEY$C_UNSGNWORD ]	: RECORD_DATA [ 0,WORD_U ] = %X'FFFF';
+
+	    [ KEY$C_SGNLONG ]	: RECORD_DATA [ 0,LONG_S ] = %X'7FFFFFFF';
+
+	    [ KEY$C_UNSGNLONG ]	: RECORD_DATA [ 0,LONG_U ] = %X'FFFFFFFF';
+
+	    [ KEY$C_PACKED ]  : BEGIN
+
+				LOCAL	SIZE,
+					HIGH_VALUE : BYTE;
+
+				SIZE = .KEY_DESC [ ( 44 + .I ),BYTE_U ] - 1;
+				HIGH_VALUE = %X'99';
+
+				CH$FILL ( .HIGH_VALUE,
+					  .SIZE,
+					  .RECORD_DATA );
+
+				RECORD_DATA [ .SIZE,BYTE_U ] = %X'9C'
+
+				END;
+
+	    [ KEY$C_SGNQUAD ]	: BEGIN
+				  RECORD_DATA [ 4,LONG_S ] = %X'7FFFFFFF';
+				  RECORD_DATA [ 0,LONG_U ] = %X'FFFFFFFF'
+				  END;
+
+	    [ KEY$C_UNSGNQUAD ]	: BEGIN
+				  RECORD_DATA [ 4,LONG_U ] = %X'FFFFFFFF';
+				  RECORD_DATA [ 0,LONG_U ] = %X'FFFFFFFF'
+				  END;
+
+	TES;
+
+	! Update the pointer (add the segment length)
+	!
+	RECORD_DATA = .RECORD_DATA + .KEY_DESC [ ( 44 + .I ),BYTE_U ]
+
+	END;
+
+    RETURN
+
+    END;
+
+END	ELUDOM

@@ -1,0 +1,914 @@
+	.TITLE	VAX$CVTPL - VAX-11 Instruction Emulator for CVTPL
+	.IDENT	/V04-000/
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; Facility: 
+;
+;	VAX-11 Instruction Emulator
+;
+; Abstract:
+;	The routine in this module emulates the VAX-11 packed decimal 
+;	CVTPL instruction. This procedure can be a part of an emulator 
+;	package or can be called directly after the input parameters 
+;	have been loaded into the architectural registers.
+;
+;	The input parameters to this routine are the registers that
+;	contain the intermediate instruction state. 
+;
+; Environment: 
+;
+;	This routine runs at any access mode, at any IPL, and is AST 
+;	reentrant.
+;
+; Author: 
+;
+;	Lawrence J. Kenah	
+;
+; Creation Date
+;
+;	18 October 1983
+;
+; Modified by:
+;
+;	V01-009	LJK0034		Lawrence J. Kenah	16-Jul-1984
+;		Fix several bugs in restart logic.
+;
+;		Use R4 instead of R7 as dispatch register for restart routine.
+;		There is a single code path where R7 contains useful data.
+;		Insure that the contents of R7 are preserved across the
+;		  occurrence of the CVTPL_5 access violation. 
+;		Use special restart path for CVTPL_6. 
+;		Fix recalculation of srcaddr. 
+;		Use saved R2 when saving condition codes.
+;
+;	V01-008	LJK0033		Lawrence J. Kenah	6-Jul-1984
+;		Add R10 to register mask used along error path when the
+;		digit count is larger than 31.
+;
+;	V01-007	LJK0032		Lawrence J. Kenah	5-Jul-1984
+;		Fix restart routine to take into account the fact that restart
+;		codes are based at one when computing restart PC.
+;
+;	V01-006	LJK0030		Lawrence J. Kenah	20-Jun-1984
+;		Load access violation handler address into R10 before
+;		any useful work (like memory accesses) gets done.
+;
+;	V01-005	LJK0029		Lawrence J. Kenah	24-May-1984
+;		Fix stack offset calculations in exit code when V-bit is set
+;		to reflect the fact that seven registers (not six) have
+;		been saved on the stack.
+;
+;	V01-004	LJK0024		Lawrence J. Kenah	22-Feb-1984
+;		Add code to handle access violations. Perform minor cleanup.
+;
+;	V01-003	LJK0023		Lawrence J. Kenah	10-Feb-1984
+;		Make a write to PC generate a reserved addressing mode fault.
+;		Temporarily do the same thing for a SP destination operand
+;		until a better solution can be figured out.
+;
+;	V01-002	LJK0016		Lawrence J. Kenah	28-Nov-1983
+;		Algorithm was revised to work with digit pairs. Overflow check
+;		was modified to account for -2,147,483,648.
+;
+;	V01-001	LJK0013		Lawrence J. Kenah	17-Nov-1983
+;		The emulation code for CVTPL was moved into a separate module.
+;--
+
+	.SUBTITLE	Declarations
+
+; Include files:
+
+	.NOCROSS			; No cross reference for these
+	.ENABLE		SUPPRESSION	; No symbol table entries either
+
+	CVTPL_DEF			; Bit fields in CVTPL registers
+	PACK_DEF			; Stack usage by exception handler
+	STACK_DEF			; Stack usage for original exception
+
+	$PSLDEF				; Define bit fields in PSL
+	$SRMDEF				; Define arithmetic trap codes
+
+	.DISABLE	SUPPRESSION	; Turn on symbol table again
+	.CROSS				; Cross reference is OK now
+
+; External declarations
+
+	.DISABLE	GLOBAL
+
+	.EXTERNAL -
+			DECIMAL$BOUNDS_CHECK,-
+			DECIMAL$PACKED_TO_BINARY_TABLE,-
+			DECIMAL$STRIP_ZEROS_R0_R1
+
+	.EXTERNAL -
+			VAX$EXIT_EMULATOR,-
+			VAX$REFLECT_FAULT,-
+			VAX$REFLECT_TRAP,-
+			VAX$RADRMOD,-
+			VAX$ROPRAND
+
+; PSECT Declarations:
+
+	.DEFAULT	DISPLACEMENT , WORD
+
+	.PSECT _VAX$CODE PIC, USR, CON, REL, LCL, SHR, EXE, RD, NOWRT, LONG
+
+	BEGIN_MARK_POINT	RESTART
+
+	.SUBTITLE	VAX$CVTPL - Convert Packed to Long 
+;+
+; Functional Description:
+;
+;	The source string specified by the  source  length  and  source  address
+;	operands  is  converted  to  a  longword  and the destination operand is
+;	replaced by the result.
+;
+; Input Parameters:
+;
+;	R0 - srclen.rw		Length of input decimal string
+;	R1 - srcaddr.ab		Address of input packed decimal string
+;	R3 - dst.wl		Address of longword to receive converted string
+;
+;	Note that the CVTPL instruction is the only instruction in the
+;	emulator package that has an operand type of .wx. This operand type
+;	needs special treatment if the operand is to be written into a general
+;	register. The following convention is established. If the destination
+;	is anything other than a general register (addressing mode 5), then R3
+;	contains the address of the destination. If the destination is a
+;	general register, then R3 contains the ones complement of the register
+;	number. Note that if this is interpreted as an address, then R3 points
+;	to the last page of so-called S1 space, the reserved half of system
+;	virtual address space. The algorithmic specification of this
+;	convention is as follows. 
+;
+;		IF R3 <31:04> NEQU ^XFFFFFFF
+;		  THEN
+;		    R3 contains the address of the destination operand
+;		  ELSE
+;		    R3 contains the ones complement of the register number
+;		    of the single register to be loaded with the result 
+;		    of the conversion
+;
+;		That is, 
+;
+;			R3 = FFFFFFFF  ==>   R0 <- result
+;			R3 = FFFFFFFE  ==>   R1 <- result
+;				.
+;				.
+;			R3 = FFFFFFF4  ==>  R11 <- result
+;				.
+;				.
+;
+;		Note that any "S1 address" in R3 on input other than
+;		FFFFFFFF through FFFFFFF0 will cause a length access
+;		violation. 
+;
+; Output Parameters:
+;
+;	R0 = 0
+;	R1 = Address of byte containing most significant digit of
+;	     the source string
+;	R2 = 0
+;	R3 = 0
+;
+; Condition Codes:
+;
+;	N <- output longword LSS 0
+;	Z <- output longword EQL 0
+;	V <- integer overflow
+;	C <- 0
+;
+; Register Usage:
+;
+;	This routine uses R0 through R7. The condition codes are recorded
+;	in R2 as the routine executes. In addition, R10 serves its usual
+;	purpose by pointing to the access violation handler.
+;-
+
+	.ENABLE	LOCAL_BLOCK
+
+	ASSUME CVTPL_B_STATE EQ 2	; Make sure we test the right FPD bit
+
+2$:	BRW	VAX$CVTPL_RESTART	; Restart somewhere else
+
+VAX$CVTPL::
+	BBS	#<CVTPL_V_FPD+16>,R0,2$	; Branch if this is a restart
+	PUSHR	#^M<R1,R4,R5,R6,R7,R10>	; Save some registers
+	ESTABLISH_HANDLER	-
+			CVTPL_ACCVIO	; Load R10 with handler address
+	MOVPSL	R2			; Get current PSL
+	BICB2	#<PSL$M_N!PSL$M_Z!PSL$M_V!PSL$M_C>,R2	; Clear condition codes
+	CLRL	R6			; Assume result is zero
+	ROPRAND_CHECK	R0		; Insure that R0 LEQU 31
+	BEQL	60$			; All done if string has zero length
+	MARK_POINT	CVTPL_1 , RESTART
+	BSBW	DECIMAL$STRIP_ZEROS_R0_R1	; Eliminate leading zeros from input
+	ASHL	#-1,R0,R0		; Convert digit count to byte count
+	BEQL	30$			; Skip loop if single digit
+
+; The first digit pair sets up the initial value of the result.
+
+	MARK_POINT	CVTPL_2 , RESTART
+	MOVZBL	(R1)+,R5		; Get first digit pair
+	MOVZBL	DECIMAL$PACKED_TO_BINARY_TABLE[R5],R6
+					; Convert to binary number
+
+; The SOBGTR instruction at the bottom of the loop can be used to decrement
+; the byte count and test whether this is the special case of an initial
+; digit count of two or three. Note that this loop does not attempt to
+; optimize the case where the V-bit is already set.
+
+	BRB	20$			; Join the loop at the bottom
+
+	MARK_POINT	CVTPL_3 , RESTART
+10$:	MOVZBL	(R1)+,R5		; Get next digit pair
+	MOVZBL	DECIMAL$PACKED_TO_BINARY_TABLE[R5],R5
+					; Convert to binary number
+	EMUL	#100,R6,R5,R6		; Blend this latest with previous result
+
+; Check all of R7 and R6<31> for nonzero. Unconditionally clear R6<31>.
+
+	BBSC	#31,R6,15$		; Branch if overflow into R6<31>
+	TSTL	R7			; Anything into upper longword
+	BEQL	20$			; Branch if OK
+15$:	BISB	#PSL$M_V,R2		; Set saved V-bit
+20$:	SOBGTR	R0,10$			; Continue for rest of whole digit pairs
+
+; The final (least significant) digit is handled in a slightly different 
+; fashion. This has an advantage in that the final overflow check is different
+; from the check that is made inside the loop. That check can be made quickly
+; without concern for the final digit special cases.
+
+	MARK_POINT	CVTPL_4 , RESTART
+30$:	EXTZV	#4,#4,(R1),R5		; Get least significant digit
+	EMUL	#10,R6,R5,R6		; Blend in with previous result
+
+; This overflow check differs from the one inside the loop in three ways.
+;
+;	The check for nonzero R7 precedes the test of R6<31>. 
+;
+;     o The high order bit of R6 is left alone. (If overflow occurs, the 
+;	complete 32-bit contents of R6 need to be preserved.)
+;
+;     o A special check is made to see if the 64-bit result is identically 
+;	equal to 
+;
+;		R6 = 80000000
+;		R7 = 00000000
+;
+;     o If this is true AND the input sign is minus, then the overflow bit 
+;	needs to be turned off. This unusual result is passed to the following
+;	code by means of a zero in R7. All other results cause nonzero R7
+;	(including the case where the V-bit was already set).
+;
+; Note that the check for V-bit previously set is the single additional 
+; instruction that must execute in the normal (V-bit clear) case to test
+; for the extraordinarily rare case of -2,147,483,648.
+
+	TSTL	R7			; Overflow into second longword?
+	BNEQ	36$			; Branch if overflow
+	BBS	#PSL$V_V,R2,33$		; Set R7 to nonzero if V-bit already set
+	CMPL	R6,#^X80000000		; Peculiar check for R6<31> NEQ zero
+	BLSSU	40$			; Branch if no overflow at all
+	BEQL	36$			; Leave R7 alone in special case
+33$:	INCL	R7			; Set R7 to nonzero in all other cases
+36$:	BISB	#PSL$M_V,R2		; Set saved V-bit
+
+; All of the input digits have been processed, Get the sign of the input
+; string and complete the instruction processing.
+
+	MARK_POINT	CVTPL_5 , RESTART
+40$:	BICB3	#^B11110000,(R1),R5	; Get sign "digit"
+
+	CASE	R5,LIMIT=#10,TYPE=B,<-	; Dispatch on sign 
+		60$,-			; 10 => +
+		50$,-			; 11 => -
+		60$,-			; 12 => +
+		50$,-			; 13 => -
+		60$,-			; 14 => +
+		60$,-			; 15 => +
+		>
+
+; Note that negative zero is not a problem in this instruction because the
+; longword result will simply be zero, independent of the input sign.
+
+50$:	MNEGL	R6,R6			; Change sign on negative input
+	TSTL	R7			; Was input -2,147,483,648?
+	BNEQ	60$			; Nope, leave V-bit alone
+	BICB	#PSL$M_V,R2		; Clear saved V-bit
+60$:	MOVL	(SP)+,R1		; Restore original value of R1
+	CLRQ	-(SP)			; Set saved R2 and R3 to zero
+
+; If R3 contains the ones complement of a number between 0 and 15, then the
+; destination is a general register. Special processing is required to 
+; correctly restore registers, store the result in a register, and set the
+; condition codes. 
+
+	MCOML	R3,R7			; Set up R7 for limit check with CASE
+	CASE	R7,LIMIT=#0,TYPE=L,<-	; See if R7 contains a register number
+
+		100$,-			; R0  --  Store into R0 via POPR
+		100$,-			; R1  --  Store into R1 via POPR
+
+		110$,-			; R2  --  Store in saved R2 on stack
+		110$,-			; R3  --  Store in saved R3 on stack
+		110$,-			; R4  --  Store in saved R4 on stack
+		110$,-			; R5  --  Store in saved R5 on stack
+		110$,-			; R6  --  Store in saved R6 on stack
+		110$,-			; R7  --  Store in saved R7 on stack
+
+		100$,-			; R8  --  Store into R8 via POPR
+		100$,-			; R9  --  Store into R9 via POPR
+		120$,-			; R10 --  Store in saved R10 on stack
+		100$,-			; R11 --  Store into R11 via POPR
+		100$,-			; AP  --  Store into AP via POPR
+		100$,-			; FP  --  Store into FP via POPR
+
+; The result of specifying PC as a destination operand is defined to be
+; UNPREDICTABLE in the VAX architecture. In addition, it is difficult (but
+; not impossible) for this emulator to modify SP because it is using the
+; stack for local storage. We will generate a reserved addressing mode fault
+; if PC is specified as the destination operand. We will also temporarily
+; generate a reserved addressing mode fault if SP is specified as the
+; destination operand. 
+
+		CVTPL_RADRMOD,-		; SP  --  Reserved addressing mode 
+		CVTPL_RADRMOD,-		; PC  --  Reserved addressing mode
+		>
+
+; If we drop through the CASE instruction, then R3 contains the address of
+; the destination operand. This includes system space addresses in the range
+; C0000000 to FFFFFFFF other than the ones complements of 0 through 15
+; (FFFFFFF0 to FFFFFFFF). The next instruction will cause an access violation
+; for all such illegal system space addresses. 
+
+	MARK_POINT	CVTPL_6 , RESTART
+	MOVL	R6,(R3)			; Store result and set condition codes
+
+; This is the exit path for this routine. The result has already been stored.
+; The condition codes are set and the saved registers restored. The BICPSW
+; instruction is necessary because the various instructions that stored the 
+; result (MOVL, PUSHL, etc.) do not affect the C-bit and the C-bit must be
+; clear on exit from this routine.
+
+70$:	BICPSW	#PSL$M_C		; Insure that C-bit is clear on exit
+	BISPSW	R2			; Set saved V-bit
+	BBS	#PSL$V_V,R2,75$		; Step out of line for overflow check
+	POPR	#^M<R2,R3,R4,R5,R6,R7,R10>	; Restore saved registers 
+						;  and clear R2 and R3
+	RSB
+
+72$:	BICPSW	#<PSL$M_N!PSL$M_Z!PSL$M_V!PSL$M_C>	; Clear condition codes
+	BISPSW	R3				; Set relevant condition codes
+	POPR	#^M<R2,R3,R4,R5,R6,R7,R10>	; Restore saved registers 
+	RSB
+
+; If the V-bit is set and decimal traps are enabled (IV-bit is set), then
+; a decimal overflow trap is generated. Note that the IV-bit can be set in
+; the current PSL or, if this routine was entered as the result of an emulated
+; instruction exception, in the saved PSL on the stack.
+
+75$:	MOVPSL	R3			; Save current condition codes
+	BBS	#PSL$V_IV,R2,78$	; Report exception if current IV-bit set
+	MOVAB	VAX$EXIT_EMULATOR,R2	; Set up R2 for PIC address comparison
+	CMPL	R2,<4*7>(SP)		; Is return PC EQLU VAX$EXIT_EMULATOR ?
+	BNEQU	72$			; No. Simply return V-bit set
+	BBC	#PSL$V_IV,<<4*<7+1>>+EXCEPTION_PSL>(SP),72$
+					; Only return V-bit if IV-bit is clear
+
+	BICPSW	#<PSL$M_N!PSL$M_Z!PSL$M_V!PSL$M_C>	; Clear condition codes
+	BISPSW	R3			; Set relevant condition codes
+
+78$:	POPR	#^M<R2,R3,R4,R5,R6,R7,R10>	; Otherwise, restore registers
+
+; ... drop into INTEGER_OVERFLOW
+
+;+
+; This code path is entered if the result is too large to fit into a longword
+; and integer overflow exceptions are enabled. The final state of the
+; instruction, including the condition codes, is entirely in place. 
+;
+; Input Parameter:
+;
+;	(SP) - Return PC
+;
+; Output Parameters:
+;
+;	0(SP) - SRM$K_INT_OVF_T (Arithmetic trap code)
+;	4(SP) - Final state PSL
+;	8(SP) - Return PC
+;
+; Implicit Output:
+;
+;	Control passes through this code to VAX$REFLECT_TRAP.
+;-
+
+INTEGER_OVERFLOW:
+	MOVPSL	-(SP)			; Save final PSL on stack
+	PUSHL	#SRM$K_INT_OVF_T	; Store arithmetic trap code
+	BRW	VAX$REFLECT_TRAP	; Report exception
+
+;+
+; The destination address is a general register. R3 contains the ones
+; complement of the register number of the general register that is to be
+; loaded with the result. Note that the result must be stored in such a way
+; that restoring the saved registers does not overwrite the destination. 
+;
+; The algorithm that accomplishes a correct store of the result with the
+; accompanying setting of the condition codes is as follows.
+;
+;	IF the register is in the range R2 through R7 or R10
+;	  THEN
+;	    store the result on the stack over that saved register
+;	    (note that this store sets condition codes, except the C-bit)
+;	  ELSE
+;	    construct a register save mask from the register number
+;	    store result on the top of the stack
+;	    (note that this store sets condition codes, except the C-bit)
+;	    POPR the result using the mask in R3
+;	ENDIF
+;	restore saved registers
+;-
+
+; R7 contains 0, 1, 8, 9, 11, 12, or 13. We will use the bit number to
+; create a register save mask for the appropriate register. Note that #1
+; is the source operand and R7 is the shift count in the next instruction.
+
+100$:	ASHL	R7,#1,R3		; R3 contains mask for single register
+	PUSHL	R6			; Store result and set condition codes
+	POPR	R3			; Restore result into correct register
+	BRB	70$			; Restore registers and return	
+
+; R7 contains 2, 3, 4, 5, 6, or 7
+
+110$:	MOVL	R6,-8(SP)[R7]		; Store result over saved register
+	BRB	70$			; Restore registers and return	
+
+; R7 contains a 10
+
+120$:	MOVL	R6,24(SP)		; Store result over saved register
+	BRB	70$			; Restore registers and return
+
+	.DISABLE	LOCAL_BLOCK
+
+	.SUBTITLE	DECIMAL_ROPRAND
+;-
+; Functional Description:
+;
+;	This routine receives control when a digit count larger than 31
+;	is detected. The exception is architecturally defined as an
+;	abort so there is no need to store intermediate state. The digit
+;	count is made after registers are saved. These registers must be
+;	restored before reporting the exception.
+;
+; Input Parameters:
+;
+;	00(SP) - Saved R1
+;	04(SP) - Saved R4
+;	08(SP) - Saved R5
+;	12(SP) - Saved R6
+;	16(SP) - Saved R7
+;	20(SP) - Saved R10
+;	24(SP) - Return PC from VAX$CVTPL routine
+;
+; Output Parameters:
+;
+;	00(SP) - Offset in packed register array to delta PC byte
+;	04(SP) - Return PC from VAX$CVTPL routine
+;
+; Implicit Output:
+;
+;	This routine passes control to VAX$ROPRAND where further
+;	exception processing takes place.
+;-
+
+DECIMAL_ROPRAND:
+	POPR	#^M<R1,R4,R5,R6,R7,R10>	; Restore saved registers
+	PUSHL	#CVTPL_B_DELTA_PC	; Store offset to delta PC byte
+	BRW	VAX$ROPRAND		; Pass control along
+
+	.SUBTITLE	CVTPL_RADRMOD
+;-
+; Functional Description:
+;
+;	This routine receives control when PC or SP is used as the destination
+;	of a CVTPL instruction. The reaction to this is not architecturally
+;	defined so we are somewhat free in how we handle it. We currently
+;	generate a RADRMOD abort with R0 containing the correct 32-bit result.
+;	In the future, we may make this instruction restartable following this
+;	exception. 
+;
+; Input Parameters:
+;
+;	R0 - Zero
+;	R1 - Address of source decimal string
+;	R2 - Contains overflow indication in R2<PSL$V_V>
+;	R3 - Register number in ones complement form
+;		R3 = -15 => PC was destination operand
+;		R3 = -14 => SP was destination operand
+;	R4 - scratch
+;	R5 - scratch
+;	R6 - Correct 32-bit result
+;	R7 - scratch
+;
+;	00(SP) - Saved R2 (contains zero)
+;	04(SP) - Saved R3 (contains zero)
+;	08(SP) - Saved R4
+;	12(SP) - Saved R5
+;	16(SP) - Saved R6
+;	20(SP) - Saved R7
+;	24(SP) - SAVED R10
+;	28(SP) - Return PC from VAX$xxxxxx routine
+;
+; Output Parameters:
+;
+;	R0 - Correct 32-bit result
+;
+;	R1, R2, and R3 are unchanged from their input values.
+;
+;	R4 through R7 and R10 are restored from the stack.
+;
+;	00(SP) - Offset in packed register array to delta PC byte
+;	04(SP) - Return PC from VAX$xxxxxx routine
+;
+; Implicit Output:
+;
+;	This routine passes control to VAX$RADRMOD where further
+;	exception processing takes place.
+;-
+
+CVTPL_RADRMOD:
+	ADDL	#8,SP			; Discard "saved" R2 and R3
+	MOVL	R6,R0			; Remember final result
+	POPR	#^M<R4,R5,R6,R7,R10>	; Restore saved registers
+	PUSHL	#CVTPL_B_DELTA_PC	; Store offset to delta PC byte
+	BRW	VAX$RADRMOD		; Pass control along
+
+	.SUBTITLE	CVTPL_ACCVIO - Reflect an Access Violation
+;+
+; Functional Description:
+;
+;	This routine receives control when an access violation occurs while
+;	executing within the VAX$CVTPL emulator routine.
+;
+;	The routine header for ASHP_ACCVIO in module VAX$ASHP contains a
+;	detailed description of access violation handling for the decimal
+;	string instructions. This routine differs from most decimal 
+;	instruction emulation routines in that it preserves intermediate 
+;	results if an access violation occurs. This is accomplished by 
+;	storing the number of the exception point, as well as intermediate 
+;	arithmetic results, in the registers R0 through R3.
+;
+; Input Parameters:
+;
+;	See routine ASHP_ACCVIO in module VAX$ASHP
+;
+; Output Parameters:
+;
+;	See routine ASHP_ACCVIO in module VAX$ASHP
+;-
+
+CVTPL_ACCVIO:
+	CLRL	R2			; Initialize the counter
+	PUSHAB	MODULE_BASE		; Store base address of this module
+	PUSHAB	MODULE_END		; Store module end address
+	BSBW	DECIMAL$BOUNDS_CHECK	; Check if PC is inside the module
+	ADDL	#4,SP			; Discard end address
+	SUBL2	(SP)+,R1		; Get PC relative to this base
+
+10$:	CMPW	R1,PC_TABLE_BASE[R2]	; Is this the right PC?
+	BEQL	30$			; Exit loop if true
+	AOBLSS	#TABLE_SIZE,R2,10$	; Do the entire table
+
+; If we drop through the dispatching based on PC, then the exception is not 
+; one that we want to back up. We simply reflect the exception to the user.
+
+20$:	POPR	#^M<R0,R1,R2,R3>	; Restore saved registers
+	RSB				; Return to exception dispatcher
+
+; The exception PC matched one of the entries in our PC table. R2 contains
+; the index into both the PC table and the handler table. R1 has served
+; its purpose and can be used as a scratch register.
+
+30$:	MOVZWL	HANDLER_TABLE_BASE[R2],R1	; Get the offset to the handler
+	JMP	MODULE_BASE[R1]		; Pass control to the handler
+	
+; In all of the instruction-specific routines, the state of the stack
+; will be shown as it was when the exception occurred. All offsets will
+; be pictured relative to R0. 
+
+	.SUBTITLE	Context-Specific Access Violation Handling for VAX$CVTPL
+;+
+; Functional Description:
+;
+;	The intermediate state of the instruction is packed into registers R0 
+;	through R3 and control is passed to VAX$REFLECT_FAULT that will, in 
+;	turn, reflect the access violation back to the user. The intermediate 
+;	state reflects the point at which the routine was executing when the 
+;	access violation occurred.
+;
+; Input Parameters:
+;
+;	R0 - Address of top of stack when access violation occurred
+;
+;	00(SP) - Saved R0 (restored by VAX$HANDLER)
+;	04(SP) - Saved R1
+;	08(SP) - Saved R2
+;	12(SP) - Saved R3
+;
+;	See individual entry points for details
+;
+; Output Parameters:
+;
+;	R0 - Address of return PC from VAX$CVTPL
+;	R1 - Byte offset to delta-PC in saved register array
+;		(PACK_V_FPD and PACK_M_ACCVIO set to identify exception)
+;
+;	See list of input parameters for CVTPL_RESTART for a description of the
+;	contents of the packed register array.
+;
+; Implicit Output:
+;
+;	R4, R5, R6, R7, and R10 are restored to the values that they had
+;	when VAX$CVTPL was entered.
+;-
+
+	.ENABLE		LOCAL_BLOCK
+
+;+
+; CVTPL_1
+;
+; An access violation occurred in subroutine STRIP_ZEROS while scanning the
+; source string for leading zeros.
+;
+;	R0  - Updated digit or byte count in source string
+;	R1  - Address of current byte in source string
+;	R2  - Condition codes reflecting result
+;	R3  - Address of destination (unchanged from input value)
+;	R6  - Intermediate (or final) longword result
+;
+;	00(R0) - Return PC from STRIP_ZEROS
+;	04(R0) - Original value of R1 (scraddr)
+;	08(R0) - Saved R4
+;	12(R0) - Saved R5
+;	16(R0) - Saved R6
+;	20(R0) - Saved R7
+;	24(R0) - Saved R10
+;	28(R0) - Return PC from VAX$CVTPL routine
+;-
+
+CVTPL_1:
+	ADDL	#4,R0			; Discard return PC from STRIP_ZEROS
+	MOVB	#CVTPL_1_RESTART,R4	; Store code that locates exception PC
+	BRB	10$			; Join common code
+
+;+
+; CVTPL_2 through CVTPL_5
+;
+;	R0  - Updated digit or byte count in source string
+;	R1  - Address of current byte in source string
+;	R2  - Condition codes reflecting result
+;	R3  - Address of destination (unchanged from input value)
+;	R6  - Intermediate (or final) longword result
+;
+;	00(R0) - Original value of R1 (scraddr)
+;	04(R0) - Saved R4
+;	08(R0) - Saved R5
+;	12(R0) - Saved R6
+;	16(R0) - Saved R7
+;	20(R0) - Saved R10
+;	24(R0) - Return PC from VAX$CVTPL routine
+;-
+
+CVTPL_2:
+	MOVB	#CVTPL_2_RESTART,R4	; Store code that locates exception PC
+	BRB	10$			; Join common code
+
+CVTPL_3:
+	MOVB	#CVTPL_3_RESTART,R4	; Store code that locates exception PC
+	BRB	10$			; Join common code
+
+CVTPL_4:
+	MOVB	#CVTPL_4_RESTART,R4	; Store code that locates exception PC
+	BRB	10$			; Join common code
+
+CVTPL_5:
+	MOVB	#CVTPL_5_RESTART,R4	; Store code that locates exception PC
+	BRB	10$			; Join common code
+
+;+
+; CVTPL_6 
+;
+;	R0  - Updated digit or byte count in source string
+;	R1  - Address of most significant byte in source string (original srcaddr)
+;	R2  - Condition codes reflecting result
+;	R3  - Address of destination (unchanged from input value)
+;	R6  - Intermediate (or final) longword result
+;
+;	00(R0) - Zero (will be restored to R2)
+;	04(R0) - Zero (will be restored to R3)
+;	08(R0) - Saved R4
+;	12(R0) - Saved R5
+;	16(R0) - Saved R6
+;	20(R0) - Saved R7
+;	24(R0) - Saved R10
+;	28(R0) - Return PC from VAX$CVTPL routine
+;-
+
+CVTPL_6:
+	ADDL	#4,R0			; Discard extra longword on the stack
+	MOVB	#CVTPL_6_RESTART,R4	; Store code that locates exception PC
+	MOVL	PACK_L_SAVED_R1(SP),-
+		(R0)			; Put "current" R1 on top of stack
+
+10$:	SUBL3	(R0)+,CVTPL_A_SRCADDR(SP),R1	; Current minus initial srcaddr
+	MOVB	R1,CVTPL_B_DELTA_SRCADDR(SP)	; Remember it for restart
+
+	ASSUME CVTPL_V_SAVED_PSW EQ 0
+
+	BISB3	#CVTPL_M_FPD,-			; Save current condition codes
+		PACK_L_SAVED_R2(SP),-		;  (found in saved R2)
+		CVTPL_B_STATE(SP)		;  and set internal FPD bit
+	INSV	R4,#CVTPL_V_STATE,-		; Store code that identifies
+		#CVTPL_S_STATE,-		;  exception PC so that we
+		CVTPL_B_STATE(SP)		;  restart at correct place
+	MOVL	R6,CVTPL_L_RESULT(SP)		; Save intermediate result
+
+; At this point, all intermediate state has been preserved in the register
+; array on the stack. We now restore the registers that were saved on entry 
+; to VAX$CVTPL and pass control to VAX$REFLECT_FAULT where further exception
+; dispatching takes place.
+
+	MOVQ	(R0)+,R4		; Restore R4 and R6
+	MOVQ	(R0)+,R6		; ... and R6 and R7
+	MOVL	(R0)+,R10		; ... and R10
+
+	MOVL	#<CVTPL_B_DELTA_PC!-	; Indicate offset for delta PC
+		PACK_M_FPD!-		; FPD bit should be set
+		PACK_M_ACCVIO>,R1	; This is an access violation
+	BRW	VAX$REFLECT_FAULT	; Continue exception handling
+
+	.DISABLE	LOCAL_BLOCK
+
+	.SUBTITLE	CVTPL_RESTART - Unpack and Restart CVTPL Instruction
+;+
+; Functional Description:
+;
+;	This routine receives control when a CVTPL instruction is restarted. 
+;	The instruction state (stack and general registers) is restored to the 
+;	state that it was in when the instruction (routine) was interrupted and 
+;	control is passed to the PC at which the exception occurred.
+;
+; Input Parameters:
+;
+;     31               23               15               07            00
+;    +----------------+----------------+----------------+----------------+
+;    |    delta-PC    |      state     |             srclen              | : R0
+;    +----------------+----------------+----------------+----------------+
+;    |                              srcaddr                              | : R1
+;    +----------------+----------------+----------------+----------------+
+;    |                              result                               | : R2
+;    +----------------+----------------+----------------+----------------+
+;    |                                dst                                | : R3
+;    +----------------+----------------+----------------+----------------+
+;
+;	Depending on where the exception occurred, some of these parameters 
+;	may not be relevant. They are nevertheless stored as if they were 
+;	valid to make this restart code as simple as possible.
+;
+;	R0<04:00> - Remaining digit/byte count in source string
+;	R0<07:05> - spare
+;	R0<15:08> - "srcaddr" difference (current - initial)
+;	R0<19:16> - Saved condition codes
+;	R0<22:20> - Restart code (identifies point where routine will resume)
+;	R0<23>    - Internal FPD flag
+;	R0<31:24> - Size of instruction in instruction stream (delta PC)
+;	R1        - Address of current byte in source string
+;	R2        - Value of intermediate or final result
+;	R3        - Address of destination (unchanged from input value of R3)
+;
+;	00(SP) - Return PC from VAX$CVTPL routine
+;
+; Implicit Input:
+;
+;	Note that the initial "srclen" is checked for legality before any
+;	restartable exception can occur. This means that R0 LEQU 31, which
+;	leaves bits <15:5> free for storing intermediate state. In the case of
+;	an access violation, R0<15:8> is used to store the difference between
+;	the original and current addresses in the source string. 
+;
+; Output Parameters:
+;
+;	R0  - Updated digit or byte count in source string
+;	R2  - Condition codes reflecting result
+;	R3  - Address of destination (unchanged from input value)
+;	R6  - Intermediate (or final) longword result
+;	R10 - Address of CVTPL_ACCVIO, this module's "condition handler"
+;
+;	If the instruction was interrupted at mark point 6, the stack and R1
+;	contain different values than they do if the instruction was interrupted
+;	at any of the intermediate restart points.
+;
+;	Access violation occurred at restart points 1 through 5
+;
+;		R1 - Address of current byte in source string
+;
+;		00(SP) - Original value of R1 (scraddr)
+;		04(SP) - Saved R4
+;		08(SP) - Saved R5
+;		12(SP) - Saved R6
+;		16(SP) - Saved R7
+;		20(SP) - Saved R10
+;		24(SP) - Return PC from VAX$CVTPL routine
+;
+;	Access violation occurred at restart points 1 through 5
+;
+;		R1 - Address of most significant byte in source string 
+;			(original srcaddr)
+;
+;		00(SP) - Zero (will be restored to R2)
+;		04(SP) - Zero (will be restored to R3)
+;		08(SP) - Saved R4
+;		12(SP) - Saved R5
+;		16(SP) - Saved R6
+;		20(SP) - Saved R7
+;		24(SP) - Saved R10
+;		28(SP) - Return PC from VAX$CVTPL routine
+;
+; Implicit Output:
+;
+;	R4, R5, and R7 are used as scratch registers
+;-
+
+VAX$CVTPL_RESTART::
+	PUSHR	#^M<R0,R1,R4,R5,R6,R7,R10>	; Save some registers
+	ESTABLISH_HANDLER	CVTPL_ACCVIO	; Reload R10 with handler address
+
+; Make sure that the CVTPL_B_STATE byte is now on the stack (in R0 or R1)
+
+	ASSUME CVTPL_B_STATE LE 7
+
+	EXTZV	#CVTPL_V_STATE,-
+		#CVTPL_S_STATE,-
+		CVTPL_B_STATE(SP),R4		; Put restart code into R4
+
+; The next two instructions reconstruct the initial value of "srcaddr" that
+; is stored on the stack just above the saved R4. This value will be loaded
+; into R1 when the instruction completes execution. 
+
+	MOVZBL	CVTPL_B_DELTA_SRCADDR(SP),R5	; Get the difference
+	SUBL2	R5,CVTPL_A_SRCADDR(SP)		; Recreate the original R1
+	MOVZBL	R0,R0				; Clear out R0<31:8>
+
+; Make sure that the intermediate result is stored in R2
+
+	ASSUME CVTPL_L_RESULT EQ 8
+
+	MOVL	R2,R6
+	MOVPSL	R2				; Get clean copy of PSL
+	EXTZV	#CVTPL_V_SAVED_PSW,-		; Retrieve saved copy of
+		#CVTPL_S_SAVED_PSW,-		;  condition codes
+		CVTPL_B_STATE(SP),R5
+	BICB2	#<PSL$M_N!PSL$M_Z!PSL$M_V!PSL$M_C>,R2	; Clear condition codes
+	BISB2	R5,R2				; Restore saved codes to R2
+
+; A check is made to determine whether the access violation occurred at 
+; restart point number 6, where the stack is slightly different from its
+; state at the other exception points.
+
+	ADDL	#4,SP			; Discard saved R0 place holder
+	CMPL	R4,#CVTPL_6_RESTART	; Check for restart at the bitter end
+	BLSSU	10$			; Branch if somewhere else
+	MOVL	(SP)+,R1		; Restore saved "current" R1
+	CLRQ	-(SP)			; Store final values of R2 and R3
+10$:	MOVZWL	RESTART_PC_TABLE_BASE-2[R4],R4	; Convert code to PC offset
+	JMP	MODULE_BASE[R4]		; Get back to work
+
+	END_MARK_POINT		CVTPL_M_STATE
+
+	.END

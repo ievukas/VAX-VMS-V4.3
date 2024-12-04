@@ -1,0 +1,1194 @@
+MODULE dcx_analyze (			! Data analysis routines
+		LANGUAGE (BLISS32),
+		IDENT = 'V04-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+!   FACILITY:
+!
+!	DCX -- Data Compression / Expansion Facility
+!
+!   ABSTRACT:
+!
+!	The Data Compression / Expansion procedures provide a general
+!	method for reducing the storage requirement for a arbitrary data.
+!
+! ENVIRONMENT:
+!
+!	VAX native, user mode.
+!
+!--
+!
+!
+! AUTHOR:  David Thiel
+!
+! CREATION DATE: July, 1981
+!
+! MODIFIED BY:
+!
+!	V03-001	DWT0078		David W. Thiel		22-Feb-1983
+!		Add support for estimated size of data to be compressed.
+!
+!--
+
+%SBTTL  'Declarations';
+
+LIBRARY
+	'sys$library:starlet';	! System macros
+REQUIRE
+	'prefix';		! DCX macros
+REQUIRE
+	'dcxdef';		! DCX public structure definitions
+REQUIRE
+	'dcxprvdef';		! DCX private structure definitions
+
+! random tree insertion macro
+!
+!	format of tree entry:
+!
+!	.------------------------------------.
+!	| ptr to tree with keys < this entry |
+!	| ptr to tree with keys > this entry |
+!	| ptr to list with keys = this entry |
+!	| key value			     |
+!	| ...................................|
+!
+MACRO
+    tree_insert (header_address, item_address) =
+	BEGIN
+
+	BIND
+	    _it = (item_address) : VECTOR [, LONG];
+
+	LOCAL
+	    _h : LONG;
+
+	_it [0] = 0;
+	_it [1] = 0;
+	_it [2] = 0;
+	_h = (header_address);
+	WHILE .._h NEQA 0 DO
+	    BEGIN
+	    IF ._it [3] LSSU .VECTOR [.._h, 3]
+	    THEN
+		_h = VECTOR [.._h, 0]
+	    ELSE IF ._it [3] GTRU .VECTOR [.._h, 3]
+	    THEN
+		_h = VECTOR [.._h, 1]
+	    ELSE
+		BEGIN
+		_it [2] = .VECTOR [.._h, 2];
+		_h = VECTOR [.._h, 2];
+		EXITLOOP;
+		END;
+	    END;
+	._h = _it [0];
+	END%,
+    tree_least (header_address) =
+	BEGIN
+
+	LOCAL
+	    _q : REF VECTOR [, LONG],
+	    _h : LONG;
+
+	_h = (header_address);
+	IF .._h EQLA 0
+	THEN
+	    0
+	ELSE
+	    BEGIN
+	    WHILE .VECTOR [.._h, 0] NEQA 0 DO
+		_h = VECTOR [.._h, 0];
+	    IF (_q = .VECTOR [.._h, 2]) NEQA 0
+	    THEN
+		BEGIN
+		VECTOR [.._h, 2] = ._q [2];
+		_q [0]
+		END
+	    ELSE
+		BEGIN
+		_q = VECTOR [.._h, 0];
+		._h = ._q [1];
+		_q [0]
+		END
+	    END
+	END%;
+
+EXTERNAL ROUTINE
+    dcx$ctx_check : lkg_ctx_check,	! Check context block
+    dcx$map_check : lkg_map_check,	! Check map
+    dcx$get_vm,			! Allocate memory
+    dcx$free_vm,		! Deallocate memory
+    lib$scopy_r_dx :		! General string copy
+	ADDRESSING_MODE (GENERAL);
+
+EXTERNAL LITERAL
+    dcx$_invarg,
+    dcx$_invctx,
+    dcx$_invitem,
+    dcx$_normal;
+
+FORWARD ROUTINE
+    process_item,		! process item list
+    make_seg,			! make a segment
+    dcx$analyze_init,		! initialize for data analysis
+    dcx$analyze_data,		! process data record
+    huffman_size,		! compute size of Huffman encoded data
+    remove_seg,			! remove one segment
+    eliminate_seg,		! eliminate unprofitable segment
+    dcx$make_map,		! compute comp / exp function
+    dcx$analyze_done;		! delete analysis context
+
+%SBTTL  'process_item - Process Item List'
+
+ROUTINE process_item (anl : REF BBLOCK, list : REF VECTOR [, LONG]) =
+BEGIN
+!++
+!
+! Compute size of Huffman Encoded Data
+!
+! Inputs:
+!
+!	anl			Address of anl structure
+!	list			Address of item list
+!
+! Outputs:
+!
+!	NONE
+!
+! Return value:
+!
+!	status code
+!
+!--
+
+IF NOT .list [0]
+THEN
+    RETURN dcx$_invitem;		! even length list
+INCR i FROM 1 TO .list [0] BY 2 DO
+    BEGIN
+    SELECTONE .list [.i] OF
+    SET
+
+    [dcx$c_bounded]:
+	anl [anl$v_bounded] = ..list [.i + 1];
+
+    [dcx$c_one_pass]:
+	anl [anl$v_one_pass] = ..list [.i + 1];
+
+    [dcx$c_est_records]:
+	BEGIN
+	anl [anl$v_est_recs] = true;
+	anl [anl$l_est_d_recs] = ..list [.i + 1];
+	END;
+
+    [dcx$c_est_bytes]:
+	BEGIN
+	anl [anl$v_est_bytes] = true;
+	anl [anl$l_est_d_bytes] = ..list [.i + 1];
+	END;
+
+    [dcx$c_list]:
+	perform (process_item (.anl, .list [.i + 1]));
+
+    TES;
+    END;
+RETURN dcx$_normal;
+
+END;					! Of process_item
+
+%SBTTL  'make_seg - Make a tree segment'
+
+ROUTINE make_seg (anl : REF BBLOCK, parent_seg : REF BBLOCK, char : LONG) =
+BEGIN
+!++
+!
+! Compute size of Huffman Encoded Data
+!
+! Inputs:
+!
+!	anl			Address of anl structure
+!	parent_seg		Address of parent anlseg structure or 0
+!	char			Transition character into segment
+!
+! Outputs:
+!
+!	NONE
+!
+! Return value:
+!
+!	status code
+!
+!--
+
+LOCAL
+    anlseg : REF BBLOCK;
+
+perform (dcx$get_vm (anlseg$k_length, anlseg));
+anl [anl$w_nsegs] = .anl [anl$w_nsegs] + 1;
+IF .parent_seg EQLA 0
+THEN
+    anl [anl$b_depth] = 1
+ELSE IF .parent_seg [anlseg$b_depth] EQL .anl [anl$b_depth]
+THEN
+    anl [anl$b_depth] = .anl [anl$b_depth] + 1;
+insque (.anlseg, .anl [anl$l_blink]);
+IF .parent_seg NEQA 0
+THEN
+    parent_seg [anlseg$w_sons] = .parent_seg [anlseg$w_sons] + 1;
+anlseg [anlseg$l_size] = anlseg$k_length;
+anlseg [anlseg$w_id] = 0;
+anlseg [anlseg$w_char] = .char;
+anlseg [anlseg$w_active] = 0;
+anlseg [anlseg$w_active_r] = 0;
+IF .parent_seg EQLA 0
+THEN
+    anlseg [anlseg$b_depth] = 1
+ELSE
+    anlseg [anlseg$b_depth] = 1 + .parent_seg [anlseg$b_depth];
+anlseg [anlseg$b_max_char] = %X'00';
+anlseg [anlseg$b_min_char] = %X'FF';
+anlseg [anlseg$b_escape] = 0;
+anlseg [anlseg$v_tent] = true;
+anlseg [anlseg$v_solid] = false;
+anlseg [anlseg$v_escape] = false;
+anlseg [anlseg$v_base] = true;
+anlseg [anlseg$v_unbounded] = NOT .anl [anl$v_bounded];
+anlseg [anlseg$w_sons] = 0;
+anlseg [anlseg$w_max_code] = 0;
+anlseg [anlseg$w_mapseg_size] = 0;
+anlseg [anlseg$l_prev] = .parent_seg;
+anlseg [anlseg$l_comp_bits] = 0;
+anlseg [anlseg$l_adj_bits] = 0;
+anlseg [anlseg$l_chars] = 0;
+IF .parent_seg NEQA 0
+THEN
+    CH$COPY (
+	.parent_seg [anlseg$b_depth] - 1, parent_seg [anlseg$t_string],
+	1, char,
+	0,
+	anlseg$s_string, anlseg [anlseg$t_string]
+	);
+IF .parent_seg EQLA 0
+THEN
+    BEGIN
+    DECR index FROM anlseg$c_next - 1 TO 0 DO
+	VECTOR [anlseg [anlseg$l_next], .index] = .anlseg;
+    END
+ELSE
+    BEGIN
+
+    LOCAL
+	seg : REF BBLOCK;
+
+    BIND
+	pnext = parent_seg [anlseg$l_next] : VECTOR [, LONG],
+	ptrs = anlseg [anlseg$l_next] : VECTOR [, LONG],
+	ca = anlseg [anlseg$t_string] : VECTOR [, BYTE];
+
+    pnext [.char] = .anlseg;
+    seg = .anl [anl$l_flink];
+    WHILE .seg NEQA anl [anl$q_queue] DO
+	BEGIN
+
+	BIND
+	    sptrs = seg [anlseg$l_next] : VECTOR [, LONG],
+	    snext = sptrs [.char] : REF BBLOCK;
+
+	IF .seg EQLA .anlseg
+	THEN
+	    0
+	ELSE IF .anlseg [anlseg$b_depth] EQL 2
+	THEN
+	    sptrs [.char] = .anlseg
+	ELSE IF .seg [anlseg$b_depth] LSS .anlseg [anlseg$b_depth]
+	THEN
+	    0
+	ELSE IF .snext [anlseg$b_depth] GEQ .anlseg [anlseg$b_depth]
+	THEN
+	    0
+	ELSE IF CH$EQL (
+	    .anlseg [anlseg$b_depth] - 2,
+	    anlseg [anlseg$t_string] + 1,
+	    .anlseg [anlseg$b_depth] - 2,
+	    seg [anlseg$t_string] + 1 + (.seg [anlseg$b_depth] - .anlseg [anlseg$b_depth])
+	    )
+	THEN
+	    sptrs [.char] = .anlseg;
+	seg = .seg [anlseg$l_flink];
+	END;
+
+    seg = .anl [anl$l_flink];
+    INCR index FROM 1 TO .anlseg [anlseg$b_depth] - 2 DO
+	seg = .VECTOR [seg [anlseg$l_next], .ca [.index]];
+    CH$MOVE (4*anlseg$c_next, seg [anlseg$l_next], anlseg [anlseg$l_next]);
+    END;
+RETURN dcx$_normal;
+
+END;					! Of make_seg
+
+%SBTTL  'dcx$analyze_init - Initialization for data analysis'
+
+GLOBAL ROUTINE dcx$analyze_init (context_addr, item, value) =
+BEGIN
+!++
+!
+! Initialization for data analysis.
+! Allocate and initialize context area.
+!
+! Inputs:
+!
+!	context_addr.wz.r	Address of context longword
+!	item.rl.r		Item code (optional)
+!	value.rl.r		Value associated with item (optional)
+!
+! Outputs:
+!
+!	context_addr		Address of context block is stored
+!
+! Return value:
+!
+!	status.wlc.v
+!
+!		dcx$_normal	All is well
+!		dcx$_invitem	Invalid item code or missing item value
+!		lib$_insvirmem	Error allocating memory
+!--
+
+BIND
+    ctx = .context_addr : REF BBLOCK;	! address of context block
+
+LOCAL
+    anl : REF BBLOCK,		! address of anl block
+    anlseg : REF BBLOCK;	! address of anlseg block
+
+BUILTIN
+    ACTUALPARAMETER,
+    ACTUALCOUNT,
+    NULLPARAMETER;
+
+perform (dcx$get_vm (ctx$k_fixed_len + anl$k_length, ctx));
+ctx [ctx$l_size] = ctx$k_fixed_len + anl$k_length;
+ctx [ctx$b_type] = ctx$c_anlyz;
+ctx [ctx$w_version] = ctx$c_version;
+ctx [ctx$l_sanity] = ctx$c_sanity;
+anl = ctx [ctx$l_specific];
+anl [anl$v_bounded] = false;
+anl [anl$v_one_pass] = false;
+anl [anl$v_est_bytes] = false;
+anl [anl$v_est_recs] = false;
+anl [anl$l_est_d_bytes] = 0;
+anl [anl$l_est_d_recs] = 0;
+anl [anl$l_d_bytes] = 0;
+anl [anl$l_d_recs] = 0;
+anl [anl$b_depth] = 0;
+anl [anl$w_nsegs] = 0;
+anl [anl$l_flink] = anl [anl$l_blink] = anl [anl$q_queue];
+IF NOT ACTUALCOUNT ()
+THEN
+    RETURN dcx$_invitem;		! even number of arguments
+INCR i FROM 2 TO ACTUALCOUNT () BY 2 DO
+    BEGIN
+
+    LOCAL
+	list : VECTOR [3, LONG];
+
+    list [0] = 3;
+    list [1] = .ACTUALPARAMETER (.i);
+    list [2] = ACTUALPARAMETER (.i + 1);
+    perform (process_item (.anl, list));
+    END;
+perform (make_seg (.anl, 0, -1));
+DECR char FROM anlseg$c_next - 1 TO 0 DO
+    perform (make_seg (.anl, .anl [anl$l_flink], .char));
+RETURN dcx$_normal;
+
+END;					! of dcx$analyze_init
+
+%SBTTL  'dcx$analyze_data - Analyze data record'
+
+GLOBAL ROUTINE dcx$analyze_data (context_addr, rec : REF BBLOCK) =
+BEGIN
+!++
+!
+! Analyze data record
+!
+! Inputs:
+!
+!	context_addr.mz.r	Address of context longword
+!	rec.rt.dx		Descriptor for (text) data record
+!
+! Outputs:
+!
+!	context_addr.mz.r	Context block accumulates data
+!
+! Return value:
+!
+!	status.wlc.v
+!
+!		dcx$_normal	All is well
+!		dcx$_invctx	Invalid context block
+!--
+
+BIND
+    ctx = .context_addr : REF BBLOCK;
+
+LOCAL
+    addr : REF VECTOR [, BYTE],	! address of data
+    len,			! lengh of data
+    anl : REF BBLOCK,
+    anlseg : REF BBLOCK,
+    status;			! return status
+
+! check context block
+!
+perform (dcx$ctx_check (.ctx, ctx$c_anlyz));
+
+! get address of data record
+!
+perform (lib$analyze_sdesc_r2 (.rec; status, len, addr); .status);
+
+! accumulate statistical information
+!
+anl = ctx [ctx$l_specific];
+anl [anl$l_d_bytes] = .anl [anl$l_d_bytes] + .len;
+anl [anl$l_d_recs] = .anl [anl$l_d_recs] + 1;
+anlseg = .anl [anl$l_flink];
+DECR i FROM .len-1 TO 0 DO
+    BEGIN
+
+    BIND
+	count = anlseg [anlseg$l_count] : VECTOR [, LONG],
+	next = anlseg [anlseg$l_next] : VECTOR [, LONG];
+
+    anlseg [anlseg$l_chars] = .anlseg [anlseg$l_chars] + 1;
+    count [.addr [0]] = .count [.addr [0]] + 1;
+    anlseg = .next [.addr [0]];
+    addr = .addr + 1;
+    END;
+IF true
+THEN
+    BEGIN
+
+    BIND
+	count = anlseg [anlseg$l_count] : VECTOR [, LONG];
+
+    anlseg [anlseg$l_chars] = .anlseg [anlseg$l_chars] + 1;
+    count [dcx$c_eor] = .count [dcx$c_eor] + 1;
+    END;
+RETURN dcx$_normal;
+
+END;					! Of dcx$analyze_data
+
+%SBTTL  'huffman_size - Compute size of Huffman Encoded Data'
+
+ROUTINE huffman_size (anl : REF BBLOCK, anlseg : REF BBLOCK) =
+BEGIN
+!++
+!
+! Compute size of Huffman Encoded Data in bits
+! Store size in anlseg$l_comp_bits field
+! Also fill in anlseg$w_active and anlseg$w_active_r fields
+! Also fill in anlseg$b_min_char and anlseg$b_max_char fields
+!
+! Inputs:
+!
+!	anl			Address of anl structure
+!	anlseg			Address of anlseg structure
+!
+! Outputs:
+!
+!	NONE
+!
+! Return value:
+!
+!	Status code
+!
+!--
+
+BIND
+    count = anlseg [anlseg$l_count] : VECTOR [, LONG];
+
+IF NOT .anl [anl$v_bounded]
+THEN
+    BEGIN
+    anlseg [anlseg$w_active] = dcx$c_chars;
+    anlseg [anlseg$w_active_r] = dcx$c_chars;
+    anlseg [anlseg$b_min_char] = %X'00';
+    anlseg [anlseg$b_max_char] = %X'FF';
+    END
+ELSE IF .anlseg [anlseg$l_chars] EQL 0
+THEN
+    BEGIN
+    anlseg [anlseg$b_min_char] = %X'00';
+    anlseg [anlseg$b_max_char] = %X'00';
+    anlseg [anlseg$w_active] = 0;
+    anlseg [anlseg$w_active_r] = 0;
+    END
+ELSE
+    BEGIN
+    anlseg [anlseg$b_min_char] = %X'00';
+    anlseg [anlseg$b_max_char] = %X'00';
+    anlseg [anlseg$w_active] = 0;
+    DECR i FROM anlseg$c_count-2 TO 0 DO
+	IF .count [.i] NEQ 0
+	THEN
+	    BEGIN
+	    anlseg [anlseg$w_active] = .anlseg [anlseg$w_active] + 1;
+	    anlseg [anlseg$b_min_char] = .i;
+	    END;
+    IF .count [dcx$c_eor] NEQ 0
+    THEN
+	anlseg [anlseg$w_active] = .anlseg [anlseg$w_active] + 1;
+    IF .anlseg [anlseg$w_active] NEQ 1
+    THEN
+	anlseg [anlseg$w_active_r] = .anlseg [anlseg$w_active]
+    ELSE
+	anlseg [anlseg$w_active_r] = 2;
+    DECR i FROM anlseg$c_count-2 TO 0 DO
+	IF .count [.i] NEQ 0
+	THEN
+	    BEGIN
+	    anlseg [anlseg$b_max_char] = .i;
+	    EXITLOOP;
+	    END;
+    END;
+IF .anlseg [anlseg$l_chars] EQL 0
+THEN
+    anlseg [anlseg$l_comp_bits] = 0
+ELSE IF .anlseg [anlseg$w_active] EQL 0
+THEN
+    anlseg [anlseg$l_comp_bits] = 0
+ELSE IF .anlseg [anlseg$w_active] EQL 1
+THEN
+    anlseg [anlseg$l_comp_bits] = .anlseg [anlseg$l_chars]
+ELSE
+    BEGIN
+
+    LOCAL
+	p1 : REF VECTOR [4, LONG],
+	p2 : REF VECTOR [4, LONG],
+	ptr : LONG,					! pointer into list
+	list : VECTOR [4 * anlseg$c_count, LONG],	! storage list
+	zero : LONG;
+
+    anlseg [anlseg$l_comp_bits] = 0;
+    zero = false;
+    ptr = 0;
+    p1 = list [0];
+    DECR i FROM anlseg$c_count-1 TO 0 DO
+	BEGIN
+	p1 [3] = .count [.i];
+	IF .p1 [3] NEQ 0
+	THEN
+	    BEGIN
+	    tree_insert (ptr, p1 [0]);
+	    p1 = p1 [4];	! bump to next cell
+	    END
+	ELSE IF (NOT .anl [anl$v_bounded]) AND (NOT .zero)
+	THEN
+	    BEGIN
+	    ! all zeroes logically consolidate to one zero
+	    zero = true;
+	    tree_insert (ptr, p1 [0]);
+	    p1 = p1 [4];	! bump to next cell
+	    END;
+	END;
+    WHILE (p1 = tree_least (ptr); (p2 = tree_least (ptr)) NEQA 0) DO
+	BEGIN
+	p1 [3] = .p1 [3] + .p2 [3];
+	anlseg [anlseg$l_comp_bits] = .anlseg [anlseg$l_comp_bits] + .p1 [3];
+	tree_insert (ptr, p1 [0]);
+	END;
+    END;
+anlseg [anlseg$l_adj_bits] = .anlseg [anlseg$l_comp_bits];
+RETURN dcx$_normal;
+
+END;					! Of huffman_size
+
+%SBTTL  'remove_seg - Remove one segment'
+
+ROUTINE remove_seg (anl : REF BBLOCK, anlseg : REF BBLOCK) =
+BEGIN
+!++
+!
+! Remove one segment fixing pointers and freeing storage
+!
+! Inputs:
+!
+!	anl			Address of anl structure
+!	anlseg			Address of anlseg structure to be removed
+!
+! Outputs:
+!
+!	NONE
+!
+! Return value:
+!
+!	dcx$_normal
+!	memory deallocation error
+!
+!--
+
+! this segment is unprofitable, eliminate it
+!
+LOCAL
+    seg : REF BBLOCK,	! replacement
+    anl_p : REF BBLOCK;
+
+remque (anlseg [anlseg$q_queue], anl_p);
+IF .anlseg [anlseg$l_prev] NEQA 0
+THEN
+    BEGIN
+
+    BIND
+	p_seg = anlseg [anlseg$l_prev] : REF BBLOCK;
+
+    p_seg [anlseg$w_sons] = .p_seg [anlseg$w_sons] - 1;
+    seg = .anl [anl$l_flink];
+    INCR index FROM 1 TO .anlseg [anlseg$b_depth] - 2 DO
+	BEGIN
+
+	BIND
+	    seg_next = seg [anlseg$l_next] : VECTOR [, LONG],
+	    anlseg_string = anlseg [anlseg$t_string] : VECTOR [, BYTE];
+
+	seg = .seg_next [.anlseg_string [.index]];
+	END;
+    anl_p = .anl [anl$l_flink];
+    WHILE .anl_p NEQA anl [anl$q_queue] DO
+	BEGIN
+
+	BIND
+	    next_p = anl_p [anlseg$l_next] : VECTOR [, LONG];
+
+	IF .next_p [.anlseg [anlseg$w_char]] EQLA .anlseg
+	THEN
+	    next_p [.anlseg [anlseg$w_char]] = .seg;
+	anl_p = .anl_p [anlseg$l_flink];
+	END;
+    END;
+perform (dcx$free_vm (.anlseg [anlseg$l_size], .anlseg));
+anl [anl$w_nsegs] = .anl [anl$w_nsegs] - 1;
+RETURN dcx$_normal;
+
+END;					! Of remove_seg
+
+%SBTTL  'Eliminate_seg - Remove unprofitable segments'
+
+ROUTINE eliminate_seg (anl : REF BBLOCK, this : REF BBLOCK) =
+BEGIN
+!++
+!
+! Determine if a segment is unprofitable and ifso, remove it
+!
+! Inputs:
+!
+!	anl			Address of anl structure
+!	this			Address of anlseg structure in question
+!
+! Outputs:
+!
+!	NONE
+!
+! Return value:
+!
+!	dcx$_normal
+!	memory deallocation error
+!
+!--
+
+! Macro to scale a size based on the ratio of observed to estimated
+! data.
+!
+MACRO scale_map (size) =
+    BEGIN
+
+    LOCAL
+	scaled_size : LONG,		! result
+	remainder : LONG,		! throw away
+	ext_prod : VECTOR [2, LONG];	! extended intermediate value
+
+    BUILTIN
+	emul,
+	ediv;
+
+    emul (%REF (size), anl [anl$l_ratio_num], %REF (0), ext_prod);
+    ediv (anl [anl$l_ratio_denom], ext_prod, scaled_size, remainder);
+    .scaled_size
+
+    END%;
+
+BIND
+    aff = this [anlseg$l_prev] : REF BBLOCK,
+    this_count = this [anlseg$l_count] : VECTOR [, LONG],
+    next = this [anlseg$l_next] : VECTOR [, LONG];
+
+! If we have no true successors then we can
+! consider eliminating the current anlseg block
+!
+IF .this [anlseg$w_sons] NEQ 0
+THEN
+    0
+ELSE IF .this [anlseg$l_chars] EQL 0
+THEN
+    remove_seg (.anl, .this)		! Basic map is bigger than data
+ELSE IF .this [anlseg$w_active] EQL 0
+THEN
+    remove_seg (.anl, .this)
+ELSE IF .this [anlseg$l_prev] EQLA 0
+THEN
+    BEGIN
+
+    ! check profitability of eliminating the last block
+    !
+    IF (
+	    (
+		(.this [anlseg$l_comp_bits])					! this data
+	    -   ((.this [anlseg$l_chars] - .this_count [dcx$c_eor]) * 8)	! raw data
+	    )
+	+   scale_map (
+		(dcxsbm$k_length*8						! this map
+		+  (.this [anlseg$w_active_r] - 1) * (2 + 16))
+	    -   (0)								! null map
+	    )
+	) GEQ 0			! true if current total size is greater
+    THEN
+	remove_seg (.anl, .this);
+    END
+ELSE
+    BEGIN
+
+    ! check profitability of eliminating the block
+    !
+    LOCAL
+	aff2 : BBLOCK [anlseg$k_length];
+
+    BIND
+	aff2_count = aff2 [anlseg$l_count] : VECTOR [, LONG];
+
+    CH$MOVE (.aff [anlseg$l_size], .aff, aff2);
+    aff2 [anlseg$l_chars] = .aff2 [anlseg$l_chars] + .this [anlseg$l_chars];
+    DECR i FROM anlseg$c_count - 1 TO 0 DO
+	aff2_count [.i] = .aff2_count [.i] + .this_count [.i];
+    perform (huffman_size (.anl, aff2));
+    IF (
+	    (
+		(.this [anlseg$l_adj_bits])						! this data
+	    +   (.aff [anlseg$l_adj_bits])						! aff data
+	    -   (.aff2 [anlseg$l_adj_bits])						! aff2 data
+	    )
+	+ scale_map (
+	        (dcxsbm$k_length*8  +  (.this [anlseg$w_active_r] - 1) * (2 + 16)  +	! this map
+		    (.this [anlseg$b_max_char] - .this [anlseg$b_min_char] + 1) * 16)
+	    +   (dcxsbm$k_length*8  +  (.aff [anlseg$w_active_r] - 1) * (2 + 16)  +	! aff map
+		    (.aff [anlseg$b_max_char] - .aff [anlseg$b_min_char] + 1) * 16)
+	    -   (dcxsbm$k_length*8  +  (.aff2 [anlseg$w_active_r] - 1) * (2 + 16)  +  	! aff2 map
+		    (IF .anl [anl$w_nsegs] GTR 2
+		     THEN ((.aff2 [anlseg$b_max_char] - .aff2 [anlseg$b_min_char] + 1) * 16)
+		     ELSE 0))
+	    )
+	) GEQ 0			! true if current total size is greater
+    THEN
+	BEGIN
+	CH$MOVE (.aff [anlseg$l_size], aff2, .aff);
+	remove_seg (.anl, .this);
+	END
+    END;
+RETURN dcx$_normal;
+
+END;					! Of eliminate_seg
+
+%SBTTL  'build_map_seg - Build a map segment'
+
+ROUTINE build_map_seg (anl : REF BBLOCK, anlseg : REF BBLOCK, dcxsbm : REF BBLOCK) =
+BEGIN
+!++
+!
+! Build a map segment
+!
+! Inputs:
+!
+!	anl			Address of anl block
+!	anlseg			Analysis segment structure address
+!	dcxsbm			Analysis of allocated map segment
+!
+! Outputs:
+!
+!	dcxsbm			Filled in
+!
+! Return value:
+!
+!	dcx$_normal		All is well
+!--
+
+LOCAL
+    flags : REF BITVECTOR,
+    nodes : REF VECTOR [, BYTE],
+    next : REF VECTOR [, WORD],
+    p1 : REF VECTOR [6, LONG],
+    p2 : REF VECTOR [6, LONG],
+    ptr : LONG,				! pointer into list
+    list : VECTOR [6 * anlseg$c_count, LONG];	! storage list
+
+BIND
+    count = anlseg [anlseg$l_count] : VECTOR [, LONG];
+
+flags = .dcxsbm + .dcxsbm [dcxsbm$w_flags];
+nodes = .dcxsbm + .dcxsbm [dcxsbm$w_nodes];
+IF .dcxsbm [dcxsbm$w_next] NEQ 0
+THEN
+    next = .dcxsbm + .dcxsbm [dcxsbm$w_next]
+ELSE
+    next = 0;
+ptr = 0;
+p1 = list [0];
+DECR i FROM anlseg$c_count-1 TO 0 DO
+    BEGIN
+    p1 [3] = .count [.i];
+    IF .p1 [3] NEQ 0 OR NOT .anl [anl$v_bounded]
+    THEN
+	BEGIN
+	p1 [4] = 0;		! node offset
+	p1 [5] = .i;		! character code
+	tree_insert (ptr, p1 [0]);
+	p1 = p1 [6];
+	END;
+    END;
+IF .anlseg [anlseg$w_active] EQL 1
+THEN
+    BEGIN
+    p2 = .ptr;
+    p1 [3] = .p2 [3];
+    p1 [4] = .p2 [4];
+    p1 [5] = .p2 [5];
+    tree_insert (ptr, p1 [0]);
+    END;
+DECR high FROM .anlseg [anlseg$w_active_r] - 2 TO 0 DO
+    BEGIN
+
+    LOCAL
+	p : VECTOR [2, LONG];
+
+    BIND
+	p2 = p [0] : REF VECTOR [6, LONG],
+	p1 = p [1] : REF VECTOR [6, LONG];
+
+    DECR i FROM 1 TO 0 DO
+	BEGIN
+
+	LOCAL
+	    q : REF VECTOR [6, LONG];
+
+	p [.i] = q = tree_least (ptr);
+	IF .q [5] EQL dcx$c_eor
+	THEN
+	    BEGIN
+	    flags [2*.high + .i] = false;
+	    nodes [2*.high + .i] = 0;
+	    END
+	ELSE IF .q [5] GEQ 0
+	THEN
+	    BEGIN
+	    flags [2*.high + .i] = true;
+	    nodes [2*.high + .i] = .q [5];
+	    IF .next NEQA 0
+	    THEN
+		BEGIN
+
+		BIND
+		    next_seg_a = anlseg [anlseg$l_next] : VECTOR [, LONG],
+		    next_seg = next_seg_a [.q [5]] : REF BBLOCK;
+
+		next [.q [5] - .anlseg [anlseg$b_min_char]] = .next_seg [anlseg$w_id];
+		END;
+	    END
+	ELSE
+	    BEGIN
+	    flags [2*.high + .i] = false;
+	    nodes [2*.high + .i] = .q [4];
+	    END;
+	END;
+    p1 [3] = .p1 [3] + .p2 [3];
+    p1 [4] = .high;
+    p1 [5] = -1;
+    tree_insert (ptr, p1 [0]);
+    END;
+
+RETURN dcx$_normal;
+
+END;			! of build_map_seg
+
+%SBTTL  'dcx$make_map - Compute mapping function'
+
+GLOBAL ROUTINE dcx$make_map (context_addr, map_addr, map_size) =
+BEGIN
+!++
+!
+! Compute mapping function
+!
+! Inputs:
+!
+!	context_addr.mz.r	Address of context longword
+!
+! Outputs:
+!
+!	context_addr.mz.r	Context block accumulates data
+!	map_addr.wa.r		Address of longword to receive map address
+!	map_size.wl.r		Address of longword to receive map length
+!
+! Return value:
+!
+!	status.wlc.v
+!
+!		dcx$_normal	All is well
+!		dcx$_invctx	Invalid context block
+!		lib$_insvirmem
+!--
+
+BUILTIN
+    NULLPARAMETER;
+
+BIND
+    ctx = .context_addr : REF BBLOCK,
+    anl = ctx [ctx$l_specific] : BBLOCK,
+    dcxmap = ctx [ctx$l_map] : REF BBLOCK;
+
+LOCAL
+    id,
+    seg : REF BBLOCK,
+    size;
+
+.map_addr = 0;
+IF NOT NULLPARAMETER (3)
+THEN
+    .map_size = 0;
+
+! validate context block
+!
+perform (dcx$ctx_check (.ctx, ctx$c_anlyz));
+
+! Compute ratio of estimated to observed data size.
+! Give priority first to an estimate of data size,
+! then to an estimate of number of records, and if
+! neither of these is provided, assume that estimated
+! is equal to observed.
+!
+IF .anl [anl$v_est_bytes] AND .anl [anl$l_est_d_bytes] GTR 0
+THEN
+    BEGIN
+    anl [anl$l_ratio_num] = .anl [anl$l_d_bytes];
+    anl [anl$l_ratio_denom] = .anl [anl$l_est_d_bytes];
+    END
+ELSE IF .anl [anl$v_est_recs] AND .anl [anl$l_est_d_recs] GTR 0
+THEN
+    BEGIN
+    anl [anl$l_ratio_num] = .anl [anl$l_d_recs];
+    anl [anl$l_ratio_denom] = .anl [anl$l_est_d_recs];
+    END
+ELSE
+    BEGIN
+    anl [anl$l_ratio_num] = 1;
+    anl [anl$l_ratio_denom] = 1;
+    END;
+
+! pre-process data
+!
+DECR depth FROM .anl [anl$b_depth] TO 1 DO
+    BEGIN
+
+    LOCAL
+	seg : REF BBLOCK;
+
+    seg = .anl [anl$l_flink];
+    WHILE .seg NEQA anl [anl$q_queue] DO
+	BEGIN
+
+	LOCAL
+	    next_seg : REF BBLOCK;
+
+	next_seg = .seg [anlseg$l_flink];
+	IF
+		.seg [anlseg$b_depth] EQL .depth
+	    AND
+		.seg [anlseg$l_chars] EQL 0
+	    AND
+		.seg [anlseg$w_sons] EQL 0
+	THEN
+	    remove_seg (anl, .seg)
+	ELSE
+	    perform (huffman_size (anl, .seg));		! compute compressed size
+	seg = .next_seg;
+	END;
+    END;
+DECR depth FROM .anl [anl$b_depth] TO 1 DO
+    BEGIN
+
+    LOCAL
+	ptr : LONG,		! random tree listhead
+	p1 : REF VECTOR [5, LONG],
+	list : VECTOR [5 * dcx$c_max_segs, LONG],
+	seg : REF BBLOCK;
+
+    ptr = 0;
+    p1 = list [0];
+    seg = .anl [anl$l_flink];
+    WHILE .seg NEQA anl [anl$q_queue] DO
+	BEGIN
+	IF
+		.seg [anlseg$b_depth] EQL .depth
+	    AND
+		.seg [anlseg$w_sons] EQL 0
+	THEN
+	    BEGIN
+	    p1 [3] = .seg [anlseg$l_chars];
+	    p1 [4] = .seg;
+	    tree_insert (ptr, p1 [0]);
+	    p1 = p1 [5];
+	    END;
+	seg = .seg [anlseg$l_flink];
+	END;
+    WHILE (p1 = tree_least (ptr)) NEQA 0 DO
+	perform (eliminate_seg (anl, .p1 [4]));
+    END;
+
+! Compute size of map
+!
+id = 0;
+size = dcxmap$k_length;
+seg = .anl [anl$l_flink];
+WHILE .seg NEQA anl [anl$q_queue] DO
+    BEGIN
+    seg [anlseg$w_id] = .id;
+    id = .id + 1;
+    size = .size + dcxsbm$k_length;
+    size = .size + (2*(.seg [anlseg$w_active_r]-1) + 7) / 8;
+    size = .size + 2*(.seg [anlseg$w_active_r]-1);
+    IF .seg [anlseg$l_flink] NEQA .seg [anlseg$l_blink]
+    THEN
+	size = .size + 2 * (.seg [anlseg$b_max_char] - .seg [anlseg$b_min_char] + 1);
+    seg = .seg [anlseg$l_flink];
+    END;
+
+! Allocate map and populate
+!
+perform (dcx$get_vm (.size, dcxmap));
+dcxmap [dcxmap$l_size] = .size;
+dcxmap [dcxmap$w_version] = dcxmap$c_version;
+dcxmap [dcxmap$l_sanity] = dcxmap$c_sanity;
+dcxmap [dcxmap$l_flags] = 0;
+dcxmap [dcxmap$w_nsubs] = .id;
+IF .id NEQ 0
+THEN
+    BEGIN
+
+    LOCAL
+	seg : REF BBLOCK,
+	dcxsbm : REF BBLOCK;
+
+    dcxmap [dcxmap$w_sub0] = dcxmap$k_length;
+    seg = .anl [anl$l_flink];
+    dcxsbm = .dcxmap + .dcxmap [dcxmap$w_sub0];
+    WHILE .seg NEQA anl [anl$q_queue] DO
+	BEGIN
+	dcxsbm [dcxsbm$w_size] = dcxsbm$k_length;
+	dcxsbm [dcxsbm$b_min_char] = .seg [anlseg$b_min_char];
+	dcxsbm [dcxsbm$b_max_char] = .seg [anlseg$b_max_char];
+	dcxsbm [dcxsbm$b_escape] = 0;
+	dcxsbm [dcxsbm$v_escape] = false;
+	dcxsbm [dcxsbm$v_unbounded] = false;
+	dcxsbm [dcxsbm$w_flags] = .dcxsbm [dcxsbm$w_size];
+	dcxsbm [dcxsbm$w_size] = .dcxsbm [dcxsbm$w_size] + (2*(.seg [anlseg$w_active_r]-1) + 7) / 8;
+	dcxsbm [dcxsbm$w_nodes] = .dcxsbm [dcxsbm$w_size];
+	dcxsbm [dcxsbm$w_size] = .dcxsbm [dcxsbm$w_size] + 2*(.seg [anlseg$w_active_r]-1);
+	IF .seg [anlseg$l_flink] NEQA .seg [anlseg$l_blink]
+	THEN
+	    BEGIN
+	    dcxsbm [dcxsbm$w_next] = .dcxsbm [dcxsbm$w_size];
+	    dcxsbm [dcxsbm$w_size] = .dcxsbm [dcxsbm$w_size] + 2 * (.seg [anlseg$b_max_char] - .seg [anlseg$b_min_char] + 1);
+	    END
+	ELSE
+	    dcxsbm [dcxsbm$w_next] = 0;
+	build_map_seg (anl, .seg, .dcxsbm);
+	dcxsbm = .dcxsbm + .dcxsbm [dcxsbm$w_size];
+	seg = .seg [anlseg$l_flink];
+	END;
+    IF .dcxsbm NEQA (.dcxmap + .dcxmap [dcxmap$l_size])
+    THEN
+	RETURN ss$_accvio;
+    END;
+.map_addr = .dcxmap;
+IF NOT NULLPARAMETER (3)
+THEN
+    .map_size = .size;
+RETURN dcx$_normal;
+
+END;					! Of dcx$make_map
+
+%SBTTL  'dcx$analyze_done -- release context and map'
+
+GLOBAL ROUTINE dcx$analyze_done (context_addr) =
+BEGIN
+!++
+!
+! Release context and map
+!
+! Inputs:
+!
+!	context_addr.mz.r	Address of context longword
+!
+! Outputs:
+!
+!	context_addr.mz.r	Context block accumulates data
+!
+! Return value:
+!
+!	status.wlc.v
+!
+!		dcx$_normal	All is well
+!--
+
+BIND
+    ctx = .context_addr : REF BBLOCK,	! address of context block
+    anl = ctx [ctx$l_specific] : BBLOCK;
+
+LOCAL
+    anlseg : REF BBLOCK;
+
+perform (dcx$ctx_check (.ctx, ctx$c_anlyz));
+WHILE NOT remque (.anl [anl$l_flink], anlseg) DO
+    perform (dcx$free_vm (.anlseg [anlseg$l_size], .anlseg));
+perform (dcx$free_vm (.ctx [ctx$l_size], .ctx));
+ctx = 0;			! mark context as gone
+RETURN dcx$_normal;
+
+END;					! Of dcx$analyze_done
+
+END					! Of module analyze
+ELUDOM

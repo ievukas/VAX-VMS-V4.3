@@ -1,0 +1,833 @@
+MODULE	exch$main				%TITLE 'Image transfer point, command dispatcher'
+		(
+		IDENT = 'V04-000',
+		ADDRESSING_MODE (EXTERNAL=LONG_RELATIVE, NONEXTERNAL=WORD_RELATIVE),
+		MAIN = main_start
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:	EXCHANGE - Foreign volume interchange utility
+!
+! ABSTRACT:	This program supports foreign volumes for VAX/VMS.  A subset  of the DCL command language is
+!		supported to perform operations as requested on the foreign volume.  The subset DCL commands
+!		are:
+!     			COPY	   - transfer a file
+!			DELETE	   - delete a file
+!			DIRECTORY  - list files on volume
+!			DISMOUNT   - dismount a mounted volume
+!			EXIT	   - exit program
+!			HELP	   - ask for explanation
+!			INITIALIZE - create empty volume
+!			MOUNT	   - mount a foreign volume
+!			RENAME	   - rename a file
+!			SQUEEZE    - compress a volume
+!			TYPE	   - display a file on SYS$OUTPUT
+!
+! ENVIRONMENT:	VAX/VMS operating system, unprivileged user-mode utility
+!
+! AUTHOR:	CW Hobbs	CREATION DATE: 1-July-1982
+!
+! MODIFIED BY:
+!
+!	V03-002	CWH3002			CW Hobbs		12-Apr-1984
+!		Add conditional to prevent noise messages during debugging.
+!
+!
+!--
+
+! Include files:
+!
+MACRO $module_name_string = 'exch$main' %;	! The require file needs to know our module name
+REQUIRE 'SRC$:EXCREQ'				! Facility-wide require file
+    ;
+
+%SBTTL 'Module table of contents'
+
+! Module table of contents:
+!
+FORWARD ROUTINE
+    main_control_c_ast	   : NOVALUE,		! AST routine to set control/c flag
+    exch$main_exit,				! EXIT verb dispatch routine
+    main_exit_handler	   : NOVALUE,		! Dismount volumes during exit
+    main_handle_cli_nocomd,			! Condition handler for CLI$_NOCOMD error
+    exch$main_help,				! HELP verb dispatch routine
+    main_setup_create_excg : NOVALUE,		! Allocate and initialize the global data
+    main_setup_load_time   : NOVALUE,		! Once-only load time initializations
+    main_start					! Transfer point, outer command loop
+    ;
+
+! System library routines
+!
+EXTERNAL ROUTINE
+    lbr$output_help : ADDRESSING_MODE(GENERAL)	! Librarian get help
+    ;
+
+! EXCHANGE facility routines
+!
+EXTERNAL ROUTINE
+    exch$moun_dismount_action,			! Dismount mounted volumes
+    exch$util_file_error,			! Signal RMS error
+    exch$util_vm_allocate_zeroed		! Allocate virtual memory
+    ;
+
+! Read-only GLOBAL storage
+!
+GLOBAL
+    exch$gq_dyn_str_template : $dyn_str_desc	! An initialized, null dynamic string descriptor
+    ;
+
+! Read-write GLOBAL storage
+!
+$global_rw
+    exch$a_gbl	: REF BLOCK [,BYTE] 		! The pointer to everything else
+    ;
+
+! Bound declarations:
+!
+!BIND
+!    ;
+
+! Local macros
+!
+MACRO
+    $$offset_check (sym) =	! Check that context block offsets coincide
+					(($BYTEOFFSET (%NAME ('ctx$',sym)) EQL $BYTEOFFSET (%NAME ('dos11ctx$',sym)))
+					  AND
+					 ($BYTEOFFSET (%NAME ('ctx$',sym)) EQL $BYTEOFFSET (%NAME ('rt11ctx$',sym))))
+					%,
+
+    $$bit_check (sym) =		! Check that context block bitfields coincide
+					(($BYTEOFFSET (%NAME ('ctx$',sym)) EQL $BYTEOFFSET (%NAME ('dos11ctx$',sym)))
+					  AND
+					 ($BITPOSITION (%NAME ('ctx$',sym)) EQL $BITPOSITION (%NAME ('dos11ctx$',sym)))
+					  AND
+					 ($BYTEOFFSET (%NAME ('ctx$',sym)) EQL $BYTEOFFSET (%NAME ('rt11ctx$',sym)))
+					  AND
+					 ($BITPOSITION (%NAME ('ctx$',sym)) EQL $BITPOSITION (%NAME ('rt11ctx$',sym))))
+					%;
+
+GLOBAL ROUTINE main_control_c_ast : NOVALUE =  	%SBTTL 'main_control_c_ast'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Set a flag which says that a control/c ast has been received
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	exch$a_gbl [excg$v_control_c] - flag set that we have received the ast
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('main_control_c_ast> ');
+$trace_print_lit ('received control/c ast');
+
+! Set the bit which says that an AST has been delivered
+!
+exch$a_gbl [excg$v_control_c] = true;
+
+RETURN;
+END;
+
+GLOBAL ROUTINE exch$main_exit (error_code) =	%SBTTL 'exch$main_exit (error_code)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Action routine for the EXIT verb, parses and performs main control functions for EXIT
+!
+! INPUTS:
+!
+!	error_code - final status code, return ss$_normal if it is 0
+!
+! IMPLICIT INPUTS:
+!
+!	Command parameters and qualifiers as returned from CLI$xxx routines.
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	EXCHANGE will exit to the DCL command level.
+!--
+
+$dbgtrc_prefix ('main_exit> ');
+
+$debug_print_lit ('EXIT verb');
+
+IF .error_code EQL 0
+THEN
+    $exit (code=ss$_normal)
+ELSE
+    $exit (code=.error_code);
+
+RETURN 0;
+END;
+
+GLOBAL ROUTINE main_exit_handler (status) : NOVALUE =  	%SBTTL 'main_exit_handler (status)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Perform exit functions for EXCHANGE.  Dismount mounted volumes.  Currently only necessary for RT-11
+!	volumes with global caching active.
+!
+! INPUTS:
+!
+!	status - reason for exit
+!
+! IMPLICIT INPUTS:
+!
+!	mounted volume queue
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	lots
+!--
+
+$dbgtrc_prefix ('main_exit_handler> ');
+
+LOCAL
+    ptr : $ref_bblock
+    ;
+
+$trace_print_lit ('entering exit handler');
+
+! Set the flag that we are exiting
+!
+exch$a_gbl [excg$v_exiting] = true;
+
+! Loop through the queue of in-use volbs.  We must go to the head of the queue with each loop, since the
+! dismount routine will remove the current item from the queue.
+!
+WHILE 1
+DO
+    BEGIN
+    ptr = .exch$a_gbl [excg$a_volb_use_flink];		! Get the first mounted volb in the queue
+    IF .ptr EQL exch$a_gbl [excg$a_volb_use_flink]	! If same as header, we are done
+    THEN
+	EXITLOOP;
+    $block_check (2, .ptr, volb, 637);			! Make sure it is a volb
+
+    ! If there are any modified segments, and the device is slow, tell them we are flushing
+    !
+    IF .ptr [volb$l_dircache] NEQ volb$m_dircache_active
+    THEN
+	IF .ptr [volb$l_devtype] EQL dt$_tu58	! If it is any kind of TU58
+	THEN
+	    BEGIN
+	    LOCAL
+		msgvec : VECTOR [5, LONG],
+		status;
+
+	    ! We use the $putmsg service to print this message.  If we signalled it, we could exit the image if
+	    ! another signal was active in the catch-all condition handler.  This is extremely likely to happen
+	    ! if the control/Y was hit during a command with a /LOG in effect, since the catch-all handler ends
+	    ! up printing EXCHANGE log messages.
+	    !
+	    msgvec [0] = 4;
+	    msgvec [1] = exch$_writecache;
+	    msgvec [2] = 2;
+	    msgvec [3] = .ptr [volb$l_vol_ident_len];
+	    msgvec [4] = ptr [volb$t_vol_ident];
+	    IF NOT (status = $putmsg (msgvec=msgvec))
+	    THEN
+		$exch_signal_stop (.status);
+	    END;
+
+    ! Now call the action routine, so that in effect we will do a standard DISMOUNT of the volume
+    !
+    exch$moun_dismount_action (.ptr);
+    END;
+
+RETURN;
+END;
+
+GLOBAL ROUTINE main_handle_cli_nocomd (sig : $ref_bblock, mech : $ref_bblock) =	%SBTTL 'main_handle_cli_nocomd'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine intercepts the signal MSG$_COMD.  This is used to avoid unnecessary noise when
+!	a blank line is given.
+!
+! INPUTS:
+!
+!	sig  - signal argument list
+!	mech - mechanism argument list
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	SS$_CONTINUE if the signal was CLI$_NOCOMD, otherwise SS$_RESIGNAL.
+!
+! SIDE EFFECTS:
+!
+!	error message is not printed for nocomd errors
+!--
+
+$dbgtrc_prefix ('main_handle_cli_nocomd> ');
+
+! If the signal name is what we are looking for, then do interrupt the signal
+!
+IF .sig [chf$l_sig_name] EQL cli$_nocomd	! DCL CLI error message (sinful knowlege of what DCL does!)
+THEN
+    RETURN ss$_continue;
+
+RETURN ss$_resignal;
+END;
+
+GLOBAL ROUTINE exch$main_help =	%SBTTL 'exch$main_help)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Action routine for the HELP verb, parses and performs main control functions for HELP
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	Command parameters and qualifiers as returned from CLI$xxx routines.
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	Help Librarian routines will be entered.
+!--
+
+$dbgtrc_prefix ('main_help> ');
+
+LOCAL
+    status,
+    topic : $desc_block		
+    ;
+
+$debug_print_lit ('HELP verb');
+
+$dyn_str_desc_init (topic);
+
+cli$get_value (%ASCID 'TOPIC', topic);
+
+status = lbr$output_help
+		(lib$put_output,
+		0,
+		topic,
+		%ASCID 'EXCHNGHLP',
+		%REF (HLP$M_PROMPT OR HLP$M_PROCESS OR HLP$M_GROUP OR HLP$M_SYSTEM OR HLP$M_HELP),
+		lib$get_input);
+
+IF NOT .status
+THEN
+    $exch_signal ($warning_stat_copy (.status));
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE main_setup_create_excg : NOVALUE =	%SBTTL 'main_setup_create_excg'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine allocates and initializes the global data
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	exch$a_gbl - external pointer to the block
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	Memory is allocated
+!--
+
+$dbgtrc_prefix ('main_setup_create_excg> ');
+
+LOCAL
+    ptr
+    ;
+
+
+$debug_print_lit ('entry');
+
+! Allocate the global data structure
+!
+exch$a_gbl = exch$util_vm_allocate_zeroed (exchblk$s_excg);
+
+! Set the block size and type
+!
+$block_init( .exch$a_gbl, excg);
+
+! Init the queue headers for the global resources
+!
+$queue_initialize (exch$a_gbl [excg$q_dos11ctx_use]);	! Head of queue of all $DOS11CTX's in use
+$queue_initialize (exch$a_gbl [excg$q_dos11ctx_avl]);	! Head of queue of all available $DOS11CTX's
+
+$queue_initialize (exch$a_gbl [excg$q_filb_use]);	! Head of queue of all $FILB's in use
+$queue_initialize (exch$a_gbl [excg$q_filb_avl]);	! Head of queue of all available $FILB's
+
+$queue_initialize (exch$a_gbl [excg$q_namb_use]);	! Head of queue of all $NAMB's in use
+$queue_initialize (exch$a_gbl [excg$q_namb_avl]);	! Head of queue of all available $NAMB's
+
+$queue_initialize (exch$a_gbl [excg$q_rmsb_use]);	! Head of queue of all $RMSB's in use
+$queue_initialize (exch$a_gbl [excg$q_rmsb_avl]);	! Head of queue of all available $RMSB's
+
+$queue_initialize (exch$a_gbl [excg$q_rmsb_use]);	! Head of queue of all $RMSB's in use
+$queue_initialize (exch$a_gbl [excg$q_rmsb_avl]);	! Head of queue of all available $RMSB's
+
+$queue_initialize (exch$a_gbl [excg$q_rt11ctx_use]);	! Head of queue of all $RT11CTX's in use
+$queue_initialize (exch$a_gbl [excg$q_rt11ctx_avl]);	! Head of queue of all available $RT11CTX's
+
+$queue_initialize (exch$a_gbl [excg$q_volb_use]);	! Head of queue of all $VOLB's in use
+$queue_initialize (exch$a_gbl [excg$q_volb_avl]);	! Head of queue of all available $VOLB's
+
+! Init the RMS pointers.  All the RMS blocks are in space between the end of the official SDL defined
+! block and the end of the allocated space.  We will carry a pointer through as we init these RMS pointers.
+!
+ptr = .exch$a_gbl + excg$k_length;		! First free byte after SDL structure
+exch$a_gbl [excg$a_sysout_fab]	= .ptr;		! output fab
+ptr = .ptr + fab$k_bln;
+exch$a_gbl [excg$a_sysout_rab]	= .ptr;		! output rab
+ptr = .ptr + rab$k_bln;
+exch$a_gbl [excg$a_sysout_nam]	= .ptr;		! output nam block
+ptr = .ptr + nam$k_bln;
+exch$a_gbl [excg$a_sysout_ebuf]	= .ptr;		! output expanded name string
+ptr = .ptr + nam$c_maxrss;
+exch$a_gbl [excg$a_sysout_rbuf]	= .ptr;		! output result name string
+
+RETURN;
+END;
+
+GLOBAL ROUTINE main_setup_load_time : NOVALUE =	%SBTTL 'main_setup_load_time'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine performs initializations which are required once only at image load time.
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('main_setup_load_time> ');
+
+LOCAL
+    dib : $bblock [12],				! First longword of dib
+    dib_desc : VECTOR [2, LONG],		! A descriptor for the above
+    jpi_item : VECTOR [10, LONG],		! Item list for f$getjpi
+    group,
+    member,
+    status
+    ;
+
+BIND
+    syscommand = %ASCID 'SYS$COMMAND';
+
+$debug_print_lit ('entry');
+
+! Allocate and initialize the global data structure
+!
+main_setup_create_excg ();
+
+! Now that the global structure is ready, we can bind to some components
+!
+BEGIN
+BIND
+    out_fab  = .exch$a_gbl [excg$a_sysout_fab]  : $bblock,
+    out_rab  = .exch$a_gbl [excg$a_sysout_rab]  : $bblock,
+    out_nam  = .exch$a_gbl [excg$a_sysout_nam]  : $bblock,
+    out_ebuf = .exch$a_gbl [excg$a_sysout_ebuf] : $bblock,
+    out_rbuf = .exch$a_gbl [excg$a_sysout_rbuf] : $bblock
+    ;
+
+! Prepare control blocks for terminal I/O
+!
+$fab_init (
+	fab = out_fab,				! File access block
+	fac = PUT,				!  Put only
+	rat = CR,
+	fnm = 'SYS$OUTPUT',
+	nam = out_nam);				!  Name block
+
+$rab_init (
+	rab = out_rab,				! Record access block
+	rac = SEQ,
+	fab = out_fab);
+
+$nam_init (
+	nam = out_nam,				! File name block
+	rsa = out_rbuf,				!  Result name addr
+	rss = nam$c_maxrss,			!  Result name size
+	esa = out_ebuf,				!  Expanded name addr
+	ess = nam$c_maxrss);			!  Expanded name size
+
+! Open the default output stream
+!
+IF NOT (status = $open (fab = out_fab))
+THEN
+    $exit (code = exch$util_file_error (exch$_openout, .status, out_fab, .out_fab [fab$l_stv]));
+
+IF NOT (status = $connect (rab = out_rab))
+THEN
+    $exit (code = exch$util_file_error (exch$_openout, .status, out_fab, .out_rab [rab$l_stv]));
+
+! If SYS$COMMAND is a terminal device, set up Control/C handlers so that we can interrupt long commands
+!
+IF NOT (status = $assign (chan=exch$a_gbl [excg$w_tt_channel], devnam=syscommand))
+THEN
+    $exch_signal_stop (exch$_accessfail, 1, syscommand, .status);
+
+! Get the device information for SYS$COMMAND
+!
+dib_desc [0] = 12;
+dib_desc [1] = dib;
+IF NOT (status = $getchn (chan=.exch$a_gbl [excg$w_tt_channel], pribuf=dib_desc))
+THEN
+    $exch_signal_stop (exch$_accessfail, 1, syscommand, .status);
+$trace_print_fao ('channel !XW, devchar !XL, devclass !XB, devtype !XB, devbufsiz !UL, devdepend !XL',
+		.exch$a_gbl [excg$w_tt_channel], .dib [dib$l_devchar],
+		.dib [dib$b_devclass], .dib [dib$b_devtype], .dib [dib$w_devbufsiz], .dib [dib$l_devdepend]);
+
+! If SYS$COMMAND is a terminal, enable the control/c ast
+!
+IF .dib [dib$b_devclass] EQL dc$_term
+THEN
+    BEGIN
+    LOCAL
+	iosb : VECTOR [4, WORD];
+
+    ! Set the control/c ast, renabling it to this routine
+    !
+    $trace_print_lit ('SYS$COMMAND is a terminal, enabling control/c');
+    IF (status = $qiow (efn=0, chan=.exch$a_gbl [excg$w_tt_channel], 
+		    func=(io$_setmode OR io$m_outband), iosb=iosb, p1=main_control_c_ast, p2=UPLIT (0,8)))
+    THEN
+	status = .iosb [0];
+
+    ! If either the qio or the io operation failed, scream and shout
+    !
+    IF NOT .status
+    THEN
+	$exch_signal_stop (.status);
+    END
+ELSE
+    BEGIN
+    $trace_print_lit ('SYS$COMMAND is not a terminal, no control/c');
+    $dassgn (chan = .exch$a_gbl [excg$w_tt_channel]);	! Deassign the channel, we have no further use for it
+    exch$a_gbl [excg$w_tt_channel] = 0;			! Mark channel as not in use
+    END;
+
+! Get the user's UIC group and member numbers, in case we create any files.
+!
+%IF switch_variant GEQ 3 %THEN group = member = 0; %FI! While debugging, suppress the bogus "uninit reference" message
+jpi_item [0] = (jpi$_grp^16 OR 4);		! Group number
+jpi_item [1] = group;				! Buffer for value
+jpi_item [2] = 0;				! Returned length not important
+jpi_item [3] = (jpi$_mem^16 OR 4);		! Member number
+jpi_item [4] = member;
+jpi_item [5] = 0;
+jpi_item [6] = (jpi$_username^16 OR 12);
+jpi_item [7] = exch$a_gbl [excg$t_username];
+jpi_item [8] = 0;
+jpi_item [9] = 0;				! End of list
+
+IF NOT (status = $getjpiw (efn=0, itmlst=jpi_item))
+THEN
+    $exch_signal_stop (.status);
+exch$a_gbl [excg$w_uic_group]  = .group;
+exch$a_gbl [excg$w_uic_member] = .member;
+
+! Get the value of command line qualifiers which last for the life of the image
+!
+exch$a_gbl [excg$v_q_message] = cli$present (%ASCID 'MESSAGE');
+
+! If global caching is requested, set up the exit handler
+!
+IF (exch$a_gbl [excg$v_q_cache] = cli$present (%ASCID 'CACHE'))
+THEN
+    BEGIN
+    $trace_print_lit ('caching requested');
+    exch$a_gbl [excg$a_cachexh_routine]   = main_exit_handler;				! Address of routine
+    exch$a_gbl [excg$l_cachexh_arg_count] = 1;						! Number of args (status)
+    exch$a_gbl [excg$a_cachexh_status]    = exch$a_gbl [excg$l_cachexh_condvalu];	! Location for status
+
+    IF NOT (status = $dclexh (desblk=exch$a_gbl [excg$r_cachexit_block]))
+    THEN
+	$exch_signal_stop (.status);
+    END;
+
+END;						! Extra end needed for the BIND
+RETURN;
+END;
+
+GLOBAL ROUTINE main_start =		%SBTTL 'main_start'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Main procedure of EXCHANGE.  Contains main command input loop.
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	Invoking command line if present, otherwise none.
+!
+! OUTPUTS:
+!
+!	None
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true, or error code if abnormal termination
+!
+! SIDE EFFECTS:
+!
+!	Many.
+!--
+
+$dbgtrc_prefix ('main_start> ');
+
+LOCAL
+    dynamic_desc	: $dyn_str_desc,	! A dynamic string descriptor for "foreign" commands
+    status
+    ;
+
+! The CLI will print an annoying "%CLI-W-NOCOMD, no command on line" message if a blank line is entered.  We
+! declare a condition handler which will stop such nonsense.
+!
+ENABLE
+    main_handle_cli_nocomd;
+
+! Check that some of our constants have valid values.  Note that the $logic_check macro will perform checks at
+! compile-time rather than run-time if possible.
+!
+$logic_check (0, ((ctx$k_buffer_length GEQU 1536) AND (ctx$k_buffer_length LSSU 65536)), 114);
+$logic_check (0, (ctx$k_buffer_length GEQU filb$s_record_buffer+1024), 143);
+$logic_check (0, (rt11ctx$s_entry EQL rt11ent$k_length), 167);
+$logic_check (0, (dos11ctx$s_entry_fields EQL dos11ctx$s_entry), 251);
+$logic_check (0, (rt11hom$k_length EQL 512), 141);
+$logic_check (0, (rt11$s_home_block EQL 512), 292);
+
+! Several routines assume that the fields in the front of the CTX$, RT11CTX$ and DOS11CTX$ structures
+! coincide.  Test these assumptions (again, compile-time checks).
+!
+$logic_check (0, ($$offset_check (a_alloc)), 293);
+$logic_check (0, ($$offset_check (a_assoc_filb)), 294);
+$logic_check (0, ($$offset_check (a_assoc_volb)), 295);
+$logic_check (0, ($$offset_check (a_buffer)), 296);
+$logic_check (0, ($$offset_check (l_cur_block)), 297);
+$logic_check (0, ($$offset_check (l_eof_block)), 298);
+$logic_check (0, ($$offset_check (l_cur_byte)), 299);
+$logic_check (0, ($$offset_check (l_flags)), 300);
+$logic_check (0, ($$offset_check (l_buf_base_block)), 301);
+$logic_check (0, ($$offset_check (l_buf_high_block)), 302);
+$logic_check (0, ($$offset_check (l_high_block_written)), 303);
+$logic_check (0, ($$bit_check (v_stream_active)), 304);
+$logic_check (0, ($$bit_check (v_output_file)), 305);
+$logic_check (0, ($$bit_check (v_flush)), 306);
+
+! Perform initializations necessary only once at load time.  SYS$OUTPUT is attached to SYSOUT_xAB.
+! Qualifiers on the EXCHANGE verb itself are parsed and recorded in global variables.
+!
+main_setup_load_time ();			! If failed, exit to VMS.
+
+!+
+! Files have been initialized.  If executed as a foreign command, perform requested function and exit.
+!-
+
+IF cli$get_value (%ASCID 'COMMAND', dynamic_desc)
+THEN
+    BEGIN
+
+    ! Parse the single command, execute if successful
+    !
+    exch$a_gbl [excg$v_foreign_command] = true;
+    IF (status = cli$dcl_parse (dynamic_desc, exch$cld_table))
+    THEN
+	status = cli$dispatch();
+
+    $check_call (4, lib$signal, exch$_trace, 1, .status, .status);
+
+    ! Terminate execution and return to DCL
+    !
+    IF NOT .status				! If failed, inhibit additional signalling
+    THEN
+	$inhibit_msg (status);
+
+    RETURN .status;
+    END;
+
+!+
+! Top of the interactive command loop.  The normal exit condition is a call to exch$main_exit, which occurs when
+! end-of-file is reached on the SYS$INPUT stream or the verb EXIT is received.
+!-
+DO
+    BEGIN
+
+
+    ! Call the library routine to parse the command, pass the address of the external command table
+    !
+    IF (status = cli$dcl_parse (0, exch$cld_table, lib$get_input, lib$get_input, %ASCID 'EXCHANGE> '))
+    THEN
+	BEGIN
+
+	exch$a_gbl [excg$v_control_c] = false;	! Clear the bit saying we got an ast
+
+	! Call the library routine to execute (call) the routine associated with the DCL verb
+	!
+	status = cli$dispatch();
+
+	! Keep track of status during development
+	!
+	$check_call (4, lib$signal, exch$_trace, 1, .status, .status);
+
+	END;
+
+    END
+UNTIL .status EQL rms$_eof;
+
+RETURN true;
+END;
+
+END				!End of module
+ELUDOM

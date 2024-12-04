@@ -1,0 +1,697 @@
+MODULE	OPC$CLUSCOMM	(
+			 LANGUAGE (BLISS32),
+			 IDENT = 'V04-000'
+			) =
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:
+!
+!	OPCOM
+!
+! ABSTRACT:
+!
+!	This module contains communications routines used by cluster functions within OPCOM.
+!
+! Environment:
+!
+!	VAX/VMS operating system.
+!
+! Author:
+!
+!	CW Hobbs
+!
+! Creation date:
+!
+!	14 July 1983
+!
+! Revision history:
+!
+!	V03-004	CWH3004		CW Hobbs			18-May-1984
+!		Reduce csp messages to two total, one per node to avoid
+!		a temporary problem with port overloads.
+!
+!	V03-003	CWH3169		CW Hobbs			5-May-1984
+!		Second pass for cluster-wide OPCOM:
+!		 - Perform a fairly liberal rewrite of this module using
+!		   kernel-ast driven, parallel calls to CSP so that
+!		   performance can be much better.
+!		 - Return SS$_NOSUCHNODE status if the target node does
+!		   not exist at the present time.
+!
+!	V03-002	CWH3002		CW Hobbs		16-Sep-1983
+!		Clean up kernel handler and error messages
+!
+!
+!--
+
+BEGIN						! Start of CLUSCOMM
+
+LIBRARY	'SYS$LIBRARY:LIB.L32';
+LIBRARY 'LIB$:OPCOMLIB';
+REQUIRE 'SHRLIB$:CSPDEF';
+
+FORWARD ROUTINE
+	CLUSCOMM_COD_ALLOCATE,			! Allocate a cluster output descriptor
+	CLUSCOMM_COD_ERROR : NOVALUE,		! Handle an error described by a cod
+	CLUSCOMM_COD_ERROR_AST : NOVALUE,	! User mode ast routine for a cod error
+	CLUSCOMM_DECLARE_KERNEL_AST,		! Declare kernel AST to start things moving
+	CLUSCOMM_OUTPUT_KERNEL_AST : NOVALUE,	! Handle ast from CSP
+	CLUSCOMM_SEND,				! Jacket routine to send message to remote node(s)
+	CLUSCOMM_SEND_ONE,			! Send message to single remote node
+	CLUSCOMM_TARGET_IN_QUEUE;		! Count number of times target node in queue
+
+EXTERNAL ROUTINE
+	CLUSUTIL_FIND_NOD_BY_CSID,
+	CLUSUTIL_NODE_MESSAGE,
+	DUMP_LOG_FILE,
+	SHARE_FAO_BUFFER,
+	WRITE_LOG_FILE;
+
+GLOBAL						! Global so that SDA can find them easily
+	COD_ALLOCATED,				! Count of CODs created
+	COD_BUSY_COUNT,				! Current count of i/os pending
+	COD_BUSY_MAX	: INITIAL (2),		! Maximum number of EXE$CSP_CALLs pending
+	COD_BUSY_NODE	: INITIAL (1),		! Maximum number of EXE$CSP_CALLs pending to single node
+	COD_ERRORS,				! Count of requests with errors
+	COD_FLUSHED,				! Count of requests flushed (also count as errors)
+	COD_REQUESTS,				! Count of requests made
+	COD_QUEUED,				! Count of requests queued
+	COD_BUSY_QUEUE	: VECTOR [2, LONG]	! Queue of CODs pending for I/O
+	      INITIAL (REP 2 OF (COD_BUSY_QUEUE)),
+	COD_FREE_QUEUE	: VECTOR [2, LONG]	! Queue of cods available for use
+	      INITIAL (REP 2 OF (COD_FREE_QUEUE)),
+	COD_WAIT_QUEUE	: VECTOR [2, LONG]	! Queue of cods waiting for actual EXE$CSP_CALL to be queued
+	      INITIAL (REP 2 OF (COD_WAIT_QUEUE)),
+	COD_GARBAGE_QUEUE : VECTOR [2, LONG]	! Pointer to list of virtual memory to deallocate
+	      INITIAL (REP 2 OF (COD_GARBAGE_QUEUE));
+!
+! A macro to put virtual memory back on the queue of garbage to be deallocated
+!
+MACRO
+	COLLECT_GARBAGE (INP_DESC) =
+		    BEGIN
+		    BIND
+			desc = (INP_DESC) : VECTOR [, LONG],
+			garbage = .desc [1] : VECTOR [, LONG];
+		    garbage [2] = .desc [0];			! Store length as second longword in block
+		    $queue_insert_tail (garbage, cod_garbage_queue);
+		    END %;
+
+GLOBAL ROUTINE cluscomm_cod_allocate =
+
+!++
+! Functional descripton:
+!
+!	This routine allocates a COD for a cluster write
+!
+! Input:
+!	None.
+!
+! Output:
+!	None.
+!
+! Routine Value:
+!	Address of block allocated
+!--
+
+BEGIN						! Start of cluscomm_cod_allocate
+
+LOCAL
+     cod 	: $ref_bblock,			! cod data structure
+     garb	: REF VECTOR [, LONG],
+     ptr,
+     status;
+
+!
+! If any garbage nodes are in the hopper, send them away.  Garbage is reclaimed this
+! way so that the kernel ast routines do not do free_vm calls on memory allocated
+! from user mode.
+!
+$queue_remove_head (cod_garbage_queue, garb);
+WHILE .garb NEQ 0
+DO
+    BEGIN
+    IF NOT (status = opc$free_vm (garb [2], garb))
+    THEN
+	$signal_stop (.status);
+    $queue_remove_head (cod_garbage_queue, garb);
+    END;
+!
+! Get a cod, a Cluster Output Descriptor, if none available on the queue then
+! allocate and initialize one.
+!
+$queue_remove_head (cod_free_queue, cod);
+IF .cod EQL 0
+THEN
+    BEGIN
+    IF NOT (status = opc$get_vm (%ref (cod_k_size), ptr))
+    THEN
+	$signal_stop (.STATUS);
+    cod_allocated = .cod_allocated + 1;
+    cod = .ptr;
+    CH$FILL (0, cod_k_size, .cod);
+    cod [cod_w_size] = cod_k_size;
+    cod [cod_b_type] = %x'77';
+    END;
+!
+! Init the block
+!
+(cod [cod_q_quetime]) = 0;
+(cod [cod_q_quetime]+4) = 0;
+cod [cod_a_csd] = 0;
+cod [cod_l_msglen] = 0;
+
+RETURN .cod;
+END;						! End of cluscomm_cod_allocate
+
+GLOBAL ROUTINE cluscomm_declare_kernel_ast =
+
+!++
+! Functional descripton:
+!
+!	This routine declares an ast to start the I/O, both it and the AST operate in kernel mode
+!
+! Input:
+!	None.
+!
+! Output:
+!	None.
+!
+! Routine Value:
+!	Value from DCLAST
+!--
+
+BEGIN						! Start of cluscomm_declare_kernel_ast
+
+RETURN $DCLAST (ASTADR=cluscomm_output_kernel_ast, ASTPRM=0);	! 0 means start
+
+END;						! End of cluscomm_declare_kernel_ast
+
+GLOBAL ROUTINE cluscomm_output_kernel_ast (csd : $ref_bblock) : NOVALUE =
+
+!++
+! Functional descripton:
+!
+!	This routine is the I/O completion for a EXE$CSP_CALL write, executes in kernel mode
+!
+! Input:
+!	csd	address of CSD for the transfer
+!
+! Output:
+!	None.
+!
+! Routine Value:
+!	None.
+!--
+
+BEGIN						! Start of cluscomm_output_kernel_ast
+
+LOCAL
+     cod : $ref_bblock;
+
+!
+! If the parameter is non-zero, release that block
+!
+IF .csd NEQ 0
+THEN
+    BEGIN
+    cod = .(csd [csd$ab_data]);			! COD address is first longword of data field
+    !
+    ! Free the CSD and put the message buffer on the list of virtual memory blocks to be deallocated
+    !
+    EXE$DEALLOC_CSD (.csd);
+    collect_garbage (cod [cod_q_msgbuf]);
+    !
+    ! Place the cod in the free queue
+    !
+    $queue_remove (.cod);			! Remove it from the queue (should be in the busy queue)
+    $queue_insert_tail (.cod, cod_free_queue);
+    cod_busy_count = .cod_busy_count - 1;
+    END;
+!
+! If we can queue another EXE$CSP_CALL, then do so
+!
+cod = .cod_wait_queue [0];
+WHILE .cod NEQ cod_wait_queue			! Loop until we see the end
+    AND
+     .cod_busy_count LSS .cod_busy_max		! or until we have filled our quota
+DO
+    BEGIN
+    LOCAL
+	next,
+	nod : $ref_bblock;
+    next = .cod [cod_l_flink];			! Save the pointer to the next, since we might pull it out
+    nod = .cod [cod_a_nod];			! Pointer to the nod block for the system
+    !
+    ! Make sure that the target is still there, this means that the csid stored in the node must be
+    ! valid and that the node must not be in the departed state.
+    !
+    IF .nod [nod_l_node_csid] NEQ .cod [cod_l_csid]	! Node has rebooted with a new csid
+      OR
+       .nod [nod_b_state] EQL nod_k_state_departed	! Node is gone, but not forgotten
+    THEN
+	BEGIN
+	$queue_remove (.cod);			! Remove it from the waiting queue
+	cod [cod_l_errstat] = ss$_nodeleave;	! Give it a reasonable error status
+	cod_flushed = .cod_flushed + 1;		! Count flushes individually
+	cluscomm_cod_error (.cod);		! Signal and clean it up
+	END
+    ELSE IF cluscomm_target_in_queue (.cod, cod_busy_queue) LSS .cod_busy_node
+    THEN
+	BEGIN
+	LOCAL
+	    status;
+	!
+	! Remove the cod from the waiting queue
+	! 
+	$queue_remove (.cod);
+	!
+	! Allocate a CSD block for the transfer.  Common fields in the CSD are initialized by
+	! the allocate routine.
+	!
+	IF NOT (cod [cod_l_errstat] = EXE$ALLOC_CSD (csd$k_length + 4 + .cod [cod_l_msglen]; csd))
+	THEN
+	    BEGIN
+	    cluscomm_cod_error (.cod);				! Signal error and clean up
+	    RETURN;						! More serious error, exit the routine
+	    END;
+	cod [cod_a_csd] = .csd;					! Point the cod at the csd
+	(csd [csd$ab_data]) = .cod;				! Store cod address as first longword in csd
+	!
+	! Set the other message dependent fields in the CSD
+	!
+	csd [csd$w_code] = csd$k_opcom;				! Set the OPCOM client code
+	csd [csd$l_sendoff] = (4 + (csd [csd$ab_data])) - .csd;	! Store offset to the actual message
+	csd [csd$l_sendlen] = .cod [cod_l_msglen];		! Store size of message
+	CH$MOVE (.cod [cod_l_msglen], .cod [cod_a_msgptr],	! Move the message into the CSD
+				(4 + (csd [csd$ab_data])));	!  right after the cod address
+	csd [csd$l_recvoff] = csd [csd$l_recvlen] = 0;		! We do not want a reply
+	csd [csd$a_astadr] = cluscomm_output_kernel_ast;	! Store address of completion AST routine
+	csd [csd$l_csid] = .cod [cod_l_csid];			! Store the target node CSID
+	IF NOT (cod [cod_l_errstat] = EXE$CSP_CALL (.cod [cod_a_csd]))
+	THEN
+	    cluscomm_cod_error (.cod)				! Signal error and clean up
+	ELSE
+	    BEGIN
+	    cod_busy_count = .cod_busy_count + 1;		! Bump the busy count
+	    cod_queued = .cod_queued + 1;			! Bump the count of those queued
+	    $queue_insert_tail (.cod, cod_busy_queue);		! Put it at the end of the busy queue
+	    $gettim (timadr=cod [cod_q_quetime]);		! Store the current time in the cod
+	    END;
+	END;
+    !
+    ! Advance to the next one, using the saved next pointer
+    !
+    cod = .next;
+    END;
+!
+! Check the validity of the queues, crash the system if anything is wrong
+!
+%IF %VARIANT EQL 7
+%THEN
+BEGIN
+EXTERNAL ROUTINE monitor_queue : NOVALUE;
+monitor_queue (cod_busy_queue, 0);
+monitor_queue (cod_free_queue, 1);
+monitor_queue (cod_wait_queue, 2);
+END;
+%FI
+
+RETURN;
+END;						! End of cluscomm_output_kernel_ast
+
+GLOBAL ROUTINE cluscomm_cod_error (cod : $ref_bblock) : NOVALUE =
+
+!++
+! Functional descripton:
+!
+!	This routine handles an error in CSP communications, executes in kernel mode.
+!	The error is given to a user-mode AST to actually handle
+!
+! Input:
+!	cod	address of COD for the transfer
+!
+! Output:
+!	None.
+!
+! Routine Value:
+!	None.
+!--
+
+BEGIN						! Start of cluscomm_cod_error
+
+LOCAL
+     csd : $ref_bblock;
+
+cod_errors = .cod_errors + 1;
+!
+! Deallocate the CSD if present
+!
+IF (csd = .cod [cod_a_csd]) NEQ 0
+THEN
+    EXE$DEALLOC_CSD (.csd);
+!
+! Return any virtual memory to the free list
+!
+IF .cod [cod_l_msglen] NEQ 0
+THEN
+    collect_garbage (cod [cod_q_msgbuf]);
+!
+! Declare an AST in user mode, so that we can use RMS/etc
+!
+$DCLAST (astadr=cluscomm_cod_error_ast, astprm=.cod, acmode=psl$c_user);
+
+RETURN;
+END;						! End of cluscomm_cod_error
+
+GLOBAL ROUTINE cluscomm_cod_error_ast (cod : $ref_bblock) : NOVALUE =
+
+!++
+! Functional descripton:
+!
+!	This routine signals an error in CSP communications, executes in user mode.
+!
+! Input:
+!	cod	address of COD for the transfer
+!
+! Output:
+!	None.
+!
+! Routine Value:
+!	None.
+!--
+
+BEGIN						! Start of cluscomm_cod_error
+
+LOCAL
+    leaving,
+    dsc : VECTOR [2, LONG],
+    nod : $ref_bblock;
+
+nod = .cod [cod_a_nod];
+leaving = (.cod [cod_l_errstat] EQL ss$_nodeleave);
+IF (NOT .leaving)				! If any other error
+  OR
+   (NOT .nod [nod_v_node_leaving])		! or if the first node_leaving error
+THEN
+    BEGIN
+    !
+    ! Put a message in the logfile
+    !
+    clusutil_node_message (.nod, opc$_cluscomm, false);
+    !
+    ! If any error besides leaving, then put a message in the logfile about the exact reason
+    !
+    IF .leaving					! Mark the first message so that we can skip the others
+    THEN
+    	nod [nod_v_node_leaving] = true
+    ELSE
+	BEGIN
+	write_log_file (
+	    share_fao_buffer (%ASCID %STRING ('Unable to communicate with !AS (!XL), system status code !XL!/',
+					'  Current statistics for cluster message activity:!/',
+					'	Msg desc allocated!8UL     Errors       !8UL!/',
+					'	Msg requests      !8UL     Msgs flushed !8UL!/',
+					'	Msgs queued       !8UL     Current busy !8UL'),
+					nod [nod_q_name_desc], .cod [cod_l_csid], .cod [cod_l_errstat],
+					.cod_allocated, .cod_errors-.cod_flushed, 
+					.cod_requests, .cod_flushed, 
+					.cod_queued, .cod_busy_count));
+	!
+	! Write some more arcane, but useful messages if we are debugging
+	!
+	%IF %VARIANT NEQ 0
+	%THEN
+	dsc [0] = cod_k_size;  dsc [1] = .cod;
+	dump_log_file (dsc, %ASCID 'Dump of COD used in transfer');
+	dump_log_file (cod [cod_q_msgbuf], %ASCID 'Dump of COD text field');
+	%FI
+	END;
+    END;
+
+$queue_insert_tail (.cod, cod_free_queue);	! All done, put it back in the queue
+
+RETURN;
+END;						! End of cluscomm_cod_error_ast
+
+GLOBAL ROUTINE CLUSCOMM_SEND (CSID, MSG_LEN, MSG_PTR) =		%SBTTL 'CLUSCOMM_SEND (CSID, MSG_LEN, MSG_PTR)'
+
+!++
+! Functional description:
+!
+!	Jacket routine to send a message to remote node(s), and wait for completion.
+!
+! Input:
+!
+!	CSID	- Id of target node, -1 for broadcast to all nodes except local
+!	MSG_LEN	- Length of message
+!	MSG_PTR	- Address of message
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	Messages will be sent to remote nodes.
+!
+! Routine value:
+!
+!	Status from comm primitive.
+!--
+
+BEGIN						! Start of CLUSCOMM_SEND
+
+EXTERNAL
+	GLOBAL_STATUS	: BITVECTOR [32],
+	LCL_CSID	: LONG,
+	NOD_HEAD	: VECTOR [2, LONG];
+
+LOCAL
+	FINAL_STAT	: LONG,
+	NOD		: $ref_bblock,
+	STATUS		: LONG;
+
+!
+! Assume success for final status
+!
+FINAL_STAT = SS$_NORMAL;
+!
+! If not in a cluster we are done, return with success
+!
+IF NOT .GLOBAL_STATUS [GBLSTS_K_IN_VAXcluster]
+THEN
+    RETURN .FINAL_STAT;
+!
+! If CSID is -1, send it to everyone
+!
+IF .CSID EQL -1
+THEN
+    BEGIN
+    NOD = .NOD_HEAD [0];
+    WHILE .NOD NEQ NOD_HEAD [0]
+    DO
+	BEGIN
+	LOCAL
+	    TARGET;
+	!
+	! Send to all nodes but local
+	!
+	TARGET = .NOD [NOD_L_NODE_CSID];
+	IF .TARGET NEQ .LCL_CSID
+	THEN
+	    BEGIN
+	    STATUS = CLUSCOMM_SEND_ONE (.TARGET, .NOD, .MSG_LEN, .MSG_PTR);
+	    IF NOT .STATUS
+	    THEN
+		FINAL_STAT = .STATUS;
+	    END;
+	!
+	! Move to the next node
+	!
+	NOD = .NOD [NOD_L_FLINK];
+	END;
+    END
+!
+! CSID is real, send it to a single node
+!
+ELSE
+    BEGIN
+    NOD = CLUSUTIL_FIND_NOD_BY_CSID (.CSID);
+    FINAL_STAT = (IF .NOD EQL 0
+		  THEN SS$_NOSUCHNODE
+		  ELSE CLUSCOMM_SEND_ONE (.CSID, .NOD, .MSG_LEN, .MSG_PTR));
+    END;
+
+RETURN .FINAL_STAT;
+END;						! End of CLUSCOMM_SEND
+
+GLOBAL ROUTINE CLUSCOMM_SEND_ONE (CSID, NOD, MSG_LEN, MSG_PTR) =		%SBTTL 'CLUSCOMM_SEND_ONE'
+
+!++
+! Functional description:
+!
+!	Send a message to a remote node, and wait for completion.
+!
+! Input:
+!
+!	CSID	- Id of target node
+!	NOD	- Address of NOD block for target node
+!	MSG_LEN	- Length of message
+!	MSG_PTR	- Address of message
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	Messages will be sent to remote nodes.
+!
+! Routine value:
+!
+!	Status from comm primitive.
+!--
+
+BEGIN						! Start of CLUSCOMM_SEND_ONE
+
+EXTERNAL
+	GLOBAL_STATUS	: BITVECTOR [32];
+
+LOCAL
+	ARGLIST		: VECTOR [2, LONG],
+	COD		: $ref_bblock,
+	STATUS		: LONG;
+
+!
+! If not in a cluster we are done, return with error.
+!
+IF NOT .GLOBAL_STATUS [GBLSTS_K_IN_VAXcluster]
+THEN
+    RETURN SS$_NOSUCHNODE;
+!
+! Allocate and fill in the COD
+!
+COD = CLUSCOMM_COD_ALLOCATE ();			! Get a new COD
+COD [COD_L_CSID] = .CSID;			! Keep a copy of the CSID in the COD
+COD [COD_A_NOD] = .NOD;				! Keep the NOD address too
+COD [COD_L_MSGLEN] = MAXU (12, .MSG_LEN);	! Store the length of the message, make sure garbage header fits
+IF NOT (STATUS = OPC$GET_VM (COD [COD_L_MSGLEN], COD [COD_A_MSGPTR]))
+THEN
+    $signal_stop (.STATUS);
+CH$MOVE (.MSG_LEN, .MSG_PTR, .COD [COD_A_MSGPTR]);
+!
+! Place the cod on the queue of outputs waiting
+!
+$QUEUE_INSERT_TAIL (.COD, COD_WAIT_QUEUE);
+COD_REQUESTS = .COD_REQUESTS + 1;
+!
+! Change to kernel mode to start the transfer, call the ast routine with a zero
+! parameter (arglst not relevant)
+!
+STATUS = $CMKRNL (ROUTIN = CLUSCOMM_DECLARE_KERNEL_AST, ARGLST = COD);
+!
+! Signal errors.  If ast quota exceeded, then write a message, since it is almost certain that
+! kernel ASTs are already active.  If not ast quota error, stop the process.
+!
+IF NOT .STATUS
+THEN
+    BEGIN
+    IF .STATUS NEQ SS$_EXQUOTA
+    THEN
+	$signal_stop (.STATUS)
+    ELSE
+	WRITE_LOG_FILE (%ASCID 'AST quota error in cluster communication');
+    END;
+
+RETURN .STATUS;
+END;						! End of CLUSCOMM_SEND_ONE
+
+GLOBAL ROUTINE cluscomm_target_in_queue (cod : $ref_bblock, queue : $ref_bblock) =
+
+!++
+! Functional descripton:
+!
+!	Check to see if the CSID field in the cod is in any of the CODs in the queue.
+!	We assume that we are operating at AST level so that we do not have to worry
+!	about interlocking the queue.
+!
+! Input:
+!	cod	pointer to a cod
+!	queue	head of a queue of CODs
+!
+! Output:
+!	None.
+!
+! Routine Value:
+!	number of matches in the queue
+!--
+
+BEGIN						! Start of cluscomm_TARGET_IN_QUEUE
+
+LOCAL
+    count,
+    csid,
+    head : $ref_bblock,
+    cur : $ref_bblock;
+
+!
+! Scan the queue, counting the number of times the target appears
+!
+count = 0;
+csid = .cod [cod_l_csid];
+head = .queue;
+cur = .head [cod_l_flink];
+WHILE .cur NEQ .head				! Loop until we see the end
+DO
+    BEGIN
+    IF .csid EQL .cur [cod_l_csid]
+    THEN
+	count = .count + 1;
+    cur = .cur [cod_l_flink];			! Get the next cod
+    END;
+
+RETURN .count;
+END;						! End of cluscomm_TARGET_IN_QUEUE
+
+END						! End of CLUSCOMM
+ELUDOM

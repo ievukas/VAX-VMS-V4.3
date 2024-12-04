@@ -1,0 +1,1714 @@
+MODULE	exch$copy				%TITLE 'copy verb dispatch and misc routines'
+		(
+		IDENT = 'V04-000',
+		ADDRESSING_MODE (EXTERNAL=LONG_RELATIVE, NONEXTERNAL=WORD_RELATIVE)
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:	EXCHANGE - Foreign volume interchange facility
+!
+! ABSTRACT:	Primary action routines for copy verb
+!
+! ENVIRONMENT:	VAX/VMS User mode
+!
+! AUTHOR:	CW Hobbs	 CREATION DATE: 2-Oct-1982
+!
+! MODIFIED BY:
+!
+!	V03-002	CWH3002			CW Hobbs		12-Apr-84
+!		Return file-not-found correctly in copy loop.  Modify TYPE
+!		output routine for eight-bit character set.
+!
+!
+!--
+
+! Include files:
+!
+MACRO $module_name_string = 'exch$copy' %;	! The require file needs to know our module name
+REQUIRE 'SRC$:EXCREQ'				! Facility-wide require file
+    ;
+
+%SBTTL 'Module table of contents'
+
+! Module table of contents:
+!
+FORWARD ROUTINE
+    exch$copy_copy,				! Main action routine for COPY verb
+	 copy_init		: NOVALUE,	! Inits common to COPY and TYPE
+	 copy_input_close	: NOVALUE,	! Close the input file
+	 copy_input_open,			! Open the input file
+    exch$copy_namb_to_filb	: NOVALUE,	! Copy fields from namb to the filb
+	 copy_output_cleanup	: NOVALUE,	! Release structures and clean up output
+	 copy_output_close,			! Close the output file
+	 copy_output_create,			! Create the output file
+	 copy_output_delete	: NOVALUE,	! Delete the output file after error
+	 copy_parse_cleanup	: NOVALUE,	! Release structures and clean up after parse
+	 copy_parse_next_input,			! Fetch and expand next input parameter
+    exch$copy_type,				! Main action routine for TYPE verb
+	 copy_type_print	: NOVALUE	! Reformat and print lines on SYS$OUTPUT
+    ;
+
+! EXCHANGE facility routines
+!
+EXTERNAL ROUTINE
+    exch$cmd_cli_get_integer,			! Get an integer value
+    exch$cmd_parse_filespec,			! Parse a file specification
+    exch$dos11_create_file,			! Create and connect to a DOS-11 file
+    exch$dos11_open_file,			! Connect to a DOS-11 file
+    exch$fil11_create_file,			! Create and connect to an RMS file
+    exch$fil11_open_file,			! Connect to an RMS file
+    exch$moun_implied_mount,			! Do a default mount
+    exch$rt11_create_file,			! Create and connect to an RT11 file
+    exch$rt11_open_file,			! Connect an RT11 file
+    exch$rt11_write_cleanup	: NOVALUE,	! Complete writing to an RT-11 volume
+    exch$rt11_write_prepare	: NOVALUE,	! Prepare to write to an RT-11 volume
+    exch$util_dos11ctx_release	: NOVALUE,	! Release dos-11 block
+    exch$util_fao_buffer,			! Format an fao string
+    exch$util_filb_allocate,			! Allocate file context block
+    exch$util_filb_release	: NOVALUE,	! Release file context block
+    exch$util_file_error,			! Tell about an rms error
+    exch$util_namb_release	: NOVALUE,	! Release name block
+    exch$util_rmsb_allocate,			! Allocate Files-11 control block
+    exch$util_rmsb_release	: NOVALUE,	! Release Files-11 block
+    exch$util_rt11ctx_allocate,			! Allocate RT-11 context block
+    exch$util_rt11ctx_release	: NOVALUE,	! Release RT-11 block
+    exch$util_vm_allocate			! Allocate virtual memory
+    ;
+
+! Equated symbols:
+!
+!LITERAL
+!    ;
+
+! Bound declarations:
+!
+BIND
+    ascid_allocation	= %ASCID 'ALLOCATION',		! Save some space, these strings used more than once
+    ascid_best_try	= %ASCID 'BEST_TRY_CONTIGUOUS',
+    ascid_contiguous	= %ASCID 'CONTIGUOUS',
+    ascid_extension	= %ASCID 'EXTENSION',
+    ascid_truncate	= %ASCID 'TRUNCATE'
+    ;
+
+GLOBAL ROUTINE exch$copy_copy =	%SBTTL 'exch$copy_copy'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Action routine for the copy verb, parses and performs main control functions for copy
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	Command parameters and qualifiers as returned from CLI$ routines.  Global environment ref'd by exch$a_gbl.
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	Files may be created.
+!--
+
+$dbgtrc_prefix ('copy_copy> ');
+
+LOCAL
+    copy : $ref_bblock,				! Pointer to work area
+    inp_filb : $ref_bblock,
+    out_filb : $ref_bblock,
+    out_namb : $ref_bblock,
+    abort,
+    protect,
+    prs_stat,
+    status
+    ;
+
+
+! Allocate and/or initialize the work area
+!
+copy_init ();
+
+! Get pointers that we need.  Have to wait until work area is allocated by init call
+!
+copy = .exch$a_gbl [excg$a_copy_work];		! Pointer to work area
+
+! Init the name used for the input file default.  As long as it is null we can also use it for output default.
+!
+str$copy_dx (copy [copy$q_input_sticky_name], %ASCID '');
+
+! Get the string and the namb for the output filename.  By fetching this parameter, we will pick up positional
+! qualifiers attached to the second parameter.
+!
+IF NOT (status = exch$cmd_parse_filespec (%ASCID 'OUTPUT', copy [copy$q_input_sticky_name], 0,
+				  copy [copy$q_output_filename], out_namb))
+THEN
+    $exch_signal_return (exch$_parseerr, 1, copy [copy$q_output_filename], .status);
+$debug_print_fao ('output parameter is "!AS"', copy [copy$q_output_filename]);
+copy [copy$a_out_namb] = .out_namb;		! Save the address of the namb in the work area
+
+! Get the default set of boolean qualifiers, note that we treat positionals on the second parameter as globals
+!
+copy [copy$v_q_best_try_contiguous] = cli$present (ascid_best_try);		! positional
+copy [copy$v_q_contiguous]	    = cli$present (ascid_contiguous);		! positional
+copy [copy$v_q_delete]		    = cli$present (%ASCID 'DELETE');		! positional
+copy [copy$v_q_replace]		    = cli$present (%ASCID 'REPLACE');		! positional
+copy [copy$v_q_system]		    = cli$present (%ASCID 'SYSTEM');		! global
+copy [copy$v_q_truncate]	    = cli$present (ascid_truncate);		! positional
+
+! For /PROTECT, we need to know whether it was specified or defaulted
+!
+protect = cli$present (%ASCID 'PROTECT');
+copy [copy$v_q_protect]		 = .protect;					! Simply value of low bit
+copy [copy$v_q_protect_explicit] = ((.protect EQL cli$_present) 		! Either /PROTECT or /NOPROTECT
+					OR (.protect EQL cli$_negated));	!  must be there
+
+! Get individual integer-valued qualifiers, routine signals on errors.  If the qualifier is not present, 0 is put
+! in the second parameter and -1 (success) is returned as the routine value.  Here we also treat positionals on the
+! second parameter as globals.
+!
+IF NOT (status = exch$cmd_cli_get_integer (ascid_allocation, copy [copy$l_q_allocation]))
+THEN
+    BEGIN
+    exch$util_namb_release (.out_namb);
+    RETURN .status;
+    END;
+
+IF NOT (status = exch$cmd_cli_get_integer (ascid_extension, copy [copy$l_q_extension]))
+THEN
+    BEGIN
+    exch$util_namb_release (.out_namb);
+    RETURN .status;
+    END;
+
+IF NOT (status = exch$cmd_cli_get_integer (%ASCID 'START_BLOCK', copy [copy$l_q_start_block]))
+THEN
+    BEGIN
+    exch$util_namb_release (.out_namb);
+    RETURN .status;
+    END;
+
+! If a foreign device is not mounted, then perform an implied mount
+!
+IF   (.out_namb [namb$a_assoc_volb] EQL 0)
+  AND
+     (BEGIN
+      BIND
+	dev = out_namb [namb$l_fabdev] : $bblock;
+      .dev [dev$v_for] OR (NOT (.dev [dev$v_mnt]))
+      END)
+  AND
+     ((.out_namb [namb$b_devclass] EQL dc$_disk)
+      OR
+      (.out_namb [namb$b_devclass] EQL dc$_tape))
+THEN
+    BEGIN
+
+    IF NOT (status = exch$moun_implied_mount (.out_namb))
+    THEN
+	BEGIN
+	exch$util_namb_release (.out_namb);
+	RETURN .status;
+	END;
+    END;
+
+! If the device has a volb, make sure that the volb is valid and that write access is permitted.
+!
+IF (.out_namb [namb$a_assoc_volb] NEQ 0)
+THEN
+    BEGIN
+    BIND
+	volb = out_namb [namb$a_assoc_volb] : $ref_bblock;
+
+    ! We should now have a valid volb, but we still should check
+    !
+    $block_check (2, .volb, volb, 496);
+
+    ! Make certain that write access is permitted
+    !
+    IF NOT .volb [volb$v_write]
+    THEN
+	BEGIN
+	$exch_signal (exch$_nocoplock, 2, .volb [volb$l_vol_ident_len], volb [volb$t_vol_ident]);
+	exch$util_namb_release (.out_namb);
+	RETURN exch$_nocoplock;
+	END;
+
+    CASE .volb [volb$b_vol_format] FROM volb$k_vfmt_lobound TO volb$k_vfmt_hibound OF
+	SET
+
+	[volb$k_vfmt_rt11] :
+			BEGIN
+			IF .out_namb [namb$v_bad_pdp_char]
+			  OR
+			   .out_namb [namb$v_rt_truncate]
+			THEN
+			    BEGIN
+			    $exch_signal (exch$_badfilename, 3, out_namb [namb$q_input],
+						.volb [volb$l_vol_type_len], volb [volb$t_vol_type]);
+			    exch$util_namb_release (.out_namb);
+			    RETURN exch$_badfilename;
+			    END;
+			exch$rt11_write_prepare (.volb);	! Do sundries necessary before we start copying
+			END;
+
+	[volb$k_vfmt_dos11] :
+			BEGIN
+			IF .out_namb [namb$v_bad_pdp_char]
+			  OR
+			   .out_namb [namb$v_dos_truncate]
+			THEN
+			    BEGIN
+			    $exch_signal (exch$_badfilename, 3, out_namb [namb$q_input],
+						.volb [volb$l_vol_type_len], volb [volb$t_vol_type]);
+			    exch$util_namb_release (.out_namb);
+			    RETURN exch$_badfilename;
+			    END;
+			END;
+
+	[INRANGE, OUTRANGE] :
+			;					! Nothing to do for these guys
+	TES;
+    END;
+
+! Allocate a file block to contain the output file information
+!
+out_filb = exch$util_filb_allocate ();
+copy [copy$a_out_filb] = .out_filb;		! Save the address of the filb in the work area
+exch$copy_namb_to_filb (.out_namb, .out_filb);	! Move some data from the namb to the filb
+
+
+! Loop through the list of input file specifications.  Errors will be signalled.  If an error occurs the current
+! input element is skipped and processing continues with the next input item.
+!
+abort = false;
+status = ss$_normal;
+WHILE (prs_stat = copy_parse_next_input ())	! Get next input file parameter
+DO
+    BEGIN
+    LOCAL
+	ino_stat;
+
+    inp_filb = .copy [copy$a_inp_filb];		! Grab the pointer to the input filb
+
+    ! Check for some invalid naming conditions
+    !
+    IF	.copy [copy$v_multiple_files]		! If the input could map multiple files
+    THEN
+	BEGIN
+
+	! Complain if the output file name is explicitly a single file name
+	!
+	IF NOT (    (.out_namb [namb$v_wildcard])			! A wildcard will help us out
+		 OR
+		    (NOT .out_namb [namb$v_explicit_name])		! A missing name will work
+		 OR
+		    (NOT .out_namb [namb$v_explicit_type])		! A missing type can also map multiple files
+		)
+	THEN
+	    BEGIN
+	    status = exch$_many_to_one;
+	    $exch_signal (.status);
+	    copy_parse_cleanup ();
+	    EXITLOOP;
+	    END;
+
+	! Also complain if /START_BLOCK has been requested, since it is hard to put several files on the same block
+	!
+	IF .copy [copy$l_q_start_block] NEQ 0
+	THEN
+	    BEGIN
+	    status = exch$_strtnomulti;
+	    $exch_signal (.status);
+	    copy_parse_cleanup ();
+	    EXITLOOP;
+	    END;
+	END;
+
+    WHILE 1
+    DO
+	BEGIN
+
+	! If a control/c is pending, don't bother with opening another file
+	!
+	IF .exch$a_gbl [excg$v_control_c]
+	THEN
+	    BEGIN
+	    ino_stat = exch$_canceled;
+	    $exch_signal ($info_stat_copy (.ino_stat));
+	    END
+	ELSE
+	    ino_stat = copy_input_open ();	! Open the input file, loop for wildcards
+
+	! Remember if this is a reopen, and clear the reopen flag
+	!
+	copy [copy$v_reopen_in_progress] = .copy [copy$v_reopen_input];
+	copy [copy$v_reopen_input] = false;	! Clear any possible retry
+
+	IF .ino_stat
+	THEN
+	    BEGIN
+	    LOCAL
+		cre_stat,
+		rec_count;
+
+	    ! Now create the file and copy the records
+	    !
+	    IF (cre_stat = copy_output_create ())	! Open the output file
+	    THEN
+		BEGIN
+		LOCAL
+		    getput_err,
+		    cop_stat,
+		    get_stat,
+		    put_stat;
+
+		! While we can get records move them to the output
+		!
+		rec_count = put_stat = getput_err = 0;
+		WHILE (get_stat = (.inp_filb [filb$a_get_routine]) (.inp_filb))
+		DO
+		    BEGIN
+		    IF NOT (put_stat = (.out_filb [filb$a_put_routine]) ()) THEN EXITLOOP;
+		    rec_count = .rec_count + 1;
+
+		    ! If we have seen control/c, exit the loop with a canceled error
+		    !
+		    IF .exch$a_gbl [excg$v_control_c]
+		    THEN
+			BEGIN
+			put_stat = exch$_canceled;
+			abort = true;
+			$exch_signal ($info_stat_copy (.put_stat));
+			EXITLOOP;
+			END;
+		    END;
+
+		$trace_print_fao ('status !XL, get_stat !XL, put_stat !XL', .status, .get_stat, .put_stat);
+
+		IF (NOT .get_stat) AND (.get_stat NEQ 0) 
+		THEN
+		    BEGIN 
+		    status = .get_stat;
+		    getput_err = true;
+		    END;
+
+		IF (NOT .put_stat) AND (.put_stat NEQ 0) 
+		THEN 
+		    BEGIN 
+		    status = .put_stat;
+		    getput_err = true;
+		    END;
+
+		! If we have an error before any records are transferred, try to delete the file
+		!
+		IF NOT .out_filb [filb$v_file_erased]	! Output file is still valid
+		THEN
+		    BEGIN
+		    IF  .getput_err				! If we had an error during our get or put and we
+		      AND					!  either have transferred no records or we would
+			((.rec_count EQL 0)			!  delete a previous version during close.  We do
+			OR					!  not want to delete the previous copy of the file
+			 (.out_filb [filb$v_delete_previous])	!  if there was an error in the transfer.
+			OR					!  We also want to delete the output file if the
+			 (.exch$a_gbl [excg$v_control_c]))	!  command was canceled.
+		    THEN
+			BEGIN
+			copy_output_delete ();			! Delete the output file if supported for the volume
+			rec_count = 0;				! Make sure we get "NOTCOPIED" message
+			END
+
+		    ! Close the ouput file
+		    !
+		    ELSE
+			BEGIN
+			LOCAL
+			    cls_stat;
+			cls_stat = copy_output_close ();	! Close the output file, clean up
+			$trace_print_fao ('status !XL, cls_stat !XL', .status, .cls_stat);
+			IF NOT .cls_stat
+			THEN
+			    BEGIN
+			    status = .cls_stat;
+			    getput_err = true;
+			    END;
+			END;
+		    END;
+
+		! If the file has been erased, set record count to zero.  The file might have been erased because
+		! of an I/O error during close, therefore we must do this here.
+		!
+		IF .out_filb [filb$v_file_erased]
+		THEN
+		    BEGIN
+		    rec_count = 0;
+		    out_filb [filb$v_file_erased] = false;
+		    END;
+
+		! Set the cop_stat if we need to signal
+		!
+		cop_stat = 0;			! Start by assuming no signal
+		IF .getput_err			! We had an error which might have caused a partial copy
+		THEN
+		    BEGIN
+		    IF .rec_count EQL 0		! No recs will get the NOTCOPIED message
+		    THEN
+			cop_stat = exch$_notcopied
+		    ELSE
+			cop_stat = exch$_partcopied;
+		    END
+		ELSE
+		    BEGIN
+		    IF  .out_filb [filb$v_name_change]		! If the name has changed
+		       AND
+			NOT .copy [copy$v_q_nolog_explicit]	! But not if /NOLOG was seen
+		    THEN
+			cop_stat = exch$_copnewname
+		    ELSE IF .copy [copy$v_q_log]		! /LOG is in effect
+			   OR
+			    .copy [copy$v_reopen_in_progress]	! Or we have successfully retried the operation
+		    THEN
+			cop_stat = exch$_copied;
+		    END;
+
+		! If we are going to retry, give that signal
+		!
+		IF .copy [copy$v_reopen_input]
+		THEN
+		    cop_stat = exch$_notcop_retry;
+
+		! If the command was canceled at the keyboard, then do not signal
+		!
+		IF .exch$a_gbl [excg$v_control_c]
+		THEN
+		    cop_stat = 0;
+
+		! Now, if we have a status do the signal
+		!
+		IF .cop_stat NEQ 0
+		THEN
+		    BEGIN
+		    LOCAL
+			b_or_r;
+		    b_or_r = (IF  ((.out_filb [filb$b_rec_format] EQL filb$k_rfmt_fixed)
+				   AND (.out_filb [filb$l_fixed_len] EQL 512))
+				OR
+				  (.out_filb [filb$b_transfer_mode] EQL filb$k_xfrm_block
+				   OR .inp_filb [filb$b_transfer_mode] EQL filb$k_xfrm_block)
+			      THEN %ASCID 'block' ELSE %ASCID 'record');
+		    $exch_signal (.cop_stat, 6, 
+					    .inp_filb [filb$l_result_name_len], inp_filb [filb$t_result_name], 
+					    .out_filb [filb$l_result_name_len], out_filb [filb$t_result_name], 
+					    .rec_count, .b_or_r);
+		    END;
+		END
+
+	    ! Able to open input, but not output.  Give the "File not copied" message
+	    !
+	    ELSE
+		BEGIN
+		$exch_signal (exch$_notcopied, 4, .inp_filb [filb$l_result_name_len], inp_filb [filb$t_result_name], 
+				    .out_filb [filb$l_result_name_len], out_filb [filb$t_result_name], .cre_stat);
+		$trace_print_fao ('status !XL, cre_stat !XL', .status, .cre_stat);
+		status = .cre_stat;
+
+		! Some errors should terminate the command, for example if the directory has overflowed there is
+		! no hope of accomplishing anything useful in this command.
+		!
+		SELECTONE .cre_stat OF
+		SET
+		    [0, exch$_rt11_overflow, exch$_volume_full, exch$_volume_full, exch$_nocopsamdev, 
+			exch$_illmtcopy, rms$_dev] :
+						    abort = true;
+		    [OTHERWISE] :
+						    ;
+		TES;
+
+		END;
+
+	    copy_input_close ();
+	    IF .abort THEN EXITLOOP;
+	    END
+
+	! We got an error from the input_open, but we aren't done yet
+	!
+	ELSE
+	    BEGIN
+	    $trace_print_fao ('status !XL, ino_stat !XL', .status, .ino_stat);
+
+	    IF  .ino_stat EQL 0
+	       OR
+		.exch$a_gbl [excg$v_control_c]
+	    THEN
+		EXITLOOP
+	    ELSE
+		BEGIN
+		status = .ino_stat;
+		SELECTONE .ino_stat OF		! Some errors call for leaving the loop
+		SET
+		    [rms$_fnf, rms$_dev] :
+				EXITLOOP;
+		    [OTHERWISE] : 		! Continue to try for all other errors
+				;
+		TES;
+		END;
+	    
+	    END;
+	END;
+
+    copy_parse_cleanup ();			! Release namb, clean up after parse
+    IF .abort THEN EXITLOOP;
+    END;
+
+! If we had an unusual return from copy_parse_input then use that as the final status
+!
+$trace_print_fao ('status !XL, prs_stat !XL', .status, .prs_stat);
+IF (NOT .prs_stat) AND (.prs_stat NEQ 0) THEN status = .prs_stat;
+
+! Clean up the structures associated with the output file
+!
+copy_output_cleanup ();
+
+$trace_print_fao ('status !XL  (exit)', .status);
+RETURN .status;
+END;
+
+GLOBAL ROUTINE copy_init : NOVALUE =	%SBTTL 'exch$copy_init'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Common init routine for the copy and type verbs
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	Command parameters and qualifiers as returned from CLI$ routines.  Global environment ref'd by exch$a_gbl.
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	Files may be created.
+!--
+
+$dbgtrc_prefix ('copy_init> ');
+
+LOCAL
+    status
+    ;
+
+BIND
+    copy = exch$a_gbl [excg$a_copy_work] : $ref_bblock	! Pointer to work area
+    ;
+
+
+! If our pointer is null, we need to allocate and initialize the work area
+!
+IF .copy EQL 0
+THEN
+    BEGIN
+
+    ! Get the right sized chunk of memory
+    !
+    copy = exch$util_vm_allocate (exchblk$s_copy);
+
+    ! Set the ident fields
+    !
+    $block_init (.copy, copy);
+
+    ! Set the dynamic strings
+    !
+    $dyn_str_desc_init (copy [copy$q_default_filename]);
+    $dyn_str_desc_init (copy [copy$q_input_filename]);
+    $dyn_str_desc_init (copy [copy$q_output_filename]);
+    $dyn_str_desc_init (copy [copy$q_input_sticky_name]);
+!\  $dyn_str_desc_init (copy [copy$q_q_boot]);
+!\  $dyn_str_desc_init (copy [copy$q_q_fdl]);
+!\  $dyn_str_desc_init (copy [copy$q_q_protection]);
+
+    END
+ELSE
+    BEGIN
+
+    ! Free the dynamic strings and the Chicago 7
+    !
+    str$free1_dx (copy [copy$q_default_filename]);
+    str$free1_dx (copy [copy$q_input_filename]);
+    str$free1_dx (copy [copy$q_output_filename]);
+!\  str$free1_dx (copy [copy$q_q_boot]);
+!\  str$free1_dx (copy [copy$q_q_fdl]);
+!\  str$free1_dx (copy [copy$q_q_protection]);
+
+    END;
+
+! Get some confidence that our work area is valid
+!
+$block_check (2, .copy, copy, 408);
+
+! Set the last part of the block to nulls
+!
+CH$FILL (0, copy$k_end_zero - copy$k_start_zero, .copy + copy$k_start_zero);
+
+! Start with a very large max rec, it will be adjusted if too large
+!
+copy [copy$l_max_rec] = 65535;
+
+! Get the global boolean qualifiers common to both commands
+!
+status = cli$present (%ASCID 'LOG');				! Global qualifier
+copy [copy$v_q_log]            = .status;			! Log state
+copy [copy$v_q_nolog_explicit] = (.status EQL cli$_negated);	! Set if /NOLOG is present
+
+!\ copy [copy$v_q_confirm]	= cli$present (%ASCID 'CONFIRM');				! global
+
+RETURN;
+END;
+
+GLOBAL ROUTINE copy_input_close : NOVALUE =	%SBTTL 'copy_input_close'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Close the input file
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	copy [copy$a_inp_filb] describes the file to be closed
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('copy_input_close> ');
+
+LOCAL
+    status
+    ;
+
+BIND
+    copy = exch$a_gbl [excg$a_copy_work] : $ref_bblock,	! Pointer to work area
+    inp_filb = copy [copy$a_inp_filb]	 : $ref_bblock	! Filb for the input
+    ;
+
+
+$block_check (2, .copy, copy, 509);
+$block_check (2, .inp_filb, filb, 510);
+
+! Call the file-specific close routine
+!
+(.inp_filb [filb$a_close_routine]) (.inp_filb);
+
+RETURN;
+END;
+
+GLOBAL ROUTINE copy_input_open =	%SBTTL 'copy_input_open'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Open the input file
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	copy [copy$a_inp_filb] describes the file to be opened
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('copy_input_open> ');
+
+LOCAL
+    status
+    ;
+
+BIND
+    copy = exch$a_gbl [excg$a_copy_work] : $ref_bblock,	! Pointer to work area
+    inp_filb = copy [copy$a_inp_filb]	 : $ref_bblock,	! Filb for the input
+    inp_namb = copy [copy$a_inp_namb]	 : $ref_bblock	! Namb for the input
+    ;
+
+
+$block_check (2, .copy, copy, 409);
+$block_check (2, .inp_filb, filb, 410);
+$block_check (2, .inp_namb, namb, 411);
+
+! Perform the volume-specific open operation
+!
+CASE .inp_namb [namb$b_vol_format] FROM volb$k_vfmt_lobound TO volb$k_vfmt_hibound OF
+SET
+    [volb$k_vfmt_dos11]		: status = exch$dos11_open_file ();
+    [volb$k_vfmt_files11]	: status = exch$fil11_open_file ();
+    [volb$k_vfmt_rt11]		: status = exch$rt11_open_file ();
+!\  [volb$k_vfmt_rtmt]		: $exch_signal_stop (exch$_notimplement);
+    [OUTRANGE,INRANGE]		: $logic_check (0, (false), 233);
+TES;
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE exch$copy_namb_to_filb (namb : $ref_bblock, 	%SBTTL 'exch$copy_namb_to_filb (namb, filb)'
+					filb : $ref_bblock) : NOVALUE =
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Set some fields in the filb using data from the namb
+!
+! INPUTS:
+!
+!	namb - address of namb
+!	filb - address of filb
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('copy_namb_to_filb> ');
+
+$block_check (2, .namb, namb, 523);
+$block_check (2, .filb, filb, 524);
+
+! Set fields in the file context block
+!
+filb [filb$a_assoc_namb]	= .namb;				! Pointer to the namb
+filb [filb$a_assoc_volb]	= .namb [namb$a_assoc_volb];		! Pointer to the volb (0 if Files-11)
+filb [filb$b_car_control]	= .namb [namb$b_car_control];		! Carriage control byte
+filb [filb$b_rec_format]	= .namb [namb$b_rec_format];		! Record format byte
+filb [filb$b_transfer_mode]	= .namb [namb$b_transfer_mode];		! Transfer mode byte
+filb [filb$l_fixed_len]		= .namb [namb$l_fixed_len];		! Record length (format=fixed only)
+filb [filb$b_pad_char]		= .namb [namb$b_pad_char];		! Pad character (format=fixed only)
+filb [filb$v_rfmt_explicit]	= .namb [namb$v_rfmt_explicit];		! A /RECORD was seen
+filb [filb$v_cctl_explicit]	= .namb [namb$v_cctl_explicit];		! A /CARRIAGE was seen
+filb [filb$v_explicit_version]	= .namb [namb$v_explicit_version];	! Explicit version number specified
+
+! Virtual devices will have meaningless vol_formats in the namb.  Copy the volb format to the namb always.
+!
+IF (.filb [filb$a_assoc_volb] NEQ 0)
+THEN
+    BEGIN
+    BIND
+	volb = filb [filb$a_assoc_volb] : $ref_bblock;
+    namb [namb$b_vol_format] = .volb [volb$b_vol_format];
+    END;
+
+RETURN;
+END;
+
+GLOBAL ROUTINE copy_output_cleanup : NOVALUE =	%SBTTL 'copy_output_cleanup'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Clean up the output file info.  Release the namb and other structures.
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	copy$a_out_filb field in copy work area
+!	copy$a_out_namb field in copy work area
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('copy_output_cleanup> ');
+
+
+BIND
+    copy = exch$a_gbl [excg$a_copy_work] : $ref_bblock,	! Pointer to work area
+    out_filb = copy [copy$a_out_filb]	 : $ref_bblock,	! Filb for the output
+    out_namb = copy [copy$a_out_namb]	 : $ref_bblock,	! Namb for the output
+    ctx = out_filb [filb$a_context]	 : $ref_bblock	! Volume specific context
+    ;
+
+! If a context block is present release it
+!
+IF .ctx NEQ 0
+THEN
+    CASE .out_namb [namb$b_vol_format] FROM volb$k_vfmt_lobound TO volb$k_vfmt_hibound OF
+    SET
+	[volb$k_vfmt_dos11] :		exch$util_dos11ctx_release (.ctx);
+	[volb$k_vfmt_files11] :		exch$util_rmsb_release (.ctx);
+	[volb$k_vfmt_rt11] :		exch$util_rt11ctx_release (.ctx);
+	[OUTRANGE,INRANGE] :		$logic_check (0, (false), 234);
+    TES;
+
+! If the output volume was RT-11, flush the directory of any modified segments
+!
+CASE .out_namb [namb$b_vol_format] FROM volb$k_vfmt_lobound TO volb$k_vfmt_hibound OF
+    SET
+
+    [volb$k_vfmt_rt11] :
+		    BEGIN
+		    BIND
+			volb = out_filb [filb$a_assoc_volb] : $ref_bblock;
+		    exch$rt11_write_cleanup (.volb);	! Do sundries necessary before we stop copying
+		    END;
+
+    [INRANGE, OUTRANGE] :
+		    ;					! Nothing to do for these guys
+    TES;
+
+! Release the output namb
+!
+exch$util_namb_release (.out_namb);
+
+! Release the output filb
+!
+exch$util_filb_release (.out_filb);
+
+RETURN;
+END;
+
+GLOBAL ROUTINE copy_output_close =	%SBTTL 'copy_output_close'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Close the output file
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	copy [copy$a_out_filb] describes the file to be closed
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('copy_output_close> ');
+
+LOCAL
+    status
+    ;
+
+BIND
+    copy = exch$a_gbl [excg$a_copy_work] : $ref_bblock,	! Pointer to work area
+    out_filb = copy [copy$a_out_filb]	 : $ref_bblock	! Filb for the output
+    ;
+
+$trace_print_lit ('entry');
+$block_check (2, .copy, copy, 514);
+$block_check (2, .out_filb, filb, 515);
+
+! Call the file-specific close routine
+!
+RETURN (.out_filb [filb$a_close_routine]) (.out_filb);
+
+END;
+
+GLOBAL ROUTINE copy_output_create =	%SBTTL 'copy_output_create'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Open the output file
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	copy [copy$a_out_filb] describes the file to be opened
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('copy_output_create> ');
+
+LOCAL
+    status
+    ;
+
+BIND
+    copy = exch$a_gbl [excg$a_copy_work] : $ref_bblock,	! Pointer to work area
+    out_filb = copy [copy$a_out_filb]	 : $ref_bblock,	! Filb for the output
+    out_namb = copy [copy$a_out_namb]	 : $ref_bblock	! Namb for the output
+    ;
+
+
+$block_check (2, .copy, copy, 516);
+$block_check (2, .out_filb, filb, 517);
+$block_check (2, .out_namb, namb, 518);
+
+! Perform the volume-specific create operation
+!
+CASE .out_namb [namb$b_vol_format] FROM volb$k_vfmt_lobound TO volb$k_vfmt_hibound OF
+SET
+    [volb$k_vfmt_dos11]		: status = exch$dos11_create_file ();
+    [volb$k_vfmt_files11]	: status = exch$fil11_create_file ();
+    [volb$k_vfmt_rt11]		: status = exch$rt11_create_file ();
+!\  [volb$k_vfmt_rtmt]		: $exch_signal_stop (exch$_notimplement);
+    [OUTRANGE,INRANGE]		: $logic_check (0, (false), 235);
+TES;
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE copy_output_delete : NOVALUE =	%SBTTL 'copy_output_delete'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Delete the output file
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	copy [copy$a_out_filb] describes the file to be deleted
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('copy_output_delete> ');
+
+LOCAL
+    status
+    ;
+
+BIND
+    copy = exch$a_gbl [excg$a_copy_work] : $ref_bblock,	! Pointer to work area
+    out_filb = copy [copy$a_out_filb]	 : $ref_bblock	! Filb for the output
+    ;
+
+
+$block_check (2, .copy, copy, 558);
+$block_check (2, .out_filb, filb, 559);
+
+! Call the file-specific delete routine
+!
+IF .out_filb [filb$a_delete_routine] NEQ 0
+THEN
+    (.out_filb [filb$a_delete_routine]) (.out_filb);
+
+RETURN;
+END;
+
+GLOBAL ROUTINE copy_parse_cleanup : NOVALUE =	%SBTTL 'copy_parse_cleanup'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Clean up after a successful parse.  Release the namb and other structures.
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	copy$a_inp_namb field in copy work area
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('copy_parse_cleanup> ');
+
+
+BIND
+    copy = exch$a_gbl [excg$a_copy_work] : $ref_bblock,	! Pointer to work area
+    inp_filb = copy [copy$a_inp_filb]	 : $ref_bblock,	! Filb for the input
+    inp_namb = copy [copy$a_inp_namb]	 : $ref_bblock,	! Namb for the input
+    ctx = inp_filb [filb$a_context]	 : $ref_bblock	! Volume specific context
+    ;
+
+! If a context block is present release it
+!
+IF .ctx NEQ 0
+THEN
+    CASE .inp_namb [namb$b_vol_format] FROM volb$k_vfmt_lobound TO volb$k_vfmt_hibound OF
+    SET
+	[volb$k_vfmt_dos11] :		exch$util_dos11ctx_release (.ctx);
+	[volb$k_vfmt_files11] :		exch$util_rmsb_release (.ctx);
+	[volb$k_vfmt_rt11] :		exch$util_rt11ctx_release (.ctx);
+	[OUTRANGE,INRANGE] :		$logic_check (0, (false), 236);
+    TES;
+
+! Release the input namb
+!
+exch$util_namb_release (.inp_namb);
+
+! Release the input filb
+!
+exch$util_filb_release (.inp_filb);
+
+RETURN;
+END;
+
+GLOBAL ROUTINE copy_parse_next_input =	%SBTTL 'copy_parse_next_input'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Fetch the next input parameter.  Parse the filename and initialize the input file work region.
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	Command qualifier value as returned from CLI$xxx routines.  COPY command work area.
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	Command work area receives parse info
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('copy_parse_next_input> ');
+
+LOCAL
+    status
+    ;
+
+BIND
+    copy = exch$a_gbl [excg$a_copy_work] : $ref_bblock,	! Pointer to work area
+    inp_filb = copy [copy$a_inp_filb]	 : $ref_bblock,	! Filb for the input
+    inp_namb = copy [copy$a_inp_namb]	 : $ref_bblock	! Namb for the input
+    ;
+
+
+$block_check (2, .copy, copy, 412);
+
+! Fetch the filename and a pointer to a namb
+!
+IF NOT (status = exch$cmd_parse_filespec (%ASCID 'INPUT', copy [copy$q_input_sticky_name], 0,
+				  copy [copy$q_input_filename], inp_namb))
+THEN
+    BEGIN
+    IF .status NEQ 0
+    THEN
+	$exch_signal (exch$_parseerr, 1, copy [copy$q_input_filename], .status);
+    RETURN .status;				! No more files to copy, or error in parse
+    END;
+$debug_print_fao ('input parameter is "!AS"', copy [copy$q_input_filename]);
+
+! If if the input potentially describes multiple files, then set the bit
+!
+IF .inp_namb [namb$v_more_files] OR .inp_namb [namb$v_wildcard]
+THEN
+    copy [copy$v_multiple_files] = true;
+
+! If a foreign device is not mounted, then perform an implied mount
+!
+IF   (.inp_namb [namb$a_assoc_volb] EQL 0)
+  AND
+     (BEGIN
+      BIND
+	dev = inp_namb [namb$l_fabdev] : $bblock;
+      .dev [dev$v_for] OR (NOT (.dev [dev$v_mnt]))
+      END)
+  AND
+     ((.inp_namb [namb$b_devclass] EQL dc$_disk)
+      OR
+      (.inp_namb [namb$b_devclass] EQL dc$_tape))
+THEN
+    BEGIN
+
+    IF NOT (status = exch$moun_implied_mount (.inp_namb))
+    THEN
+	BEGIN
+	exch$util_namb_release (.inp_namb);
+	RETURN .status;
+	END;
+
+    ! We should now have a valid volb, but we still should check
+    !
+    $block_check (2, .inp_namb [namb$a_assoc_volb], volb, 413);
+
+    END;
+
+! Now copy the full name to the default name for proper stickiness
+!
+str$copy_dx (copy [copy$q_input_sticky_name], inp_namb [namb$q_fullname]);
+
+! Allocate a file block to contain the input information
+!
+inp_filb = exch$util_filb_allocate ();
+exch$copy_namb_to_filb (.inp_namb, .inp_filb);	! Copy from the namb to the filb
+
+! Refetch the positional REWIND qualifier.  DOS-11 clears this bit after rewinding the tape, therefore we must
+! set it once for each parameter
+!
+copy [copy$v_q_rewind] = cli$present (%ASCID 'REWIND');
+
+! We allow several "output" qualifiers to be on the input filespec.  We interpret "output" quals on the output
+! spec as applying to all output files, whereas "output" quals on the input spec apply only to files created for
+! this input spec.
+!
+IF NOT .copy [copy$v_type_command]
+THEN
+    BEGIN
+    inp_filb [filb$v_q_best_try_contiguous]	= cli$present (ascid_best_try);
+    inp_filb [filb$v_q_contiguous]		= cli$present (ascid_contiguous);
+    inp_filb [filb$v_q_truncate]		= cli$present (ascid_truncate);
+
+    ! Get integer-valued "output" qualifiers, routine signals on errors.  If the qualifier is not present, 0 is put
+    ! in the second parameter and -1 (success) is returned as the routine value.
+    !
+    IF NOT (status = exch$cmd_cli_get_integer (ascid_allocation, inp_filb [filb$l_q_allocation]))
+    THEN
+	BEGIN
+	copy_parse_cleanup ();
+	RETURN .status;
+	END;
+    IF NOT (status = exch$cmd_cli_get_integer (ascid_extension, inp_filb [filb$l_q_extension]))
+    THEN
+	BEGIN
+	copy_parse_cleanup ();
+	RETURN .status;
+	END;
+    END;
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE exch$copy_type =	%SBTTL 'exch$copy_type'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Action routine for the type verb, parses and performs main control functions for type
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	Command parameters and qualifiers as returned from CLI$ routines.  Global environment ref'd by exch$a_gbl.
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	Files may be created.
+!--
+
+$dbgtrc_prefix ('copy_type> ');
+
+LOCAL
+    copy : $ref_bblock,				! Pointer to work area
+    inp_filb : $ref_bblock,
+    status
+    ;
+
+
+! Allocate and/or initialize the work area
+!
+copy_init ();
+
+! Get pointers that we need.  Have to wait until work area allocated by init call
+!
+copy = .exch$a_gbl [excg$a_copy_work];		! Pointer to work area
+copy [copy$v_type_command] = true;
+
+! Init the name used for the input file default
+!
+str$copy_dx (copy [copy$q_input_sticky_name], %ASCID '.LIS');
+
+! Loop through the list of input file specifications.  Errors will be signalled.
+!
+status = rms$_fnf;
+WHILE copy_parse_next_input ()			! Get next input file parameter
+DO
+    BEGIN
+
+    inp_filb = .copy [copy$a_inp_filb];		! The input filb
+
+    WHILE copy_input_open ()			! Open the input file, loop for wildcards
+    DO
+	BEGIN
+	REGISTER
+	    rec_count;
+
+	! Print the file name if file list or wildcards
+	!
+    	IF .copy [copy$v_multiple_files]
+    	THEN
+    	    BEGIN
+	    REGISTER
+		fao_desc = 0 : $ref_bblock;
+	    copy_type_print (0, 0);
+	    fao_desc = exch$util_fao_buffer (%ASCID 'File "!AF"',
+				    .inp_filb [filb$l_result_name_len], inp_filb [filb$t_result_name]);
+	    copy_type_print (.fao_desc [dsc$w_length], .fao_desc [dsc$a_pointer]);
+	    copy_type_print (0, 0);
+	    END;
+
+	! While we can get records print them on sys$output
+	!
+	rec_count = 0;
+	WHILE (.inp_filb [filb$a_get_routine]) (.inp_filb)
+	DO
+	    BEGIN
+	    rec_count = .rec_count + 1;
+	    copy_type_print (.inp_filb [filb$l_record_len], .inp_filb [filb$a_record]);
+	    IF .exch$a_gbl [excg$v_control_c] THEN EXITLOOP;	! If we have seen control/c, exit the loop
+	    END;
+
+	IF .exch$a_gbl [excg$v_control_c]	! If control/c, tell them about it
+	THEN
+	    $exch_signal ($info_stat_copy (exch$_canceled))
+	ELSE IF .copy [copy$v_q_log]		! If /LOG, then display file name and count
+	THEN
+	    $exch_signal (exch$_typed, 3, .inp_filb [filb$l_result_name_len], inp_filb [filb$t_result_name], .rec_count);
+
+	copy_input_close ();
+	status = ss$_normal;
+	IF .exch$a_gbl [excg$v_control_c] THEN EXITLOOP;
+	END;
+
+    copy_parse_cleanup ();			! Release namb, clean up after parse
+    IF .exch$a_gbl [excg$v_control_c] THEN EXITLOOP;
+    END;
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE copy_type_print (len, rec : $ref_bvector) : NOVALUE =	%SBTTL 'copy_type_print (len, rec)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Reformats (non-format control chars replaced by ^char) and prints the record
+!
+! INPUTS:
+!
+!	len - length of the record to be reformatted
+!	rec - address of the record
+!
+! IMPLICIT INPUTS:
+!
+!	output rab in global storage
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	output on SYS$OUTPUT
+!--
+
+$dbgtrc_prefix ('copy_type_print> ');
+
+BIND
+    copy = exch$a_gbl [excg$a_copy_work] : $ref_bblock,	! Pointer to work area
+    fab = exch$a_gbl [excg$a_sysout_fab] : $ref_bblock,	! Pointer to output fab
+    rab = exch$a_gbl [excg$a_sysout_rab] : $ref_bblock	! Pointer to output rab
+    ;
+
+! Define a table of substitute strings for control characters.  We define a byte vector of offsets to
+! ASCIC substitute strings.  A zero in the table means no substitution, an non-zero is the offset from
+! the base of the substitute strings.
+!
+BIND
+    table_base = UPLIT BYTE (0);
+OWN
+    table : VECTOR [256, BYTE] PRESET (
+	    [%x'00'] =	(UPLIT BYTE (%ascic 'NUL') - table_base),
+	    [%x'01'] =	(UPLIT BYTE (%ascic 'SOH') - table_base),
+	    [%x'02'] =	(UPLIT BYTE (%ascic 'STX') - table_base),
+	    [%x'03'] =	(UPLIT BYTE (%ascic 'ETX') - table_base),
+	    [%x'04'] =	(UPLIT BYTE (%ascic 'EOT') - table_base),
+	    [%x'05'] =	(UPLIT BYTE (%ascic 'ENQ') - table_base),
+	    [%x'06'] =	(UPLIT BYTE (%ascic 'ACK') - table_base),
+	    [%x'07'] =	(UPLIT BYTE (%ascic 'BEL') - table_base),
+	    [%x'08'] =	(UPLIT BYTE (%ascic 'BS') - table_base),
+	    [%x'0E'] =	(UPLIT BYTE (%ascic 'SO') - table_base),
+	    [%x'0F'] =	(UPLIT BYTE (%ascic 'SI') - table_base),
+	    [%x'10'] =	(UPLIT BYTE (%ascic 'DLE') - table_base),
+	    [%x'11'] =	(UPLIT BYTE (%ascic 'DC1') - table_base),
+	    [%x'12'] =	(UPLIT BYTE (%ascic 'DC2') - table_base),
+	    [%x'13'] =	(UPLIT BYTE (%ascic 'DC3') - table_base),
+	    [%x'14'] =	(UPLIT BYTE (%ascic 'DC4') - table_base),
+	    [%x'15'] =	(UPLIT BYTE (%ascic 'NAK') - table_base),
+	    [%x'16'] =	(UPLIT BYTE (%ascic 'SYN') - table_base),
+	    [%x'17'] =	(UPLIT BYTE (%ascic 'ETB') - table_base),
+	    [%x'18'] =	(UPLIT BYTE (%ascic 'CAN') - table_base),
+	    [%x'19'] =	(UPLIT BYTE (%ascic 'EM') - table_base),
+	    [%x'1A'] =	(UPLIT BYTE (%ascic 'SUB') - table_base),
+	!   [%x'1B'] =	(UPLIT BYTE (%ascic 'ESC') - table_base),
+	    [%x'1C'] =	(UPLIT BYTE (%ascic 'FS') - table_base),
+	    [%x'1D'] =	(UPLIT BYTE (%ascic 'GS') - table_base),
+	    [%x'1E'] =	(UPLIT BYTE (%ascic 'RS') - table_base),
+	    [%x'1F'] =	(UPLIT BYTE (%ascic 'US') - table_base),
+	    [%x'7F'] =	(UPLIT BYTE (%ascic 'DEL') - table_base),
+	    [%x'80'] =	(UPLIT BYTE (%ascic 'X80') - table_base),
+	    [%x'81'] =	(UPLIT BYTE (%ascic 'X81') - table_base),
+	    [%x'82'] =	(UPLIT BYTE (%ascic 'X82') - table_base),
+	    [%x'83'] =	(UPLIT BYTE (%ascic 'X83') - table_base),
+	    [%x'84'] =	(UPLIT BYTE (%ascic 'IND') - table_base),
+	    [%x'85'] =	(UPLIT BYTE (%ascic 'NEL') - table_base),
+	    [%x'86'] =	(UPLIT BYTE (%ascic 'SSA') - table_base),
+	    [%x'87'] =	(UPLIT BYTE (%ascic 'ESA') - table_base),
+	    [%x'88'] =	(UPLIT BYTE (%ascic 'HTS') - table_base),
+	    [%x'89'] =	(UPLIT BYTE (%ascic 'HTJ') - table_base),
+	    [%x'8A'] =	(UPLIT BYTE (%ascic 'VTS') - table_base),
+	    [%x'8B'] =	(UPLIT BYTE (%ascic 'PLD') - table_base),
+	    [%x'8C'] =	(UPLIT BYTE (%ascic 'PLU') - table_base),
+	    [%x'8D'] =	(UPLIT BYTE (%ascic 'RI') - table_base),
+	    [%x'8E'] =	(UPLIT BYTE (%ascic 'SS2') - table_base),
+	    [%x'8F'] =	(UPLIT BYTE (%ascic 'SS3') - table_base),
+	    [%x'90'] =	(UPLIT BYTE (%ascic 'DCS') - table_base),
+	    [%x'91'] =	(UPLIT BYTE (%ascic 'PU1') - table_base),
+	    [%x'92'] =	(UPLIT BYTE (%ascic 'PU2') - table_base),
+	    [%x'93'] =	(UPLIT BYTE (%ascic 'STS') - table_base),
+	    [%x'94'] =	(UPLIT BYTE (%ascic 'CCH') - table_base),
+	    [%x'95'] =	(UPLIT BYTE (%ascic 'MW') - table_base),
+	    [%x'96'] =	(UPLIT BYTE (%ascic 'SPA') - table_base),
+	    [%x'97'] =	(UPLIT BYTE (%ascic 'EPA') - table_base),
+	    [%x'98'] =	(UPLIT BYTE (%ascic 'X98') - table_base),
+	    [%x'99'] =	(UPLIT BYTE (%ascic 'X99') - table_base),
+	    [%x'9A'] =	(UPLIT BYTE (%ascic 'X9A') - table_base),
+	    [%x'9B'] =	(UPLIT BYTE (%ascic 'CSI') - table_base),
+	    [%x'9C'] =	(UPLIT BYTE (%ascic 'ST') - table_base),
+	    [%x'9D'] =	(UPLIT BYTE (%ascic 'OSC') - table_base),
+	    [%x'9E'] =	(UPLIT BYTE (%ascic 'PM') - table_base),
+	    [%x'9F'] =	(UPLIT BYTE (%ascic 'APC') - table_base),
+	    [%x'A0'] =	(UPLIT BYTE (%ascic 'XA0') - table_base),
+	    [%x'FF'] =	(UPLIT BYTE (%ascic 'XFF') - table_base));
+BIND
+    table_top = UPLIT BYTE (0);			! Hang a label on the end
+
+! Make sure that all of the strings total fewer than 256 bytes, so that byte offsets will work.  Note
+! that BLISS stores the above table like <table-base><ascic-strings><table><table-top> so that we must
+! include the length of the table itself.  Also test the assumption about storage format.  (We have
+! defined both OWN and PLIT to the same psect.)
+!
+$logic_check (0, ((table_top-table_base) LEQ 511), 309);
+$logic_check (0, ((table_base LSSA table) AND (table LSSA table_top)), 318);
+
+LOCAL
+    buf : $bvector [filb$s_record_buffer*5],	! Worst case is buffer of deletes, "<DEL><DEL>..."
+    buflen,
+    bufptr,
+    status
+    ;
+
+REGISTER
+    ip,						! Input pointer
+    op;						! Output pointer
+
+ROUTINE put (len, buf) : NOVALUE =
+BEGIN
+
+!+
+! Local routine to put a record.  If the put fails because the record is too long, we will shorten the
+! request and try again.
+!-
+
+LOCAL
+    status;
+
+BIND
+    copy = exch$a_gbl [excg$a_copy_work] : $ref_bblock,	! Pointer to work area
+    fab = exch$a_gbl [excg$a_sysout_fab] : $ref_bblock,	! Pointer to output fab
+    rab = exch$a_gbl [excg$a_sysout_rab] : $ref_bblock	! Pointer to output rab
+    ;
+
+rab [rab$w_rsz] = .len;
+rab [rab$l_rbf] = .buf;
+
+IF NOT (status = $put (rab = .rab))
+THEN
+    BEGIN
+
+    ! If the error is due to a record which was too long, shorten the request and try again
+    !
+    IF (
+	    (.copy [copy$l_max_rec] GTRU 80)	! we aren't pretty short already
+	AND
+	    (
+		(.status EQL RMS$_RSZ)		! error is rec too big (get from tape)
+	     OR
+		(
+		    (.status EQL RMS$_SYS)	! terminal maxbuf error
+		 AND
+		    (.rab [rab$l_stv] EQL SS$_EXQUOTA)
+		)
+	    )
+        )
+    THEN
+	BEGIN
+	copy [copy$l_max_rec] = (.len * 90) / 100;	! try with rec 90% as long
+	put (.copy [copy$l_max_rec], .buf);
+	RETURN;
+	END
+    ELSE
+	exch$util_file_error (exch$_writeerr, .status, .fab, .rab [rab$l_stv]);
+    END;
+
+RETURN;
+END;
+
+ip = .rec;					! Input buffer pointer
+op = buf;
+
+DECR count FROM .len-1 TO 0 			! Convert the controls
+DO
+    BEGIN
+    REGISTER
+	char,					! Local character variable
+	string : $ref_bvector;			! Pointer to string for expansion
+
+    char = CH$RCHAR_A (ip);			! Get next character
+    IF (string = .table [.char]) NEQ 0		! See if the substitution offset is zero
+    THEN
+	BEGIN
+	REGISTER
+	    len;
+	string = .string + table_base;		! Turn the offset into an address
+	CH$WCHAR_A ('<', op);			! Start with the open bracket
+	len = .string [0];			! Move the length to a register
+	CH$MOVE (.len, string [1], .op);	! Copy the ASCIC string
+	op = .op+.len;				! Move the output pointer
+	CH$WCHAR_A ('>', op);			! And finish with the close bracket
+	END
+    ELSE					! Offset is zero, just move the char
+	CH$WCHAR_A (.char, op);	
+    END;
+
+! Start with the address and length of the record
+!
+buflen = .op - buf;
+bufptr = buf;
+
+! Print the record.  We must allow for a segmented put if the size of the record is too big for the output file.
+!
+DO
+    BEGIN
+    put (MINU (.buflen, .copy [copy$l_max_rec]), .bufptr);
+    buflen = .buflen - .copy [copy$l_max_rec];
+    bufptr = .bufptr + .copy [copy$l_max_rec];
+    END
+UNTIL .buflen LEQ 0;
+
+RETURN;
+END;
+
+END
+ELUDOM

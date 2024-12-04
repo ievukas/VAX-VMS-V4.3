@@ -1,0 +1,1298 @@
+	.TITLE	REBLDLOCK - Rebuild Lock Database on Failover
+	.IDENT	'V04-000'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+;
+; FACILITY:	Executive, system services and fork level code
+;
+; ABSTRACT:
+;	This module contains routines used to rebuild the lock database
+;	when a system is removed from the cluster.
+;
+; ENVIRONMENT:	Kernel mode, fork level, loadable code
+;
+;--
+;
+; AUTHOR: Steve Beckhardt,	 CREATION DATE:	25-May-1983
+;
+; MODIFIED BY:
+;
+;	V03-015	SRB0135		Steve Beckhardt		6-Jul-1984
+;		Zero deadlock bitmap expiration timestamps on every
+;		state change.
+;
+;	V03-014	SRB0134		Steve Beckhardt		22-Jun-1984
+;		Fixed bugs in lock rebuilding.  1)  Put all locks
+;		in response states (RSP...) into RETRY state and
+;		2) store newly computed group grant mode in all resources,
+;		regardless of where the resource is mastered.
+;
+;	V03-013	SRB0132		Steve Beckhardt		25-May-1984
+;		Added support for LCK$M_NODLCKWT flag.
+;
+;	V03-012	SRB0121		Steve Beckhardt		29-Apr-1984
+;		Added more integrity checks.
+;
+;	V03-011	SRB0117		Steve Beckhardt		10-Mar-1984
+;		Added code to remove RSBs from time out queue
+;		during failover.
+;
+;	V03-010	SRB0115		Steve Beckhardt		24-Feb-1984
+;		Added support for distributed deadlock detection.
+;
+;	V03-008	SRB0110		Steve Beckhardt		27-Jan-1984
+;		Added MEMSEQ checking for REBUILD messages.  Added
+;		PMS counters.  Fixed RSPDOLOCL bug in DISPATCH.
+;		Added routines to set rebuild state.  Fixed CSID_VALID bug.
+;
+;	V03-007	SRB0108		Steve Beckhardt		11-Jan-1984
+;		Redesigned rebuilding lock database to remaster all trees
+;		and to support distributed root directory.  Added support
+;		for request sequence numbering on failover and for
+;		maintaining the EPID in locks.
+;
+;	V03-006	SRB0106		Steve Beckhardt		6-Dec-1983
+;		Changed LKB$L_REFCNT, RSB$L_REFCNT, and RSB$L_BLKASTCNT
+;		to be word fields.
+;
+;	V03-005	SRB0104		Steve Beckhardt		17-Oct-1983
+;		Fixed bug where second quadword of value block was lost
+;		when rebuilding locks.
+;
+;	V03-004	SRB0100		Steve Beckhardt		29-Jul-1983
+;		Changed interface to failover routines
+;
+;	V03-003	SRB0094		Steve Beckhardt		23-Jun-1983
+;		Continued adding support for n-node failover.
+;
+;	V03-002	SRB0093		Steve Beckhardt		3-Jun-1983
+;		Removed spurious test and resultant BUG_CHECK.
+;
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+
+;
+; MACROS:
+;
+
+	$ACBDEF				; ACB offsets
+	$CADEF				; Conditional assembly switches
+	$CDRPDEF			; CDRP offsets
+	$CLSMSGDEF			; Cluster message offsets
+	$CLUBDEF			; CLUB offsets
+	$CSBDEF				; CSB offsets
+	$DYNDEF				; Data structure names
+	$FKBDEF				; Fork block offsets
+	$IPLDEF				; IPL definitions
+	$LCKDEF				; LCK definitions
+	$LKBDEF				; LKB offsets
+	$PCBDEF				; PCB offsets
+	$PRIDEF				; Priority definitions
+	$PSLDEF				; PSL definitions
+	$RSBDEF				; RSB offsets
+	$RSNDEF				; Resource numbers
+
+;
+; EQUATED SYMBOLS:
+;
+
+
+;
+; OWN STORAGE:
+;
+
+	.PSECT	$$$040,LONG
+
+	.ALIGN	LONG
+
+CURR_LOCKID:			; Current lockid
+	.LONG	0
+RETURN_ADDR:			; Return address from failover routines
+	.LONG	0
+LCK$GL_TS_CSID::		; CSID of system issuing timestamps
+	.LONG	0		; (0= this system)
+
+	.PSECT	$$$020
+
+;***********************************************************************
+;
+; NOTE:	The following assumption is in effect for this entire module.
+;
+;************************************************************************
+
+	ASSUME	IPL$_SYNCH  EQ  IPL$_SCS
+
+	.SBTTL	LCK$INIT_REBUILD - Initialize lock database for rebuild
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine initializes the lock database for the rebuild
+;	operation.  It does the following:
+;
+;		o  Removes all LKBs and RSBs from time out queue and
+;		   deallocates RSBs
+;		o  Clears all LKB$M_RESEND bits
+;		o  Removes all master copy locks
+;		o  Changes all locally issued locks in transient SCS states
+;		   to RETRY state
+;		o  Clears all RSB$M_DIRENTRY flags 
+;		o  Sets all RSB$L_CSID fields to an illegal CSID
+;		o  Removes all directory entries
+;		o  Selects a node to issue timestamps (for deadlock detection)
+;		   and resets expiration timestamps
+;
+;	The result is a lock database with strictly local information;
+;	no master copies and no directory entries.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	LCK$INIT_REBUILD (called from failover table dispatcher)
+;	IPL must be at IPL$_SYNCH
+;
+; INPUT ARGUMENTS:
+;
+;	None
+;
+; OUTPUT ARGUMENTS:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+;	R0 - R5 not preserved
+;--
+
+LCK$INIT_REBUILD::
+	PUSHR	#^M<R5,R6,R7,R8,R9,R10,R11>
+
+; Remove all locks (and RSBs) from the timeout queue.  RSBs represent
+; calls to LCK$SND_RMVDIR that failed due to insufficient pool.
+; These should be deallocated.
+
+	MOVAL	G^LCK$GL_TIMOUTQ,R5	; Get address of queue header
+5$:	REMQUE	@(R5),R6		; Remove LKB (or RSB)
+	BVS	8$			; Queue is empty
+	BICW	#LKB$M_TIMOUTQ,-	; Clear status bit
+		LKB$W_STATUS(R6)
+	CMPB	LKB$B_TYPE(R6),-	; Is it a RSB?
+		#DYN$C_RSB
+	BNEQ	5$			; No
+	MOVL	R6,R0			; Yes deallocate it
+	JSB	G^EXE$DEANONPAGED
+	BRB	5$
+
+; Loop through the lock id. table to remove all master copy locks.
+; If a lock we wish to delete has a non-zero reference count then
+; it is deferred until later.  Conversly, whenever we delete a lock
+; we also try to delete its parent lock.
+
+8$:	CLRL	R11			; Initialize lock id.
+	MOVL	G^LCK$GL_IDTBL,R10	; Get address of lock id. table
+
+10$:	; Get next lock
+
+	INCL	R11			; Advance to next lock id.
+	CMPL	R11,G^LCK$GL_MAXID	; Reached the end?
+	BGTRU	40$			; Yes
+	MOVL	(R10)[R11],R6		; Get pointer to LKB
+	BGEQ	10$			; Unused entry
+
+	; Delete lock if it is a master copy  and has a zero
+	; reference count.  Also delete parents, if possible.
+	; If the lock belongs to this system, then change all transient
+	; SCS states to RETRY state.
+
+	BICW	#LKB$M_RESEND,-		; Clear RESEND bit
+		LKB$W_STATUS(R6)
+	BBS	#LKB$V_MSTCPY,-		; Branch if master copy
+		LKB$W_STATUS(R6),20$
+	DISPATCH	LKB$B_STATE(R6),TYPE=B,PREFIX=LKB$K_,-
+		<-
+		<RSPNOTQED,15$>,-	; Change temporary SCS wait states	
+		<RSPQUEUED,15$>,-	; into RETRY state
+		<RSPGRANTD,15$>,-	
+		<RSPDOLOCL,15$>,-
+		>
+	BRB	10$			; All other states are okay as is
+15$:	MOVB	#LKB$K_RETRY,-
+		LKB$B_STATE(R6)
+	BRB	10$
+
+20$:	TSTW	LKB$W_REFCNT(R6)	; Are there any sublocks?
+	BNEQ	10$			; Yes, defer to later
+	REMQUE	LKB$L_SQFL(R6),R0	; Remove LKB from RSB state queue
+	MOVL	LKB$L_PARENT(R6),R5	; Save address of parent
+	BSBW	LCK$DEALLOC_LKB		; Deallocate LKB
+	MOVL	R5,R6			; Now try parent
+	BNEQ	20$			; There is one
+	BRB	10$			; Advance to next lock id.
+
+; Loop through all RSBs in the resource hash table.  For each RSB,
+; clear its DIRENTRY bit, set its CSID to an invalid CSID, delete it
+; if all the queues are empty and its reference count is zero.
+; Also delete parents, if possible.
+
+40$:	ASHL	G^LCK$GL_HTBLCNT,#1,R10	; Get size of hash table
+	MOVL	G^LCK$GL_HASHTBL,R11	; Get address of hash table
+
+50$:	; Start on next hash chain
+
+	MOVAL	(R11)+,R9		; Get address of next list head
+
+60$:	; Get next RSB in this hash chain.  R9 serves as the linkage
+	; pointer while R8 points to RSB to be processed.  These start 
+	; out the same but if the RSB pointed to by R8 gets deleted, then
+	; R9 is backed up to point to the previous RSB.
+
+	MOVL	(R9),R9			; Get address of next RSB
+	BEQL	90$			; Reached end of chain
+	MOVL	R9,R8			; Move RSB address to R8
+70$:	BICW	#RSB$M_DIRENTRY,-	; Clear directory entry bit
+		RSB$W_STATUS(R8)
+	MNEGL	#1,RSB$L_CSID(R8)	; Store invalid CSID
+	MOVAL	RSB$L_GRQFL(R8),R0	; Get address of granted queue
+	CMPL	(R0),R0			; Is granted queue empty?
+	BNEQ	60$			; No
+	ADDL	#8,R0			; Yes, get address of conversion queue
+	CMPL	(R0),R0			; Is conversion queue empty?
+	BNEQ	60$			; No
+	ADDL	#8,R0			; Yes, get address of wait queue
+	CMPL	(R0),R0			; Is wait queue empty?
+	BNEQ	60$			; No
+
+	; All queues are empty.  Now check to see if it's reference count
+	; is zero.  If it's reference count is non-zero then we will
+	; handle it later when we climb up the tree of one of it's
+	; descendants.
+
+	TSTW	RSB$W_REFCNT(R8)	; Are there any sub-resources?
+	BNEQ	60$			; Yes, move onto next RSB in chain
+	CMPL	R8,R9			; Are we deallocating our linkage?
+	BNEQ	80$			; No
+	MOVL	RSB$L_HSHCHNBK(R9),R9	; Yes, back up linkage pointer
+80$:	MOVL	RSB$L_PARENT(R8),R7	; Save parent RSB address
+	JSB	G^LCK$DEALLOC_RSB	; Deallocate RSB
+	MOVL	R7,R8			; Get parent RSB address
+	BNEQ	70$			; There is a parent, work on it
+	BRB	60$			; Repeat
+
+90$:	; Finished one complete hash chain.  
+
+	DECL	R10			; Decr. count of hash chains
+	BGTR	50$			; Repeat
+
+	; Select a node to issue timestamps for deadlock detection.
+	; Every node must select the same system.  An easy way to select
+	; the same system everywhere is to use the first entry in the
+	; directory vector.  These also have the (required) property
+	; that the local CSID is referenced with a zero.
+	; Also zero the bitmap expiration timestamps to prevent possible
+	; false deadlocks due to the new timestamp issuing system
+	; having a system time slightly behind timestamps already issued.
+
+	MOVL	G^LCK$GL_DIRVEC,R0	; Get address of directory vector
+	MOVL	(R0),W^LCK$GL_TS_CSID	; Copy CSID
+	MOVAQ	G^LCK$GQ_BITMAP_EXP,R0	; Get address of timestamps
+	CLRQ	(R0)+			; Reset exact expiration time
+	CLRQ	(R0)			; Reset local (approx.) expir. time
+
+	POPR	#^M<R5,R6,R7,R8,R9,R10,R11>
+	RSB
+
+	.SBTTL	LCK$REBUILD_LKBS - Rebuild LKBs 
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine makes a pass through the lock id. table to 
+;	process each lock (and its parents).  Root locks are
+;	sent to the appropriate directory system.  Sublocks (if mastered
+;	remotely) are sent to the system mastering the tree.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	LCK$REBUILD_LKBS (called from failover table dispatcher)
+;	IPL must be at IPL$_SYNCH
+;
+; INPUT ARGUMENTS:
+;
+;	R5	Address of failover control block
+;
+; OUTPUT ARGUMENTS:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+;	R0 - R5 not preserved
+;--
+
+LOCKS_DONE:
+	; Finished processing entire lock id. table.  Continue with next
+	; phase of failover.
+
+	POPR	#^M<R6,R7,R8>		; Restore registers
+	JMP	@W^RETURN_ADDR		; Return to caller via saved ret. addr.
+
+LCK$REBUILD_LKBS::
+	POPL	W^RETURN_ADDR		; Save return address
+
+; Process all locks in the lock id. table.  For each lock, do the
+; following:
+;	If RSB$L_CSID is 0, then it is being mastered here and
+;	there is nothing to do for this lock.
+;	If RSB$L_CSID is -1 then we have to find out where it
+;	is being mastered.  We find this out by climbing its tree
+;	until we find a RSB$L_CSID not equal to -1.  If we reach the
+;	top of the tree, then we send it to the appropriate directory
+;	system.
+;	If RSB$L_CSID is a non-zero CSID then we send the lock to that
+;	system is LKB$M_RESEND is set.
+;
+	CLRL	W^CURR_LOCKID		; Initialize current lockid
+
+NEXT_LOCKID_SAVE:
+	PUSHR	#^M<R6,R7,R8>		; Save registers
+NEXT_LOCKID:
+	INCL	W^CURR_LOCKID		; Advance to next lock id.
+	CMPL	W^CURR_LOCKID,-		; Reached the end of the id. table?
+		G^LCK$GL_MAXID
+	BGTRU	LOCKS_DONE		; Yes
+SAME_LOCKID:
+	MOVL	W^CURR_LOCKID,R1	; Get lock id.
+	MOVL	G^LCK$GL_IDTBL,R0	; Get address of lock id. table
+	MOVL	(R0)[R1],R6		; Get pointer to LKB
+	BGEQ	NEXT_LOCKID		; Unused entry
+
+	MOVL	LKB$L_RSB(R6),R8	; Get address of RSB
+	MOVL	RSB$L_CSID(R8),R3	; Get system managing this resource
+	BEQL	NEXT_LOCKID		; It's us
+
+	; R3 contains CSID of system managing this resource tree or -1.
+	; If it is a CSID and the lock does not have to be resent, then
+	; just continue onto the next lock id.
+	; Otherwise, climb up the tree to the first lock that is not
+	; marked to be resent and whose RSB has a valid CSID (or zero).
+	; Then resend locks below that lock to that system.  If we
+	; reach the root of the tree, then send the root lock to the
+	; appropriate directory system.  If we are the directory 
+	; system for this resource, then we manage the
+	; tree.  Likewise, if we reach a lock whose RSB has a 
+	; zero CSID then we are managing this tree.  In this case,
+	; reclimb the tree clearing the RSB$L_CSID fields along the way.
+
+	TSTW	R3			; Is CSID valid?
+	BLSS	20$			; No, lock must be remastered
+	BBC	#LKB$V_RESEND,-		; Branch if this lock 
+		LKB$W_STATUS(R6),NEXT_LOCKID  ; need not be resent
+
+20$:	; The current lock must be resent.  Climb tree to first lock
+	; that doesn't have to be resent (RESEND bit = 0 and CSID is valid).
+
+	MOVL	R6,R7			; Save starting LKB in R7
+	MOVL	R6,R5			; Put starting LKB in R5
+
+30$:	MOVL	R5,R6			; R6 points to last LKB
+	MOVL	LKB$L_PARENT(R5),R5	; R5 points to parent LKB
+	BEQL	40$			; Reached the top; R6 is root LKB
+	MOVL	LKB$L_RSB(R5),R8	; Get RSB
+	MOVL	RSB$L_CSID(R8),R3	; Get CSID
+	BEQL	50$			; This system is managing resource tree
+	BBS	#LKB$V_RESEND,-		; Branch if this LKB must be resent
+		LKB$W_STATUS(R5),30$	
+	TSTW	R3			; Is CSID valid?
+	BLSS	30$			; No
+
+	; R8 points to a RSB with a valid CSID and the corresponding lock
+	; (in R5) does not need to be resent.  Resend the lock pointed to
+	; by R6 to the same system.
+
+	BRB	REBUILD
+
+40$:	; R6 points to root LKB.  If its RSB$L_CSID (R3) is valid then resend
+	; to that system.  Otherwise resend to the appropriate directory 
+	; system (unless we are the directory system for that resource).
+
+	TSTW	R3			; Is CSID valid?
+	BGEQ	REBUILD			; Yes
+	MOVL	G^LCK$GL_DIRVEC,R3	; No, get address of directory vector
+	MOVZWL	RSB$W_HASHVAL(R8),R1	; Get hash value
+	CLRL	R2			; Clear high order hash value
+	EDIV	-12(R3),R1,R0,R1	; Compute hash index (in R1)
+	MOVL	(R3)[R1],R3		; Get directory system
+	BNEQ	REBUILD			; It's not us
+	BISW	#RSB$M_DIRENTRY,-	; Set directory entry bit
+		RSB$W_STATUS(R8)
+
+50$:	; This system is now managing this resource tree.  Starting at
+	; the current LKB (R7) climb tree to LKB whose RSB contains a
+	; zero CSID (R5) clearing RSB$L_CSID along the way.  
+
+	MOVL	LKB$L_RSB(R7),R8	; Get address of RSB
+	TSTW	RSB$L_CSID(R8)		; Make sure current CSID is invalid
+	BGEQ	60$			; Error - it's valid
+	CLRL	RSB$L_CSID(R8)		; Clear CSID
+	MOVL	LKB$L_PARENT(R7),R7	; Get next parent
+	CMPL	R7,R5			; Reached the top?
+	BNEQ	50$			; No
+
+	; If R5 is 0 then the current lock is a root lock that we are
+	; now mastering (on the directory system).  Fork in this case
+	; to allow other systems a chance to get directory entries.
+
+	TSTL	R5			; Is this a root lock?
+	BNEQ	55$			; No, advance to next lock id.
+	POPR	#^M<R6,R7,R8>
+	ADDL3	#CLUB$B_CLUFCB,-	; Get address of failover control block
+		G^CLU$GL_CLUB,R5
+	MOVB	#IPL$_SYNCH,-		; Store fork IPL
+		FKB$B_FIPL(R5)
+	FORK
+	BSBW	CNX$CHECK_FAILOVER	; Check for another failover
+	BRW	NEXT_LOCKID_SAVE	; Yes
+
+55$:	BRW	NEXT_LOCKID
+60$:	BUG_CHECK	LOCKMGRERR,FATAL
+
+REBUILD:
+	; Have a LKB (in R6) that needs to be rebuilt on destination system
+	; (CSID in R3).  However, locks in certain states aren't resent.  
+	; Dispatch on lock state.
+
+	MOVL	LKB$L_RSB(R6),R8	; Get RSB address
+	DISPATCH	LKB$B_STATE(R6),TYPE=B,PREFIX=LKB$K_,-
+		<-
+		<GRANTED,20$>,-
+		<CONVERT,20$>,-		
+		<WAITING,20$>,-		
+		<RETRY,10$>,-		
+		<SCSWAIT,10$>,-
+		>
+	BUG_CHECK	LOCKMGRERR,FATAL; Other states are not allowed
+
+10$:	; Handle locks in RETRY and SCSWAIT states as special cases.
+	; If they are a conversion then they must be rebuilt.  If they 
+	; are a new lock then they are not sent as they will be 
+	; retried or deallocated.
+
+	BBS	#LCK$V_CONVERT,-	; Branch if conversion
+		LKB$W_FLAGS(R6),20$
+	BRW	STORE_CSID		; New lock - just store CSID
+
+20$:	; Rebuild LKB (in R6) on system whose CSID is in R3
+
+	BSBW	CNX$ALLOC_WARMCDRP	; Allocate a CDRP
+	BSBW	CNX$RESOURCE_CHECK	; Only retry a limited number of times
+	BLBC	R0,30$			; Couldn't allocate one or CSID invalid
+	MOVZWL	LKB$L_PID(R6),R1	; Get PID index
+	BEQL	25$			; Branch if system owned
+	MOVL	G^SCH$GL_PCBVEC,R0	; Get address of PCB vector
+	MOVL	(R0)[R1],R1		; Get address of PCB
+25$:	MOVL	R1,CDRP$L_VAL8(R5)	; Store PCB address in CDRP
+	MOVL	R6,CDRP$L_VAL1(R5)	; Store LKB address
+	MOVL	R8,CDRP$L_VAL2(R5)	; Store RSB address
+	MOVL	CSB$L_CLUB(R3),R0	; Get CLUB address
+	MOVW	CLUB$W_MEMSEQ(R0),-	; Store MEMSEQ in CDRP
+		CDRP$L_VAL3(R5)
+	MOVAB	W^LCK$BLD_REBLDLOCK,-	; Store address of message build routine
+		CDRP$L_MSGBLD(R5)
+	POPR	#^M<R6,R7,R8>		; Restore registers
+	BSBW	CNX$SEND_MSG_CSB	; Send the message
+	BLBC	R0,50$			; Exit this routine (restart failover)
+	PUSHR	#^M<R6,R7,R8>		; Save registers
+	MOVL	CDRP$L_VAL1(R5),R6	; Get address of LKB
+	MOVL	LKB$L_RSB(R6),R8	; Get address of RSB
+
+	; Have response message.  Registers contain:
+	;	R2	Address of response message
+	;	R3	Address of CSB
+	;	R5	Address of CDRP
+	;	R6	Address of LKB
+	;	R8	Address of RSB
+
+	MOVL	CSB$L_CLUB(R3),R0	; Get address of CLUB
+	CMPW	CLUB$W_MEMSEQ(R0),-	; Check MEMSEQ in message
+		LKMSG$W_MEMSEQ(R2)
+	BNEQ	REBLD_RETRY		; No match!
+	DISPATCH	LKMSG$B_STATE(R2),TYPE=B,PREFIX=LKB$K_,-
+		<-
+		<RSPNOTQED,REBLD_NOTQED>,-
+		<RSPDOLOCL,REBLD_DOLOCL>,-
+		<RSPRESEND,REBLD_RESEND>,-
+		<RSPGRANTD,REBLD_GRANTD>,-
+		<RETRY,REBLD_RETRY>,-
+		>
+	BUG_CHECK	LOCKMGRERR,FATAL; Other states are not allowed
+	
+30$:	; Failed to allocate a CDRP.  Wait and retry if SS$_INSFMEM.
+	; Bugcheck otherwise.
+
+	CMPW	R0,#SS$_INSFMEM
+	BNEQ	40$
+	POPR	#^M<R6,R7,R8>
+	ADDL3	#CLUB$B_CLUFCB,-	; Get address of failover control block
+		G^CLU$GL_CLUB,R5
+	MOVB	#IPL$_SYNCH,-		; Store fork IPL
+		FKB$B_FIPL(R5)
+	FORK_WAIT			; Fork and wait
+	BRB	CHECK_FAILOVER2		; Check failover and redo same lock
+40$:	BUG_CHECK	LOCKMGRERR,FATAL
+
+50$:	; Exit this routine as we will start another failover.  Have to
+	; deallocate CDRP in R5.
+
+	MOVL	R5,R0			; Address of CDRP
+	JSB	G^EXE$DEANONPAGED	; Deallocate it 
+	BRW	CNX$END_FAILOVER	; End this failover
+
+REBLD_NOTQED:
+	; Lock wasn't rebuilt.  This may be due to insufficient lockids
+	; on the remote system or it may be a bug.  Either way, bugcheck.
+	; As currently implemented in DSTRLOCK, we should never see this
+	; bugcheck as the remote system bugchecks with an appropriate
+	; resource exhausted bugcheck.
+
+	BUG_CHECK	RESEXH,FATAL
+
+REBLD_DOLOCL:
+	; Manage this resource on this system
+
+	.IF NE	CA$_MEASURE
+	INCL	G^PMS$GL_DIR_OUT
+	.ENDC
+
+	CLRL	RSB$L_CSID(R8)		; Indicate it's managed locally
+
+REBLD_RETRY:
+	BSBW	CNX$DEALL_WARMCDRP_CSB	; Deallocate CDRP, message bfr., etc.
+	BRB	CHECK_FAILOVER
+
+REBLD_GRANTD:
+	; Lock was rebuilt on specified destination system
+
+	.IF NE	CA$_MEASURE
+	INCL	G^PMS$GL_ENQNEW_OUT
+	.ENDC
+
+	MOVL	LKMSG$L_MSTLKID(R2),-	; Store master lock id. in LKB
+		LKB$L_REMLKID(R6)
+	BSBW	CNX$DEALL_WARMCDRP_CSB	; Deallocate CDRP, message bfr., etc.
+	MOVL	CSB$L_CSID(R3),R3	; Get destination CSID
+
+STORE_CSID:
+	; If the CSID in R3 is different than the stored CSID, then store
+	; this one and mark all locks to be resent.  However, we verify
+	; that the one we are overwriting is not valid.  If it is valid,
+	; then we verify that it got stored as a result of NOT rebuilding
+	; a lock (see REBUILD and 10$ code, above and LCK$MARK_FOR_RESEND).
+
+	CMPL	R3,RSB$L_CSID(R8)	; Does it match what's already stored?
+	BEQL	40$			; Yes
+	BSBW	LCK$MARK_FOR_RESEND	; Mark all other LKBs to be resent
+	MOVL	R3,RSB$L_CSID(R8)	; Store new CSID
+40$:	BICW	#LKB$M_RESEND,-		; Clear resend bit on this one to 
+		LKB$W_STATUS(R6)	; indicate it has been resent
+
+CHECK_FAILOVER:
+	POPR	#^M<R6,R7,R8>
+CHECK_FAILOVER2:
+	BSBW	CNX$CHECK_FAILOVER	; Check for new failover
+	PUSHR	#^M<R6,R7,R8>
+	BRW	SAME_LOCKID
+
+REBLD_RESEND:
+	; Resend request to specified system.
+
+	.IF NE	CA$_MEASURE
+	INCL	G^PMS$GL_DIR_OUT
+	.ENDC
+
+	PUSHL	LKMSG$L_CSID(R2)	; Save CSID of specified system
+	BSBW	CNX$DEALL_WARMCDRP_CSB	; Deallocate CDRP, message bfr., etc.
+	POPL	R3			; Restore CSID
+	MOVL	R6,R2			; Move LKB address
+	POPR	#^M<R6,R7,R8>
+	BSBW	CNX$CHECK_FAILOVER	; Check for new failover
+	PUSHR	#^M<R6,R7,R8>
+	MOVL	R2,R6			; Move LKB address
+	BRW	REBUILD			; Send to specified system
+
+	.SBTTL	LCK$REBLD_LOCK - Rebuild a lock during failover
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called from the received lock message routines
+;	to build a LKB during failover.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	LCK$REBLD_LOCK
+;	IPL must be at IPL$_SYNCH
+;
+; INPUT PARAMETERS:
+;
+;	R6	Address of LKB
+;	R8	Address of RSB
+;	R9	Address of input message
+;
+; OUTPUT PARAMETERS:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+;	R0 - R4 not preserved
+;--
+
+LCK$REBLD_LOCK::
+	MOVB	LKMSG$B_LCKSTATE(R9),-	; Store lock state
+		LKB$B_STATE(R6)
+
+	; Dispatch according to lock state
+
+	DISPATCH	LKB$B_STATE(R6),TYPE=B,PREFIX=LKB$K_,-
+		<-
+		<GRANTED,40$>,-
+		<CONVERT,30$>,-
+		<WAITING,60$>,-
+		>
+20$:	BUG_CHECK	LOCKMGRERR,FATAL; Illegal lock mode
+
+30$:	; Lock state is CONVERT.  Lock needs to be placed in sequence
+	; number order in the conversion queue and then the value
+	; block should be stored if it's newer than the existing value block.
+
+	MOVAB	RSB$L_CVTQFL(R8),R3	; Get address of conversion queue
+	BSBB	80$			; Process like WAITING locks
+	BRB	50$			; Process value block like GRANTED locks
+
+40$:	; Lock state is GRANTED.  Insert on granted queue, set LKB status
+	; bits and store value block if it's newer than the existing one.
+
+	INSQUE	LKB$L_SQFL(R6),-	; Insert lock on granted queue
+		RSB$L_GRQFL(R8)
+	BISB	LKMSG$B_LSTATUS(R9),-	; Set appropriate status bits
+		LKB$W_STATUS(R6)
+50$:	SUBL3	RSB$L_VALSEQNUM(R8),-	; Is value block in message newer
+		LKMSG$L_VALSEQALT(R9),R0; than current one in RSB?
+	BLEQ	55$			; No
+	MOVQ	LKMSG$Q_VALBLKALT(R9),-	; Yes store new value block
+		RSB$Q_VALBLK(R8)
+	MOVQ	LKMSG$Q_VALBLKALT+8(R9),-
+		RSB$Q_VALBLK+8(R8)
+	MOVL	LKMSG$L_VALSEQALT(R9),-	; Store new sequence number
+		RSB$L_VALSEQNUM(R8)
+	BICW	#RSB$M_VALINVLD,-	; Clear value invalid flag
+		RSB$W_STATUS(R8)
+	BBC	#RSB$V_VALINVLD,-	; Optionally set flag
+		LKMSG$B_RSTATUS(R9),55$
+	BISW	#RSB$M_VALINVLD,-	
+		RSB$W_STATUS(R8)
+55$:	RSB
+
+60$:	; Lock state is WAITING.  Set appropriate LKB status bits and
+	; insert lock onto waiting queue in sequence number order.
+
+	MOVAB	RSB$L_WTQFL(R8),R3	; Get address of WAIT queue
+
+80$:	; Common code for waiting and converting locks
+
+	BISW	#LKB$M_ASYNC,-		; Set ASYNC bit
+		LKB$W_STATUS(R6)
+	MOVZWL	LKMSG$W_RQSEQALT(R9),R4	; Get request sequence number
+	MOVW	R4,LKB$W_RQSEQNM(R6)	; Store it
+
+	; Traverse queue (address in R3) for correct place to insert lock.
+	; R4 contains this lock's sequence number.
+
+	MOVL	R3,R2			; Save address of header in R2
+90$:	MOVL	(R2),R2			; Get next LKB
+	CMPL	R2,R3			; Reached the end?
+	BEQL	97$			; Yes
+	SUBW3	R4,LKB$W_RQSEQNM-LKB$L_SQFL(R2),R0 ; Compare sequence numbers
+	BLSS	90$			; Move to next LKB
+95$:	INSQUE	LKB$L_SQFL(R6),@4(R2)	; Insert this lock before lock in R2
+	RSB
+
+97$:	; Have a new highest sequence number.  Store it +1 in RSB.
+
+	ADDW3	#1,R4,RSB$W_RQSEQNM(R8)
+	BRB	95$
+
+	.SBTTL	LCK$CHECK_DIRENTRY - Check if this is a directory entry
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called during failover when it appears that
+;	another system has performed a directory lookup.  
+;	If this is a root resource then we verify the CSID in the 
+;	directory entry is valid.  If it's not, then the requesting
+;	system gets to manage this resource.
+;
+;	If this is not a root resource, then we must be managing this
+;	tree but have not yet reached this RSB.  In this case, clear
+;	the CSID in this RSB and in all parent RSBs until we reach
+;	an RSB that already has a zero CSID.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	LCK$CHECK_DIRENTRY
+;
+; INPUT PARAMETERS:
+;
+;	R4	CSID of system managing resource (or -1)
+;	R5	CSID of system doing directory lookup (or lock rebuild)
+;	R8	Address of RSB
+;
+; OUTPUT PARAMETERS:
+;
+;	R0	Completion code
+;	R4	CSID of system managing resource or CSID
+;		of system to resend request to
+;
+; IMPLICIT OUTPUTS:
+;
+;	The CSIDs in this RSB tree may be modified
+;
+; COMPLETION CODES:
+;
+;	0	This is not a directory entry - rebuild the lock
+;	1	This is a directory entry - perform a directory lookup
+;
+; SIDE EFFECTS:
+;
+;	R0 - R3 not preserved
+;--
+
+LCK$CHECK_DIRENTRY::
+	MOVL	R4,R3			; Move CSID for this RSB
+	TSTL	RSB$L_PARENT(R8)	; Is this a root resource?
+	BNEQ	50$			; No
+	TSTW	R3			; Is CSID valid?
+	BGTR	40$			; Yes
+
+	; CSID is invalid.  Verify this is the directory system for this
+	; resource and if so, make this the correct directory entry.
+
+	MOVL	G^LCK$GL_DIRVEC,R3	; Get address of directory vector
+	MOVZWL	RSB$W_HASHVAL(R8),R1	; Get hash value
+	CLRL	R2			; Clear high order hash value
+	EDIV	-12(R3),R1,R0,R1	; Compute hash index (in R1)
+	MOVL	(R3)[R1],R4		; Get directory system
+	BNEQ	40$			; It's not us
+	BISW	#RSB$M_DIRENTRY,-	; It is us; set directory entry bit
+		RSB$W_STATUS(R8)
+	BSBB	LCK$MARK_FOR_RESEND	; Mark all LKBs on this RSB to be resent
+	MOVL	R5,RSB$L_CSID(R8)	; Requesting system manages resource
+	MOVL	R5,R4			; Return this CSID in R4
+40$:	MOVL	#1,R0			; Process like a directory lookup
+	RSB
+
+50$:	; This RSB is not a root resource.  This tree must be managed
+	; on this system but we haven't reached this RSB yet.  Set
+	; all RSBs on this leg of the tree to be managed locally.
+	; 	R3 = CSID
+	;	R8 = RSB
+
+	MOVL	R8,R2			; Move address of RSB
+60$:	TSTW	R3			; Verify CSID is not valid
+	BGTR	80$			; Error
+	CLRL	RSB$L_CSID(R2)		; Manage this resource locally
+	MOVL	RSB$L_PARENT(R2),R2	; Get parent
+	BEQL	80$			; Error if we reach top of tree
+	MOVL	RSB$L_CSID(R2),R3	; Get CSID
+	BNEQ	60$			; Repeat
+	
+	CLRL	R0			; Set status to indicate rebuild lock
+	RSB
+
+80$:	BUG_CHECK	LOCKMGRERR,FATAL
+
+	.SBTTL	LCK$MARK_FOR_RESEND - Mark LKBs on RSB for resending
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	LCK$MARK_FOR_RESEND is called during failover whenever the RSB$L_CSID
+;	field changes from invalid to valid (but not zero).  This routine
+;	scans all the state queues on the RSB and marks all the LKBs
+;	to be resent.
+;
+;	This routine is also called during failover whenever the RSB$L_CSID
+;	field changes from one valid system to another (but not zero).
+;	In this case, it is necessary to verify that no locks have
+;	actually been resent to the old system.
+;
+;	NOTE:  The two cases are distinguished by whether or not the CSID in
+;	       RSB$L_CSID is valid.  Consequently, storing a new CSID MUST be
+;	       done AFTER calling this routine.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	LCK$MARK_FOR_RESEND	
+;	IPL must be at IPL$_SYNCH
+;
+; INPUT PARAMETERS:
+;
+;	R8	Address of RSB
+;
+; IMPLICIT INPUTS:
+;
+;	RSB$L_CSID is used as described above.
+;
+; OUTPUT PARAMETERS:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+;	R0 - R2 not preserved
+;--
+
+LCK$MARK_FOR_RESEND:
+	ASSUME	RSB$L_CVTQFL  EQ  RSB$L_GRQFL+8
+	ASSUME	RSB$L_WTQFL  EQ  RSB$L_CVTQFL+8
+
+	MOVAL	RSB$L_GRQFL(R8),R1	; Get address of granted queue
+	MOVL	#3,R2			; Process all three queues
+
+10$:	MOVL	R1,R0			; R0 will step through queue
+
+20$:	MOVL	(R0),R0			; Get next LKB on queue
+	CMPL	R0,R1			; Reached end of queue?
+	BEQL	30$			; Yes
+	TSTW	RSB$L_CSID(R8)		; Is CSID valid?
+	BGEQ	25$			; Yes
+	BISW	#LKB$M_RESEND,-		; Set resend bit in LKB
+		LKB$W_STATUS-LKB$L_SQFL(R0)
+	BRB	20$			; Move on to next LKB in this queue
+
+25$:	BBS	#LKB$V_RESEND,-		; Ok if lock hasn't been rebuilt yet
+		LKB$W_STATUS-LKB$L_SQFL(R0),20$
+	DISPATCH	LKB$B_STATE-LKB$L_SQFL(R0),TYPE=B,PREFIX=LKB$K_,-
+		<-
+		<RETRY,20$>,-		; These states haven't been rebuilt
+		<SCSWAIT,20$>,-		; and are thus okay too.
+		<RSPNOTQED,20$>,-
+		>
+	BUG_CHECK	LOCKMGRERR,FATAL
+
+30$:	ADDL	#8,R1			; Point to next queue
+	SOBGTR	R2,10$			; Repeat for all three queues
+	RSB
+
+	.SBTTL	LCK$REBUILD_RSBS
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine makes a pass through the resource hash table
+;	to rebuild the RSB database.  For each RSB, it computes new group
+;	grant and conversion grant modes, a new BLKASTCNT, and grants
+;	any possible unprotected locks.  
+;
+; CALLING SEQUENCE:
+;
+;	JSB	LCK$REBUILD_RSBS (called from failover table dispatcher)
+;	IPL must be at IPL$_SYNCH
+;
+; INPUT PARAMETERS:
+;
+;	R5	Address of failover control block
+;
+; OUTPUT PARAMETERS:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+;	R0 - R5 are not preserved
+;--
+
+LCK$REBUILD_RSBS::
+	POPL	W^RETURN_ADDR		; Save return address
+	PUSHR	#^M<R5,R6,R7,R8,R9,R10,R11>
+
+	; Loop through all RSBs in the resource hash table.  For each
+	; RSB, process it's locks.
+
+	ASHL	G^LCK$GL_HTBLCNT,#1,R10	; Get size of hash table
+	MOVL	G^LCK$GL_HASHTBL,R11	; Get address of hash table
+
+10$:	; Start on next hash chain
+
+	MOVAL	(R11)+,R8		; Get address of next list head
+
+20$:	; Get next RSB in this hash chain.  
+
+	MOVL	(R8),R8			; Get address of next RSB
+	BEQL	30$			; Reached end of chain
+	BSBB	PROCESS_RSB		; Process it
+	BRB	20$			; Repeat
+
+30$:	; Finished one complete hash chain.  Fork to allow SCS to get
+	; a chance to execute and then proceed to next hash chain.
+
+	MOVQ	R10,R3			; Save size and address of hash table
+	POPR	#^M<R5,R6,R7,R8,R9,R10,R11>
+	MOVB	#IPL$_SYNCH,-		; Store fork IPL
+		FKB$B_FIPL(R5)
+	FORK
+	BSBW	CNX$CHECK_FAILOVER	; Check for another failover
+	PUSHR	#^M<R5,R6,R7,R8,R9,R10,R11>
+	MOVQ	R3,R10			; Restore size and address of table
+	DECL	R10			; Decr. count of hash chains
+	BGTR	10$			; Repeat
+
+	POPR	#^M<R5,R6,R7,R8,R9,R10,R11>
+	JMP	@W^RETURN_ADDR		; Return to caller via saved ret. addr.
+
+	.SBTTL	PROCESS_RSB - Process a single RSB during failover
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called during failover to process a single RSB.
+;	It recomputes the group grant modes, blocking AST count, queues
+;	blocking ASTs and grants locks, where possible
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	PROCESS_RSB
+;	IPL must be at IPL$_SYNCH
+;
+; INPUT PARAMETERS:
+;
+;	R8	Address of RSB to be processed
+;
+; OUTPUT PARAMETERS:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+;	R0 - R7, and R9 destroyed
+;--
+
+CSID_ERROR:
+	BUG_CHECK	LOCKMGRERR,FATAL; CSID in RSB not valid or not equal
+					; to parent RSB's CSID
+
+STATE_NOTZERO:
+	BUG_CHECK	LOCKMGRERR,FATAL;Rebuild state is not 0 or 3
+
+PROCESS_RSB:
+
+	; This routine does two functions, depending on the value of
+	; LCK$GB_REBLD_STATE.  If it's 3 then we do a complete rebuild
+	; of the RSB.  If it's 0 then we simply try to grant waiting
+	; locks
+
+	CMPB	G^LCK$GB_REBLD_STATE,#3	; What phase of failover are we in?
+	BEQL	5$			; Do the complete rebuild
+	TSTB	G^LCK$GB_REBLD_STATE	; Verify state is 0
+	BNEQ	STATE_NOTZERO		; Error
+	TSTL	RSB$L_CSID(R8)		; Only regrant locks if we are
+	BEQL	3$			; mastering this resource
+	RSB
+3$:	MOVZBL	RSB$B_GGMODE(R8),R5	; Get group grant mode
+	BRW	90$			; Just grant locks
+
+5$:	; Verify that the CSID in the RSB is valid and equal to the
+	; CSID in the parent RSB.
+	; Then loop through all locks on all three queues.  As we do this
+	; we will compute new group grant and conversion grant modes,
+	; a new BLKASTCNT, send blocking ASTs, etc.
+	; R9 is used to maintain a count of the number of locks on the
+	; resource.  This will be used later, just for an integrity check.
+
+	ASSUME	RSB$L_CVTQFL  EQ  RSB$L_GRQFL+8
+	ASSUME	RSB$L_WTQFL   EQ  RSB$L_CVTQFL+8
+
+	TSTW	RSB$L_CSID(R8)		; Make sure CSID is not still -1
+	BLSS	CSID_ERROR		; Error
+	MOVL	RSB$L_PARENT(R8),R0	; Get address of parent RSB
+	BEQL	8$			; No parent
+	CMPL	RSB$L_CSID(R8),-	; Verify this CSID matches parent's
+		RSB$L_CSID(R0)		; CSID
+	BNEQ	CSID_ERROR		; Error!
+8$:	CLRL	R5			; Initialize group grant mode
+	CLRL	R9			; Initialize number of locks on resource
+	CLRW	RSB$W_BLKASTCNT(R8)	; Initialize blocking AST count
+	MOVL	#3,R4			; Process 3 queues
+	MOVAL	RSB$L_GRQFL(R8),R7	; Address of first queue
+
+10$:	; Start processing next lock queue
+
+	MOVL	R7,R6			; Use R6, save queue header in R7
+
+20$:	; Process next lock in this queue
+
+	MOVL	(R6),R6			; Get next lock
+	CMPL	R6,R7			; Reached end of queue?
+	BNEQ	30$			; No
+	BRW	80$			; Yes, move to next queue
+30$:	SUBL	#LKB$L_SQFL,R6		; Point to start of LKB
+	INCL	R9			; Incr. count of locks
+
+	; Do the following code only for the granted queue
+
+	CMPL	R4,#3			; Are we doing the granted queue?
+	BLSS	50$			; No
+	CMPB	LKB$B_STATE(R6),-	; Yes, is state = GRANTED?
+		#LKB$K_GRANTED
+	BNEQ	50$			; No
+	TSTL	LKB$L_BLKASTADR(R6)	; Is a blocking AST specified?
+	BEQL	50$			; No
+	INCW	RSB$W_BLKASTCNT(R8)	; Yes, incr. blocking AST count
+
+50$:	; Do the following code only for the granted and conversion queues
+
+	CMPL	R4,#1			; Are we doing the waiting queue?
+	BLEQ	60$			; Yes
+	MOVZBL	LKB$B_GRMODE(R6),R1	; No, get granted mode
+	BBC	R1,G^LCK$COMPAT_TBL[R5],75$ ; Verify it's compatible
+	CMPL	R1,R5			; Is it bigger than the current
+	BLEQU	60$			; group grant mode?
+	MOVL	R1,R5			; Yes, it becomes new gg mode
+
+60$:	; Do the following code only for the conversion and waiting queues
+	; and only if this resource is managed on this system
+
+	CMPL	R4,#3			; Are we doing the granted queue?
+	BGEQ	70$			; Yes
+	TSTL	RSB$L_CSID(R8)		; Are we managing this resource?
+	BNEQ	70$			; No
+
+	; Queue blocking ASTs if necessary.  Don't queue blocking ASTs
+	; on behalf of locks in any of the SCS or response states.
+
+	DISPATCH	LKB$B_STATE(R6),TYPE=B,PREFIX=LKB$K_,-
+		<-
+		<CONVERT,65$>,-
+		<WAITING,65$>,-
+		>
+	BRB	70$			; Ignore other states
+63$:	BRB	10$
+65$:	TSTW	RSB$W_BLKASTCNT(R8)	; Anyone want a blocking AST?
+	BEQL	68$			; No
+	PUSHR	#^M<R4,R5,R6,R7,R8,R9,R10,R11>
+	JSB	G^LCK$QUEUE_BLOCKAST	; Queue blocking ASTs
+	POPR	#^M<R4,R5,R6,R7,R8,R9,R10,R11>
+
+68$:	; Insert waiting locks on the timeout queue (if not already on it).
+	; We've already determined that the lock is mastered on this system
+	; and it is in either CONVERT or WAITING state.
+
+	BBS	#LCK$V_NODLCKWT,-	; Don't insert if no deadlock wait 
+		LKB$W_FLAGS(R6),70$	; is specified
+	MOVL	G^LCK$GL_WAITTIME,R0	; Get lock wait time
+	BEQL	70$			; Deadlock checking is disabled
+	BBSS	#LKB$V_TIMOUTQ,-	; Branch if already on the queue;
+		LKB$W_STATUS(R6),70$	; set bit otherwise
+	ADDL3	R0,G^EXE$GL_ABSTIM,-	; Add wait time to current time to
+		LKB$L_DUETIME(R6)	; get duetime
+	CLRB	LKB$B_TSLT(R6)		; Init. timestamp lifetime
+	MOVAL	G^LCK$GL_TIMOUTQ,R0
+	INSQUE	LKB$L_ASTQFL(R6),-	; Insert lock on end of timeout queue
+		@4(R0)
+
+70$:	ADDL	#LKB$L_SQFL,R6		; Point to queue links
+	BRW	20$			; Go to next LKB in this queue
+
+75$:	BUG_CHECK	LOCKMGRERR,FATAL; Incompatible granted locks
+					; or resource has no locks
+					; and is not a directory entry
+80$:	; Proceed to next queue
+
+	ADDL	#8,R7			; R7 points to next queue header
+	SOBGTR	R4,63$			; Repeat for all three queues
+
+	; Store newly computed group grant mode, regardless of
+	; who is mastering resource.  Also verify that there are
+	; some locks on this resource.  The only tolerable case of no
+	; locks is if this is a directory entry resource.
+
+	ASSUME	RSB$V_DIRENTRY  EQ  0
+
+	MOVB	R5,RSB$B_GGMODE(R8)	; Store group grant mode
+	MOVB	R5,RSB$B_CGMODE(R8)	; Store conversion grant mode
+	TSTL	R9			; Are there any locks?
+	BNEQ	85$			; Yes
+	BLBC	RSB$W_STATUS(R8),75$	; Error if not a directory entry
+
+85$:	; Do the following code only if we are managing this resource
+
+	TSTL	RSB$L_CSID(R8)		; Is resource managed locally?
+	BNEQ	100$			; No
+
+	; Invalidate value block if group grant mode is not greater 
+	; than CR mode.
+
+	CMPB	R5,#LCK$K_CRMODE	; Is group grant mode greater than CR?
+	BGTRU	90$			; Yes
+	BISW	#RSB$M_VALINVLD,-	; No, set value block invalid bit
+		RSB$W_STATUS(R8)
+	INCL	RSB$L_VALSEQNUM(R8)	; Incr. value block seq. number
+
+90$:	; Try granting locks.  Note that we may have to 
+	; temporarily change LCK$GB_STALLREQS in order
+	; to get LCK$GRANTCVTS to grant locks.  If LCK$GB_REBLD_STATE is
+	; set to 3 we temporarily set LCK$GB_STALLREQS to +1.  Note that we 
+	; cannot suspend this thread of execution at IPL$_SYNCH while
+	; LCK$GB_STALLREQS is changed.
+
+	CVTBL	G^LCK$GB_STALLREQS,R7	; Fetch stall flag and save it
+	CMPB	G^LCK$GB_REBLD_STATE,#3	; Is rebuild state = 3?
+	BNEQ	95$			; No
+	MOVB	#1,G^LCK$GB_STALLREQS	; Yes, store temp. stall flag
+95$:	JSB	G^LCK$GRANTCVTS		; Try granting locks
+	MOVB	R7,G^LCK$GB_STALLREQS	; Restore old value of stall flag
+100$:	RSB
+
+	.SBTTL	LCK$RESUME_UNPROT - Resume processes waiting for locks
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	These routines resume processes waiting for locks.  The
+;	processes are in MWAIT waiting for resource RSN$_CLUSTRAN.
+;	The global cell LCK$GB_STALLREQS controls which processes
+;	proceed and which go back into MWAIT.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	LCK$RESUME_UNPROT - Resume processes waiting for unprotected
+;				    locks
+;	JSB	LCK$RESUME_ALL  -   Resume processes waiting for protected
+;				    locks
+;	JSB	LCK$STALL_ALL	-   Stall all lock requests
+;
+;	IPL must be at IPL$_SYNCH
+;
+; INPUT PARAMATERS:
+;
+;	None
+;
+; OUTPUT PARAMETERS:
+;
+;	None
+;
+; IMPLICIT OUTPUTS:
+;
+;	LCK$GB_STALLREQS - Set to 1 by LCK$RESUME_UNPROT
+;			   Set to 0 by LCK$RESUME_ALL
+;			   set to -1 by LCK$STALL_ALL
+;
+; SIDE EFFECTS:
+;
+;	R0 - R5 destroyed
+;--
+
+LCK$RESUME_ALL::
+	CLRL	R0
+	BRB	RESUME_COM
+
+LCK$RESUME_UNPROT::
+	MOVL	#1,R0
+
+RESUME_COM:
+	MOVB	R0,G^LCK$GB_STALLREQS	; Store new value for stall indicator
+	MOVL	#RSN$_CLUSTRAN,R0	; Set resource number
+	JSB	G^SCH$RAVAIL		; Make it available
+	RSB
+
+LCK$STALL_ALL::
+	MNEGB	#1,G^LCK$GB_STALLREQS	; Store -1 for stall indicator
+	RSB
+
+	.SBTTL	LCK$SET_STATEn - Set rebuild state to specified value
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	These routines set the rebuild state to a specified value.
+;	The purpose of the rebuild state is to guarantee that all
+;	nodes process each step in the failover table in unison
+;	without any nodes getting ahead of other nodes.  The rebuild
+;	state variable is used by the lock manager's input message
+;	dispatcher in routine DSTRLOCK.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	LCK$SET_STATEn
+;
+; INPUT PARAMETERS:
+;
+;	LCK$GB_REBLD_STATE	(The old value is verified)
+;
+; OUTPUT PARAMETERS:
+;
+;	LCK$GB_REBLD_STATE	(The new value is set)
+;
+; SIDE EFFECTS:
+;
+;	R0 and R1 not preserved
+;--
+
+
+LCK$SET_STATE1::
+	MOVB	#1,G^LCK$GB_REBLD_STATE	; Old value can be anything
+	RSB
+
+LCK$SET_STATE2::
+	MOVB	#1,R0
+	BRB	SET_STATE
+
+LCK$SET_STATE3::
+	MOVB	#2,R0
+
+SET_STATE:
+	MOVAB	G^LCK$GB_REBLD_STATE,R1	; Get address of state variable
+	CMPB	(R1),R0			; Verify old value
+	BNEQ	10$
+	INCB	(R1)			; Set new state
+	RSB
+
+10$:	BUG_CHECK	LOCKMGRERR,FATAL
+
+LCK$SET_STATE0::
+	MOVB	#3,R0
+	BSBB	SET_STATE
+	CLRB	(R1)
+	RSB
+
+
+
+
+
+	.END

@@ -1,0 +1,918 @@
+%TITLE 'Line output (horizontal motion)'
+MODULE LOHORI (	IDENT = 'V04-000'
+    		%BLISS32[, ADDRESSING_MODE(EXTERNAL =		LONG_RELATIVE,
+    					   NONEXTERNAL =	LONG_RELATIVE)]
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!++
+! FACILITY:	 DSR (Digital Standard RUNOFF) / DSRPLUS
+!
+! ABSTRACT: Translation from intermediate format to final output.
+!
+!
+! ENVIRONMENT: Transportable
+!
+! AUTHOR: K. A. Dawson	 CREATION DATE: December 1983
+!
+
+%SBTTL 'Revision History'
+!
+! MODIFIED BY:
+!
+!	010	KFA00010	Ken Alden	06-Jul-1983
+!		Fixed logic for resetting pointer that is used in
+!		  scanning the MRA during a no-out run-through.
+!
+!	009	KFA00009	Ken Alden	30-Jun-1983
+!		Adding a tsf_cref_count to keep track of pending crefs.
+!
+!	008	KFA00008	Ken Alden	28-Jun-1983
+!		Fixed cref bug with bars enabled.
+!
+!	007	KFA00007	Ken Alden	28-Jun-1983
+!		CLH is not called now unless line has something in it.
+!
+!	006	KFA00006	Ken Alden	27-Jun-1983
+!		Teaked the counter logic for skip_out output.
+!
+!	005	KFA00005	Ken Alden	23-Jun-1983
+!		Added call to OUTCREF when gca_skip_out was true (and a cref
+!		  is pending. This insures that the when the mra is not read,
+!		  OUTCREF may still be called. 
+!
+!	004	REM00004	Ray Marshall	17-June-1983
+!		Add call to OUTCREF based on encountering a <RINTES>C escape
+!		  sequence in the MRA.
+!
+!	003	KAD00003	Keith Dawson	4-May-1983
+!		Move test for /QUICK, so that CLH is never called if we are 
+!		  skipping output.
+!
+!	002	KAD00002	Keith Dawson	14-Apr-1983
+!		Correct DSRPLUS conditionals for emphasis routines.
+!
+!	001	KAD00001	Keith Dawson	22-Mar-1983
+!
+!--
+
+%SBTTL 'Module Level Declarations'
+
+!
+! TABLE OF CONTENTS:
+!
+
+REQUIRE 'REQ:RNODEF';			! RUNOFF variant definitions
+
+FORWARD ROUTINE
+    LOUT1 : NOVALUE,
+    build_line,
+    compute_next_pass;
+!
+! INCLUDE FILES:
+!
+LIBRARY 'NXPORT:XPORT';			! XPORT Library
+
+%IF DSRPLUS %THEN
+LIBRARY 'REQ:DPLLIB';			! DSRPLUS BLISS Library
+%ELSE
+LIBRARY 'REQ:DSRLIB';			! DSR BLISS Library
+%FI
+!
+! MACROS:
+!
+
+MACRO 
+    emphasis_passes = 
+	(     (.pass_cntr GTR pass_setup)
+	  AND (.pass_cntr LSS pass_real_text)
+	)
+    %;
+
+MACRO
+    doing_underlining =
+	(.pass_cntr EQL pass_underline
+	OR
+	 .pass_cntr EQL pass_bold_underline)
+    %;
+
+MACRO					! TRUE if output is for an 
+    laser_output =			! LN01 or an LN01E.
+	(.gca_op_dev EQL op_dev_ln01
+	OR 
+	.gca_op_dev EQL op_dev_ln01e)
+    %;
+
+MACRO					! TRUE if we should generate 
+    generate_bare_cr_line =	(	! intermediate output.
+
+     (	(.last_pass GTR 0)		! First BUILD_LINE loop...
+	AND				! and either we are doing bolding/overstriking,
+	( (NOT doing_underlining)	! or we are doing underlining but not /SEPERATE.
+	  OR	
+	  (doing_underlining AND NOT .outopt_und_sep)
+	)
+     )
+  OR
+     (  (.last_pass LSS 0)		! Second BUILD_LINE loop...
+	AND				! and any bolding is present.
+	(.tsf_bld)			
+     )
+				)
+    %;
+!
+! EQUATED SYMBOLS:
+!
+
+EXTERNAL LITERAL
+    rintes : UNSIGNED (8);
+
+!
+! OWN STORAGE:
+!
+OWN
+    emphasis_bits,		! A word containing information on current-character 
+				! and last-character bold and underline.
+    p_lines,			! Number of physical lines represented.
+    padding : VECTOR [75],	! Justification spacing built up here.
+    pi,				! Index into padding.
+    overstrike_count,		! Number of characters in an overstrike sequence (/BACKSPACE mode only).
+    overstrike_char,		! The character with which to overstrike the previous one.
+    overstrike_seq,		! CH$PTR to start of an overstrike sequence.
+    bold_limit,			! Location of last character to be bolded.
+    over_limit,			! Location of last overstruck character.
+    under_limit,		! Location of last character to be underlined.
+    pass_limit,			! Limit of scan for current pass
+    next_pass,			! Keeps track of the next pass.
+    last_pass,			! The number of the last pass for this line.
+    pass_cntr;			! Count of which pass is happening. See below.
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL
+    fnct : FNCT_DEFINITION,
+%IF FLIP %THEN
+    rnoiob: REF $XPO_IOB(),
+%FI
+
+    fra : fixed_string,
+    gca : gca_definition,
+    sca : sca_definition,
+    tsf : tsf_definition,
+    outopt : VECTOR [outopt_size],
+    phan : phan_definition;
+
+EXTERNAL LITERAL 				! Error messages
+    rnfile;
+
+EXTERNAL ROUTINE
+    bsemph,	opemph,		
+
+%IF LN01 %THEN
+    lnemph : NOVALUE,
+%FI
+%IF DSRPLUS %THEN
+    vtemph : NOVALUE,	outcref,
+%FI
+%IF FLIP %THEN
+    flemph : NOVALUE,
+%FI
+
+    clh,	cskipl,		erms,		fbwait,
+    justf,	lstops,		newpag,		tpfeql,
+    tpr,	uform;
+
+%SBTTL 'LOUT1 -- Process remaining normal text in line.'
+GLOBAL ROUTINE LOUT1 (ptr) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Process the remaining normal text in the line.
+!
+! FORMAL PARAMETERS:
+!
+!	ptr		Character reader in input line.
+!
+! IMPLICIT INPUTS:	None
+!
+! IMPLICIT OUTPUTS:	None
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:	None
+!
+! SIDE EFFECTS:		None
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	status;
+
+    pass_cntr = 1;
+    bold_limit = 0;
+    over_limit = 0;
+    under_limit = 0;
+    status = false;
+
+
+    INCR i FROM 0 TO 74 DO  padding [.i] = 1;
+
+    ! Compute number of physical lines that this record represents.
+    p_lines = 1;
+
+    IF (.tsf_und
+	AND .outopt_und_sep)
+    THEN
+	p_lines = 2;		! Underline with dashes on next line.
+
+    ! This 'turns a page' if necessary.
+    IF NOT .fnct_expanding
+    THEN
+	BEGIN
+	IF NOT tpr (.p_lines)
+	THEN
+	    phan_top_page = .phan_paging OR .phan_top_page;
+
+	! If we are positioned at precisely the position where it would be ok
+	! to output one or more footnotes, terminate a new page.
+	IF (tpfeql () NEQ 0)
+	THEN
+	    phan_top_page = .phan_paging OR .phan_top_page;
+	END;
+
+    ! If necessary, put heading on page before writing text.
+    IF (.phan_top_page
+	AND NOT .fnct_expanding)
+    THEN
+	newpag ();
+
+    ! If skipping output because the user used the /PAGES switch (or because 
+    ! we are in an early pass of /AUTOMATIC processing), just count the lines
+    ! but don't do any output.
+    IF .gca_skip_out
+    THEN
+	BEGIN
+%IF DSRPLUS %THEN
+    	LOCAL
+    	    temp_ptr,
+    	    temp_length;
+
+%FI
+	    phan_lines_tp = .phan_lines_tp + .p_lines;
+%IF DSRPLUS %THEN
+    	temp_length = .tsf_int_hl;
+    	temp_ptr = .ptr;
+	WHILE (.tsf_cref_data NEQ 0)
+    		AND
+    	 (.temp_length NEQ 0) 
+    		AND
+    	 (NOT CH$FAIL (.temp_ptr)) 	DO
+    	    BEGIN
+    	    temp_ptr = CH$FIND_SUB (.temp_length, .temp_ptr, 3
+		      ,CH$PTR(UPLIT(%STRING(%CHAR (28),'C '))));
+    	    IF NOT CH$FAIL (.temp_ptr)
+    	    THEN
+    		BEGIN
+    		outcref ();	!Dump this pending cref.
+    		tsf_cref_count = .tsf_cref_count - 1; ! One less cref pending.
+    		!Reduce the context length to reflect what it has already scanned.
+    		temp_length = .tsf_int_hl - CH$DIFF(.temp_ptr,.ptr) - 3;
+    		temp_ptr = CH$PLUS(.temp_ptr, 3);
+    		END;
+    	    END;
+%FI
+	RETURN
+	END;
+
+    ! Compute spacing for justification.
+    IF .tsf_jus_cnt NEQ 0		! If justification required,
+    THEN				! set up PADDING accordingly.
+	justf (padding, .tsf_jus_cnt,
+			(IF .tsf_justify THEN .tsf_padding ELSE 0),
+			.tsf_just_alg);
+
+    ! Take care of possible pending formfeed.
+    IF .phan_form_pend NEQ 0
+    THEN
+	IF .phan_simulate
+	THEN
+	    uform ()				!/SIMULATE
+	ELSE
+	    IF .phan_pause
+	    THEN
+		fbwait ()
+	    ELSE
+%IF FLIP %THEN
+		IF NOT (.gca_op_dev EQL op_dev_flip)
+		THEN
+%FI
+		    ! We must write out the formfeed here and then clear the
+		    ! FRA, because if an emphasized title is waiting, the FRA
+		    ! is going to be cleared (in BUILD_LINE) before it has
+		    ! a chance to be written.
+		    BEGIN
+		    fs_wchar (fra, .phan_form_pend);
+		    clh (clh_out_nocrlf);
+		    fs_init (fra);
+		    END;
+
+    phan_form_pend = 0;
+
+!+
+! Generation of what TSF/MRA represent happens below this point.
+!
+! Take care of actual line printing, including bold, overstriking,
+! and underlining.  This, if not done using backspace, requires several
+! passes over the line to generate separate lines which can then
+! be used to overstrike each other.
+!-
+    ! Make sure the pass counter is 1 going into BUILD_LINE. This avoids a 
+    ! nasty bug involving recursive calls to LOUT for top-of-page processing.
+    !
+    pass_cntr = 1;
+    WHILE NOT .status DO
+	status = build_line (.ptr);
+
+!Processing continues here when we exit BUILD_LINE returning TRUE.
+    !1.  This output statement (also) does the last overprint
+    !    to achieve the proper bolding depth.
+    !2.  In /BACKSPACE mode, this write statement does the
+    !	 actual output, since nothing has been output yet.
+    !3.  In either case, the terminating CRLF is output.
+%IF FLIP %THEN
+    IF (.gca_op_dev EQL op_dev_flip) and .sca_header
+    THEN
+	BEGIN
+	OWN tochl_rec : $flip_tochl PRESET ([tochl_code] = flip$k_tochl);
+	$XPO_PUT (IOB=.rnoiob, STRING= (flip$k_tochl_size,tochl_rec));
+	sca_header = false;
+	END;
+%FI
+    op_dev_write_output_line;
+
+    ! Clear output buffer for next line.
+    fs_init (fra);
+!+
+! Generate separate underlining now, if specified.
+!-
+    IF	.outopt_und_sep
+	AND
+	.tsf_und		!Not unless there is any underlining to do!
+    THEN
+	BEGIN
+	pass_cntr = (IF .tsf_bld 
+		    THEN pass_bold_underline 
+		    ELSE pass_underline);
+	last_pass = -1;		! "-1" signals this separate-underline call to BUILD_LINE.
+	build_line (.ptr);
+	fs_wchar (fra, 10);	! Add <lf> to the line.
+	clh (clh_out_nocrlf);	! 
+	fs_init (fra);		! Clear output buffer for next line.
+	phan_lines_tp = .phan_lines_tp + 1;
+	END;
+
+    ! Update count of number of lines on this page.
+    phan_lines_tp = .phan_lines_tp + 1;
+    END;					! End of LOUT1
+
+%SBTTL 'BUILD_LINE -- output entire text line, using multiple passes if needed'
+ROUTINE BUILD_LINE (ptr) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	BUILD_LINE does the actual work of building up an output line, 
+!	using multiple passes for overstriking, underlining, and bolding.
+!
+! FORMAL PARAMETERS:
+!
+!	ptr		is the input line pointer, passed from LOUT to LOUT1.
+!
+! IMPLICIT INPUTS:
+!
+!	Some of the OWN variables of this module (NOUT).
+!
+! IMPLICIT OUTPUTS:	None
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	The routine returns TRUE to indicate that more processing is 
+!	required on a line; it returns FALSE to indicate that the line is 
+!	ready for output. It is called in a loop until it returns FALSE.
+!
+! SIDE EFFECTS:
+!
+!	Text is written onto FRA.
+!--
+
+    BEGIN
+
+    LOCAL
+	hold_khar,
+	hold_operand1,
+	hold_seq_start,		! CH$PTR to start of a character sequence.
+	op_code,
+	operand1,
+	ptr_copy_1;
+
+    ! Initialize LOCAL variables.
+    !
+    hold_operand1 = 0;
+    operand1 = 0;
+    ptr_copy_1 = .ptr;
+    next_pass = .pass_cntr;	! Initialize to the current pass count.
+
+    ! Initialize OWN variables.
+    !
+    pi = 0;
+
+    ! Initialize emphasis and overstriking information for each call.
+    !
+    emphasis_bits = 0;
+    overstrike_count = 0;
+    overstrike_char = 0;
+
+    ! For LN01[e] output, overstriking is treated in a special way. In this 
+    ! case, bolding/underlining passes produce no text on the FRA; the only 
+    ! passes that write to the FRA are pass_overstrike and pass_real_text.
+    ! 
+    IF	(laser_output AND .tsf_ovr)
+	AND
+	(.pass_cntr LSS pass_overstrike)
+	AND
+	(.pass_cntr GTR pass_setup)
+    THEN
+	! Decide which pass comes next and set up the counter for it.
+	BEGIN
+	pass_cntr = compute_next_pass ();
+	RETURN false;
+	END;
+
+    !+
+    ! For all passes except text-generating one, output spaces instead 
+    ! of the change bars.
+    !-
+    IF emphasis_passes
+    THEN
+	lstops (lstops_none, false)	! Space over the listing option columns.
+    ELSE
+	lstops (lstops_all, false);	! Output listing options.
+
+    ! Shift text according to amount computed by .CENTER, etc commands.
+
+    INCR i FROM 1 TO .tsf_adjust DO
+	fs_wchar (fra, %C' ');
+
+    ! Get limit of scan for this pass.
+    pass_limit = (CASE .pass_cntr FROM pass_setup TO pass_real_text OF
+	SET
+
+	[pass_setup] :		 .tsf_int_hl;	! 1st pass sets up others.
+
+	[pass_bold] :		 .bold_limit;	! Last character for bolding
+
+	[pass_overstrike] :	 .over_limit;	! Last overstriking character
+	[pass_bold_overstrike] : .over_limit;
+
+	[pass_underline] :	 .under_limit;	! Last underlined character 
+	[pass_bold_underline] :  .under_limit;
+
+	[pass_real_text] :	 .tsf_int_hl;	! 7th pass generates output
+
+	TES);
+
+    INCR k FROM 1 TO .pass_limit DO	! Process (horizontal) text.
+	BEGIN
+	hold_seq_start = .ptr_copy_1;	! Remember start of this sequence.
+	hold_khar = CH$RCHAR_A (ptr_copy_1);
+
+	IF .hold_khar EQL rintes
+	THEN
+	    BEGIN
+	    op_code = CH$RCHAR_A (ptr_copy_1);
+	    hold_operand1 = CH$RCHAR_A (ptr_copy_1);
+	    k = .k + 2;
+
+	    SELECT .op_code OF
+		SET
+
+		[%C'B'] :
+		    (IF .tsf_bld
+		    THEN
+		    ! Remember bolding information if bolding wanted.
+			BEGIN
+			emph_current_bold = true;
+			operand1 = .hold_operand1;
+			END
+		    );
+
+%IF DSRPLUS %THEN
+		[%C'C'] :
+    		    BEGIN
+    		    IF .pass_cntr EQL pass_setup
+    		    THEN
+    			BEGIN
+    		    	outcref();  ! Process pending .REF records.
+        		tsf_cref_count = .tsf_cref_count - 1;
+    			END;
+    		    operand1 = 0;
+    		    END;
+%FI
+		[%C'U'] :
+		    (IF .tsf_und
+		    THEN
+		    ! Remember underlining information if underlining wanted.
+			BEGIN
+			emph_current_underline = true;
+			operand1 = .hold_operand1;
+			END
+		    );
+
+		[%C'N'] :
+		    ! A No-operation
+		    BEGIN
+		    0				! Avoid compiler message
+		    END;
+
+		[%C'I'] :
+		    ! Insert this character.
+		    BEGIN
+		    fs_wchar (fra, .hold_operand1);
+		    END;
+
+		[%C'J'] :
+		    ! Justification mark
+		    BEGIN
+		    ! Insert appropriate amount of spacing here.
+
+		    INCR i FROM 1 TO .padding [.pi] DO
+			fs_wchar (fra, %C' ');
+
+		    operand1 = 0;
+		    pi = .pi + 1;	! Sychronize insert count with word
+		    END;		! count.
+
+		[%C'O'] :
+		    (IF .tsf_ovr
+		    THEN
+		    ! If overstriking is wanted remember this information.
+			BEGIN
+			! Remember overstrike character
+			overstrike_char = .hold_operand1;
+			operand1 = .hold_operand1;
+
+			IF .overstrike_count EQL 0
+			THEN
+			! Remember start of overstrike sequence.
+			    overstrike_seq = .hold_seq_start;
+			overstrike_count = .overstrike_count + 1;
+			END
+		    );
+
+		[OTHERWISE] :
+		    BEGIN
+		    ! Some illegal character following RINTES.  Tell the user
+		    ! it's an internal logic error and then carry on.
+		    erms (rnfile, CH$PTR (UPLIT ('lout1')), 5);
+		    END;
+		TES;
+	    END
+	ELSE
+	    BEGIN 		! Are positioned at the "naked" character.
+	    ! Is this an emphasized or overstruck character?
+	    IF .operand1 NEQ 0
+	    THEN
+		! Process character according to which pass.
+		BEGIN
+		IF .pass_cntr EQL pass_setup
+		THEN
+		    ! Save location of emphasized character for later passes.
+		    BEGIN
+		    IF .emph_current_bold 		THEN bold_limit  = .k;
+		    IF (.overstrike_count NEQ 0)	THEN over_limit  = .k;
+		    IF .emph_current_underline 		THEN under_limit = .k;
+		    END;
+
+		SELECTONE TRUE OF
+		    SET
+%IF LN01 %THEN
+		    [laser_output] :		!Output for LN01 or LN01E.
+			lnemph (.hold_khar, .gca_ln01_ital_under, 
+				emphasis_bits, .overstrike_count, 
+				.overstrike_char, .overstrike_seq, .pass_cntr);
+%FI
+%IF DSRPLUS %THEN
+		    [.gca_op_dev EQL op_dev_vt100] :	!Output for VT100.
+			vtemph (.hold_khar, .gca_ln01_ital_under, 
+				emphasis_bits, .pass_cntr);
+%FI
+%IF FLIP %THEN
+		    [(.gca_op_dev EQL op_dev_flip)] :	!Output for FLIP.
+			flemph (.hold_khar, .gca_ln01_ital_under, 
+				emphasis_bits, .pass_cntr);
+%FI
+		    [.outopt_back] :		!Backspace mode.
+			bsemph (.hold_khar, .gca_ln01_ital_under, 
+				emphasis_bits, .overstrike_count, 
+				.overstrike_char, .overstrike_seq, .pass_cntr);
+
+		    [.outopt_over] :		!Line overprinting mode.
+			opemph 	(.hold_khar, .gca_ln01_ital_under, 
+				emphasis_bits, .overstrike_count, 
+				.overstrike_char, .overstrike_seq, .pass_cntr);
+
+		    [OTHERWISE] : 
+			erms (rnfile, CH$PTR (UPLIT ('build_line')), 10);
+
+		    TES;
+
+		operand1 = 0;
+		hold_operand1 = 0;
+		emph_current_bold = false;
+		emph_current_underline = false;
+		overstrike_count = 0;
+		overstrike_char = 0;
+		END
+	    ELSE
+		!It's a normal, unemphasized character to be output. Put it 
+		! in the output buffer only if pass 1 or pass 7; otherwise 
+		! use ' ' for a place holder.
+		IF (NOT emphasis_passes)
+		THEN
+		    BEGIN
+%IF LN01 %THEN
+		    !Check for LN01 emphasis and turn it off.
+		    IF laser_output
+			AND
+			(.emph_previous_emphasized NEQ 0)	!Emphasis on?
+		    THEN
+			!Have to turn off all emphasis
+			lnemph (-1, .gca_ln01_ital_under, 
+				emphasis_bits, .overstrike_count, 
+				.overstrike_char, .overstrike_seq, .pass_cntr);
+%FI
+%IF DSRPLUS %THEN
+		    !Check for VT100 emphasis and turn it off.
+		    IF (.gca_op_dev EQL op_dev_vt100)		!VT100.
+			AND
+			(.emph_previous_emphasized NEQ 0)	!Emphasis on?
+		    THEN
+			!Have to turn off all emphasis
+			vtemph (-1, .gca_ln01_ital_under, 
+				emphasis_bits, .pass_cntr);
+%FI
+%IF FLIP %THEN
+		    !Check for FLIP emphasis and turn it off
+		    IF (.gca_op_dev EQL op_dev_flip)
+		    THEN
+			flemph (-1, .gca_ln01_ital_under, 
+				emphasis_bits, .pass_cntr);
+%FI
+		    fs_wchar (fra, .hold_khar);	!First or last pass: write character.
+		    END				
+		ELSE
+		    fs_wchar (FRA, %C' ');	! Emphasis pass: write placeholding space.
+
+	    END; 				! End of "naked" character processing.
+
+	END;					! End of 'INCR K' loop.
+
+    ! For the first pass, compute the number of the LAST pass that will be 
+    ! made over this text.
+
+    IF .pass_cntr EQL pass_setup
+    THEN
+	last_pass =
+	    (IF (.over_limit NEQ 0
+		  OR .under_limit NEQ 0
+		  OR .bold_limit NEQ 0)
+	     THEN
+		pass_real_text
+	     ELSE
+		pass_setup);
+%IF LN01 %THEN
+    ! Be sure there's no emphasis left hanging around.
+    IF (laser_output AND (.emph_previous_emphasized NEQ 0) )
+    THEN
+	!Finish this record.
+	lnemph (-1, .gca_ln01_ital_under, 
+		emphasis_bits, .overstrike_count, 
+		.overstrike_char, .overstrike_seq, .pass_cntr);
+%FI
+%IF DSRPLUS %THEN
+    !In VT100 mode everything is done in one pass. But first we have to be 
+    !sure there's no emphasis left hanging around.
+
+    IF (.gca_op_dev EQL op_dev_vt100)		!VT100?
+    THEN
+	!Finish this record
+	BEGIN
+	IF .emph_previous_underline OR .emph_previous_bold	!Any emphasis left on?
+	THEN
+	    vtemph (-1, .gca_ln01_ital_under, 
+		emphasis_bits, .pass_cntr);
+
+	RETURN true;				!Nothing more left to do.
+	END;
+%FI
+%IF FLIP %THEN
+    !For FLIP, everything is done in one pass.
+    IF (.gca_op_dev EQL op_dev_flip)
+    THEN
+	BEGIN
+	flemph (-1, .gca_ln01_ital_under, 
+		emphasis_bits, .pass_cntr);
+
+	RETURN true;
+	END;
+%FI
+
+!+
+! We are now finished with one pass ... almost. Regardless of how we got here, there's some text
+! that hasn't been output yet. If there is nothing left to do, then we'll RETURN TRUE, which forces
+! out this text with a CRLF after it at the bottom of LOUT1. Otherwise, near the end of this routine
+! the text gets output with no CRLF. 
+!-
+    IF (.outopt_back)			! User said /BACKSPACE; everything is done in one pass.
+      OR
+	(.pass_cntr EQL .last_pass)	! Last pass.
+    THEN
+	RETURN true;
+
+    ! For emphasis passes, add a "bare <cr>" to the line. It is at the end of the line which is to
+    ! be overprinted, not at the start of the line which does the overprinting. 
+    IF  emphasis_passes
+    THEN
+	fs_wchar (fra, 13);
+!+
+! The following two output operations, which generate the intermediate (emphasis) bare-<cr> 
+! lines, are not done for the underlining passes if the user specified /SEPARATE. Instead,
+! underlining is done in a separate call to BUILD_LINE, from LOUT1, after the 7th pass over
+! the line. This second call to BUILD_LINE is signalled by a LAST_PASS value of -1, which is
+! used in the macro GENERATE_BARE_CR_LINE, tested below.
+!-
+    ! If this is a bolding pass (.PASS_CNTR is even) then repeat the line as many times as specified
+    ! on the /BOLD:n switch. The expression (.OUTOPT_BLDN - 1) is arrived at as follows: .OUTOPT_BLDN is
+    ! the number of times that the line should be overprinted, so this INCR overprints one time less. An
+    ! additional CLH (CLH_OUT_NOCRLF) below adds an overprint. When BUILD_LINE returns TRUE the final
+    ! overprinting is done. The module DOOPTS has taken care of the /BOLD:0 case, so that if the user said
+    ! /BOLD:0, no bolding is seen by this routine at all. 
+    !
+    IF  (NOT .pass_cntr)
+	AND
+   	generate_bare_cr_line
+	AND
+	(NOT laser_output)
+    THEN
+	INCR I FROM 1 TO (.outopt_bldn - 1) DO
+	    clh (clh_out_nocrlf);
+
+    ! At the end of every intermediate (emphasis) pass over the line, output the line without any
+    ! carriage control following it. If this is the first or the last pass, then we do no output now. 
+    IF  emphasis_passes
+	AND
+   	generate_bare_cr_line
+	AND
+	(NOT laser_output)
+    THEN
+	clh (clh_out_nocrlf);
+
+    !
+    ! Clear the line buffer in the following cases:
+    !
+    !	- for LN01 output, on any pass but overstriking or real_text
+    !	- for non-LN01 output, on any pass but the separate-underlining pass
+    !
+    IF laser_output
+    THEN
+	! ** NOTE: This test depends on the values in PASS.REQ: the 
+	!	   overstriking passes must come last.
+	BEGIN
+	IF .pass_cntr LSS pass_overstrike 
+	THEN 
+	    fs_init (fra);
+	END
+    ELSE
+	BEGIN
+	IF .last_pass GTR 0
+	THEN				!Not separate-underlining.
+	    fs_init (fra);
+	END;
+
+    ! Decide which pass comes next and set up counter for the next iteration.
+    !
+    pass_cntr = compute_next_pass ();
+
+    RETURN false;
+
+    END;					! End of build_line
+
+%SBTTL 'compute_next_pass -- Decide which pass comes next'
+ROUTINE compute_next_pass = 
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Decide which pass over the MRA the next pass should be.
+!
+! FORMAL PARAMETERS:	None
+!
+! IMPLICIT INPUTS:
+!
+!	The value of the OWN variable pass_cntr is used as the starting 
+!	point for the calculation.
+!
+!	Values in the tsf, outopt, and gca structures are used (in some 
+!	cases by way of macros defined at the top of this module).
+!
+!	The order of the pass_... literals defined in PASS.REQ determines 
+!	the overall logic of this routine.
+!
+! IMPLICIT OUTPUTS:	None
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Returns the new value for pass_cntr (but does not update the OWN 
+!	itself).
+!
+! SIDE EFFECTS:		None
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	next_one;
+
+    ! Start with the current value of the pass counter.
+    next_one = .pass_cntr;
+
+    ! Increment based on whether there is any bolding or not.
+    next_one = (IF .tsf_bld
+		THEN
+		    (.next_one + 1)
+		ELSE
+		    (.next_one + 2)
+		);
+
+    ! Check for underlining in Passes 3 and 4.
+    IF	(.next_one EQL pass_underline)
+	OR 
+	(.next_one EQL pass_bold_underline)
+    THEN
+	IF (NOT .tsf_und)		!No underlining to do, or
+	  OR (.outopt_und_nosp		! non-spacing underline
+	      AND NOT .outopt_und_sep)	! (was already done)...
+	THEN				
+	    next_one = .next_one + 2;	! Skip the underlining pass.
+
+    ! For LN01 output, any overstriking is taken care of at the 
+    ! overstrike pass (only).
+    IF	(.next_one EQL pass_bold_overstrike)
+	AND 
+	(laser_output)
+    THEN
+	next_one = pass_real_text;
+
+    ! Skip if no overstriking required.
+    IF	(.next_one GEQ pass_overstrike)
+	AND
+	(NOT .tsf_ovr)
+    THEN
+	next_one = pass_real_text;
+
+    RETURN .next_one;
+
+    END;					! End of compute_next_pass
+
+END						! End of module
+ELUDOM

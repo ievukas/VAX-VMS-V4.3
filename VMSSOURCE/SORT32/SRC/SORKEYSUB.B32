@@ -1,0 +1,3309 @@
+MODULE SOR$KEY_SUB (
+		IDENT = 'V04-000'	! File: SORKEYSUB.B32 Edit: PDG3033
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+!
+! FACILITY:	VAX-11 SORT/MERGE
+!
+! ABSTRACT:
+!
+!	This module contains the routines that build the comparison routine.
+!
+! ENVIRONMENT:	VAX/VMS user mode
+!
+! AUTHOR: P. Gilbert, CREATION DATE: 14-Dec-1981
+!
+! MODIFIED BY:
+!
+!	T03-015		Original
+!	T03-016	Add run-time check for presence of VFC area in LENADR routine.
+!		PDG 20-Dec-1982
+!	T03-017	Check for DISP[COM_ORD_MAX] (not CTX[COM_LRL_INT]) exceeding
+!		MAX_REFSIZE.  PDG 28-Dec-1982
+!	T03-018	Added clean-up routines.  PDG 6-Jan-1983
+!	T03-019	New interface for collating sequence stuff.  PDG 26-Jan-1983
+!	T03-020	Don't output the stable field for index sorts.  Change the
+!		severity of SOR$_KEY_LEN.  Save the stream number for stable
+!		merges.  PDG 27-Jan-1983
+!	T03-021	Changes for hostile environment.  PDG 3-Feb-1983
+!	T03-022	Change MOVC5s to use a pad character.  PDG 8-Feb-1983
+!	T03-023	Pass the context address to callback routines.  PDG 11-Feb-1983
+!	T03-024	Some changes with linkages.  PDG 10-Mar-1983
+!	T03-025	Fix bug in GEN_CONVERT_FLT.  Check validity of KBF_ORDER.
+!		PDG 22-Mar-1983
+!	T03-026	Redefine 2-byte opcodes to conform with STARLET's definition.
+!		PDG 4-Apr-1983
+!	T03-027	Various changes for KANJI.  PDG 2-May-1983
+!	T03-028	Test for F-floating, D-floating and decimal hardware support.
+!		PDG 10-May-1983
+!	T03-029	Allocate an extra byte in generated code to avoid a 11/750
+!		problem when the next byte is not readable.  PDG 9-Aug-1983
+!	T03-030	Set COM_EQUAL equal to 0 if it's not needed.  PDG 26-Aug-1983
+!	T03-031	Add COM_ARCHFLAG to store SYI$_ARCHFLAG.  PDG 31-Jan-1984
+!	T03-032	Change COM_RHB to COM_RHB_INP and COM_RHB_OUT.
+!		This is to avoid problems with merge, where an incoming
+!		record overwrites the VFC area for the outgoing record.
+!		PDG 24-Jul-1984
+!	T03-033	Correct diagnoses of entire key disappearing (SOR$_KEY_LEN).
+!		PDG 9-Aug-1984
+!--
+
+LIBRARY	'SYS$LIBRARY:LIB';
+LIBRARY 'SRC$:OPCODES';
+REQUIRE	'SRC$:COM';
+
+LITERAL				! Global registers used between routines
+    R_CUR_PC =	10,
+    R_BRANCH =	9;
+LITERAL
+    FUN_K_STAB=	FALSE;		! True to pass records in a stable order
+LINKAGE
+    LINK_OPOPNEQ =
+	JSB(REGISTER=2,REGISTER=4):
+	GLOBAL(CUR_PC=R_CUR_PC, BRANCH=R_BRANCH, CTX=COM_REG_CTX)
+	NOTUSED(1,5,6,7,8),
+
+    LINK_BNEQ =
+	JSB(REGISTER=4):
+	GLOBAL(CUR_PC=R_CUR_PC, BRANCH=R_BRANCH, CTX=COM_REG_CTX)
+	NOTUSED(1,2,3,5,6,7,8),
+
+    LINK_SAVE =
+	JSB(REGISTER=4):
+	GLOBAL(CUR_PC=R_CUR_PC, BRANCH=R_BRANCH, CTX=COM_REG_CTX)
+	NOTUSED(2,3,5,6,7,8),
+
+    LINK_DISP =
+	JSB(REGISTER=2,REGISTER=3):
+	GLOBAL(CUR_PC=R_CUR_PC)
+	NOTUSED(1,4,5,6,7,8,9,11),
+
+    LINK_LITE =
+	JSB(REGISTER=2,REGISTER=3):
+	GLOBAL(CUR_PC=R_CUR_PC)
+	NOTUSED(1,5,6,7,8,9,11),
+
+    LINK_ROOM =
+	JSB(REGISTER=0):
+	GLOBAL(CUR_PC=R_CUR_PC,
+		CTX=COM_REG_CTX)
+	NOTUSED(6,7,8,9),
+
+    LINK_COMPARE =
+	CALL:
+	GLOBAL(CUR_PC=R_CUR_PC, BRANCH=R_BRANCH,
+		CTX=COM_REG_CTX),
+
+    LINK_MOVE =
+	CALL:
+	GLOBAL(CUR_PC=R_CUR_PC,
+		CTX=COM_REG_CTX);
+
+FORWARD ROUTINE
+    TKS_HACK:		NOVALUE	CAL_CTXREG,
+    KEY_COMPRESS:	NOVALUE	CAL_CTXREG,
+    COND_HAND,
+!   CHAR_HARDWARE:	CAL_CTXREG,		! Test for Char String support
+!   EDPC_HARDWARE:	CAL_CTXREG,		! Test for EDITPC support
+!   CRC_HARDWARE:	CAL_CTXREG,		! Test for CRC support
+!   DCML_HARDWARE:	CAL_CTXREG,		! Test for Decimal support
+    FFLT_HARDWARE:	CAL_CTXREG,		! Test for F-floating support
+    DFLT_HARDWARE:	CAL_CTXREG,		! Test for D-floating support
+    GFLT_HARDWARE:	CAL_CTXREG,		! Test for G-floating support
+    HFLT_HARDWARE:	CAL_CTXREG,		! Test for H-floating support
+    DO_REI:		NOVALUE,
+    EMIT_DISP:		NOVALUE LINK_DISP,
+    SAVE_REGS:		NOVALUE LINK_SAVE,
+    EMIT_BNEQ:		NOVALUE LINK_BNEQ,
+    EMIT_LITE:		NOVALUE LINK_LITE,
+    ROOM:			LINK_ROOM,
+    OPOPNEQ:		NOVALUE LINK_OPOPNEQ,
+    GEN_CONVERT_DEC:		LINK_COMPARE,
+    GEN_CONVERT_FLT:		LINK_COMPARE,
+    GEN_MOVE:		NOVALUE	LINK_MOVE,
+    GEN_COMPARE:	NOVALUE	LINK_COMPARE,
+    MOVE_KEYS:			LINK_COMPARE,
+    EXPAND:		NOVALUE,
+    SOR$$KEY_SUB:		CAL_CTXREG,
+    CLEAN_UP:		CAL_CTXREG NOVALUE;
+
+SOR$$END_ROUTINE_(CLEAN_UP);
+
+EXTERNAL ROUTINE
+    SOR$$ERROR,						! Issue diagnostic
+    %IF NOT HOSTILE %THEN
+    SOR$$RDT:		CAL_CTXREG,			! Use record defn table
+    SOR$$RFA_ACCESS:	NOVALUE	CAL_ACCESS,		! Access record by RFA
+    %FI
+    SOR$$ALLOCATE:	CAL_CTXREG,			! Allocate storage
+    SOR$$DEALLOCATE:	CAL_CTXREG NOVALUE;		! Deallocate storage
+
+%IF NOT HOSTILE %THEN
+EXTERNAL
+    LIB$AB_CVTTP_O:	ADDRESSING_MODE(GENERAL),
+    LIB$AB_CVTTP_U:	ADDRESSING_MODE(GENERAL),
+    LIB$AB_CVTTP_Z:	ADDRESSING_MODE(GENERAL);
+%FI
+
+%IF NOT HOSTILE %THEN
+EXTERNAL LITERAL
+    FUN_K_KANJI: WEAK UNSIGNED(1);
+%FI
+
+%IF HOSTILE %THEN
+    MACRO
+	SYS$GETSYIW = SOR$SYS$GETSYIW %,
+	SYS$UNWIND  = SOR$SYS$UNWIND  %;
+%FI
+
+! This bit in the key description buffer indicates a converted key
+!
+MACRO
+    KBF_CVT =	%FIELDEXPAND(KBF_ORDER,0),
+		%FIELDEXPAND(KBF_ORDER,1) + 1, 1, 0 %;
+
+
+! PLEN_ gives the number of bytes required for a packed number of X digits.
+! LEN_ gives the number of bytes for a key.
+!
+MACRO
+    PLEN_(X) = ((X)/2+1) %,
+    LEN_(B) =
+	BEGIN
+	SWITCHES STRUCTURE(BLOCK[,BYTE]);	! STRUCTURE(KBF_BLOCK)
+	IF .B[KBF_TYPE] EQL DSC$K_DTYPE_P
+	THEN PLEN_(.B[KBF_LENGTH])
+	ELSE .B[KBF_LENGTH]
+	END %;
+
+! Define the field within COM_ROUTINES that references the start of the
+! generated code.
+!
+MACRO
+    S_START =	%EXPAND %FIELDEXPAND(COM_ROUTINES,0) + 1, 0, 32, 0 %;
+
+!
+! The following tables contain the largest allowed sizes for the various
+! datatypes (a value of -1 indicates no upper limit); a bitvector
+! indicating that the length, if specified, should match the maximum length;
+! and a bit indicating that the datatype can be compared like a binary number.
+!
+MACRO
+    DSC_SUPPORTED =
+	    DSC$K_DTYPE_ADT,	8,	TRUE,	TRUE,
+	    DSC$K_DTYPE_B,	1,	TRUE,	TRUE,
+	    DSC$K_DTYPE_BU,	1,	TRUE,	TRUE,
+	    DSC$K_DTYPE_D,	8,	TRUE,	FALSE,
+	    DSC$K_DTYPE_F,	4,	TRUE,	FALSE,
+	    DSC$K_DTYPE_G,	8,	TRUE,	FALSE,
+	    DSC$K_DTYPE_H,	16,	TRUE,	FALSE,
+	    DSC$K_DTYPE_L,	4,	TRUE,	TRUE,
+	    DSC$K_DTYPE_LU,	4,	TRUE,	TRUE,
+	    DSC$K_DTYPE_NL,	32,	FALSE,	FALSE,
+	    DSC$K_DTYPE_NLO,	31,	FALSE,	FALSE,
+	    DSC$K_DTYPE_NR,	32,	FALSE,	FALSE,
+	    DSC$K_DTYPE_NRO,	31,	FALSE,	FALSE,
+	    DSC$K_DTYPE_NU,	31,	FALSE,	FALSE,
+	    DSC$K_DTYPE_NZ,	31,	FALSE,	FALSE,
+	    DSC$K_DTYPE_O,	16,	TRUE,	TRUE,
+	    DSC$K_DTYPE_OU,	16,	TRUE,	TRUE,
+	    DSC$K_DTYPE_P,	31,	FALSE,	FALSE,
+	    DSC$K_DTYPE_Q,	8,	TRUE,	TRUE,
+	    DSC$K_DTYPE_QU,	8,	TRUE,	TRUE,
+	    DSC$K_DTYPE_T,	-1,	FALSE,	FALSE,
+	    DSC$K_DTYPE_W,	2,	TRUE,	TRUE,
+	    DSC$K_DTYPE_WU,	2,	TRUE,	TRUE,
+	    DSC$K_DTYPE_Z,	-1,	FALSE,	FALSE %;
+LITERAL
+    MAX_SUPPORTED = DSC$K_DTYPE_ADT;	! Value of largest supported data type
+MACRO
+    DSC_L_[A,B,C,D] = [A] = B %,
+    DSC_F_[A,B,C,D] = [A] = C %,
+    DSC_B_[A,B,C,D] = [A] = D %;
+OWN
+    DSC_LENGTH: VECTOR[MAX_SUPPORTED+1,BYTE,SIGNED]
+	PSECT(SOR$RO_CODE) PRESET(DSC_L_(DSC_SUPPORTED)),
+    DSC_FORCE: BITVECTOR[MAX_SUPPORTED+1]
+	PSECT(SOR$RO_CODE) PRESET(DSC_F_(DSC_SUPPORTED)),
+    DSC_BINARY: BITVECTOR[MAX_SUPPORTED+1]
+	PSECT(SOR$RO_CODE) PRESET(DSC_B_(DSC_SUPPORTED));
+
+! Macroes to emit a sequence of bytes.
+!
+MACRO
+    EMIT_4[W,X,Y,Z] =
+	%IF NOT %NULL(Z) %THEN EMIT_LONG((W)+(X)^8+(Y)^16+(Z)^24) %ELSE
+	%IF NOT %NULL(X) %THEN EMIT_WORD((W)+(X)^8)
+	%IF NOT %NULL(Y) %THEN;EMIT_BYTE((Y)) %FI %ELSE
+	%IF NOT %NULL(W) %THEN EMIT_BYTE((W)) %FI %FI %FI %,
+    EMIT_BYTES[] =
+	BEGIN
+	EMIT_4(%REMAINING)
+	END %,
+    EMIT_BYTE(X) = CH$WCHAR_A(X,CUR_PC) %,
+    EMIT_WORD(X) = (CUR_PC[0,0,16,0] = X; CUR_PC = .CUR_PC+2) %,
+    EMIT_LONG(X) = (CUR_PC[0,0,32,0] = X; CUR_PC = .CUR_PC+4) %,
+    !
+    ! Emit an absolute address
+    !
+    EMIT_ABSA(X) = (EMIT_BYTE(M_AID+R_PC); EMIT_LONG(X)) %;
+LITERAL
+    K_ABSA = 5;
+
+LITERAL
+    K_BYTE =	1,
+    K_WORD =	2,
+    K_LONG =	4;
+
+! Define the value of the largest short literal
+!
+LITERAL
+    SHORT_LIT =	63;	! Largest short literal
+
+! None of the code generated by these routines should reference registers
+! COM_REG_SRC1, COM_REG_SRC2 or COM_REG_CTX except by these names.  Therefore,
+! undeclare the R_x names for these registers.
+!
+UNDECLARE
+    %NAME('R_',%NUMBER(COM_REG_SRC1)),
+    %NAME('R_',%NUMBER(COM_REG_SRC2)),
+    %NAME('R_',%NUMBER(COM_REG_CTX));
+
+!
+! Saving and restoring registers in the key comparison routines.
+!
+! The linkage to the key comparison routine allows only registers R0..R5 to be
+! used, register R0 is the returned value, and register R1 need not be saved.
+! When any of R2..R5 must be saved, SAVE_REGS is called with a mask of the
+! registers to save.  This may generate code, and affects the code generated
+! by EMIT_BNEQ to restore saved registers.
+!
+! When registers are saved (with a PUSHR), the mask of saved registers is
+! updated.  EMIT_BNEQ will generate appropriate code to branch to (or around)
+! code to restore the saved registers and return (in R0) plus or minus one.
+!
+! EMIT_BNEQ identifies the appropriate action based on its parameter, which is
+! used as an index into the BRANCH vector.  This parameter is one of:
+!	K_U	Unsigned ascending	K_U+1	Unsigned descending
+!	K_S	Signed ascending	K_S+1	Signed descending
+!
+! The following code may be generated.  Choices are listed by preference.
+!
+!	{
+!	  { BNEQ {UA|UD|SA|SD} | BEQL 1$/BRW {UA|UD|SA|SD}/1$: }
+!	|
+!	  { UA:BLEQU 1$ | UD:BGEQU 1$ | SA:BLEQ 1$ | SD:BGEQ 1$ }
+!	  POPR #^M<mask>/MOVL #1,R0/RSB
+!	  1$: { BNEQ M | BEQL 2$/M:POPR #^M<mask>/MNEGL #1,R0/RSB/2$: }
+!	}
+!
+! Thus, from 2 to 16 bytes of code are generated per EMIT_BNEQ.  The branches
+! to UA, UD, SA, SD, or M are taken only if that label has been defined, is
+! withing range, and restores the appropriate registers.  POPRs are generated
+! only if registers must be restored.
+!
+! A zero is returned at the end of the key comparison routine by the following.
+!
+!	POPR #^M<mask>/CLRL R0/RSB
+!
+! For each label, the following information is stored (offsets are from the
+! beginning of generated code).
+!
+!	The offset to the label (-1 indicates the label hasn't been generated).
+!	The mask of registers that are restored at that label.
+!
+! Note that the registers must be saved in order.  That is, if Ri is saved,
+! then Rj (with j < i) cannot later be saved.  This should be no problem,
+! since all register saves are from R0..Rk.
+!
+LITERAL
+    K_U  =	0,	! Unsigned ascending	(descending is one greater)
+    K_S  =	2;	! Signed ascending	(descending is one greater)
+
+OWN
+    OPC_BRANCHES: VECTOR[4,BYTE,UNSIGNED]
+	PSECT(SOR$RO_CODE) PRESET(
+	    [K_U] = OPC_BLEQU,	[K_U+1] = OPC_BGEQU,
+	    [K_S] = OPC_BLEQ,	[K_S+1] = OPC_BGEQ);
+
+MACRO
+    SAVED_REGS = BRANCH[0] %,
+    BR_D_(X) = BRANCH[1+(X)] %,	! Address for a direct branch
+    BR_M_(X) = BRANCH[5+(X)] %,	! Mask of restored registers
+    BR_I_(X) = BRANCH[9+(X)] %;	! Address for an indirect branch
+
+LITERAL
+    BR_SIZE = 1+3*4;		! Size in longwords of branches array
+
+ROUTINE TKS_HACK
+	(
+	KEY_BUFF:	REF KEY_BLOCK
+	):	CAL_CTXREG NOVALUE =
+!++
+! Functional Description:
+!
+!	This routine modifies the key description buffer to account for the
+!	fact that keys are being stripped.
+!
+!	The number of bytes to strip is computed from the key descriptions,
+!	or specified by the user as the "total key size" parameter,
+!	depending.
+!
+!	Key stripping and key prefixing are known as the infamous TKS hack.
+!
+! Formal Parameters:
+!
+!	KEY_BUFF	Address of DSC format key descriptions.
+!			The descriptions may be modified by this routiine.
+!
+! Implicit Inputs:
+!
+!	CTX		Longword pointing to work area (passed in COM_REG_CTX)
+!
+! Implicit Outputs:
+!
+!	CTX[COM_TKS]	Number of bytes to strip before calling user-written
+!			routines, and before returning the record.
+!	CTX[COM_LRL]	Advanced by the number of bytes we are stripping.
+!
+! Routine Value:
+!
+!	None (may signal errors).
+!
+! Side Effects:
+!
+!	None.
+!
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CTX =	COM_REG_CTX:	REF CTX_BLOCK;
+
+    IF NOT .CTX[COM_HACK_STRIP]
+    THEN
+	BEGIN
+	!
+	! We were requested to not do this hack.
+	!
+	CTX[COM_TKS] = 0;
+	RETURN;
+	END;
+
+
+    ! If the user-comparison routine is being used, strip as many bytes as
+    ! were specified by the user (TOT_KEY_SIZE parameter).
+    !
+    ! If we are generating our own key comparison routine,
+    !	and the record interface is being used (on input),
+    ! then use KEY_BUFF to calculate the number of bytes to strip,
+    ! otherwise, don't strip any keys (set COM_TKS to zero).
+    !
+    IF .CTX[COM_COMPARE] NEQ 0	! His own comparison routine?
+    THEN
+	0			! Don't change COM_TKS
+    ELIF
+	.CTX[COM_NUM_FILES] NEQ 0
+    THEN
+	CTX[COM_TKS] = 0	! File interface, don't strip keys
+    ELSE
+	BEGIN
+	CTX[COM_TKS] = 0;
+	INCR I FROM 0 TO .KEY_BUFF[KEY_NUMBER]-1 DO
+	    BEGIN
+	    LOCAL
+		KBF:	REF KBF_BLOCK;	! Pointer to the key description
+
+	    ! Grab a local pointer to the key description buffer
+	    !
+	    KBF = KEY_BUFF[KEY_KBF(.I)];
+
+	    ! Store the offset to this key
+	    !
+	    KBF[KBF_POSITION] = .CTX[COM_TKS];
+
+	    ! Note: The old sort didn't allow unconverted decimal keys, we do.
+	    !
+	    CTX[COM_TKS] = .CTX[COM_TKS] + LEN_(KBF[BASE_]);
+
+	    END;
+	END;
+
+    CTX[COM_LRL] = .CTX[COM_LRL] + .CTX[COM_TKS];
+
+    END;
+
+ROUTINE KEY_COMPRESS
+	(
+	KEY_BUFF:	REF KEY_BLOCK
+	):	CAL_CTXREG NOVALUE =
+!++
+! Functional Description:
+!
+!	This routine attempts to combine adjacent keys.
+!	Additionally, it converts keys to a normalized form.
+!
+! Formal Parameters:
+!
+!	KEY_BUFF	Address of DSC format key descriptions.
+!			The descriptions may be modified by this routiine.
+!
+! Implicit Inputs:
+!
+!	CTX		Longword pointing to work area (passed in COM_REG_CTX)
+!
+! Implicit Outputs:
+!
+!	None.
+!
+! Routine Value:
+!
+!	None (may signal errors).
+!
+! Side Effects:
+!
+!	None.
+!
+! Notes:
+!
+!	The following datatypes compare bytes in the following order:
+!
+!	C	u0,u1,u2,...
+!	xB	x0
+!	xW	x1,u0
+!	xL	x3,u2,u1,u0
+!	xQ	x7,u6,...,u1,u0
+!	xO	x15,u14,...,u1,u0
+!
+!	The following pairs of adjacent keys can be combined:
+!
+!	Keys	Conditions		Result
+!	C	x.l=1			Ub(x.a,x.l)
+!	C,C	x.a+x.l=y.a		C(x.a,x.l+y.l)
+!	C,uB	x.a+x.l=y.a,y.l=1	C(x.a,x.l+y.l)
+!	uB,C	x.a+x.l=y.a,x.l=1	C(x.a,x.l+y.l)
+!	xb,Ub	x.a=y.a+y.l		xb(y.a,x.l+y.l)
+!
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CTX =	COM_REG_CTX:	REF CTX_BLOCK;
+    0;
+
+%(
+	KEY_NUMBER =	0, 0, 16, 0 %,			! Number of keys
+	KEY_KBF(N) =	2 + KBF_K_SIZE * (N), 0, 0, 0 %,
+	KEY_BLOCK =	BLOCK[2 + KBF_K_SIZE * MAX_KEYS, BYTE] %;
+
+    ! For each key, attempt to combine it with following keys
+    !
+    INCR I FROM 0 TO .KEY_BUFF[KEY_NUMBER]-1 DO
+	BEGIN
+	LOCAL
+	    KBF1:	REF KBF_BLOCK,	! Pointer to the key description
+	    KBF2:	REF KBF_BLOCK;	! Pointer to the key description
+
+	! Grab a local pointer to the key description buffer
+	!
+	KBF1 = KEY_BUFF[KEY_KBF(.I)];
+
+	?????
+
+	END;
+)%
+    END;
+
+ROUTINE COND_HAND (
+	SIGVEC:	REF BLOCK[,BYTE],	! Signal vector
+	MCHVEC:	REF BLOCK[,BYTE]) =	! Mechanism vector
+!++
+! Functional Description:
+!
+!	This routine is a condition handler for the x_HARDWARE routines.
+!	The x_HARDWARE routines determine whether the x-type instructions
+!	are implemented in hardware.
+!
+! Formal Parameters:
+!
+!	SIGVEC	Signal vector
+!	MCHVEC	Mechanism vector
+!
+! Implicit Inputs:
+!
+!	None.
+!
+! Implicit Outputs:
+!
+!	None.
+!
+! Routine Value:
+!
+!	If SS$_OPCDEC was signalled, unwind the stack so that the x_HARDWARE
+!	routine returns FALSE (not implemented in hardware).
+!	If any other error was signalled, return SS$_RESIGNAL.
+!
+! Notes:
+!
+!	The returned value of the x_HARDWARE routines should not affect the
+!	correctness of the sort.
+!	If TRUE is incorrectly returned, LIB$EMULATE fakes the instructions.
+!	If FALSE is incorrectly returned, the key will be converted, so that
+!	binary compares will be used.
+!
+!	The x_HARDWARE routines may be short-circuited by defining the symbol
+!	x_FORCE to be the value to return.
+!
+!	If the instruction succeeds, we then look at SYI$_ARCHFLAG to determine
+!	whether the instruction emulator is in use (since this would cause us
+!	to not catch the signal).
+!
+! Side Effects:
+!
+!	None.
+!
+!--
+    BEGIN
+    IF .SIGVEC[CHF$L_SIG_NAME] EQL SS$_OPCDEC
+    THEN
+	BEGIN
+	MCHVEC[CHF$L_MCH_SAVR0] = FALSE;
+	RETURN $UNWIND();
+	END
+    ELSE
+	RETURN SS$_RESIGNAL;
+    END;
+
+LINKAGE
+    JSB0 = JSB: NOPRESERVE(0,1,2,3,4,5) NOTUSED(6,7,8,9,10,11),
+    JSB1 = JSB(REGISTER=2): GLOBAL(CTX=COM_REG_CTX)
+		NOPRESERVE(0,1,2,3,4,5) NOTUSED(6,7,8,9,10);
+LITERAL
+    ARC_NOTUSED = NOT(		! Mask of bits with no meaning (to us)
+	ARC$M_CHAR_EMUL OR ARC$M_DCML_EMUL OR ARC$M_EDPC_EMUL OR
+	ARC$M_CRC_EMUL  OR ARC$M_DFLT_EMUL OR ARC$M_FFLT_EMUL OR
+	ARC$M_GFLT_EMUL OR ARC$M_HFLT_EMUL);
+    ASSERT_(ARC_NOTUSED NEQ 0)	! Assert there are some unused bits
+
+
+ROUTINE ARCHFLAG(P): JSB1 =
+    BEGIN
+    EXTERNAL REGISTER
+	CTX = COM_REG_CTX:	REF CTX_BLOCK;
+
+    ! Have we gotten SYI$_ARCHFLAG before?
+    !
+    IF .CTX[COM_ARCHFLAG] EQL 0
+    THEN
+	BEGIN
+	!
+	! Call $GETSYI, and then indicate that we've gotten SYI$_ARCHFLAG
+	!
+	ASSERT_(%FIELDEXPAND(COM_ARCHFLAG,2) GEQ ARC$S_ARCDEF * %BPUNIT)
+	LOCAL
+	    ITMLST: VECTOR[4] INITIAL
+		(SYI$_ARCHFLAG ^ 16 + ARC$S_ARCDEF, CTX[COM_ARCHFLAG], 0, 0);
+	$GETSYIW(ITMLST=ITMLST[0]);	! On errors COM_ARCHFLAG is still zero
+	CTX[COM_ARCHFLAG] = .CTX[COM_ARCHFLAG] OR ARC_NOTUSED;
+	END;
+
+    ! Return the value of the ARC$V_xxx_EMUL flag
+    !
+!   IF     .BITVECTOR[UPLIT(ARC_NOTUSED),.P] THEN SOR$$ERROR(SOR$_SHR_BADLOGIC);
+    RETURN .BITVECTOR[CTX[COM_ARCHFLAG], .P];
+    END;
+
+MACRO
+    P_(O,P,S,E) = P %;
+MACRO
+    X_HARDWARE(A) =
+	BEGIN
+	!
+	! Return true if hardware support exists
+	! Return false otherwise
+	!
+	EXTERNAL REGISTER
+	    CTX = COM_REG_CTX:	REF CTX_BLOCK;
+	%IF %DECLARED(%NAME(A,'_FORCE'))
+	%THEN
+	    RETURN %NAME(A,'_FORCE')
+	%ELSE
+	    BEGIN
+	    !
+	    ! Establish a condition handler so that if we catch an "opcode
+	    ! reserved to Digital" signal, we will assume no hardware support.
+	    !
+	    ESTABLISH_(COND_HAND);
+	    !
+	    ! Try the instruction.
+	    !
+	    JSB0(UPLIT BYTE(%REMAINING, OPC_RSB));
+	    !
+	    ! We got here.  The instruction is either implemented in hardware
+	    ! or emulated (so that we couldn't catch a signal).
+	    ! If the system claims it is emulating, assume no hardware support.
+	    ! If it claims no emulation, assume the hardware got us here.
+	    !
+	    ASSERT_((ARC_NOTUSED AND %NAME('ARC$M_',A,'_EMUL')) EQL 0)
+	    RETURN NOT ARCHFLAG( P_( %NAME('ARC$V_',A,'_EMUL') ) );
+	    END
+	%FI
+	END %;
+
+!	CHAR_HARDWARE:CAL_CTXREG = X_HARDWARE('CHAR', OPC_CMPC3, 0, %X'0C', %X'0C');
+!	EDPC_HARDWARE:CAL_CTXREG = X_HARDWARE('EDPC', OPC_BPT);
+!	CRC_HARDWARE :CAL_CTXREG = X_HARDWARE('CRC',  OPC_BPT);
+!	DCML_HARDWARE:CAL_CTXREG = X_HARDWARE('DCML', OPC_CMPP3, 0, %X'0C', %X'0C');
+ROUTINE FFLT_HARDWARE:CAL_CTXREG = X_HARDWARE('FFLT', OPC_CMPF, 0, 0);
+ROUTINE DFLT_HARDWARE:CAL_CTXREG = X_HARDWARE('DFLT', OPC_CMPD, 0, 0);
+ROUTINE GFLT_HARDWARE:CAL_CTXREG = X_HARDWARE('GFLT', WORD(OPC_CMPG), 0, 0);
+ROUTINE HFLT_HARDWARE:CAL_CTXREG = X_HARDWARE('HFLT', WORD(OPC_CMPH), 0, 0);
+
+ASSERT_(DSC$K_DTYPE_F MOD 5 EQL 0)
+ASSERT_(DSC$K_DTYPE_D MOD 5 EQL 1)
+ASSERT_(DSC$K_DTYPE_G MOD 5 EQL 2)
+ASSERT_(DSC$K_DTYPE_H MOD 5 EQL 3)
+MACRO
+    FDGH_HARDWARE_(DTY) = (.VECTOR[UPLIT BYTE(
+	FFLT_HARDWARE - FFLT_HARDWARE, DFLT_HARDWARE - FFLT_HARDWARE,
+	GFLT_HARDWARE - FFLT_HARDWARE, HFLT_HARDWARE - FFLT_HARDWARE),
+	(DTY) MOD 5;,BYTE] + FFLT_HARDWARE)() %;
+
+ROUTINE DO_REI: NOVALUE =
+    BEGIN
+    !
+    ! This little routine executes an REI instruction.  This is the only
+    ! architecturally defined way to ensure that code which was written by
+    ! a program is actually available before the instruction prefetch.
+    !
+    LINKAGE LINK_REI = INTERRUPT: NOTUSED(2,3,4,5,6,7,8,9,10,11);
+    ROUTINE REI( RETPC, RETPSL ): LINK_REI = 0;
+    LOCAL NEWPSL;
+    BUILTIN MOVPSL;
+    MOVPSL(NEWPSL);
+    REI(.NEWPSL);
+    END;
+
+LITERAL K_SAVE_REGS = 3;			! Max bytes from this routine
+ROUTINE SAVE_REGS(S): LINK_SAVE NOVALUE =
+    BEGIN
+    EXTERNAL REGISTER
+	CUR_PC = R_CUR_PC:	REF BLOCK,
+	BRANCH = R_BRANCH:	REF VECTOR;
+    LOCAL
+	M;				! Registers not currently saved
+
+    ! Don't bother saving registers that don't need to be preserved for the
+    ! linkage to the comparison routine.  Don't bother saving registers that
+    ! have already been saved.  We must, however, save registers in increasing
+    ! order (because that's the way PUSHR and POPR work, and the only info we
+    ! keep is the mask of registers saved, not the order we saved them).
+    !
+    M = .S AND NOT .SAVED_REGS AND NOT %NOPRESERVE(JSB_COMPARE);
+    IF .M EQL 0 THEN RETURN;
+
+    ! We need to save some more registers.  If (for example), we are saving R8,
+    ! we must also save R0 through R7 (unless they've have already been saved,
+    ! or don't need to be saved for this linkage).
+    !
+    M = .M OR .M^-1;
+    M = .M OR .M^-2;
+    M = .M OR .M^-4;
+    M = .M OR .M^-8;
+    M = .M AND NOT .SAVED_REGS AND NOT %NOPRESERVE(JSB_COMPARE);
+
+    ! Check that the save mask fits in a short literal.
+    !
+    IF .M GTRU SHORT_LIT THEN SOR$$ERROR(SOR$_SHR_BADLOGIC);
+
+    ! Generate code to store the registers on the stack, and update the
+    ! register save mask.
+    !
+    EMIT_BYTES(OPC_PUSHR, .M);
+    SAVED_REGS = .SAVED_REGS OR .M;
+
+    END;
+
+LITERAL K_BNEQ = 18;				! Max bytes from this routine
+ROUTINE EMIT_BNEQ(DST): LINK_BNEQ NOVALUE =
+!+
+!   Emit a BNEQ instruction
+!-
+    BEGIN
+    EXTERNAL REGISTER
+	CUR_PC = R_CUR_PC:	REF BLOCK,
+	BRANCH = R_BRANCH:	REF VECTOR,
+	CTX = COM_REG_CTX:	REF CTX_BLOCK;
+
+    ! See whether we have a definition for the desired label.
+    !
+    IF  .BR_D_(.DST) LSS 0 OR
+	.BR_M_(.DST) NEQ .SAVED_REGS
+    THEN
+	BEGIN
+	!
+	! No label defined yet.  Generate code.
+	!
+	LOCAL
+	    TMP: REF VECTOR[,BYTE];
+	BR_D_(.DST) = BR_I_(.DST) = .CUR_PC - .CTX[S_START];
+	BR_M_(.DST) = .SAVED_REGS;
+	ASSERT_(K_BNEQ GEQ 2+2+4+2+2+4)
+	EMIT_BYTES(.OPC_BRANCHES[.DST],0);
+	TMP = .CUR_PC;
+	IF .SAVED_REGS NEQ 0 THEN EMIT_BYTES(OPC_POPR, .SAVED_REGS);
+	EMIT_BYTES(OPC_MOVL, 1, M_R+R_0, OPC_RSB);
+	TMP[-1] = .CUR_PC - .TMP;
+	EMIT_BYTES(OPC_BEQL, 0);
+	TMP = .CUR_PC;
+	IF .SAVED_REGS NEQ 0 THEN EMIT_BYTES(OPC_POPR, .SAVED_REGS);
+	EMIT_BYTES(OPC_MNEGL, 1, M_R+R_0, OPC_RSB);
+	TMP[-1] = .CUR_PC - .TMP;
+	END
+    ELSE
+	BEGIN
+	ASSERT_(K_BNEQ GEQ 5)
+	!
+	! The code exists, we just have to get there.
+	!
+	LOCAL
+	    Z;
+	Z = .BR_D_(.DST) + .CTX[S_START] - .CUR_PC - 2;	! Branch displacement
+	IF
+	    BEGIN
+	    IF .Z<0,8,1> EQL .Z			! Will branch byte suffice?
+	    THEN
+		TRUE
+	    ELSE
+		BEGIN
+		LOCAL
+		    T: REF VECTOR[,BYTE,SIGNED];
+		T = .BR_I_(.DST) + .CTX[S_START];
+		Z = .T - .CUR_PC - 2;
+		IF .Z<0,8,1> EQL .Z		! Can we branch to a branch?
+		THEN
+		    BEGIN
+		    !
+		    ! Try a little branch chaining
+		    !
+		    IF .T[0] EQL OPC_BNEQ
+		    THEN
+			BEGIN
+			T = .T + .T[1] - .CUR_PC;
+			IF .T<0,8,1> EQL .T THEN Z = .T;
+			END;
+		    TRUE
+		    END
+		ELSE
+		    FALSE
+		END
+	    END
+	THEN
+	    BEGIN
+	    BR_I_(.DST) = .CUR_PC - .CTX[S_START];	! Save indirect branch address
+	    EMIT_BYTE(OPC_BNEQ);
+	    EMIT_BYTE(.Z);
+	    END
+	ELSE
+	    BEGIN
+	    EMIT_BYTES(OPC_BEQL, 3);
+	    BR_I_(.DST) = .CUR_PC - .CTX[S_START];	! Save indirect branch address
+	    EMIT_BYTE(OPC_BRW);
+	    EMIT_WORD(.Z);				! Branch to final destination
+	    END;
+	END;
+    END;
+
+LITERAL K_DISP = 5;				! Max bytes from this routine
+ROUTINE EMIT_DISP(DISP, REG): LINK_DISP NOVALUE =
+!+
+!   Displacement mode addressing (does not handle PC-relative addressing).
+!-
+    BEGIN
+    EXTERNAL REGISTER
+	CUR_PC = R_CUR_PC:	REF BLOCK;
+    IF
+	.DISP<0,08,1> EQL .DISP
+    THEN
+	BEGIN
+	IF .DISP EQL 0
+	THEN
+	    EMIT_BYTE(M_RD+.REG)		! (reg)
+	ELSE
+	    BEGIN
+	    EMIT_BYTE(M_BD+.REG);		! ^Bxx(reg)
+	    EMIT_BYTE(.DISP);
+	    END;
+	END
+    ELIF
+	.DISP<0,16,1> EQL .DISP
+    THEN
+	BEGIN
+	EMIT_BYTE(M_WD+.REG);			! ^Wxxxx(reg)
+	EMIT_WORD(.DISP);
+	END
+    ELSE
+	BEGIN
+	EMIT_BYTE(M_LD+.REG);			! ^Lxxxxxxxx(reg)
+	EMIT_LONG(.DISP);
+	END;    
+    END;
+
+LITERAL K_OPOPNEQ = K_DISP+K_DISP+K_BNEQ;	! Max bytes from this routine
+ROUTINE OPOPNEQ(OFF, DST): LINK_OPOPNEQ NOVALUE =
+    BEGIN
+    EXTERNAL REGISTER
+	CUR_PC = R_CUR_PC:	REF BLOCK,
+	BRANCH = R_BRANCH:	REF VECTOR,
+	CTX = COM_REG_CTX:	REF CTX_BLOCK;
+    BUILTIN
+	TESTBITCC;
+
+    IF TESTBITCC(DST<0,1,0>)		! Check ascending/descending flag
+    THEN
+	BEGIN
+	EMIT_DISP(.OFF, COM_REG_SRC1);	! xx(Rsrc1)
+	EMIT_DISP(.OFF, COM_REG_SRC2);	! yy(Rsrc2)
+	END
+    ELSE
+	BEGIN
+	EMIT_DISP(.OFF, COM_REG_SRC2);	! yy(Rsrc2)
+	EMIT_DISP(.OFF, COM_REG_SRC1);	! xx(Rsrc1)
+	END;
+    EMIT_BNEQ(.DST);			! BNEQ dst
+    END;
+
+LITERAL K_LITE = 5;				! Max bytes from this routine
+ROUTINE EMIT_LITE(BWL, LIT): LINK_LITE NOVALUE =
+!+
+!   Literal mode addressing
+!-
+    BEGIN
+    EXTERNAL REGISTER
+	CUR_PC = R_CUR_PC:	REF BLOCK;
+    IF
+	.LIT LEQU SHORT_LIT
+    THEN
+	EMIT_BYTE(.LIT)
+    ELSE
+	BEGIN
+	EMIT_BYTE(M_AI+R_PC);			! (PC)+
+	CUR_PC[0,0,8*.BWL,0] = .LIT;
+	CUR_PC = .CUR_PC + .BWL;
+	END;
+    END;
+
+LITERAL K_CALL4 = 37		! Max bytes from this routine
+	%IF FUN_K_STAB %THEN +30 %FI;
+ROUTINE EMIT_CALL4
+	(
+	U_RTN,			! Address of the user routine
+	DISP:	REF VECTOR	! Address of field displacements table
+	): NOVALUE LINK_COMPARE =
+!+
+!   Generate a call to a user routine.
+!
+!   The arguments passed to the user routine are:
+!	Address of source1, by reference
+!	Address of source2, by reference
+!	Length of source1, by reference
+!	Length of source2, by reference
+!	Address of the user's context longword
+!-
+    BEGIN
+    EXTERNAL REGISTER
+	CTX=	COM_REG_CTX:	REF CTX_BLOCK,
+	CUR_PC = R_CUR_PC:	REF BLOCK;
+
+    ASSERT_(K_CALL4 GEQ
+	1+K_DISP+			! Push address of the context longword
+	MAX(1+K_DISP+1+K_DISP,2+2+2)+	! Push the lengths
+	MAX(4,1+K_DISP+1+K_DISP)+	! Push the addresses
+	%IF FUN_K_STAB %THEN
+	1+2*K_DISP+2+7+12+		! Swap for stable sorts
+	%FI
+	2+K_ABSA)			! The CALL itself
+
+
+    IF NOT .CTX[COM_HACK_2ARGS]
+    THEN
+	BEGIN
+	!
+	! Push the address of the user's context longword
+	!
+	EMIT_BYTE(OPC_PUSHAB);
+	EMIT_DISP(%FIELDEXPAND(COM_CTXADR,0)*%UPVAL, COM_REG_CTX);
+	!
+	! Push the addresses of the word lengths
+	!
+	IF .DISP[COM_ORD_VAR] GEQ 0
+	THEN
+	    BEGIN
+	    EMIT_BYTE(OPC_PUSHAB);
+	    EMIT_DISP(.DISP[COM_ORD_VAR], COM_REG_SRC2);
+	    EMIT_BYTE(OPC_PUSHAB);
+	    EMIT_DISP(.DISP[COM_ORD_VAR], COM_REG_SRC1);
+	    END
+	ELSE
+	    BEGIN
+	    EMIT_BYTES(OPC_PUSHAW, M_AI+R_PC);
+	    EMIT_WORD(.CTX[COM_LRL]-.CTX[COM_TKS]);
+	    EMIT_BYTES(OPC_PUSHL, M_RD+R_SP);
+	    END;
+	END;
+
+    ! Now push the addresses of the records
+    !
+    %IF COM_REG_SRC1+1 EQL COM_REG_SRC2
+    %THEN
+    IF .DISP[COM_ORD_DATA] EQL 0 AND .CTX[COM_TKS] EQL 0
+    THEN
+	EMIT_BYTES(OPC_MOVQ, M_R+COM_REG_SRC1,		! MOVQ	Rsrc1
+	    M_AD+R_SP)					!	-(SP)
+    ELSE
+    %FI
+	BEGIN
+	EMIT_BYTE(OPC_PUSHAB);				! PUSHAB
+	EMIT_DISP(.DISP[COM_ORD_DATA]+.CTX[COM_TKS],	!	n(Rsrc2)
+		COM_REG_SRC2);
+	EMIT_BYTE(OPC_PUSHAB);				! PUSHAB
+	EMIT_DISP(.DISP[COM_ORD_DATA]+.CTX[COM_TKS],	!	n(Rsrc1)
+		COM_REG_SRC1);
+	END;
+
+    ! If stable sorts were requested, be sure that we pass the arguments in
+    ! a stable order!
+    !
+    %IF FUN_K_STAB %THEN
+    IF .DISP[COM_ORD_STAB] GEQ 0
+    THEN
+	BEGIN
+	LOCAL
+	    TMP: REF VECTOR[,BYTE];
+	EMIT_BYTE(OPC_CMPL);
+	EMIT_DISP(.DISP[COM_ORD_STAB], COM_REG_SRC1);
+	EMIT_DISP(.DISP[COM_ORD_STAB], COM_REG_SRC2);
+	EMIT_BYTES(OPC_BLEQ, 0);
+	TMP = .CUR_PC;
+	EMIT_BYTES(OPC_MOVQ, M_AI+R_SP, M_R+R_0,
+	    OPC_PUSHL, M_R+R_0,
+	    OPC_PUSHL, M_R+R_1);
+	IF NOT .CTX[COM_HACK_2ARGS] AND .DISP[COM_ORD_VAR] GEQ 0
+	THEN
+	    EMIT_BYTES(OPC_MOVQ, M_BD+R_SP, 8, M_R+R_0,
+		OPC_MOVL, M_R+R_1, M_BD+R_SP, 8,
+		OPC_MOVL, M_R+R_0, M_BD+R_SP, 12);
+	TMP[-1] = .CUR_PC - .TMP;
+	END;
+    %FI
+
+
+    ! Now emit the CALL
+    !
+    IF NOT .CTX[COM_HACK_2ARGS]
+    THEN
+	EMIT_BYTES(OPC_CALLS, 5)			! CALLS	#5
+    ELSE
+	EMIT_BYTES(OPC_CALLS, 2);			! CALLS	#2
+    EMIT_ABSA(.U_RTN);					!	rtn
+
+    END;
+
+ROUTINE ROOM(SPACE): LINK_ROOM =
+!+
+!   Verify amount of space remaining in string, extending string if needed.
+!-
+    BEGIN
+    EXTERNAL REGISTER
+	CUR_PC = R_CUR_PC:	REF BLOCK,
+	CTX =	COM_REG_CTX:	REF CTX_BLOCK;
+    BIND
+	XCODE =	CTX[COM_ROUTINES]: VECTOR[2];
+
+    LOCAL
+	DELTA:	VECTOR[2],
+	OLDSTART;
+
+    ! Determine how much memory we need
+    !
+    DELTA[0] = .CUR_PC - .XCODE[1] + .SPACE;
+
+    ! See whether we have enough space.
+    ! Return if there's already more than enough.
+    !
+    IF .XCODE[0] GEQ .DELTA[0]
+    THEN
+	RETURN TRUE;
+
+    ! Round memory request up to a multiple of 128 (i.e., get more than needed)
+    !
+    DELTA[0] = ROUND_(.DELTA[0], 128);
+
+    ! Save the old starting address
+    !
+    OLDSTART = .XCODE[1];
+
+    ! Allocate the memory
+    !
+    DELTA[1] = SOR$$ALLOCATE(.DELTA[0]);
+
+    ! Copy the old code into the new buffer
+    !
+    CH$MOVE(.XCODE[0], .XCODE[1], .DELTA[1]);
+
+    ! Deallocate the old code
+    !
+    SOR$$DEALLOCATE(.XCODE[0], XCODE[1]);
+
+    ! Copy the new length/address into COM_ROUTINES
+    !
+    XCODE[0] = .DELTA[0];
+    XCODE[1] = .DELTA[1];
+
+    ! Update the current PC
+    !
+    CUR_PC = .CUR_PC - .OLDSTART + .XCODE[1];
+
+    RETURN FALSE;
+    END;
+
+LITERAL K_MOVE = 66;				! Max bytes from this routine
+ROUTINE GEN_MOVE
+	(
+	LEN,					! Bytes to move
+	SRCOFF,					! Source offset
+	SRCREG,					! Source register
+	DSTOFF,					! Destination offset
+	DSTREG					! Destination register
+	):	NOVALUE	LINK_MOVE =
+!++
+! Functional Description:
+!
+!	This routine generates code to do a simple move.
+!
+! Formal Parameters:
+!
+!	(see above)
+!	CTX		Longword pointing to work area (passed in COM_REG_CTX)
+!
+! Implicit Inputs:
+!
+!	None.
+!
+! Implicit Outputs:
+!
+!	None.
+!
+! Routine Value:
+!
+!	None.
+!
+! Side Effects:
+!
+!	None.
+!
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CUR_PC = R_CUR_PC:	REF BLOCK,
+	CTX =	COM_REG_CTX:	REF CTX_BLOCK;
+
+    IF .SRCREG EQL COM_REG_SRC1 AND .LEN+.SRCOFF GTR .CTX[COM_SRL]
+    THEN
+	BEGIN
+	ASSERT_(K_MOVE GEQ 1+K_LITE+8+K_DISP+K_LITE+K_LITE+K_DISP)
+	!
+	! If the source is coming from the input record, and the field extends
+	! past the shortest record length, we must emit a MOVC5 instruction.
+	! It is a little tacky to assume that we are in the input conversion
+	! routine, based on SRCREG being COM_REG_SRC1, but this test suffices;
+	! Care should be taken in the rest of this module if this is not so.
+	! Code depending on this aspect of GEN_MOVE is coded as GEN_MOVE_VAR.
+	!
+	IF .SRCOFF NEQ 0
+	THEN
+	    BEGIN
+	    EMIT_BYTE(OPC_SUBW3);		! SUBW3
+	    EMIT_LITE(K_WORD, .SRCOFF);		!	#srcoff,
+	    EMIT_BYTES(M_R+R_6, M_R+R_0,	!	R6, R0
+		OPC_BGEQU, 2,			! BGEQU	0$
+		OPC_CLRW, M_R+R_0,		! CLRW	R0
+		OPC_MOVC5, M_R+R_0);		! 0$: MOVC5 R0,
+	    END
+	ELSE
+	    BEGIN
+	    EMIT_BYTES(OPC_MOVC5, M_R+R_6);	! MOVC5	R6,
+	    END;
+	EMIT_DISP(.SRCOFF, .SRCREG);		!	srcoff(srcreg),
+	EMIT_LITE(K_BYTE, .CTX[COM_PAD]);	!	#pad,
+	EMIT_LITE(K_WORD, .LEN);		!	#len,
+	EMIT_DISP(.DSTOFF, .DSTREG);		!	dstoff(dstreg)
+	END
+    ELIF .LEN GTR TUN_K_BINMOVE
+    THEN
+	BEGIN
+	ASSERT_(K_MOVE GEQ 1+K_LITE+K_DISP+K_DISP)
+	EMIT_BYTE(OPC_MOVC3);
+	EMIT_LITE(K_WORD, .LEN);
+	EMIT_DISP(.SRCOFF, .SRCREG);
+	EMIT_DISP(.DSTOFF, .DSTREG);
+	END
+    ELSE
+	BEGIN
+	BIND
+	    MOVE = UPLIT BYTE(OPC_MOVB, OPC_MOVW, OPC_MOVL, OPC_MOVQ):
+		VECTOR[,BYTE];
+	LOCAL
+	    L;
+	ASSERT_(K_MOVE GEQ (1+K_DISP+K_DISP)*(((TUN_K_BINMOVE-7)/8)+3))
+	L = .LEN;
+	DECR I FROM 3 TO 0 DO WHILE .L GEQ 1^.I DO
+	    BEGIN
+	    EMIT_BYTE(.MOVE[.I]);
+	    EMIT_DISP(.SRCOFF+.LEN-.L, .SRCREG);
+	    EMIT_DISP(.DSTOFF+.LEN-.L, .DSTREG);
+	    L = .L - 1^.I;
+	    END;
+	END;
+    END;
+BIND ROUTINE GEN_MOVE_VAR = GEN_MOVE: NOVALUE LINK_MOVE;
+
+ROUTINE GEN_CONVERT_DEC
+	(
+	PKBF:		REF KBF_BLOCK,		! Key description
+	DISP,					! Displacement from SRC2
+	STACK:		REF VECTOR[1]		! Amount of stack needed
+	):		LINK_COMPARE =
+!++
+! Functional Description:
+!
+!	This routine generates code to convert a single decimal key.
+!
+! Formal Parameters:
+!
+!	PKBF		Address of the key description.
+!			This is modified to reflect the new key description.
+!	DISP		Displacement from SRC2 of where to write the key.
+!	STACK		Address of the amount of temporary stack allocation
+!	CTX		Longword pointing to work area (passed in COM_REG_CTX)
+!
+! Implicit Inputs:
+!
+!	None.
+!
+! Implicit Outputs:
+!
+!	None.
+!
+! Routine Value:
+!
+!	Length in bytes of the converted key.
+!
+! Side Effects:
+!
+!	None.
+!
+! Notes:
+!
+!	It is worthwhile to convert packed numbers to a more convienient form,
+!	because of the performance of the CMPP instructions, particularly on
+!	VAX architectures that don't implement these instructions in microcode.
+!	This is not yet implemented.
+!
+!	Note the following classification of how the sign nibble compares on
+!	VAX-11/780s:
+!		Negative: 1,3,5,9,B,D
+!		Positive: 0,2,4,6,7,8,A,C,E,F
+!		All forms of zero compare equal.
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CTX=	COM_REG_CTX:	REF CTX_BLOCK,
+	CUR_PC=	R_CUR_PC:	REF BLOCK;
+    LITERAL
+	K_MAXDEC =	31;	! Maximum length of decimal data
+    LOCAL
+	POFF,			! Offset to packed number on stack
+	CVTLEN,			! Length in bytes of converted data
+	LEN,			! Length used in CVTSP and CVTTP instructions
+	REG_SRC,		! Source register
+	KBF:	REF KBF_BLOCK;	! Key description
+
+    %IF NOT HOSTILE %THEN
+
+    KBF = PKBF[BASE_];
+    LEN = .KBF[KBF_LENGTH];
+    IF ONEOF_(.KBF[KBF_TYPE], BMSK_(DSC$K_DTYPE_NL, DSC$K_DTYPE_NR))
+    THEN
+	LEN = .LEN - 1;		! DSC length includes sign, the hardware doesn't
+
+    IF .LEN EQL 1 AND .KBF[KBF_TYPE] EQL DSC$K_DTYPE_NLO
+    THEN
+	KBF[KBF_TYPE] = DSC$K_DTYPE_NRO;
+
+
+    ! If all we will be looking at is a sign, don't do this test, since
+    ! +0 and -0 sort equally.
+    !
+    IF .LEN EQL 0 AND
+	    ONEOF_(.KBF[KBF_TYPE], BMSK_(DSC$K_DTYPE_NL, DSC$K_DTYPE_NR))
+    THEN
+	BEGIN
+	KBF[KBF_TYPE] = DSC$K_DTYPE_Z;
+	KBF[KBF_LENGTH] = 0;
+	RETURN 0;
+	END;
+
+
+    ! Determine how much stack space is required for this routine
+    !
+    BEGIN
+    LOCAL
+	STAK;
+    POFF = 0;
+    STAK = 0;
+    IF ONEOF_(.KBF[KBF_TYPE], BMSK_(DSC$K_DTYPE_NLO, DSC$K_DTYPE_NR))
+    THEN
+	STAK = ROUND_(.LEN+1);
+    IF .LEN LEQ 9
+    THEN
+	BEGIN
+	POFF = .STAK;
+	STAK = .STAK + PLEN_(.LEN);
+	END;
+    STACK[0] = MAX(.STACK[0], .STAK);
+    END;
+
+    ! Normally, the source comes from the input record (COM_REG_SRC2).
+    ! However, for indexed sorts, the key may have already been moved to the
+    ! internal format record.  If so, use COM_REG_SRC2 as the input register.
+    !
+    REG_SRC = COM_REG_SRC1;
+    IF .KBF[KBF_CVT] THEN REG_SRC = COM_REG_SRC2;
+
+    ! Convert the number to packed.
+    !
+    IF .KBF[KBF_TYPE] EQL DSC$K_DTYPE_NLO
+    THEN
+	BEGIN
+	ROOM(K_MOVE+1+K_DISP+3+K_ABSA+13);
+	GEN_MOVE(MAX(.LEN-1,0),				! MOVE	#len-1
+	    .KBF[KBF_POSITION]+1, .REG_SRC,		!	1(src)
+	    2, R_SP);					!	2(SP)
+	EMIT_BYTE(OPC_MOVZBL);				! MOVZBL
+	EMIT_DISP(.KBF[KBF_POSITION], .REG_SRC);	!	(src)
+	EMIT_BYTES(M_R+R_0,				!	R0
+	    OPC_MOVB, M_I+R_0);				! MOVB
+	EMIT_ABSA(LIB$AB_CVTTP_O);			!	CVTTP_O[R0]
+	EMIT_BYTES(M_AD+R_SP,				!	-(SP)
+	    OPC_MOVB, 1, M_AD+R_SP,			! MOVB	#1, -(SP)
+	    OPC_CVTPS, 2, M_RD+R_SP,			! CVTPS	#2, (SP)
+	    1, M_BD+R_SP, 2,				!	#1, 2(SP)
+	    OPC_ADDL2, 2, M_R+R_SP);			! ADDL2	#2, SP
+	END
+    ELIF
+	.KBF[KBF_TYPE] EQL DSC$K_DTYPE_NR
+    THEN
+	BEGIN
+	ROOM(1+K_DISP+1+K_MOVE);
+	EMIT_BYTE(OPC_MOVB);				! MOVB	nn+len(Rsrc1)
+	EMIT_DISP(.KBF[KBF_POSITION]+.LEN, .REG_SRC);
+	EMIT_BYTE(M_RD+R_SP);				!	(SP)
+	GEN_MOVE(.LEN,					! MOVE	#len
+	    .KBF[KBF_POSITION], .REG_SRC,		!	nn(Rsrc1)
+	    1, R_SP);					!	1(SP)
+	END;
+
+    ROOM(1+K_LITE+MAX(1,K_DISP)+K_ABSA+K_LITE);
+
+    ! Emit the opcode
+    !
+    IF ONEOF_(.KBF[KBF_TYPE], BMSK_(
+	DSC$K_DTYPE_NU, DSC$K_DTYPE_NZ, DSC$K_DTYPE_NRO))
+    THEN
+	EMIT_BYTE(OPC_CVTTP)
+    ELSE
+	EMIT_BYTE(OPC_CVTSP);
+
+    ! Emit the source length
+    !
+    EMIT_LITE(K_WORD, .LEN);
+
+
+    ! Emit the source address
+    !
+    IF ONEOF_(.KBF[KBF_TYPE], BMSK_(
+	DSC$K_DTYPE_NLO, DSC$K_DTYPE_NR))
+    THEN
+	EMIT_BYTES(M_RD+R_SP)
+    ELSE
+	EMIT_DISP(.KBF[KBF_POSITION], .REG_SRC);
+
+
+    ! Emit a reference to the appropriate translation table, if needed
+    !
+    IF .KBF[KBF_TYPE] EQL DSC$K_DTYPE_NU
+    THEN
+	EMIT_ABSA(LIB$AB_CVTTP_U)
+    ELIF .KBF[KBF_TYPE] EQL DSC$K_DTYPE_NZ
+    THEN
+	EMIT_ABSA(LIB$AB_CVTTP_Z)
+    ELIF .KBF[KBF_TYPE] EQL DSC$K_DTYPE_NRO
+    THEN
+	EMIT_ABSA(LIB$AB_CVTTP_O);
+
+
+    ! The destination length
+    !
+    EMIT_LITE(K_WORD, .LEN);
+
+
+    ! Determine whether packed is the best we can do
+    !
+    ROOM(K_DISP+1+K_LITE+1+1+2+K_DISP+1+K_LITE+1);
+    IF .LEN GTR 9
+    THEN					! Value won't fit in a longword
+	BEGIN
+	!
+	! We've converted the number to packed
+	!
+	KBF[KBF_TYPE] = DSC$K_DTYPE_P;
+	CVTLEN = PLEN_(.LEN);	! Value to return
+	KBF[KBF_LENGTH] = .LEN;
+	END
+    ELSE					! Value will fit in a longword
+	BEGIN
+	!
+	! We will convert to some form of signed binary
+	!
+	KBF[KBF_TYPE] = DSC$K_DTYPE_B;
+	EMIT_DISP(.POFF, R_SP);			!	xx(SP)
+	EMIT_BYTE(OPC_CVTPL);			! CVTPL
+	EMIT_LITE(K_WORD, .LEN);		!	#len
+	EMIT_BYTE(M_RD+R_3);			!	(R3)	packed number
+	IF .LEN GTR 4
+	THEN					! Value won't fit in a word
+	    BEGIN
+	    CVTLEN = 4;
+	    END
+	ELSE					! Value will fit in a word
+	    BEGIN
+	    EMIT_BYTE(M_R+R_0);
+	    IF .LEN GTR 2
+	    THEN				! Value won't fit in a byte
+		BEGIN
+		EMIT_BYTES(OPC_MOVW,M_R+R_0);
+		CVTLEN = 2;
+		END
+	    ELSE				! Value will fit in a byte
+		BEGIN
+		EMIT_BYTES(OPC_MOVB,M_R+R_0);
+		CVTLEN = 1;
+		END;
+	    END;
+	KBF[KBF_LENGTH] = .CVTLEN;
+	END;
+
+    EMIT_DISP(.DISP, COM_REG_SRC2);
+
+    KBF[KBF_POSITION] = .DISP;
+    KBF[KBF_CVT] = TRUE;
+
+    %ELSE
+
+    SOR$$ERROR(SOR$_SHR_BADLOGIC);
+    CVTLEN = 0;
+
+    %FI
+
+    RETURN .CVTLEN;
+    END;
+
+ROUTINE GEN_CONVERT_FLT
+	(
+	PKBF:		REF KBF_BLOCK,	! Key description
+	DISP				! Displacement from SRC2
+	):		LINK_COMPARE =
+!++
+! Functional Description:
+!
+!	This routine generates code to convert a single (F,D,G,H) floating key.
+!
+! Formal Parameters:
+!
+!	PKBF		Address of the key description.
+!			This is modified to reflect the new key description.
+!	DISP		Displacement from SRC2 of where to write the key.
+!	CTX		Longword pointing to work area (passed in COM_REG_CTX)
+!
+! Implicit Inputs:
+!
+!	None.
+!
+! Implicit Outputs:
+!
+!	None.
+!
+! Routine Value:
+!
+!	Length in bytes of the converted key.
+!
+! Side Effects:
+!
+!	None.
+!
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CTX=	COM_REG_CTX:	REF CTX_BLOCK,
+	CUR_PC=	R_CUR_PC:	REF BLOCK;
+    LOCAL
+	FDGH:	REF BLOCK,
+	KBF:	REF KBF_BLOCK,		! Key description
+	REG_SRC,			! Source register
+	TMP:	REF VECTOR[,BYTE];
+    ASSERT_(DSC$K_DTYPE_F MOD 5 EQL 0)
+    ASSERT_(DSC$K_DTYPE_D MOD 5 EQL 1)
+    ASSERT_(DSC$K_DTYPE_G MOD 5 EQL 2)
+    ASSERT_(DSC$K_DTYPE_H MOD 5 EQL 3)
+    MACRO
+	X_LEN = 0, 0, 8,0 %,	! Length in bytes
+	X_MB1 = 0,16,16,0 %;	! Mantissa bits in first word
+    OWN
+	OWN_FDGH: BLOCKVECTOR[4,1]
+	    PSECT(SOR$RO_CODE) PRESET(
+		[0,X_LEN]=	4,		! Length in bytes
+		[1,X_LEN]=	8,
+		[2,X_LEN]=	8,
+		[3,X_LEN]=	16,
+		[0,X_MB1]=	1^7-1,		! Mantissa bits in first word
+		[1,X_MB1]=	1^7-1,
+		[2,X_MB1]=	1^4-1,
+		[3,X_MB1]=	1^0-1);
+
+    ! Normally, the source comes from the input record (COM_REG_SRC2).
+    ! However, for indexed sorts, the key may have already been moved to the
+    ! internal format record.  If so, use COM_REG_SRC2 as the input register.
+    !
+    KBF = PKBF[BASE_];
+    REG_SRC = COM_REG_SRC1;
+    IF .KBF[KBF_CVT] THEN REG_SRC = COM_REG_SRC2;
+
+    ! We convert the floating point numbers as follows:
+    !
+    ! The first word contains the exponent, and (except for H) a few mantissa
+    ! bits.  The low word is ordered as follows (smaller to larger):
+    !	FFF0..8010,800x(reserved),000x(zero),0010..7FFF
+    !
+    ! If the sign of the number is negative, negate all the bits (except the
+    ! sign bit).
+    ! If the sign is positive, check for zero.  If not zero, clear the result,
+    ! otherwise, copy the number.
+    !
+    ROOM(1+K_DISP+2+K_DISP+6+1+K_LITE+3+8*4+8+6);
+
+    ! Get a pointer to the appropriate entry in the OWN_FDGH table.
+    !
+    FDGH = OWN_FDGH[.KBF[KBF_TYPE] MOD 5, BASE_];
+
+    ! Get the address of the source
+    ! Get the address just past the destination
+    ! Fetch the (sign-extended) sign of the source
+    !
+    EMIT_BYTES(OPC_MOVAB);				! MOVAB
+    EMIT_DISP(.KBF[KBF_POSITION], .REG_SRC);		!	(src1)
+    EMIT_BYTES(M_R+R_1,					!	R1
+	OPC_MOVAB);					! MOVAB
+    EMIT_DISP(.DISP+.FDGH[X_LEN], COM_REG_SRC2);	!	4/8/8/16(src2)
+    EMIT_BYTES(M_R+R_2,					!	R2
+	OPC_EXTV, 15, 1, M_RD+R_1,			! EXTV	#15, #1, (R1),
+	M_R+R_0);					!	R0
+
+    ! Test for an exponent of zero.
+    !
+    EMIT_BYTES(OPC_CMPW);				! CMPW
+    EMIT_LITE(K_WORD, .FDGH[X_MB1]);			!	#^X7F/7F/0F/00
+    EMIT_BYTES(M_RD+R_1,				!	(R1)
+	OPC_BGEQU, 0);					! BGEQU 1$
+    TMP = .CUR_PC;
+
+    ! Copy the number, complementing if negative
+    !
+    DECR I FROM .FDGH[X_LEN]/2-1 TO 0 DO		! Do 2/4/4/8 times
+	EMIT_BYTES(OPC_XORW3, M_R+R_0,			! XORW3	R0,
+		M_AI+R_1, M_AD+R_2);			!	(R1)+, -(R2)
+
+    ! Insert the sign bit
+    !
+    EMIT_BYTES(OPC_INSV, M_R+R_0, 7, 1,			! INSV	R0, #7, #1
+	M_BD+R_2, .FDGH[X_LEN]-1,			!	4/8/8/16-1(R2)
+	OPC_BRB, 0);					! BRB	2$
+    TMP[-1] = .CUR_PC - .TMP;				!1$:
+    TMP = .CUR_PC;
+
+    ! Zero the destination
+    !
+    IF .FDGH[X_LEN] GEQ 16  THEN EMIT_BYTES(OPC_CLRQ, M_AD+R_2);
+    IF .FDGH[X_LEN] GEQ  8  THEN EMIT_BYTES(OPC_CLRQ, M_AD+R_2)
+			    ELSE EMIT_BYTES(OPC_CLRL, M_AD+R_2);
+    TMP[-1] = .CUR_PC - .TMP;				!2$:
+
+    ! Store the new datatype
+    ! Note that this is stored in it's normalized form.
+    !
+    KBF[KBF_TYPE] = DSC$K_DTYPE_B;
+    KBF[KBF_POSITION] = .DISP;
+    KBF[KBF_CVT] = TRUE;
+
+    ! Return the length in bytes of the converted keys.
+    !
+    RETURN .FDGH[X_LEN];
+
+    END;
+
+%IF NOT HOSTILE %THEN
+ROUTINE GEN_CONVERT_UDEF
+	(
+	PKBF:		REF KBF_BLOCK,	! Key description
+	DISP				! Displacement from SRC2
+	):		LINK_COMPARE =
+!++
+! Functional Description:
+!
+!	This routine generates code to convert user-defined key data types.
+!
+! Formal Parameters:
+!
+!	PKBF		Address of the key description.
+!			This is modified to reflect the new key description.
+!	DISP		Displacement from SRC2 of where to write the key.
+!	CTX		Longword pointing to work area (passed in COM_REG_CTX)
+!
+! Implicit Inputs:
+!
+!	None.
+!
+! Implicit Outputs:
+!
+!	None.
+!
+! Routine Value:
+!
+!	Length in bytes of the converted key.
+!
+! Side Effects:
+!
+!	None.
+!
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CTX =	COM_REG_CTX:	REF CTX_BLOCK,
+	CUR_PC = R_CUR_PC:	REF BLOCK,
+	BRANCH = R_BRANCH:	REF VECTOR;
+    EXTERNAL ROUTINE
+	SOR$$DTYPE_KBF;
+    LOCAL
+	KBF:	REF KBF_BLOCK,		! Key description
+	REG_SRC,			! Source register
+	CVTKBF:	KBF_BLOCK,		! Converted key description
+	CVTRTN:	INITIAL(0),		! Conversion routine
+	CMPRTN:	INITIAL(0),		! Comparison routine
+	STATUS;
+
+    ! Check before calling SOR$$DTYPE_xxx
+    !
+    IF FUN_K_KANJI THEN 0 ELSE RETURN 0;
+
+    ! Normally, the source comes from the input record (COM_REG_SRC2).
+    ! However, for indexed sorts, the key may have already been moved to the
+    ! internal format record.  If so, use COM_REG_SRC2 as the input register.
+    !
+    KBF = PKBF[BASE_];
+    REG_SRC = COM_REG_SRC1;
+    IF .KBF[KBF_CVT] THEN REG_SRC = COM_REG_SRC2;
+
+    ! Analyze the key
+    !
+    CVTKBF[KBF_TYPE] = .KBF[KBF_TYPE];
+    CVTKBF[KBF_ORDER] = .KBF[KBF_ORDER];
+    CVTKBF[KBF_POSITION] = 0;
+    CVTKBF[KBF_LENGTH] = .KBF[KBF_LENGTH];
+    STATUS = SOR$$DTYPE_KBF(KBF[BASE_], CVTKBF[BASE_], CVTRTN, CMPRTN);
+    IF NOT .STATUS
+    THEN
+	BEGIN
+	SOR$$ERROR(SOR$_RTNERROR, 0, .STATUS);
+	KBF[KBF_TYPE] = DSC$K_DTYPE_Z;
+	KBF[KBF_LENGTH] = 0;
+	RETURN 0;
+	END;
+
+    ! Call the conversion routine
+    !
+    IF .CVTRTN NEQ 0
+    THEN
+	BEGIN
+	LOCAL
+	    TMP: REF VECTOR[,BYTE];
+
+	ROOM(4+K_LITE+4+2+K_LITE+2+K_DISP+2+K_ABSA+8+K_LITE+2+K_ABSA);
+
+	! Call the conversion routine
+	!
+	IF .REG_SRC EQL COM_REG_SRC1 AND
+	    .KBF[KBF_LENGTH]+.KBF[KBF_POSITION] GTR .CTX[COM_SRL]
+	THEN
+	    BEGIN
+	    EMIT_BYTES(
+		OPC_MOVZWL, M_R+R_6, M_R+R_0,		! MOVZWL R6, R0
+		OPC_SUBW2);				! SUBW2
+	    EMIT_LITE(K_WORD, .KBF[KBF_POSITION]);	!	#srcoff,
+	    EMIT_BYTES(M_R+R_0,				!	R0
+		OPC_BGEQU, 2,				! BGEQU	0$
+		OPC_CLRW);				! CLRW
+	    END
+	ELSE
+	    BEGIN
+	    EMIT_BYTES(OPC_MOVZWL);			! MOVZWL
+	    EMIT_LITE(K_WORD, .KBF[KBF_LENGTH]);	!	#n
+	    END;
+	EMIT_BYTES(M_R+R_0,				!	R0
+	    OPC_MOVAB);					! MOVAB
+	EMIT_DISP(.KBF[KBF_POSITION],.REG_SRC);		!	xx(Rsrc), R1
+	EMIT_BYTES(M_R+R_1, OPC_MOVZWL);		! MOVZWL
+	EMIT_LITE(K_WORD, .CVTKBF[KBF_LENGTH]);		!	#n, R2
+	EMIT_BYTES(M_R+R_2, OPC_MOVAB);			! MOVAB
+	EMIT_DISP(.DISP, COM_REG_SRC2);			!	xx(Rsrc2), R3
+	EMIT_BYTES(M_R+R_3, OPC_JSB);			! JSB
+	EMIT_ABSA(.CVTRTN);				!	CVTRTN
+
+	! Check the status
+	!
+	! It is tempting to also check for SOR$_DELxxx codes, or to
+	! delete the record if an error occurs.
+	!
+	TMP = .CUR_PC + 3;
+	EMIT_BYTES(OPC_BLBS, M_R+R_0, 0,	! BLBS	R0, 1$
+		OPC_PUSHL, M_R+R_0,		! PUSHL	R0
+		OPC_CLRL, M_AD+R_SP,		! CLRL	-(SP)
+		OPC_PUSHL);			! PUSHL	#SOR$_RTNERROR
+	EMIT_LITE(K_LONG, SOR$_RTNERROR);
+	EMIT_BYTES(OPC_CALLS, 3);		! CALLS	#3
+	EMIT_ABSA(SOR$$ERROR);			!	SOR$$ERROR
+	TMP[-1] = .CUR_PC - .TMP;		! Correct displacement
+
+	! Store the new datatype
+	!
+	KBF[KBF_TYPE] = .CVTKBF[KBF_TYPE];
+	KBF[KBF_ORDER] = .CVTKBF[KBF_ORDER];
+	KBF[KBF_POSITION] = .DISP;
+	KBF[KBF_LENGTH] = .CVTKBF[KBF_LENGTH];
+	KBF[KBF_CVT] = TRUE;
+	END;
+
+    ! Convert to it's normalized form.
+    !
+    IF .KBF[KBF_TYPE] GTRU MAX_SUPPORTED THEN 0
+    ELIF .DSC_BINARY[.KBF[KBF_TYPE]]
+    THEN
+	BEGIN
+	IF ONEOF_(.KBF[KBF_TYPE], BMSK_(DSC$K_DTYPE_BU,DSC$K_DTYPE_WU,
+	    DSC$K_DTYPE_LU,DSC$K_DTYPE_QU,DSC$K_DTYPE_OU))
+	THEN KBF[KBF_TYPE] = DSC$K_DTYPE_BU
+	ELSE KBF[KBF_TYPE] = DSC$K_DTYPE_B;
+	END;
+
+    ! Return the length in bytes of the converted keys.
+    !
+    IF .CVTRTN NEQ 0
+    THEN
+	RETURN .KBF[KBF_LENGTH]
+    ELSE
+	RETURN 0;
+
+    END;
+%FI
+
+ROUTINE GEN_COMPARE
+	(
+	PKBF:		REF KBF_BLOCK,		! Key description
+	INDEX					! Number of the key
+	):	NOVALUE	LINK_COMPARE =
+!++
+! Functional Description:
+!
+!	This routine generates a single key compare.
+!
+! Formal Parameters:
+!
+!	PKBF		Address of the key description.
+!	INDEX		Index of the key, 0 indicates the first key
+!	CTX		Longword pointing to work area (passed in COM_REG_CTX)
+!				(used only for COM_COLLATE)
+!
+! Implicit Inputs:
+!
+!	None.
+!
+! Implicit Outputs:
+!
+!	None.
+!
+! Routine Value:
+!
+!	Status code.
+!
+! Side Effects:
+!
+!	None.
+!
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CTX =	COM_REG_CTX:	REF CTX_BLOCK,
+	CUR_PC = R_CUR_PC:	REF BLOCK,
+	BRANCH = R_BRANCH:	REF VECTOR;
+    LITERAL
+	K_MAXDEC =	31;	! Maximum length of decimal data
+    MACRO
+	CMP_(OPC, SU, OFF) =
+	    BEGIN
+	    %IF %NAME('OPC_',OPC) LEQU %X'FF'
+	    %THEN EMIT_BYTE(%NAME('OPC_',OPC))
+	    %ELSE EMIT_WORD(%NAME('OPC_',OPC))
+	    %FI;
+	    OPOPNEQ(
+		.KBF[KBF_POSITION] %IF NOT %NULL(OFF) %THEN + OFF %FI,
+		%NAME('K_',SU)+.KBF[KBF_ORDER]);
+	    END %;
+
+    LOCAL
+	KBF:	REF KBF_BLOCK;		! Local copy of pointer to key
+
+    KBF = PKBF[BASE_];
+
+    ! Case on the datatype to generate code
+    !
+    ROOM(2+K_OPOPNEQ);
+    CASE .KBF[KBF_TYPE] FROM 0 TO 28 OF
+	SET
+	[DSC$K_DTYPE_T]: IF .KBF[KBF_LENGTH] GTRU 0 THEN
+%(
+	! This section of code can be used to compare implementations
+	! of the DEC_MULTINATIONAL collating sequence.
+	!
+	IF
+	    BEGIN
+	    LOCAL
+		LOG:	VECTOR[2],
+		RSL:	VECTOR[2],
+		BUF:	VECTOR[1,BYTE],
+		STATUS;
+	    LOG[0] = %CHARCOUNT('STR$COMPARE_MULTI');
+	    LOG[1] = UPLIT BYTE('STR$COMPARE_MULTI');
+	    RSL[0] = %ALLOCATION(BUF);
+	    RSL[1] = BUF[0];
+	    $TRNLOG(LOGNAM=LOG[0], RSLBUF=RSL[0]) EQL SS$_NORMAL
+	    END
+	THEN
+	    BEGIN
+	    EXTERNAL ROUTINE
+		STR$COMPARE_MULTI:	ADDRESSING_MODE(GENERAL);
+	    ROOM(2*(1+K_DISP+1+K_LITE)+12+K_ABSA+5+K_BNEQ);
+	    EMIT_BYTE(OPC_PUSHAB);
+	    EMIT_DISP(.KBF[KBF_POSITION], COM_REG_SRC1);	! xx(Rsrc1)
+	    EMIT_BYTE(OPC_PUSHL);
+	    EMIT_LITE(K_LONG, .KBF[KBF_LENGTH]);
+	    EMIT_BYTE(OPC_PUSHAB);
+	    EMIT_DISP(.KBF[KBF_POSITION], COM_REG_SRC2);	! xx(Rsrc2)
+	    EMIT_BYTE(OPC_PUSHL);
+	    EMIT_LITE(K_LONG, .KBF[KBF_LENGTH]);
+	    EMIT_BYTES(OPC_PUSHL, 1, OPC_CLRL, M_AD+R_SP,
+		OPC_PUSHAB, M_BD+R_SP, 8,
+		OPC_PUSHAB, M_BD+R_SP, 20,
+		OPC_CALLS, 4);
+	    EMIT_ABSA(STR$COMPARE_MULTI);
+	    EMIT_BYTES(OPC_ADDL2, 16, M_R+R_SP, OPC_TSTL, M_R+R_0);
+	    EMIT_BNEQ(K_S+.KBF[KBF_ORDER]);
+	    END
+	ELSE
+)%
+	    BEGIN
+	    ROOM(K_SAVE_REGS+1+K_ABSA+1+
+		MAX(1+K_LITE+K_DISP+K_DISP+5+K_BNEQ,
+		    1+K_LITE+2+K_DISP+5+K_DISP+4+K_BNEQ));
+	    SAVE_REGS(%B'111110');				! Save R1..R5
+	    EMIT_BYTE(OPC_MOVAB);
+	    EMIT_ABSA(.CTX[COM_COLLATE]);
+	    EMIT_BYTE(M_R+R_5);
+	    IF .VECTOR[.CTX[COM_COLLATE],1] NEQ 0
+	    THEN
+		BEGIN
+		LOCAL TMP: REF VECTOR[,BYTE];
+		EMIT_BYTE(OPC_CMPC3);
+		EMIT_LITE(K_WORD, .KBF[KBF_LENGTH]);
+		EMIT_DISP(.KBF[KBF_POSITION], COM_REG_SRC1);	! xx(Rsrc1)
+		EMIT_DISP(.KBF[KBF_POSITION], COM_REG_SRC2);	! xx(Rsrc2)
+		EMIT_BYTES(OPC_BEQL, 0);
+		TMP = .CUR_PC;
+		EMIT_BYTES(OPC_JSB, M_BDD+R_5, 4);
+		EMIT_BNEQ(K_S+.KBF[KBF_ORDER]);
+		TMP[-1] = .CUR_PC - .TMP;
+		END
+	    ELSE
+		BEGIN
+		EMIT_BYTE(OPC_MOVZWL);
+		EMIT_LITE(K_WORD, .KBF[KBF_LENGTH]);
+		EMIT_BYTES(M_R+R_0, OPC_MOVAB);
+		EMIT_DISP(.KBF[KBF_POSITION], COM_REG_SRC1);	! xx(Rsrc1)
+		EMIT_BYTES(M_R+R_1, OPC_MOVL, M_R+R_0, M_R+R_2, OPC_MOVAB);
+		EMIT_DISP(.KBF[KBF_POSITION], COM_REG_SRC2);	! xx(Rsrc2)
+		EMIT_BYTES(M_R+R_3, OPC_JSB, M_BDD+R_5, 0);
+		!
+		! This routine returns R0 = -1, 0, or +1.
+		! The resultant condition codes of calling this routine
+		! are equivalent to those from MOVL R0, R0.
+		! Thus, we want to do a signed branch.
+		! 
+		EMIT_BNEQ(K_S+.KBF[KBF_ORDER]);
+		END;
+	    END;
+
+	[DSC$K_DTYPE_Z,
+	 DSC$K_DTYPE_NU]: IF .KBF[KBF_LENGTH] GTRU 0 THEN
+	    BEGIN
+	    LITERAL
+		TUN_K_BYTE_COMPARE = TRUE;
+	    ROOM(1+K_OPOPNEQ+K_SAVE_REGS+1+K_LITE+K_OPOPNEQ);
+	    IF TUN_K_BYTE_COMPARE THEN CMP_(CMPB, U);
+	    IF .KBF[KBF_LENGTH] GTRU TUN_K_BYTE_COMPARE
+	    THEN
+		BEGIN
+		SAVE_REGS(%B'1110');		! Save R1..R3
+		EMIT_BYTE(OPC_CMPC3);
+		EMIT_LITE(K_WORD, .KBF[KBF_LENGTH]-TUN_K_BYTE_COMPARE);
+		OPOPNEQ(.KBF[KBF_POSITION]+TUN_K_BYTE_COMPARE, K_U+.KBF[KBF_ORDER]);
+		END
+	    END;
+	[DSC$K_DTYPE_B,
+	 DSC$K_DTYPE_BU]:
+	    BEGIN
+	    BIND
+		CMP = UPLIT BYTE(OPC_CMPB, OPC_CMPW, OPC_CMPL): VECTOR[,BYTE];
+	    LOCAL
+		L, Z, SU;
+	    L = .KBF[KBF_LENGTH];
+	    ROOM((2+.L^-2)*(1+K_OPOPNEQ));
+	    SU = K_U + .KBF[KBF_ORDER];
+	    IF .KBF[KBF_TYPE] EQL DSC$K_DTYPE_B THEN SU = .SU - K_U + K_S;
+	    DECR I FROM 2 TO 0 DO WHILE (Z = .L - 1^.I) GEQ 0 DO
+		BEGIN
+		EMIT_BYTE(.CMP[.I]);
+		OPOPNEQ(
+		    .KBF[KBF_POSITION] + .Z,
+		    .SU);
+		L = .Z;
+		SU = K_U + .KBF[KBF_ORDER];	! Other compares are unsigned
+		END;
+	    END;
+	[DSC$K_DTYPE_F]:	CMP_(CMPF, S);
+	[DSC$K_DTYPE_D]:	CMP_(CMPD, S);
+	[DSC$K_DTYPE_G]:	CMP_(CMPG, S);
+	[DSC$K_DTYPE_H]:	CMP_(CMPH, S);
+	[DSC$K_DTYPE_P]:
+	    BEGIN
+	    ROOM(K_SAVE_REGS+1+K_LITE+K_OPOPNEQ);
+	    SAVE_REGS(%B'1110');		! Save R1..R3
+	    EMIT_BYTE(OPC_CMPP3);
+	    EMIT_LITE(K_WORD, .KBF[KBF_LENGTH]);
+	    OPOPNEQ(.KBF[KBF_POSITION], K_S+.KBF[KBF_ORDER]);
+	    END;
+
+	[OUTRANGE]:
+%IF NOT HOSTILE %THEN
+	IF FUN_K_KANJI		! Check before calling SOR$$DTYPE_xxx
+	THEN
+	    BEGIN
+	    EXTERNAL ROUTINE
+		SOR$$DTYPE_KBF;
+	    LOCAL
+		CVTKBF:	KBF_BLOCK,
+		CVTRTN:	INITIAL(0),
+		CMPRTN:	INITIAL(0),
+		STATUS;
+	    STATUS = SOR$$DTYPE_KBF(KBF[BASE_], CVTKBF[BASE_], CVTRTN, CMPRTN);
+	    IF NOT .STATUS THEN SOR$$ERROR(SOR$_RTNERROR, 0, .STATUS);
+	    IF .CMPRTN EQL 0
+	    THEN
+		RETURN SOR$$ERROR(SOR$_SHR_BADLOGIC);
+	    ROOM(K_SAVE_REGS+1+K_LITE+5+K_DISP+2+K_DISP+2+K_ABSA+2+K_BNEQ);
+	    SAVE_REGS(%B'111111');			! Save R0..R5
+	    EMIT_BYTES(OPC_MOVZWL);
+	    EMIT_LITE(K_WORD, .KBF[KBF_LENGTH]);
+	    EMIT_BYTES(M_R+R_0, OPC_MOVL, M_R+R_0, M_R+R_2, OPC_MOVAB);
+	    EMIT_DISP(.KBF[KBF_POSITION], COM_REG_SRC1);	! xx(Rsrc1)
+	    EMIT_BYTES(M_R+R_1, OPC_MOVAB);
+	    EMIT_DISP(.KBF[KBF_POSITION], COM_REG_SRC2);	! xx(Rsrc2)
+	    EMIT_BYTES(M_R+R_3, OPC_JSB);
+	    EMIT_ABSA(.CMPRTN);
+	    EMIT_BYTES(OPC_TSTL, M_R+R_0);
+	    EMIT_BNEQ(K_S+.KBF[KBF_ORDER]);
+	    END
+	ELSE
+%FI
+	    RETURN SOR$$ERROR(SOR$_SHR_BADLOGIC);
+
+	[INRANGE]:
+	    RETURN SOR$$ERROR(SOR$_SHR_BADLOGIC);
+	TES;
+
+    RETURN;
+    END;
+
+ROUTINE MOVE_KEYS
+	(
+	KEY_BUFF:	REF KEY_BLOCK,		! Key descriptions buffer
+	DISP					! Displacement from SRC2
+	):	LINK_COMPARE =
+!++
+! Functional Description:
+!
+!	This routine generates code to save unconverted keys
+!	(for non-record sorts).
+!
+! Formal Parameters:
+!
+!	KEY_BUFF	Address of the key descriptions buffer.
+!			This is modified to reflect the new key descriptions.
+!	DISP		Displacement from SRC2 of where to write the key.
+!	CTX		Longword pointing to work area (passed in COM_REG_CTX)
+!
+! Implicit Inputs:
+!
+!	None.
+!
+! Implicit Outputs:
+!
+!	None.
+!
+! Routine Value:
+!
+!	Length in bytes of the copied keys.
+!
+! Side Effects:
+!
+!	None.
+!
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CTX =	COM_REG_CTX:	REF CTX_BLOCK,
+	CUR_PC = R_CUR_PC:	REF BLOCK;
+    LOCAL
+	BUFF:	REF KEY_BLOCK,	! Local copy of KEY_BUFF
+	CVTCNT;			! Number of bytes copied by this routine
+    BUFF = KEY_BUFF[BASE_];
+
+    ! Analyze the unconverted keys to determine which bytes must be copied
+    !
+    CVTCNT = 0;
+    WHILE TRUE DO
+	BEGIN
+	LOCAL
+	    LOPOS,
+	    HIPOS;
+
+	! Find the first byte containing an unconverted key.
+	!
+	LOPOS = -1;
+	DECR I FROM .BUFF[KEY_NUMBER]-1 TO 0 DO
+	    BEGIN
+	    BIND Y = BUFF[KEY_KBF(.I)]: KBF_BLOCK;
+	    IF NOT .Y[KBF_CVT] AND .Y[KBF_POSITION] LSSU .LOPOS
+	    THEN
+		LOPOS = .Y[KBF_POSITION];
+	    END;
+
+	IF .LOPOS LSS 0 THEN EXITLOOP;		! Exit of no more found
+
+	! While we are finding unconverted keys that overlap this key,
+	! take the overlap of the two pieces.
+	!
+	HIPOS = .LOPOS;
+	WHILE TRUE DO
+	    BEGIN
+	    LOCAL FOUND;
+	    FOUND = FALSE;
+	    DECR I FROM .BUFF[KEY_NUMBER]-1 TO 0 DO
+		BEGIN
+		BIND Y = BUFF[KEY_KBF(.I)]: KBF_BLOCK;
+		IF NOT .Y[KBF_CVT] AND .Y[KBF_POSITION] LEQ .HIPOS
+		THEN
+		    BEGIN
+		    FOUND = TRUE;
+		    HIPOS = MAX(.HIPOS, .Y[KBF_POSITION] + LEN_(Y[BASE_]));
+		    Y[KBF_CVT] = TRUE;
+		    Y[KBF_POSITION] = .Y[KBF_POSITION]+.DISP+.CVTCNT-.LOPOS;
+		    END;
+		END;
+	    IF NOT .FOUND THEN EXITLOOP;
+	    END;
+
+	! We found everything that overlaps this piece, so allocate it
+	!
+	IF .HIPOS NEQ .LOPOS		! Check for zero length
+	THEN
+	    BEGIN
+	    ROOM(K_MOVE);
+	    GEN_MOVE_VAR(.HIPOS - .LOPOS, .LOPOS, COM_REG_SRC1,
+		.DISP + .CVTCNT, COM_REG_SRC2);
+	    CVTCNT = .CVTCNT + .HIPOS - .LOPOS;
+	    END;
+	END;
+
+    RETURN .CVTCNT;	! Return the number of bytes this routine converted
+    END;
+
+ROUTINE EXPAND
+	(
+	ORD,
+	CNT,
+	DISP:	REF VECTOR
+	):	NOVALUE =
+!++
+! Functional Description:
+!
+!	This routine adds CNT bytes to the field referenced by ORD.
+!
+! Formal Parameters:
+!
+!	ORD	Index of the field to be expanded
+!	CNT	Number of bytes by which to expand the field
+!	DISP	Address of the displacements table
+!
+! Implicit Inputs:
+!
+!	None.
+!
+! Implicit Outputs:
+!
+!	None.
+!
+! Routine Value:
+!
+!	None.
+!
+! Side Effects:
+!
+!	None.
+!
+!--
+    BEGIN
+
+    ! Move all the following fields down.
+    ! Also, if this field hasn't been allocated yet, allocate it.
+    !
+    INCR I FROM .ORD+1 TO COM_ORD_MAX DO
+	BEGIN
+	IF .DISP[.I] GEQ 0
+	THEN
+	    BEGIN
+	    IF .DISP[.ORD] LSS 0 THEN DISP[.ORD] = .DISP[.I];
+	    DISP[.I] = .DISP[.I] + .CNT;
+	    END;
+	END;
+
+    END;
+
+GLOBAL ROUTINE SOR$$KEY_SUB
+	(
+	KEY_BUFFER:	REF KEY_BLOCK
+	):	CAL_CTXREG =
+
+!++
+! Functional Description:
+!
+!	This routine generates the key comparison routines, and optionally,
+!	an input conversion routine and an output conversion routine.
+!
+!	The key comparison routine returns one of the following values:
+!		-1 if the first record collates before the second record
+!		 0 if the records collate equal
+!		 1 if the first record collates after the second record
+!
+! Formal Parameters:
+!
+!	KEY_BUFFER	Address of a counted list of key descriptions.
+!		
+!	CTX		Longword pointing to work area (passed in COM_REG_CTX)
+!
+!	The following fields of the context area are used as input:
+!		COM_SORT_TYPE	Type of sort (TYP_K_RECORD, etc)
+!		COM_NUM_FILES	Number of input files
+!		COM_LRL		Longest input record length (see below)
+!		COM_MINVFC	Length of VFC area
+!		COM_COLLATE	Collating sequence information
+!		COM_HACK_STRIP	Flag to do key stripping
+!		COM_STABLE	Flag indicating stable sort
+!		COM_VAR		Flag indicating variable-length records
+!		COM_NO_DUPS	Flag indicating to delete duplicate records
+!		COM_MERGE	Indicates what to store for stable
+!		COM_PAD		Pad character
+!
+!	The following fields are used as input/output:
+!		COM_COMPARE	Comparison routine
+!		COM_EQUAL	Equal-key routine
+!		COM_TKS		Total key size (hack hack)
+!
+!	The following fields are used as output:
+!		COM_INPUT	Routine to do input conversion of records
+!		COM_LENADR	Routine to return length/address of record
+!		COM_SRL		Shortest allowable input record length
+!		COM_LRL_INT	Length of internal format record
+!
+!	Actually, the COM_LRL field may be increased if key stripping is being
+!	done, since the longest record length specified by the user doesn't
+!	account for the extra bytes he's put at the beginning of the record.
+!
+! Implicit Inputs:
+!
+!	None.
+!
+! Implicit Outputs:
+!
+!	None.
+!
+! Routine Value:
+!
+!	Status code.
+!
+! Side Effects:
+!
+!	None.
+!
+!--
+
+    BEGIN
+    EXTERNAL REGISTER
+	CTX =	COM_REG_CTX:	REF CTX_BLOCK;
+
+    GLOBAL REGISTER
+	CUR_PC = R_CUR_PC:	REF BLOCK,	! PC of code we're generating
+	BRANCH = R_BRANCH:	REF VECTOR;	! Address of branches table
+
+    LITERAL
+	RTN_SIZE =	128;			! Initial routine size
+
+    LOCAL
+	BRANCHES:	VECTOR[BR_SIZE],	! Branch addresses
+	STACK,					! Stack needed for input routine
+	TMP:	REF VECTOR[,BYTE],		! Temporary pointer to code
+	DISP:	VECTOR[COM_ORD_MAX+1],		! Field displacements
+	KEY_BUFF:	KEY_BLOCK;		! Space to save the key info
+
+    MACRO
+	! Check for writing too far
+	!
+	VERIFY_LEN(A) =
+	    IF .CUR_PC GTRA
+		.VECTOR[ CTX[COM_ROUTINES], 0 ] +
+		.VECTOR[ CTX[COM_ROUTINES], 1 ]
+	    THEN
+		RETURN SOR$$ERROR(SOR$_SHR_BADLOGIC) %,
+
+	! Allocate some bytes in a field
+	!
+	EXPAND_(A,B) =
+	    EXPAND(%NAME('COM_ORD_',A), B, DISP[0]) %;
+
+
+    ! Get a local copy of the key description buffer, since we may mung it.
+    ! The presence of a user-comparison routine indicates no key buffer.
+    ! If we don't have one or the other, default to the whole record.
+    !
+    IF KEY_BUFFER[BASE_] NEQ 0
+    THEN
+	BEGIN
+	LOCAL
+	    LEN;
+	LEN = 2 + .KEY_BUFFER[KEY_NUMBER] * KBF_K_SIZE;
+	IF .LEN GTR %ALLOCATION(KEY_BUFF) THEN RETURN SOR$$ERROR(SOR$_NUM_KEY);
+	CH$MOVE(.LEN, KEY_BUFFER[BASE_], KEY_BUFF[BASE_]);
+	END
+    ELIF
+	.CTX[COM_COMPARE] NEQ 0
+    THEN
+	KEY_BUFF[KEY_NUMBER] =	0		! No key descriptions
+    ELSE
+	BEGIN
+	BIND
+	    KBF = KEY_BUFF[KEY_KBF(0)]: KBF_BLOCK;
+	KEY_BUFF[KEY_NUMBER] =	1;		! One key
+	KBF[KBF_TYPE] =		DSC$K_DTYPE_T;	! Text
+	KBF[KBF_ORDER] =	0;		! Ascending
+	KBF[KBF_POSITION] =	0;		! Start at the beginning
+	KBF[KBF_LENGTH] =	.CTX[COM_LRL];	! For the length of the record
+	END;
+
+!+
+!
+! Analyze the keys, et al.
+! Decide whether RFA,FILE,STAB,VFC,FORM,VAR and DATA (all but KEY) fields are
+! present.  If present, compute the displacement to the field.
+!
+!-
+
+
+    ! Versions V3 (and earlier) stripped keys before passing the record to the
+    ! key comparison routine, or returning the record from the sort.
+    ! For compatability, we must do the same (ugh).  See SORT_MERGE for
+    ! details on setting COM_HACK_STRIP (requests stripping).
+    !
+    ! Note that this is done before we analyze the keys.  Otherwise, we may not
+    ! strip enough bytes, due to keys being dropped or shortened.
+    !
+    TKS_HACK(KEY_BUFF[BASE_]);
+
+
+    ! A -1 in the displacements table indicates field not present
+    !
+    CH$FILL(%X'FF', COM_ORD_MAX * %UPVAL, DISP[0]);
+    DISP[COM_ORD_MAX] = 0;
+
+
+    ! RFA needed?
+    !
+    ! We need the RFA (and possibly file number) for non-record sorts.
+    !
+    IF .CTX[COM_SORT_TYPE] NEQ TYP_K_RECORD
+    THEN
+	BEGIN
+	EXPAND_('RFA', RAB$S_RFA);
+	IF .CTX[COM_NUM_FILES] GTRU 1
+	THEN
+	    EXPAND_('FILE', 1);
+	END;
+
+
+    ! DATA, Record length, and VFC area needed?
+    !
+    ! We need the data portion for record sorts.
+    ! We need the length for variable-length records.
+    ! We may also need the VFC area.
+    !
+    IF .CTX[COM_SORT_TYPE] EQL TYP_K_RECORD
+    THEN
+	BEGIN
+	EXPAND_('DATA', .CTX[COM_LRL]);		!***
+	IF .CTX[COM_MINVFC] NEQ 0 THEN EXPAND_('VFC', .CTX[COM_MINVFC]);
+	IF .CTX[COM_VAR] THEN EXPAND_('VAR', 2);	! A word for length
+	END
+    ELSE
+	BEGIN
+	!
+	! If we don't have the data, don't call user-written routines.
+	!
+	IF .CTX[COM_COMPARE] NEQ 0 OR .CTX[COM_EQUAL] NEQ 0
+	THEN
+	    RETURN SOR$$ERROR(SOR$_BAD_TYPE);
+	END;
+
+
+    ! Record format needed?
+    !
+    ! Needed if we have more than one record format.
+    !
+    IF .CTX[COM_FORMATS] GTRU 1
+    THEN
+	EXPAND_('FORM', 1);
+
+
+    ! Record number needed?
+    !
+    ! If a stable sort, use a longword to save the record number.
+    !
+    IF .CTX[COM_STABLE]
+    THEN
+	EXPAND_('STAB', 4);
+
+
+    ! Verify the keys, unless the user has his own comparison routine.
+    !
+    IF .CTX[COM_COMPARE] EQL 0
+    THEN
+	BEGIN
+
+	! Loop through each key
+	!
+	DECR I FROM .KEY_BUFF[KEY_NUMBER]-1 TO 0 DO
+	    BEGIN
+	    LOCAL
+		KEYLEN,				! Length of this key
+		KBF:	REF KBF_BLOCK;		! Local copy of key
+
+
+	    ! Grab a local pointer to the key description buffer
+	    !
+	    KBF = KEY_BUFF[KEY_KBF(.I)];
+
+
+	    ! Check the validity of the ascending/descending flag
+	    !
+	    IF .KBF[KBF_ORDER] GTRU 1
+	    THEN
+		BEGIN
+		SOR$$ERROR(SOR$_BAD_KEY);
+		KBF[KBF_ORDER] = .KBF[KBF_ORDER] AND NOT 1;
+		END;
+
+
+	    ! Check the validity of the length
+	    !
+	    IF	BEGIN
+		IF .KBF[KBF_TYPE] GTRU MAX_SUPPORTED
+		THEN %IF NOT HOSTILE %THEN FUN_K_KANJI %ELSE FALSE %FI
+		ELIF .KBF[KBF_LENGTH] GTRU .DSC_LENGTH[.KBF[KBF_TYPE]]
+		THEN FALSE
+		ELIF .DSC_FORCE[.KBF[KBF_TYPE]]
+		THEN
+		    BEGIN
+		    IF .KBF[KBF_LENGTH] EQL 0
+		    THEN
+			KBF[KBF_LENGTH] = .DSC_LENGTH[.KBF[KBF_TYPE]];
+		    .KBF[KBF_LENGTH] EQL .DSC_LENGTH[.KBF[KBF_TYPE]]
+		    END
+		ELSE
+		    TRUE
+		END
+	    THEN
+		0
+	    ELSE
+		BEGIN
+		SOR$$ERROR(SOR$_BAD_KEY);
+		KBF[KBF_TYPE] = DSC$K_DTYPE_Z;
+		KBF[KBF_LENGTH] = 0;
+		END;
+
+
+	    ! Compute the length in bytes of this key
+	    !
+	    KEYLEN = LEN_(KBF[BASE_]);
+
+
+	    ! Check that the key fits within the longest record length
+	    !
+	    IF .KEYLEN + .KBF[KBF_POSITION] GTR .CTX[COM_LRL]
+	    THEN
+		BEGIN
+		!
+		! Part of the key extends past the longest record length.
+		! Shorten string keys, and ignore all other keys.
+		!
+		IF  .KBF[KBF_TYPE] EQL DSC$K_DTYPE_Z OR
+		    .KBF[KBF_TYPE] EQL DSC$K_DTYPE_T OR
+		    .KBF[KBF_TYPE] GTRU MAX_SUPPORTED
+		THEN
+		    BEGIN
+		    KEYLEN = .CTX[COM_LRL] - .KBF[KBF_POSITION];
+		    IF .KEYLEN LSS 0 THEN KEYLEN = 0;	! Don't get negative
+		    END
+		ELSE
+		    BEGIN
+		    KBF[KBF_TYPE] = DSC$K_DTYPE_Z;
+		    KEYLEN = 0;
+		    END;
+
+		! Complain about the error.
+		! If the entire key disappeared, make it a worse error.
+		!
+		! Special-case a length of -1.
+		!
+		IF  .KBF[KBF_LENGTH] NEQ 1^%FIELDEXPAND(KBF_LENGTH,2)-1 OR
+		    .KEYLEN EQL 0
+		THEN
+		    SOR$$ERROR(
+		    (IF .KEYLEN EQL 0
+		    THEN SOR$_KEY_LEN AND NOT STS$M_SEVERITY OR STS$K_ERROR
+		    ELSE SOR$_KEY_LEN AND NOT STS$M_SEVERITY OR STS$K_INFO),
+		    2, .I+1, .KBF[KBF_LENGTH]);
+
+		! Store the newly computed key length
+		!
+		KBF[KBF_LENGTH] = .KEYLEN;
+		END;
+
+
+	    ! Determine the shortest record length that contains all keys
+	    ! However, string keys are okay.
+	    !
+	    IF	.CTX[COM_SRL] LSS .KEYLEN + .KBF[KBF_POSITION] AND
+		.KBF[KBF_TYPE] NEQ DSC$K_DTYPE_T AND
+		.KBF[KBF_TYPE] NEQ DSC$K_DTYPE_Z AND
+		.KBF[KBF_TYPE] LEQU MAX_SUPPORTED
+	    THEN
+		CTX[COM_SRL] = .KEYLEN + .KBF[KBF_POSITION];
+
+
+	    ! For index sorts, allocate space for the original keys.
+	    !
+	    IF .CTX[COM_SORT_TYPE] EQL TYP_K_INDEX
+	    THEN
+		EXPAND_('OKEY', .KEYLEN);
+
+
+	    ! Convert keys to a normalized form; namely, the signed or
+	    ! unsigned byte equivalents, with the appropriate length; change
+	    ! datatype T to Z if there is no collating sequence.
+	    !
+	    IF .KBF[KBF_TYPE] EQL DSC$K_DTYPE_T AND
+		.CTX[COM_COLLATE] EQL 0
+	    THEN
+		KBF[KBF_TYPE] = DSC$K_DTYPE_Z;
+	    IF .KBF[KBF_TYPE] EQL DSC$K_DTYPE_Z
+	    THEN
+		BEGIN
+		IF .KBF[KBF_LENGTH] EQL 1 THEN KBF[KBF_TYPE] = DSC$K_DTYPE_BU;
+		END
+	    ELIF .KBF[KBF_TYPE] GTRU MAX_SUPPORTED
+	    THEN
+		0
+	    ELIF .DSC_BINARY[.KBF[KBF_TYPE]]
+	    THEN
+		BEGIN
+		IF ONEOF_(.KBF[KBF_TYPE], BMSK_(DSC$K_DTYPE_BU,DSC$K_DTYPE_WU,
+		    DSC$K_DTYPE_LU,DSC$K_DTYPE_QU,DSC$K_DTYPE_OU))
+		THEN KBF[KBF_TYPE] = DSC$K_DTYPE_BU
+		ELSE KBF[KBF_TYPE] = DSC$K_DTYPE_B;
+		END;
+
+	    END;
+
+	END;
+
+
+    ! Try to do some key compression.
+    !
+    KEY_COMPRESS(KEY_BUFF[BASE_]);
+
+
+    ! Initialize code descriptor, and the current PC
+    !
+    VECTOR[ CTX[COM_ROUTINES], 0 ] = 0;
+    VECTOR[ CTX[COM_ROUTINES], 1 ] = CUR_PC = 0;
+
+!+
+!
+! Generate the input conversion routine
+!
+!-
+
+    !+
+    !
+    ! Note: The conversion routine is not entered here.
+    ! If we need converted keys, we will branch back here to convert them
+    !
+    !-
+
+
+    ! Save offset from beginning of the code of the current address
+    !
+    TMP = .CUR_PC - .CTX[S_START];
+
+
+    ! No stack space needed yet
+    !
+    STACK = 0;
+
+
+    ! Because we are using GEN_MOVE (et al), we must assert that the input
+    ! conversion routine does not preserve registers R0..R5 or R6 (the length).
+    !
+    ASSERT_((%B'1111111' AND NOT %NOPRESERVE(JSB_INPUT)) EQL 0)
+
+
+    ! Check whether the user is doing his own comparisons
+    !
+    IF .CTX[COM_COMPARE] EQL 0
+    THEN
+	BEGIN
+	!
+	! Loop through, and convert keys as needed
+	!
+	! Note that we may expand COM_ORD_KEY.  This is okay, as we've not yet
+	! generated code to reference any of the other COM_ORD_xxx fields.
+	!
+	LOCAL
+	    OKECNT,		! Byte count of original keys
+	    CVTCNT;		! Byte count of converted keys
+
+	OKECNT = 0;
+	CVTCNT = 0;
+	INCR I FROM 0 TO .KEY_BUFF[KEY_NUMBER]-1 DO
+	    BEGIN
+	    LOCAL
+		KBF:	REF KBF_BLOCK;	! Local copy of key
+
+	    KBF = KEY_BUFF[KEY_KBF(.I)];	! Pointer to key description
+
+	    ! For index sorts, copy the original keys.
+	    ! Note that the OKEY area has already been allocated.
+	    ! Since the KEY area may be expanded later for converted keys,
+	    ! we require that the OKEY area not be moved (OKEY LSS KEY).
+	    ! 
+	    IF .CTX[COM_SORT_TYPE] EQL TYP_K_INDEX
+	    THEN
+		BEGIN
+		ASSERT_(COM_ORD_OKEY LSS COM_ORD_KEY)
+		LOCAL
+		    KEYLEN;			! Length in bytes of the key
+		KEYLEN = LEN_(KBF[BASE_]);
+		ROOM(K_MOVE);
+		GEN_MOVE_VAR(.KEYLEN,
+		    .KBF[KBF_POSITION], COM_REG_SRC1,
+		    .DISP[COM_ORD_OKEY]+.OKECNT, COM_REG_SRC2);
+
+		! Indicate that the key location is relative to the
+		! beginning of the internal format record.
+		!
+		KBF[KBF_POSITION] = .DISP[COM_ORD_OKEY]+.OKECNT;
+		KBF[KBF_CVT] = TRUE;
+		OKECNT = .OKECNT + .KEYLEN;
+		END;
+
+	    %IF NOT HOSTILE %THEN
+	    !
+	    ! If a user-defined key, convert it as needed.
+	    !
+	    IF .KBF[KBF_TYPE] GTRU MAX_SUPPORTED
+	    THEN
+		BEGIN
+		EXPAND_('KEY', 0);	! Make sure the key area is allocated
+		CVTCNT = .CVTCNT +	! Generate code and add to length
+		    GEN_CONVERT_UDEF(KBF[BASE_], .DISP[COM_ORD_KEY]+.CVTCNT);
+		END;
+	    %FI
+
+	    ! If a decimal datatype (other than packed),
+	    ! or G,H_floating with no hardware support, then convert the key.
+	    !
+	    IF ONEOF_(.KBF[KBF_TYPE], BMSK_(
+		DSC$K_DTYPE_NU, DSC$K_DTYPE_NZ, DSC$K_DTYPE_NL,
+		DSC$K_DTYPE_NLO, DSC$K_DTYPE_NR, DSC$K_DTYPE_NRO))
+	    THEN
+		BEGIN
+		EXPAND_('KEY', 0);	! Make sure the key area is allocated
+		CVTCNT = .CVTCNT +	! Generate code and add to length
+		    GEN_CONVERT_DEC(KBF[BASE_], .DISP[COM_ORD_KEY]+.CVTCNT,
+			STACK);
+		END
+	    ELIF
+		ONEOF_(.KBF[KBF_TYPE], BMSK_(DSC$K_DTYPE_F, DSC$K_DTYPE_D,
+		    DSC$K_DTYPE_G, DSC$K_DTYPE_H)) AND
+		    NOT FDGH_HARDWARE_(.KBF[KBF_TYPE])
+	    THEN
+		BEGIN
+		EXPAND_('KEY', 0);	! Make sure the key area is allocated
+		CVTCNT = .CVTCNT +	! Generate code and add to length
+		    GEN_CONVERT_FLT(KBF[BASE_], .DISP[COM_ORD_KEY]+.CVTCNT);
+		END;
+	    END;
+
+
+	! Save the other keys, unless we have them in the DATA area.
+	!
+	IF .DISP[COM_ORD_DATA] LSS 0		! If we aren't saving data,
+	THEN					! then we'd better save keys
+	    BEGIN
+	    EXPAND_('KEY', 0);		! Make sure the key area is allocated
+	    CVTCNT = .CVTCNT + MOVE_KEYS(
+		KEY_BUFF[BASE_],		! Key descriptions
+		.DISP[COM_ORD_KEY]+.CVTCNT);	! Displacement
+	    END;
+
+
+	! Round up stack requirements
+	!
+	STACK = ROUND_(.STACK);
+
+
+	! If any keys were converted, actually allocate the space, and
+	! issue a return, since we'll be coming back this way.
+	!
+	IF .DISP[COM_ORD_KEY] GEQ 0 OR .DISP[COM_ORD_OKEY] GEQ 0
+	THEN
+	    BEGIN
+	    EXPAND_('KEY', .CVTCNT);
+	    ROOM(1+K_LITE+1+4);
+	    IF .STACK NEQ 0
+	    THEN
+		BEGIN
+		EMIT_BYTE(OPC_ADDL2);
+		EMIT_LITE(K_LONG, .STACK);
+		EMIT_BYTE(M_R+R_SP);
+		END;
+	    EMIT_BYTES(OPC_MOVL, 1, M_R+R_0, OPC_RSB);	! Return success
+	    END;
+	END;
+
+
+    ! This is where we want to enter the conversion routine.
+    ! For now, just store the offset from the beginning of the string.
+    !
+    CTX[COM_INPUT] = .CUR_PC - .CTX[S_START];
+
+
+    ! If there is a record definition table, call SOR$$RDT to determine whether
+    ! to omit or include this record.
+    !
+    %IF NOT HOSTILE %THEN
+    IF .CTX[COM_RDT_ADR] NEQ 0
+    THEN
+	BEGIN
+	ROOM(7+K_ABSA+7+4+K_LITE+1+K_DISP);
+	EMIT_BYTES(
+	    OPC_PUSHAL, M_AD+R_SP,		! PUSHAL -(SP)
+	    OPC_PUSHAB, M_RD+COM_REG_SRC1,	! PUSHA	(Rsrc1)
+	    OPC_CALLS, 2);
+	EMIT_ABSA(SOR$$RDT);			! CALLS	#2, SOR$RDT
+	EMIT_BYTES(
+	    OPC_MOVL, M_AI+R_SP, M_R+R_1,	! MOVL	(SP)+, R1
+	    OPC_BLBS, M_R+R_0, 1,		! BLBS	R0, 1$
+	    OPC_RSB);				! RSB
+%(
+	IF .DISP[COM_ORD_FORM] GEQ 0
+	THEN
+	    BEGIN
+	    ASSERT_(RDT_UNIT LEQ SHORT_LIT)
+	    EMIT_BYTES(OPC_DIVL2, RDT_UNIT, M_R+R_1, OPC_SUBB3);
+	    EMIT_LITE(K_BYTE, .CTX[COM_RDT_ADR]/RDT_UNIT);
+	    EMIT_BYTE(M_R+R_1);
+	    EMIT_DISP(.DISP[COM_ORD_FORM], COM_REG_SRC2);
+	    END;
+)%
+	END;
+    %FI
+
+
+    ! Store the length, if needed
+    !
+    IF .DISP[COM_ORD_VAR] GEQ 0
+    THEN
+	BEGIN
+	ROOM(1+K_LITE+1+K_DISP);
+	IF .CTX[COM_TKS] NEQ 0
+	THEN
+	    BEGIN
+	    EMIT_BYTE(OPC_SUBW3);			! SUBW3
+	    EMIT_LITE(K_WORD, .CTX[COM_TKS]);		!	#tks
+	    END
+	ELSE
+	    BEGIN
+	    EMIT_BYTE(OPC_MOVW);			! MOVW
+	    END;
+	EMIT_BYTE(M_RD+COM_REG_SRC1);			!	(Rsrc1)
+	EMIT_DISP(.DISP[COM_ORD_VAR], COM_REG_SRC2);	!	n(Rsrc2)
+	END;
+
+
+    ! Store the original data, if needed.
+    !
+    IF .DISP[COM_ORD_DATA] GEQ 0
+    THEN
+	BEGIN
+	ROOM(MAX(4+K_MOVE,4+K_LITE+K_LITE+K_DISP));
+	IF .DISP[COM_ORD_VAR] LSS 0
+	THEN
+	    BEGIN
+	    !
+	    ! Special-case fixed-length records
+	    !
+	    EMIT_BYTES(OPC_MOVL, M_BD+COM_REG_SRC1, 4, M_R+R_1);
+	    GEN_MOVE(.CTX[COM_LRL],			!	#length
+		0, 1,					!	0(R1)
+		.DISP[COM_ORD_DATA], COM_REG_SRC2);	!	src2disp(Rsrc2)
+	    END
+	ELSE
+	    BEGIN
+	    EMIT_BYTES(OPC_MOVC5,			! MOVC5
+		M_RD+COM_REG_SRC1,			!	(Rsrc1),
+		M_BDD+COM_REG_SRC1,4);			!	@4(Rsrc1),
+	    EMIT_LITE(K_BYTE, .CTX[COM_PAD]);		!	#pad
+	    EMIT_LITE(K_WORD, .CTX[COM_LRL]);		!	#length
+	    EMIT_DISP(
+		.DISP[COM_ORD_DATA], COM_REG_SRC2);	!	src2disp(Rsrc2)
+	    END;
+	END;
+
+    ! Store the record number for stable sorts.
+    ! Store the stream number for stable merges.
+    !
+    IF .DISP[COM_ORD_STAB] GEQ 0
+    THEN
+	BEGIN
+	ROOM(1+K_DISP+K_DISP);
+	EMIT_BYTE(OPC_MOVL);				! MOVL
+	EMIT_DISP(					!	m(CTX)
+	    (IF .CTX[COM_MERGE]
+	    THEN %FIELDEXPAND(COM_MRG_STREAM,0)*%UPVAL
+	    ELSE %FIELDEXPAND(COM_INP_RECNUM,0)*%UPVAL), COM_REG_CTX);
+	EMIT_DISP(.DISP[COM_ORD_STAB], COM_REG_SRC2);	!	n(Rsrc2)
+	END;
+
+
+    ! If we need the RFA, copy it too
+    !
+    IF .DISP[COM_ORD_RFA] GEQ 0
+    THEN
+	BEGIN
+	MACRO O_(O,P,S,E) = O %;
+	ASSERT_(RAB$S_RFA EQL 6)
+	ROOM(1+K_DISP+K_LITE+3+K_DISP+2+K_DISP);
+	EMIT_BYTE(OPC_ADDL3);				! ADDL3
+	EMIT_DISP(					!	mm(CTX)
+	    %FIELDEXPAND(COM_INP_CURR,0)*%UPVAL,COM_REG_CTX);
+	EMIT_LITE(K_LONG, DDB_RAB+O_(RAB$W_RFA));	!	#offset
+	EMIT_BYTES(M_R+R_0,				!	R0
+	    OPC_MOVL, M_AI+R_0);			! MOVL	(R0)+
+	EMIT_DISP(.DISP[COM_ORD_RFA],  COM_REG_SRC2);	!	nn(Rsrc2)
+	EMIT_BYTES(OPC_MOVW, M_RD+R_0);			! MOVW	(R0)
+	EMIT_DISP(.DISP[COM_ORD_RFA]+4,COM_REG_SRC2);	!	nn+4(Rsrc2)
+	!
+	! If the file number is needed, get it, too
+	!
+	IF .DISP[COM_ORD_FILE] GEQ 0
+	THEN
+	    BEGIN
+	    ROOM(1+K_DISP+K_DISP);
+	    EMIT_BYTE(OPC_MOVB);
+	    EMIT_DISP(%FIELDEXPAND(DDB_FIL,0)
+		-DDB_RAB
+		-O_(RAB$W_RFA)
+		-4, R_0);
+	    EMIT_DISP(.DISP[COM_ORD_FILE], COM_REG_SRC2);
+	    END;
+	END;
+
+
+    ! If the VFC area (record header buffer, RHB) is needed, get it, too.
+    ! Note that the VFC area, like the RFA, is passed through the context area.
+    ! On the chance that the code later decides to not allocate the VFC area,
+    ! check whether the address of the storage is zero.
+    !
+    IF .DISP[COM_ORD_VFC] GEQ 0
+    THEN
+	BEGIN
+	LOCAL
+	    TMP2: REF VECTOR[,BYTE];		! Temporary pointer to code
+	ROOM(1+K_DISP+3+K_MOVE);
+	EMIT_BYTE(OPC_MOVL);				! MOVL
+	EMIT_DISP(%FIELDEXPAND(COM_RHB_INP,0)*%UPVAL,	!	mm(CTX)
+	    COM_REG_CTX);
+	EMIT_BYTES(M_R+R_0,				!	R0
+	    OPC_BEQL, 0);				! BEQL	0$
+	TMP2 = .CUR_PC;					! Save PC
+	GEN_MOVE(.CTX[COM_MINVFC], 0, R_0,		! MOVE	#len, 0(R0)
+	    .DISP[COM_ORD_VFC],  COM_REG_SRC2);		!	nn(Rsrc2)
+	TMP2[-1] = .CUR_PC - .TMP2;		! Correct displacement
+	END;
+
+
+    ! If we need to convert keys, branch back and convert them
+    !
+    ROOM(1+K_LITE+1+10);
+    TMP = TMP[0] + .CTX[S_START];	! Adjust TMP to be actual address
+    IF (.DISP[COM_ORD_KEY] GEQ 0 OR .DISP[COM_ORD_OKEY] GEQ 0)
+	AND .(TMP[0]) NEQ (OPC_MOVL + 1^8 + (M_R+R_0)^16 + OPC_RSB^24)
+    THEN
+	BEGIN
+	LOCAL
+	    Z;
+	IF .STACK NEQ 0
+	THEN
+	    BEGIN				! Allocate stack space
+	    EMIT_BYTE(OPC_SUBL2);			! SUBL2
+	    EMIT_LITE(K_LONG, .STACK);			!	#stack
+	    EMIT_BYTE(M_R+R_SP);			!	SP
+	    END;
+	EMIT_BYTES(
+	    OPC_MOVW, M_RD+COM_REG_SRC1, M_R+R_6,	! MOVW	(Rsrc1), R6
+	    OPC_MOVL,					! MOVL
+	    M_BD+COM_REG_SRC1, 4,			!	4(Rsrc1),
+	    M_R+COM_REG_SRC1);				!	Rsrc1
+	Z = TMP[0] - .CUR_PC - 3;			! Branch displacement
+	IF .Z<0,8,1> EQL .Z				! Will BRB suffice?
+	THEN (EMIT_BYTE(OPC_BRB); EMIT_BYTE(.Z+1))
+	ELSE (EMIT_BYTE(OPC_BRW); EMIT_WORD(.Z));
+	END
+    ELSE
+	EMIT_BYTES(OPC_MOVL, 1, M_R+R_0,	! MOVL	#1, R0
+	    OPC_RSB);				! RSB
+
+    VERIFY_LEN();				! Check for writing too far
+
+!+
+!
+! Generate the key comparison routine
+!
+!-
+
+    ! Store the offset from the beginning of the string.
+    !
+    TMP = .CUR_PC - .CTX[S_START];
+
+
+    ! Initialize the branches table.
+    !
+    CH$FILL(%X'FF', %ALLOCATION(BRANCHES), BRANCHES[0]);
+    BRANCH = BRANCHES[0];
+
+
+    ! We haven't saved any registers yet.
+    !
+    SAVED_REGS = 0;
+
+
+    ! If the user supplied a comparison routine, call it.
+    !
+    IF .CTX[COM_COMPARE] NEQ 0
+    THEN
+	BEGIN
+	ROOM(K_CALL4+4);
+	EMIT_CALL4(.CTX[COM_COMPARE], DISP[0]);
+	IF .DISP[COM_ORD_STAB] GEQ 0			! Stable?
+	THEN
+	    EMIT_BYTES(OPC_BLBC, M_R+R_0, 1,		! BLBC	R0, 1$
+			OPC_RSB)			! RSB
+	ELSE
+	    EMIT_BYTE(OPC_RSB);				! RSB
+	END
+    ELSE
+	BEGIN
+	INCR I FROM 0 TO .KEY_BUFF[KEY_NUMBER]-1 DO
+	    BEGIN
+	    LOCAL
+		KBF:	REF KBF_BLOCK;
+	    BUILTIN
+		TESTBITCC;
+	    KBF = KEY_BUFF[KEY_KBF(.I)];
+	    IF TESTBITCC(KBF[KBF_CVT])
+	    THEN
+		BEGIN
+		!
+		! The key has not been converted.
+		! Adjust the offset to the key.
+		!
+		KBF[KBF_POSITION] = .KBF[KBF_POSITION] + .DISP[COM_ORD_DATA];
+		END;
+	    GEN_COMPARE(KBF[BASE_], .I);
+	    END;
+	END;
+
+
+    ! Generate a little more code for stable sorts
+    !
+    IF .DISP[COM_ORD_STAB] GEQ 0
+    THEN
+	BEGIN
+	!
+	! Generate another comparison for stable sorts
+	!
+	LOCAL
+	    KBF: KBF_BLOCK;
+	KBF[KBF_TYPE] = DSC$K_DTYPE_BU;
+	KBF[KBF_ORDER] = 0;
+	KBF[KBF_POSITION] = .DISP[COM_ORD_STAB];
+	KBF[KBF_LENGTH] = %UPVAL;
+	GEN_COMPARE(KBF[BASE_]);
+	END;
+
+
+    ! Store the length of an internal-format record
+    !
+    CTX[COM_LRL_INT] = .DISP[COM_ORD_MAX];
+    IF .DISP[COM_ORD_MAX] GTR MAX_REFSIZE
+    THEN
+	SOR$$ERROR(SOR$_SHR_BADLOGIC);	! Not really bad logic, just rare.
+
+
+    ! Generate code to return a zero, and process saved registers
+    !
+    ROOM(5);
+    EMIT_BYTES(OPC_CLRL, M_R+R_0);		! CLRL	R0
+    IF .SAVED_REGS NEQ 0 THEN EMIT_BYTES(OPC_POPR, .SAVED_REGS);
+    EMIT_BYTE(OPC_RSB);				! RSB
+
+
+    ! Store the offset to the start of this routine
+    !
+    CTX[COM_COMPARE] = .TMP;
+
+
+    ! Check for writing too far
+    !
+    VERIFY_LEN();
+
+!+
+!
+! Generate the equal-key routine
+!
+!-
+    ! Store the offset from the beginning of the string.
+    !
+    TMP = .CUR_PC - .CTX[S_START];
+
+
+    ! If the user specified his own equal-key routine, call it.
+    !
+    IF .CTX[COM_EQUAL] NEQ 0
+    THEN
+	BEGIN
+	ROOM(K_CALL4+9+K_LITE+2+K_ABSA+4);
+	EMIT_CALL4(.CTX[COM_EQUAL], DISP[0]);
+	EMIT_BYTES(OPC_BLBC, M_R+R_0, 1,		! BLBC	R0, error
+		OPC_RSB,				! RSB
+		OPC_PUSHL, M_R+R_0,			! error: PUSHL R0
+		OPC_PUSHL, 0,				! PUSHL	#0
+		OPC_PUSHL);				! PUSHL	#SOR$_RTNERROR
+	EMIT_LITE(K_LONG, SOR$_RTNERROR);
+	EMIT_BYTES(OPC_CALLS, 3);			! CALLS	#3
+	EMIT_ABSA(SOR$$ERROR);				!	SOR$$ERROR
+	EMIT_BYTES(OPC_MOVL, SS$_NORMAL, M_R+R_0,	! MOVL	#SS$_NORMAL, R0
+		OPC_RSB);				! RSB
+	END
+    ELIF .CTX[COM_NODUPS]
+    THEN
+	BEGIN
+	EMIT_BYTES(OPC_MOVL, M_AI+R_PC);		! MOVL
+	EMIT_LONG(SOR$_DELETE2);			!	#SOR$_DELETE2
+	EMIT_BYTES(M_R+R_0,				!	R0
+	    OPC_RSB);					! RSB
+	END
+    ELSE
+	BEGIN
+	!
+	! Emit a HALT instruction.
+	! This indicates that COM_EQUAL should be set to zero below.
+	!
+	EMIT_BYTE(OPC_HALT);
+	END;
+
+
+    ! Store the offset to the start of this routine
+    !
+    CTX[COM_EQUAL] = .TMP;
+
+
+    ! Check for writing too far
+    !
+    VERIFY_LEN();
+
+!+
+!
+! Generate the length-address routine
+!
+!-
+    ! Store the offset to this routine
+    !
+    CTX[COM_LENADR] = .CUR_PC - .CTX[S_START];
+
+
+    ! If the VFC area (record header buffer, RHB) is needed, get it.
+    ! Note that the VFC area is passed through the context area.
+    !
+    IF .DISP[COM_ORD_VFC] GEQ 0
+    THEN
+	BEGIN
+	LOCAL
+	    TMP2: REF VECTOR[,BYTE];		! Temporary pointer to code
+	ROOM(1+K_DISP+1+2+8+K_MOVE+1);
+	EMIT_BYTE(OPC_MOVL);				! MOVL
+	EMIT_DISP(%FIELDEXPAND(COM_RHB_OUT,0)*%UPVAL,	!	mm(CTX)
+	    COM_REG_CTX);
+	EMIT_BYTE(M_R+R_0);				!	R0
+	EMIT_BYTES(OPC_BEQL, 0);			! BEQL	4$
+	TMP2 = .CUR_PC;
+
+	! If any of R0..R5 are %NOTUSED, call a routine to do the move.
+	! If any of R0..R5 are %PRESERVE, save and restore the registers.
+	! 
+	IF .CTX[COM_MINVFC] GTRU TUN_K_BINMOVE
+	THEN
+	    %IF (%B'111111' AND %NOTUSED(JSB_LENADR)) NEQ 0
+	    %THEN
+		BEGIN
+		EMIT_BYTES(OPC_CALLS, 0, M_BD+R_PC, 2,	! CALLS	#0, 2(PC)
+		    OPC_BRB, 0,				! BRB	4$
+		    %B'111111'				! .WORD ^M<mask>
+		    AND (%NOTUSED(JSB_LENADR) OR %PRESERVE(JSB_LENADR)), 0);
+		TMP = .CUR_PC - 2;
+		END
+	    %ELSE %IF (%B'111111' AND %PRESERVE(JSB_LENADR)) NEQ 0
+	    %THEN
+		EMIT_BYTES(OPC_PUSHR, %B'111111' AND %PRESERVE(JSB_LENADR))
+	    %ELSE
+		0
+	    %FI %FI;
+
+	GEN_MOVE(.CTX[COM_MINVFC],			! MOVE	#len, 
+	    .DISP[COM_ORD_VFC],  COM_REG_SRC2,		!	nn(Rsrc2)
+	    0, R_0);					!	0(R0)
+
+	IF .CTX[COM_MINVFC] GTRU TUN_K_BINMOVE
+	THEN
+	    %IF (%B'111111' AND %NOTUSED(JSB_LENADR)) NEQ 0
+	    %THEN
+		BEGIN
+		EMIT_BYTE(OPC_RET);				! RET
+		TMP[-1] = .CUR_PC - .TMP;			!4$:
+		END
+	    %ELSE %IF (%B'111111' AND %PRESERVE(JSB_LENADR)) NEQ 0
+	    %THEN
+		EMIT_BYTES(OPC_POPR, %B'111111' AND %PRESERVE(JSB_LENADR))
+	    %ELSE
+		0
+	    %FI %FI;
+
+	TMP2[-1] = .CUR_PC - .TMP2;
+
+	END;
+
+
+    ! Generate code to move the length/address into R0/R1
+    !
+    ! Set the longest output record length.
+    !
+    ROOM(MAX(					! Make room for the code
+	1+MAX(K_DISP,K_LITE)+2+K_DISP+2,	! RECORD
+	1+K_DISP+2+K_ABSA+1,			! TAG
+	4+K_DISP+2,				! ADDRESS
+	1+K_LITE+2+K_DISP+2));			! INDEX
+    CASE .CTX[COM_SORT_TYPE] FROM TYP_K_RECORD TO TYP_K_MAX OF
+	SET
+
+	[TYP_K_RECORD]:
+	    BEGIN
+	    CTX[COM_LRL_OUT] = .CTX[COM_LRL]-.CTX[COM_TKS];
+	    EMIT_BYTE(OPC_MOVZWL);
+	    IF .DISP[COM_ORD_VAR] GEQ 0
+	    THEN
+		EMIT_DISP(.DISP[COM_ORD_VAR], COM_REG_SRC2)
+	    ELSE
+		EMIT_LITE(K_WORD, .CTX[COM_LRL_OUT]);
+	    EMIT_BYTES(M_R+R_0, OPC_MOVAB);
+	    EMIT_DISP(.DISP[COM_ORD_DATA]+.CTX[COM_TKS], COM_REG_SRC2);
+	    EMIT_BYTES(M_R+R_1, OPC_RSB);
+	    END;
+
+	%IF NOT HOSTILE %THEN
+
+	[TYP_K_TAG]:
+	    BEGIN
+	    CTX[COM_LRL_OUT] = .CTX[COM_LRL];
+	    EMIT_BYTE(OPC_PUSHAB);			! PUSHAB
+	    EMIT_DISP(.DISP[COM_ORD_RFA], COM_REG_SRC2); !	rfa(Rsrc1)
+	    EMIT_BYTES(OPC_CALLS, 1);			! CALLS	#1
+	    EMIT_ABSA(SOR$$RFA_ACCESS);			!	SOR$$RFA_ACCESS
+	    EMIT_BYTE(OPC_RSB);				! RSB
+	    END;
+
+	[TYP_K_ADDRESS]:
+	    BEGIN
+	    CTX[COM_LRL_OUT] = RAB$S_RFA;
+	    IF .DISP[COM_ORD_FILE] GEQ 0
+	    THEN
+	        CTX[COM_LRL_OUT] = .CTX[COM_LRL_OUT] + 1;
+	    ASSERT_(COM_ORD_RFA+1 EQL COM_ORD_FILE)
+	    EMIT_BYTE(OPC_MOVL);
+	    ASSERT_(RAB$S_RFA+1 LEQ SHORT_LIT)
+	    EMIT_BYTE(.CTX[COM_LRL_OUT]);
+	    EMIT_BYTES(M_R+R_0,
+		    OPC_MOVAB);
+	    EMIT_DISP(.DISP[COM_ORD_RFA], COM_REG_SRC2);
+	    EMIT_BYTES(M_R+R_1, OPC_RSB);
+	    END;
+
+	[TYP_K_INDEX]:
+	    BEGIN
+	    LOCAL
+		Z;			! A temporary
+	    !
+	    ! The only fields we should output are:
+	    !	RFA, FILE, OKEY, in that order.
+	    ! The only other fields we may have in the internal record are:
+	    !	KEY, STABLE
+	    !
+	    ASSERT_(COM_ORD_RFA  LSS COM_ORD_FILE)
+	    ASSERT_(COM_ORD_FILE LSS COM_ORD_OKEY)
+	    !
+	    ! Assert that neither the KEY or STABLE fields
+	    ! are between the RFA and OKEY fields.
+	    !
+	    ASSERT_((COM_ORD_KEY -COM_ORD_RFA) GTRU (COM_ORD_OKEY-COM_ORD_RFA))
+	    ASSERT_((COM_ORD_STAB-COM_ORD_RFA) GTRU (COM_ORD_OKEY-COM_ORD_RFA))
+	    !
+	    ! Find the displacement of the first field after COM_ORD_OKEY.
+	    ! We will find something, since DISP[COM_ORD_MAX] is geq 0.
+	    !
+	    INCR I FROM COM_ORD_OKEY+1 TO COM_ORD_MAX DO
+		IF (Z = .DISP[.I]) GEQ 0 THEN EXITLOOP;
+	    CTX[COM_LRL_OUT] = .Z - .DISP[COM_ORD_RFA];
+	    EMIT_BYTE(OPC_MOVZWL);
+	    EMIT_LITE(K_WORD, .CTX[COM_LRL_OUT]);
+	    EMIT_BYTES(M_R+R_0,
+		OPC_MOVAB);
+	    EMIT_DISP(.DISP[COM_ORD_RFA], COM_REG_SRC2);
+	    EMIT_BYTES(M_R+R_1, OPC_RSB);
+	    END;
+
+	%ELSE
+
+	[INRANGE,OUTRANGE]:
+	    RETURN SOR$$ERROR(SOR$_SHR_BADLOGIC);
+
+	%FI
+
+	TES;
+
+
+    ! Make sure there is a free byte following the last one we executed.
+    ! This avoids a 11/750 problem if the next byte is not readable.
+    !
+    ROOM(1);
+
+
+    ! Check for writing too far
+    !
+    VERIFY_LEN();
+
+    ! Adjust the entry points to the generated routines.
+    !
+    CTX[COM_INPUT]	= .CTX[COM_INPUT]	+ .CTX[S_START];
+    CTX[COM_COMPARE]	= .CTX[COM_COMPARE]	+ .CTX[S_START];
+    CTX[COM_EQUAL]	= .CTX[COM_EQUAL]	+ .CTX[S_START];
+    CTX[COM_LENADR]	= .CTX[COM_LENADR]	+ .CTX[S_START];
+
+    ! Is the COM_EQUAL routine really needed?
+    !
+    IF CH$RCHAR(.CTX[COM_EQUAL]) EQL OPC_HALT
+    THEN
+	CTX[COM_EQUAL] = 0;
+
+    %IF %SWITCHES(DEBUG)
+    %THEN
+	BEGIN
+	EXTERNAL ROUTINE
+	    SOR$$OUTPUT;
+	MACRO
+	    DESC_(A) = UPLIT(%CHARCOUNT(A), UPLIT BYTE(A)) %;
+	SOR$$OUTPUT(DESC_(%STRING(
+	    'routine input,  !_!XL-!XL!/',
+	    'routine compare,!_!XL-!XL!/',
+	    'routine equal,  !_!XL-!XL!/',
+	    'routine lenadr, !_!XL-!XL!/')),
+	    .CTX[COM_INPUT],	.CTX[COM_COMPARE]-1,
+	    .CTX[COM_COMPARE],	.CTX[COM_EQUAL]-1,
+	    .CTX[COM_EQUAL],	.CTX[COM_LENADR]-1,
+	    .CTX[COM_LENADR],
+	    .VECTOR[ CTX[COM_ROUTINES], 0 ] +
+	    .VECTOR[ CTX[COM_ROUTINES], 1 ] - 1 );
+	END;
+    %FI
+
+    ! Execute an REI instruction to guarantee that instruction prefetch gets
+    ! the instructions we've just written.
+    !
+    DO_REI();
+
+    RETURN SS$_NORMAL;
+
+    END;
+
+%IF NOT HOSTILE %THEN
+EXTERNAL ROUTINE
+	LIB$FIND_IMAGE_SYMBOL: ADDRESSING_MODE(GENERAL);
+BIND	DTYPE1 = UPLIT BYTE('SOR$DTYPE');
+MACRO	DTYPE_DECL = VECTOR[2] INITIAL (%CHARCOUNT('SOR$DTYPE'), DTYPE1) %;
+MACRO	NAMSTR_DECL(X) = VECTOR[2] INITIAL (%CHARCOUNT(X), UPLIT BYTE(X)) %;
+MACRO	DTYPE_(X) =
+	    BEGIN
+	    OWN Z:	INITIAL(0);
+	    BUILTIN	AP, CALLG;
+	    IF .Z EQL 0
+	    THEN
+		BEGIN
+		LOCAL DTYPE: DTYPE_DECL, NAMSTR: NAMSTR_DECL(X), STATUS;
+		STATUS = LIB$FIND_IMAGE_SYMBOL(DTYPE, NAMSTR, Z);
+		IF NOT .STATUS THEN RETURN SOR$$ERROR(SOR$_SHR_SYSERROR,0,.STATUS);
+		END;
+	    RETURN CALLG(.AP, .Z);
+	    END %;
+GLOBAL ROUTINE SOR$$DTYPE_KBF = DTYPE_('SOR$DTYPE_KBF');
+GLOBAL ROUTINE SOR$$DTYPE_T_W = DTYPE_('SOR$DTYPE_T_W');
+%FI
+
+ROUTINE CLEAN_UP: CAL_CTXREG NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Release resources allocated by this module.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE (signals errors)
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CTX =	COM_REG_CTX:	REF CTX_BLOCK;
+
+    ! Deallocate the code we generated
+    !
+    SOR$$DEALLOCATE(.VECTOR[CTX[COM_ROUTINES],0], VECTOR[CTX[COM_ROUTINES],1]);
+
+    END;
+
+END
+ELUDOM

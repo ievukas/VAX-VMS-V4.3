@@ -1,0 +1,730 @@
+module lnk_procshrim 			! PROCESS SHAREABLE IMAGES ON PASS 1
+		(ident = 'V04-000'
+		,addressing_mode 
+			(external    = general
+			,nonexternal = long_relative
+			)
+		) =
+begin
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	LINKER
+!
+! ABSTRACT:	THIS MODULE CONTAINS THE ROUTINES TO READ SHAREABLE
+!			IMAGES ON PASS 1.
+!
+!
+! ENVIRONMENT:	VMS NATIVE MODE
+!
+! AUTHOR:	T.J. PORTER, CREATION DATE: 15-DEC-77
+!
+! MODIFIED BY:
+!
+!	V03-008	ADE0003		Alan D. Eldridge	 7-Aug-1984
+!		Propagate the DZRO bit from the shareable image ISD to the
+!		corresponding ISD in the new image.  It was being cleared
+!		unconditionally.
+!
+!	V03-007	JWT0192		Jim Teague		 2-Aug-1984
+!		Unfortunately, push came to shove, and the global
+!		isd search optimization has been tossed.
+!
+!	V03-006	JWT0189		Jim Teague		25-Jul-1984
+!		Make some changes to accomodate demand-zero image
+!		sections in shareable images.  The minimum image
+!		file VBN for the symbol table is now 2, instead of 3.
+!		Why?  Consider the case of a shareable image with
+!		nothing BUT a demand zero image section...
+!
+!	V03-005	ADE0002		Alan D. Eldridge	10-Jul-1984
+!		Fix null arguments passed in SIGNAL due to editting errors.
+!
+!	V03-004	ADE0001		Alan D. Eldridge	26-Feb-1984
+!		Don't erase CLU$L_GSMATCH.  It is no longer re-used as
+!		something else in pass 2, and it is referenced to correctly
+!		perform the GSMATCH checking in pass one.
+!
+!	V03-003	JWT0152		Jim Teague		 8-Feb-1984
+!		Long names for global image section descriptors.
+!
+!	V03-002	JWT0111		Jim Teague		14-Apr-1983
+!		Don't pull in shareable images that are in global
+!		isds unless they're based.
+!
+!	V03-001 JWT0044		Jim Teague		30-Jul-1982
+!		Open file performance boost.
+!
+!--
+
+!
+! TABLE OF CONTENTS:
+!
+forward routine
+    readnextblock;				! READS THE NEXT HEADER BLOCK OF IMAGE
+
+!
+! INCLUDE FILES:
+!
+library 'LIBL32';				! VMS SYSTEM STRUCTURE DEFINITIONS
+require 'PREFIX';				! USEFUL GENERAL MACROS
+library 'DATBAS';				! INTERNAL DATA BASE DEFINITIONS
+require 'ISGENC';				! IMAGE SECTION PARAMETERS
+
+!
+! MACROS:
+!
+!	NONE
+!
+! EQUATED SYMBOLS:
+!
+!	NONE
+!
+! EXTERNAL REFERENCES:
+!
+
+external routine
+    lnk$alloblk 	: novalue,		! DYNAMIC MEMORY ALLOCATOR
+    lnk$allocluster,				! ALLOCATE CLUSTER DESCRIPTOR
+    lnk$closefile	: novalue,		! CLOSE CURRENT INPUT FILE
+    lnk$pointobj	: novalue,		! POINTS TO NEW PLACE IN FILE
+    lnk$addimage,				! PROCESS SHAREABLE IMAGE
+    lnk$procsobj;				! PROCESSES OBJECT MODULES (I.E. THE GST)
+
+external literal
+    lin$_badimghdr,				! BAD IMAGE HEADER ERROR MESSAGE
+    lin$_basshrbel,				! BASED SHAREABLE IMAGE BELOW BASE=
+    lin$_confbasadr,				! CONFLICTING BASE ADDRESSES FOR SHR IMGS
+    lin$_idmismch,				! GSMATCH MISMATCH WITH SHR IMG STB LIBRARY
+    lin$_imgbased,				! ATTEMPT TO RE-BASE A NON-PIC IMAGE
+    lin$_noimgfil,				! NO IMAGE FILE CREATED
+    lin$_nonpicimg,				! SHAREABLE IMAGE IS NON-PIC
+    lin$_relink,				! RELINK DUE TO COPYALWAYS SECTION
+    lin$_readerr;				! READ ERROR
+
+external
+    lnk$gl_shrclstrs,				! COUNT OF NUMBER OF SHAREABLE IMAGE CLUSTERS (PIC AND NON-PIC)
+    lnk$al_rab		: block [, byte],	! RAB FOR OPEN IMAGE FILE
+    lnk$gw_nisects	: word,			! IMAGE SECTION ACCUMULATOR
+    lnk$gw_shriscts	: word,			! NUMBER OF SHAREABLE IMAGE ISECTS
+    lnk$gb_pass		: byte,			! CURRENT PASS
+    lnk$gl_curfil	: ref block [, byte],	! CURRENT FILE POINTER
+    lnk$gl_curclu	: ref block [, byte],	! CURRENT CLUSTER DESCRIPTOR
+    lnk$gl_defclu	: block [, byte],	! DEFAULT_CLUSTER DESCRIPTOR
+    lnk$gl_lastclu	: ref block [, byte],	! POINTER TO LAST CLUSTER DESCRIPTOR
+    lnk$gl_ctlmsk	: block [, byte],	! CONTROL FLAGS
+    lnk$gl_objrecs ;				! COUNT OF OBJECT RECORDS
+
+!
+! MODULE OWN STORAGE:
+!
+global
+    lnk$gl_gsbufdsc	: vector [3],		! BUFFER DESCRIPTOR FOR COPIED GLOBAL SECTIONS
+    lnk$gl_imgrecs ;				! COUNT OF IMAGE RECORDS
+
+own
+    curisdseq		: vector [4, byte] 	! SUFFIX TO SCLUSTER NAME GIVING GBL ISD NAME
+			initial (%ascii '_000'),! 
+    hdrblkcnt,					! NUMBER REMAINING HEADER BLOCKS
+    headerblock ;				! CURRENT HEADER VBN
+
+
+
+global routine lnk$procshrim (modrfa) = 	!
+!++
+! FUNCTIONAL DESCRIPTION:
+!			THIS ROUTINE IS CALLED TO PROCESS SHAREABLE IMAGES ON PASS
+!	ONE OF THE LINK. IT READS AND VALIDATES EVERY BLOCK OF THE IMAGE HEADER
+!	BUILDING THE LIST OF IMAGE SECTION DESCRIPTORS. AFTER COMPLETING THE HEADER
+!	IT SETS THE RAB POINTING TO THE SYMBOL TABLE PART OF THE IMAGE FILE AND
+!	CALLS LNK$PROCSOBJ TO DO THE PASS ONE OBJECT MODULE PROCESSING
+!	OF THE SYMBOL TABLE.
+!			THE SYMBOL TABLE OF A SHAREABLE IMAGE CONTAINS ALL THE UNIVERSAL
+!	SYMBOLS DEFINED FOR THE IMAGE AND IS IN THE OBJECT MODULE FORMAT.
+!
+! FORMAL PARAMETERS:
+!	MODRFA IS A POINTER TO THE 6 BYTE RFA OF THE SHAREABLE IMAGE IF
+!	IT IS IN A LIBRARY. IF NOT A LIBRARY SHAREABLE IMAGE THE ARGUMENT
+!	DOES NOT EXIST.
+!
+! IMPLICIT INPUTS:
+!	SEE ABOVE EXTERNAL DECLARATIONS.
+!	IN ADDITION THE FILE CONTAINING THE IMAGE IS ALREADY OPEN
+!	FOR BLOCK READ OPERATIONS.
+!
+! IMPLICIT OUTPUTS:
+!	SEE ABOVE GLOBAL DECLARATIONS.
+!	IN ADDITION ALL IMAGE SECTIONS FOUND IN THIS SHAREABLE IMAGE
+!	ARE APPENDED TO THE LIST AND THE GST HAS BEEN PROCESSED AS AN OBJECT
+!	MODULE. THAT IS ALL UNIVERSAL SYMBOLS ARE IN THE LINKER SYMBOL TABLE.
+!
+! ROUTINE VALUE:
+!	RETURNS VALUE TRUE IF SUCCESSFULLY PROCESSED, ELSE FALSE
+!
+! SIDE EFFECTS:
+!	THE ROUTINE DOES NOT RETURN IF A FATAL ERROR IS DETECTED.
+!
+!--
+begin
+builtin
+	actualcount ;				! GETS COUNT OF ARGUMENTS
+local
+	nxtisdoff,				! OFFSET TO NEXT ISD
+	blockoffset,				! OFFSET IN FILE TO FIRST HEADER BLOCK
+	isectident,				! MAJOR AND MINOR ID FROM HEADER
+	firstisdvpg,				! VPG OF FIRST ISECT
+	symdbgdatdsc	: ref block [, byte],	! POINTER TO SYMBOL TABLE DESCRIPTOR
+	gstrecs,				! NUMBER OF RECORDS IN SYMBOL TABLE
+	ownclu		: ref block [, byte],	! POINTER TO OWNING CLUSTER DESCRIPTOR
+	ownfdb 		: ref block [, byte],	!  AND IT'S FILE DESCRIPTOR BLOCK
+	cludesc		: ref block [, byte],	! POINTER TO CREATED CLUSTER DESCRIPTOR
+	curhdrisd	: ref block [, byte],	! POINTER TO CURRENT ISD IN HEADER
+	curisd 		: ref block [, byte],	! POINTER TO CURRENT ISD BEING BUILT
+	newhdrisd	: ref block [, byte],	! POINTER TO HEADER PART OF CURRENT ISD BEING BUILT
+	firstisd	: ref block [, byte],	! POINTER TO FIRST ISECT IN CLUSTER
+	gstvbn		: vector [2, long],	! RFA OF GST
+	iafva,					! RELATIVE VA OF FIXUP SECTION
+	saverecount,				! SAVED RECORD COUNT WHILE IN OBJPS1
+	maxisdvbn ;				! LAST IMAGE VBN + 1
+
+map
+	modrfa : ref block [, byte] ;				! POINTER TO BLOCK
+
+bind
+	header = lnk$al_rab [rab$l_ubf] : ref block [, byte] ;	! POINTER TO BLOCK BUFFER
+
+if actualcount () eql 0						! IF CALLED WITH NO ARGUMENTS
+then
+    blockoffset = 0						! HEADER AT START OF FILE
+else
+    blockoffset = .modrfa [rfa$l_vbn] - 1 ;			! OTHERWISE GET OFFSET
+
+lnk$gl_shrclstrs = .lnk$gl_shrclstrs + 1 ;			! COUNT THIS SHAREABLE IMAGE CLUSTER
+
+cludesc     =  0 ;						! NO CREATED CLUSTER YET
+hdrblkcnt   =  1 ;						! MUST BE AT LEAST ONE BLOCK
+nxtisdoff   = -1 ;						! NEXT ISD IS ON NEXT BLOCK
+maxisdvbn   =  0 ;						! RESET LAST BLOCK OF IMAGE
+headerblock = .blockoffset ;					! AND SET FOR FIRST BLOCK READ
+
+ch$fill (%c'0', 3, curisdseq [1]) ;				! INITIALIZE THE ISD NAME SUFFIX
+
+while .nxtisdoff eql -1						! WHILE THERE ARE MORE
+do  begin							! HEADER BLOCKS
+    if not readnextblock ()					! GET THE NEXT ONE
+    then
+	signal_stop (lin$_badimghdr, 1			 	! AND IF UNSUCCESSFUL, FATAL IMAGE
+		    ,lnk$gl_curfil [fdb$q_filename]
+		    ) ;
+    if .headerblock eql (.blockoffset + 1)			! IF THE FIRST
+    then
+	begin							! HAVE SOME VALIDATION TO DO
+	!
+	!   VALIDATE IMAGE HEADER
+	!
+	if .header [ihd$b_imgtype] neq ihd$k_shr		! CHECK IT IS A SHAREABLE IMAGE
+	or .header [ihd$w_majorid] neq ihd$k_majorid		! MAJOR HEADER ID MUST MATCH
+	or (.(header [ihd$w_minorid])<0, 8, 0> eql (ihd$k_minorid and %x'FF') 
+	     and 
+	    .(header [ihd$w_minorid])<8, 8, 0> gtru (ihd$k_minorid and %x'FF00')/256
+	   ) 
+	or .header [ihd$w_size]	gtru maxu ((.header [ihd$w_patchoff] ! THE HEADER FIXED PART
+					     + ihp$k_length)	     ! MUST BE LESS THAN A BLOCK AND MUST
+					   ,ihd$k_maxlength
+					   )
+	or (hdrblkcnt    = .header [ihd$b_hdrblkcnt] - 1) lss 0	 ! CONTAIN PATCH AREA. 0 TO
+	or (symdbgdatdsc = .header + .header [ihd$w_symdbgoff])	 ! 127 MORE BLOCKS. GET THE
+ 			   gequ (.header + .header [ihd$w_size]) ! GST DESCRIPTOR WHICH MUST BE CONTAINED
+	or (gstrecs      = .symdbgdatdsc [ihs$w_gstrecs]) lssu 3 ! IN HEADER. MUST BE AT LEAST 3 RECORDS
+	or (gstvbn [0]   = .symdbgdatdsc [ihs$l_gstvbn]) 	 ! AND MUST BE BEYOND THE HEADER BLOCKS
+			   lequ (.hdrblkcnt + 1)
+	then
+	    signal_stop (lin$_badimghdr, 1			 ! ANY ABOVE NOT TRUE, FATAL IMAGE
+			,lnk$gl_curfil [fdb$q_filename]		 !  HEADER ERROR
+			) ;
+	if not (lnk$gl_curclu [clu$v_pic] = .header [ihd$v_picimg]) ! EXTRACT THE PIC BIT AND IF NON-PIC
+	then
+	    begin
+	    lnk$gl_ctlmsk [lnk$v_picimg] = false ;		! THIS IMAGE IS ALSO NON-PIC
+
+	    if         .lnk$gl_curclu [clu$v_usrbased]		! IF NON-PIC IMAGE BASED BY USER
+	       and not .lnk$gl_curclu [clu$v_intclu]		!  AND NOT AN INTERNALLY CREATED CLUSTER
+	    then
+		begin
+		signal	(lin$_imgbased, 1			!  THEN THAT'S AN ERROR, BECAUSE WE CAN'T 
+			,lnk$gl_curfil [fdb$q_filename]		!  RELOCATE IT
+			) ;
+		lnk$gl_curclu [clu$v_usrbased] = false ;
+		lnk$gl_curclu [clu$l_usrbase] = 0 ;
+		end ;
+	    end
+	else
+	    if .lnk$gl_curclu [clu$v_usrbased]			! BUT IF CLUSTER BASED BY OPTION
+	    then
+		lnk$gl_ctlmsk [lnk$v_picimg] = false ;
+
+	if          .lnk$gl_ctlmsk [lnk$v_shr]			! IF CREATING A SHAREABLE IMAGE
+	    and not .lnk$gl_ctlmsk [lnk$v_ubased]		!  AND IMAGE NOT BASED BY USER
+	    and not .lnk$gl_curclu [clu$v_pic]			!  AND THIS IMAGE JUST MADE IT NON-PIC
+	then
+	    signal  (lin$_nonpicimg, 1			 	! THEN TELL USER ABOUT IT (INFO)
+		    ,lnk$gl_curfil [fdb$q_filename]
+		    ) ;
+	if (lnk$gl_curclu [clu$v_matchctl] = 			! EXTRACT THE GLOBAL SECTION MATCH CONTROL
+		.header [ihd$v_matchctl]) eql isd$k_matnev
+	then
+	    lnk$gl_curclu [clu$v_copy] = true ;			! MAKING PRIVATE COPY IF MATCH NEVER
+
+	isectident = .header [ihd$l_ident] ;			! NOW THE IDENT TO WHICH IT APPLIES
+	iafva = 0 ;
+
+	if (.header + .header [ihd$w_activoff]) 
+	    gtru header [ihd$l_iafva]				! IF IMAGE HAS FIXUP VA OFFSET
+	then
+	    begin
+	    iafva = .header [ihd$l_iafva] ;			!  THEN PICK IT UP
+	    if .iafva eql 0 
+	    then 
+		lnk$gl_curclu [clu$v_prefixup] = true ;		! FIXVA THERE, BUT 0, SO ASSUME NOT THERE
+	    end
+	else
+	    lnk$gl_curclu [clu$v_prefixup] = true ;		! NO FIXUP VA, FLAG OLD IMAGE
+
+	lnk$gl_imgrecs = .lnk$gl_imgrecs + .hdrblkcnt + 1 ;	! COUNT HEADER BLOCKS AS RECORDS
+	curhdrisd = .header + .header [ihd$w_size] ;		! POINT TO FIRST ISD IN HEADER
+	!
+	!
+	!   CHECK GSMATCH OF IMAGE AGAINST GSMATCH FOUND IN SHAREABLE IMAGE
+	!   LIBRARY IF THIS IMAGE FOUND IN A LIBRARY
+	!
+	if     .lnk$gl_curclu [clu$l_gsmatch] neq 0		! IF FOUND IN SHAREABLE IMAGE LIB
+	   and .lnk$gl_curclu [clu$l_gsmatch] neq .isectident	!  AND IMAGE/LIBRARY MISMATCH
+	then
+	    begin
+	    bind    libident = lnk$gl_curclu [clu$l_gsmatch] : block [, byte],
+		    imgident = isectident 		     : block [, byte] ;
+
+	    signal (lin$_idmismch, 6				! WARN USER ABOUT IDENT PROBLEM
+		    ,.imgident [gmt$b_majorid],.imgident [gmt$b_minorid]
+		    ,lnk$gl_curfil [fdb$q_filename], .libident [gmt$b_majorid],.libident [gmt$b_minorid]
+		    ,lnk$gl_curfil [fdb$q_libnamdsc]
+		    ) ;
+	    end ;
+	end							! ALL DONE WITH FIRST BLOCK
+    else
+	curhdrisd = .header ;					! OTHER BLOCKS ARE ALL ISD
+
+    !
+    !  PROCESS IMAGE SECTION DESCRIPTORS
+    !
+    while (nxtisdoff = .(curhdrisd [isd$w_size])<0, 16, 1>) gtr 0  ! WHILE MORE ISD'S ON THIS BLOCK
+    do	begin
+	if .curhdrisd [isd$b_type] neq isd$k_usrstack		! BEGIN LOOP THAT PROCESSES EACH
+	then
+	    begin						! IGNORING STACK SECTION
+	    if .curhdrisd [isd$v_copyalway]			! IF THIS IS COPY ALWAYS SECTION
+	    then
+		signal_stop (lin$_relink, 2			! THEN ISSUE MESSAGE AND GIVE UP NOW
+			    ,lnk$gl_curfil [fdb$q_filename]
+			    ,lnk$gl_curfil [fdb$q_filename]
+			    ) ;
+
+	    if .curhdrisd [isd$v_gbl] 				  ! IF GLOBAL ISECT
+	    then
+		begin						  !  THEN CHECK FROM SAME SHAREABLE IMAGE
+		local	found,
+			shrdesc : block [dsc$c_s_bln, byte] ;
+		bind
+			gblnam  = curhdrisd [isd$t_gblnam] : vector [, byte] ;
+
+		shrdesc [dsc$a_pointer] =  gblnam [1] ;		   ! COMPLETE SECTION NAME DESCRIPTOR 
+	        shrdesc [dsc$w_length]  = .gblnam [0] - suffix_size ;	! FIND LENGTH OF GLOBAL SECTION
+								   ! SECTION NAME IN ISECT DESCRIPTOR
+		if .cludesc eql 0				   ! IF NO CREATED CLUSTERS YET
+		or not ch$eql (.shrdesc [dsc$w_length], gblnam [1] ! OR THIS IS FOR A DIFFERENT CLUSTER
+			      ,.shrdesc [dsc$w_length], cludesc [clu$t_name]
+			      )
+		then
+		    begin
+		    lnk$addimage (shrdesc, 0, cludesc, found) ;	    ! ADD IMAGE TO THE CLUSTER LIST
+		    if .cludesc neq 0 and not .found
+		    then
+			begin
+			cludesc [clu$v_prefixup] = .lnk$gl_curclu [clu$v_prefixup] ; 
+								     ! COPY PREFIXUP FLAG FROM PARENT CLUSTER
+			cludesc [clu$l_ownclu]   = .lnk$gl_curclu ;  ! SET OWNING CLUSTER DESCRIPTOR
+
+			if not .lnk$gl_curclu [clu$v_pic]	     ! IF THIS IMAGE IS NON-PIC
+			then
+			    begin
+			    cludesc [clu$v_based] = true ;			! FLAG CLUSTER AS BASED
+			    cludesc [clu$l_base] = (if   .curhdrisd [isd$v_based] 
+						    then .curhdrisd [isd$v_vpg]^9 
+						    else .lnk$gl_curclu [clu$l_base] +
+							 .lnk$gl_curclu [clu$l_cluoff]
+						    ) ;
+			    lnk$gl_curclu [clu$l_cluoff] = .lnk$gl_curclu [clu$l_cluoff] + 
+							   .curhdrisd [isd$w_pagcnt]*512 ;
+			    end ;
+			end
+		    else
+			begin
+			if (.lnk$gl_curclu [clu$v_based] 		! IF THIS CLUSTER IS BASED 
+				and not
+			    .lnk$gl_curclu [clu$v_pic]
+			   )
+			or  .lnk$gl_curclu [clu$v_usrbased]
+			then
+			    begin
+			    ownclu = .cludesc [clu$l_ownclu] ;		! GET OWNING CLUSTER POINTER
+
+			    if .ownclu neq 0
+			    then
+				lnk$gl_curclu [clu$l_cluoff] = .lnk$gl_curclu [clu$l_cluoff] + 
+								.curhdrisd[isd$w_pagcnt]*512 ;
+
+			    if  .ownclu neq 0				! IF THERE IS AN OWNING CLUSTER
+				and 
+				.ownclu [clu$v_based]			!  WHICH IS ALSO BASED
+				and 
+				.cludesc [clu$l_base] neq .curhdrisd [isd$v_vpg]^9
+									! AND WANTS THIS CLUSTER AT A 
+									! DIFFERENT PLACE
+			    then
+				begin
+				ownfdb = .ownclu [clu$l_fstfdb] ;	! GET FIRST FILE DESCRIPTOR BLOCK
+				signal  (lin$_confbasadr, 5
+					,cludesc [clu$b_namlng]
+					,.curhdrisd [isd$v_vpg]^9, lnk$gl_curfil [fdb$q_filename]
+					,.cludesc [clu$l_base], ownfdb [fdb$q_filename]
+					,lin$_noimgfil
+					) ;
+				lnk$gl_ctlmsk [lnk$v_image] = false ;	! DON'T MAKE A NON-RUNNABLE IMAGE
+				end
+			    else
+				begin
+				if not .lnk$gl_curclu [clu$v_usrbased]
+				then
+				    begin
+				    if not .cludesc [clu$v_based]	! IF CLUSTER NOT ALREADY BASED
+				    then
+					lnk$gw_shriscts = .lnk$gw_shriscts - .cludesc [clu$l_nisects] ;
+
+				    cludesc [clu$v_based] = true ;	! FLAG AS BASED
+				    cludesc [clu$l_base] = .curhdrisd [isd$v_vpg]^9 ;
+				    end ;
+				end ;
+			    end ;
+			end ;
+		    end
+		else
+		    begin
+		    if .lnk$gl_curclu [clu$v_based] or .lnk$gl_curclu [clu$v_usrbased]
+		    then
+			lnk$gl_curclu [clu$l_cluoff] =  .lnk$gl_curclu [clu$l_cluoff] + 
+							.curhdrisd [isd$w_pagcnt] * 512 ;
+
+		    end ;
+		end ;
+
+
+	    if not .curhdrisd[isd$v_gbl]
+	    then
+		begin
+		lnk$alloblk (isd$c_size, curisd) ;			! ALLOCATE A DESCRIPTOR
+		curisd [isl$l_nxtisd] = 0 ;				! CURRENT IS LAST
+		curisd [isl$l_bufadr] = 0 ;				! NO BUFFER FOR IT YET
+		curisd [isl$l_bufend] = 0 ;				! ...
+		curisd [isl$l_cludsc] = .lnk$gl_curclu ;		! SET POINTER TO CLUSTER DESCRIPTOR
+		newhdrisd = curisd [isl$t_hdrisd] ;			! POINT TO PART DESTINED FOR HEADER
+		ch$copy (.curhdrisd [isd$w_size]
+			, curhdrisd [isd$w_size], 0			! COPY THE ISD FROM THE
+			, isd$k_maxlenglbl, curisd [isl$t_hdrisd]	! HEADER TO DESCRIPTOR 0 FILLED
+			) ;
+		if .lnk$gl_curclu [clu$l_fstisd] eql 0			! IF THIS IS THE FIRST
+		then
+		    begin
+		    if .lnk$gl_curclu [clu$v_usrbased]			! IF BASED BY USER
+		    then
+			begin
+			if .lnk$gl_curclu [clu$v_based]			! IF CLUSTER IS ALSO BASED
+			    and 
+			   .lnk$gl_curclu [clu$l_base] neq .lnk$gl_curclu [clu$l_usrbase]
+			then
+			    begin
+			    signal ( lin$_confbasadr, 5
+				   , lnk$gl_curclu [clu$b_namlng]
+				   ,.lnk$gl_curclu [clu$l_base], lnk$gl_curfil [fdb$q_filename]
+				   ,.lnk$gl_curclu [clu$l_usrbase], $descriptor ('Options file')
+				   , lin$_noimgfil
+				   ) ;
+			    lnk$gl_ctlmsk [lnk$v_image] = false ;
+			    end ;
+
+			lnk$gl_curclu [clu$l_base]    = .lnk$gl_curclu [clu$l_usrbase] ;
+			lnk$gl_curclu [clu$l_usrbase] = 0 ;
+			lnk$gl_curclu [clu$v_based]   = true ;
+			end
+		    else
+			begin
+			if .lnk$gl_curclu [clu$v_based]			! IF BASED DUE TO ANOTHER IMAGE 
+			    and not 					! BASING IT AND IT TURNED OUT TO
+			   .lnk$gl_curclu [clu$v_pic]			! BE NON-PIC
+			then
+			    begin
+			    if .lnk$gl_curclu [clu$l_base] neq .newhdrisd [isd$v_vpg]^9
+			    then
+				begin
+				ownclu = .lnk$gl_curclu [clu$l_ownclu] ;
+				ownfdb = .ownclu [clu$l_fstfdb] ;
+				signal	( lin$_confbasadr, 5
+					, lnk$gl_curclu [clu$b_namlng]
+					,.newhdrisd [isd$v_vpg]^9, lnk$gl_curfil [fdb$q_filename]
+					,.lnk$gl_curclu [clu$l_base], ownfdb [fdb$q_filename]
+					, lin$_noimgfil
+					) ;
+				lnk$gl_ctlmsk [lnk$v_image] = false ;
+				end
+			    end
+			else
+			    if not .lnk$gl_curclu [clu$v_pic]
+			    then					! THEN EXTRACT BASE VPN
+				begin
+				lnk$gl_curclu [clu$l_base]  = .newhdrisd [isd$v_vpg]^9 ;
+				lnk$gl_curclu [clu$v_based] = true ;
+				end ;
+			end ;
+		    firstisd = .newhdrisd ;				! POINT TO FIRST ISECT IN CLUSTER
+		    end ;
+
+		lnk$gl_curclu [clu$l_nisects] = .lnk$gl_curclu [clu$l_nisects] + 1 ;
+									! COUNT ISECT IN CLUSTER
+
+		    begin
+		    bind   lastisd = lnk$gl_curclu [clu$l_lstisd] 	! POINTER TO LAST ISD IN CLUSTER
+				   : ref block [, byte] ;
+
+		    lastisd [isl$l_nxtisd] = .curisd ;			! PUT AT END OF LIST
+		    lastisd = .curisd ;					! AND MAKE CURRENT THE NEW LAST
+		    end ;
+
+
+		if .lnk$gl_curclu [clu$v_pic]				! IF A PIC CLUSTER
+		then
+		    begin
+		    if .newhdrisd eql .firstisd				! IF FIRST ISECT THIS CLUSTER
+		    then
+			firstisdvpg = .newhdrisd [isd$v_vpg] ;		! THEN SAVE VPG OF FIRST ISECT
+
+		    newhdrisd [isd$v_vpg] = .newhdrisd [isd$v_vpg] -	! THEN SUBTRACT OUT THE BASE
+					    .firstisdvpg ;		! FOR LATER RE-LOCATION (NEEDED 
+									! FOR OLD IMAGES LINKED @200)
+
+		    if  not .lnk$gl_curclu [clu$v_based] 
+		    then lnk$gw_shriscts = .lnk$gw_shriscts + 1 ;	! COUNT IT
+		    end ;
+
+		lnk$gl_curclu [clu$l_pages] = .lnk$gl_curclu [clu$l_pages] + .newhdrisd [isd$w_pagcnt] ;
+									! ACCUMULATE THE PAGES REQUIRED
+
+		if (ownclu = .lnk$gl_curclu [clu$l_ownclu]) eql 0
+		then 
+		    lnk$gl_curclu [clu$l_cluoff] =  .lnk$gl_curclu [clu$l_cluoff] + 
+						    .newhdrisd [isd$w_pagcnt]*512
+		else
+		    ownclu [clu$l_cluoff] = .ownclu [clu$l_cluoff] + .newhdrisd [isd$w_pagcnt]*512 ;
+
+		if .curhdrisd [isd$v_wrt]				! IF SECTION IS WRITEABLE
+		    and not 
+		   .curhdrisd [isd$v_crf]				!  AND NOT COPY-ON-REF
+		then
+		    lnk$gl_curclu [clu$v_wrt] = true ;			!  THEN REMEMBER FOR LNKIMGOUT
+
+		if .lnk$gl_curclu [clu$v_based]				! IF CLUSTER IS BASED THEN FLAG
+		then
+		    newhdrisd [isd$v_based] = true ;			! IN CLUSTER DESCRIPTOR ALSO
+
+		if not .curhdrisd [isd$v_dzro]				! PROVIDED NOT A DEMAND ZERO ISD
+		   and .curhdrisd [isd$l_vbn] neq 0			!  AND SECTION IS PRESENT IN IMAGE
+		then
+		    if .curhdrisd [isd$l_vbn] gequ .maxisdvbn		! IF IMAGE SECTION GOES BEYOND LAST
+		    then
+			maxisdvbn = .curhdrisd [isd$l_vbn] +	 	! BLOCK OF LAST ISECT, THEN
+				    .curhdrisd [isd$w_pagcnt] ;		! COMPUTE NEW MAX VBN IN USE
+
+		if not .curhdrisd [isd$v_gbl]				! IF IMAGE SECTION IS NOT
+		then							!   ALREADY GLOBAL
+		    begin
+		    local gblsect_namlng ;
+
+		    gblsect_namlng = .lnk$gl_curclu[clu$b_namlng] + suffix_size ;
+		    ! 
+		    !   The size of this global isd   =   length of private isd 
+		    !					+ length of gblsect ident 
+		    !					+ length of gblsect name count byte 
+		    !					+ length of gblsect name
+		    !
+		    newhdrisd [isd$w_size] = isd$k_lenpriv + .gblsect_namlng + 5 ; ! SET SIZE AND
+		    newhdrisd [isd$v_gbl]  = true ;				   ! MAKE IT GLOBAL NOW
+										!  GLOBAL ISDS
+		    decr i from 3 to 1						! COMPUTE ISD NAME BY
+		    do	begin
+			if (curisdseq [.i] = .curisdseq [.i] + 1) gtru %c'9'	! INCREMENTING THE SUFFIX
+			then
+			    curisdseq [.i] = %c'0'
+			else
+			    exitloop ;
+			end ;
+
+		    (newhdrisd [isd$t_gblnam])<0, 8, 0> = .gblsect_namlng ;	
+
+									! COPY THE CLUSTER
+									! NAME CONCATENATED WITH
+		    ch$copy (.lnk$gl_curclu [clu$b_namlng] 
+			    ,lnk$gl_curclu [clu$t_name], 4		! THE SEQUENTIAL NUMBER
+			    ,curisdseq [0], 0, .gblsect_namlng	 	! OF THE SECTION AND ZERO
+			    ,newhdrisd [isd$t_gblnam] + 1
+			    ) ;						! FILL THEN SET MATCH CONTROL
+		    newhdrisd [isd$v_matchctl] = .lnk$gl_curclu [clu$v_matchctl] ;
+		    newhdrisd [isd$l_ident]    = .isectident ;		! AND THE MATCH CONTROL IDENT
+		    end ;
+
+		if not .curhdrisd [isd$v_dzro]				! IF NOT DEMAND ZERO AND 
+		   and .lnk$gl_curclu [clu$v_copy]			! SHAREABLE IMAGE TO BE COPIED 
+		   and .curhdrisd [isd$l_vbn] neq 0			! AND SECTION IS PRESENT IN THIS 
+		then							! ONE
+		    begin
+		    if .curhdrisd [isd$w_pagcnt] gtru .lnk$gl_gsbufdsc [0]	! MAXIMIZE THE SIZE OF
+		    then 							! BUFFER WE'LL NEED
+			lnk$gl_gsbufdsc [0] = .curhdrisd [isd$w_pagcnt] ; 
+		    end ;
+
+		if .iafva neq 0						! IF THERE IS A FIXUP SECTION
+		   and 
+		   (.newhdrisd [isd$v_vpg]^9 eql .iafva)		!  AND THIS IS IT
+		then
+		    begin
+		    lnk$gl_curclu [clu$l_fixisd] = .curisd ;		!  THEN REMEMBER IT FOR LATER
+		    newhdrisd [isd$v_fixupvec] = true ;			! FLAG FIXUP SECTION IN ISD 
+		    end ;						! UNCONDITIONALLY
+
+		lnk$gw_nisects = .lnk$gw_nisects + 1 ;			! COUNT THAT IMAGE SECTION
+		end ;							! OF LOCAL ISECT
+
+	    if (curhdrisd = .curhdrisd + .nxtisdoff) gtru (.header + 510) ! CHECK IT WAS COMPLETELY
+	    then			    				! CONTAINED BY THE CURRENT BLOCK
+		 signal_stop (lin$_badimghdr, 1		 		! IF NOT TRUE, FATAL IMAGE
+			     ,lnk$gl_curfil [fdb$q_filename]		!  HEADER ERROR
+			     ) ;
+		end							! END OF ISECTION LOOP
+	    else
+		!
+		!   IMAGE SECTION WAS A STACK ISD, JUST SKIP IT BUT MAKE SURE IT IS CONTAINED BY THE
+		!   CURRENT BLOCK -- ISSUE ERROR AND QUIT IF NOT
+		!
+		if (curhdrisd = .curhdrisd + .nxtisdoff) gtru (.header + 510)
+		then
+		    signal_stop (lin$_badimghdr, 1, lnk$gl_curfil [fdb$q_filename]) ;
+
+	end ;						! END OF BLOCK LOOP
+    end ;
+
+if .maxisdvbn gtru .gstvbn [0] or .hdrblkcnt neq 0		! AND THIS SHOULD ALSO POINT TO GST
+								! AND NO HEADER BLOCKS REMAIN
+then									! IF EITHER ABOVE NOT TRUE, 
+    signal_stop (lin$_badimghdr, 1, lnk$gl_curfil [fdb$q_filename]) ;	! FATAL IMAGE HEADER ERROR
+
+if     .lnk$gl_curclu [clu$v_based]					! IF THIS CLUSTER IS BASED
+   and .lnk$gl_defclu [clu$v_based]					! AND BASE= IN OPTION FILE
+   and .lnk$gl_curclu [clu$l_base] lequ .lnk$gl_defclu [clu$l_base]	!  AND THIS IMAGE IS BELOW IT
+then
+    signal  (lin$_basshrbel, 3, lnk$gl_curfil [fdb$q_filename]	 	!  THEN WARN USER SHR IMG 
+	    ,.lnk$gl_curclu [clu$l_base], .lnk$gl_defclu [clu$l_base]	!  BELOW BASE=
+	    ) ;
+
+gstvbn [0]  = .gstvbn [0] + .blockoffset ;				! RELOCATE DOWN FILE IF NECESSARY
+gstvbn [1]  =  0 ;							! CLEAR THE BYTE OFFSET IN THE RFA
+saverecount = .lnk$gl_objrecs ;						! SAVE CURRENT RECORD COUNT
+lnk$pointobj (gstvbn) ;							! POINT TO GST
+
+if not lnk$procsobj (gstvbn)						! AND GO PROCESS IT LIKE AN
+then
+return false ;								! OBJECT RETURNING IF ERROR
+	
+saverecount = .lnk$gl_objrecs - .saverecount ;				! GET NUMBER PROCESSED
+
+if .saverecount neq .gstrecs						! AND IF NOT CORRECT NUMBER
+then
+    signal_stop (lin$_badimghdr, 1, lnk$gl_curfil [fdb$q_filename]) ;	! FATAL IMAGE HEADER ERROR
+
+lnk$gl_imgrecs = .lnk$gl_imgrecs + .saverecount ;			! ACCUMULATE RECORD COUNT
+return true								! ALL DONE SO RETURN SUCCESS
+end ;									! End of LNK$PROCSHRIM
+
+
+routine readnextblock = 			! READ NEXT BLOCK IF ANY
+!++
+!	THIS ROUTINE IS CALLED TO READ THE NEXT BLOCK OF THE IMAGE HEADER
+!	READ ERRORS ARE FATAL. A REQUEST TO READ ANOTHER BLOCK
+!	WHEN HDRBLKCNT IS ALREADY ZERO RETURNS FATAL.
+!	HDRBLKCNT IS DECREMENTED AFTER EACH READ AND HEADERBLOCK IS
+!	INCREMENTED BEFORE EACH READ.
+!
+!--
+begin
+local
+	saveusz,
+	readerror ;
+
+if .hdrblkcnt leq 0					! IF NO MORE BLOCKS
+then
+    return false ;					! RETURN FAILURE
+
+saveusz     = .lnk$al_rab [rab$w_usz] ;			! SAVE USZ
+headerblock = .headerblock + 1 ;			! SET THE BLOCK TO READ
+
+lnk$al_rab [rab$l_bkt] = .headerblock ;			! SET STARTING VBN
+lnk$al_rab [rab$w_usz] = 512 ;				! AND SET THE BYTE COUNT
+
+if not (readerror = $read (rab = lnk$al_rab))		! ATTEMPT TO READ LIBRARY, USING
+then
+    begin						! BUFFER ALREADY SET UP
+    signal (lin$_readerr, 1				!
+	   ,lnk$gl_curfil [fdb$q_filename]
+	   ,.readerror, .lnk$al_rab [rab$l_stv]
+	   ) ;
+    lnk$closefile (.lnk$gl_curfil) ;			! THE MESSAGES AND ATTEMPT TO
+    lnk$al_rab [rab$w_usz] = .saveusz ;			! RESTORE USZ
+    return false ;
+    end ;
+
+hdrblkcnt = .hdrblkcnt - 1 ;				! DECREMENT THE BLOCK COUNT
+lnk$al_rab [rab$w_usz] = .saveusz ;
+return true ;						! AND ALL DONE SUCCESSFULLY
+end ;							! END OF READNEXTBLOCK
+end
+
+eludom							! End of module

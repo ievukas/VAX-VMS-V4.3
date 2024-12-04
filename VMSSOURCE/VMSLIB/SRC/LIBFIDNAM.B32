@@ -1,0 +1,682 @@
+%TITLE 'LIB$FID_TO_NAME - Convert device and file ID to file specification'
+MODULE	LIB$FID_TO_NAME (	    ! Convert device and file ID to file spec
+	IDENT = 'V04-000' ) =	    ! File: LIBFIDNAM.B32 Edit: V03-004
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!++
+! FACILITY:	General Utility Library
+!
+! ABSTRACT:
+!
+!	This routine converts a device and file identification to a file
+!	specification.
+!
+! ENVIRONMENT:	Runs at any access mode - AST reentrant
+!
+! AUTHOR: Martin L. Jack, CREATION DATE: 23-Dec-1981
+!
+! MODIFIED BY:
+!
+! V03-004	SOP0004		J. R. Sopka		19 September 1983
+!         Add test for NULL_DIRECTORY to handle directory strings returned
+!         by the ACP for ODS-1 formatted disks.
+!
+! V03-003	SOP0003		J. R. Sopka		29 August 1983
+!         Invoke SYS$FILESCAN via $FILESCAN macro in STARLET.  This fixes 
+!         problem of 'insufficient arguments' caused if optional arguments
+!         are not supplied.
+!
+! V03-002	SOP0002		J. R. Sopka		10 August 1983
+!         Re-work to reduce stack usage to be callable in Kernel mode.
+!         Return partial spec if any available.  
+!
+! V03-001	SOP0001		J. R. Sopka		 7 June 1983
+!         Complete rework to access new ACP attribute which returns an 
+!         entire file spec in a single call.  
+!
+! 1-004 - Correct two paths on which the routine could return without releasing
+!	  channel and event flag.  MLJ 22-Mar-1982
+! 1-003 - Add ACP_STATUS parameter to return error that occurred in a file
+!	  operation.  Print [?] whenever a lookup error occurs on a directory.
+!	  MLJ 15-Mar-1982
+! 1-002 - Print [] rather than [?] if zero backlink at top level.  Add
+!	  DIRECTORY_ID parameter.  Use device name if logical volume name not
+!	  available.  Check ACP type; avoid [?] for Structure Level 1.
+!	  MLJ 15-Jan-1982
+! 1-001	- Original from LIBACP.B32.  MLJ 23-Dec-1981
+!--
+
+%SBTTL	'Declarations'
+!
+! TABLE OF CONTENTS:
+!
+FORWARD ROUTINE
+    LIB$FID_TO_NAME;		! Convert device and file ID to file specification
+
+!
+! INCLUDE FILES:
+!
+LIBRARY 'SYS$LIBRARY:LIB';	! System symbols
+
+!
+! SWITCHES:
+!
+SWITCHES
+	ADDRESSING_MODE (EXTERNAL = GENERAL, NONEXTERNAL = WORD_RELATIVE);
+!
+! LINKAGES:
+!
+LINKAGE
+	LINKAGE_JSB_3_6 = JSB(REGISTER=0,REGISTER=1,REGISTER=2):
+			  NOPRESERVE(3,4,5,6),
+
+	LINKAGE_JSB_2_2 = JSB(REGISTER=0;REGISTER=1,REGISTER=2);
+!
+! MACROS:
+!
+MACRO	MASTER_FILE_DIRECTORY	( DIRECTORY_STRING_LENGTH, 
+				  DIRECTORY_STRING_ADDRESS )
+	= 
+	  (	DIRECTORY_STRING_LENGTH  EQL  %CHARCOUNT( '[000000]' )
+	    AND
+		CH$EQL( DIRECTORY_STRING_LENGTH, DIRECTORY_STRING_ADDRESS,
+			%CHARCOUNT( '[000000]' ), CH$PTR( UPLIT( '[000000]' ) ) )
+	  )%;
+
+MACRO	NULL_DIRECTORY		( DIRECTORY_STRING_LENGTH, 
+				  DIRECTORY_STRING_ADDRESS )
+	= 
+	  (	DIRECTORY_STRING_LENGTH  EQL  %CHARCOUNT( '[]' )
+	    AND
+		CH$EQL( DIRECTORY_STRING_LENGTH, DIRECTORY_STRING_ADDRESS,
+			%CHARCOUNT( '[]' ), CH$PTR( UPLIT( '[]' ) ) )
+	  )%;
+
+
+!
+! EQUATED SYMBOLS:
+!
+LITERAL
+
+    ! size of the local buffer for constructing the string to return.
+    ! this will be truncated to the maximum RMS file specifier length for return.
+    ! 16 is the maximum length of a logical volume name.
+    BUF_SIZE	=  NAM$C_MAXRSS + 16;
+
+!
+! FIELDS:
+!
+!	NONE
+!
+! PSECTS:
+!
+    PSECT
+	CODE = _LIB$CODE (READ, NOWRITE, EXECUTE, SHARE, PIC, ADDRESSING_MODE (WORD_RELATIVE)),
+	PLIT = _LIB$CODE (READ, NOWRITE, EXECUTE, SHARE, PIC, ADDRESSING_MODE (WORD_RELATIVE)),
+	OWN  = _LIB$DATA (READ, WRITE, NOEXECUTE, NOSHARE, PIC, ADDRESSING_MODE (LONG_RELATIVE)),
+	GLOBAL = _LIB$DATA (READ, WRITE, NOEXECUTE, NOSHARE, PIC, ADDRESSING_MODE (LONG_RELATIVE)) ;
+!
+! OWN STORAGE:
+!
+!	NONE
+
+%SBTTL	'External References'
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL ROUTINE
+    LIB$GET_EF,						! Allocate an event flag
+    LIB$FREE_EF,					! Deallocate an event flag
+    LIB$ANALYZE_SDESC_R2:	LINKAGE_JSB_2_2,	! Analyze descriptor
+    LIB$SCOPY_R_DX6:		LINKAGE_JSB_3_6;	! String copy
+
+EXTERNAL LITERAL				! Completion status codes
+    LIB$_INVARG,					! Invalid argument
+    LIB$_STRTRU,					! String truncated
+    LIB$_INVFILSPE;					! Invalid file specification
+
+%SBTTL	'LIB$FID_TO_NAME - Convert device and file ID to file specification'
+GLOBAL ROUTINE LIB$FID_TO_NAME (	! Convert device and file ID to file specification
+	DEVICE_NAME,				! Device name string descriptor
+	FILE_ID:	    REF BLOCK[,BYTE],	! File identification
+	FILE_SPEC,				! File specification string descriptor
+	FILE_SPEC_LENGTH,			! True length of FILE_SPEC returned
+	DIRECTORY_ID:	    REF BLOCK[,BYTE],	! Directory identification
+	ACP_STATUS				! ACP status return returned
+    	) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine converts a disk device name and file identification to a
+!	file specification by requesting the ACP file spec attribute.
+!	This routine will not operate well on Structure Level 1 disks, unless
+!	the DIRECTORY_ID parameter is used.
+!
+! CALLING SEQUENCE:
+!
+!	ret_status.wlc.v = LIB$FID_TO_NAME (	device-name.rt.dx, 
+!						file-id.rwu.r,
+!						file-spec.wt.dx, 
+!						[file-spec-length.wwu.r],
+!						[directory-id.rwu.r], 
+!						[acp-status.wlu.r]	)
+!
+! INPUT PARAMETERS:
+!
+!	DEVICE_NAME		Address of a descriptor for a device name.
+!				Typically this string is obtained from the
+!				NAM$T_DVI field of a VAX-11 RMS name block.
+!				The device name must reference a disk device.
+!				The string must contain no more than 64
+!				characters.
+!
+!	FILE_ID			Address of an array of three words that
+!				specifies a file identification.  Typically
+!				this array is obtained from the NAM$W_FID field
+!				of a VAX-11 RMS name block.  The $FIDDEF macro
+!				defines the structure of this parameter.
+!
+!	DIRECTORY_ID		Address of an array of three words that
+!				specifies a directory file identification.
+!				Typically this array is obtained from the
+!				NAM$W_DID field of a VAX-11 RMS name block.
+!				The $FIDDEF macro defines the structure of this
+!				parameter.  This is an optional parameter.
+!
+! OUTPUT PARAMETERS:
+!
+!	FILE_SPEC		Address of a descriptor for a string that
+!				receives the file specification.  This is an
+!				output parameter.
+!
+!	FILE_SPEC_LENGTH	Address of a word to receive the number	of
+!				characters written into file-spec, not
+!				counting padding in the case of a fixed-length
+!				string.  If the output string is truncated to
+!				the size specified in the file-spec
+!				string, file-spec-length is set to this
+!				size.  Therefore, file-spec-length can
+!				always be used by the calling program to access
+!				a valid substring of file-spec.  This is
+!				an optional output parameter, passed by
+!				reference.
+!
+!	ACP_STATUS		Address of a longword that receives the status
+!				resulting from traversing the back links.  This
+!				is an optional output parameter.
+!
+!	The output parameters are guaranteed to be stored only if the routine
+!	value is true.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! COMPLETION STATUS:
+!
+!	SS$_NORMAL	Normal successful completion
+!
+!	LIB$_STRTRU	Output string truncated (qualified success)
+!
+!	LIB$_INVARG	Required argument omitted, or device-name longer than
+!			64 characters
+!
+!	LIB$_INVFILSPE	Device-name does not reference a disk
+!
+!	LIB$ANALYZE_SDESC errors
+!	$ASSIGN errors
+!	$QIO errors
+!	$DASSGN errors
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+BEGIN
+
+LOCAL
+    ACP_STATUS_VALUE:			! Value for ACP_STATUS
+		UNSIGNED LONG,
+    ACP_TYPE:				! ACP type attribute returned by GETDVI
+		UNSIGNED LONG
+		VOLATILE,
+    ATR:				! QIO attribute list
+		BLOCKVECTOR[ 2, ATR$S_ATRDEF, BYTE],
+    BUFFER:				! Buffer to construct return string
+		VECTOR[ BUF_SIZE, BYTE ]
+		VOLATILE,
+    BUF_PTR:				! Pointer to BUFFER
+		REF VECTOR[ , BYTE ],
+    BUF_LENGTH:				! Length of return string
+		UNSIGNED WORD
+		INITIAL ( 0 ),
+    CHANNEL:				! Channel number
+		UNSIGNED WORD,
+    DESC:				! Descriptor for various arguments
+		VECTOR[ 2, LONG],
+    EFN:				! Event flag number
+		UNSIGNED WORD,
+    FIB:
+		BLOCK[ FIB$C_LENGTH, BYTE ],
+    FILE_ITM:				! Item list for $FILESCAN
+		BLOCKVECTOR[ 4, FSCN$S_ITEM_LEN, BYTE ],
+    FINAL_STATUS:			! Status return
+		UNSIGNED LONG,
+    IOSB:				! I/O status block
+		VECTOR[ 4, WORD ];
+
+
+BUILTIN
+    ACTUALCOUNT,			! Return number of arguments
+    LOCC,				! 'LOCate Character' instruction
+    NULLPARAMETER;			! Test if parameter specified
+
+LABEL
+    PROCESS;				! Block containing QIO processing to ACP
+
+!+
+! Ensure that the required parameters are present.
+!-
+IF    ACTUALCOUNT() LSSU 3     THEN  RETURN LIB$_INVARG;
+
+!+
+! Analyze the input device name descriptor and set up the local descriptor.
+!-
+BEGIN ! block to use output registers
+REGISTER    R1 = 1,    R2 = 2;
+FINAL_STATUS = LIB$ANALYZE_SDESC_R2(.DEVICE_NAME; R1, R2);
+IF    NOT .FINAL_STATUS          THEN  RETURN .FINAL_STATUS;
+IF   .R1 GTRU LOG$C_NAMLENGTH    THEN  RETURN  LIB$_INVARG;
+DESC[0] = .R1;
+DESC[1] = .R2;
+END; ! block to use output registers
+
+!+
+! Assign a channel to the device.
+!-
+FINAL_STATUS = $ASSIGN( DEVNAM = DESC,  CHAN = CHANNEL );
+IF    NOT .FINAL_STATUS           THEN  RETURN .FINAL_STATUS;
+
+!+
+! Allocate an event flag.
+!-
+FINAL_STATUS = LIB$GET_EF(EFN);
+IF    NOT .FINAL_STATUS
+THEN
+    BEGIN
+    $DASSGN(CHAN=.CHANNEL);
+    RETURN .FINAL_STATUS;
+    END;
+
+!+ - + - + - + - + - + - + - + - + - + - + - + - + - + - + - + - + - + - + - + -
+! Beginning of block containing processing on the opened channel.  Leave this 
+! block with FINAL_STATUS containing the status to be returned to the caller.
+!-
+PROCESS:  BEGIN    
+
+ACP_STATUS_VALUE = SS$_NORMAL;
+
+!+
+! Attempt to obtain the logical volume name for the device.
+!-
+BEGIN	LOCAL    DEV_ITM  :  $ITMLST_DECL( ITEMS=2 );
+$ITMLST_INIT(	ITMLST= DEV_ITM,
+		( ITMCOD= DVI$_LOGVOLNAM,   BUFADR= BUFFER, 
+			BUFSIZ= LOG$C_NAMLENGTH,  RETLEN= BUF_LENGTH ),
+		( ITMCOD= DVI$_ACPTYPE,     BUFADR= ACP_TYPE, 
+			BUFSIZ= 4,                RETLEN= 0 )
+            );
+
+ACP_TYPE = 0;
+
+FINAL_STATUS = $GETDVI( CHAN=.CHANNEL, EFN=.EFN, ITMLST=DEV_ITM );
+IF    NOT .FINAL_STATUS    THEN  LEAVE PROCESS;
+FINAL_STATUS = $WAITFR( EFN=.EFN );
+IF    NOT .FINAL_STATUS    THEN  LEAVE PROCESS;
+END;
+
+!+
+! Set the buffer pointer.
+!-
+BUF_PTR = BUFFER + .BUF_LENGTH;
+
+!+
+! If a logical volume name was returned.
+!-
+IF  .BUF_LENGTH  NEQ  0
+THEN
+    !+
+    ! If there is no trailing colon on the logical volume name, add one.
+    !-
+    IF   .BUF_PTR[-1] NEQ %C':'
+    THEN
+	BEGIN
+	BUF_PTR[0] = %C':';
+	BUF_PTR    = .BUF_PTR + 1;
+	BUF_LENGTH = .BUF_LENGTH + 1;
+	END;
+;
+
+!+
+! Check the ACP type code to ensure that the device is a disk to which we can
+! issue the necessary ACP functions.
+!-
+IF  .ACP_TYPE NEQ DVI$C_ACP_F11V1 
+  AND
+    .ACP_TYPE NEQ DVI$C_ACP_F11V2
+THEN
+    BEGIN
+    FINAL_STATUS = LIB$_INVFILSPE;
+    LEAVE PROCESS;
+    END;
+
+!+
+! Set up the FIB for the QIO to get file spec from the ACP.
+!-
+CH$FILL( 0, FIB$C_LENGTH, FIB );
+IF
+    ! The DIRECTORY_ID parameter was specified
+    NOT NULLPARAMETER( 5 )
+THEN
+    ! We get the file spec for the specified directory id first.
+    BEGIN
+    FIB[ FIB$W_FID_NUM ] = .DIRECTORY_ID[ FID$W_NUM ];
+    FIB[ FIB$W_FID_SEQ ] = .DIRECTORY_ID[ FID$W_SEQ ];
+    FIB[ FIB$W_FID_RVN ] = .DIRECTORY_ID[ FID$W_RVN ];
+    END
+ELSE
+    ! We can get the file spec for the specified file id right away.
+    BEGIN
+    FIB[ FIB$W_FID_NUM ] = .FILE_ID[ FID$W_NUM ];
+    FIB[ FIB$W_FID_SEQ ] = .FILE_ID[ FID$W_SEQ ];
+    FIB[ FIB$W_FID_RVN ] = .FILE_ID[ FID$W_RVN ];
+    END
+;
+
+DESC[0] = FIB$C_LENGTH;
+DESC[1] = FIB;
+
+!+
+! QIO to get full file specification attribute.
+!-
+CH$FILL( 0, 2*ATR$S_ATRDEF, ATR );
+ATR[ 0, ATR$W_TYPE ] = ATR$C_FILE_SPEC;
+ATR[ 0, ATR$W_SIZE ] = BUF_SIZE - .BUF_LENGTH;
+ATR[ 0, ATR$L_ADDR ] = .BUF_PTR;
+
+FINAL_STATUS = $QIOW(   FUNC=IO$_ACCESS,
+			CHAN=.CHANNEL,
+			IOSB=IOSB,
+			P1=DESC,
+			P5=ATR		);
+IF    .FINAL_STATUS        THEN  FINAL_STATUS = .IOSB[0];
+ACP_STATUS_VALUE = .FINAL_STATUS;
+IF    NOT .FINAL_STATUS    THEN  LEAVE PROCESS;
+
+!+
+! If a logical volume name was available, 
+! then discard the char count and the device name returned by QIO,
+! else just discard the char count of the string returned by the QIO.
+!-
+BEGIN	! Block to bind FILE_SPEC_LEN
+BIND	FILE_SPEC_LEN	=  .BUF_PTR	:  UNSIGNED WORD;
+
+IF    .BUF_LENGTH  NEQ  0
+THEN
+    BEGIN
+    !+
+    ! Locate the device portion of the file spec returned by the QIO.
+    ! QIO returns the file specification as a counted ASCII string.
+    !-
+    DESC[0] = .FILE_SPEC_LEN;
+    DESC[1] = FILE_SPEC_LEN + 2;
+
+    CH$FILL( 0, 2*FSCN$S_ITEM_LEN, FILE_ITM );
+    FILE_ITM[ 0, FSCN$W_ITEM_CODE ] = FSCN$_DEVICE;	! zero item terminates list
+
+    FINAL_STATUS = $FILESCAN( SRCSTR = DESC, VALUELST = FILE_ITM );
+    IF    NOT .FINAL_STATUS    THEN  LEAVE PROCESS;
+
+    !+
+    ! Skip the device portion, and append the remainder of the file spec 
+    ! to the logical volume name.
+    !-
+    BUF_PTR = CH$MOVE(  .FILE_SPEC_LEN - .FILE_ITM[ 0, FSCN$W_LENGTH ],
+			.FILE_ITM[ 0, FSCN$L_ADDR ] + .FILE_ITM[ 0, FSCN$W_LENGTH ],
+			.BUF_PTR  );
+    END
+ELSE
+    !+
+    ! Discard the character count portion of the string returned by the QIO.
+    !-
+    BUF_PTR = CH$MOVE(  .FILE_SPEC_LEN,  FILE_SPEC_LEN + 2,  .BUF_PTR  )
+;
+
+!+
+! Set the buffer length count.
+!-
+BUF_LENGTH = .BUF_PTR - BUFFER;
+
+END;	! Block to bind FILE_SPEC_LEN 
+
+!+
+! If   the DIRECTORY_ID parameter was specified,
+! then convert directory file spec to directory format
+!      and append file spec for FILE_ID to it.
+!-
+IF  NOT NULLPARAMETER( 5 )
+THEN
+    BEGIN   LOCAL   PTR            :  REF VECTOR[ , BYTE ],
+		    CLOSE_BRACKET  :  UNSIGNED BYTE;
+
+    !+
+    ! Extract interesting pieces of the file spec currently in BUFFER.
+    !-
+    BEGIN
+    DESC[0] = .BUF_LENGTH;
+    DESC[1] = BUFFER;
+
+    CH$FILL( 0, 4*FSCN$S_ITEM_LEN, FILE_ITM );
+
+    FILE_ITM[ 0, FSCN$W_ITEM_CODE ] = FSCN$_DIRECTORY;
+    FILE_ITM[ 1, FSCN$W_ITEM_CODE ] = FSCN$_NAME;
+    FILE_ITM[ 2, FSCN$W_ITEM_CODE ] = FSCN$_TYPE;	! zero item terminates list
+
+    FINAL_STATUS = $FILESCAN( SRCSTR = DESC, VALUELST = FILE_ITM );
+    IF    NOT .FINAL_STATUS    THEN  LEAVE PROCESS;
+    END;
+
+    !+
+    ! Save the close bracket character used in directory specification
+    !-
+    PTR = (.FILE_ITM[ 0, FSCN$L_ADDR ] + 
+	    		.FILE_ITM[ 0, FSCN$W_LENGTH ] - 1 );
+    CLOSE_BRACKET = .PTR[0];
+
+
+    IF
+	! directory is a root directory
+	MASTER_FILE_DIRECTORY(	.FILE_ITM[ 0, FSCN$W_LENGTH ], 
+	    			.FILE_ITM[ 0, FSCN$L_ADDR ]	)
+      OR
+	! a null directory specification has been returned
+	NULL_DIRECTORY(		.FILE_ITM[ 0, FSCN$W_LENGTH ], 
+	    			.FILE_ITM[ 0, FSCN$L_ADDR ]	)
+    THEN
+	!+
+	! Place directory filename as root directory.
+	!-
+	PTR = CH$MOVE( .FILE_ITM[ 1, FSCN$W_LENGTH ],
+			.FILE_ITM[ 1, FSCN$L_ADDR ],
+			.FILE_ITM[ 0, FSCN$L_ADDR ] + 1 )
+    ELSE
+	!+
+	! Place directory filename into directory format as sub-directory.
+	! Here we assume that the filename immediately follows the closing
+	! bracket of the directory spec in the file spec returned by the ACP
+	!-
+	BEGIN
+	PTR[0] = %C'.';
+	PTR = .FILE_ITM[ 1, FSCN$L_ADDR ] + .FILE_ITM[ 1, FSCN$W_LENGTH ];
+	END
+    ;
+
+    !+
+    ! Close the directory portion of the file spec with saved close bracket
+    !-
+    PTR[0] = .CLOSE_BRACKET;
+
+    !+
+    ! Set length of current buffer contents.
+    !-
+    BUF_PTR = .PTR + 1;
+    BUF_LENGTH = .BUF_PTR - BUFFER;
+
+    !+
+    ! Set up the FIB for the QIO to get filename from the ACP.
+    !-
+    CH$FILL( 0, FIB$C_LENGTH, FIB );
+    FIB[ FIB$W_FID_NUM ] = .FILE_ID[ FID$W_NUM ];
+    FIB[ FIB$W_FID_SEQ ] = .FILE_ID[ FID$W_SEQ ];
+    FIB[ FIB$W_FID_RVN ] = .FILE_ID[ FID$W_RVN ];
+
+    !+
+    ! QIO to get ASCII file name attribute.
+    !-
+    ATR[ 0, ATR$W_TYPE ] = ATR$C_ASCNAME;
+    ATR[ 0, ATR$W_SIZE ] = (IF    (BUF_SIZE - .BUF_LENGTH)  LSSU  ATR$S_ASCNAME
+			    THEN  (BUF_SIZE - .BUF_LENGTH)
+			    ELSE  ATR$S_ASCNAME		);
+    ATR[ 0, ATR$L_ADDR ] = .BUF_PTR;
+
+    DESC[0] = FIB$C_LENGTH;
+    DESC[1] = FIB;
+
+    FINAL_STATUS = $QIOW(   FUNC=IO$_ACCESS,
+			    CHAN=.CHANNEL,
+			    IOSB=IOSB,
+			    P1=DESC,
+			    P5=ATR		);
+    IF    .FINAL_STATUS        THEN  FINAL_STATUS = .IOSB[0];
+    ACP_STATUS_VALUE = .FINAL_STATUS;
+    IF    NOT .FINAL_STATUS    THEN  LEAVE PROCESS;
+
+    !+
+    ! Scan for trailing spaces and remove these.
+    ! QIO returns the filename with blank fill out to the specified length.
+    !-
+    BEGIN ! block to use output registers
+    REGISTER    R0 = 0;
+    LOCC( %REF(%C' '), %REF(BUF_SIZE - .BUF_LENGTH), .BUF_PTR; R0 );
+    BUF_LENGTH = BUF_SIZE - .R0;
+    BUF_PTR = BUFFER + .BUF_LENGTH;
+    END; ! block to use output registers
+
+    END;	! Processing for the DIRECTORY_ID parameter.
+END;	! of block PROCESS
+!+
+! End of block containing processing on the opened channel.
+! FINAL_STATUS contains the most severe status encountered during processing.
+! If   an error has been encountered 
+! then we will return it rather than any error status we may obtain during 
+!      the following wrap-up.
+!+ - + - + - + - + - + - + - + - + - + - + - + - + - + - + - + - + - + - + - + -
+
+!+
+! Deassign the channel and deallocate the event flag.
+!-
+BEGIN
+    LOCAL   STATUS_1:	UNSIGNED LONG,
+	    STATUS_2:	UNSIGNED LONG;
+    STATUS_1 = $DASSGN( CHAN=.CHANNEL );
+    STATUS_2 = LIB$FREE_EF( EFN );
+    IF    .FINAL_STATUS    THEN  FINAL_STATUS = .STATUS_1;
+    IF    .FINAL_STATUS    THEN  FINAL_STATUS = .STATUS_2;
+END;
+
+!+
+! Return the ACP status code if requested.
+!-
+IF    NOT NULLPARAMETER(6)
+THEN
+    .ACP_STATUS = .ACP_STATUS_VALUE;
+
+!+
+! If we have even a partial file spec, return it.
+!-
+IF    .BUF_LENGTH  NEQ  0
+THEN  
+    BEGIN	REGISTER    R1 = 1;
+		LOCAL	STATUS:  UNSIGNED LONG;
+
+    !+
+    ! Do not return a file spec longer than the maximum RMS can handle.
+    !-
+    IF	  .BUF_LENGTH  GTRU  NAM$C_MAXRSS
+    THEN
+	BEGIN
+	BUF_LENGTH = NAM$C_MAXRSS;
+	IF    .FINAL_STATUS    THEN  FINAL_STATUS = LIB$_STRTRU;
+	END;
+
+    !+
+    ! Copy the file specification to its destination, 
+    ! and determine if truncation occurred.
+    !-
+    STATUS = LIB$SCOPY_R_DX6(.BUF_LENGTH, BUFFER, .FILE_SPEC);
+    IF    .FINAL_STATUS    THEN  FINAL_STATUS = .STATUS;
+    LIB$ANALYZE_SDESC_R2(.FILE_SPEC; R1);
+    IF    .R1 LSSU .BUF_LENGTH
+    THEN
+	BEGIN
+	BUF_LENGTH = .R1;
+	IF    .FINAL_STATUS    THEN  FINAL_STATUS = LIB$_STRTRU;
+	END;
+    END;
+
+!+
+! Return the length of the file specification if requested.
+!-
+IF    NOT NULLPARAMETER(4)
+THEN
+    (.FILE_SPEC_LENGTH)<0,16> = .BUF_LENGTH;
+
+!+
+! Return the vanilla success status unless an error has occured.
+!-
+RETURN	(IF    .FINAL_STATUS
+	 THEN  SS$_NORMAL
+	 ELSE  .FINAL_STATUS);
+
+END;					! End of routine LIB$FID_TO_NAME
+
+END					! End of module LIB$FID_TO_NAME
+ELUDOM

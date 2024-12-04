@@ -1,0 +1,1263 @@
+MODULE SOR$SPEC_FILE (
+		IDENT = 'V04-000'	! File: SORSPEC.B32 Edit: PDG3030
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+!
+! FACILITY:	VAX-11 SORT/MERGE
+!
+! ABSTRACT:
+!
+!	This module contains routines that read and process specification text.
+!
+! ENVIRONMENT:	VAX/VMS user mode
+!
+! AUTHOR: Peter D Gilbert, CREATION DATE: 07-Jan-1982
+!
+! MODIFIED BY:
+!
+!	T03-015		Original
+!	T03-016	Copy relevant information to RDT entries with same KFT indices.
+!		Improve calculation of COM_FORMATS.  Comments.  PDG 13-Dec-1982
+!	T03-017	Put a linkage declaration on SOR$$COMPARE.  PDG-15-Dec-1982
+!	T03-018	Define offsets for use by SOR$$COMPARE.  PDG 22-Dec-1982
+!	T03-019	Check for a longword temporary (not CTX[COM_LRL_INT) exceeding
+!		MAX_REFSIZE.  PDG 28-Dec-1982
+!	T03-020	Added the output format record length as an output parameter
+!		from SOR$$REFORM.  PDG 3-Jan-1983
+!	T03-021	Added clean-up routine for the work area.  PDG 26-Jan-1983
+!	T03-022	Use COM_MRG_STREAM for stable merges.  PDG 27-Jan-1983
+!	T03-023	Define COM$B_PAD for use by SOR$$COMPARE.  PDG 8-Feb-1983
+!	T03-024	Abort on errors from SOR$$SFPRS.  Use KFT_NDE_SIZ.
+!		Pass the context address to callback routines.  PDG 12-Feb-1983
+!	T03-025	Use SOR$$(DE)ALLOCATE to append code strings.  PDG 7-Mar-1983
+!	T03-026	Special-case some stuff to use SOR$$KEY_SUB.  PDG 17-Mar-1983
+!	T03-027	Correctly set the COM_VAR flag.  PDG 9-May-1983
+!	T03-028	Fix adding DSC_ADR to COM_COMPARE.  Make allowances for ADDRESS
+!		and INDEX sorts.  PDG 10-May-1983
+!	T03-029	Leave COM_EQUAL equal to 0 if it's not needed.  PDG 26-Aug-1983
+!	T03-030	SOR$$BEST_FILE_NAME assumes NAM$B_RSL and NAM$B_ESL are zero
+!		before the OPEN or CREATE.  PDG 10-Nov-1983
+!--
+
+LIBRARY	'SYS$LIBRARY:STARLET';
+REQUIRE	'SRC$:COM';
+LIBRARY 'SRC$:SRTSPC';
+LIBRARY	'SRC$:OPCODES';
+
+!%IF %DECLARED(%QUOTE $DESCRIPTOR) %THEN UNDECLARE %QUOTE $DESCRIPTOR; %FI
+
+FORWARD ROUTINE
+    SOR$$SPEC_FILE:	CAL_CTXREG,		! Process specification text
+    CALC_LRL_OUT:	CAL_CTXREG NOVALUE,	! Spec file processing for LRL
+    SOR$$SPEC_KEY_SUB:	CAL_CTXREG,		! Process keys for spec file
+    INPUT:		JSB_INPUT,		! General input routine
+    COMPARE:		JSB_COMPARE,		! General compare routine
+    SOR$$COMPATIBLE:	CAL_CTXREG,		! Test keys for compatibility
+    CLEAN_UP:		CAL_CTXREG NOVALUE;	! Release resources
+
+SOR$$END_ROUTINE_(CLEAN_UP);			! Declare a clean-up routine
+
+EXTERNAL ROUTINE
+    LIB$SFREE1_DD:	ADDRESSING_MODE(GENERAL),	! Free a dynamic string
+    LIB$GET_VM:		ADDRESSING_MODE(GENERAL),	! Get virtual memory
+    STR$APPEND:		ADDRESSING_MODE(GENERAL),	! Append strings
+    SOR$$SFPRS:		CAL_CTXREG,			! Parse specifications
+    SOR$$BEST_FILE_NAME:CAL_CTXREG NOVALUE,		! Get best file name string
+    SOR$$ALLOCATE:	CAL_CTXREG,			! Allocate storage
+    SOR$$DEALLOCATE:	CAL_CTXREG NOVALUE,		! Deallocate storage
+    SOR$$KEY_SUB:	CAL_CTXREG,			! Generate routines
+    SOR$$ERROR;						! Error routine
+
+! Define offsets within the internal format record
+!
+LITERAL
+    OFF_STAB=	0,	! Offset to the stable information	(long)
+    OFF_FMT=	4,	! Offset to the format number		(byte)
+    OFF_LEN=	5,	! Offset to the record length		(word)
+    OFF_ADR=	7;	! Offset to the data portion of the record
+
+! Define offsets for use by SOR$$COMPARE.
+!
+BIND ZIP_CTX = 0:	BLOCK[CTX_K_SIZE] FIELD(CTX_FIELDS);
+GLOBAL LITERAL
+    COM$L_COLLATE=	ZIP_CTX[COM_COLLATE],
+    COM$B_PAD=		ZIP_CTX[COM_PAD];
+
+GLOBAL ROUTINE SOR$$SPEC_FILE: CAL_CTXREG =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine processes the specification text.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	Status code.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CTX =	COM_REG_CTX:	REF BLOCK[CTX_K_SIZE]
+				FIELD(CTX_FIELDS);
+    LOCAL
+	FAB:	$FAB_DECL,		! FAB block
+	NAM:	$NAM_DECL VOLATILE,	! NAM block
+	RAB:	REF $RAB_DECL,		! RAB block
+	DDB:	REF DDB_BLOCK,
+	FNA:	BLOCK[NAM$C_MAXRSS, BYTE],	! File name string area
+	BUF:	VECTOR[MAX_SPC_LINE,BYTE],	! Buffer area
+	DESC:	BLOCK[8,BYTE],			! Dynamic string descriptor
+	STATUS;			! Status
+
+
+    ! Initialize the FAB (file access block) and the NAM (name block)
+    !
+    $FAB_INIT(
+	FAB = FAB[BASE_],		! FAB block
+	NAM = NAM[BASE_],		! NAM block
+!	FNA				! File name area	(set below)
+!	FNS				! File name area size	(set below)
+	FAC = GET,			! File access
+	SHR = GET,			! Sharing
+	DNA = UPLIT BYTE(STR_SPC_EXT),	! Default extension is .SRT
+	DNS = %CHARCOUNT(STR_SPC_EXT),	! Default extension is .SRT
+	RFM = VAR,			! Needed if no input files
+	RAT = CR);			! Record attributes
+    $NAM_INIT(
+	NAM = NAM[BASE_],		! NAM block
+	ESS = %ALLOCATION(FNA),		! Expanded name string size
+	ESA = FNA[BASE_],		! Expanded name string area
+	RSS = %ALLOCATION(FNA),		! Resultant name string size
+	RSA = FNA[BASE_]);		! Resultant name string area
+
+
+    ! Initialize a dynamic string descriptor for the text
+    !
+    DESC[DSC$W_LENGTH] = 0;
+    DESC[DSC$B_DTYPE] = DSC$K_DTYPE_T;
+    DESC[DSC$B_CLASS] = DSC$K_CLASS_D;
+    DESC[DSC$A_POINTER] = 0;
+
+
+    ! Loop for each input file
+    !
+    DDB = .CTX[COM_SPC_DDB];			! Point to first DDB
+    WHILE DDB[BASE_] NEQ 0 DO
+	BEGIN
+
+	! Actually open the input file
+	!
+	NAM[NAM$B_RSL] = 0;
+	NAM[NAM$B_ESL] = 0;
+	FAB[FAB$W_IFI] = 0;
+	BEGIN
+	SWITCHES STRUCTURE(BLOCK[,BYTE]);
+	FAB[FAB$B_FNS] = .DDB[DDB_NAME][DSC$W_LENGTH];
+	FAB[FAB$L_FNA] = .DDB[DDB_NAME][DSC$A_POINTER];
+	END;
+	STATUS = $OPEN(FAB = FAB[BASE_]);
+
+
+	! Get the best file name string available into NAM$B_RSL/NAM$L_RSA
+	!
+	SOR$$BEST_FILE_NAME(FAB[BASE_], DDB[DDB_NAME]);
+
+	IF NOT .FAB[FAB$L_STS]
+	THEN
+	    RETURN SOR$$ERROR(SOR$_SHR_OPENIN, 1, DDB[DDB_NAME],
+		    .FAB[FAB$L_STS], .FAB[FAB$L_STV]);
+
+	! Connect to the FAB
+	!
+	RAB = DDB[DDB_RAB+BASE_];
+	$RAB_INIT(
+	    RAB = RAB[BASE_],
+	    FAB = FAB[BASE_],
+	    RAC = SEQ,
+	    USZ = %ALLOCATION(BUF),
+	    UBF = BUF,
+	    ROP = <RAH,LOC,MAS>);
+
+	STATUS = $CONNECT(RAB = RAB[BASE_]);
+	IF NOT .STATUS
+	THEN
+	    RETURN SOR$$ERROR(SOR$_SHR_OPENOUT, 1, DDB[DDB_NAME],
+		    .RAB[RAB$L_STS], .RAB[RAB$L_STV]);
+
+	! Read all the records from the file
+	!
+	WHILE TRUE DO
+	    BEGIN
+
+	    IF (STATUS = $GET(RAB = RAB[BASE_]))
+	    THEN
+		BEGIN
+		LOCAL
+		    D:	VECTOR[2];		! Descriptor
+
+		! Append the record and a null to the string
+		!
+		D[0] = .RAB[RAB$W_RSZ];
+		D[1] = .RAB[RAB$L_RBF];
+		DECR I FROM 1 TO 0 DO
+		    BEGIN
+		    STATUS = STR$APPEND(DESC[BASE_], D[0]);
+		    IF NOT .STATUS
+		    THEN
+			RETURN SOR$$ERROR(SOR$_SHR_SYSERROR, 0, .STATUS);
+		    D[0] = 1;
+		    D[1] = UPLIT BYTE(0);
+		    END;
+		END
+	    ELIF
+		.STATUS EQL RMS$_RSA		! Record Stream Active
+	    THEN
+	    	$WAIT(RAB=RAB[BASE_])		! Wait until not so active
+	    ELSE
+		EXITLOOP;			! Some other error
+	    END;
+
+
+	! Check for the expected status
+	!
+	IF .STATUS NEQ RMS$_EOF
+	THEN
+	    SOR$$ERROR(SOR$_SHR_READERR, 1, DDB[DDB_NAME],
+		    .RAB[RAB$L_STS], .RAB[RAB$L_STV]);
+
+
+	! All records have been read from this file, so close it.
+	! Zero the IFI in the DDB, so we know that this file is closed
+	!
+	IF NOT $CLOSE(FAB=FAB[BASE_])
+	THEN
+	    SOR$$ERROR(SOR$_SHR_CLOSEIN, 1, DDB[DDB_NAME],
+		.FAB[FAB$L_STS], .FAB[FAB$L_STV]);
+	DDB[DDB_IFI] = 0;
+
+
+	! Advance to the next file
+	!
+	DDB = .DDB[DDB_NEXT];
+	END;
+
+
+    ! Append any other text to the buffer
+    !
+    STATUS = STR$APPEND(DESC[BASE_], CTX[COM_SPC_TXT]);
+    IF NOT .STATUS THEN RETURN SOR$$ERROR(SOR$_SHR_SYSERROR, 0, .STATUS);
+
+
+    ! Allocate a work area to hold the tables produced by SOR$$SFPRS
+    !
+    IF .CTX[COM_WRK_ADR] EQL 0
+    THEN
+	BEGIN
+	CTX[COM_WRK_SIZ] = WRK_K_ALLOC;
+	STATUS = LIB$GET_VM(CTX[COM_WRK_SIZ], CTX[COM_WRK_ADR]);
+	IF NOT .STATUS THEN SOR$$ERROR(SOR$_SHR_SYSERROR, 0, .STATUS);
+	CTX[COM_WRK_END] = .CTX[COM_WRK_ADR] + .CTX[COM_WRK_SIZ];
+	END;
+
+
+    ! Call SOR$$SFPRS to build the tables
+    !
+    BEGIN
+    LOCAL D: VECTOR[2];		! Descriptor
+    D[0] = .DESC[DSC$W_LENGTH];
+    D[1] = .DESC[DSC$A_POINTER];
+    STATUS = SOR$$SFPRS(D[0]);
+    IF NOT .STATUS
+    THEN
+	RETURN SOR$$FATAL(.STATUS);
+    END;
+
+
+    ! Free the dynamic strings
+    !
+    STATUS = LIB$SFREE1_DD(DESC[BASE_]);	! Free the string
+    IF NOT .STATUS THEN SOR$$ERROR(SOR$_SHR_SYSERROR, 0, .STATUS);
+    STATUS = LIB$SFREE1_DD(CTX[COM_SPC_TXT]);	! Free the string
+    IF NOT .STATUS THEN SOR$$ERROR(SOR$_SHR_SYSERROR, 0, .STATUS);
+
+    RETURN SS$_NORMAL;
+    END;
+
+ROUTINE CALC_LRL_OUT: CAL_CTXREG NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Do some processing of the spec tables after the input LRL is known.
+!	It determines the longest output record length.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	CTX[COM_LRL_OUT]	Longest output record length
+!	CTX[COM_SPEC_TKS]	Total key size
+!	CTX[COM_FORMATS]	Number of different record formats
+!	CTX[COM_VAR]		Flag indicating variable-length records
+!	FDT[0,FDT_FLD_SIZ]	Input LRL
+!	KFT[*,KFT_NDE_SIZ]	Input LRL (only those that refer to first FDT)
+!	KFT[*,KFT_NDE_POS]	Position of field in internal node
+!	KFT[*,KFT_BUILD]	True if field must be built/copied
+!
+! ROUTINE VALUE:
+!
+!	Status code.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CTX =	COM_REG_CTX:	REF BLOCK[CTX_K_SIZE]
+				FIELD(CTX_FIELDS);
+    BIND
+	RDT = CTX[COM_RDT_ADR]: REF RDT_TAB[],	! Record definition table
+	KFT = CTX[COM_KFT_ADR]: REF KFT_TAB[],	! Key field table
+	FDT = CTX[COM_FDT_ADR]: REF FDT_TAB[],	! Field definition table
+	CFT = CTX[COM_CFT_ADR]: REF CFT_TAB[];	! Constant definition table
+
+    LOCAL
+	SEEN: BITVECTOR[KFT_MAX],
+	MAX_DSUM,
+	MAX_KSUM;
+
+
+    ! Store the input LRL in:
+    !	FDT[0,FDT_FLD_SIZ] and KFT[*,KFT_NDE_SIZ] for every KFT entry
+    !	with KFT_CONSTANT = FALSE and KFT_FDT_IDX = 0.
+    !
+    BEGIN
+    LOCAL
+	KFT_PTR: REF KFT_TAB[];		! Local pointer to KFT table
+    FDT[0,FDT_FLD_SIZ] = .CTX[COM_LRL];
+    KFT_PTR = KFT[0,BASE_];
+    DECR I FROM .CTX[COM_KFT_SIZ]-1 TO 0 DO
+	BEGIN
+	IF NOT .KFT_PTR[0,KFT_CONSTANT] AND .KFT_PTR[0,KFT_FDT_IDX] EQL 0
+	THEN
+	    KFT_PTR[0,KFT_NDE_SIZ] = .CTX[COM_LRL];
+	KFT_PTR = KFT_PTR[1,BASE_];
+	END;
+    END;
+
+
+    ! Initialize our variables
+    !
+    CH$FILL(0, %ALLOCATION(SEEN), SEEN[0]);
+    MAX_DSUM = 0;
+    MAX_KSUM = 0;
+
+
+    ! Loop through all record definitions for include statements
+    !
+    DECR RDT_IX FROM .CTX[COM_RDT_SIZ]-1 TO 0 DO
+    IF .RDT[.RDT_IX, RDT_INCLUDE]
+    THEN
+	BEGIN
+	BUILTIN
+	    TESTBITSS;
+	LOCAL
+	    Z;
+
+	! Have we seen this before?
+	!
+	Z = .RDT[.RDT_IX, RDT_KFT_IDX];
+	IF TESTBITSS(SEEN[.Z])
+	THEN
+	    BEGIN
+%(
+	    ! Find the RDT entry, and copy relevant information
+	    !
+	    DECR TMP_IX FROM .CTX[COM_RDT_SIZ]-1 TO 0 DO
+	    IF .RDT[.TMP_IX, RDT_INCLUDE]
+	    THEN
+		BEGIN
+		IF .Z EQL .RDT[.TMP_IX, RDT_KFT_IDX]
+		THEN
+		    BEGIN
+		    ! currently there's no relevant info to copy
+		    EXITLOOP;
+		    END;
+		END;
+)%
+	    0;
+	    END
+	ELSE
+	    BEGIN
+	    LOCAL
+		DSUM,				! Sum of data lengths
+		KSUM,				! Sum of key lengths
+		KFT_PTR: REF KFT_TAB[];		! Local pointer to KFT table
+
+	    ! Increment the number of different record formats
+	    !
+	    CTX[COM_FORMATS] = .CTX[COM_FORMATS] + 1;
+
+	    KFT_PTR = KFT[.Z,BASE_];		! Pointer to key field entry
+	    DSUM = 0;
+	    KSUM = 0;
+	    IF ONEOF_(.CTX[COM_SORT_TYPE], BMSK_(TYP_K_ADDRESS,TYP_K_INDEX))
+	    THEN
+		DSUM = RAB$S_RFA;
+	    WHILE 1 DO
+		BEGIN
+		LOCAL L;
+		L = .KFT_PTR[0, KFT_NDE_SIZ];	! Get length in bytes
+		IF .KFT_PTR[0, KFT_DATA]	! Data or key?
+		THEN
+		    BEGIN
+		    IF NOT ONEOF_(.CTX[COM_SORT_TYPE],
+			BMSK_(TYP_K_ADDRESS,TYP_K_INDEX))
+		    THEN
+			BEGIN
+			KFT_PTR[0, KFT_NDE_POS] = .DSUM;
+			DSUM = .DSUM + .L;
+			END
+		    ELSE
+			KFT_PTR[0, KFT_BUILD] = FALSE;
+		    END
+		ELSE
+		    BEGIN
+		    IF NOT ONEOF_(.CTX[COM_SORT_TYPE],
+			BMSK_(TYP_K_ADDRESS,TYP_K_INDEX))
+		    THEN
+			BEGIN
+			KFT_PTR[0, KFT_NDE_POS] = .KSUM;
+			KSUM = .KSUM + .L;
+			END
+		    ELSE
+			BEGIN
+			KFT_PTR[0, KFT_NDE_POS] = .DSUM;
+			DSUM = .DSUM + .L;
+			END;
+		    END;
+		WHILE .KFT_PTR[0,KFT_CONDX] DO	! ??? Were these ever verified?
+		    BEGIN
+		    KFT_PTR = KFT_PTR[1,BASE_];
+		    KFT_PTR[0, KFT_NDE_POS] = .KFT_PTR[-1, KFT_NDE_POS];
+		    IF NOT .KFT_PTR[-1, KFT_BUILD]
+		    THEN
+			KFT_PTR[0, KFT_BUILD] = FALSE;
+		    END;
+		IF NOT .KFT_PTR[0,KFT_CONTINUE] THEN EXITLOOP;
+		KFT_PTR = KFT_PTR[1,BASE_];
+		END;
+
+	    ! Store the information for this RDT entry
+	    !
+	    !RDT[.RDT_IX, field] = value;	! Currently, nothing to store
+
+	    ! Update MAX_KSUM
+	    !
+	    IF .KSUM GTR .MAX_KSUM THEN MAX_KSUM = .KSUM;
+
+	    ! Update MAX_DSUM
+	    !
+	    IF .MAX_DSUM EQL 0
+	    THEN
+		MAX_DSUM = .DSUM
+	    ELIF .DSUM LSS .MAX_DSUM
+	    THEN
+		CTX[COM_VAR] = TRUE
+	    ELIF .DSUM GTR .MAX_DSUM
+	    THEN
+		BEGIN
+		MAX_DSUM = .DSUM;
+		CTX[COM_VAR] = TRUE;	! Depends on sort process
+		END
+	    END;
+	END;
+
+    ! Store the longest output record length, and total key size
+    !
+    IF .CTX[COM_RDT_SIZ] GTR 0
+    THEN
+	BEGIN
+	CTX[COM_LRL_OUT]  = .MAX_DSUM;	! Longest output record length
+	CTX[COM_SPEC_TKS] = .MAX_KSUM;	! Total key size
+	END;
+
+    END;
+
+GLOBAL ROUTINE SOR$$SPEC_KEY_SUB: CAL_CTXREG =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Process key descriptions from the specification text.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	CTX		Longword pointing to work area (passed in COM_REG_CTX)
+!
+!	The following fields of the context area are used as input:
+!		COM_SORT_TYPE	Type of sort (TYP_K_RECORD, etc)
+!		COM_NUM_FILES	Number of input files
+!		COM_LRL		Longest input record length (see below)
+!		COM_MINVFC	Length of VFC area
+!		COM_COLLATE	Collating sequence information
+!		COM_STABLE	Flag indicating stable sort
+!		COM_VAR		Flag indicating variable-length records
+!		COM_NO_DUPS	Flag indicating to delete duplicate records
+!
+!	The following fields are used as input/output:
+!		COM_COMPARE	Comparison routine
+!		COM_EQUAL	Equal-key routine
+!		COM_TKS		Total key size (hack hack)
+!		COM_SPEC_TKS	Total key size, due to record reformatting
+!
+!	The following fields are used as output:
+!		COM_INPUT	Routine to do input conversion of records
+!		COM_LENADR	Routine to return length/address of record
+!		COM_SRL		Shortest allowable input record length
+!		COM_LRL_INT	Length of internal format record
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	Status code.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CTX =	COM_REG_CTX:	REF BLOCK[CTX_K_SIZE]
+				FIELD(CTX_FIELDS);
+    BIND
+	RDT = CTX[COM_RDT_ADR]: REF RDT_TAB[],	! Record definition table
+	KFT = CTX[COM_KFT_ADR]: REF KFT_TAB[],	! Key field table
+	FDT = CTX[COM_FDT_ADR]: REF FDT_TAB[],	! Field definition table
+	CFT = CTX[COM_CFT_ADR]: REF CFT_TAB[];	! Constant definition table
+
+    BIND
+	UE1 = PLIT BYTE(
+	    OPC_PUSHL,  M_BD+COM_REG_CTX, %FIELDEXPAND(COM_CTXADR)*%UPVAL,
+	    OPC_PUSHAB, M_BD+COM_REG_SRC2, OFF_LEN,
+	    OPC_PUSHAB, M_BD+COM_REG_SRC1, OFF_LEN,
+	    OPC_PUSHAB, M_BD+COM_REG_SRC2, OFF_ADR,
+	    OPC_PUSHAB, M_BD+COM_REG_SRC1, OFF_ADR,
+	    OPC_CALLS, 5, M_AID+R_PC): VECTOR,
+	UE2 = PLIT BYTE(
+	    OPC_BLBC, M_R+R_0, 1,
+	    OPC_RSB,
+	    OPC_PUSHL, M_R+R_0,
+	    OPC_PUSHL, 0,
+	    OPC_PUSHL, M_AI+R_PC, LONG(SOR$_RTNERROR),
+	    OPC_CALLS, 3, M_AID+R_PC): VECTOR,
+	UE3 = PLIT BYTE(
+	    OPC_MOVL, SS$_NORMAL, M_R+R_0,
+	    OPC_RSB): VECTOR,
+	UE4 = PLIT BYTE(
+	    OPC_BLBC, M_R+R_0, 1,
+	    OPC_RSB,
+	    OPC_MOVL, 1, M_R+R_0,
+	    OPC_CMPL,M_BD+COM_REG_SRC1,OFF_STAB,M_BD+COM_REG_SRC2,OFF_STAB,
+	    OPC_BGTRU, 3,
+	    OPC_SBWC, 1, M_R+R_0,
+	    OPC_RSB): VECTOR;
+
+    ROUTINE APPEND(LEN, ADR): CAL_CTXREG NOVALUE =
+	BEGIN
+	EXTERNAL REGISTER
+	    CTX = COM_REG_CTX:	REF BLOCK[CTX_K_SIZE]
+				FIELD(CTX_FIELDS);
+	BIND
+	    XCODE =	CTX[COM_ROUTINES]: VECTOR[2];
+	LOCAL
+	    DELTA:	VECTOR[2];
+	DELTA[0] = .XCODE[0] + .LEN;
+	DELTA[1] = SOR$$ALLOCATE(.DELTA[0]);
+	CH$MOVE(.LEN, .ADR, CH$MOVE(.XCODE[0], .XCODE[1], .DELTA[1]));
+	SOR$$DEALLOCATE(.XCODE[0], XCODE[1]);
+	XCODE[0] = .DELTA[0];
+	XCODE[1] = .DELTA[1];
+	END;
+
+    BIND
+	DSC_ADR = VECTOR[CTX[COM_ROUTINES],0],
+	DSC_LEN = VECTOR[CTX[COM_ROUTINES],1];
+
+    LOCAL
+	ADJ_EQUAL,
+	ADJ_COMPARE;
+
+
+    ! Determine the longest output record length, COM_LRL_OUT.
+    ! This also calculates COM_SPEC_TKS and COM_FORMATS.
+    !
+    CALC_LRL_OUT();
+
+
+    ! See if we can use SOR$$KEY_SUB to generate the key comparison routines.
+    ! We can do this if:
+    !	There is only one record format,
+    !	There are no conditional keys, and
+    !	The data is simply the entire record (and not less than the LRL).
+    !
+    BEGIN LABEL LAB; LAB:
+    BEGIN
+    BUILTIN
+	TESTBITSS,
+	TESTBITCC;
+    LOCAL
+	HAVE_DATA,
+	KEY_BUFF:	KEY_BLOCK,
+	KFT_PTR:	REF KFT_TAB[];		! Local pointer to KFT table
+
+    IF .CTX[COM_FORMATS] NEQ 1 THEN LEAVE LAB;
+
+    KFT_PTR = KFT[0,BASE_];
+    HAVE_DATA = FALSE;
+    KEY_BUFF[KEY_NUMBER] = 0;			! No keys yet
+    DECR I FROM .CTX[COM_KFT_SIZ]-1 TO 0 DO
+	BEGIN
+	IF .KFT_PTR[0,KFT_CONDX] THEN LEAVE LAB;
+	IF .KFT_PTR[0,KFT_DATA]
+	THEN
+	    BEGIN
+	    IF .KFT_PTR[0,KFT_CONSTANT] THEN LEAVE LAB;
+	    IF TESTBITSS(HAVE_DATA) THEN LEAVE LAB;
+	    IF .KFT_PTR[0,KFT_NDE_POS] NEQ 0 THEN LEAVE LAB;
+	    IF .KFT_PTR[0,KFT_NDE_SIZ] LSS .CTX[COM_LRL] THEN LEAVE LAB;
+	    END
+	ELSE
+	    BEGIN
+	    LOCAL
+		FDT_PTR:REF FDT_TAB[1],
+		KBF:	REF KBF_BLOCK;
+	    KBF = KEY_BUFF[KEY_KBF(.KEY_BUFF[KEY_NUMBER])];
+	    FDT_PTR = FDT[.KFT_PTR[0,KFT_FDT_IDX],BASE_];
+	    KBF[KBF_TYPE] =	.FDT_PTR[0,FDT_TYPE];
+	    KBF[KBF_LENGTH] =	.FDT_PTR[0,FDT_FLD_SIZ];
+	    KBF[KBF_POSITION] =	.FDT_PTR[0,FDT_FLD_POS];
+	    KBF[KBF_ORDER] =	.KFT_PTR[0,KFT_DESCEND];
+	    KEY_BUFF[KEY_NUMBER] = .KEY_BUFF[KEY_NUMBER] + 1;
+	    END;
+	IF NOT .KFT_PTR[0,KFT_CONTINUE]
+	THEN
+	    IF TESTBITCC(HAVE_DATA) THEN LEAVE LAB;
+	KFT_PTR = KFT_PTR[1,BASE_];
+	END;
+    RETURN SOR$$KEY_SUB(KEY_BUFF[BASE_]);
+    END;
+    END;
+
+
+    ! If we don't have the data, don't call user-written routines.
+    !
+    IF .CTX[COM_SORT_TYPE] NEQ TYP_K_RECORD
+    THEN
+	BEGIN
+	IF .CTX[COM_COMPARE] NEQ 0 OR .CTX[COM_EQUAL] NEQ 0
+	THEN
+	    RETURN SOR$$ERROR(SOR$_BAD_TYPE);
+	END;
+
+
+    ADJ_EQUAL = FALSE;
+    ADJ_COMPARE = FALSE;
+
+
+    ! If the user specified his own equal-key routine, call it.
+    !
+    BEGIN
+    SWITCHES UNAMES;
+    IF .CTX[COM_EQUAL] NEQ 0
+    THEN
+	BEGIN
+	LOCAL
+	    TMP;
+	TMP = .DSC_LEN;
+	APPEND(.UE1[-1], UE1);
+	APPEND(%UPVAL, CTX[COM_EQUAL]);
+	APPEND(.UE2[-1], UE2);
+	APPEND(%UPVAL, %REF(SOR$$ERROR));
+	APPEND(.UE3[-1], UE3);
+	CTX[COM_EQUAL] = .TMP;
+	ADJ_EQUAL = TRUE;
+	END
+    ELIF .CTX[COM_NODUPS]
+    THEN
+	BEGIN
+	ROUTINE NODUPS: JSB_EQUAL = SOR$_DELETE2;
+	CTX[COM_EQUAL] = NODUPS;
+	END
+    ELSE
+	BEGIN
+	!
+	! Leave COM_EQUAL equal to 0
+	!
+	0;
+	END;
+    END;
+
+
+    ! Store the address of the length/address routine
+    !
+    BEGIN
+    ROUTINE LENADR(S: REF VECTOR[,BYTE]; LEN, ADR): JSB_LENADR NOVALUE =
+	BEGIN
+	LEN = .(S[OFF_LEN])<0,16,0>;
+	ADR = S[OFF_ADR];
+	END;
+    CTX[COM_LENADR] = LENADR;
+    END;
+
+
+    ! If the user supplied a comparison routine, call it.
+    !
+    IF .CTX[COM_COMPARE] NEQ 0
+    THEN
+	BEGIN
+	LOCAL
+	    TMP;
+	TMP = .DSC_LEN;
+	APPEND(.UE1[-1], UE1);
+	APPEND(%UPVAL, CTX[COM_COMPARE]);
+	APPEND(.UE4[-1], UE4);
+	CTX[COM_COMPARE] = .TMP;
+	ADJ_COMPARE = TRUE;
+	END
+    ELSE
+	BEGIN
+	CTX[COM_COMPARE] = COMPARE;
+	END;
+
+    ! Store the address of the input reformatting routine
+    !
+    CTX[COM_INPUT] = INPUT;
+
+
+    ! Store the length of an internal-format record
+    !
+    BEGIN
+    LOCAL TMP;
+    CTX[COM_LRL_INT] = TMP =
+	OFF_ADR +		! Offset to start of the data
+	.CTX[COM_LRL_OUT] +	! The data
+	.CTX[COM_SPEC_TKS];	! The keys
+    IF .TMP GTR MAX_REFSIZE
+    THEN
+	SOR$$ERROR(SOR$_SHR_BADLOGIC);	! Not really bad logic, just rare.
+    END;
+
+
+    ! Adjust the actual addresses of the comparison and equal-key routines
+    !
+    IF .ADJ_EQUAL   THEN CTX[COM_EQUAL]   = .DSC_ADR + .CTX[COM_EQUAL];
+    IF .ADJ_COMPARE THEN CTX[COM_COMPARE] = .DSC_ADR + .CTX[COM_COMPARE];
+
+
+    ! Loop through the key field table, adjusting the positions of the fields
+    ! within the internal format node.
+    !
+    DECR Z FROM .CTX[COM_KFT_SIZ]-1 TO 0 DO
+	BEGIN
+	LOCAL
+	    KFT_PTR: REF KFT_TAB[];		! Local pointer to KFT table
+	KFT_PTR = KFT[.Z,BASE_];		! Pointer to key field entry
+	IF .KFT_PTR[0, KFT_DATA]
+	THEN
+	    KFT_PTR[0, KFT_NDE_POS] = .KFT_PTR[0, KFT_NDE_POS]
+		+ OFF_ADR
+	ELIF
+	    NOT ONEOF_(.CTX[COM_SORT_TYPE],
+		BMSK_(TYP_K_ADDRESS,TYP_K_INDEX))
+	THEN
+	    KFT_PTR[0, KFT_NDE_POS] = .KFT_PTR[0, KFT_NDE_POS]
+		+ OFF_ADR + .CTX[COM_LRL_OUT]
+	ELSE
+	    KFT_PTR[0, KFT_NDE_POS] = .KFT_PTR[0, KFT_NDE_POS]
+		+ OFF_ADR
+	END;
+
+    RETURN TRUE;
+    END;
+
+ROUTINE INPUT
+	(
+	INPREC:	REF VECTOR[2],		! Length/address of input record
+	OUTREC:	REF VECTOR[,BYTE]	! Area for reformatted output record
+	): JSB_INPUT =
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Reformat an input record.
+!
+! FORMAL PARAMETERS:
+!
+!	As described above
+!
+! IMPLICIT INPUTS:
+!
+!	CTX		Longword pointing to work area (passed in COM_REG_CTX)
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	False iff the record should be dropped from the sort, true otherwise.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CTX =	COM_REG_CTX:	REF BLOCK[CTX_K_SIZE]
+				FIELD(CTX_FIELDS);
+    REGISTER
+	CA =	COM_REG_CTX;
+
+    BIND
+	RDT = CTX[COM_RDT_ADR]: REF RDT_TAB[],	! Record definition table
+	KFT = CTX[COM_KFT_ADR]: REF KFT_TAB[],	! Key field table
+	FDT = CTX[COM_FDT_ADR]: REF FDT_TAB[],	! Field definition table
+	CFT = CTX[COM_CFT_ADR]: REF CFT_TAB[];	! Constant definition table
+
+    EXTERNAL ROUTINE
+	SOR$$RDT:	CAL_CTXREG,
+	SOR$$REFORM:	CAL_CTXREG;
+
+    LOCAL
+	RDTPTR:	REF RDT_TAB,
+	KFT_IX,
+	Z;
+
+    ! Determine the record type
+    !
+    Z = SOR$$RDT( INPREC[0], RDTPTR );
+    SELECTONE .Z OF
+	SET
+	[0]:	RETURN FALSE;		! omit the record
+	[1]:	BEGIN
+		KFT_IX = .RDTPTR[0, RDT_KFT_IDX];
+		Z = SOR$$REFORM( INPREC[0], KFT[.KFT_IX,BASE_],
+		    OUTREC[0], OUTREC[OFF_LEN]);
+		IF .Z NEQ 1 THEN (SOR$$ERROR(.Z); RETURN FALSE);
+		END;
+	[OTHERWISE]:
+		(SOR$$ERROR(.Z); RETURN FALSE);
+	TES;
+
+    (OUTREC[OFF_FMT])<0,8,0> = .KFT_IX;
+
+    IF NOT .CTX[COM_STABLE]
+    THEN (OUTREC[OFF_STAB])<0,32,0> = 0
+    ELIF .CTX[COM_MERGE]
+    THEN (OUTREC[OFF_STAB])<0,32,0> = .CTX[COM_MRG_STREAM]
+    ELSE (OUTREC[OFF_STAB])<0,32,0> = .CTX[COM_INP_RECNUM];
+
+    IF ONEOF_(.CTX[COM_SORT_TYPE], BMSK_(TYP_K_ADDRESS,TYP_K_INDEX))
+    THEN
+	BEGIN
+	CH$MOVE(
+	    RAB$S_RFA,
+	    BLOCK[.CTX[COM_INP_CURR],DDB_RAB+RAB$W_RFA;,BYTE],
+	    OUTREC[OFF_ADR]);
+	END;
+
+    RETURN TRUE;
+
+    END;
+
+ROUTINE COMPARE
+	(
+	REC1:	REF VECTOR[,BYTE],	! Address of internal format record
+	REC2:	REF VECTOR[,BYTE]	! Address of internal format record
+	): JSB_COMPARE =
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Compare records.
+!
+! FORMAL PARAMETERS:
+!
+!	As described above
+!
+! IMPLICIT INPUTS:
+!
+!	CTX		Longword pointing to work area (passed in COM_REG_CTX)
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	-1 if the first record collates before the second record
+!	 0 if the records collate equal
+!	 1 if the first record collates after the second record
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CTX =	COM_REG_CTX:	REF BLOCK[CTX_K_SIZE]
+				FIELD(CTX_FIELDS);
+    BIND
+	RDT = CTX[COM_RDT_ADR]: REF RDT_TAB[],	! Record definition table
+	KFT = CTX[COM_KFT_ADR]: REF KFT_TAB[],	! Key field table
+	FDT = CTX[COM_FDT_ADR]: REF FDT_TAB[],	! Field definition table
+	CFT = CTX[COM_CFT_ADR]: REF CFT_TAB[];	! Constant definition table
+
+    EXTERNAL ROUTINE
+	SOR$$COMPARE:	CAL_CTXREG;		! aka CA_LINKAGE
+
+    LOCAL
+	KFT1:	REF KFT_TAB,
+	KFT2:	REF KFT_TAB,
+	EOK1,
+	EOK2,
+	S;
+
+    KFT1 = KFT[.REC1[OFF_FMT], BASE_];	! Get 1st record's KFT pointer
+    KFT2 = KFT[.REC2[OFF_FMT], BASE_];	! Get 2nd record's KFT pointer
+    EOK1 = FALSE;
+    EOK2 = FALSE;
+
+    ! While there are more keys
+    !
+    WHILE TRUE DO
+	BEGIN
+	LOCAL
+	    FLD1: VECTOR[2],	! Length/address of field or constant
+	    FLD2: VECTOR[2],	! Length/address of field or constant
+	    TYP1,
+	    TYP2,
+	    FDT_IX;		! Index into FDT (or CFT) table
+
+	! Advance both pointers to the next key description
+	!
+	WHILE 1 DO
+	    BEGIN
+	    IF NOT .KFT1[0,KFT_CONDX] THEN
+	    IF NOT .KFT1[0,KFT_DATA] THEN EXITLOOP;
+	    IF NOT .KFT1[0,KFT_CONTINUE] THEN (EOK1 = TRUE; EXITLOOP);
+	    KFT1 = KFT1[1,BASE_];
+	    END;
+	WHILE 1 DO
+	    BEGIN
+	    IF NOT .KFT2[0,KFT_CONDX] THEN
+	    IF NOT .KFT2[0,KFT_DATA] THEN EXITLOOP;
+	    IF NOT .KFT2[0,KFT_CONTINUE] THEN (EOK2 = TRUE; EXITLOOP);
+	    KFT2 = KFT2[1,BASE_];
+	    END;
+
+	! The one that runs out of keys first collates less
+	!
+	IF (S = .EOK2 - .EOK1) NEQ 0 THEN RETURN .S;
+	IF .EOK1 THEN EXITLOOP;
+
+
+	FDT_IX = .KFT1[0,KFT_FDT_IDX];
+	IF .KFT1[0,KFT_CONSTANT]
+	THEN
+	    BEGIN
+	    TYP1 = DSC$K_DTYPE_Z;		! Unspecified
+	    FLD1[0] = .KFT1[0, KFT_NDE_SIZ]
+	    END
+	ELSE
+	    BEGIN
+	    TYP1 = .FDT[.FDT_IX, FDT_TYPE];
+	    IF .TYP1 EQL DSC$K_DTYPE_P
+	    THEN
+		FLD1[0] = .FDT[.FDT_IX, FDT_FLD_SIZ]
+	    ELSE
+		FLD1[0] = .KFT1[0, KFT_NDE_SIZ]
+	    END;
+	FLD1[1] = .KFT1[0,KFT_NDE_POS] + REC1[0];
+
+	FDT_IX = .KFT2[0,KFT_FDT_IDX];
+	IF .KFT2[0,KFT_CONSTANT]
+	THEN
+	    BEGIN
+	    TYP2 = .TYP1;			! Make it the same as the other
+	    FLD2[0] = .KFT2[0, KFT_NDE_SIZ];
+	    END
+	ELSE
+	    BEGIN
+	    TYP2 = .FDT[.FDT_IX, FDT_TYPE];
+	    IF .TYP1 EQL DSC$K_DTYPE_Z THEN TYP1 = .TYP2;
+	    IF .TYP2 EQL DSC$K_DTYPE_P
+	    THEN
+		FLD2[0] = .FDT[.FDT_IX, FDT_FLD_SIZ]
+	    ELSE
+		FLD2[0] = .KFT2[0, KFT_NDE_SIZ]
+	    END;
+	FLD2[1] = .KFT2[0,KFT_NDE_POS] + REC2[0];
+
+	! If the types are different, simply distinguish the records
+	!
+	IF (S = .TYP1 - .TYP2) NEQ 0 THEN RETURN SIGN(.S);
+
+	! If different descending flags, the descending key comes first
+	!
+	IF (S = .KFT2[0,KFT_DESCEND]-.KFT1[0,KFT_DESCEND]) NEQ 0
+	    THEN RETURN .S;
+
+	! Finally, compare the fields
+	!
+	IF (S = SOR$$COMPARE(.TYP1, FLD1[0], FLD2[0])) NEQ 0 THEN
+	    IF .KFT1[0,KFT_DESCEND] THEN RETURN -(.S) ELSE RETURN .S;
+
+	! See whether this record definition is continued
+	! Is this needed???
+	!
+	IF NOT .KFT1[0,KFT_CONTINUE] THEN EXITLOOP;
+	IF NOT .KFT2[0,KFT_CONTINUE] THEN EXITLOOP;
+
+	! Advance to the next KFT entries
+	!
+	KFT1 = KFT1[1,BASE_];
+	KFT2 = KFT2[1,BASE_];
+
+	END;
+
+    ! The one that runs out of keys first collates less
+    !
+    IF (S = .KFT2[0,KFT_CONTINUE] - .KFT1[0,KFT_CONTINUE]) NEQ 0
+	THEN RETURN .S;
+
+    IF (S = .(REC1[OFF_STAB]) - .(REC2[OFF_STAB])) NEQ 0
+	THEN RETURN SIGN(.S);
+
+    RETURN 0;
+    END;
+
+GLOBAL ROUTINE SOR$$COMPATIBLE(
+	KFT1:	REF KFT_TAB,	! Address of KFT entry for first key
+	KFT2:	REF KFT_TAB	! Address of KFT entry for second key
+	): CAL_CTXREG =
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Determine whether keys are compatible.
+!
+! FORMAL PARAMETERS:
+!
+!	As described above
+!
+! IMPLICIT INPUTS:
+!
+!	CTX		Longword pointing to work area (passed in COM_REG_CTX)
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	 0 if the keys are compatible.
+!	-1 if the keys are incompatible with KFT1 coming first.
+!	 1 if the keys are incompatible with KFT2 coming first.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CTX =	COM_REG_CTX:	REF BLOCK[CTX_K_SIZE]
+				FIELD(CTX_FIELDS);
+    BIND
+	FDT = CTX[COM_FDT_ADR]: REF FDT_TAB[];	! Field definition table
+
+    LOCAL
+	FDT_IX,
+	FLD1_TYP:	BYTE,
+	FLD2_TYP:	BYTE,
+	FLD1_LEN:	WORD,
+	FLD2_LEN:	WORD,
+	FLD1_SCA:	BYTE,
+	FLD2_SCA:	BYTE,
+	S;
+
+    FDT_IX = .KFT1[0,KFT_FDT_IDX];
+    IF .KFT1[0,KFT_CONSTANT]
+    THEN
+	BEGIN
+	FLD1_TYP = DSC$K_DTYPE_Z;
+	FLD1_LEN = .KFT1[0, KFT_NDE_SIZ];
+	FLD1_SCA = 0;
+	END
+    ELSE
+	BEGIN
+	FLD1_TYP = .FDT[.FDT_IX, FDT_TYPE];
+	IF .FLD1_TYP EQL DSC$K_DTYPE_P
+	THEN
+	    FLD1_LEN = .FDT[.FDT_IX, FDT_FLD_SIZ]
+	ELSE
+	    FLD1_LEN = .KFT1[0, KFT_NDE_SIZ];
+	FLD1_SCA = .FDT[.FDT_IX, FDT_SCALE];
+	END;
+
+    FDT_IX = .KFT2[0,KFT_FDT_IDX];
+    IF .KFT2[0,KFT_CONSTANT]
+    THEN
+	BEGIN
+	FLD2_TYP = .FLD1_TYP;
+	FLD2_LEN = .KFT2[0, KFT_NDE_SIZ];
+	FLD2_SCA = 0;
+	END
+    ELSE
+	BEGIN
+	FLD2_TYP = .FDT[.FDT_IX, FDT_TYPE];
+	IF .FLD1_TYP EQL DSC$K_DTYPE_Z THEN FLD1_TYP = .FLD2_TYP;
+	IF .FLD2_TYP EQL DSC$K_DTYPE_P
+	THEN
+	    FLD2_LEN = .FDT[.FDT_IX, FDT_FLD_SIZ]
+	ELSE
+	    FLD2_LEN = .KFT2[0, KFT_NDE_SIZ];
+	FLD2_SCA = .FDT[.FDT_IX, FDT_SCALE];
+	END;
+
+
+    ! If the types are different, simply distinguish the records
+    !
+    IF (S = .FLD1_TYP - .FLD2_TYP) NEQ 0 THEN RETURN SIGN(.S);
+
+
+    ! Check the lengths
+    !
+    IF .FLD1_TYP NEQ DSC$K_DTYPE_T AND .FLD1_TYP NEQ DSC$K_DTYPE_Z
+    THEN
+	IF (S = .FLD1_LEN - .FLD2_LEN) NEQ 0 THEN RETURN SIGN(.S);
+    
+
+    ! Check the scales
+    !
+    IF (S = .FLD1_SCA - .FLD2_SCA) NEQ 0 THEN RETURN SIGN(.S);
+
+
+    ! If different descending flags, the descending key comes first
+    !
+    IF (S = .KFT2[0,KFT_DESCEND]-.KFT1[0,KFT_DESCEND]) NEQ 0
+	THEN RETURN .S;
+
+
+    ! The fields are compatible
+    !
+    RETURN 0;
+    END;
+
+ROUTINE CLEAN_UP: CAL_CTXREG NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Release resources allocated by this module.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE (signals errors)
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CTX =	COM_REG_CTX:	REF CTX_BLOCK;
+    IF .CTX[COM_WRK_ADR] NEQ 0 AND .CTX[COM_WRK_END] NEQ 0
+    THEN
+	BEGIN
+	CTX[COM_WRK_ADR] = .CTX[COM_WRK_END] - .CTX[COM_WRK_SIZ];
+	SOR$$DEALLOCATE(.CTX[COM_WRK_SIZ], CTX[COM_WRK_ADR]);
+	END;
+    END;
+
+END
+ELUDOM

@@ -1,0 +1,1285 @@
+MODULE RUJMAN (
+		LANGUAGE (BLISS32),
+		ADDRESSING_MODE (EXTERNAL=GENERAL),
+		IDENT = 'V04-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  MOUNT Utility Structure Level 2
+!
+! ABSTRACT:
+!
+!	This module contains those routine necessary to handle the creation
+!	and manipulation of Recovery Unit Journals (RUJ) on Files-11 ODS-2
+!	disk volumes.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Steven T. Jeffreys	 CREATION DATE:  18-Jul-1983
+!
+! MODIFIED BY:
+!
+!	V03-008	HH0041		Hai Huang			24-Jul-1984
+!		Remove REQUIRE 'LIBD$:[VMSLIB.OBJ]MOUNTMSG.B32'.
+!
+!	V03-007	HH0019		Hai Huang			08-May-1984
+!		Another round in fixing up truncation errors.
+!
+!	V03-006	HH0007		Hai Huang			22-Mar-1984
+!		Fix truncation error introduced by cluster-mount support.
+!
+!	V03-004	WMC0002		Wayne Cardoza			16-Jan-1984
+!		Immediately return from main routine to disable RU journals
+!
+!	V03-004	DAS0001		David Solomon			29-Nov-1983
+!		Add support for specifying maximum journal record size
+!		with a new keyword, /JOURNAL=(RECORD_SIZE=n).
+!
+!	V03-003	WMC0001		Wayne Cardoza			20-Sep-1983
+!		DEVEXI is legal return status for CREJNL.
+!
+!	V03-002	CDS0001		Christian D. Saether		30-Aug-1983
+!		Change name of default cjf directory from [journal] to
+!		[sysjnl].
+!
+!	V03-001	STJ3116		Steven T. Jeffreys,		02-Aug-1983
+!		Created local definition of $DISMOU macro.
+!
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:MOUDEF.B32';
+
+
+FORWARD ROUTINE
+	ACCESS_JOURNAL,						! Look up RUJ file on volume
+	ACTIVATE_JOURNAL,					! Main routine
+	ANALYZE_DEVLIST	: NOVALUE,				! Build volume data base from device list
+	CREATE_RUJ,						! Call $CREJNL to create an RUJ
+	DISMOUNT_VOLSET	: NOVALUE,				! Dismount all or part of a volume set
+	GET_VOLUME_NAME,					! Return volume name
+	INTERCEPT_SIGNAL,					! Condition handler
+	RCP_RESTART;						! Restart "frozen' RUJ
+
+!*******************************************************************************
+!*******************************************************************************
+!**									      **
+!**				  N O T E				      **
+!**									      **
+!** The following macro is a local redefinition of the $DISMOU system service **
+!** macro, and is necessary in order to make use of the disount system        **
+!** within the $MOUNT system service.  Since both $DISMOU and $MOUNT are      **
+!** protected shareable images, and cannot make outbound references, the      **
+!** $DISMOU code must be included into the $MOUNT code at link time.  The     **
+!** $MOUNT service then calls $DISMOU as if it were a normal routine, instead **
+!** of going through the $DISMOU service dispatcher.			      **
+!**									      **
+!*******************************************************************************
+!*******************************************************************************
+!
+!   $DISMOU
+! 
+!     Dismount Volume
+! 
+!      $DISMOU devnam ,[flags]
+! 
+!      devnam = address of device name string descriptor
+! 
+!      flags  = 32-bit status mask  selecting options for  the  dismount
+!               The  symbols  for  the flags are  defined by the $DMTDEF
+!               macro.
+! 
+!                Flag      Meaning
+! 
+!            DMT$M_NOUNLOAD   Do not unload the volume.
+! 
+!            DMT$M_UNIT       Dismount the specified device, rather
+!                             than the entire volume set.
+! 
+UNDECLARE %QUOTE $DISMOU;
+KEYWORDMACRO $DISMOU (DEVNAM=0,FLAGS=0) =
+	(
+	EXTERNAL ROUTINE SYS$DISMOU : BLISS ADDRESSING_MODE (GENERAL);
+	KERNEL_CALL (SYS$DISMOU, DEVNAM, FLAGS)
+	) %;
+
+
+!+
+!
+! Own storage for general use in this module.
+!
+!-
+
+LITERAL
+	ROOTVOL_NAMLEN	= 64;					! Maximum length of a device name
+
+EXTERNAL LITERAL
+	CJF$_DEVEXI;
+
+OWN
+	AA$_DATA_BEGIN	: VECTOR [0],				! Mark start of data area
+	DISMOUNT_COUNT	: LONG,					! Count of volumes that were dismounted
+	ODS2_VOLUME	: BITVECTOR [DEVMAX],			! Indicates volume supports ODS-2 file structure
+	ROOT_PRESENT	: BITVECTOR [DEVMAX],			! Indicates presence of root volume for a given volume set
+	RUJRNL_PRESENT	: BITVECTOR [DEVMAX],			! Indicates presence of RUJ file on a given volume
+	ROOTVOL_DSC	: BBLOCK [DSC$K_S_BLN],			! Root volume device name descriptor
+	ROOTVOL_BUF	: BBLOCK [ROOTVOL_NAMLEN],		! Buffer for root volume device name
+	ROOTVOL_INDEX	: VECTOR [DEVMAX, BYTE, UNSIGNED],	! Each entry contians index+1 of root volume if in PHYS_NAME
+	VOLSET_RVN	: VECTOR [DEVMAX, BYTE, UNSIGNED],	! Vector of Relative Volume Numbers
+	ZZ$_DATA_END	: VECTOR [0];				! Mark end of data area
+
+ROUTINE ACCESS_JOURNAL (DEVICE_NAME) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine will attempt to access the Recovery Unit (RU) journal
+!	file on a given volume.
+!
+! CALLING SEQUENCE:
+!	ACCESS_JOURNAL (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1:	address of a device name descriptor
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	Status code passed back by $OPEN
+!
+! SIDE EFFECTS:
+!	None.
+!
+!--
+
+BEGIN
+
+!
+! Allocate plits in the $CODE$ psect to avoid truncation error when
+! linking mountshr.
+!
+PSECT
+	PLIT = $CODE$;
+
+BIND
+	RUJRNL_FILE	= DESCRIPTOR ('[SYSJNL]RUJNL.RUJ;1');
+
+LOCAL
+	STATUS;
+
+MAP
+	DEVICE_NAME	: REF BBLOCK,
+	RUJRNL_FILE	: BBLOCK;
+
+OWN
+	RUJRNL_FAB	: $FAB (FOP=UFO);
+
+!
+! Build a File Attributes Block (FAB) and determine
+! if there is a journal file on volume by attempting
+! to open it.
+!
+
+RUJRNL_FAB[FAB$B_DNS] = .DEVICE_NAME[DSC$W_LENGTH];
+RUJRNL_FAB[FAB$L_DNA] = .DEVICE_NAME[DSC$A_POINTER];
+RUJRNL_FAB[FAB$B_FNS] = .RUJRNL_FILE[DSC$W_LENGTH];
+RUJRNL_FAB[FAB$L_FNA] = .RUJRNL_FILE[DSC$A_POINTER];
+
+IF (STATUS = $OPEN (FAB = RUJRNL_FAB))				! Attempt to open the file
+THEN
+    $DASSGN (CHAN = .RUJRNL_FAB[FAB$L_STV]);			! Deassign channel to close file
+
+!
+! If the status was RMS$_DNR, it indicates that the journal file
+! was present, but could not be accessed, as it or the directory
+! describing it were spread across one or more disks and at least
+! one of those disks is not mounted.  Convert the RMS$_DNR to success
+! to indicate that the journal file is present.
+!
+IF .STATUS EQL RMS$_DNR
+THEN
+    STATUS = 1;
+
+RETURN .STATUS
+
+END;
+
+GLOBAL ROUTINE ACTIVATE_JOURNAL =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine will do the appropriate RUJ operation for
+!	each device listed in the PHYS_NAME descriptor vector.
+!
+!
+! CALLING SEQUENCE:
+!	ACTIVATE_JOURNAL ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	<see the EXTERNAL declaration>
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	Status code passed back by RUJ routines.
+!
+! SIDE EFFECTS:
+!	The state of the volume may be changed depending on the action of
+!	the journalling ACP.  A serious error returned by the journalling
+!	service will mandate dismounting pieces (or all) of the volume sets.
+!
+!--
+
+BEGIN
+
+!EXTERNAL LITERAL
+!	ROOTVOL_NAMLEN	= 64;					! Maximum length of a device name
+
+!EXTERNAL
+!	AA$_DATA_BEGIN	: VECTOR [0],				! Mark start of data area
+!	DISMOUNT_COUNT	: LONG,					! Count of volumes that were dismounted
+!	ODS2_VOLUME	: BITVECTOR [DEVMAX],			! Indicates volume supports ODS-2 file structure
+!	ROOT_PRESENT	: BITVECTOR [DEVMAX],			! Indicates presence of root volume for a given volume set
+!	RUJRNL_PRESENT	: BITVECTOR [DEVMAX],			! Indicates presence of RUJ file on a given volume
+!	ROOTVOL_DSC	: BBLOCK [DSC$K_S_BLN],			! Root volume device name descriptor
+!	ROOTVOL_BUF	: BBLOCK [ROOTVOL_NAMLEN],		! Buffer for root volume device name
+!	ROOTVOL_INDEX	: BBLOCK [DEVMAX, BYTE, UNSIGNED],	! Each entry contians index+1 of root volume if in PHYS_NAME
+!	VOLSET_RVN	: VECTOR [DEVMAX, BYTE, UNSIGNED],	! Vector of Relative Volume Numbers
+!	ZZ$_DATA_END	: VECTOR [0];				! Mark end of data area
+
+!EXTERNAL ROUTINE
+!	ANALYZE_DEVLIST	: NOVALUE ADDRESSING_MODE (GENERAL),	! Inspect the list of devices
+!	DISMOUNT_VOLSET	: NOVALUE ADDRESSING_MODE (GENERAL);	! Dismount volumes if journalling doesn't work
+
+EXTERNAL
+	MOUNT_OPTIONS	: BITVECTOR,				! Mount option flag bits
+	PHYS_COUNT	: LONG,					! # of descriptors in PHYS_NAME
+	PHYS_NAME	: BBLOCKVECTOR [DEVMAX, DSC$K_S_BLN],	! Descriptor of root volume name
+	STORED_CONTEXT	: BITVECTOR;				! Determines if tape or disk mount
+	
+LITERAL
+	ALL_VOLUMES	= 1,					! Various and sundry mnemonics
+	ONE_VOLUME	= 0,
+	PERMANENT_RUJ	= 1,
+	TEMPORARY_RUJ	= 0;
+
+LOCAL
+	RUJRNL_EXISTS,						! Boolean
+	STATUS;
+
+
+!
+! If the user explicitly requested that Recovery Unit Journalling (RUJ)
+! not be activated, return a success status immediately.
+!
+!***JNL** turn off RU journals
+
+MOUNT_OPTIONS[OPT_NOJRNL] = 1; !***JNL** 
+IF .MOUNT_OPTIONS[OPT_NOJRNL]
+THEN
+    RETURN 1;
+
+!
+! RUJ is only appropriate for disk volumes.  If we are mounting a tape
+! or a foreign disk, return a success status immediately.
+!
+IF .STORED_CONTEXT[TAPE_MOUNT]
+OR .MOUNT_OPTIONS[OPT_FOREIGN]
+THEN
+    RETURN 1;
+
+!
+! Inspect the list of devices that have been mounted, and record some
+! useful information.  This is necessary because $MOUNT allows a great
+! deal of flexibility in the amount and type of disks volumes that may
+! be mounted.
+!
+ANALYZE_DEVLIST (PHYS_NAME[0, DSC$W_LENGTH], .PHYS_COUNT);
+
+!+
+! Now that the volume/device data base has been created, process each
+! volume in the device list.  Three passes are made through the list,
+! and the ordering of the processing is important.  The actions performed are:
+!
+!	1. For each ODS-2 volume (mounted on a device in the device list) that
+!	   is a member of a volume set, but not the root volume of a volume set,
+!	   and contains a RUJ file, create a temporary RUJ to process the
+!	   existing RUJ file, and delete the file when done.
+!
+!	   This pass is meant to process new members to a volume set that
+!	   already contain user files, and might have an active RUJ file
+!	   present on the volume.  The volume must be in a consistent state
+!	   before it can be a full-fledged member of the volume set.  A
+!	   journalling failure at this point will cause the volume, but not
+!	   the volume set, to be dismounted.
+!
+!	2. For each ODS-2 volume (mounted on a device in the device list) that
+!	   is a root volume of a volume set, or not part of any volume set,
+!	   attempt to create a permanent RUJ on the volume if a journal file
+!	   already exists, or if the user requested one be created.
+!
+!	   Volumes of this type are the most prevalent.  A journalling failure
+!	   at this point will cause the entire volume set to be dismounted.
+!
+!	3. For each ODS-2 volume (mounted on a device in the device list) that
+!	   is a member of a volume set but not a root volume, attempt to restart
+!	   a "frozen" recovery unit.
+!
+!	   This pass handles the case of a volume set that is mounted in stages.
+!	   An active RUJ on an imcomplete volume set might become "frozen" if
+!	   data on missing volumes is needed to complete the journalling
+!	   operation.  Note that if more pieces of the volume set are still
+!	   not mounted, the RUJ may remain frozen.  A journalling failure at
+!	   this point will cause the entire volume set to be dismounted.  Note
+!	   that if the RUJ remains frozen, the volume set is not dismounted.
+!
+! Note that DISMOUNT_VOLSET will update the local device list database to reflect
+! the removal (dismounting) of volumes.
+!
+! This level of checking is necessary because $MOUNT will allow many types
+! of volumes to be mounted with a single invocation.  For example, more than
+! one volume set can be mounted; ODS1 and ODS2 disks can be mounted together
+! also.
+!-
+
+!
+! Handle case 1
+!
+INCR J FROM 0 TO .PHYS_COUNT-1 DO
+    IF  .ODS2_VOLUME[.J]
+    AND .VOLSET_RVN[.J] GTR 1
+    AND .RUJRNL_PRESENT[.J]
+    THEN
+	IF NOT (STATUS = EXEC_CALL (CREATE_RUJ, PHYS_NAME[.J, DSC$W_LENGTH], TEMPORARY_RUJ))
+	THEN
+	    DISMOUNT_VOLSET (PHYS_NAME, .PHYS_COUNT, .J,  ONE_VOLUME, .STATUS);
+
+!
+! Handle case 2.
+!
+INCR J FROM 0 TO .PHYS_COUNT-1 DO
+    IF  .ODS2_VOLUME[.J]
+    AND .VOLSET_RVN[.J] LEQ 1
+    AND (.RUJRNL_PRESENT[.J] OR .MOUNT_OPTIONS[OPT_NEWJRNL])
+    THEN
+	IF NOT (STATUS = EXEC_CALL (CREATE_RUJ, PHYS_NAME[.J, DSC$W_LENGTH], PERMANENT_RUJ))
+	THEN
+	    DISMOUNT_VOLSET (PHYS_NAME, .PHYS_COUNT, .J,  ALL_VOLUMES, .STATUS);
+
+!
+! Handle case 3.
+!
+INCR J FROM 0 TO .PHYS_COUNT-1 DO
+    IF  .ODS2_VOLUME[.J]
+    AND .VOLSET_RVN[.J] GTR 1
+    AND NOT .ROOT_PRESENT[.J]
+    THEN
+	IF NOT (STATUS = EXEC_CALL (RCP_RESTART, PHYS_NAME[.J, DSC$W_LENGTH]))
+	THEN
+	    DISMOUNT_VOLSET (PHYS_NAME, .PHYS_COUNT, .J,  ALL_VOLUMES, .STATUS);
+
+!
+! Compare the number of volumes dismounted against the original number
+! of volumes in the device list.  There are three posibilities:
+!	1. No volumes have been dismounted - return SS$_NORMAL
+!	2. Some but not all volumes have been dismounted - return MOUN$_DISMPART
+!	3. All volumes have been dismounted - return MOUN$_DISMAL
+!
+IF .DISMOUNT_COUNT LEQ 0
+THEN
+    RETURN SS$_NORMAL
+ELSE
+    IF .DISMOUNT_COUNT LSS .PHYS_COUNT
+    THEN
+	RETURN MOUN$_DISMPART
+    ELSE
+	RETURN MOUN$_DISMAL
+
+END;
+
+ROUTINE ANALYZE_DEVLIST (DEVNAM_LIST, LIST_LENGTH) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	For each device in the physical device name descriptor vector, determine
+!		o the file structure level (ODS-1 or ODS-2)
+!		o the name of the root volume in the volume set
+!		  (if present in the device list, record the index)
+!		o the Relative Volume Number (RVN)
+!		o whether or not the root volume is in the list
+!		o whether of not a volume has a RUJ file
+!
+! CALLING SEQUENCE:
+!	ANALYZE_DEVLIST (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1	: address of a vector of device name descriptors
+!	ARG2	: number of device name descriptors in the list
+!
+! IMPLICIT INPUTS:
+!	<see the EXTERNAL declaration>
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN								! Start of ANALYZE_DEVLIST
+
+!EXTERNAL LITERAL
+!	ROOTVOL_NAMLEN	= 64;					! Maximum length of a device name
+
+!EXTERNAL
+!	AA$_DATA_BEGIN	: VECTOR [0],				! Mark start of data area
+!	DISMOUNT_COUNT	: LONG,					! Count of volumes that were dismounted
+!	ODS2_VOLUME	: BITVECTOR [DEVMAX],			! Indicates volume supports ODS-2 file structure
+!	ROOT_PRESENT	: BITVECTOR [DEVMAX],			! Indicates presence of root volume for a given volume set
+!	RUJRNL_PRESENT	: BITVECTOR [DEVMAX],			! Indicates presence of RUJ file on a given volume
+!	ROOTVOL_DSC	: BBLOCK [DSC$K_S_BLN],			! Root volume device name descriptor
+!	ROOTVOL_BUF	: BBLOCK [ROOTVOL_NAMLEN],		! Buffer for root volume device name
+!	ROOTVOL_INDEX	: BBLOCK [DEVMAX, BYTE, UNSIGNED],	! Each entry contians index+1 of root volume if in PHYS_NAME
+!	VOLSET_RVN	: VECTOR [DEVMAX, BYTE, UNSIGNED],	! Vector of Relative Volume Numbers
+!	ZZ$_DATA_END	: VECTOR [0];				! Mark end of data area
+
+!EXTERNAL ROUTINE
+!	ACCESS_JOURNAL;						! Determine if RUJ file present on a volume
+
+LOCAL
+	I;							! Loop counter
+
+MAP
+	DEVNAM_LIST	: REF BBLOCKVECTOR [DEVMAX, DSC$K_S_BLN];
+
+OWN
+	ACP_TYPE	: LONG,					! Volume ACP type
+	ROOTNAME_BUF	: BBLOCK [ROOTVOL_NAMLEN],		! Root volume device name buffer
+	VOLUME_NUMBER	: LONG,					! Relative volume number
+
+	DVI_LIST	: BBLOCK [10*4]				! $GETDVI item list
+			  INITIAL (
+				   WORD (64),			!    ITEM - Root volume device name
+				   WORD (DVI$_ROOTDEVNAM),
+				   LONG	(0),			!    Filled in at run time
+				   LONG (0),			!    Filled in at run time
+				   WORD (4),			!    ITEM - Relative Volume Number
+				   WORD (DVI$_VOLNUMBER),
+				   LONG (VOLUME_NUMBER),
+				   LONG (0),
+				   WORD (4),			!    ITEM - ACP type
+				   WORD (DVI$_ACPTYPE),
+				   LONG (ACP_TYPE),
+				   LONG (0),
+				   LONG (0)			!    List terminator
+				  );
+
+!
+! Initialize the data area.
+!
+CH$FILL (0, (ZZ$_DATA_END-AA$_DATA_BEGIN), AA$_DATA_BEGIN);
+
+!
+! For each device listed, determine
+!	o the file structure level (ODS-1 or ODS-2)
+!	o its Relative Volume Number (RVN)
+!	o if it has a journal file
+!	o the device name the root volume is mounted on
+!	o if the root volume was mounted by this invocation of $MOUNT
+!
+INCR J FROM 0 TO .LIST_LENGTH-1 DO
+    BEGIN
+    !
+    ! Get the RVN and root volume device name.
+    !
+    ROOTVOL_DSC[DSC$A_POINTER] = ROOTVOL_BUF;
+    DVI_LIST[4, 0, 32, 0] = ROOTVOL_BUF;
+    DVI_LIST[8, 0, 32, 0] = ROOTVOL_DSC[DSC$W_LENGTH];
+    $GETDVI (DEVNAM = DEVNAM_LIST[.J, DSC$W_LENGTH], ITMLST=DVI_LIST);
+    VOLSET_RVN[.J] = .VOLUME_NUMBER;
+
+    !
+    ! If the volume supports the ODS-2 file structure, note it, and
+    ! determine if the root volume for this volume set was mounted in
+    ! this invocation of $MOUNT.  Note that if the RVN is LEQ 1, then
+    ! this volume is the root volume.
+    !
+    IF .ACP_TYPE EQL DVI$C_ACP_F11V2
+    THEN
+	BEGIN
+	ODS2_VOLUME[.J] = 1;					! Note that this volume supports ODS-2.
+	RUJRNL_PRESENT[.J] = ACCESS_JOURNAL (DEVNAM_LIST[.J, DSC$W_LENGTH]);
+        IF .VOLSET_RVN[.J] LEQ 1
+	THEN
+	    BEGIN						! This is the volume is its own root
+	    ROOT_PRESENT[.J] = 1;				! Note the the root volume is present in the device list
+	    ROOTVOL_INDEX[.J] = .J + 1;				! Note the index of the root volume (biased by 1)
+	    END;
+	!
+	! Check the root volume device name for this device against those
+	! in the supplied list.  If no match, it means that this volume is
+	! an addition to an already mounted volume set.
+	!
+	I = 0;
+	WHILE NOT .ROOT_PRESENT[.J] AND (.I LEQ .LIST_LENGTH-1) DO
+	    IF CH$EQL	(.DEVNAM_LIST[.I, DSC$W_LENGTH],
+			 .DEVNAM_LIST[.I, DSC$A_POINTER],
+			 .ROOTVOL_DSC[DSC$W_LENGTH],
+			 .ROOTVOL_DSC[DSC$A_POINTER]
+			)
+	    THEN
+		BEGIN
+		ROOT_PRESENT[.J] = 1;				! Note the the root volume is present in the device list
+		ROOTVOL_INDEX[.J] = .I + 1;			! Note the index of the root volume (biased by 1)
+		END
+	    ELSE
+		I = .I + 1;
+	END;
+    END;
+
+END;								! End of ANALYZE_DEVLIST
+
+ROUTINE CREATE_RUJ (DEVICE_NAME, PERMANENT_RUJ) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Create a JSB and call the $CREJNL system service to create a
+!	RUJ on a specified device.  The longevity of the RUJ is also
+!	specified.
+!
+! CALLING SEQUENCE:
+!	CREATE_RUJ (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1	: address of a device name descriptor
+!	ARG2	: if 0 then create a temporary RUJ, otherwise create a permanent RUJ.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	Status code passed back by RUJ routines.
+!
+! SIDE EFFECTS:
+!	The state of the volume may be changed depending on the action of
+!	the journalling ACP.
+!	Success messages are SIGNALED, errors are handled outside of this
+!	routine.
+!
+!--
+
+BEGIN								! Start of CREATE_JOURNAL
+
+EXTERNAL
+	JRNL_EXTEND,						! RUJ default file extension size
+	JRNL_QUOTA,						! RUJ byte quota per recovery unit
+	JRNL_SIZE,						! Recovery Unit Journal (RUJ)  initial size
+	JRNL_RECORD_SIZE,						! RUJ maximum record size
+	MOUNT_OPTIONS	: BITVECTOR;				! Option flags
+
+!EXTERNAL ROUTINE
+!	GET_VOLUME_NAME	: ADDRESSING_MODE (GENERAL),		! Return volume name for a given device
+!	INTERCEPT_SIGNAL: ADDRESSING_MODE (GENERAL);		! Condition handler
+
+LOCAL
+	JRNL_CHANNEL,						! Channel to volume
+	STATUS		: BBLOCK [4],
+	VOLUME_NAME	: REF BBLOCK;				! Volume name descriptor
+
+OWN
+	JSB		: BBLOCK [JSB$C_LENGTH];		! Journal State Block
+
+
+!
+! Enable a condition handler to field and print signalled messages.
+!
+ENABLE INTERCEPT_SIGNAL;
+
+!
+! Build the JSB in OWN storage (stack space is at a premium).
+!
+JRNL_CHANNEL = 0;
+CH$FILL (0, JSB$C_LENGTH, JSB);					! Initialize the JSB
+JSB[JSB$B_JNLTYP] = DT$_RUJNL;					! Set the journal type
+JSB[JSB$L_FILSIZ] = .JRNL_SIZE;					! Set RUJ initial size
+JSB[JSB$W_FILEXT] = .JRNL_EXTEND;				! Set RUJ extend size
+JSB[JSB$W_MAXSIZ] = .JRNL_RECORD_SIZE;				! Set RUJ max record size
+JSB[JSB$L_QUOTA] =  .JRNL_QUOTA;				! Set RUJ process byte quota
+JSB[JSB$W_BUFSIZ] = 1;						! Use 1 block buffers in driver
+JSB[JSB$B_COPIES] = 1;						! Only one RUJ on volume
+JSB[JSB$B_JNLDEV] = JSB$C_DISK;					! Specify device class
+JSB[JSB$B_ACMODE] = PSL$C_USER;					! Specify journal access mode
+JSB[JSB$L_PRINAMDES] = .DEVICE_NAME;				! devnam descriptor address
+CH$FILL (-1, 8, JSB[JSB$Q_EXPDAT]);				! default exparation date
+								!  Ignorant Bliss STILL does not handle quadwords.
+!
+! Set RUJ creation flags
+!
+IF .PERMANENT_RUJ
+THEN
+    JSB[JSB$V_CIF] = .MOUNT_OPTIONS[OPT_NEWJRNL]
+ELSE
+    BEGIN
+    JSB[JSB$V_TMPJNL] = 1;
+    JSB[JSB$V_TMPFIL] = 1;
+    END;
+
+!
+! Activate the journal (this is a synchronous operation).
+! Parameters that are defaulted are flaged with (*).
+!
+! The $CREJNL code is loadable, and not necessarily present in the system.
+!
+STATUS = $CREJNL (CHAN	 = JRNL_CHANNEL,			! Channel returned by the service
+	   	  JSB	 = JSB,					! JSB address
+	 	  ACMODE = 0,					! Access mode for channel
+	   	  PROT	 = 0,					! Protection for channel    (*)
+	   	  FACCOD = 0,					! Addr of facility code	    (*)
+	   	  FLAGS	 = 0,					! Option flags		    (*)
+	   	  OBJUIC = 0,					! Object UIC		    (*)
+	   	  SESSID = 0,					! Session ID		    (*)
+	   	  IOSB	 = 0					! Internal IOSB		    (*)
+	  	 );
+
+!
+! Device already exists should be changed to a success code
+!
+IF .STATUS EQL CJF$_DEVEXI
+THEN
+    STATUS[STS$V_SEVERITY] = STS$K_SUCCESS;
+!
+! Deassign the journal channel.  The return status is not interesting.
+! If the RUJ that was created was a temporary journal, deassigning the
+! channel will get rid of the journal and the RUJ file.
+!
+$DEASJNL (CHAN = .JRNL_CHANNEL);
+
+!
+! If the status code returned by $CREJNL indicates an "informational" message,
+! attempt to inform the user of the event.  All other status values are handled
+! outside of this routine.  The status code is signalled, and a condition
+! handler prints the message.
+!
+IF .STATUS[STS$V_SEVERITY] EQL STS$K_INFO
+THEN
+    BEGIN
+    VOLUME_NAME = GET_VOLUME_NAME (.DEVICE_NAME);
+    ERR_MESSAGE (MOUN$_VOLSTATUS, 1, .VOLUME_NAME, .STATUS);
+    END;
+
+RETURN .STATUS
+
+END;								! End of CREATE_JOURNAL
+
+ROUTINE DISMOUNT_VOLSET (DEVLIST, LIST_SIZE, INDEX, ENTIRE_VOLSET, ERROR_STATUS) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Dismount all or part of a volume set, and update the local device/volume
+!	data base to reflect the loss of one or more volumes.
+!
+! CALLING SEQUENCE:
+!	DISMOUNT_VOLSET (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1	: address of the list of all volumes mounted in this invocation of $MOUNT
+!	ARG2	: number of volumes mounted in this invocation of $MOUNT
+!	ARG3	: index into ARG1 (the current volume)
+!	ARG4	: if 0 dismount a single volume, otherwise dismount the entire volume set
+!	ARG5	: the journalling error status code
+!
+! IMPLICIT INPUTS:
+!	<see the EXTERNAL declarations>
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE.
+!
+! SIDE EFFECTS:
+!	The internal device data base is updated to reflect the dismounting of the volume(s).
+!	The user is informed of the progress.
+!
+!--
+
+BEGIN								! Start of CREATE_JOURNAL
+
+!EXTERNAL LITERAL
+!	ROOTVOL_NAMLEN	= 64;					! Maximum length of a device name
+
+!EXTERNAL
+!	AA$_DATA_BEGIN	: VECTOR [0],				! Mark start of data area
+!	DISMOUNT_COUNT	: BBLOCK [4],				! Count of volumes that were dismounted
+!	ODS2_VOLUME	: BITVECTOR [DEVMAX],			! Indicates volume supports ODS-2 file structure
+!	ROOT_PRESENT	: BITVECTOR [DEVMAX],			! Indicates presence of root volume for a given volume set
+!	RUJRNL_PRESENT	: BITVECTOR [DEVMAX],			! Indicates presence of RUJ file on a given volume
+!	ROOTVOL_DSC	: BBLOCK [DSC$K_S_BLN],			! Root volume device name descriptor
+!	ROOTVOL_BUF	: BBLOCK [ROOTVOL_NAMLEN],		! Buffer for root volume device name
+!	ROOTVOL_INDEX	: BBLOCK [DEVMAX, BYTE, UNSIGNED],	! Each entry contians index+1 of root volume if in PHYS_NAME
+!	VOLSET_RVN	: VECTOR [DEVMAX, BYTE, UNSIGNED],	! Vector of Relative Volume Numbers
+!	ZZ$_DATA_END	: VECTOR [0];				! Mark end of data area
+
+!EXTERNAL ROUTINE
+!	GET_VOLUME_NAME	: ADDRESSING_MODE (GENERAL),		! Return volume name for a given device
+!	INTERCEPT_SIGNAL: ADDRESSING_MODE (GENERAL);		! Condition handler
+
+LOCAL
+	MULTI_DISMOUNT	: LONG,					! Boolean, indicates more than one volume dismounted
+	PRIMARY_STATUS	: LONG,					! Primary status message code
+	ROOT_INDEX	: LONG,					! Index into device list of root volume for volume set
+	VOLUME_NAME	: REF BBLOCK;				! Volume name descriptor
+
+MAP
+	DEVLIST		: REF BBLOCKVECTOR [DEVMAX, DSC$K_S_BLN];
+
+OWN
+	DISMOUNT_FLAGS	: BBLOCK [4],				! Flags for $DISMOU call
+	ROOTDEV1_BUF	: BBLOCK [64],				! Buffer for primary root device name
+	ROOTDEV1_DSC	: BBLOCK [DSC$K_S_BLN]			! Descriptor for primary root device name
+			  PRESET ([DSC$A_POINTER] = ROOTDEV1_BUF),
+	ROOTDEV2_BUF	: BBLOCK [64],				! Buffer for secondary root device name
+	ROOTDEV2_DSC	: BBLOCK [DSC$K_S_BLN]			! Descriptor for secondary root device name
+			  PRESET ([DSC$A_POINTER] = ROOTDEV2_BUF),
+	VOLNAMLIST_BUF	: BBLOCK [DEVMAX*12],			! Buffer for volume names
+	VOLNAMLIST_DSC	: BBLOCKVECTOR [DEVMAX, DSC$K_S_BLN],	! Vector of volume name descriptors
+	VOLSET_SIZE	: LONG,					! Number of volumes in the volume set
+	VOLSETNAM_BUF	: BBLOCK [12],				! Volume set name buffer
+	VOLSETNAM_DSC	: BBLOCK [DSC$K_S_BLN],			! Volume set name descriptor
+	VOLUME_REMOVED	: BITVECTOR [DEVMAX],			! Mark volume as being removed
+
+	PRIMARY_DVI	: BBLOCK [7*4]				! $GETDVI item list for volume set info
+			  INITIAL (
+				   WORD (4),			!    ITEM - Volume set size
+				   WORD (DVI$_VOLCOUNT),
+				   LONG	(VOLSET_SIZE),
+				   LONG (0),
+				   WORD (64),			!    ITEM - Volume set root device name
+				   WORD (DVI$_ROOTDEVNAM),
+				   LONG	(ROOTDEV1_BUF),
+				   LONG (ROOTDEV1_DSC),
+				   LONG (0)			! List terminator
+				  ),
+
+	SECONDARY_DVI	: BBLOCK [4*4]				! $GETDVI item list for volume root device name
+			  INITIAL (
+				   WORD (64),			!    ITEM - Volume set root device name
+				   WORD (DVI$_ROOTDEVNAM),
+				   LONG	(ROOTDEV2_BUF),
+				   LONG (ROOTDEV2_DSC),
+				   LONG (0)			! List terminator
+				  );
+
+	
+!
+! Enable a condition handler to field and print signalled messages.
+!
+ENABLE INTERCEPT_SIGNAL;
+
+!
+! For the specified device, fetch the root device name and the number
+! of volumes in the volume set.
+!
+$GETDVI (DEVNAM=DEVLIST[.INDEX, DSC$W_LENGTH], ITMLST=PRIMARY_DVI);
+
+!
+! For each volume in the device list that is being dismounted,
+! update the internal device data base to reflect this change of status.
+! If only volume need be dismounted, this is very simple, otherwise...
+!
+IF NOT .ENTIRE_VOLSET
+OR .VOLSET_SIZE LEQ 1
+THEN
+    BEGIN
+    !
+    ! Remove this volume from the data base, and increment the dismount count.
+    !
+    ODS2_VOLUME[.INDEX] = 0;
+    ROOT_PRESENT[.INDEX] = 0;
+    RUJRNL_PRESENT[.INDEX] = 0;
+    VOLSET_RVN[.INDEX] = 0;
+    ROOTVOL_INDEX[.INDEX] = 0;
+    DISMOUNT_COUNT = .DISMOUNT_COUNT + 1;
+    END
+ELSE
+    BEGIN
+    !
+    ! ... otherwise, if the volume being dismounted is part of a volume
+    ! set, each volume in the device list that is associated with the
+    ! volume set must be removed from the device data base and dismounted.
+    ! The process is complicated if the root volume is not present in the
+    ! device list.  A ROOTVOL_INDEX of 0 implies that the root volume is
+    ! not present in the list, and a string comparison is necessary.
+    !
+    VOLUME_REMOVED = 0;
+    ROOT_INDEX = .ROOTVOL_INDEX[.INDEX];
+    INCR J FROM 0 TO .LIST_SIZE-1 DO
+	BEGIN
+	!
+	! See if the root volume indexes match.  If so, further checks are mandated.
+	!
+	IF  (.ROOT_INDEX EQL .ROOTVOL_INDEX[.J])
+	AND .ODS2_VOLUME[.J]
+	THEN
+	    BEGIN
+	    !
+	    ! The indexes match.  If the number is nonzero, then the root volume has been mounted
+	    ! by this invocation of $MOUNT.  Otherwise, the root device name of the current device
+	    ! must be fetched and compared against the root device name supplied by the caller.
+	    !
+	    IF .ROOT_INDEX NEQ 0
+	    OR ($GETDVI (DEVNAM=DEVLIST[.J, DSC$W_LENGTH], ITMLST=SECONDARY_DVI);
+		IF CH$EQL (.ROOTDEV1_DSC[DSC$W_LENGTH],
+			   .ROOTDEV1_DSC[DSC$A_POINTER],
+			   .ROOTDEV2_DSC[DSC$W_LENGTH],
+			   .ROOTDEV2_DSC[DSC$A_POINTER]
+			  )
+		THEN
+		    1
+		ELSE
+		    0
+		)
+	    THEN
+		BEGIN
+		!
+		! Remove this volume from the data base, and increment the dismount count.
+		!
+		ODS2_VOLUME[.J] = 0;
+		ROOT_PRESENT[.J] = 0;
+		RUJRNL_PRESENT[.J] = 0;
+		VOLSET_RVN[.J] = 0;
+		ROOTVOL_INDEX[.J] = 0;
+		VOLUME_REMOVED[.J] = 1;
+		DISMOUNT_COUNT = .DISMOUNT_COUNT + 1;
+		!
+		! Get and save the volume name.  This must be done before dismounting the volume.
+		!
+		VOLUME_NAME = GET_VOLUME_NAME (DEVLIST[.J, DSC$W_LENGTH]);
+		VOLNAMLIST_DSC[.J, DSC$W_LENGTH] = .VOLUME_NAME[DSC$W_LENGTH];
+		VOLNAMLIST_DSC[.J, DSC$A_POINTER] = VOLNAMLIST_BUF + (12 * .J);
+		CH$MOVE (.VOLUME_NAME[DSC$W_LENGTH], .VOLUME_NAME[DSC$A_POINTER], .VOLNAMLIST_DSC[.J, DSC$A_POINTER]);
+		END;
+	    END;
+	END;
+   END;
+	
+!
+! The informational message will vary depending on whether or not this is
+! a volume set.  Determine the primary message code and the volume name.
+! The volume name must be fetched before the volume is dismounted.
+! A local copy of the volume set name is made for future reference.
+!
+IF (.VOLSET_SIZE GTR 1) AND .ENTIRE_VOLSET
+THEN
+    BEGIN
+    MULTI_DISMOUNT = 1;
+    VOLUME_NAME = GET_VOLUME_NAME (DEVLIST[.INDEX, DSC$W_LENGTH], 1);
+    VOLSETNAM_DSC[DSC$W_LENGTH] = .VOLUME_NAME[DSC$W_LENGTH];
+    VOLSETNAM_DSC[DSC$A_POINTER] = VOLSETNAM_BUF;
+    CH$MOVE (.VOLUME_NAME[DSC$W_LENGTH], .VOLUME_NAME[DSC$A_POINTER], .VOLSETNAM_DSC[DSC$A_POINTER]);
+    PRIMARY_STATUS = MOUN$_VOLSETSTS;
+    END
+ELSE
+    BEGIN
+    MULTI_DISMOUNT = 0;
+    VOLUME_NAME = GET_VOLUME_NAME (DEVLIST[.INDEX, DSC$W_LENGTH]);
+    PRIMARY_STATUS = MOUN$_VOLSTATUS;
+    END;
+
+!
+! Dismount all or part of the volume set, as specified by the caller.
+!
+DISMOUNT_FLAGS = 0;
+IF NOT .ENTIRE_VOLSET
+THEN
+    DISMOUNT_FLAGS[DMT$V_UNIT] = 1;
+$DISMOU (DEVNAM=DEVLIST[.INDEX, DSC$W_LENGTH], FLAGS=.DISMOUNT_FLAGS);
+
+!
+! Inform the user that at least one volume has been dismounted.
+! Include the status code specified by the caller.
+!
+ERR_MESSAGE (.PRIMARY_STATUS, 1, .VOLUME_NAME, MOUN$_CJFERR, 0, .ERROR_STATUS);
+
+!
+! If more than one volume was dismounted, inform the user of each volume
+! that was dismounted.
+!
+IF .MULTI_DISMOUNT
+THEN
+    INCR J FROM 0 TO .LIST_SIZE-1 DO
+	IF .VOLUME_REMOVED[.J]
+	THEN
+	   BEGIN
+	   VOLUME_NAME = GET_VOLUME_NAME (DEVLIST[.J, DSC$W_LENGTH]);
+	   ERR_MESSAGE (MOUN$_DISMOUNTD, 2, VOLNAMLIST_DSC[.J, DSC$W_LENGTH], VOLSETNAM_DSC);
+	   END;
+
+END;								! End of DISMOUNT_VOLSET
+
+ROUTINE GET_VOLUME_NAME (DEVICE_NAME, FLAG) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+! 	Given the address of a device name descriptor, return the address of
+!	a string descriptor for the volume mounted in that device.  The volume
+!	name is from 1 to 12 characters.  Since the address returned points to
+!	routine-local storage, the string must be copied by the caller to prevent
+!	the next invocation of this routine from overwriting the result.
+!
+! CALLING SEQUENCE:
+!	GET_VOLUME_NAME (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1	: address of device name descriptor
+!	ARG2	: if present, indicates that the volume set name should be returned.
+!
+! IMPLICIT INPUTS:
+!	<see the EXTERNAL declarations>
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	Address of the volume name descriptor.
+!	Return 0 if the device does not contain a volume.
+!
+! SIDE EFFECTS:
+!	NONE.
+!
+!--
+
+BEGIN								! Start of GET_VOLUME_NAME
+
+
+!
+! Allocate plits in the $CODE$ psect to avoid truncation error when
+! linking mountshr.
+!
+PSECT
+	PLIT = $CODE$;
+
+BIND
+	NO_VOLSET_NAME	= DESCRIPTOR ('<name n/a>'),
+	NAME_PREFIX	= DESCRIPTOR ('DISK$');
+
+BUILTIN
+	ACTUALCOUNT;
+
+MAP
+	NAME_PREFIX	: BBLOCK;
+
+OWN
+	LOGNAM_BUF	: BBLOCK [64],				! Buffer for volume logical name
+	LOGNAM_DSC	: BBLOCK [DSC$K_S_BLN]			! Descriptor for logical name string
+			  PRESET ([DSC$A_POINTER] = LOGNAM_BUF),
+	VOLNAM_BUF	: BBLOCK [12],				! Buffer for volume name string
+	VOLNAM_DSC	: BBLOCK [DSC$K_S_BLN]			! Descriptor for volume name string
+			  PRESET ([DSC$A_POINTER] = VOLNAM_BUF),
+	VOLSETNAM_DSC	: BBLOCK [DSC$K_S_BLN],			! Decriptor for isolated volume set name
+
+	VOLUME_DVI	: BBLOCK [7*4]				! $GETDVI item list for volume info
+			  INITIAL (
+				   WORD (12),			!    ITEM - Volume name
+				   WORD (DVI$_LOGVOLNAM),
+				   LONG	(LOGNAM_BUF),
+				   LONG (LOGNAM_DSC),
+				   WORD (12),			!    ITEM - Volume name
+				   WORD (DVI$_VOLNAM),
+				   LONG	(VOLNAM_BUF),
+				   LONG (VOLNAM_DSC),
+				   LONG (0)			! List terminator
+				  );
+
+
+!
+! Get the requested information.
+! If $GETDVI failied, return 0.
+!
+IF NOT $GETDVI (DEVNAM=.DEVICE_NAME, ITMLST=VOLUME_DVI)
+THEN
+    RETURN 0;
+
+!
+! If the volume set name was requested, strip off the system-provided
+! prefix before returning it to the user.  If no prefix exists, then
+! this is not a volume set, and a special message indicating that the
+! volume set name is not available is returned instead.
+!
+IF ACTUALCOUNT() GTR 1
+THEN
+    IF CH$EQL  (.NAME_PREFIX[DSC$W_LENGTH],
+		.NAME_PREFIX[DSC$A_POINTER],
+		.NAME_PREFIX[DSC$W_LENGTH],
+		.LOGNAM_DSC[DSC$A_POINTER]
+	       )
+    THEN
+	BEGIN
+	VOLSETNAM_DSC[DSC$W_LENGTH] = .LOGNAM_DSC[DSC$W_LENGTH] - .NAME_PREFIX[DSC$W_LENGTH];
+	VOLSETNAM_DSC[DSC$A_POINTER] = .LOGNAM_DSC[DSC$A_POINTER] + .NAME_PREFIX[DSC$W_LENGTH];
+	RETURN VOLSETNAM_DSC;
+	END
+    ELSE
+	RETURN NO_VOLSET_NAME;
+
+RETURN VOLNAM_DSC
+
+END;								! End of GET_VOLUME_NAME
+
+ROUTINE INTERCEPT_SIGNAL (SIGNAL, MECHANISM) =
+
+!++
+! Functional Description:
+!
+!	This routine is a conditon handler whose sole
+!	reason for existence is to force the primary
+!	conditon code's facility-code to that of the
+!	MOUNT facility.
+!
+! Input:
+!
+!	SIGNAL    = Address of the signal array
+!	MECHANISM = Address of the mechanism array
+!
+! Output:
+!
+!	The condition facility code is equal to MOUN$_FACILITY
+!--
+
+BEGIN						! Start of INTERCEPT_SIGNAL
+
+MAP
+
+	SIGNAL		: REF BBLOCK,		! Signal array
+	MECHANISM	: REF BBLOCK;		! Mechanism array
+
+EXTERNAL
+
+	MOUNT_OPTIONS	: BITVECTOR VOLATILE,	! parser option flags
+	USER_STATUS	: VECTOR;		! Status return of some routines
+
+
+IF .SIGNAL[CHF$L_SIG_NAME] NEQ SS$_UNWIND
+THEN
+    BEGIN
+    !
+    ! Make the facility code MOUN$_FCILITY.
+    !
+    IF .BBLOCK [SIGNAL[CHF$L_SIG_NAME], STS$V_FAC_NO] EQL 0
+    THEN
+	BBLOCK [SIGNAL[CHF$L_SIG_NAME], STS$V_FAC_NO] = MOUN$_FACILITY;
+
+    IF .BBLOCK [SIGNAL[CHF$L_SIG_NAME], STS$V_MSG_NO] EQL 0
+    THEN
+	BBLOCK [SIGNAL[CHF$L_SIG_NAME], STS$V_MSG_NO] = .USER_STATUS [0] ^ (-$BITPOSITION (STS$V_MSG_NO));
+
+    !
+    ! If the caller requested it, print the message text associated with the message.
+    !
+    IF .MOUNT_OPTIONS [OPT_MESSAGE]
+    THEN
+	BEGIN
+	SIGNAL [CHF$L_SIG_ARGS] = .SIGNAL [CHF$L_SIG_ARGS] - 2;
+	$PUTMSG (MSGVEC = SIGNAL [CHF$L_SIG_ARGS], ACTRTN=0, FACNAM=0);
+	SIGNAL [CHF$L_SIG_ARGS] = .SIGNAL [CHF$L_SIG_ARGS] + 2;
+	BBLOCK [SIGNAL [CHF$L_SIG_NAME], STS$V_INHIB_MSG] = 1;
+	END;
+
+    !
+    ! If the condition severity code is SEVERE or ERROR, then unwind the
+    ! stack back to the caller of the frame that established this handler.
+    ! Return the condition code in R0.
+    !
+    IF .BBLOCK [SIGNAL [CHF$L_SIG_NAME], STS$V_SEVERITY] EQL STS$K_SEVERE
+    OR .BBLOCK [SIGNAL [CHF$L_SIG_NAME], STS$V_SEVERITY] EQL STS$K_ERROR
+    THEN
+	BEGIN
+	MECHANISM [CHF$L_MCH_SAVR0] = .SIGNAL [CHF$L_SIG_NAME];
+	$UNWIND ();
+	END;
+    END;
+
+!
+! Attempt to continue the operation.
+!
+RETURN (SS$_CONTINUE);
+
+END;						! End of INTERCEPT_SIGNAL
+
+ROUTINE RCP_RESTART ( DEVNAM: REF BBLOCK) =
+
+!++
+! RCP_RESTART
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Issue RESTART command to the RCP for the specified volume. This
+!	causes the RCP to restart any recovery operations which were frozen
+!	due to inaccessibility of objects.
+!
+! CALLING SEQUENCE:
+!
+!	STATUS	= RCP_RESTART ( DEVNAM );
+!
+! FORMAL PARAMETERS:
+!
+!	DEVNAM	= address of descriptor of device name for which frozen
+!		  Recovery Unit operations are to be restarted.
+!
+! COMPLETION CODES:
+!
+!	SS$_NORMAL	= successful completion
+!	...
+!--
+
+BEGIN
+
+EXTERNAL ROUTINE
+	CJF$RECOVERW	: ADDRESSING_MODE (GENERAL);		! interface to RCP
+!	GET_VOLUME_NAME	: ADDRESSING_MODE (GENERAL),		! Return volume name for a given device
+!	INTERCEPT_SIGNAL: ADDRESSING_MODE (GENERAL);		! Condition handler
+
+EXTERNAL LITERAL
+	EXE$C_SYSEFN;						! system event flag
+
+LOCAL
+	VOLUME_NAME	: REF BBLOCK;				! Volume name descriptor
+
+OWN
+    !
+    ! Allocate space for RODB and RODBA structures.  OWN storage is used
+    ! since stack space is at a premium.
+    !
+	RODB		: BLOCK [RODB$K_LENGTH  + 4, BYTE],	! RODB plus term. zero
+	RODBA		: BLOCK [RODBA$K_LENGTH + 4, BYTE],	! RODBA + 0
+	IOSB		: VECTOR [2,LONG],			! I/O status block
+	STATUS		: BBLOCK [4];				! completion status
+
+
+!
+! Enable a condition handler to field and print signalled messages.
+!
+ENABLE INTERCEPT_SIGNAL;
+
+!
+! Fill the fixed portions of the RODB and RODBA. 
+!
+RODB [RODB$B_TYPE] = RODB$K_RUJNL;				! object is RU journal
+RODB [RODB$B_COUNT] = 1;					! only one attribute
+RODB [RODB$W_SIZE] = RODB$K_LENGTH + 4;				! actually, this isn't used
+RODB [RODB$A_POINTER] = RODBA;					! point to attribute block
+RODB + RODB$K_LENGTH = 0;					! termination zero
+RODBA [RODBA$B_TYPE] = RODBA$K_RUJDEVNAM;			! attribute is device name
+RODBA [RODBA$W_SIZE] = .DEVNAM[DSC$W_LENGTH];			! length of attribute
+RODBA [RODBA$A_POINTER] = .DEVNAM[DSC$A_POINTER];		! addr of attribute
+RODBA + RODBA$K_LENGTH = 0;					! termination zero
+
+!
+! Send it to the RCP.
+!
+STATUS = CJF$RECOVERW ( CJF$M_RESTART,				! function = RESTART
+		        RODB,					! OBJECT data block
+			0,					! filter list (none)
+			%REF(PSL$C_EXEC),			! access mode
+			EXE$C_SYSEFN,				! event flag
+			IOSB,					! I/O status block
+			0,					! no AST address
+			0 );					! no AST parameter
+IF .STATUS THEN STATUS = .IOSB [ 0 ];
+
+!
+! If the status code returned by $CREJNL indicates an "informational" message,
+! attempt to inform the user of the event.  All other status values are handled
+! outside of this routine.  The status code is signalled, and a condition
+! handler prints the message.
+!
+IF .STATUS[STS$V_SEVERITY] EQL STS$K_INFO
+THEN
+    BEGIN
+    VOLUME_NAME = GET_VOLUME_NAME (.DEVNAM);
+    ERR_MESSAGE (MOUN$_VOLSTATUS, 1, .VOLUME_NAME, .STATUS);
+    END;
+
+.STATUS								! Return status to caller
+
+END;
+
+END
+ELUDOM

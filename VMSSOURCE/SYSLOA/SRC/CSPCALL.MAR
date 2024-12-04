@@ -1,0 +1,1959 @@
+	.TITLE	 CSPCALL	- Loadable Exec support for CSP
+	.IDENT	'V04-000'
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+;
+; FACILITY:	VMS
+;
+; ABSTRACT:	Routine to call the Cluster Server Process on another node.
+;
+; AUTHOR:	Paul R. Beck
+;
+; DATE:		21-MAR-1983 
+;
+; REVISION HISTORY:
+;
+;	V03-016	ADE0010		Alan D. Eldridge	18-Jul-1984
+;		Consmetic (comments only) cleanup.
+;
+;	V03-015	ADE0008		Alan D. Eldridge	24-May-1984
+;		Add bug-checks to avoid pool corruption when deallocating
+;		packets.  This has proven to be a problem area.
+;
+;	V03-014	ADE0008		Alan D. Eldridge	22-May-1984
+;		Bias ACB$W_WAIT_CNT in EXE$CSP_BRDCST while the routine is
+;		referencing the master ACB copy.  This is needed since the code
+;		is a referencer -- race conditions could otherwise cause the
+;		ACB$V_STS_WAIT flag to be cleared prematurely by DEALL_CSD.
+;
+;	V03-013	ADE0007		Alan D. Eldridge	18-May-1984
+;		Clear parent pointer in offspring ACB when deallocating
+;		offspring.  It was being deallocated in the parent ACB.
+;
+;	V03-011	ADE0006		Alan D. Eldridge	26-Apr-1984
+;		Erase ACB$V_WAIT at end of EXE$CSP_BRDCST if ACB$W_WAIT_CNT
+;		is zero.
+;
+;	V03-010	ADE0005		Alan D. Eldridge	12-Apr-1984
+;		Make default retry count 4 -- it was 30.
+;
+;	V03-010	ADE0004		Alan D. Eldridge	22-Mar-1984
+;		Fix EXE$CSP_COMMAND handling of CSP$_LOCAL request.
+;
+;	V03-009	DWT0193 	David W. Thiel		15-MAR-1984
+;		Change interface to ACKMSG block transfer.
+;
+;	V03-008	ADE0003		Alan D. Eldridge	28-Feb-1984
+;		Add support for CSP$_LOCAL call in EXE$CSP_COMMAND.
+;
+;	V03-007	ADE0002		Alan D. Eldridge	 6-Feb-1984
+;		Move CSD address to R2 in EXE$CSP_BRDCST before call to WAIT.
+;		Call scheduler at IPL$_SYNCH.  Check ACB$W_WAIT_CNT before
+;		clear ACB$V_STS_WAIT.
+;
+;	V03-006	ADE0001		Alan D. Eldridge	 9-Dec-1983
+;		Rewrite to use the ACKMSG of the Connection Manager rather
+;		than DECnet.  Merge module CSPALLOC into this one in order
+;		keep all special buffering details local to one module.
+;		Add state table, etc.
+;
+;	V03-005	JLV0309		Jake VanNoy		 5-OCT-1983
+;		Check status after call to EXE$ALLOC_CSD.
+;
+;	V03-004	JLV0305		Jake VanNoy		29-AUG-1983
+;		Add error checking to EXE$CSP_CALL call in EXE$CSP_BRDCST.
+;		Call EXE$DEANONPGDSIZ instead of EXE$DEANONPAGED.
+;
+;	V03-003	PRB0231		Paul R. Beck	 13-JUL-1983 21:33
+;		Fix bugs in broadcast.
+;		Change "empty slot" test in main routine.
+;
+;	V03-002	PRB0203		Paul R. Beck	 7-JUN-1983 22:53
+;		Fix non-PIC definition of NET0:
+;		Add broadcast capability.
+;
+;	V03-001	PRB0164		Paul R. Beck	 22-APR-1983 14:28:31 
+;		Add PSECT.
+;--
+
+;+
+;
+;   Future enhancements:
+;
+;   1.	Create a better bug-check code.  INCONSTATE is temporary.
+;
+;   2.  Do a better job about image rundown.
+;
+;   3.  What happens if a user tries to ^Y-Stop in various places (especially
+;	after depleting the JIB quota and while in a a wait state allocating
+;	memory).
+;-
+
+;
+;  Definitions
+;
+	$ACBDEF
+	$CSBDEF
+	$CSDDEF
+	$CSPDEF
+	$CDRPDEF
+	$CLSMSGDEF
+	$CLUBDEF
+	$CLUBTXDEF
+	$DYNDEF
+	$FKBDEF
+	$IPLDEF
+	$JIBDEF
+	$PCBDEF
+	$PHDDEF
+	$PRIDEF
+	$RSNDEF
+	$SBODEF
+	$SSDEF
+	$VADEF
+
+
+
+
+;
+;   Macro to setup up a routine dispatch table
+;
+.MACRO	$DSP_TABLE  list			; Setup dispatch table
+
+	.MACRO	$dspent	_$dspinx,_$dspact
+		.IIF GT,  <_$dspinx-_$maxinx>,	_$maxinx = _$dspinx
+		.	 = _$tmp + <4 * _$dspinx>
+		.long	_$dspact - _$tmp
+	.ENDM	$dspent
+
+	_$tmp	 = .
+	_$maxinx = 0
+	.IRP	a,<LIST>
+		$dspent	a
+	.ENDR
+
+	. = _$tmp + <4 * _$maxinx> + 4
+.ENDM	$DSP_TABLE
+
+;
+;   Macro to create and fill the event state table.
+;
+CEV$K_STATES  =  6				; Number of columns in the table
+CEV$_MAX_EVT  = -1 				; Init the number of rows
+CEV$_EXIT     =  0				; Define termination event
+
+.MACRO	$CEV  event, i,f,x,k,a,s		; Create state table entries  
+						; for the specified event
+	CEV$_MAX_EVT = CEV$_MAX_EVT + 1		; Bump max event value
+	CEV$_'event' = CEV$_MAX_EVT		; Define circuit event symbol
+
+		$ENT	i,_i			; Create table entry
+		$ENT	f,_f
+		$ENT	x,_x
+		$ENT	k,_k
+		$ENT	a,_a
+		$ENT	s,_s
+.ENDM	$CEV
+
+.MACRO	$ENT	entry,def_sta			; Create state table entry
+
+		_$ent = %LENGTH(entry)-1
+		CEV$K_sta_. = CEV$K_sta'def_sta'; Define default next state
+
+	.IF IDN,entry,?				; ? => bug 
+	    .BYTE  CEV$K_sta_.			; Use current state
+	    .BYTE  2				; Action is bug-check
+	.IFF
+	    .BYTE  CEV$K_sta_%EXTRACT(0,1,entry); Setup next state
+	    .BYTE  %EXTRACT(1,_$ent,entry)	; Setup action routine index
+	.ENDC
+.ENDM	$ENT
+
+
+
+
+.MACRO	$RSP_CEV_TAB, LIST			; CSPMSG$K_RSP to CEV$_ mapping
+
+	.MACRO	$make_entry, rsp, cev
+		. = _$START + cspmsg$k_rsp_'rsp'
+		.byte cev$_'cev'
+	.ENDM	$make_entry
+
+	_$start = .
+		.byte	0 [cspmsg$k_rsp_max+1]		; Init table
+	_$end   = .
+
+	.IRP	member,<list>				; Fill table
+		$make_entry member
+	.ENDR
+	.=_$end
+
+.ENDM	$RSP_CEV_TAB
+
+
+;
+;  Define CLSMSG format
+;
+$DEFINI	CSPMSG
+$EQULST CSPMSG$K_RSP_,,0,1,-		; Define response codes
+<-
+	<NOP>,-				; Should never be used
+	<ILL>,-				; Illegal CSPMSG$K_RSP_xx code specified
+	<BUSY>,-			; Remote CSP is busy, try later
+	<NOCSP>,-			; No CSP process
+	<RO>,-				; Read/only completion
+	<RW>,-				; Read/write completion
+	<BADCSD>,-			; Illegal CSD detected
+	<ASYNERR>,-			; Asynchronous block transfer failure
+	<SYNERR>,-			; Synchronous block transfer failure
+	<MAX>,-				; Not a legal response code -- used
+>					; to mark end of list
+
+.= CLMHDR$K_BT_LENGTH			; Skip over ACKMSG header
+
+$DEF	CSPMSG$B_RSP	  .BLKB	1	; Response code
+$DEF	CSPMSG$B_SPARE	  .BLKB	1	; Reserved -- used here for alignment
+$DEF	CSPMSG$W_CLIENT	  .BLKW	1	; Client i.d.
+$DEF	CSPMSG$L_CSD_SIZE .BLKL	1	; Size of CSD
+	CSPMSG$K_LENGTH = .		;
+$DEFEND	CSPMSG				;
+
+$DEFINI	ACB				; Define our own ACB extensions
+					;
+.= <ACB$K_LENGTH + 15>	& ^C<15>	; Goto end of normal ACB honoring normal
+					; pool granularty
+	;
+	;  A copy of the AST and PID are needed in the ACB to prevent a block
+	;  tranfer or a client from corrupting the ones in the CSD.
+	;
+$DEF	ACB$L_USER_AST	.BLKL	1	; User's AST address
+$DEF	ACB$L_USER_PID	.BLKL	1	; User's PID
+$DEF	ACB$W_WAIT_CNT	.BLKW	1	; Used if ACB$V_STS_BCST is set
+					; -- # of outstanding broadcasts
+$DEF	ACB$W_LAST_INX	.BLKW	1	; -  Last CSB index used 
+$DEF	ACB$L_PARENT	.BLKL	1	; Used if ACB$V_STS_BCST is clear
+					; -- 0 means no parent
+$DEF	ACB$B_STA	.BLKB	1	; CEV$K_STA_xxx code used by state table
+$DEF	ACB$B_STS	.BLKB	1	; The following:
+					;
+	$VIELD	ACB,0,-			;
+			<<STS_ASY,,M>  -; Used to determine if return was async
+			,<STS_QUE,,M>  -; Set if ACB queue header is in use
+			,<STS_WAIT,,M> -; While set, don't return to user
+			,<STS_BCST,,M> -; Set if part of broadcast
+			,<STS_PCNT,,M> -; Set if part of parent's WAIT_CNT
+			>		;
+$DEF	ACB$W_RETRY	.BLKW	1	; Retries allowed (signed value)
+	ACB$K_RETRY     = 4		; Max number of retries allowed
+	ACB$K_CSPLNG    = .		; Length of ACB we use
+$DEFEND ACB				;
+
+
+		.PSECT	$$$200,NOPIC,EXE,QUAD,RD,WRT
+
+CSP$BEGIN::					; Starting address for reading
+						; map while debugging
+;
+; OWN STORAGE:
+;
+
+;
+;  ACB states
+;
+$EQULST CEV$K_STA_,,0,1,-
+<-
+	<I>	-; Initial:	Initial state upon being allocated.
+		-;		On the 'idle CSD' queue.
+		-;
+	<F>	-; Forking:	Waiting 1 sec. before requesting a "warm" CDRP.
+		-;		On either some system fork or wait queue.
+		-;
+	<X>	-; Transfer:	Undergoing block transfer.
+		-;		On the 'active transfer' queue.
+		-;
+	<K>	-; KAST:	In use as a 'special kernel' AST block.  
+		-;		On the PCB AST queue.
+		-;
+	<A>	-; AST:		In use as a normal AST block.  
+		-;		On the PCB AST queue.
+		-;
+	<S>	-; System:	The ACB is being processed by system CSP code.
+		-;		Not on any queue.
+>
+
+CEV$AL_ACTTAB:
+  $DSP_TABLE -
+    <-
+	< 0, ACT_NOP>		-; Nop action routine
+	< 2, ACT_BUG>		-; Bugcheck
+	< 4, ACT_NYI>		-; Not yet implemented
+	<10, ACT_INSQUE>	-; Queue ACB to 'idle' queue, resignal the event
+	<12, ACT_REMQUE>	-; Remove ACB from current queue, resignal event
+	<14, ACT_REQ_ILL_BT>	-; User requested block transfer on via a CSD
+				-; that is in the wrong state
+	<16, ACT_REQ_DEAL>	-; User requested CSD deallocation before AST 
+				-; was delivered
+	<18, ACT_GET_CDRP>	-; Allocate warm CDRP 
+	<20, ACT_FORK_WAIT>	-; Put ACB on FORK and WAIT queue
+	<22, ACT_BLOCK_XFER>	-; Request ACKMSG block transfer
+	<24, ACT_SYN_ERROR>	-; Process synchronous block transfer error
+	<26, ACT_QUE_KAST>	-; Request Special Kernel AST
+	<28, ACT_QUE_AST>	-; Request Normal  Kernel AST
+	<32, ACT_DEALL>		-; Deallocate CSD
+	<34, ACT_GIVE_UP>	-; Retry count exceeded
+	<36, ACT_NO_AST>	-; No client AST to deliver
+   >
+
+
+
+CEV$AW_STA_TAB:
+;
+;                  I    F    X    K    A    S   
+;     -----------+----+----+----+----+----+----+
+$CEV  EXIT	  ?    ?    ?    ?    ?    ?    ; Exit state table processing
+$CEV  BUG	  ?    ?    ?    ?    ?    ?	; Bug detected
+						;
+$CEV  REQ_BT	  S12  .14  .14  .14  .14  .18	; User block-transfer request
+$CEV  REQ_DEALL   S12  .16  .16  .16  .16  .32	; User's deallocate CSD request
+						;
+$CEV  NO_CDRP	  ?    ?    ?    ?    ?    F20	; No CDRP's available
+$CEV  FORK_DONE	  ?    S18  ?    ?    ?    ?	; Back from FORK_WAIT
+$CEV  GOT_CDRP	  ?    ?    ?    ?    ?    X22	; CDRP was allocated
+$CEV  BT_DONE	  ?    ?    K26  ?    ?    ?	; Block-transfer done
+$CEV  BT_SYNERR	  .24  ?    I10  ?    ?    ?	; Synchronous transfer error
+
+$CEV  CSP_BUSY    ?    ?    F20  ?    ?    ?	; Remote CSP is busy
+$CEV  NO_CSP	  ?    ?    F20  ?    ?    ?	; No CSP on remote node
+$CEV  GIVE_UP	  ?    K34  ?    ?    ?    ?    ; Retry count exceeded
+						;
+$CEV  KAST_DEL	  ?    ?    ?    A28  ?    ?	; Special Kernel AST delivered
+$CEV  AST_DEL	  .    ?    ?    ?    I10  ?	; Normal Kernel AST delivered
+$CEV  NO_AST	  .36  ?    ?    I10  S32  ?	; No user AST to deliver
+$CEV  INV_PID	  S12  ?    ?    ?    ?    .32	; Event is "invalid PID"
+
+
+;
+;  Table to map CSPMSG$K_RSP codes to CEV$_ events
+;
+CEV$AB_RSP_CEV:
+   $RSP_CEV_TAB -
+     <-	
+	<NOP,	   BUG>			-; Not supposed to be used
+	<BUSY,	   CSP_BUSY>		-; Remote CSP is busy, try later
+	<NOCSP,	   NO_CSP>		-; No CSP process
+	<RO,	   BT_DONE>		-; Read/only completion
+	<RW,	   BT_DONE>		-; Read/write completion
+	<BADCSD,   BUG>			-; Illegal CSD detected
+	<ASYNERR,  BT_DONE>		-; Asynchronous block transfer failure
+	<SYNERR,   BT_SYNERR>		-; Synchronous block transfer failure
+	<MAX,	   BUG>			-; Not supposed to be used
+     >
+
+;
+;  Queue headers
+;
+		 .ALIGN QUAD
+
+CSP$Q_ACB_IDLE:	 .QUAD	0	; ACB/CSD's allocated to some process but 
+				; which are otherwise idle
+CSP$Q_ACB_XFER:	 .QUAD	0	; ACB/CSD's with block transfer in progress
+				;
+CSP$B_RCVCSDCNT: .BYTE	0	; Number of rcv'd CSD's being processed 
+				; currently.
+CSP$B_INITED:	 .BYTE	0	; Zero only if queue's not inited
+
+;
+;  Define CSP specific receive CDRP fields and extensions
+;
+CDRP$L_CSP_CSD =  0+CDRP$K_CM_LENGTH	; Pointer to allocated CSD
+CDRP$L_CSP_SP1 =  4+CDRP$L_CSP_CSD	; Spare
+
+$VIELD	CDRP,0,-			; Define CDRP$B_CLTSTS flags
+<-
+	<CSP_ERROR,,M>,-		; ACKMSG error experienced
+	<CSP_QUEUED,,M>,-		; CSD is queued to CSP process
+	<CSP_FLWCTL,,M>,- 		; CSD accounted against flow control
+>
+
+
+	.PSECT	$$$200,EXE		; Go to code .PSECT
+
+
+.SBTTL	'CSP$INIT	- Init CSP data structures upon load'
+;++
+;
+;  This code is called once when the CLUSTRLOA is loaded.  It init's the
+;  queue headers.
+;
+;  INPUTS:	NONE
+;
+;  OUTPUTS:	R0	SS$_NORMAL
+;
+;--
+CSP$INIT::				; Init data structures
+	BLBS	CSP$B_INITED,100$	; If LBS, we've been here
+
+	ASSUME	CSP$Q_ACB_XFER  EQ  8+CSP$Q_ACB_IDLE
+
+	MOVAB	CSP$Q_ACB_IDLE,R0	; Get queue header address
+	MOVAB	(R0),(R0)+		; Setup ACB_IDLE queue header
+	MOVAB	-4(R0),(R0)+		;
+	MOVAB	(R0),(R0)+		; Setup ACB_XFER queue header
+	MOVAB	-4(R0),(R0)+		;
+					;
+	ADDL3	#CLUB$L_CSPFL,-		; Get queue header address
+		G^CLU$GL_CLUB,R0	;
+	MOVAB	(R0),(R0)		; Setup forward link
+	MOVAB	(R0),4(R0)		; Setup backward link
+					;
+100$:	MOVB	#1,CSP$B_INITED		; Say "initialized"
+	MOVL	#SS$_NORMAL,R0		; Always successful
+	RSB				; Done
+
+
+.SBTTL	'CLEAN_UP	- ACKMSG Rcv cleanup routine'
+;++
+;
+;  This routine is called by ACKMSG when a fatal virtual circuit error is 
+;  encountered.  ACKMSG is going to drop this thread on the floor and will
+;  deallocate the CLUBTX structure.  It is up to us to eventually deallocate
+;  the CDRP and the CSD.
+;
+;  INPUTS:	R5	CDRP Pointer
+;		R4	N/A
+;		R3	CSB (or zero)
+;		R2	Pointer to message stored in CLUBTX
+;		R1	Pointer to extension space at end of CLUBTX (0 if none)
+;		R0	Scratch
+;
+;  OUTPUTS:	??
+;
+;--
+		.ENABL	LSB
+CLEAN_UP:						  ; Cleanup upon error
+	BISB	#CDRP$M_CSP_ERROR,CDRP$B_CLTSTS(R5)	  ; Remember error
+CLEAN_UP1:						  ; Internal cleanup
+	BBS	#CDRP$V_CSP_QUEUED,CDRP$B_CLTSTS(R5),100$ ; If BS, CSD is 
+							  ; queued to CSP
+	BBCC	#CDRP$V_CSP_FLWCTL,CDRP$B_CLTSTS(R5),50$  ; If BS, accounted 
+							  ; against flow control
+	DECB	CSP$B_RCVCSDCNT				  ; Return flow credit
+50$:	MOVL	CDRP$L_CSP_CSD(R5),R0			  ; Get CSD
+	BEQL	70$					  ; If EQL, none
+	CLRL	CDRP$L_CSP_CSD(R5)			  ; Clear ptr
+	JSB	G^EXE$DEANONPAGED			  ; Deallocate CSD
+70$:	MOVL	R5,R0					  ; Get CDRP
+	JSB	G^EXE$DEANONPAGED			  ; Deallocate CDRP
+100$:	RSB						  ; Done
+
+		.DSABL	LSB
+
+
+.SBTTL	'CSP$DISPATCH	- Dispatch on received ACKMSG message'
+;++
+;
+;  INPUTS:	R5	Unitialized CDRP
+;		R4	PDT address
+;		R3	CSB address
+;		R2	Message address
+;		R1-R0	Scratch
+;
+;  OUTPUTS:	R5-R0	Garbage
+;
+;--
+		.ENABL	LSB
+CSP$DISPATCH::					; CSP ACMKSG dispatcher
+	;
+	;
+	;    Call CNX$PARTNER_INIT_CSB to allocate new BTX (R2) and to init CDRP
+	;
+	;
+	CLRL	R1				; No BTX extension space needed
+	MOVAB	CLEAN_UP,R4			; Address of cleanup routine
+	BSBW	CNX$PARTNER_INIT_CSB		; Prepare for block transfer
+						; - may return to our caller
+						; - may never return if 
+						;   connection breaks
+	CLRB	CDRP$B_CLTSTS(R5)		; Init client (us) status
+	CLRL	CDRP$L_CSP_CSD(R5)		; Init CSD pointer
+	CLRL	CDRP$L_CSP_SP1(R5)		; Init spare longword
+	MOVL	#CSP$_ABORT,R1			; Say "no CSP process"
+	MOVL	G^CLU$GL_CLUB,R0		; Get CLUB
+	BEQL	20$				; If EQL, none
+	TSTL	CLUB$L_CSPIPID(R0)		; CSP there ?
+	BEQL	20$				; If EQL, no
+	CMPB	#CSP$K_MAX_FLWCTL,CSP$B_RCVCSDCNT  ; Within limit?
+	BGTRU	30$				; If GTRU yes, okay to continue
+10$:	MOVL	#CSP$_REJECT,R1			; "reject due to flow control"
+20$:	BSBW	CSP_COMMAND			; Issue command
+	BRW	100$				; Done
+30$:	;
+	;
+	;    Flow control allows us to continue.  Allocate a CSD to receive the
+	;    remote request.
+	;
+	;
+	MOVL	CSPMSG$L_CSD_SIZE(R2),CDRP$L_XCT_LEN(R5); Save CSD size
+	ADDL3	#12,CDRP$L_XCT_LEN(R5),R1		; Get total CSD size
+	JSB	G^EXE$ALONONPAGED			; Allocate CSD
+	BLBC	R0,10$					; If LBC no, treat as
+							; flow control problem
+	INCB	CSP$B_RCVCSDCNT				; Consume flow control
+	BISB	#CDRP$M_CSP_FLWCTL,CDRP$B_CLTSTS(R5)	; And mark the fact
+	;
+	;
+	;    Setup the CDRP for the block transfer, and read the remote command 
+	;    into the allocated buffer.
+	;
+	;    The call to CNX$BLOCK_READ returns to our caller immediately, and
+	;    returns in-line only after the transfer completes.  If an error is
+	;    encountered and our error routine (CLEAN_UP) is called, then there
+	;    is no return in-line.
+	;
+	;
+	MOVL	R2,CDRP$L_CSP_CSD(R5)			; Setup pointer
+	MOVZWL	R1,8(R2)				; Setup size
+	MOVL	R5,(R2)					; Setup CDRP pointer
+	ADDL	#12,R2					; Go to CSD area
+	EXTZV	#VA$V_VPN,#VA$S_VPN,R2,R1		; Get page number
+	MOVL	G^MMG$GL_SPTBASE,R0			; Get base of SPT
+	MOVAL	(R0)[R1],CDRP$L_CNXSVAPTE(R5)		; Setup SVAPTE
+	BICW3	#^C<VA$M_BYTE>,R2,CDRP$W_CNXBOFF(R5)	; Setup BOFF
+	MOVL	CDRP$L_XCT_LEN(R5),CDRP$L_CNXBCNT(R5)	; Setup BCNT
+	CLRB	CDRP$B_CNXRMOD(R5)			; Setup for kernel mode
+	CLRL	CDRP$L_RBOFF(R5)			; Start at begining of 
+	CLRL	CDRP$L_LBOFF(R5)			;  buffer on both sides
+	BSBW	CNX$BLOCK_READ				; Read remote request
+	;
+	;
+	;    We only get here if the READ completed successfully.  Pickup the
+	;    CSD, queue it, and wake the CSP process to come and get it.
+	;
+	;    If the CSP is no longer there (SCH$WAKE fails), empty the CSD queue
+	;    and send an approriate response.
+	;
+	;
+	ADDL3	#12,CDRP$L_CSP_CSD(R5),R2		; Get the CSD 
+	BISB	#CDRP$M_CSP_QUEUED,CDRP$B_CLTSTS(R5) 	; Say "queued to CSP"
+							;
+INSQUE_CLUB:						; Queue CSD to CLUB
+	;
+	;
+	;    Inputs:	R0	Scratch
+	;		R1	Scratch
+	;		R2	CSD pointer
+	;		R3	Scratch
+	;		R4	Scratch
+	;		R5	CDRP pointer, if any
+	;
+	;
+	MOVL	G^CLU$GL_CLUB,R0			; Get CLUB
+	INSQUE	(R2),@CLUB$L_CSPBL(R0)			; Queue the CSD
+	MOVL	CLUB$L_CSPIPID(R0),R1			; Get CSP's IPID
+	BEQL	80$					; If EQL, no CSP
+	JSB	G^SCH$WAKE				; Wake CSP
+	BLBS	R0,100$					; If LBS, okay
+80$:	MOVL	G^CLU$GL_CLUB,R4			; Get the CLUB
+90$:	REMQUE	@CLUB$L_CSPFL(R4),R2			; Get the CSD
+	BVS	100$					; If VS, none left
+	MOVL	#CSP$_ABORT,R1				; Setup function code
+	BSBB	EXE$CSP_COMMAND				; Process CSD
+	BRB	90$					; Loop	
+100$:	RSB						; Done
+		.DSABL	LSB
+
+
+.SBTTL	'EXE$CSP_COMMAND  Receive commnad from CSP process'
+;++
+;
+;  The CSP process calls this routine when it is done processing a CSD.  The 
+;  action is to conditionally send the CSD back to the requestor (if it contains
+;  new data) and to terminate the block transfer sequence with a response 
+;  message.
+;
+;  This routine is also used to process the CSP$_LOCAL command.  This command
+;  is used to pass locally generated requests to the CSP process.
+;
+;  INPUTS:	R4	client code 	(CSP$_LOCAL only)
+;		R3	0		(CSP$_LOCAL only)
+;			Will someday be used for message build call back
+;		R2	Address of CSD
+;		R1	Function code:
+;
+;			    CSP$_ABORT	- Abort the request
+;			    CSP$_BADCSD	- Illegal CSD structure detected
+;			    CSP$_DONE	- Terminate the exchange
+;			    CSP$_REJECT - Reject request due to flow control
+;			    CSP$_REPLY	- Send CSD back to requestor
+;			    CSP$_LOCAL	- Send local CSD to CSP
+;
+;		R0	Scratch
+;
+;  OUTPUTS:	R2-R0	Garbage
+;
+;--
+EXE$CSP_COMMAND::				; Command from CSP
+	PUSHR	#^M<R3,R4,R5>			; Save regs
+	DSBINT	#IPL$_SYNCH			; Go to proper IPL
+						;
+	BSBB	50$				; Process the command
+						;
+	ENBINT					; Restore IPL
+	POPR	#^M<R3,R4,R5>			; Restore regs
+	RSB					; Done
+
+50$:	CMPL	R1,#CSP$_LOCAL			; "Local" request ?
+	BNEQ	CSP_COMMAND_1			; If NEQ, no
+	;
+	;
+	;    This is a "local" request
+	;
+	;
+	CMPB	#CSP$K_MAX_FLWCTL,CSP$B_RCVCSDCNT  ; Within limit?
+	BGTRU	70$				; If GTRU, okay
+60$:	MOVZWL	#SS$_REJECT,R0			; Tell caller we failed
+	BRB	100$				; Take common exit
+70$:	MOVZWL	#12+CSD$K_LENGTH,R1		; Setup block size
+	JSB	G^EXE$ALONONPAGED		; Allocate the block
+	BLBC	R0,60$				; If LBC, failed
+						;
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>		; Save regs
+	MOVC5	#0,(SP),#0,R1,(R2)		; Zero the block
+	POPR	#^M<R0,R1,R2,R3,R4,R5>		; Restore regs
+						;
+	MOVZWL	R1,8(R2)			; Setup size, zero type
+	ADDL	#12,R2				; Goto CSD area
+	SUBL	#12,R1				; Reduce size
+	MOVW	R1,8(R2)			; Setup size
+	MOVB	#DYN$C_CLU,CSD$B_TYPE(R2)	; Setup type
+	MOVB	#DYN$C_CSD,CSD$B_SUBTYPE(R2)	; Setup subtype
+	MOVW	R4,CSD$W_CODE(R2)		; Enter client code
+	INCB	CSP$B_RCVCSDCNT  		; Consume flow control
+	BSBW	INSQUE_CLUB			; Queue the CSD
+	;
+	;
+	;   *** NOTE ***
+	;
+	;   For a variety of reasons (CSP not there yet, CSP was there when
+	;   CSD was queued but exitted shortly thereafter), a return with
+	;   the low bit set does not mean that the request actually made
+	;   it.  A return with the low bit clear does mean that it didn't.
+	;
+	;   A more sophisticated mechanism for status reporting will need
+	;   to be invented if this is not adequate for future users of
+	;   this interface (currenly only the Quorum disk thread uses this).
+	;
+	;
+	MOVL	#1,R0				; Assume success (error at
+						; this point is untrustworthy)
+100$:	RSB					; Return status to caller
+
+
+CSP_COMMAND_1:					; Process CSP command
+	;
+	;
+	;    If the CDRP pointer is zero, then this is a "local" CSD being
+	;    returned -- simply restore the flow control taken and deallocate
+	;    the CSD.  Otherwise, 
+	;
+	;
+	MOVL	-12(R2),R5				; Get CDRP
+	BNEQ	5$					; If NEQ, not local CSD
+	DECB	CSP$B_RCVCSDCNT  			; Restore flow control
+	MOVAB	-12(R2),R0				; Get block address
+	JMP	G^EXE$DEANONPAGED			; Deallocate the block
+5$:	BICB	#CDRP$M_CSP_QUEUED,-			; CSP is done with CSD
+		 CDRP$B_CLTSTS(R5) 			;
+CSP_COMMAND:						; Process CSP command
+							 ;
+	BBS	#CDRP$V_CSP_ERROR,CDRP$B_CLTSTS(R5),900$ ; If BS, ACKMSG error
+							 ; occurred
+	DISPATCH  R1,-
+	<-
+	    <CSP$_DONE,   100$>,-		; Terminate the exchange
+	    <CSP$_BADCSD, 300$>,-		; Illegal CSD structure
+	    <CSP$_ABORT,  310$>,-		; CSP is not there or is going
+	    <CSP$_REJECT, 320$>,-		; Reject due to no flow control
+	    <CSP$_REPLY,  800$>,-		; Send CSD back to requestor
+	>	
+
+	BUG_CHECK  INCONSTATE,FATAL		; Unknown command
+
+100$:	;
+	;
+	;    Send CSD back to requestor before finishing up the block transfer
+	;
+	;
+	BSBW	CNX$BLOCK_WRITE			; Send CSD back to requestor
+	MOVL	#CSPMSG$K_RSP_RW,R1		; Setup response code
+	BRB	810$				; Finish up block transfer
+
+	;
+	;
+	;    Miscellaneous failures
+	;
+	;
+300$:	MOVL	#CSPMSG$K_RSP_BADCSD,R1		; Inidicate 'bad csd'
+	BRB	810$				; Finish up block transfer
+310$:	MOVL	#CSPMSG$K_RSP_NOCSP,R1		; Indicate 'no CSP process'
+	BRB	810$				; Finish up block transfer
+320$:	MOVL	#CSPMSG$K_RSP_BUSY,R1		; Indicate 'no flow credits'
+	BRB	810$				; Finish up block transfer
+
+800$:	;
+	;
+	;    Finish up the block transfer and deallocate the CDRP and CSD
+	;    Store the response code in low byte of CDRP$L_VAL2.
+	;
+	MOVL	#CSPMSG$K_RSP_RO,R1		; Setup response code
+810$:	MOVB	R1,CDRP$L_VAL2(R5)		; Enter response code
+	MOVAB	B^RSP_MSGBLD,CDRP$L_MSGBLD(R5)	; Setup message build routine
+	BSBW	CNX$PARTNER_RESPOND		; Finish up block transfer
+900$:	BSBW	CLEAN_UP1			; Cleanup CDRP, CSD, etc
+	RSB					; Done
+
+RSP_MSGBLD:
+	;
+	;   ACKMSG calls us here to build the response message.
+	;
+	;   INPUTS:	R5	CDRP ptr
+	;		R4	PDT ptr
+	;		R3	CSB ptr
+	;		R2	Message pointer
+	;		R0	Scratch
+	;
+	;
+								;
+	MOVB	CDRP$L_VAL2+0(R5),CSPMSG$B_RSP(R2)		; Copy CSP response
+	MOVB	#<CLSMSG$K_FAC_CSP ! CLSMSG$M_RESPMSG>, -	; Copy code/flag
+    		CLSMSG$B_FACILITY(R2)
+	CLRB	CLSMSG$B_FUNC(R2)				; Copy our fct
+	RSB							; Done
+
+
+.SBTTL	'EXE$CSP_BRDCST	- Send CSP request to all nodes'
+;++
+;
+;  Send specified message to all other nodes in the cluster.  A list is made of
+;  all nodes currently in the cluster, and the message is sent to the CSP in 
+;  each.  A new list is then made and compared with the first; if any new nodes 
+;  have appeared, the message is sent to them.  This repeats until the no new 
+;  nodes appear.  Note that the local node is excluded from the list of 
+;  recipients.
+;
+;
+;  Allocation and Deallocation of CSD's
+;  ------------------------------------
+;
+;  EXE$ALLOC_CSD   should be used to allocate all CSD's.
+;  EXE$DEALLOC_CSD should be used to deallocate all CSD's.
+;
+;  Because some fields in the CSD need reinitializing, and since the call to
+;  EXE$DEALLOC_CSD is merely a request (the actual deallocation can only happen
+;  when the CSD "runs down"), CSD's should not be recycled by the clients, but
+;  rather a fresh one should be allocated for each use.
+;
+;  The template CSD is allocated by the caller and this routine allocates the 
+;  rest.  However, the AST routine is responsible for deallocating each CSD; 
+;  this is true of every CSD the AST routine is called with, including the 
+;  template CSD.  If there is no AST routine specified, then EXE$CSP_BRDCST will
+;  cause the CSD's used in the node dialogues to be automatically deallocated.
+;  Note that the AST routine need not deallocate a CSD immediately -- it may
+;  queue for later deallocation at normal process level.
+;
+;  The caller is always responsible for deallocating the template CSD as listed
+;  in the table below.  Basically, if the call to this routine returns an error,
+;  or if no AST is specified, then the caller should deallocate the CSD upon
+;  return.  Otherwise, the AST routine should cause the CSD (in this case 
+;  CSD$L_CSID = -1) to be deallocated.
+;
+;
+;
+;  The CSD$L_USER_AST field
+;  ------------------------
+;
+;  If this field is zero, then no AST's will be delivered and control is not
+;  returned to the caller until the completion of the dialoque with the final
+;  node.  
+;
+;  If this field is non-zero, then control is returned to the user as soon as
+;  possible.  An AST will be delivered after the completion of a dialogue with 
+;  each node.  The CSD address is the AST parameter.  The AST routine should 
+;  check the CSD$L_CSID field to determine the remote node, and CSD$Q_INT_IOSB 
+;  to determine the status.  Also, it may read the response data described by 
+;  CSD$L_RECVLEN and CSD$L_RECVOFF.  
+;
+;  If EXE$CSP_BRDCST returns with the low bit set in R0, then an AST will be 
+;  delivered using the template CSD as a parameter (i.e, CSD$L_CSID=-1) after 
+;  completion of the dialogue with the final node.  This allows the caller to 
+;  know when the all of the EXE$CSP_BRDCST operations are done.
+;
+;  If EXE$CSP_BRDCST returns with the low bit clear in R0, then no further AST 
+;  will be queued to the process (those already in the queue will be delivered 
+;  when process state allows).  This means that the AST routine will not be
+;  called with the template CSD.
+;
+;
+;  Danger of Disabling AST's
+;  -------------------------
+;
+;  Since the allocation of CSD's is charged against the user's BYTCNT quota,
+;  and if the caller has specified an AST routine, then calling EXE$CSP_BRDCST
+;  could hang the process.  This is because the quota is only returned when a
+;  CSD is deallocated, and that does not happen until the AST causes to happen.
+;  This also implies that the CSD should be deallocated as soon as possible 
+;  after the AST is delivered.
+;
+;  AST's may be disabled if no AST routine is specified since in that case
+;  an AST does not have to be delivered before the quota is returned since the
+;  CSD is deallocated in the 'Special Kernel' AST routine that is delivered 
+;  when the block transfer completes or fails.  Note that 'Special Kernel' AST's
+;  are not disabled by the $SETAST service.
+;
+;
+;  Waiting for Pool or Process Quota
+;  ---------------------------------
+;
+;  When system resources or process quotas are not available, EXE$CSP_BRDCST
+;  will optionally wait, depending on the setting of PCB$V_SSRWAIT, in the 
+;  current mode (kernel) at IPL 0.  This will allow the process to be deleted
+;  (cleanup any allocated pool is eventually done when the timer ticks or some
+;  block transfer completes), but will not allow the user to "^Y, STOP" the
+;  current running image.  The later problem should be solved someday, but it
+;  it is non-trivial since our caller is not the "user" but is some internal
+;  system service code which may have resources to clean up.
+;
+;	NOTE:	Caller's of this routine are therefore cautioned from making
+;		this eventual solution overly difficult by calling 
+;		EXE$CSP_BRDCST from awkward places.
+;
+;
+;
+;  In summary
+;  ----------
+;
+;  R0's	    AST		When to EXE$DEALLOC_CSD 	When EXE$CSP_BRDCST
+;  low bit  specified	the template CSD 		returns to caller
+;  -------  ---------	------------------------	-------------------
+;    LBC     no		Upon return - no further 	When the error is 
+;			AST's are delivered.		encountered.
+;    LBC     yes	Upon return - no further 	When the error is 
+;			AST's are delivered.		encountered.
+;    LBS     no		Upon return			When all dialogues
+;							have completed.
+;    LBS     yes	By the AST routine or by  	As soon as possible.
+;			some action it schedules.
+;
+;
+;
+;
+;  CALLING SEQUENCE:	JSB	EXE$CSP$BRDCST  at IPL 0
+;
+;
+;  INPUTS:	R2	Address of template CSD which is completely filled in 
+;			(including user data) with the exception CSD$L_CSID.  
+;
+;  OUTPUTS:	R0	Status
+;
+;		All other registers are preserved.
+;
+;--
+EXE$CSP_BRDCST::
+	PUSHR	#^M<R1,R2,R3,R4,R5,R6,R7,R8,R9>	; Save volatile reg's
+						;
+	BSBW	COMMON_SETUP			; Check IPL, get ACB, etc
+	BLBC	R0,100$				; If LBC, error
+	MOVL	R2,R6				; Save ptr to the template CSD
+	MOVL	R4,R9				; Save ACB pointer
+	INCW	ACB$W_WAIT_CNT(R9)		; Bias the wait count while
+						; this routine is using the ACB
+	MOVZWL	#SS$_NOSUCHNODE,R0		; set up other escape code
+						;
+	MNEGL	#1,CSD$L_CSID(R6)		; Mark CSD as "template"
+	MOVW	G^CLU$GW_MAXINDEX,ACB$W_LAST_INX(R9) ; Init final CSB index 
+						;
+10$:	;
+	;
+	;    Get the next CSB.  If there is one, allocate a CSD and copy the 
+	;    the template to it.
+	;
+	;
+	BSBB	GET_NEXT_CSB			; Get next CSB, if any
+	BLBC	R0,70$				; If LBC, we're done
+	MOVZWL	CSD$W_SIZE(R6),R1		; Get the allocation size
+	JSB	G^EXE$ALLOC_CSD			; Get a new CSD for this node
+	BLBC	R0,70$				; Error if LBC (no recovery)
+						;
+	PUSHL	R2				; Save its address
+	MOVC3	R1,(R6),(R2)			; Fill it in from the template
+	POPL	R2				; Retrieve the CSD
+						;
+	;
+	;
+	;    Make the CSP call to tranfer the CSD.  
+	;
+	;
+	MOVAB	-ACB$K_CSPLNG(R2),R4		; Get ACB
+	MOVL	R9,ACB$L_PARENT(R4) 		; Remember parent
+	INCW	ACB$W_WAIT_CNT(R9)		; Account for this broadcast
+	BISB   #ACB$M_STS_BCST!-		; Mark it as part of broadcast
+		ACB$M_STS_PCNT,ACB$B_STS(R4)	; and part of broadcast count
+	MOVL	R8,CSD$L_CSID(R2)		; Fill in CSID
+	JSB	G^EXE$CSP_CALL			; Send it to its fate
+	BLBS	R0,10$				; Loop if ok
+	BBCC   #ACB$V_STS_PCNT,ACB$B_STS(R4),60$; If BC, no longer part of count
+	CLRL	ACB$L_PARENT(R4)		; Erase pointer
+	DECW	ACB$W_WAIT_CNT(R9)		; Account for this broadcast
+60$:	MOVL	R2,R0				; Set for deallocation
+	JSB	G^EXE$DEALLOC_CSD		; Deallocate
+	BRB	10$				; Loop
+70$:	;
+	;
+	;    We're done.
+	;
+	;
+	MOVL	#SS$_NORMAL,R0			; Indicate success
+						;
+80$:	BLBC	R0,100$				; If LBC, return immediately
+	DECW	ACB$W_WAIT_CNT(R9)		; Take back this routine's 
+						; reference
+	BNEQ	90$				; If NEQ, may need to wait
+	BBCC	#ACB$V_STS_WAIT,ACB$B_STS(R9),90$ ; Else our waiting is done
+90$:	MOVL	R6,R2				; Setup original CSD address
+	BSBW	WAIT				; Wait if necessary
+						;
+100$:	POPR	#^M<R1,R2,R3,R4,R5,R6,R7,R8,R9>	; Restore registers
+	RSB					; Done
+
+
+GET_NEXT_CSB:					;
+	DSBINT	#IPL$_SCS			; Lock cluster database 
+						;
+	CLRL	R0				; Assume no new CSB's
+	MOVZWL	ACB$W_LAST_INX(R9),R1 		; Get next index to use
+	BEQL	60$				; If EQL, done
+	MOVL	G^CLU$GL_CLUSVEC,R7		; Address the cluster vector
+	BEQL	60$				; If EQL, none
+	MOVL	G^CLU$GL_CLUB,R4		; Get Cluster Block
+	BEQL	60$				; If EQL, not in cluster (?)
+	MOVZWL	G^CLU$GW_MAXINDEX,R3		; Get vector length counter
+	BEQL	60$				; If EQL, none
+	CMPW	R3,R1				; Compare against last index
+	BGEQU	30$				; If LSSU, it shrunk
+	MOVL	R3,R1				; Update current index
+30$:	MOVL	(R7)[R1],R2			; Get CSB
+	BGEQ	50$				; If GEQ, this slot is empty
+	MOVL	CSB$L_CSID(R2),R8		; Get the CSID 
+	CMPL	CLUB$L_LOCAL_CSB(R4),R2		; Is this the local node?
+	BEQL	50$				; If EQL yes, don't use it
+	INCL	R0				; Else, say "CSB found"
+	DECW	R1				; Update index for next time
+	BRB	60$				; Exit loop
+50$:	SOBGTR	R1,30$				; Still in the vector? Continue.
+						;
+60$:	MOVW	R1,ACB$W_LAST_INX(R9)		; Update index for next time
+						;
+	ENBINT					; Done with the vector
+	RSB					; Return
+
+
+.SBTTL	'EXE$ALLOC_CSD	- Allocate and initialize a CSD block'
+;++
+;
+;  Allocate and initialize fixed portions of CSD structure and an ACB to be
+;  used as an internal work block.
+;
+;  EXE$ALLOC_CSD   should be used to allocate all CSD's.
+;  EXE$DEALLOC_CSD should be used to deallocate all CSD's.
+;
+;  Because some fields in the CSD need reinitializing, and since the call to
+;  EXE$DEALLOC_CSD is merely a request (the actual deallocation can only happen
+;  when the CSD "runs down"), CSD's should not be recycled by the clients, but
+;  rather a fresh one should be allocated for each use.
+;
+; 
+;  CALLING SEQUENCE:	JSB	EXE$ALLOC_CSD  at IPL 0
+;
+;  INPUTS:	R2	Scratch
+;		R1	Size of structure to allocate (minimum CSD$AB_DATA)
+;		R0	Scratch
+;
+;  OUTPUTS:	R2	Address of allocated structure
+;		R1	Size allocated
+;		R0	Completion status:
+;				SS$_NORMAL     => normal success
+;				Low bit clear  => no buffer allocated
+;
+;--
+EXE$ALLOC_CSD::
+	MOVL	S^#SS$_BADPARAM,R0		; Assume error
+5$:	SAVIPL					; Push IPL
+	TSTL	(SP)+				; Was is 0 ?
+	BEQL	10$				; If EQL, okay
+	RSB					; Else illegal IPL
+						;
+10$:	PUSHR	#^M<R3,R4,R5>			; Save critical regs
+	;
+	;
+	;    Check BYTCNT quota, wait if necessary.  The ACB is allocated along
+	;    with the CSD block for simplicity.  BYTCNT quota is decremented for
+	;    the ACB in order to prevent a process from gobbling up too much
+	;    pool in case the CSD is small.  
+	;
+	;
+	CMPL	R1,#CSD$AB_DATA			; Is the request large enough ?
+	BLSSU	60$				; If LSSU, no
+	ADDL	#ACB$K_CSPLNG,R1		; Add in ACB size
+	MOVL	G^CTL$GL_PCB,R4			; Get address of PCB
+	JSB	G^EXE$BUFQUOPRC			; Wait for adequate BYTCNT quota
+	BLBC	R0,50$				; If LBC, not enough
+	;
+	;
+	;    EXE$BUFQUOPRC put us at IPL$_ASTDEL to prevent AST's from consuming
+	;    any quota from the JIB.  Take the quota and restore IPL to 0 to
+	;    allow the call to EXE$ALLOCBUF to wait if needed without blocking
+	;    AST delivery (AST's may cause memory to be returned to pool) and
+	;    hence avoiding a deadlock.  There is no need to stay at IPL$_ASTDEL
+	;    to avoid process deallocation since we have not yet allocated any
+	;    system wide resources (such as pool).
+	;
+	;
+	MOVL	PCB$L_JIB(R4),R0		; Get JIB
+	SUBL	R1,JIB$L_BYTCNT(R0)		; Take the quota
+						;
+30$:	PUSHR	#^M<R1,R4>			; Save quota taken, PCB
+	JSB	G^EXE$ALLOCBUF			; Allocate the buffer
+						; ...return at IPL$_ASTDEL (2)
+	POPR	#^M<R1,R4>			; Restore requested size, PCB
+						;
+	BLBS	R0,80$				; If LBS, successful allocation
+	BBS	#PCB$V_SSRWAIT,PCB$L_STS(R4),50$; If BS, wait mode DISABLED
+	MOVL	#RSN$_NPDYNMEM,R0		; Resource to wait for
+						;
+	SETIPL	#IPL$_SYNCH			; SCH$RWAIT requires this
+	MOVPSL	-(SP)				; PSL onto stack for SCH$RWAIT
+	JSB	G^SCH$RWAIT			; Wait for resource
+	SETIPL	#0				; Restore IPL
+						;
+	BRB	30$				; Loop
+50$:	;
+	;
+	;    Error return
+	;
+	;
+	MOVL	PCB$L_JIB(R4),R2		; Get JIB
+	ADDL	R1,JIB$L_BYTCNT(R2)		; Restore the quota taken
+60$:	CLRL	R2				; Invalidate buffer pointer
+70$:	BRB	100$				; Take common exit
+80$:	;
+	;
+	;    Got a buffer. Initialize the fixed portions.
+	;
+	;
+	PUSHR	#^M<R1,R2,R3,R4,R5>		; Protect volatile registers
+	MOVC5	#0,(SP),#0,-			; Clear the front end
+		#ACB$K_CSPLNG+CSD$AB_DATA,(R2) 	; 
+	POPR	#^M<R1,R2,R3,R4,R5>		; Restore
+	;
+	;
+	;    Fill in the ACB fields as appropriate.  ACB$B_RMOD and ACB$L_PID
+	;    must be filled in just prior to queuing the AST since it may be 
+	;    used as a fork block until then.
+	;
+	;    The PID must be saved in the ACB since it may not be trusted if 
+	;    saved only in the CSD, especially if the CSD is to recieve a block
+	;    transfer.
+	;
+	;
+	ASSUME	FKB$B_FIPL  EQ  ACB$B_RMOD
+	ASSUME	FKB$L_FPC   EQ  ACB$L_PID
+
+	MOVW	R1,	      ACB$W_SIZE(R2)	; Setup total size
+	MOVB	#DYN$C_ACB,   ACB$B_TYPE(R2)	; Setup block type
+	MOVW	#ACB$K_RETRY, ACB$W_RETRY(R2)	; Setup retry count
+	MOVB	#CEV$K_STA_I, ACB$B_STA(R2)	; Initialize ACB state
+	MOVAB	W^KAST,	      ACB$L_KAST(R2)	; Setup special-kernel AST ptr
+	MOVAB	W^AST,        ACB$L_AST(R2)	; Setup normal kernel AST ptr
+	MOVL	PCB$L_PID(R4),ACB$L_USER_PID(R2); Copy internal PID
+	CLRL		      ACB$L_USER_AST(R2); Zero user's AST address
+	MOVAB	ACB$K_CSPLNG(R2),ACB$L_ASTPRM(R2) ; CSD address is AST parameter
+						;
+	ADDL	#ACB$K_CSPLNG,R2		; Advance to the CSD structure
+	SUBL	#ACB$K_CSPLNG,R1		; Reduce size appropriately
+
+	ASSUME	CSD$B_SUBTYPE  EQ  1+CSD$B_TYPE
+
+	MOVW	#<DYN$C_CSD@8>!-		; Fill in type/subtype
+		  DYN$C_CLU,CSD$B_TYPE(R2) 	;
+	MOVW	R1,CSD$W_SIZE(R2)		; Save allocation size
+
+	MOVQ	PCB$Q_PRIV(R4),CSD$Q_PROCPRIV(R2) ; Copy privileges
+	MOVL	PCB$L_UIC(R4), CSD$L_PROCUIC(R2)  ; Copy UIC
+	MOVL	PCB$L_PID(R4), CSD$L_IPID(R2)	  ; Copy internal PID
+	MOVL	G^CTL$GL_PHD,R0			  ; Get address of header
+	MOVL	PHD$L_IMGCNT(R0),CSD$L_IMGCNT(R2) ; Copy image activation count
+
+	MOVAB	-ACB$K_CSPLNG(R2),R4		; Get ACB address
+	BSBW	ACT_INSQUE			; Queue ACB to 'idle' queue
+	MOVL	#SS$_NORMAL,R0			; Success
+	;
+	;    That's it.
+	;
+100$:	SETIPL	#0				; Restore IPL
+	POPR	#^M<R3,R4,R5>			; Restore regs
+	RSB					; Done
+
+
+
+.SBTTL	'EXE$DEALLOC_CSD  Deallocate CSD or mark it for deletion'
+;++
+;
+;  Deallocate CSD structure.   The deallocation is done via the PROC_EVENT
+;  mechanism to protect against deallocating the CSD if it active on some
+;  queue or there is a transfer in progress (there is no cancel request as
+;  part of the ACKMSG services).  Depending upon the current state, the CSD
+;  is either deallocated immediately or marked for delete when the CSD becomes
+;  free.
+;
+;  EXE$ALLOC_CSD   should be used to allocate all CSD's.
+;  EXE$DEALLOC_CSD should be used to deallocate all CSD's.
+;
+;  Because some fields in the CSD need reinitializing, and since the call to
+;  EXE$DEALLOC_CSD is merely a request (the actual deallocation can only happen
+;  when the CSD "runs down"), CSD's should not be recycled by the clients, but
+;  rather a fresh one should be allocated for each use.
+;
+;
+;  CALLING SEQUENCE:	JSB	EXE$DEALLOC_CSD at IPL 0 or 2.
+;
+;  INPUTS:	R0	Address of CSD to deallocate
+;			CSD$W_SIZE(R0) = size of CSD
+;
+;  OUTPUTS:	R0-R3 	Clobbered
+;
+;
+;--
+EXE$DEALLOC_CSD::
+	PUSHR	#^M<R4,R5>			; Save regs
+						;
+	MOVAB	-ACB$K_CSPLNG(R0),R4		; Get ACB block
+	MOVZBL	#CEV$_REQ_DEALL,R1		; Setup event code
+	BSBW	PROC_EVENT			; Process the event
+						;
+	POPR	#^M<R4,R5>			; Restore regs
+	MOVL	S^#SS$_NORMAL,R0		; Setup return status
+	RSB					; Done	
+
+
+.SBTTL	'EXE$CSP_CALL	- Send a request message to local or remote CSP'
+;++
+;
+;  Call the Cluster Server Process on another node.
+;
+;  A block of data (the CSD) is sent to the CSP on the target node, and 
+;  optionally recieve a response message into the same CSD.
+;
+;  If CSD$L_USER_AST is 0, then this routine does not return until the block
+;  transfer has completed, or has failed.
+;
+;  If CSD$L_USER_AST is non-zero, then this routine returns immediately.  If
+;  the return is with the low bit clear, then the AST will not be delivered and
+;  the CSD should be deallocated upon return.  If the return is with the low
+;  bit set in R0, then the AST routine should deallocate teh CSD.
+;
+;
+;
+;  R0's	    AST		When to EXE$DEALLOC_CSD 	When EXE$CSP_CALL
+;  low bit  specified	the CSD 			returns to caller
+;  -------  ---------	------------------------	-------------------
+;    LBC     no		Upon return - no further 	When the error is 
+;			AST's are delivered.		encountered.
+;    LBC     yes	Upon return - no further 	When the error is 
+;			AST's are delivered.		encountered.
+;    LBS     no		Upon return			When all dialogues
+;							have completed.
+;    LBS     yes	By the AST routine or by  	As soon as possible.
+;			some action it schedules.
+;
+;
+;
+;  EXE$ALLOC_CSD   should be used to allocate all CSD's.
+;  EXE$DEALLOC_CSD should be used to deallocate all CSD's.
+;
+;  Because some fields in the CSD need reinitializing, and since the call to
+;  EXE$DEALLOC_CSD is merely a request (the actual deallocation can only happen
+;  when the CSD "runs down"), CSD's should not be recycled by the clients, but
+;  rather a fresh one should be allocated for each use.
+;
+;
+;  CALLING SEQUENCE: 	JSB	EXE$CSP_CALL at IPL 0
+;
+;  INPUTS:	R2	Address of CSD structure
+;		R0	Scratch
+;
+;  OUTPUTS:	R0	SS$_... status code.
+;		 		  
+;		All other registers are preserved.
+;
+;--				
+EXE$CSP_CALL::					; Send request to CSP
+	PUSHR	#^M<R1,R2,R3,R4,R5,R6> 		; Save volatile registers
+						;
+	BSBW	COMMON_SETUP			; Check IPL, get ACB, etc
+	BLBC	R0,200$				; If LBC, error
+	SETIPL	#IPL$_ASTDEL			; Go to IPL 2 to prevent AST's
+	;
+	;
+	;    Request the start of the block transfer sequence
+	;
+	;
+	MOVL	#CEV$_REQ_BT,R1			; Event is 'request block xfer
+	MOVZWL	#SS$_NORMAL,R6			; Initialize status register
+	BSBW	PROC_EVENT			; Process it
+	MOVL	R6,R0				; Pickup status
+						;
+100$:	SETIPL	#0				; Return to IPL 0
+	BBS	#ACB$V_STS_BCST,ACB$B_STS(R4),200$ ; If BS, part of "broadcast"
+	BLBC	R0,200$				; If error, then return now
+	MOVAB	ACB$K_CSPLNG(R4),R2		; Pickup CSD
+	BSBB	WAIT				; Wait if necessary
+						;
+200$:	POPR	#^M<R1,R2,R3,R4,R5,R6> 		; Restore volatile registers
+300$:	RSB					; Return to caller 
+
+
+WAIT:	;
+	;
+	;    We are waiting here for the block transfer to complete so that
+	;    we can return to the user.  This is done whenever CSD$L_USER_AST
+	;    is 0.  It allows a synchronous return.
+	;
+	;
+	;    Inputs:	R4	Scratch
+	;		R2	CSD address
+	;		R0	SS$_NORMAL
+	;
+	;    Outputs:	R4	Garbage
+	;
+	;		All other registers are preserved
+	;
+	MOVZWL	#SS$_NORMAL,R0			; Setup return status
+	MOVAB	-ACB$K_CSPLNG(R2),R4		; Get ACB
+	BBC	#ACB$V_STS_WAIT,ACB$B_STS(R4),100$ ; If BC, not suspended
+	MOVL	G^CTL$GL_PCB,R4			; Get PCB
+	MOVL	#RSN$_ASTWAIT,R0		; Setup wait condition
+						;
+	SETIPL	#IPL$_SYNCH			; SCH$RWAIT requires this
+	MOVPSL	-(SP)				; Put PSL on the stack
+	JSB	G^SCH$RWAIT			; Wait for resource
+	SETIPL	#0				; Restore IPL
+						;
+	BRB	WAIT				; Loop
+100$:	RSB					; Done
+
+
+
+COMMON_SETUP:
+	MOVL	#SS$_BADPARAM,R0		; Assume error 
+	SAVIPL					; Push IPL
+	TSTL	(SP)+				; Was is 0 ?
+	BNEQ	100$				; If NEQ, illegal IPL
+	;
+	;
+	;    Sanity check various fields in the CSD
+	;
+	;
+	ASSUME	CSD$B_SUBTYPE  EQ  1+CSD$B_TYPE
+
+	CMPW	#<DYN$C_CSD@8>!DYN$C_CLU,CSD$B_TYPE(R2) ; Right structure?
+	BNEQ	100$					; If NEQ, return error
+	MOVAB	-ACB$K_CSPLNG(R2),R4			; Pickup ACB address
+	CLRQ	CSD$Q_INT_IOSB(R2)			; Zero initial status
+	MOVZWL	ACB$W_SIZE(R4),R3			; Get ACB total size
+	ADDL	R4,R3					; Calculate end
+	ADDL3	CSD$L_SENDOFF(R2),R2,R1			; Get begining of region
+	ADDL	CSD$L_SENDLEN(R2),R1			; Calc end of region
+	CMPL	R1,R3					; Within bounds ?
+	BGTRU	100$					; If GTRU, out of bounds
+	ADDL3	CSD$L_RECVOFF(R2),R2,R1			; Get begining of region
+	ADDL	CSD$L_RECVLEN(R2),R1			; Calc end of region
+	CMPL	R1,R3					; Within bounds ?
+	BGTRU	100$					; If GTRU, out of bounds
+	;
+	;
+	;    If the user want's an AST, let him have it without decrementing
+	;    its AST quota.  The ACB is needed anyway as a work block, and
+	;    the user has been charged for it via JIB$L_BYTCNT.
+	;
+	;
+	MOVL	CSD$A_ASTADR(R2),ACB$L_USER_AST(R4)	; Save user AST address
+	BNEQ	70$					; If NEQ, continue
+	BBS	#ACB$V_STS_BCST,ACB$B_STS(R4),70$	; If BCST, never wait
+	BISB	#ACB$M_STS_WAIT,ACB$B_STS(R4)		; Else, wait until done
+70$:	MOVL	#SS$_NORMAL,R0				; Say "success"
+100$:	RSB						; Done
+
+
+.SBTTL	'KAST		- Special Kernel AST entry point'
+.SBTTL	'AST		- Normal  Kernel AST entry point'
+;++
+;
+;  The proper event is determined and the event processor is called.
+;
+;--				
+KAST:						; Special Kernel AST
+	;
+	;
+	;    The ACB is in R5.  IPL is IPL$_ASTDEL (2).
+	;
+	;    R0 thru R5 may be clobbered upon return to caller
+	;
+	;
+	MOVL	ACB$L_ASTPRM(R5),R2		; Get CSD
+	MOVL	#CEV$_KAST_DEL,R1		; Setup event code
+	BSBB	ASTEVT				; Process event
+	RSB					; Done
+
+AST:						; Normal Kernel AST
+	;
+	;
+	;    The ACB is the AST parameter.  IPL is 0.
+	;
+	;    All regs but R0,R1 must be saved/restored.
+	;
+	;
+	.WORD	^M<R2,R3,R4,R5>			; Entry mask
+	MOVL	4(AP),R2			; Get CSD address
+	MOVL	#CEV$_AST_DEL,R1		; Setup event code
+	BSBB	ASTEVT				; Do AST common processing
+	TSTL	R4				; Still have an ACB ?
+	BEQL	30$				; If EQL, no
+	MOVL	ACB$L_USER_AST(R4),R0		; Get AST address
+	BEQL	30$				; If EQL, none
+	CALLG	(AP),(R0)			; Call the user AST routine
+30$:	RET					; Done
+
+ASTEVT:	MOVAB	-ACB$K_CSPLNG(R2),R4		; Get ACB address
+	BBCC	#ACB$V_STS_QUE,ACB$B_STS(R4),90$; ACB no longer queued to PCB
+	TSTL	ACB$L_USER_AST(R4)		; Does user want AST delivered?
+	BEQL	50$				; If EQL, no
+	MOVL	G^CTL$GL_PHD,R0			; Get current PHD
+	CMPL	PHD$L_IMGCNT(R0),CSD$L_IMGCNT(R2) ; Compare image deactivations
+	BEQL	70$				; If EQL, same image is running
+50$:	MOVL	#CEV$_NO_AST,R1			; No user AST to deliver
+70$:	BSBW	PROC_EVENT			; Process the event
+	RSB					; Done
+
+90$:	BUG_CHECK  INCONSTATE,FATAL		; Queued state is inconsistent
+
+
+
+.SBTTL	'PROC_EVENT_ASY	- Process CSD event if process is still around'
+.SBTTL	'PROC_EVENT	- Process CSD event'
+;+
+;
+;  This routine processes all CSD events and is state table driven.  Action 
+;  routines are called until the null event is detected.  Each action routine 
+;  generates a new event, which it returns in R1, and returns with the low bit
+;  set in R0 only if the indicated state change is to be performed.
+;
+;
+;  CALLING SEQUENCE:	JSB PROC_EVENT at IPL$_SYNCH or lower
+;
+;  INPUTS:	R5	Scratch
+;		R4	ACB ptr 
+;		R3	Scratch
+;		R2	Optional event parameter
+;		R1	Standard event longword
+;		R0	Scratch
+;
+;		All other registers are scratch.
+;
+;  OUTPUTS:	R4	Unchanged, or zero if deallocated
+;
+;		All other registers between R0 and R5 are clobbered
+;
+;-
+PROC_EVENT_ASY:					; Process asynch event
+	MOVZWL	ACB$L_USER_PID(R4),R0		; Get process index
+	MOVL	G^SCH$GL_PCBVEC,R2		; Get address of PCB vector
+	MOVL	(R2)[R0],R2			; Get PCB itself
+	CMPL	ACB$L_USER_PID(R4),PCB$L_PID(R2); Is this process still here?
+	BEQL	PROC_EVENT			; If EQL, yes
+	BRW	DEALL_CSD			; Else, deallocate CSD/ACB
+						;
+PROC_EVENT:					; Process all CSD events
+	ASSUME	 IPL$_SYNCH  EQ  IPL$_SCS
+	DSBINT	#IPL$_SYNCH			; Synchronize
+10$:	;
+	;
+	;    Find appropriate state table entry
+	;
+	;
+	CMPL	S^#CEV$_MAX_EVT,R1	; Is event within range ?
+	BLSSU	200$			; If LSSU then bug exists
+	MULL3	S^#CEV$K_STATES,R1,R0	; Bias for current event
+	MOVZBL	ACB$B_STA(R4),R3	; Get ACB state
+	ADDL	R3,R0			; Add current state offset
+	MOVAW	W^CEV$AW_STA_TAB[R0],R3	; Address state table entry
+	;
+	;
+	;
+	;    Dispatch to the action routine with the following:
+	; 
+	;    INPUTS:	R5	Scratch
+	;		R4	ACB pointer
+	;		R3	CSID of target system
+	;		R2	CSD pointer
+	;		R1	Event code
+	;		R0	Scratch
+	;
+	;    ON RETURN:	R5	Garbage
+	;		R4	ACB pointer
+	;		R3	Garbage
+	;		R2	Garbage
+	;		R1	Next event code to chain to
+	;		R0	Low bit set to request state change
+	;			Low bit clear to inhibit state change
+	;
+	;
+	PUSHAB	(R3)+			; Save table address
+	MOVZBL	(R3),R3			; Get action routine index
+	MOVAB	W^CEV$AL_ACTTAB,R0	; Get action routine table
+	ADDL	(R0)[R3],R0		; Get action routine address
+	MOVL	ACB$L_ASTPRM(R4),R2	; Get the CSD 
+	MOVL	CSD$L_CSID(R2),R3	; Get the CSID
+	JSB	(R0)			; Dispatch
+	POPL	R3			; Get next state, cleanup stack
+	TSTL	R4			; Is ACB still there ?
+	BEQL	100$			; If EQL, its been deallocated
+	BLBC	R0,50$			; Avoid state change if LBC
+	MOVB	(R3),ACB$B_STA(R4)	; Change state
+50$:	CMPL	S^#CEV$_EXIT,R1		; Are we done ?
+	BNEQ	10$			; If NEQ then process next event
+					;
+100$:	ENBINT				; Restore IPL
+	RSB				; Done
+
+200$:	BUG_CHECK  INCONSTATE,FATAL	; Signal the bug
+
+
+
+.SBTTL	'ACT_INSQUE	- Queue  ACB to CSP$Q_ACB_IDLE'
+.SBTTL	'ACT_REMQUE	- Remove ACB from current (internal) queue'
+;+
+;
+;  The ACB queue operation is performed.  Upon return, the event code passed 
+;  in R1 is unchanged and the low bit of R0 is set.  This will force the same
+;  event to be reprocessed after the state change.
+;
+;
+;  INPUTS:	R4	ACB pointer
+;		R1	Event to be processed
+;		R0	Scratch
+;
+;  OUTPUTS:	R4	Unchanged
+;		R1	Unchanged
+;		R0	Low bit set to force state change
+;
+;-
+ACT_INSQUE:					; Put ACB on 'idle' queue
+	BBSS	#ACB$V_STS_QUE,ACB$B_STS(R4),10$; Mark ACB as 'queued'
+	INSQUE	(R4),CSP$Q_ACB_IDLE		; Remove from current queue
+	MOVL	#1,R0				; Request state change
+	RSB					; Return to reprocess same event
+
+10$:	BUG_CHECK  INCONSTATE,FATAL		; Queued state is inconsistent
+
+ACT_REMQUE:					; Dequeue ACB and deallocate it
+	BBCC	#ACB$V_STS_QUE,ACB$B_STS(R4),10$; Mark ACB as 'not queued'
+	REMQUE	(R4),R4				; Remove from current queue
+	MOVL	#1,R0				; Request state change
+	RSB					; Return to reprocess same event
+
+10$:	BUG_CHECK  INCONSTATE,FATAL		; Queued state is inconsistent
+
+
+.SBTTL	'ACT_GET_CDRP	- Allocate a warm CDRP for block transfer'
+;+
+;
+;  INPUTS:	R5	Scratch
+;		R4	ACB pointer
+;		R3	CSID of target system
+;		R2	CSD pointer
+;		R1	Scratch
+;		R0	Scratch
+;
+;  OUTPUTS:	R5	CDRP pointer if allocation was a success
+;		R4	ACB pointer
+;		R3	Garbage
+;		R2	Garbage
+;		R1	CEV$_NO_CDRP	if no CDRP was available
+;			CEV$_GOT_CDRP	if CDRP allocation was successful
+;		R0	Low bit set to request state change
+;
+;-
+ACT_GET_CDRP:					; Allocate warm CDRP
+	;
+	;
+	;    Allocate a warm CDRP and fill it in as appropriate
+	;
+	;
+	JSB	G^CNX$ALLOC_WARMCDRP		; Get the CDRP
+	MOVZBL	#CEV$_NO_CDRP,R1		; Assume allocation failure
+	BLBC	R0,100$				; If LBC, allocation failed
+	MOVL	ACB$L_ASTPRM(R4),R2		; Get the CSD again
+	MOVL	R4,CDRP$L_VAL5(R5)		; Save ACB address
+	MOVAB	W^REQ_MSGBLD,CDRP$L_MSGBLD(R5)	; Setup message build routine
+	CLRB	CDRP$B_CNXRMOD(R5)		; Kernel mode
+						;
+	MOVL	G^MMG$GL_SPTBASE,R0		; Get SPT base address
+	EXTZV	#VA$V_VPN,#VA$S_VPN,R2,R1	; Get page number
+	MOVAL	(R0)[R1],CDRP$L_CNXSVAPTE(R5)		; Store SVAPTE
+	MOVZWL	CSD$W_SIZE(R2),CDRP$L_CNXBCNT(R5)	; Store BCNT
+	BICW3	#^C<VA$M_BYTE>,R2,CDRP$W_CNXBOFF(R5)	; Store BOFF
+	;
+	;
+	;    Exit with proper new event code
+	;
+	;
+	MOVZBL	#CEV$_GOT_CDRP,R1		; Setup new event
+100$:	MOVL	#1,R0				; Request state change
+	RSB					; Done
+
+REQ_MSGBLD: 				
+	;
+	;   ACKMSG calls us here to build the request message.
+	;
+	;   INPUTS:	R5	CDRP ptr
+	;		R4	PDT ptr
+	;		R3	CSB ptr
+	;		R2	Message pointer
+	;
+	;
+	MOVL	CDRP$L_VAL5(R5),R0			; Get ACB address
+	MOVL	ACB$L_ASTPRM(R0),R0			; Get the CSD again
+	MOVZWL	CSD$W_SIZE(R0),CSPMSG$L_CSD_SIZE(R2)	; Setup size
+	MOVW	CSD$W_CODE(R0),CSPMSG$W_CLIENT(R2)	; Setup client code
+	MOVB	#CLSMSG$K_FAC_CSP,CLSMSG$B_FACILITY(R2)	; Tell ACKMSG it's us
+	CLRB	 CLSMSG$B_FUNC(R2)			; Our func code 
+							; - not used yet
+	RSB						; Done
+
+
+.SBTTL	'ACT_FORK_WAIT	- Fork and wait for up to 1 second'
+;+
+;
+;  INPUTS:	R5	Scratch
+;		R4	ACB pointer
+;		R3	CSID of target system
+;		R2	CSD pointer
+;		R1	Scratch
+;		R0	Scratch
+;
+;  OUTPUTS:	R5	CDRP pointer if allocation was a success
+;		R4	ACB pointer
+;		R3	Garbage
+;		R2	Garbage
+;		R1	CEV$_EXIT   if okay to retry
+;			CEV$_GIVEUP if retry count exceeded
+;		R0	Low bit set to request state change
+;
+;  SIDE EFFECTS:	When the fork returns, PROC_EVENT is called with the
+;			event CEV$_FORK_DONE
+;		
+;-
+ACT_FORK_WAIT:					; Fork and wait for up to 1 sec.
+	MOVL	#CEV$_GIVE_UP,R1		; Assume retry count exceeded
+	DECW	ACB$W_RETRY(R4)			; Account for retry
+	BLEQ	30$				; If LEQ, count exceeded	
+
+	ASSUME	FKB$B_FIPL EQ  ACB$B_RMOD
+	ASSUME	FKB$L_FPC  EQ  ACB$L_PID
+	ASSUME	FKB$L_FR3  EQ  ACB$L_AST
+	ASSUME	FKB$L_FR4  EQ  ACB$L_ASTPRM
+
+	MOVL	R4,R5				; Setup fork block address
+	MOVQ	FKB$L_FR3(R5),R3		; Get ACB fields to be saved
+	MOVB	#IPL$_SCS,FKB$B_FIPL(R5)	; Setup fork IPL
+	BSBB	50$				; Create fork thread
+	MOVL	R5,R4				; Re-establish ACB pointer
+	MOVZBL	#CEV$_EXIT,R1			; Setup next event code
+30$:	MOVL	#1,R0				; Request state change
+	RSB					; Done
+
+50$:	BBSS	#ACB$V_STS_QUE,ACB$B_STS(R5),90$; Mark ACB as 'queued'
+	FORK_WAIT				; Fork and wait for a second 
+	BBCC	#ACB$V_STS_QUE,ACB$B_STS(R5),90$; Mark ACB as 'not queued'
+	MOVL	R5,R4				; Re-establish ACB pointer
+	MOVL	#CEV$_FORK_DONE,R1		; Setup event
+	BSBW	PROC_EVENT_ASY			; Process event if process is 
+						; still here, else deallocate
+						; the ACB/CSD
+	RSB					; Done
+
+90$:	BUG_CHECK  INCONSTATE,FATAL		; Queued state is inconsistent
+
+
+.SBTTL	'ACT_REQ_ILL_BT	- Request illegal block-transfer'
+.SBTTL	'ACT_BLOCK_XFER - Request ACKMSG Block Transfer'
+;+
+;
+;  INPUTS:	R5	CDRP pointer
+;		R4	ACB pointer
+;		R3	CSID of target system
+;		R2	CSD pointer
+;		R1	Scratch
+;		R0	Scratch
+;
+;  OUTPUTS:	R5	Garbage
+;		R4	ACB pointer
+;		R3	Garbage
+;		R2	Garbage
+;		R1	CEV$_EXIT
+;			CEV$_BT_DONE
+;			CEV$_CSP_BUSY
+;		R0	Low bit set to request state change
+;
+;  SIDE EFFECTS:	When the fork returns, PROC_EVENT is called with the
+;			event CEV$_FORK_DONE
+;		
+;-
+ACT_REQ_ILL_BT:					; User requested block transfer
+						; with CSD in the wrong state
+	MOVL	#SS$_DEVACTIVE,R6		; Say 'CSD in wrong state'
+	MOVL	S^#CEV$_EXIT,R1			; No further events
+	MOVB	#1,R0				; Allow state transition
+	RSB
+
+ACT_BLOCK_XFER:					; Request ACKMSG block transfer
+	;
+	;
+	;    CNX$BLOCK_XFER usually  returns asynchronously.  Therefore, we
+	;    must call a routine to call CNX$BLOCK_XFER so that we can return
+	;    to our caller with the correct values in the registers.
+	;
+	;
+	BISB	#ACB$M_STS_ASY,ACB$B_STS(R4)	; Mark ACB for asynch access
+	PUSHL	R4				; Save ACB pointer
+	BSBB	30$				; Make request and return
+	POPL	R4				; Restore ACB pointer
+	BBCC	#ACB$V_STS_ASY,ACB$B_STS(R4),10$; If BC, CNX$BLOCK_XFER returned
+						; synchronously.
+	MOVZBL	#CEV$_EXIT,R1			; No further events for now
+10$:	MOVL	#1,R0				; Request state change
+	RSB					; Done
+
+20$:	BUG_CHECK  INCONSTATE,FATAL		; Queued state is inconsistent
+
+30$:	;
+	;    Request block transfer.
+	;
+	;    We are resumed after the call to BLOCK_XFER when block transfer 
+	;    sequence has completed with the following registers setup:
+	;
+	;	R5	Address of CDRP
+	;	R4	Address of PDT
+	;	R3	CSB address
+	;	R2	Address of response message buffer	(if R0 has LBS)
+	;	R1	Scratch
+	;	R0	Status
+	;
+	;
+	BBSS	#ACB$V_STS_QUE,ACB$B_STS(R4),10$; Mark ACB as 'queued'
+	INSQUE	(R4),CSP$Q_ACB_XFER		; Queue to 'active xfer' queue
+	BSBW	CNX$BLOCK_XFER			; Do block transfer seqeuence
+	MOVL	CDRP$L_VAL5(R5),R4		; Get ACB pointer
+	BBCC	#ACB$V_STS_QUE,ACB$B_STS(R4),20$; Mark ACB as 'not queued'
+	REMQUE	(R4),R4				; Remove from 'active xfer' list
+						;
+	BLBS	R0,50$				; If LBS, then no error
+	MOVL	#CSPMSG$K_RSP_SYNERR,R1		; Assume synchronous error
+	BBS	#ACB$V_STS_ASY,ACB$B_STS(R4),60$; If BS, return was synchronous
+	MOVL	#CSPMSG$K_RSP_ASYNERR,R1	; Asynchronous error
+	BRB	60$				; Continue
+50$:	MOVZBL	CSPMSG$B_RSP(R2),R1		; Get the response code
+60$:	MOVQ	R0,ACB$K_CSPLNG+CSD$Q_INT_IOSB(R4) ; Save status info
+	BSBB	DUMP_CDRP			   ; Dump CDRP using R0 status
+	MOVQ	ACB$K_CSPLNG+CSD$Q_INT_IOSB(R4),R0 ; Recover status info
+	;
+	;
+	;    If ACB$V_STS_ASY is still set then the return is synchronous and
+	;    all we have to do, after clearing the flag, is to return and let
+	;    our caller chain to the next event since we are still in the event
+	;    processing loop.
+	;
+	;    Otherwise, we must call PROC_EVENT_ASY to check to see if the 
+	;    process is still there, and if so, to process the new event.
+	;    
+	;
+	CMPL	R1,#CSPMSG$K_RSP_MAX		; Within range ?
+	BLEQU	70$				; If LEQU, okay
+	MOVB	#CSPMSG$K_RSP_ILL,R1		; Override with our own code
+70$:	MOVZBL	CEV$AB_RSP_CEV[R1],R1		; Convert response to an event
+	BBSC	#ACB$V_STS_ASY,ACB$B_STS(R4),90$; If BS, return was synchronous
+	BSBW	PROC_EVENT_ASY			; Process event 
+90$:	RSB					; Return
+
+
+DUMP_CDRP:					; Dump CDRP according to status
+	BLBC	R0,10$				; If LBC, special cleanup
+	BRW	CNX$DEALL_WARMCDRP_CSB		; Deallocate ACKMSG resources
+10$:	;
+	;
+	;    The following code assumes that the CDRP is "cold", that is,
+	;    contains no associated buffer or RSPID.
+	;
+	;
+	PUSHR	#^M<R2,R3>			; Save regs
+	MOVL	R5,R0				; Get address for deallocation
+	CLRL	R5				; CDRP is now gone
+	JSB	G^EXE$DEANONPAGED		; Deallocate it
+						;
+	POPR	#^M<R2,R3>			; Restore regs
+	RSB					; Done	
+
+
+.SBTTL	'ACT_NO_AST	- No AST to deliver - deallocate CSD if broadcast'
+.SBTTL	'ACT_GIVE_UP	- Retry count has be exhausted, give up'
+.SBTTL	'ACT_QUE_KAST	- Queue Special Kernel AST to process'
+.SBTTL	'ACT_QUE_AST	- Queue Normal  Kernel AST to process'
+;+
+;
+;  Come here when the Block transfer has completed or failed.  
+;
+;
+;  INPUTS:	R5	Scratch
+;		R4	ACB pointer
+;		R3	CSID of target system
+;		R2	CSD pointer
+;		R1	Scratch
+;		R0	Scratch
+;
+;  OUTPUTS:	R5	Garbage
+;		R4	ACB pointer
+;		R3	Garbage
+;		R2	Garbage
+;		R1	CEV$_EXIT
+;		R0	Low bit set to request state change
+;
+;-
+		.ENABL	LSB
+ACT_NO_AST:					; No AST to deliver
+	BICB	#ACB$M_STS_WAIT,ACB$B_STS(R4)	; No need to wait any longer
+	BBC	#ACB$V_STS_BCST,ACB$B_STS(R4),30$ ; If BC, not part of broadcast
+	MOVL	#CEV$_REQ_DEALL,R1		; Else, request deallocation
+	BRB	40$				; Continue
+						;
+ACT_GIVE_UP:					; Retry count exceeded
+	MOVZWL	#SS$_TIMEOUT,-			; Setup status
+		ACB$K_CSPLNG+CSD$Q_INT_IOSB(R4)	;
+	BBSC	#ACB$V_STS_QUE,ACB$B_STS(R4),50$; Make sure ACB is not queued
+						;
+ACT_QUE_KAST:					; Queue Special Kernel AST 
+	MOVL	ACB$L_USER_PID(R4),ACB$L_PID(R4); Copy internal PID
+	MOVB	#ACB$M_KAST!-			; Mark as 'special kernel'
+		 ACB$M_NODELETE,ACB$B_RMOD(R4)	; and don't delete ACB
+	MOVL	#PRI$_IOCOM,R2			; Setup priority increment class
+	BRB	10$				; Continue
+						;
+ACT_QUE_AST:					; Queue Normal Kernel AST
+	CLRL	R2				; Use null priority inc. class
+10$:	BBSS	#ACB$V_STS_QUE,ACB$B_STS(R4),50$; ACB will be queued to the PCB
+	MOVL	R4,R5				; Setup ACB pointer
+	PUSHL	R4				; Save ACB address
+	JSB	G^SCH$QAST			; Queue the AST
+	POPL	R4				; Restore ACB address
+30$:	MOVL	#CEV$_EXIT,R1			; No new events
+40$:	MOVL	#1,R0				; Request state change
+	RSB					; Done
+
+50$:	BUG_CHECK  INCONSTATE,FATAL		; Queued state is inconsistent
+
+		.DSABL	LSB
+
+.SBTTL	'ACT_SYN_ERROR	- Synchronous block transfer error'
+;+
+;
+;  INPUTS:	R5	Scratch
+;		R4	ACB pointer
+;		R3	CSID of target system
+;		R2	CSD pointer
+;		R1	Scratch
+;		R0	Scratch
+;
+;  OUTPUTS:	R5	Garbage
+;		R4	ACB pointer
+;		R3	Garbage
+;		R2	Garbage
+;		R1	CEV$_EXIT
+;		R0	Low bit set to request state change
+;
+;-
+ACT_SYN_ERROR:					; Synchronous block transfer err
+	CLRL	ACB$L_USER_AST(R4)		; No AST delivery if synchronous
+						; error return
+	MOVZWL	CSD$W_IOSB_STAT(R2),R6		; Setup status to be returned
+						; to EXE$CALL_CSP 
+	MOVZBL	#CEV$_EXIT,R1			; No further events
+	MOVL	#1,R0				; Request state change
+	RSB					; Done
+
+
+.SBTTL	'ACT_REQ_DEAL	- Illegal user deallocation request'
+;+
+;
+;  INPUTS:	R5	Scratch
+;		R4	ACB pointer
+;		R3	CSID of target system
+;		R2	CSD pointer
+;		R1	Scratch
+;		R0	Scratch
+;
+;  OUTPUTS:	R5	Garbage
+;		R4	0 to indicate CSD has been deallocated
+;		R3	Garbage
+;		R2	Garbage
+;		R1	CEV$_EXIT
+;		R0	Low bit clear to avoid state change
+;
+;-
+ACT_REQ_DEAL:					; Illegal user dealloc. request
+	;
+	;
+	;    The user has requested that the CSD be deallocated while the CSD
+	;    is in the wrong state (e.g., a block transfer is in progress).
+	;    Since this is a user error just prevent user AST notification and
+	;    let the transfer run its course.  When the transfer completes and
+	;    the 'special kernel' AST is delivered, return quotas and deallocate
+	;    the CSD.
+	;
+	;    Note:  
+	;	This action routine could be rewritten to bug-check, but since
+	;	since not all users have been updated yet to request AST 
+	;	notification, and since there is no adequate mechanism yet in 
+	;	place to detect image run-down (an interactive user may have 
+	;	Control-Y'd and issued a STOP) we do the next best thing:  stop
+	;	the user AST delivery and return quota's when the operation 
+	;	actual completes.  The choice of when to return quota's is not 
+	;	perfect, but the choice was made since it may save the system 
+	;	from running out of pool at the expense of the process possibly
+	;	running out of quota.
+	;
+	;	Eventually, each client must be updated to request AST 
+	;	notification even if it is not receiving any response.  Also, an
+	;	image run-down hook is needed and a hook in ACKMSG to abort a 
+	;	transfer in progress.
+	;
+	;
+	CLRL	CSD$A_ASTADR(R2)		; Prevent AST notification
+	CLRL	ACB$L_USER_AST(R4)		; Here too
+	MOVZBL	#CEV$_EXIT,R1			; No further events
+	MOVL	#1,R0				; Allow state change
+	RSB					; Done
+
+
+.SBTTL	'ACT_DEALL	- Deallocate CSD, return quotas'
+;+
+;
+;  INPUTS:	R5	Scratch
+;		R4	ACB pointer
+;		R3	CSID of target system
+;		R2	CSD pointer
+;		R1	Scratch
+;		R0	Scratch
+;
+;  OUTPUTS:	R5	Garbage
+;		R4	0 to indicate CSD has been deallocated
+;		R3	Garbage
+;		R2	Garbage
+;		R1	CEV$_EXIT
+;		R0	Low bit clear to avoid state change
+;
+;-
+ACT_DEALL:					; Deallocate CSD, return quota
+	MOVZWL	ACB$L_USER_PID(R4),R0		; Get process index
+	MOVL	G^SCH$GL_PCBVEC,R1		; Get address of PCB vector
+	MOVL	(R1)[R0],R0			; Get PCB itself
+	CMPL	ACB$L_USER_PID(R4),PCB$L_PID(R0); Is this process still here?
+	BNEQ	DEALL_CSD			; If NEQ, no
+						;
+	MOVZWL	ACB$W_SIZE(R4),R1		; Get quota taken
+	MOVL	PCB$L_JIB(R0),R0		; Get JIB
+	ADDL	R1,JIB$L_BYTCNT(R0)		; Return quota
+						;
+DEALL_CSD:					; Deallocate CSD/ACB
+	BBCC   #ACB$V_STS_PCNT,ACB$B_STS(R4),30$; If BC, not part of Bcst count
+	MOVL	ACB$L_PARENT(R4),R0		; Get parent ACB, if any
+	CLRL	ACB$L_PARENT(R4)		; Erase pointer
+	CMPB	ACB$B_TYPE(R0),#DYN$C_ACB	; Check packet type
+	BNEQ	200$				; If NEQ, pool corruption
+	DECW	ACB$W_WAIT_CNT(R0)		; Decrement the wait count
+	BNEQ	30$				; If NEQ, not done yet
+	BBCC	#ACB$V_STS_WAIT,ACB$B_STS(R0),30$ ; If BC, not waiting
+30$:	MOVL	R4,R0				; Get address for deallocation
+	CLRL	R4				; Erase offical pointer
+	CMPB	ACB$B_TYPE(R0),#DYN$C_ACB	; Check packet type
+	BNEQ	200$				; If NEQ, pool corruption
+	TSTW	ACB$W_WAIT_CNT(R0)		; Any lingering references?
+	BNEQ	210$				; If NEQ yes, bug
+	JSB	G^EXE$DEANONPAGED		; Deallocate the block
+						;
+	MOVL	S^#SS$_NORMAL,R0		; Why not
+	MOVZBL	#CEV$_EXIT,R1			; No further events
+	RSB					; Done
+
+200$:	BUG_CHECK  INCONSTATE,FATAL		; ACB$B_TYPE is wrong
+210$:	BUG_CHECK  INCONSTATE,FATAL		; WAIT_CNT non-zero
+
+
+.SBTTL	'ACT_BUG	- Bugcheck failure'
+.SBTTL	'ACT_NYI	- Not-yet-implemented error'
+.SBTTL	'ACT_NOP	- No-operation'
+;+
+;
+;
+;   INPUTS:	R5	ACB ptr or zero 
+;
+;   OUTPUTS:	R5	Unchanged
+;
+;
+;-
+ACT_BUG:
+	BUG_CHECK  INCONSTATE,FATAL	; Signal the bug
+ACT_NYI:
+	BUG_CHECK  INCONSTATE,FATAL	; Signal the bug
+
+ACT_NOP:				; Nop action routine
+	MOVL	S^#CEV$_EXIT,R1		; No further events
+	MOVB	#1,R0			; Allow state transition
+	RSB
+
+
+.END
+
+
+

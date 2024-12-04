@@ -1,0 +1,753 @@
+MODULE badblocks(%TITLE 'Analyze/Media Bad Block Manipulation Procedures'
+		IDENT = 'V04-000') =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!
+!++
+!
+! Faclity:
+!
+!	Analyze/Media
+!
+! Abstract:
+!
+!	This module contains the procedures required to handle bad block
+!	processing for last track and non-last track devices.
+!
+! Environment:
+!
+!	VAX/VMS User Mode, Non-Privileged
+!
+! Author:
+!
+!	Michael T. Rhodes, 		Creation Date: July, 1982
+!
+! Modified By:
+!
+!	V03-002	MTR0007		Michael T. Rhodes	19-May-1983
+!		Fix 'bad$init_buffers' to protect against boundary condition
+!		when three patterns are specified.
+!
+!	V03-001	MTR0001		Michael T. Rhodes	15-Dec-1982
+!		Modify routine 'bad$init_buffers' to use upto an octaword
+!		of user supplied test pattern.  The 'pattern' is located
+!		in the 'bad$gl_bad_term' data vector, with the number of
+!		long word elements described in bad$gb_term_count.
+!
+!--
+
+%SBTTL 'Bad Block Information Format Specifications'
+!++
+!
+! This utility supports bad block information in two formats "last track" and
+! "non-last track".  A last track device is one in which the bad block
+! information is located on the last physical track of the device and is the
+! default for ALL devices containing more than 4096 blocks.  Any device which
+! falls outside of this category (ie. less than 4096 blocks) will be deemed a
+! non last track device.  A block is defined as 512 bytes which may actually
+! be made up of one or more physical sectors.  The devices are analyzed in a
+! standard fashion, which is to write one or more test patterns onto the media
+! followed by reading and verifing these patterns against the test pattern
+! buffer.  The bad block information will be written to the software detected
+! bad block area (for last track devices it is written on the last track
+! following the manufacturers detected bad block file and on non last track
+! devices it is located on the last good block on the device) following the
+! analysis.
+!
+! NOTES:	1.  In either case (last track or non-last track) the size of
+!		    the bad block files are a constant of 512 bytes.
+!
+!		2.  The MDBSF is redundantly recorded on the first 10 blocks of
+!		    the last track, with the SDBSF recorded on the remaining
+!		    blocks of the last track.  The MDBSF is not modified in any
+!		    way nor are the first ten sectors of the last track.
+!
+!
+! FORMAT of Last Track Bad Block Information:
+!
+!{alias: The Manufacturers Detected Bad Sector File (MDBSF)
+!	 and the  Software Detected Bad Sector File (SDBSF)}
+!
+!	31				0
+!	+-------+-------+-------+-------+
+!	|    Cartridge Serial Number	| 0
+!	|		 		|
+!	+---------------+---------------+
+!	| Cartridge	|   Not Used	| 4	The Cartridge Identifier word
+!	| Identifier	|		|	contains all:
+!	+-------+-------+---------------+	  0's - Data Cartridge
+!	| Track	| Sector|   Cylinder	| 8	  1's - Alignment Cartridge
+!	|	|	|		|
+!	+-------+-------+---------------+
+!	|   :	|   :	|	:	|
+!	|   :	|   :	|	:	|
+!	+-------+-------+---------------+
+!	|  - 1	|  - 1	|      - 1	| 251.
+!	|	|	|		|
+!	+-------+-------+---------------+
+!						Note that this format implies
+!						that no more than 126 sectors
+!						can be bad!
+!
+!--
+
+!++
+!	
+! FORMAT of Non-Last Track Bad Block Information:
+!
+!	31				0
+!	+-------+-------+-------+-------+
+!	| Desc	| Desc	| Addr	| Count	| 0
+!	| Avail	| Used	|Fld Siz|Fld Siz|
+!	+-------+-------+-------+-------+
+!	| Low Order LBN	| Block	| High	| 4
+!	|		| Count	| LBN	|
+!	+---------------+-------+-------+
+!	|	:	|   :	|   :	| :
+!	|	:	|   :	|   :	| :
+!	+---------------+-------+-------+
+!	|	0	|   0	|   0	| :
+!	|		|   	|   	| :
+!	+---------------+-------+-------+
+!	|  Checksum of 	|   Not Used	| 251.
+!	|Bad Block Info	| 		|
+!	+---------------+---------------+
+!
+!	NOTE:	Only 126 entries are initially available in the buffer due to
+!		the overhead of the header and Checksum information.
+!
+!	Field Definitions:
+!
+!		Count Fld Siz		- Size of the Block count field in bytes.
+!		Addr Fld Siz		- Size of the Address field in bytes.
+!		Desc Used		- Number of descriptors used for bad blocks.
+!		Desc Avail		- Number of descriptors available.
+!		High LBN		- High order byte of the Logical Block Number.
+!		Block Count		- Number of bad blocks in this set.
+!		Low Order LBN		- Low order portion of the Logical Block Number.
+!		Checksum Bad Block Info	- Check sum of the bad block information.
+!
+!--
+
+%SBTTL 'Declarations'
+!
+! Include files:
+!
+REQUIRE	'lib$:baddef';					! Define BAD's structures.
+LIBRARY	'SYS$LIBRARY:LIB';				! Define VMS structures.
+
+!
+! Table of Contents:
+!
+FORWARD ROUTINE
+    bad$check_ltk	: NOVALUE,			! Check last track device for a user supplied entry.
+    bad$check_nlt	: NOVALUE,			! Check non last track device for a user supplied entry.
+    bad$cvt_ltk_long	: NOVALUE,			! Convert last track format to longwords.
+    bad$cvt_nlt_long	: NOVALUE,			! Convert non last track format to longwords.
+    bad$cvt_phy_log,					! Convert Physical address to logical.
+    bad$init_buffers	: NOVALUE,			! Initialize the contents of the data buffers.
+    check_for_blk0	: NOVALUE,			! Check block number for block 0.
+    cvt_log_phy,					! Convert Logical address to Physical.
+    cvt_long_nlt	: NOVALUE,			! Convert longwords to non last track format.
+    insert_blocks	: NOVALUE,			! Insert the indicated bad blocks into the SDBSF.
+    lookup_bad;						! Look up specified block in the Bad Sector files.
+
+!
+! Private Storage
+!
+BIND
+    mdbsf = $DESCRIPTOR ('MDBSF') : $BBLOCK,
+    sdbsf = $DESCRIPTOR ('SDBSF') : $BBLOCK;
+
+!
+! External references:
+!
+EXTERNAL
+    bad$gl_bad_term	: VECTOR [4, LONG],		! Information vector.
+    bad$gb_block_fact	: BYTE,				! Number of sectors per block.
+    bad$gl_chan,					! Channel number for device.
+    bad$gl_context	: BITVECTOR [32],		! Global control context flags.
+    bad$ga_bufadr	: VECTOR [2, LONG],		! Address of data transfer buffers.
+    bad$ga_device	: $BBLOCK [dsc$c_s_bln],	! Address of device name descriptor.
+    bad$ga_input_desc	: $BBLOCK [dsc$c_s_bln],	! Address of general purpose input descriptor.
+    bad$gl_func,					! IO function code for $QIO.
+    bad$ga_mdbsf	: REF $BBLOCK,			! Address of the Manufacturers Detected Bad Sector File.
+    bad$ga_sdbsf	: REF $BBLOCK,			! Address of the Software Detected Bad Sector File.
+    bad$gl_sdbsf_ptr,					! Pointer to the first available entry in the SDBSF.
+    bad$gl_sectors,					! Number of sectors per track.
+    bad$gb_term_count	: BYTE,				! Number of elements in bad$gl_bad_term.
+    bad$ga_tpb,						! Address of the Test Pattern Buffer.
+    bad$gl_tracks,					! Number of tracks per cylinder.
+    bad$gl_trnsfr_cnt;					! Number of bytes per transfer.
+
+!
+! Define message codes...
+!
+EXTERNAL LITERAL
+    bad$_bbfovf,					! Bad block file overflow.
+    bad$_dupblknum,					! Duplicate block number.
+    bad$_readerr,					! Read error.
+    bad$_srclin,					! Source line.
+    bad$_writeerr;					! Write error.
+
+
+%SBTTL	'bad$check_ltk -- Check Last Track bad block information'
+GLOBAL ROUTINE	bad$check_ltk (lobound, hibound) : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    Check last track bad block information files.
+!
+! NOTE: "lobound" and "hibound" are specified in lbn form.  
+!	These values will be converted by "lookup_bad" into
+!       the appropriate formats for last track or non last
+!       track information.
+!
+! Inputs:
+!
+!    lobound	val	the lower bound block number to look up.
+!
+!    hibound	val	the upper bound block number to look up.
+!
+! Side Effects:
+!
+!    Any block(s) that are not found in either the MDBSF or the SDBSF,
+!    will be added to the SDBSF via a call to "insert_blocks".
+!
+!--
+BEGIN
+LOCAL
+    ltentry;
+
+check_for_blk0 (lobound);				! If block 0 is bad, flag it.
+INCR entry FROM .lobound TO .hibound DO			! If the block is not in the
+    BEGIN						! MDBSF or SDBSF (as they exist)
+    IF NOT lookup_bad (.entry, .bad$ga_mdbsf)		! then enter this block into
+    THEN						! the SDBSF and bump the first
+        BEGIN						! free entry pointer.
+        IF NOT lookup_bad (.entry, .bad$ga_sdbsf)
+        THEN
+            insert_blocks (.entry, 0)			! Insert the current block.
+        ELSE
+            IF .bad$gl_context [ctx_v_init]		! Only display duplicate block number xxxxx,
+            THEN					! messages during the initialization phase. 
+                SIGNAL (bad$_dupblknum, 2,		! Informational message.
+                        .entry,
+                        sdbsf,
+                        bad$_srclin, 1, bad$ga_input_desc);
+        END
+    ELSE
+        IF .bad$gl_context [ctx_v_init]			! Only display duplicate block number xxxxx,
+        THEN						! messages during the initialization phase.
+            SIGNAL (bad$_dupblknum, 2,			! Informational message.
+                    .entry,
+                    mdbsf,
+                    bad$_srclin, 1, bad$ga_input_desc);
+    END;
+END;    ! of GLOBAL ROUTINE bad$check_ltk
+
+
+%SBTTL	'bad$check_nlt -- Check Non Last Track bad block information'
+GLOBAL ROUTINE	bad$check_nlt (lobound, hibound) : NOVALUE =
+!++
+!
+! Functional Description:
+!
+! Check for prior bad block information for non last track devices.
+!
+! NOTE: "lobound" and "hibound" are specified in lbn form.
+!       These values will be converted by "lookup_bad" into
+!       the appropriate formats for last track or non last
+!       track information.
+!
+! Inputs:
+!
+!    lobound	val	the lower bound block number to look up.
+!
+!    hibound	val	the upper bound block number to look up.
+!
+! Side Effects:
+!
+!    Any block(s) that are not found in the SDBSF, will be added via
+!    a call to "insert_blocks".
+!
+!--
+BEGIN
+LOCAL
+    count,
+    next,
+    nltentry,
+    start_block;
+
+check_for_blk0 (lobound);				! If block 0 is bad, flag it.
+INCR entry FROM .lobound TO .hibound DO			! Look for each block individually.
+    BEGIN
+    IF NOT lookup_bad (.entry, .bad$ga_sdbsf)		! Look for the low bound lbn.
+    THEN						! If it was NOT found, then save the starting block
+        BEGIN						! number and count the number of interveining blocks
+        count = 0;					! on file to the next block recorded.
+        next = start_block = .entry;
+        INCR next_entry FROM .entry + 1 TO .hibound DO
+            BEGIN
+            IF NOT lookup_bad (.next_entry, .bad$ga_sdbsf)
+            THEN
+                count = .count + 1
+            ELSE
+                BEGIN
+                IF .bad$gl_context [ctx_v_init]		! Only display duplicate block number xxxxx,
+                THEN					! messages during the initialization phase.
+                    SIGNAL (bad$_dupblknum, 2,		! Informational message.
+                            .next_entry,
+                            sdbsf,
+                            bad$_srclin, 1, bad$ga_input_desc);
+                next = .next_entry;			! Remember the "next" block number to check.
+                EXITLOOP;
+                END;
+            next = .next_entry;				! Remember the "next" block number to check.
+            END;
+        entry = .next;					! Update the "next" block number to check.
+        insert_blocks (.start_block, .count);		! Add the new bad blocks to the list.
+        END
+    ELSE
+        IF .bad$gl_context [ctx_v_init]			! Only display the dupliacte block number xxxxx,
+        THEN						! messages during the initialization phase.
+            SIGNAL (bad$_dupblknum, 2,			! Informational message.
+                    .entry,
+                    sdbsf,
+                    bad$_srclin, 1, bad$ga_input_desc);
+    END;
+END;    ! of GLOBAL ROUTINE bad$check_nlt
+
+
+%SBTTL	'Conversion and Formatting routines'
+GLOBAL ROUTINE bad$cvt_ltk_long (entry, sec, trk, cyl) : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    Convert last track entry to long words.
+!
+! Inputs:
+!
+!	entry	val	the last track entry to covert.
+!
+! Outputs:
+!
+!	sec	adr	the address of the longword to receive the sector number.
+!	trk	adr	the address of the longword to receive the track number.
+!	cyl	adr	the address of the longword to receive the cylinder number.
+!
+!--
+BEGIN
+MAP
+    entry  : $BBLOCK,
+    cyl    : REF $BBLOCK,
+    trk    : REF $BBLOCK,
+    sec    : REF $BBLOCK;
+
+.cyl = .entry [ltk_w_cylinder];				!+---+---+-------+
+.trk = .entry [ltk_b_track];				!|trk|sec|  cyl  |
+.sec = .entry [ltk_b_sector];				!+---+---+-------+
+
+END;    ! of GLOBAL ROUTINE bad$cvt_ltk_long
+
+
+GLOBAL ROUTINE	bad$cvt_nlt_long (entry, cnt, lbn) : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    Convert a non last track bad block entry into a pair of long words
+!    containing the count value and Logical Block Number.
+!
+! Inputs:
+!
+!	entry	val	the non last track entry to convert.
+!
+! Outputs:
+!
+!	cnt	adr	the address of a longword to receive the count of
+!			contigous bad blocks.
+!	lbn	adr	the address of a longword to receive the logical block number.
+!
+!--
+BEGIN
+MAP
+    entry : $BBLOCK,
+    cnt : REF $BBLOCK,
+    lbn : REF $BBLOCK;
+
+.lbn = .entry [nlt_b_highlbn] ^16 OR			! Extract the high order and
+       .entry [nlt_w_lowlbn];				! low order portions of the lbn.
+.cnt = .entry [nlt_b_sectorcnt];			! Extact the count.
+
+END;    ! of GLOBAL ROUTINE bad$cvt_nlt_long
+
+
+GLOBAL ROUTINE	bad$cvt_phy_log (sec, trk, cyl) =
+!++
+!
+! Functional Description:
+!
+!    Convert Physical Address specification to Logical Block Number.
+!
+! Outputs:
+!
+!	sec	val	the sector number
+!	trk	val	the track number
+!	cyl	val	the cylinder number
+!
+! Routine Value:
+!
+!    The logical block number is returned as the value of the call.
+!
+!--
+BEGIN
+
+RETURN ((.cyl * .bad$gl_tracks + .trk ) * .bad$gl_sectors + .sec) / .bad$gb_block_fact;
+
+END;    ! of GLOBAL ROUTINE bad$cvt_phy_log
+
+
+ROUTINE	cvt_log_phy (lbn, addr) =
+!++
+!
+! Functional Description:
+!
+!    Convert Logical Block Number to a Physical Address	
+!
+! Inputs:
+!
+!	lbn	val	the logical block number to convert
+!
+! Outputs:
+!
+!	addr	adr	the address of the longword to receive the
+!			physical address.
+!
+!--
+BEGIN
+MAP
+    addr : REF $BBLOCK;
+
+LOCAL
+    cyl,
+    sec,
+    trk,
+    blk : VECTOR [2, LONG];
+
+BUILTIN
+    EDIV;
+
+blk [0] = .lbn * .bad$gb_block_fact;			! Scale the logical block
+blk [1] = 0;						! number by the blocking factor.
+EDIV (bad$gl_sectors, blk, blk, sec);			! Extract the sector number.
+EDIV (bad$gl_tracks,  blk, cyl, trk);			! Extract the cylinder and track numbers.
+.addr = .trk ^24 OR					! Format into last track entry.
+        .sec ^16 OR					! 31    16|15     0
+        .cyl;						! +---+---+-------+
+RETURN TRUE;						! |trk|sec|  cyl  |
+							! +---+---+-------+
+END;    ! of ROUTINE cvt_log_phy
+
+
+ROUTINE	cvt_long_nlt (lbn, cnt, entry) : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    Convert a pair of long words containing a Logical Block Number and a
+!    count value into a non last track bad block entry.
+!
+! Inputs:
+!
+!	lbn	val	the logical block number
+!
+!	cnt	val	the count of contigous bad blocks
+!
+! Outputs:
+!
+!	entry	adr	the address of the longword to receive the value.
+!
+!--
+BEGIN
+MAP
+    entry : REF $BBLOCK;
+
+entry [nlt_w_lowlbn] = .lbn <0,16>;			! Format into a non last track entry.
+entry [nlt_b_highlbn] = .lbn <16, 8>;			! 31      16|15 8|7   0
+entry [nlt_b_sectorcnt] = .cnt <0,8>;			! +---------+---------+
+							! | low lbn |cnt |hlbn|
+							! +---------+----+----+
+END;    ! of ROUTINE cvt_long_nlt
+
+
+%SBTTL	'insert_blocks -- Insert the specified bad blocks into the SDBSF'
+ROUTINE	insert_blocks (entry, cnt) : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    Insert the specified bad blocks into the SDBSF.  Call the appropriate
+!    conversion routines to convert the lbn into the required format.
+!
+! Inputs:
+!
+!    entry	val	the block number to insert into the SDBSF.
+!
+!    cnt	val	the number of contiguous blocks to mark bad.
+!
+! Side Effects:
+!
+!    The entry (block number) and count will be converted to the appropriate
+!    format before insertion into the SDBSF.  If the SDBSF becomes full during
+!    any stage of the analysis, we will STOP (via a SIGNAL_STOP) and inform
+!    the user of the problem.
+!
+!--
+BEGIN
+LOCAL
+    new_entry;
+
+IF .bad$gl_sdbsf_ptr GEQU .bad$ga_sdbsf + bad$k_page_size ! Have we reached the end of the bad block file?
+THEN							! If we did, inform the user that the medium or
+    SIGNAL_STOP (bad$_bbfovf, 1, bad$ga_device);	! device is potentially unreliable.
+
+IF .bad$gl_context [ctx_v_ltdevice]			! Last track device?
+THEN
+    cvt_log_phy (.entry, new_entry)			! Convert this block to a physical address.
+ELSE
+    BEGIN
+    cvt_long_nlt(.entry, .cnt, new_entry);		! Convert the range to non last track entry.
+    bad$ga_sdbsf [nlt_b_usedbbdsc] =
+        .bad$ga_sdbsf [nlt_b_usedbbdsc] + 2;		! Update used descriptor count.
+    END;
+
+.bad$gl_sdbsf_ptr = .new_entry;				! Append the new entry to the file.
+bad$gl_sdbsf_ptr = .bad$gl_sdbsf_ptr + 4;		! Update the next free entry pointer.
+
+END;    ! of ROUTINE insert_blocks
+
+
+%SBTTL	'lookup_bad -- Look up entry in bad block file(s)'
+ROUTINE	lookup_bad (entry, buffer) =
+!++
+!
+! Functional Description:
+!
+!    Look up the entry(ies) in the bad block buffer.
+!    If the entry exists, RETURN TRUE; ELSE FALSE.
+!
+!    The above is true also in the case of a non last track device,
+!    if the block already exists in the bad block file as implied
+!    within a bad block cluster descriptor.
+!
+! Inputs:
+!
+!    entry	val	the block number to look up the in bad block file.
+!
+!    buffer	adr	the address of the bad block file to search for the
+!			entry provided above
+!
+! Routine Value:
+!
+!    TRUE	If the block is found within the given bad block file,
+!
+!    FALSE	otherwise.
+!
+!--
+BEGIN
+LOCAL
+    match;
+
+match = FALSE;
+
+IF .bad$gl_context [ctx_v_ltdevice]			! Last track device?
+THEN
+    BEGIN
+    MAP
+        buffer : REF VECTOR [, LONG];			! For ease of reference.
+
+    LOCAL
+        ltentry;
+
+    cvt_log_phy (.entry, ltentry);			! Convert the LBN to lt fmt.
+    INCR ptr FROM .buffer + ltk_k_headersiz		! Examine each of the bad
+             TO .buffer + bad$k_page_size / 4 - 2	! blocks listed.
+             BY 4
+    DO
+        BEGIN						! Look for a match or the
+        IF ..ptr EQL .ltentry				! end of the file.
+        THEN
+            BEGIN
+            match = TRUE;				! We found a match.
+            EXITLOOP;
+            END;
+
+        IF ..ptr EQL -1
+        THEN						! No match found.
+            BEGIN
+            match = FALSE;				! End of file encountered.
+            EXITLOOP;
+            END;
+        END;
+    END
+ELSE
+    BEGIN
+    MAP
+        buffer : REF $BBLOCK;
+
+    LOCAL
+        cnt,
+        lbn;
+
+    IF .buffer [nlt_b_usedbbdsc] NEQ 0			! Are there any bad blocks on file?
+    THEN
+        INCR ptr FROM .buffer + nlt_k_headersiz		! Examine only the used bad block
+                 TO .buffer + nlt_k_headersiz +		! descriptors.
+                   (.buffer [nlt_b_usedbbdsc] * 2 - 4) 	! The number of bad block descriptors
+                 BY 4					! are always stored as a multiple of 2
+        DO						! (Compatibility for ODS-1 and ODS-2)
+            BEGIN
+            bad$cvt_nlt_long (..ptr, cnt, lbn);		! Convert the descriptor into a
+            IF  .entry LEQU .lbn + .cnt			! starting logical block number
+            AND .entry GEQU .lbn			! and a count, then see if the
+            THEN					! entry is within the described
+                BEGIN					! range of contiguous bad blocks.
+                match = TRUE;				! Set match found and return.
+                EXITLOOP;
+                END;
+            END;
+    !
+    ! If there are no bad blocks on file or we did not match a block described
+    ! within the range specified in the bad block descriptor, then we will 
+    ! return FALSE.
+    !
+    END;
+RETURN .match;
+END;    ! of ROUTINE lookup_bad
+
+
+%SBTTL	'check_for_blk0 -- See if entry is block zero'
+ROUTINE	check_for_blk0 (entry) : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    See if the entry sought is block zero.  If it is, we set an
+!    internal flag in the context bits and record it in the SDBSF.
+!    The user is warned when we exit (both at SYS$ERROR and in the
+!    listing if one was requested) that block zero is bad and the
+!    medium should not be used as a system device.
+!
+! Inputs:
+!
+!    entry	val	the block number to check.
+!
+! Side Effects:
+!
+!    If the block number is zero (0), then the context bit (blk0bad)
+!    will be set true.
+!
+!--
+BEGIN
+    MAP
+        entry : REF VECTOR [, LONG];
+
+IF ..entry EQL 0
+THEN
+    BEGIN
+    bad$gl_context [ctx_v_blk0bad] = TRUE;		! Flag block 0 is bad!
+    END;
+END;    ! of ROUTINE check_for_blk0
+
+
+%SBTTL	'bad$init_buffers -- Initialize the contents of the data buffers'
+GLOBAL ROUTINE	bad$init_buffers (pattern) : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    Initialize the contents of the data buffers with the given test pattern.
+!
+! Inputs:
+!
+!    pattern	val	the test pattern used to initialize the contents
+!			of the buffers.
+!
+! Side Effects:
+!
+!    The two data buffers and the test pattern buffer will have their contents
+!    initialized to the pattern specified.
+!
+!--
+BEGIN
+BUILTIN
+    ACTUALCOUNT;
+
+BIND
+    buf0 = .bad$ga_tpb		: VECTOR [, LONG],
+    buf1 = .bad$ga_bufadr [0]	: VECTOR [, LONG],
+    buf2 = .bad$ga_bufadr [1]	: VECTOR [, LONG];
+
+LOCAL
+    tpb_boundary,
+    buf_boundary;
+
+tpb_boundary = bad$k_page_size / 4 - 1;			! Compute the test pattern buffer
+buf_boundary = .bad$gl_trnsfr_cnt / 4 - 1;		! and the data buffer's boundaries.
+
+IF ACTUALCOUNT () NEQ 0
+THEN							! Use the supplied test pattern.
+    BEGIN
+    INCR loc FROM 0 TO .tpb_boundary
+    DO buf0 [.loc] = .pattern;				! Fill the test pattern buffer.
+
+    INCR loc FROM 0 TO .buf_boundary
+    DO buf1 [.loc] = buf2 [.loc] = .pattern;		! Fill the data buffers.
+    END
+ELSE							! Use the pattern supplied in the data vector.
+    BEGIN
+    INCR loc FROM 0 TO .tpb_boundary			! Fill the test pattern buffer,
+    BY .bad$gb_term_count 				! compute the offset to the next location.
+    DO	INCR offset FROM 0 TO .bad$gb_term_count - 1
+        DO  IF (.loc + .offset) LEQ .tpb_boundary	! Be sure we're still within the buffer's boundary.
+            THEN buf0 [.loc + .offset] = .bad$gl_bad_term [.offset]
+            ELSE EXITLOOP;				! We're done.
+
+    INCR loc FROM 0 TO .buf_boundary			! Fill the data buffers.
+    BY .bad$gb_term_count				! Compute the offset.
+    DO	INCR offset FROM 0 TO .bad$gb_term_count - 1	! And move the pattern.
+        DO  IF (.loc + .offset) LEQ .buf_boundary	! Be sure we're still within the buffers' boundaries.
+            THEN buf1 [.loc + .offset] = buf2 [.loc + .offset] = .bad$gl_bad_term [.offset]
+            ELSE EXITLOOP;
+    END;
+    
+END;    ! of GLOBAL ROUTINE bad$init_buffers.
+
+END    ! of MODULE badblocks
+ELUDOM

@@ -1,0 +1,1301 @@
+	.TITLE	CONUTIL - Cluster Configuration Manager Utilities
+	.IDENT	'V04-000'
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; FACILITY: EXECUTIVE, CLUSTER MANAGEMENT
+;
+; ABSTRACT: 
+;	This module contains utility routines used by cluster configuration
+;	management and failover sequencing.
+;
+; ENVIRONMENT: VAX/VMS
+;
+; AUTHOR: David W. Thiel,	 CREATION DATE: 4-Apr-1983
+;
+; MODIFIED BY:
+;
+;	V03-012	DWT0239		David W. Thiel		30-Aug-1984
+;		Tie off CNX$BUGCHECK_CLUSTER to be a plain bugcheck,
+;		since it doesn't work.
+;
+;	V03-011	DWT0225		David W. Thiel		11-Jul-1984
+;		Change call to temporary name EXE$MNTVERSP2 to
+;		real name EXE$CLUTRANIO.
+;
+;	V03-010	DWT0219		David W. Thiel		08-May-1984
+;		Add synchronization of I/O cluster and lock cluster.
+;
+;	V03-009	DWT0210		David W. Thiel		07-Apr-1984
+;		Use BUSY bit in CLUBFKB to track activity in this
+;		block instead of a bit in the CLUB$L_FLAGS field.
+;
+;	V03-008	DWT0195		David W. Thiel		23-Mar-1984
+;		Add notion of dynamic quorum for quorum disk.
+;		Move computation of dynamic quorum from
+;		CNX$QUORUM_CALC to COMPUTE_DYNAMIC_QUORUM.
+;		Correct dynamic and static quorum computation.
+;
+;	V03-007	DWT0174		David W. Thiel		21-Feb-1984
+;		Minimize quorum disk votes against value in CLUB
+;		when computing quorum.
+;
+;	V03-006	DWT0152		David W. Thiel		29-Dec-1983
+;		Replace lock manager directory system logic with
+;		new code to support directory system vector.
+;		Add common routine to compute quorum and support a
+;		variable number of votes for the quorum disk.
+;		Delete CNX$FAILO_ALLOW_JOIN routine.
+;
+;	V03-005	DWT0146		David W. Thiel		14-Nov-1983
+;		Block activity when out of quorum using a fork block
+;		in the CLUB rather than a wired-in fork block.
+;		Add routines CNX$DIRVEC_ADJ and CNX$DIRVEC_FILL to
+;		manipulate the lock manager directory system vector.
+;
+;	V03-004	DWT0128		David W. Thiel		30-Aug-1983
+;		Clean up lock manager directory system CSID
+;		management.
+;
+;	V03-003	DWT0119		David W. Thiel		11-Aug-1983
+;		Add support for quorum disk.  Change CONFIG_CHANGE
+;		to CNX$CONFIG_CHANGE.
+;
+;	V03-002	DWT0110		David W. Thiel		28-Jul-1983
+;		Add CNX$SCAN_CSBS_FORK and CNX$CLUB_FORK routines.
+;		Convert failover routines to JSB interface.
+;		Add routine to loop at IPL 4 while the cluster is out
+;		of quorum.
+;
+;	V03-001	DWT0106		David W. Thiel		21-Jun-1983
+;		Coorect CNX$SET_DIRSYS, add CNX$FORM_DIRSYS entry point.
+;		Add failover routine to allow nodes to join cluster.
+;		Enable code to fix EPIDs.
+;
+;--
+
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+	$CDRPDEF			; CDRP offsets
+	$CDTDEF				; CDT Offsets
+	$CLMDRSDEF			; Cluster disconnect/reject codes
+	$CLSMSGDEF			; Cluster message definitions
+	$CLUBDEF			; CLUster Block offsets
+	$CSBDEF				; CSB Offsets
+	$DYNDEF				; Data structure type codes
+	$FKBDEF				; ForK Block offsets
+	$IPLDEF				; IPL definitions
+	$IRPDEF				; IRP offsets
+	$PCBDEF				; Process Control Block offsets
+	$SBDEF				; System Block offsets
+	$SSDEF				; Status code definitions
+	$TQEDEF				; TQE offsets
+
+;***********************************************************************
+;
+; NOTE:	The following assumptions are in effect for this entire module.
+;
+;************************************************************************
+
+	ASSUME	IPL$_SYNCH  EQ  IPL$_SCS
+	ASSUME	IPL$_SYNCH  EQ  IPL$_TIMER
+	ASSUME	IPL$_SYNCH  GT  IPL$_IOPOST
+
+	.PSECT	$$$100,LONG
+
+	.DEFAULT	DISPLACEMENT,WORD
+
+	.SBTTL	CNX$RESP_FORGET - Respond to a message and forget about it
+	.SBTTL	CNX$SEND_FORGET - Send message and forget about it
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Queue a message or response to be sent and forget about it.
+;	When the acknowledgement is received or the connection breaks,
+;	the CDRP is deallocated.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$SEND_FORGET
+;	JSB	CNX$RESP_FORGET
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	R2:	Address of message buffer (CNX$RESP_FORGET only)
+;	R3:	Address of CSB
+;	R5:	Address of fully initialized CDRP
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+;--
+
+CNX$RESP_FORGET::
+	MOVL	R2,CDRP$L_MSG_BUF(R5)	; Address of message buffer
+	MOVL	CLSMSG$L_RSPID(R2), -	; Store RSPID to return in CDRP
+		CDRP$L_RETRSPID(R5)
+
+CNX$SEND_FORGET::
+	BSBW	CNX$SEND_MSG_CSB	; Send message
+;
+;	We are resumed here when the message is acknowledged.
+;	Registers contain:
+;		R0:	Status
+;		R3:	Address of CSB
+;		R4:	Address of PDT
+;		R5:	Address of CDRP
+;
+	MOVL	R5,R0			; Address of CDRP
+	JMP	G^EXE$DEANONPAGED	; Deallocate CDRP and return
+
+	.SBTTL	CNX$BUGCHECK_CLUSTER - Bugcheck local cluster
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called to request that all members of the local
+;	cluster bugcheck.  A typical use is when two clusters detect each
+;	other and one (or both) decide to bow out gracefully.
+;
+;	*** TEMPORARY ***
+;	Since there was a fatal flaw in the approach, this has been replaced
+;	by a plain old CLUEXIT bugcheck to minimize the confusion added to
+;	the dump.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$BUGCHECK_CLUSTER
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	Cluster Holocaust
+;--
+
+CNX$BUGCHECK_CLUSTER::
+	BUG_CHECK	CLUEXIT,FATAL	; We've can't shut down the world, so just
+					;  shut down self
+
+
+	.SBTTL	CNX$INIT_CSBS - Initialize CSBs for new transition
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine initializes all CSBs for a new transition.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$INIT_CSBS
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	R0 and R1 are destroyed
+;
+;--
+
+CNX$INIT_CSBS::
+	PUSHR	#^M<R3,R4>		; Save registers
+	BSBW	CNX$SCAN_CSBS		; Iterate over all CSBs
+	BLBC	R0,20$			; Branch when done
+	BBCC	#CSB$V_SELECTED, -	; Clear selected flag
+		CSB$L_STATUS(R3),10$
+10$:	RSB
+
+20$:	POPR	#^M<R3,R4>		; Restore registers
+	RSB
+
+	.SBTTL	CNX$SCAN_CSBS - Scan all CSB's
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine scans all CSB's.
+;	It does a co-routine call-back for each CSB.
+;	When all CSB's have been scanned, it returns failure status.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$SCAN_CSBS
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;
+;	R4 is CLUB address
+;
+; COMPLETION CODES:
+;
+;	R0 = even:	end of scan
+;	R0 = odd:	co-routine call-back
+;			R3 is address of CSB
+;			R4 is address of CLUB
+;		On co-routine return:
+;			R3 is address of CSB following which
+;			    the scan is to resume.
+;
+; SIDE EFFECTS:
+;
+;	R3 is destroyed
+;
+;--
+
+	.ENABLE	LSB
+
+CNX$SCAN_CSBS::
+	MOVL	G^CLU$GL_CLUB,R3	; Get CLUB address
+	ASSUME	CLUB$L_CSBQFL EQ 0
+	ASSUME	CSB$L_SYSQFL EQ 0
+110$:	MOVL	G^CLU$GL_CLUB,R4	; Get CLUB address
+	MOVL	CSB$L_SYSQFL(R3),R3	; Advance to next CSB
+	CMPL	R4,R3			; End of list?
+	BEQL	130$			; Branch if no more CSB's
+120$:	MOVL	S^#SS$_NORMAL,R0	; Set success value
+;
+; Call back caller:
+;
+;	04(SP):		Original return address
+;	00(SP):		Return address to resume scan
+;
+;	R0:		Status = SS$_NORMAL
+;	R3:		Address of CSB scanned
+;	R4:		Address of CLUB
+;
+	JSB	@(SP)			; Return with CSB
+;
+;	R3 :		Address of CSB following which scan resumes
+;	Others:		Don't care
+;
+	BRB	110$			; Go around again
+
+	.SBTTL	CNX$SCAN_CSBS_EXIT - Request immediate exit from CSB Scan
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This code provides an immediate exit from the CSB scan loop.
+;
+; CALLING SEQUENCE:
+;
+;	JMP	CNX$SCAN_CSBS_EXIT
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	R3 is CSB address
+;
+; OUTPUT PARAMETERS:
+;
+;	Return is from call to CNX$SCAN_CSBS.
+;	R0 is 0
+;	R4 is CLUB address
+;
+; COMPLETION CODES:
+;
+;	Return is from call to CNX$SCAN_CSBS
+;
+; SIDE EFFECTS:
+;
+;	R0 and R4 are destroyed
+;
+;--
+
+CNX$SCAN_CSBS_EXIT::
+	ADDL	#4,SP			; Clear co-routine return from stack
+	MOVL	G^CLU$GL_CLUB,R4	; Get CLUB address
+130$:	CLRL	R0			; Set failure value
+	RSB
+
+	.SBTTL	CNX$SCAN_CSBS_RETRY - Delay, then Contine CSB Scan
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine handles the case where a thread must wait for
+;	some resource before it may proceed during a CSB scan.
+;	All context for the thread must reside in the R3 CSB address.
+;	After the delay, CNX$SCAN_CSBS returns with the same CSB as on
+;	the iteration during which this routine was called.
+;
+; CALLING SEQUENCE:
+;
+;	JMP	CNX$SCAN_CSBS_RETRY
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	R3 is CSB address
+;
+; OUTPUT PARAMETERS:
+;
+;	Return is from call to CNX$SCAN_CSBS.
+;	R3 is CSB address
+;	R4 is CLUB address
+;
+; COMPLETION CODES:
+;
+;	Return is from call to CNX$SCAN_CSBS
+;
+; SIDE EFFECTS:
+;
+;	R0, R1, R2, R4, R5 are destroyed
+;
+;--
+
+CNX$SCAN_CSBS_RETRY::
+	ADDL	#4,SP			; Know this value
+	MOVL	G^CLU$GL_CLUB,R4	; Address of CLUB
+	MOVAB	CLUB$B_FORK_BLOCK(R4),R5 ; Address of fork block
+	BBSS	#CLUBFKB$V_FKB_BUSY, -	; Branch if fork block is
+		CLUBFKB$L_STATUS(R5),300$ ;  not busy
+	POPR	#^M<R4>			; Save return address
+	ASSUME	CLUBFKB$B_FORK_BLOCK EQ 0
+	ASSUME	CLUBFKB$S_FORK_BLOCK GE FKB$K_LENGTH
+	FORK_WAIT			; Wait for the next clock tick
+	PUSHL	R4			; Restore return address
+	MOVAB	-CLUB$B_FORK_BLOCK(R5),R4 ; Address of CLUB
+	BBCC	#CLUBFKB$V_FKB_BUSY, -	; Clear fork block busy indicator
+		CLUBFKB$L_STATUS(R5),300$
+	BRB	120$			; Repeat co-routine call
+
+300$:	BUG_CHECK	CNXMGRERR,FATAL	; Double use of fork block
+
+	.SBTTL	CNX$SCAN_CSBS_FORK - Fork, then Contine CSB Scan
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine handles the case where a thread must momentarily
+;	release control before it may proceed during a CSB scan.
+;	All context for the thread must reside in the R3 CSB address.
+;	After the delay, CNX$SCAN_CSBS returns with the same CSB as on
+;	the iteration during which this routine was called.
+;
+; CALLING SEQUENCE:
+;
+;	JMP	CNX$SCAN_CSBS_FORK
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	R3 is CSB address
+;
+; OUTPUT PARAMETERS:
+;
+;	Return is from call to CNX$SCAN_CSBS.
+;	R3 is CSB address
+;	R4 is CLUB address
+;
+; COMPLETION CODES:
+;
+;	Return is from call to CNX$SCAN_CSBS
+;
+; SIDE EFFECTS:
+;
+;	R0, R1, R2, R4, R5 are destroyed
+;
+;--
+
+CNX$SCAN_CSBS_FORK::
+	ADDL	#4,SP			; Know this value
+	MOVL	G^CLU$GL_CLUB,R4	; Address of CLUB
+	MOVAB	CLUB$B_FORK_BLOCK(R4),R5 ; Address of fork block
+	BBSS	#CLUBFKB$V_FKB_BUSY, -	; Branch if fork block is
+		CLUBFKB$L_STATUS(R5),400$ ;  not busy
+	MOVB	#IPL$_SCS,FKB$B_FIPL(R5) ;Initialize fork IPL
+	POPR	#^M<R4>			; Save return address
+	ASSUME	CLUBFKB$B_FORK_BLOCK EQ 0
+	ASSUME	CLUBFKB$S_FORK_BLOCK GE FKB$K_LENGTH
+	JSB	G^EXE$FORK		; Wait until the fork list cycles
+	PUSHL	R4			; Restore return address
+	MOVAB	-CLUB$B_FORK_BLOCK(R5),R4 ; Address of CLUB
+	BBCC	#CLUBFKB$V_FKB_BUSY, -	; Clear fork block busy indicator
+		CLUBFKB$L_STATUS(R5),400$
+	BRW	110$			; Advance to next CSB
+
+400$:	BUG_CHECK	CNXMGRERR,FATAL	; Double use of fork block
+
+	.DISABLE	LSB
+
+	.SBTTL	CNX$ASSIGN_CSID - Assign a tentative CSID to a CSB
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Allocate a CSID slot and form the CSID.
+;	This is all done using the tentative CSID allocation context
+;	found in CLUB$W_NEXT_CSID.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$ASSIGN_CSID
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	R3:	CSB for which a CSID is to be allocated
+;	CLUB$W_NEXT_CSID contains first CSID slot to consider
+;
+; OUTPUT PARAMETERS:
+;
+;	R4:	CLUB address
+;
+; COMPLETION CODES:
+;
+;	R0:	success/failure status
+;
+; SIDE EFFECTS:
+;
+;	CSB$L_CSID(R3) receives the allocated CSID.
+;	CLUB$W_NEXT_CSID is updated.
+;	R1 and R2 are destroyed.
+;
+;--
+
+CNX$ASSIGN_CSID::
+	MOVL	CSB$L_CLUB(R3),R4	; Address of CLUB
+	MOVZWL	G^CLU$GW_MAXINDEX,R0	; Number of potentially available slots
+	MOVZWL	CLUB$W_NEXT_CSID(R4),R2 ; First slot to consider
+	BEQL	20$			; Branch to avoid slot 0
+10$:	CMPW	R2,G^CLU$GW_MAXINDEX	; Wrap slot index around yet?
+	BLSSU	30$			; Not yet
+20$:	MOVL	#1,R2			; Do wrap around
+30$:	MOVL	G^CLU$GL_CLUSVEC,R1	; Address of CSB vector
+	MOVL	(R1)[R2],R1		; Look at CSB vector entry
+	BGEQ	40$			; Branch if slot is free
+	INCL	R2
+	SOBGTR	R0,10$			; Iterate over all possible slots
+	RSB				; Return with failure status
+
+40$:	ADDW3	#1,R2, -		; Update next CSID
+		CLUB$W_NEXT_CSID(R4)
+	ADDW3	#1,R1,CSB$W_CSID_SEQ(R3) ; CSID sequence number
+	MOVW	R2,CSB$W_CSID_IDX(R3)	; CSID index
+	MOVL	#1,R0			; Return success
+	RSB
+
+	.SBTTL	CNX$MARK_LOCKED - Mark Node Locked
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Mark the specified node as LOCKED.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$MARK_LOCKED
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	R3:	CSB of the node to be marked locked
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	R0-R1 are destroyed.
+;
+;--
+
+CNX$MARK_LOCKED::
+	INCB	CSB$B_REF_CNT(R3)	; Bump reference count to nail down CSB
+	BBSS	#CSB$V_LOCKED, -	; Lock and branch if already locked
+		CSB$L_STATUS(R3),90$
+	RSB
+
+90$:	BUG_CHECK	CNXMGRERR,FATAL	; Consistency check
+
+	.SBTTL	CNX$MARK_UNLOCKED - Mark Node Unlocked
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Mark the specified node as unLOCKED.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$MARK_UNLOCKED
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	R3:	CSB of the node to be marked unlocked
+;
+; OUTPUT PARAMETERS:
+;
+;	R3:	If CSB deleted, then contents of back link pointer
+;		If CSB not deleted, then CSB address
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	R0-R1 are destroyed.
+;
+;--
+
+CNX$MARK_UNLOCKED::
+	PUSHR	#^M<R4,R5>		; Save some registers
+	MOVL	CSB$L_CLUB(R3),R4	; Address of CLUB
+	BBC	#CLUB$V_TRANSITION, -	; Branch if no transition in progress
+		CLUB$L_FLAGS(R4),90$
+	CMPL	CLUB$L_LOCAL_CSB(R4), -	; Is this node the coordinator?
+		CLUB$L_COORD(R4)
+	BNEQ	10$			; Branch if no
+	BBCC	#CSB$V_LOCKED, -	; Unlock and branch if not locked
+		CSB$L_STATUS(R3),90$
+	MOVL	R3,R5			; Move CSB address
+	BSBW	CNX$DECREFCNT		; Decrement reference count -- if CSB
+	MOVL	R5,R3			;   deleted, return previous list entry
+10$:	POPR	#^M<R4,R5>		; Restore registers
+	RSB
+
+90$:	BUG_CHECK	CNXMGRERR,FATAL	; Consistency check
+
+	.SBTTL	CNX$DIRVEC_ADJ - Adjust size of lock manager directory system vector
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Adjust the length of the lock manager directory system vector to accomodate
+;	nodes that may be added to the cluster by the state transition now in
+;	progress.  This routine is also used to initially create the lock manager
+;	directory system vector.  This routine never changes the contents of the
+;	vector -- it only adjusts the size.
+;
+;	The purpose of the lock manager directory system vector is to encode the
+;	node serving as the directory for each resource.  Resource names are hashed
+;	and the directory system vector indicates the CSID of the node serving as
+;	the directory for that resource.  The local node always appears as a 0
+;	entry.  Each node may have 0, 1, or more entries depending upon the setting
+;	of the LCK$GB_LCKDIRWT system parameter.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$DIRVEC_ADJ
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	LCK$GL_DIRVEC is 0 or points to the current directory vector.
+;
+; OUTPUT PARAMETERS:
+;
+;	LCK$GL_DIRVEC points to the adjusted directory vector.
+;
+; COMPLETION CODES:
+;
+;	R0 : Success/Failure
+;		Succeeds if vector is big enough or can be expanded as required.
+;		Fails if vector cannot be expanded as required.
+;
+; SIDE EFFECTS:
+;
+;	R1-R2 are destroyed.
+;
+; DATA STRUCTURES:
+;
+;	The following is a picture of the DIRVEC structure
+;
+;	 31           24 23           16 15           08 07           00
+;	+---------------+---------------+---------------+---------------+
+;	|         Number of valid entries (lognwords)                   |
+;	+---------------+---------------+---------------+---------------+
+;	|         Number of allocated entries (longwords)               |
+;	+---------------+---------------+---------------+---------------+
+;	|DYN$C_CLU_LCKDIR DYN$C_CLU     |              SIZE             |
+;	+---------------+---------------+---------------+---------------+
+;	|         First entry (CSID or 0 if local system)               |
+;	+---------------+---------------+---------------+---------------+
+;	.                                                               .
+;	.                                                               .
+;	.                                                               .
+;	+---------------+---------------+---------------+---------------+
+;	|         Last entry (CSID or 0 if local system)               |
+;	+---------------+---------------+---------------+---------------+
+;
+;
+;--
+
+CNX$DIRVEC_ADJ::
+	PUSHR	#^M<R3,R4,R5>		; Save registers
+	CLRL	R1			; Clear node counter
+	CLRL	R5			; Clear weight accumulator
+	BSBW	CNX$SCAN_CSBS		; Iterate over all CSBS
+	BLBC	R0,20$			; Branch when done
+	BBC	#CSB$V_SELECTED, -	; Branch if node is not selected
+		CSB$L_STATUS(R3),10$
+	INCL	R1			; Count the node
+	MOVZWL	CSB$W_LCKDIRWT(R3),R0	; Node weight
+	ADDL2	R0,R5			; Count weight of the node
+10$:	RSB				; End of iteration
+
+20$:	TSTL	R5			; Any weight seen?
+	BNEQ	30$			; Weight seen, use it
+	MOVL	R1,R5			; Use number of nodes
+30$:	MOVL	G^LCK$GL_DIRVEC,R4	; Address of current directory vector
+	BEQL	40$			; No directory at present
+	MOVAB	-12(R4),R4		; Point to base of block
+	CMPL	0(R4),R5		; Compare present and future needs
+	BEQL	60$			; No change needed
+	BLSSU	40$			; Branch if present < future
+	MOVL	0(R4),R5		; Maximum of present and future
+40$:	MULL3	#4,R5,R1		; Convert to byte count
+	ADDL2	#3*4,R1			; Add overhead
+	JSB	G^EXE$ALONONPAGED	; Allocate space for new vector
+	BLBC	R0,70$			; Can't allocate memory
+	MOVAB	12(R2),G^LCK$GL_DIRVEC	; Store address of new dirvec
+	CLRL	(R2)			; Clear divisor longword
+	MOVL	R5,4(R2)		; Number of slots allocated
+	MOVW	R1,8(R2)		; Store size of new vector
+	MOVB	#DYN$C_CLU,10(R2)	; Fill in block type
+	MOVB	#DYN$C_CLU_LCKDIR,11(R2) ; Fill in block sub-type
+	TSTL	R4			; Was there a previous block?
+	BNEQ	50$			; Branch if yes
+	MOVL	R2,R4			; Pretend new is old
+50$:	MOVL	0(R4),0(R2)		; Copy divisor
+	MULL3	0(R4),#4,R0		; Size of block to copy
+	MULL3	4(R2),#4,R1		; Size of new block to fill or zero
+	PUSHL	R2			; Save address of new block
+	PUSHL	R4			; Save address of old block
+	MOVC5	R0,12(R4),#0,R1,12(R2)	; Copy data and zero the remainder of the new block
+	POPR	#^M<R0>			; Restore address of ?old? block
+	CMPL	R0,(SP)+		; Test for old=new
+	BEQL	60$			; Branch if no previous block to delete
+	JSB	G^EXE$DEANONPAGED	; Deallocate old LCKDIR block
+60$:	MOVL	S^#SS$_NORMAL,R0	; Mark success
+70$:	POPR	#^M<R3,R4,R5>		; Restore register
+	RSB
+
+	.SBTTL	CNX$DIRVEC_FILL - Update contents of lock manager directory system vector
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Update the contents of the lock manager directory system vector to accurately
+;	reflect the current state of the cluster.  It is assumed that the vector
+;	has previously been adjusted so that it can contain the data that will be
+;	stored.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$DIRVEC_FILL
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	LCK$GL_DIRVEC contains address of directory system vector
+;
+; OUTPUT PARAMETERS:
+;
+;	LCK$GL_DIRVEC contains address of updated directory system vector
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	R0-R2 are destroyed.
+;
+;--
+
+CNX$DIRVEC_FILL::
+	PUSHR	#^M<R3,R4,R5>		; Save registers
+;
+; Fill in DIRVEC, ignoring zero-weight nodes
+;
+	MOVL	G^LCK$GL_DIRVEC,R4	; Address of first DIRVEC entry
+	MOVAB	-12(R4),R3		; Pointer to true base of DIRVEC
+	CLRL	0(R3)			; Initialize divisor
+	MOVL	G^CLU$GL_CLUSVEC,R2	; Address of CLUSVEC
+	MOVZWL	G^CLU$GW_MAXINDEX,R5	; Number of entries in CLUSVEC
+10$:	MOVL	(R2)+,R1		; Address of CSB for cluster member?
+	BGEQ	30$			; Branch if slot unused
+	MOVZWL	CSB$W_LCKDIRWT(R1),R0	; Weight of this node
+	BEQL	30$			; Ignore zero-weight nodes
+	BSBB	100$			; Call processing routine
+30$:	SOBGTR	R5,10$			; Iterate over all CLUSVEC entries
+;
+; See if any non-zero weight nodes were found
+;
+	CMPL	R4,G^LCK$GL_DIRVEC	; Were any entries fill in
+	BNEQ	70$			; Branch if yes
+;
+; No non-zero weight nodes were found.
+; Give every node a weight of one.
+;
+	MOVL	G^CLU$GL_CLUSVEC,R2	; Address of CLUSVEC
+	MOVZWL	G^CLU$GW_MAXINDEX,R5	; Number of entries in CLUSVEC
+40$:	MOVL	(R2)+,R1		; Address of CSB for cluster member?
+	BGEQ	50$			; Branch if slot unused
+	MOVL	#1,R0			; Use weight of 1
+	BSBB	100$			; Use standard processing routine
+50$:	SOBGTR	R5,40$			; Iterate over all CLUSVEC entries
+
+70$:	POPR	#^M<R3,R4,R5>		; Restore register
+	RSB
+;
+; Processing a cluster member.
+;	R0: weight of node
+;	R3: address of base of directory vector
+;	R4: next available slot in directory vector
+;	R0,R2 are destroyed
+;
+100$:	PUSHL	R2			; Save register
+	ADDL2	R0,0(R3)		; Increment divisor
+	CMPL	0(R3),4(R3)		; Check for overflow
+	BGTR	190$			; Branch if no slots left
+	MOVL	CSB$L_CSID(R1),R2	; CSID of this system
+	BBC	#CSB$V_LOCAL, -		; Branch if this is the local node
+		CSB$L_STATUS(R1),110$
+	CLRL	R2			; Use zero instead of local system CSID
+110$:	MOVL	R2,(R4)+		; Store entry in DIRVEC
+	SOBGTR	R0,110$			; Store <weight> entries
+	POPR	#^M<R2>			; Restore register
+	RSB				; Return
+
+190$:	BUG_CHECK	CNXMGRERR,FATAL	; DIRVEC is not long enough -- consistency check
+
+
+	.SBTTL	CNX$CLUB_WAIT - Do CLUB-Based 1 Second Wait
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Do a 0-1 second timeout using the CLUB$B_FORK_BLOCK and
+;	the FORK_WAIT service.
+;	An immediate return is made to the caller's caller.
+;	When the timout occurs, a return is made to the caller.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$CLUB_WAIT
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;
+;	R4 is address of CLUB
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	R0-R2,R5 are destroyed
+;
+;--
+
+CNX$CLUB_WAIT::
+	MOVL	G^CLU$GL_CLUB,R4	; Address of CLUB
+	MOVAB	CLUB$B_FORK_BLOCK(R4),R5 ; Address of fork block
+	BBSS	#CLUBFKB$V_FKB_BUSY, -	; Branch if fork block is
+		CLUBFKB$L_STATUS(R5),10$ ;  not busy
+	POPR	#^M<R4>			; Save return address
+	ASSUME	CLUBFKB$B_FORK_BLOCK EQ 0
+	ASSUME	CLUBFKB$S_FORK_BLOCK GE FKB$K_LENGTH
+	FORK_WAIT			; Wait for the next clock tick
+	PUSHL	R4			; Restore return address
+	MOVAB	-CLUB$B_FORK_BLOCK(R5),R4 ; Address of CLUB
+	BBCC	#CLUBFKB$V_FKB_BUSY, -	; Clear fork block busy indicator
+		CLUBFKB$L_STATUS(R5),10$
+	RSB				; Terminate the thread
+
+10$:	BUG_CHECK	CNXMGRERR,FATAL	; Double use of fork block
+
+	.SBTTL	CNX$CLUB_FORK - Do CLUB-Based Fork
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Momentarily release control using the CLUB$B_FORK_BLOCK
+;	fork block.
+;	An immediate return is made to the caller's caller.
+;	When the fork list cycles, a return is made to the caller.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$CLUB_FORK
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;
+;	R4 is address of CLUB
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	R0-R2,R5 are destroyed
+;
+;--
+
+CNX$CLUB_FORK::
+	MOVL	G^CLU$GL_CLUB,R4	; Address of CLUB
+	MOVAB	CLUB$B_FORK_BLOCK(R4),R5 ; Address of fork block
+	BBSS	#CLUBFKB$V_FKB_BUSY, -	; Branch if fork block is
+		CLUBFKB$L_STATUS(R5),10$	;  not busy
+	MOVB	#IPL$_SCS,FKB$B_FIPL(R5) ;Initialize fork IPL
+	POPR	#^M<R4>			; Save return address
+	ASSUME	CLUBFKB$B_FORK_BLOCK EQ 0
+	ASSUME	CLUBFKB$S_FORK_BLOCK GE FKB$K_LENGTH
+	JSB	G^EXE$FORK		; Wait until the fork list cycles
+	PUSHL	R4			; Restore return address
+	MOVAB	-CLUB$B_FORK_BLOCK(R5),R4 ; Address of CLUB
+	BBCC	#CLUBFKB$V_FKB_BUSY, -	; Clear fork block busy indicator
+		CLUBFKB$L_STATUS(R5),10$
+	RSB				; Terminate the thread
+
+10$:	BUG_CHECK	CNXMGRERR,FATAL	; Double use of fork block
+
+	.SBTTL	CNX$FIX_EPID - Add node specifier to EPIDs
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called when a node joins a cluster to add the node
+;	identification to the EPIDs of existing processes.  This assumes that
+;	very little has happened up to this point and that therefore, only
+;	fields within the PCB need to be updated.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$FIX_EPID
+;	IPL is IPL$_SYNC
+;
+; INPUT PARAMETERS:
+;
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	R0-R1 may be destroyed
+;
+;--
+
+CNX$FIX_EPID::
+	PUSHR	#^M<R2,R3,R4>			; Save registers
+;
+; Set the contents of the cell SCH$GW_LOCALNODE to the compressed form of
+; the local node CSID.  Update the extended PID cells of all processes on
+; the system.  (Null process will be updated multiple times, but no harm done)
+;
+	ASSUME	PCB$S_EPID_NODE_IDX EQ 8	; Index is one byte
+	ASSUME	PCB$S_EPID_NODE_SEQ EQ 2	; Seqno is two bits
+	ASSUME	PCB$V_EPID_NODE_SEQ EQ -	; Seqno is right after index
+		<PCB$V_EPID_NODE_IDX + PCB$S_EPID_NODE_IDX>
+NODE_WIDTH = PCB$S_EPID_NODE_IDX + PCB$S_EPID_NODE_SEQ
+
+	MOVL	G^CLU$GL_CLUB,R4		; Address of CLUB
+	MOVL	CLUB$L_LOCAL_CSB(R4),R1		; Local CSB address
+	MOVAW	G^SCH$GW_LOCALNODE,R3		; Get pointer to the localnode
+	MOVB	CSB$W_CSID_IDX(R1),(R3)+	; Store the index
+	BICB3	#^XFC,CSB$W_CSID_SEQ(R1),(R3)+	; Store the sequence, clearing high bits
+	MOVZWL	-(R3),R3			; Put localnode in a register
+	MOVZWL	G^SCH$GL_MAXPIX,R2		; Get index of highest PCB
+	MOVL	G^SCH$GL_PCBVEC,R0		; Get address of pcb vector
+10$:	MOVL	(R0)+,R4			; Get address of PCB
+	INSV	R3,#PCB$V_EPID_NODE_IDX,-    	; Set the node bits in the
+		#NODE_WIDTH,PCB$L_EPID(R4)   	;   extended PID field
+	TSTL	PCB$L_EOWNER(R4)		; Is it a subprocess?
+	BEQL	20$				; Not subprocess, leave it alone
+	INSV	R3,#PCB$V_EPID_NODE_IDX,-    	; Set the node bits in the
+		#NODE_WIDTH,PCB$L_EOWNER(R4) 	;   subprocess owner field
+20$:	SOBGEQ	R2,10$				; Try next PCB
+	POPR	#^M<R2,R3,R4>			; Restore registers
+	RSB
+
+	.SBTTL	CNX$CHECK_QUORUM - Check Presence of Quorum and Hang if Absent
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Test for the presence of a quorum of "live" nodes.  If a quorum is
+;	absent, loop at IPL 4 until a quorum is restored.  This serves to
+;	block activity that might use shared resources for which the locks
+;	may not longer be valid (since this node may have been failed out
+;	by someone else).  A fork loop at IPL 4 is used because this blocks
+;	all process-based activity while allowing timer-based activity and
+;	SCS/connection management functions to continue uninterrupted.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSBW/BSBB	CNX$CHECK_QUORUM
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	R0 and R1 are destroyed.
+;
+;--
+
+CNX$CHECK_QUORUM::
+	PUSHR	#^M<R2,R3,R4,R5>	; Save registers
+	BSBB	COMPUTE_DYNAMIC_QUORUM	; Is dynamic quorum present?
+	BLBS	R0,10$			; Branch if present
+	BBC	#CLUB$V_CLUSTER, -	; Branch if not cluster member
+		CLUB$L_FLAGS(R4),10$	;   and return
+	BBCC	#CLUB$V_QUORUM, -	; Mark quorum absent, branch if
+		CLUB$L_FLAGS(R4),10$	;   already absent
+	JSB	G^EXE$CLUTRANIO		; Throw disks into mount verification
+					; to inhibit further I/O initiations
+	MOVAB	W^LOSEQUORUM_MSG,R0	; Quorum lost message
+	CLRL	R5			; No CSB address
+	BSBW	CNX$CONFIG_CHANGE	; Log event
+	BSBB	200$			; Fork on I/O Post queue
+10$:	POPR	#^M<R2,R3,R4,R5>	; Restore registers
+	RSB				; Return to caller
+
+;
+; I/O Post fork routine.
+; Re-fork until a dynamic quorum is present
+;
+	ASSUME	IPL$_SCS GT IPL$_IOPOST
+100$:	DSBINT	#IPL$_SCS		; Raise IPL
+	BSBB	COMPUTE_DYNAMIC_QUORUM	; Is dynamic quorum present?
+	BLBS	R0,110$			; Branch if present
+	BSBB	200$			; Fork on same block
+	BRB	120$			; Branch to common exit
+
+110$:	BISL2	#CLUB$M_QUORUM, -	; Mark quorum present
+		CLUB$L_FLAGS(R4)
+	MOVAB	W^GAINQUORUM_MSG,R0	; Quorum lost message
+	CLRL	R5			; No CSB address
+	BSBW	CNX$CONFIG_CHANGE	; Log event
+120$:	ENBINT				; Restore IPL
+	RSB
+
+;
+; Set up and queue fork block onto I/O Post processing queue
+;
+200$:	MOVAB	CLUB$B_HANG_FKB(R4),R5	; Address of fork block
+	MOVB	#DYN$C_FRK, -		; Block type
+		FKB$B_TYPE(R5)
+	MOVB	#IPL$_IOPOST, -		; IPL = 4
+		FKB$B_FIPL(R5)
+	MOVAB	B^100$,FKB$L_FPC(R5)	; Restart PC address
+	MOVAQ	G^IOC$GL_PSFL,R0	; Address of queue header
+	INSQUE	(R5),@4(R0)		; Queue to I/O Post-processing queue
+	SOFTINT	#IPL$_IOPOST		; Wake up dispatcher
+	RSB
+
+	.SBTTL	COMPUTE_DYNAMIC_QUORUM - Calculate dynamic quorum presence
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Determine whether a quorum is dynamically present, i.e., whether
+;	there are live connections to a quorum of nodes.  In addition to
+;	calculating based on available nodes, add extra votes if the
+;	quorum file is a "member" of the cluster and is dynamically
+;	accessible to the local node.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	COMPUTE_DYNAMIC_QUORUM
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	CSB'S in list with CSB$M_MEMBER bit set
+;
+; OUTPUT PARAMETERS:
+;
+;	R4 is address of CLUB
+;
+; COMPLETION CODES:
+;
+;	R0 = TRUE indicates that a quorum is dynamically present
+;	R0 = FALSE indicates that a quorum is not dynamically present
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;--
+
+COMPUTE_DYNAMIC_QUORUM:
+	PUSHR	#^M<R1,R2,R3>		; Save registers
+	CLRL	R2			; Votes to be included
+	BSBW	CNX$SCAN_CSBS
+	BLBC	R0,30$			; All done
+	BBC	#CSB$V_MEMBER, -	; Branch if node is not cluster member
+		CSB$L_STATUS(R3),20$
+	BBS	#CSB$V_LONG_BREAK, -	; Branch if long break seen
+		CSB$L_STATUS(R3),20$
+	BBS	#CSB$V_LOCAL, -		; Branch if local node
+		CSB$L_STATUS(R3),10$	;   and include votes
+	CMPB	CSB$B_STATE(R3), -	; Is connection open?
+		#CSB$K_OPEN
+	BNEQ	20$			; Branch if not open
+10$:	MOVZWL	CSB$W_VOTES(R3),R0	; Sum votes
+	ADDL2	R0,R2
+20$:	RSB				; Continue scan
+
+30$:	BBC	#CLUB$V_QF_VOTE, -	; Branch if disk is not "member"
+		CLUB$L_FLAGS(R4),40$
+	BBC	#CLUB$V_QF_DYNVOTE, -	; Branch if connection can't be trusted yet
+		CLUB$L_FLAGS(R4),40$
+	MOVZWL	CLUB$W_QDVOTES(R4),R0	; Votes for quorum disk
+	ADDL2	R0,R2
+40$:	MOVZWL	CLUB$W_QUORUM(R4),R1	; Cluster quorum
+	CLRL	R0			; Assume no dynamic quorum
+	CMPL	R2,R1			; Check for presence of quorum
+	BLSSU	50$			; Branch if quorum is not dynamically present
+	MOVL	#1,R0			; Quorum is dynamically present
+50$:	POPR	#^M<R1,R2,R3>		; Restore registers
+	RSB
+
+	.SBTTL	CNX$QUORUM_CALC - Calculate Quorum and related data
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Calculate the Quorum, Votes, and Number of nodes for the selected
+;	nodes.  Quorum is maximized with the value in CLUB$W_QUORUM.
+;	Quorum disk votes is minimized with the value in CLUB$W_QDVOTES.
+;	Quorum is ratcheted up to be greater than half of the number of votes.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$QUORUM_CALC
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	CSB'S in list
+;
+; OUTPUT PARAMETERS:
+;
+;	R4 is address of CLUB
+;	R2 is number of nodes in cluster
+;	R1 is maximum of quorum in selected CSBs and CLUB$W_QUORUM
+;	R0 is sum of the votes of the selected CSBs
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	CLUB$W_NEWQUORUM contains calculated quorum
+;	CLUB$W_NEWQDVOTES contains calculated quorum disk votes
+;	CLUB$V_QF_NEWVOTE indicates whether or not quorum disk should be a "member"
+;
+;--
+
+CNX$QUORUM_CALC::
+	PUSHR	#^M<R3,R5,R6,R7>	; Save registers
+	MOVL	G^CLU$GL_CLUB,R4	; Address of CLUB
+	MOVZWL	CLUB$W_QUORUM(R4),R1	; R1 = quorum
+	CLRL	R2			; R2 = Number of nodes
+	CLRL	R5			; R5 = votes
+	MOVZWL	CLUB$W_QDVOTES(R4),R6	; R6 = Min quorum disk votes
+	MCOML	#0,R7			; Turn all quorum disk bits on
+	BSBW	CNX$SCAN_CSBS
+	BLBC	R0,100$			; All done
+	BBC	#CSB$V_SELECTED, -	; Branch if not selected
+		CSB$L_STATUS(R3),40$
+	MCOML	CSB$L_STATUS(R3),R0	; Get complement of QF_ACTIVE and QF_SAME
+	BICL2	R0,R7			; Cumulate QF_ACTIVE and QF_SAME bits
+	INCL	R2			; Count another node
+	CMPW	CSB$W_QUORUM(R3),R1	; Maximize quorum
+	BLEQU	30$			; OK
+	MOVZWL	CSB$W_QUORUM(R3),R1	; New maximum
+30$:	MOVZWL	CSB$W_VOTES(R3),R0	; Sum votes
+	ADDL2	R0,R5
+	CMPW	CSB$W_QDVOTES(R3),R6	; Minimize quorum disk votes over all nodes
+	BGEQU	40$			; Branch if no new minimum
+	MOVZWL	CSB$W_QDVOTES(R3),R6	; New minimum
+40$:	RSB				; Continue scan
+
+100$:	MOVL	R5,R0			; Number of votes
+	BBCC	#CLUB$V_QF_NEWVOTE, -	; Assume no vote for quorum disk
+		CLUB$L_FLAGS(R4),110$
+110$:	BBC	#CSB$V_QF_SAME,R7,130$	; Branch if same disk not specified by all
+	BBC	#CSB$V_QF_ACTIVE,R7,130$ ; Branch if any disk is inactive
+120$:	ADDL2	R6,R0			; Count quorum disk vote in total
+	BBSS	#CLUB$V_QF_NEWVOTE, -	; Tag the quorum disk as contributing a vote
+		CLUB$L_FLAGS(R4),130$
+130$:	ADDL3	#2,R0,R3		; Votes + 2
+	DIVL2	#2,R3			; (Votes + 2) / 2
+	CMPL	R3,R1			; (Votes + 2)/2 < quorum?
+	BLSSU	140$			; Branch if yes
+	MOVL	R3,R1			; Up the quorum
+140$:	MOVW	R1,CLUB$W_NEWQUORUM(R4)	; Computed quorum
+	MOVW	R6, -			; Quorum disk votes
+		CLUB$W_NEWQDVOTES(R4)
+	POPR	#^M<R3,R5,R6,R7>	; Restore registers
+	RSB				; Return
+
+
+	.SBTTL	CNX$DISPATCH - Second level input dispatcher for CNX
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called by the first level input message dispatcher
+;	whenver the facility code in the incoming message is CLSMSG$K_FAC_CNX.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$DISPATCH
+;	IPL is IPL$_SCS
+;
+; INPUT PARAMETERS:
+;
+;	R2 is address of message
+;	R3 is address of CSB
+;	R4 is address of PDT
+;	R5 :
+;		If CLSMSG$L_RSPID(R2) is non-zero, then R5 is the address of
+;		a noninitialized CDRP.
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	R0-R5 may be destroyed
+;
+;--
+
+CNX$DISPATCH::
+	DISPATCH	CLSMSG$B_FUNC(R2),TYPE=B,PREFIX=CLMCNX$K_FNC_, -
+		< -
+		<STATUS,CNX$RCVD_STATUS>, -	; Status message
+		<ENTER,CNX$RCVD_ENTER>, -	; Cluster membership request message
+		<LOCK,CNX$RCVD_LOCK>, -		; Coordinator lock request
+		<DESC,CNX$RCVD_DESC>, -		; Node description
+		<VEC,CNX$RCVD_VEC>, -		; Cluster vector slot description
+		<FORM,CNX$RCVD_FORM>, -		; New cluster proposal
+    		<RECONFIG,CNX$RCVD_RECONFIG>, -	; Reconfiguration proposal
+		<JOIN,CNX$RCVD_JOIN>, -		; Proposal to add node
+		<UNLOCK,CNX$RCVD_UNLOCK>, -	; Unlock/Undo request
+		<PH2,CNX$RCVD_PH2>, -		; Phase 2 message
+		<READY,CNX$RCVD_READY>, -	; Ready for failover step
+		<DOSTEP,CNX$RCVD_DOSTEP>, -	; Do failover step
+		<QUORUM,CNX$RCVD_QUORUM>, -	; Quorum change message
+		<TRNSTS,CNX$RCVD_TRNSTS>, -	; Transition status request
+		<TOPOLOGY,CNX$RCVD_TOPOLOGY> -	; Topology exchange request
+		>
+	BUG_CHECK	CNXMGRERR,FATAL		; Invalid function code
+
+
+	.END
+

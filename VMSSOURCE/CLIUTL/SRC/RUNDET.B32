@@ -1,0 +1,887 @@
+MODULE rundet (%TITLE 'Run Detached Process -- CLI Utility Procedure'
+		IDENT = 'V04-000',
+		MAIN = run_detached) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!++
+!
+! Facility:
+!
+!	CLI Utility
+!
+! Abstract:
+!
+!	This module contains the routines necessary to act as a CLI interface
+!	to the create process ($CREPRC) and schedule wakeup ($SCHDWK) system
+!	services.
+!
+! Environment:
+!
+!	VAX/VMS User Mode, Non-Privileged
+!
+! Author:
+!
+!	Michael T. Rhodes, 		Creation Date: March, 1983
+!
+! Modified By:
+!
+!	V03-007	MCN0159		Maria del C. Nasr	28-Mar-1984
+!		Use LIB$TPARSE to parse uic instead of RUN_CVTUIC.
+!
+!	V03-006	RAS0274		Ron Schaefer		20-Mar-1984
+!		Make this work with searchlists by using LIB$FIND_FILE
+!		to parse the image filespec.  Wildcards are not allowed.
+!
+!	V03-005	TMK0001		Todd M. Katz		13-Nov-1983
+!		Add the qualifier /JOB_TABLE_QUOTA. The use of this
+!		qualifier allows the creator of a detached process to
+!		specify its job-wide logical name table creation quota.
+!
+!	V03-004	MTR0002		Michael T. Rhodes	22-Jul-1983
+!		Correct qualifier name /PROCESS to /PROCESS_NAME.
+!
+!	V03-003	MTR0001		Michael T. Rhodes	29-Apr-1983
+!		Convert privilege processing to use common CLI utility
+!		routine PRV$SETPRIV.  Also change PID message to PROC_ID.
+!
+!	V03-002	WMC0002		Wayne Cardoza		14-Apr-1983
+!		Qualifier is /DETACHED
+!
+!	V03-001	WMC0001		Wayne Cardoza		11-Apr-1983
+!		Add /DETACH and /DUMP flags.
+!
+!--
+
+
+%SBTTL 'Declarations'
+!
+! Include Files:
+!
+LIBRARY	'SYS$LIBRARY:LIB';				! Define VMS structures.
+LIBRARY	'SYS$LIBRARY:TPAMAC';				! T$PARSE structures
+
+!
+! Table of Contents:
+!
+FORWARD ROUTINE
+	run_detached	: NOVALUE,			! Create a sub or detached process.
+	init_arg_list	: NOVALUE,			! Initialize the $CREPRC and $SCHDWK argument lists.
+	parse_image_spec: NOVALUE,			! Obtain the expanded image file specification.
+	get_wakeup_info	: NOVALUE,			! Get info for the $SCHDWK .
+	get_uic		: NOVALUE,			! Get the UIC value.
+	get_privileges	: NOVALUE,			! Set up the privilege mask vector for the process.
+	get_quotas	: NOVALUE,			! Set up the quota list for the process.
+	get_cpulm	: NOVALUE,			! Special case for CPU time limit quota.
+	get_value	: NOVALUE,			! Get the value of the current command line entity.
+	insert_quota	: NOVALUE,			! Insert a quota list entry.
+	get_stsflgs	: NOVALUE,			! Set up the initial process status flag vector.
+	schedule_process: NOVALUE;			! Schedule the process to be executed.
+
+!
+! External references:
+!
+EXTERNAL ROUTINE
+	CLI$GET_VALUE	: ADDRESSING_MODE (GENERAL),	! CLI call back routine to get command line entity.
+	CLI$PRESENT	: ADDRESSING_MODE (GENERAL),	! CLI call back routine to determine entity presence.
+	lib$cvt_dtime	: ADDRESSING_MODE (GENERAL),	! Private CLI routine to convert a string to a delta time.
+	LIB$CVT_DX_DX	: ADDRESSING_MODE (GENERAL),	! General conversion routine.
+	lib$cvt_time	: ADDRESSING_MODE (GENERAL),	! Private CLI routine to convert a string to an absolute time.
+	LIB$GET_VM	: ADDRESSING_MODE (GENERAL),	! Library routine to obtain virtual memory.
+	LIB$FIND_FILE	: ADDRESSING_MODE (GENERAL),	! Library routine to parse filespecs.
+	LIB$TPARSE	: ADDRESSING_MODE (GENERAL),	! Table driven parser
+	prv$setpriv	: ADDRESSING_MODE (GENERAL);	! Private CLI routine to process privileges and set bits in mask.
+
+!
+! Define message codes...
+!
+$SHR_MSGDEF	(RUN,192,GLOBAL,			! Define the shareable messages first.
+		(INSVIRMEM,SEVERE),			! Insufficient virtual memory.
+		(INVQUAVAL,ERROR),			! Invalid qualifier value.
+		(PARSEFAIL,SEVERE),			! Error parsing file spec.
+		(SYNTAX,SEVERE));			! Error parsing command entity.
+
+EXTERNAL LITERAL
+	cli$_negated,					! Command line entity was explicitly negated.
+	run$_creprc,					! Create process failed.
+	run$_proc_id,					! Identification of created process.
+	run$_getjpi,					! Error obtaining job and process information.
+	run$_cvterr,					! Error converting entity value.
+	run$_invuic,					! Invalid UIC.
+	run$_illval,					! Illegal CPU time limit.
+	run$_schdwk;					! Failed to schedule the wakeup request.
+
+	
+
+%SBTTL	'Declarations -- Private Storage'
+!
+! Command qualifiers, keywords, and keyword paths
+!
+BIND
+	accounting =	$descriptor ('ACCOUNTING'),		! Log accounting records for created process.
+	authorize =	$descriptor ('AUTHORIZE'),		! Perform user authorization when image is LOGINOUT.
+	delay =		$descriptor ('DELAY'),			! Hibernate process and awaken after delta time interval.
+	detach =	$descriptor ('DETACHED'),		! Detached process
+	dump =		$descriptor ('DUMP'),			! Image dump requested
+	error =		$descriptor ('ERROR'),			! Error device (SYS$ERROR).
+	input =		$descriptor ('INPUT'),			! Input device (SYS$INPUT).
+	interval =	$descriptor ('INTERVAL'),		! Hibernate process and awaken at regularly scheduled intervals.
+	mailbox =	$descriptor ('MAILBOX'),		! Unit number of termination mailbox for this process.
+	output =	$descriptor ('OUTPUT'),			! Output device (SYS$OUTPUT).
+	p1 =		$descriptor ('P1'),			! Image file specification parameter.
+	priority =	$descriptor ('PRIORITY'),		! Base priority at which the created process is to execute.
+	privileges =	$descriptor ('PRIVILEGES'),		! Defines the privileges for the created process.
+	process =	$descriptor ('PROCESS_NAME'),		! Specifies the process name.
+	resource_wait =	$descriptor ('RESOURCE_WAIT'),		! Enable/disables resource wait mode for the process.
+	schedule =	$descriptor ('SCHEDULE'),		! Hibernate the process and awaken at absolute time.
+	service_fail =	$descriptor ('SERVICE_FAILURE'),	! Enable/disable system service failure exception mode.
+	swapping =	$descriptor ('SWAPPING'),		! Enable/disable process swapping.
+	uic =		$descriptor ('UIC');			! Detached process UIC.
+
+LITERAL
+	true = 1, false = 0,					! Boolean operands.
+	jpientries = 3,						! Number of entries in the $GETJPI item list.
+	jpilistsize = jpientries * 12,				! Number of bytes required for the $GETJPI item list.
+	list_k_entry_size = 5,					! Number of bytes in a list entry.
+	priv_entries = 31;					! Number of real privileges (prv$v_xxx).
+
+MACRO								! Macro to create list entries for the quota & privilege tbls.
+	list_entry (name, entity) = BYTE (name), LONG ($descriptor (entity)) %,
+	list_b_name =  0,0,8,0 %,				! Name field access formal.
+	list_l_value = 1,0,32,0 %;				! Value field access formal.
+
+OWN
+	run$a_error	: $bblock [dsc$c_s_bln],		! Descriptor for error device specification.
+	run$a_image	: $bblock [dsc$c_s_bln],		! Descriptor for image file specification.
+	run$a_input	: $bblock [dsc$c_s_bln],		! Descriptor for input device specification.
+	run$a_input_desc: $bblock [dsc$c_s_bln],		! General purpose dynamic input descriptor.
+	run$a_output	: $bblock [dsc$c_s_bln],		! Descriptor for output device specification.
+	run$a_prcnam	: $bblock [dsc$c_s_bln],		! Descriptor for process name.
+	run$a_quota,						! Quota list head address.
+	run$l_baspri,						! Base execution priority for the process.
+	run$l_mbxunt,						! Termination mailbox unit number.
+	run$l_pid,						! Created process' PID.
+	run$l_status,						! Global Status vector.
+	run$l_stsflg	: $bblock [4],				! Initial process state status flags.
+	run$l_uic,						! Detached process' UIC.
+	run$q_daytim	: VECTOR [2, LONG] INITIAL (-1,-1),	! Time at which the process is to be awakened. 
+	run$q_interval	: VECTOR [2, LONG] INITIAL (0,0),	! Interval at which the wake up request is to be repeated.
+	run$q_prvadr	: VECTOR [2, LONG],			! Privilege vector.
+	run$a_image_buf	: $bblock [nam$c_maxrss],		! Buffer to hold the expanded file specification.
+	run$a_findfile	: ref $bblock,				! Context ptr for LIB$FIND_FILE.
+
+
+%SBTTL	'Data Structures -- $GETJPI Item list'
+!++
+!
+! Functional Description:
+!
+!    This structure is used to obtain default job and process information
+!    for the created process.
+!
+!--
+run$a_getjpi	: $bblock [jpilistsize]						! Item list for $GETJPI.
+		  INITIAL (
+		  WORD (4, jpi$_prib),		LONG (run$l_baspri, 0),		! Process base priority.
+		  WORD (8, jpi$_procpriv),	LONG (run$q_prvadr, 0),		! Process 'SAME' privileges.
+		  WORD (0, 0),			LONG (0, 0)),			! Item list terminator.
+
+
+%SBTTL	'Data Structures -- Quota Table'
+!++
+!
+! Functional Description:
+!
+!    This structure is used to parse and process the command line entries
+!    which comprise the quota list values and to establish the initial quota
+!    context for the $CREPRC system service.
+!
+!--
+run$a_quota_tbl	: $bblock [(pql$_length - 1) * list_k_entry_size]		! Quota table.
+		  INITIAL (
+		  list_entry (pql$_astlm,	'AST_LIMIT'),			! AST limit quota.
+		  list_entry (pql$_bytlm,	'BUFFER_LIMIT'),		! Maximum number of bytes for buffered IO or tmpmbx.
+		  list_entry (pql$_enqlm,	'ENQUEUE_LIMIT'),		! Maximum # of outstanding locks for the process.
+		  list_entry (pql$_wsextent,	'EXTENT'),			! Max size to which an image may increase phy mem.
+		  list_entry (pql$_fillm,	'FILE_LIMIT'),			! Maximum number of simultaneously open files.
+		  list_entry (pql$_biolm,	'IO_BUFFERED'),			! Max number of concurrent buffered IO operations.
+		  list_entry (pql$_diolm,	'IO_DIRECT'),			! Maximum number of concurrent direct IO operations.
+		  list_entry (pql$_wsquota,	'MAXIMUM_WORKING_SET'),		! Max size which process can expand its working set.
+		  list_entry (pql$_pgflquota,	'PAGE_FILE'),			! Max number of pages allocated for paging process.
+		  list_entry (pql$_tqelm,	'QUEUE_LIMIT'),			! Maximum number of timer queue entries.
+		  list_entry (pql$_prclm,	'SUBPROCESS_LIMIT'),		! Max number of subprocesses which can be created.
+		  list_entry (pql$_cpulm,	'TIME_LIMIT'),			! Maximum CPU time allocated to the process.
+		  list_entry (pql$_wsdefault,	'WORKING_SET'),			! Default working set size for the process.
+		  list_entry (pql$_jtquota,	'JOB_TABLE_QUOTA')		! Job-wide logical name table creation quota
+		  );
+
+! TPARSE state table to parse the uic value
+!
+
+$INIT_STATE ( uic_states, uic_keys );
+
+$STATE	(,
+	(tpa$_ident,,,,run$l_uic)
+	);
+
+$STATE	(,
+	(tpa$_eos, tpa$_exit)
+	);
+
+%SBTTL	'run_detached -- Create a sub or detached process'
+ROUTINE run_detached : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    This routine is responsible for calling the initialization procedure
+!    which will build the argument lists used for performing the create
+!    process ($CREPRC) system service.  If the process is to be scheduled
+!    to be awakened or re-executed at specific intervals, a call is made
+!    to perform that action.
+!
+! Implicit Inputs:
+!
+!    The command line supplied by the CLI.
+!
+! Implicit Outputs:
+!
+!    The process is created with the process identification (PID) of the
+!    created process SIGNALled to the caller as a success status message.
+!
+! Routine Value:
+!
+!    SS$_NORMAL		Process was created/scheduled without errors.
+!
+!    false		Error status from failed routine.
+!
+! Side Effects:
+!
+!    The process may have been hibernated with a scheduled wake up pending.
+!
+!--
+BEGIN
+
+init_arg_list ();					! Initialize the argument lists for the $CREPRC and $SCHDWK.
+
+IF NOT (run$l_status = $CREPRC (PIDADR = run$l_pid,	! Process ID of created process.
+				IMAGE =  run$a_image,	! File specification of the image to execute.
+				INPUT =  run$a_input,	! Input device specification (assigned to SYS$INPUT).
+				OUTPUT = run$a_output,	! Output device specification (assigned to SYS$OUTPUT).
+				ERROR =  run$a_error,	! Error device specification (assigned to SYS$ERROR).
+				PRVADR = run$q_prvadr,	! Quadword privilege vector address.
+				QUOTA =  .run$a_quota,	! List head address for the quota list.
+				PRCNAM = run$a_prcnam,	! Process name.
+				BASPRI = .run$l_baspri,	! Process base execution priority.
+				UIC =    .run$l_uic,	! Process UIC.
+				MBXUNT = .run$l_mbxunt,	! Termination mailbox unit number.
+				STSFLG = .run$l_stsflg))! Initial process state status flags.
+THEN
+    SIGNAL_STOP (run$_creprc, 0, .run$l_status)		! Any errors, stop here and inform the user.
+ELSE
+    SIGNAL (run$_proc_id, 1, .run$l_pid);		! Process was created successfully, show it's PID to the creator.
+
+IF .run$l_stsflg [prc$v_hiber]				! Should we leave a wake up call?
+THEN    schedule_process ();
+
+END;    ! of ROUTINE run_detached
+
+
+%SBTTL	'init_arg_list -- Initialize argument lists'
+ROUTINE init_arg_list : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    This routine is responsible for calling the procedures to parse
+!    the command line and establish the arguments for creating and
+!    scheduling the requested process.
+!
+! Implicit Inputs:
+!
+!    Global data for the argument lists, command line entities etc..
+!
+! Implicit Outputs:
+!
+!    The command line has been parsed with the resultant information
+!    available for calls to the create process ($CREPRC) and the schedule
+!    wake up ($SCHDWK) system services.
+!
+! Side Effects:
+!
+!    Errors encountered during initialization will be signalled by
+!    the routine which detected the problem.
+!
+!--
+BEGIN
+!
+! Initialize the various descriptors.
+!
+CH$FILL (0, dsc$c_s_bln, run$a_image);			! Image file specification descriptor.
+CH$FILL (0, dsc$c_s_bln, run$a_input);			! Input device specification descriptor.
+CH$FILL (0, dsc$c_s_bln, run$a_input_desc);		! Initialize the dynamic input descriptor.
+CH$FILL (0, dsc$c_s_bln, run$a_output);			! Output device specification descriptor.
+CH$FILL (0, dsc$c_s_bln, run$a_error);			! Error device specification descriptor.
+CH$FILL (0, dsc$c_s_bln, run$a_prcnam);			! Process name descriptor.
+run$a_input [dsc$b_class] = dsc$k_class_d;		! Input device.
+run$a_output [dsc$b_class] = dsc$k_class_d;		! Output device.
+run$a_error [dsc$b_class] = dsc$k_class_d;		! Error device.
+run$a_prcnam [dsc$b_class] = dsc$k_class_d;		! Process name.
+run$a_input_desc [dsc$b_dtype] = dsc$k_dtype_t;		! General purpose input descriptor (type req for conversions!)
+run$a_input_desc [dsc$b_class] = dsc$k_class_d;		! General purpose input descriptor.
+
+IF NOT (run$l_status = $GETJPI (ITMLST = run$a_getjpi))	! Obtain the necessary job and process info.
+THEN    SIGNAL_STOP (run$_getjpi, 0, .run$l_status);	! If we encounter an error, quit.
+
+CLI$GET_VALUE (input, run$a_input);			! Obtain the input device specification.
+CLI$GET_VALUE (output, run$a_output);			! Obtain the output device specification.
+CLI$GET_VALUE (error, run$a_error);			! Obtain the error device specification.
+CLI$GET_VALUE (process, run$a_prcnam);			! Obtain the process name.
+
+parse_image_spec ();					! Obtain the expanded image file specification.
+get_value (mailbox, run$l_mbxunt);			! Get the mailbox unit number if supplied.
+get_value (priority, run$l_baspri);			! Get the process base priority if supplied.
+get_wakeup_info ();					! See if we should leave a wake up call.
+get_uic ();						! Get the user identification code (UIC).
+get_privileges ();					! Set up the process privilege vector.
+get_quotas ();						! Set up the default process quotas.
+get_stsflgs ();						! Set up the initial process context flags.
+
+END;    ! of ROUTINE init_arg_list
+
+
+%SBTTL	'parse_image_spec -- Parse image file specification'
+ROUTINE parse_image_spec : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    This routine obtains the image file specification from the command
+!    line and parses it, producing a resultant file specification with
+!    defaults applied.
+!
+! Implicit Inputs:
+!
+!	none
+!
+! Implicit Outputs:
+!
+!    The image file has been parsed with the resultant file specification in
+!    run$a_image_buf, and the appropriate fields of the descriptor run$a_image 
+!    initialized.
+!
+! Side Effects:
+!
+!    Parse errors from RMS or errors from LIB$FIND_FILE will result 
+!    with a FATAL error signalled.
+!
+!--
+BEGIN
+
+bind
+    default_name = uplit (%charcount('.EXE'),uplit byte ('.EXE'));
+
+local
+    status,
+    findfilenam	: ref block [ ,byte ];
+
+CLI$GET_VALUE (p1, run$a_input_desc);			! Obtain the image file specification.
+
+run$a_image [DSC$B_CLASS] = DSC$K_CLASS_D;
+run$a_image [DSC$B_DTYPE] = DSC$K_DTYPE_T;
+
+! Get the next file name to search for, no wildcards permitted.
+!
+status = LIB$FIND_FILE(
+	run$a_input_desc, run$a_image,
+	run$a_findfile,
+	default_name, 0, 0, %REF(1));
+
+! If the filename has wildcards in it it's an error
+!
+if (.status and sts$m_msg_no)  eql  shr$_nowild
+then
+    run$a_findfile [fab$l_sts] = .status;
+
+! Report miscellaneous errors from LIB$FIND_FILE
+!
+if not .status
+then
+    SIGNAL_STOP (run$_parsefail, 1, 
+	run$a_input_desc, .run$a_findfile [fab$l_sts], .run$a_findfile [fab$l_stv]);
+
+findfilenam = .run$a_findfile [fab$l_nam];
+
+! If an explicit version number was not specified, remove the version number.
+!
+IF NOT .findfilenam [nam$v_exp_ver]
+THEN 
+    run$a_image [dsc$w_length] = .run$a_image [dsc$w_length] - .findfilenam [nam$b_ver];
+
+END;    ! of ROUTINE parse_image_spec
+
+
+%SBTTL	'get_wakeup_info -- Process the $SCHDWK time values'
+ROUTINE get_wakeup_info : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    This routine is responsible for obtaining and converting the time values
+!    used to schedule wake up requests for the created process.
+!
+! Implicit Outputs:
+!
+!    run$q_interval	delta		Reschedule the process to execute at
+!					this interval.
+!
+!    run$q_daytim	absolute or	Schedule the process to execute at
+!			delta		this time.
+!
+! Side Effects:
+!
+!    The time quantities are obtained as .ASCID strings from the CLI.  To
+!    convert them we call the appropriate library routine.  Any errors
+!    encountered during the conversion will be signalled, and execution
+!    of this image terminated.
+!
+!--
+BEGIN
+
+IF CLI$GET_VALUE (delay, run$a_input_desc)		! Was /DELAY specified?
+THEN
+    IF NOT (run$l_status = LIB$CVT_DTIME (run$a_input_desc, run$q_daytim))
+    THEN
+        SIGNAL_STOP (run$_cvterr, 2, delay, run$a_input_desc, .run$l_status);
+
+IF CLI$GET_VALUE (interval, run$a_input_desc)		! Was /INTERVAL specified?
+THEN
+    IF NOT (run$l_status = LIB$CVT_DTIME (run$a_input_desc, run$q_interval))
+    THEN
+        SIGNAL_STOP (run$_cvterr, 2, interval, run$a_input_desc, .run$l_status);
+
+IF CLI$GET_VALUE (schedule, run$a_input_desc)		! How about /SCHEDULE?
+THEN
+    IF NOT (run$l_status = LIB$CVT_TIME (run$a_input_desc, run$q_daytim))
+    THEN
+        SIGNAL_STOP (run$_cvterr, 2, schedule, run$a_input_desc, .run$l_status);
+
+END;    ! of ROUTINE get_wakeup_info
+
+
+%SBTTL	'get_uic -- Process the UIC, converting it to a longword value'
+ROUTINE get_uic : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    This routine is responsible for obtaining and converting a UIC string
+!    of the form [group, member] to a longword value.
+!
+! Implicit Inputs:
+!
+!    run$a_input_desc	adr	Address of a general purpose dynamic
+!				string descriptor.
+!
+! Side Effects:
+!
+!    If the UIC could not be converted, we will inform the user with
+!    an invalid UIC diagnostic and exit.
+!
+!--
+BEGIN
+
+LOCAL
+    TPA_PARAM :	$BBLOCK [TPA$K_LENGTH0]
+		INITIAL (REP TPA$K_LENGTH0 OF BYTE (0));
+
+IF CLI$GET_VALUE (uic, run$a_input_desc)		! If the user supplied a UIC
+THEN							! convert it to a longword value.
+    BEGIN
+    tpa_param [tpa$l_count] = tpa$k_count0;
+    tpa_param [tpa$l_stringcnt] = .run$a_input_desc [dsc$w_length];
+    tpa_param [tpa$l_stringptr] = .run$a_input_desc [dsc$a_pointer];
+
+    IF NOT LIB$TPARSE (tpa_param, uic_states, uic_keys)
+    THEN
+	SIGNAL_STOP (run$_invuic, 1, run$a_input_desc); ! converting the UIC, inform the user.
+    END;
+
+END;    ! of ROUTINE get_uic
+
+
+%SBTTL	'get_privileges -- Obtain the process privileges'
+ROUTINE get_privileges : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    This routine iteratively calls the routine CLI$GET_VALUE to obtain the
+!    privileges specified by the user.  The private CLI routine PRV$SETPRIV
+!    is then called to convert the ascii string name into a bit number and
+!    set/clear the appropriate bit in the privilege mask.
+!
+! Implicit Inputs:
+!
+!    prv$a_input_desc	adr	Address of a general purpose deynamic
+!				string descriptor.
+!    prv$q_prvadr	adr	Address of the privilege mask quadword.
+!
+! Implicit Outputs:
+!
+!    The privilege vector has been established.  The privileges are set/cleared
+!    according to whether the were explicitly specified, explicitly negated
+!    or set as a result of the 'SAME' privilege.
+!
+! Side Effects:
+!
+!    The 'SAME' privilege is special cased...
+!
+!    If an invalid privilege keyword is detected we will signal a fatal error.
+!
+!--
+BEGIN
+
+BIND
+    same =	$descriptor ('SAME'):	$bblock,
+    nosame =	$descriptor ('NOSAME'):	$bblock;
+
+IF (CLI$PRESENT ($descriptor ('PRIVILEGES.SAME')) EQL cli$_negated)		! Default action is to use the same
+THEN    run$q_prvadr [1] = run$q_prvadr [0] = 0;				! privileges as the creating process'.
+
+WHILE CLI$GET_VALUE (privileges, run$a_input_desc)				! Preclude an invalid keyword error by
+DO										! screening out the '[NO]SAME' privilege.
+   IF  CH$NEQ (.run$a_input_desc [dsc$w_length], .run$a_input_desc [dsc$a_pointer], .same [dsc$w_length], .same [dsc$a_pointer])
+   AND CH$NEQ (.run$a_input_desc [dsc$w_length], .run$a_input_desc [dsc$a_pointer], .nosame [dsc$w_length], .nosame [dsc$a_pointer])
+   THEN
+        IF NOT prv$setpriv (run$a_input_desc, run$q_prvadr)
+        THEN    SIGNAL_STOP (run$_invquaval, 2, run$a_input_desc, privileges);
+
+END;    ! of ROUTINE get_privileges
+
+
+%SBTTL	'get_quotas -- Obtain the process quota values'
+ROUTINE get_quotas : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    This routine is responsible for establishing the quota list.
+!
+!    NOTE:  The ending address of the quota table computation in the INCR
+!	    loop below subtracts 2 from the pql$_length value.  This is the
+!	    correction value for the unused pql$_listend entry and the true
+!	    ending address of the quota table.
+!
+! Implicit Inputs:
+!
+!    The quota list table.
+!
+!    Quota table format:
+!
+!	31		7	0
+!			+-------+
+!			! name  !
+!	+---------------+-------+
+!	!  cmnd line ent desc	!
+!	+-----------------------+
+!
+!	Where the name field contains the PQL$_xxx value
+!	and the cmnd line ent desc contains the address
+!	of the quota name descriptor.
+!
+! Implicit Outputs:
+!
+!    The quota list is established.
+!
+!--
+BEGIN
+
+LOCAL
+    value : volatile;						! Command line entity's value.
+
+INCR entry FROM run$a_quota_tbl					! Search through the quota list looking for any
+           TO run$a_quota_tbl + ((pql$_length - 2) * list_k_entry_size)	! quota info specified in the command line.
+           BY list_k_entry_size
+DO
+    BEGIN							! If we find some, put it into the $CREPRC quota list.
+    BIND    quota_entry = .entry : $bblock;			! Change reference structure.
+    IF CLI$PRESENT (.quota_entry [list_l_value])		! Was this entity in the command line?
+    THEN							! Yes...
+        BEGIN
+        IF .quota_entry [list_b_name] EQL pql$_cpulm		! Is this quota the CPU time limit?
+        THEN    get_cpulm (.quota_entry [list_l_value], value)	! Yes, special case for CPU time limit...
+        ELSE    get_value (.quota_entry [list_l_value], value);	! Normal case, just get the value.
+        insert_quota (.quota_entry [list_b_name], .value);	! Insert this quota into the quota list.
+        END;
+    END;    ! of DO statement.
+
+IF .run$a_quota NEQ 0						! If any quotas have been processed, be sure to
+THEN insert_quota (pql$_listend, 0);				! terminate the list.
+
+END;    ! of ROUTINE get_quotas
+
+
+%SBTTL	'get_cpulm -- Special case the CPU time limit quota'
+ROUTINE get_cpulm (entry, value) : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    This routine handles the special case of the CPU time limit quota,
+!    since a simple string to numeric conversion is not the case.
+!
+!    We perform the CLI call back locally to get the cpu time limit string,
+!    then we call the time conversion routine followed by reducing the time
+!    value to a single longword.
+!
+! Inputs:
+!
+!    entry	adr	Address of the string descriptor for the
+!			cpu time limit quota command qualifier.
+!
+! Outputs:
+!
+!    value	adr	The address of the resultant time value.
+!
+! Side Effects:
+!
+!    If any errors are encountered the will be signalled.
+!
+!--
+BEGIN
+
+BUILTIN
+    EDIV;
+
+LOCAL
+    delta : VECTOR [2, LONG],					! Delta time quadword.
+    psl : $bblock [4];						! Copy of the processor status longword.
+
+MAP
+    entry : REF $bblock,
+    value : REF $bblock;
+
+CLI$GET_VALUE (.entry, run$a_input_desc);			! First we must get the time string and
+IF (run$l_status = LIB$CVT_DTIME (run$a_input_desc, delta))	! convert the .ASCID string to a delta time.
+THEN								! If conversion was ok then condense the delta
+    BEGIN							! time to a single longword value.
+    psl = EDIV (%REF(-200000), delta [0], delta [0], delta [1]);! Convert the delta time to a CPU time limit.
+
+    IF .psl [psl$v_v]						! Check for overflow.
+    THEN    SIGNAL_STOP (run$_illval, 1, run$a_input_desc);	! CPU time limit value was too big.
+
+    IF .delta [1] NEQ 0						! No overflow...should we round the
+    THEN    delta [1] = 1;					! CPU time limit?
+
+    .value = (.delta [0] * 2) + .delta [1];			! Set the CPU time limit.
+    END
+ELSE
+    SIGNAL_STOP (run$_syntax, 1, run$a_input_desc, .run$l_status);
+
+END;    ! of ROUTINE get_cpulm
+
+
+%SBTTL	'get_value -- Obtain and convert a command line entity'
+ROUTINE get_value (entry, ret_val) : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    This routine will obtain a command line entity and convert
+!    the text representation of the value into a numeric quantity.
+!
+! Inputs:
+!
+!    entry	adr	The address of the current command line quota entity
+!			in the quota table.
+!
+! Outputs:
+!
+!    ret_val	adr	The address of a longword to receive the converted value
+!			of the command line entity.
+!
+! Side Effects:
+!
+!    Errors encountered during conversion will be signalled.
+!
+!--
+BEGIN
+
+LOCAL
+    value_desc : $bblock [dsc$c_s_bln],				! Descriptor for conversion to a numeric value.
+    value;							! Resultant value from conversion.
+
+MAP
+    entry :	REF $bblock,
+    ret_val :	REF $bblock;
+
+value_desc [dsc$w_length] = 0;					! Length is left upto the conversion routine.
+value_desc [dsc$b_dtype] = dsc$k_dtype_lu;			! Type is unsigned longword.
+value_desc [dsc$b_class] = dsc$k_class_s;			! Scalar.
+value_desc [dsc$a_pointer] = value;				! Address to store result of conversion.
+
+IF CLI$GET_VALUE (.entry, run$a_input_desc)			! If the entity is present in the command
+THEN								! line and has a value associated with it,
+    IF NOT (run$l_status =					! perform the conversion according to the information
+                LIB$CVT_DX_DX (run$a_input_desc, value_desc)) 	! supplied by the descriptors.
+    THEN    SIGNAL_STOP (run$_cvterr, 2, .entry, run$a_input_desc, .run$l_status)
+    ELSE    .ret_val = .value;
+
+END;    ! of ROUTINE get_value
+
+
+%SBTTL	'insert_quota -- Insert a quota into the quota list'
+ROUTINE insert_quota (name, value) : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    This routine is respsonsible for entering the specified
+!    quota list entry into the quota list.
+!
+! Inputs:
+!
+!    name	val	The name of the quota (pql$_xxx)
+!
+!    value	val	The value of the quota.
+!
+! Implicit Outputs:
+!
+!    The quota entry has been added to the quota list and
+!    the list pointer has been updated to point to the next
+!    entry slot.
+!
+! Side Effects:
+!
+!    If this is the first call, we will allocate a heap of
+!    memory to store the quota list in.  This will be
+!    deallocated at image rundown.
+!
+!--
+BEGIN
+
+OWN
+    quota_ptr : REF $bblock [4];
+
+IF .run$a_quota EQL 0					! Has a quota list been allocated?
+THEN                                                    ! No, allocate one...
+    BEGIN						! Call library routine to get virtual memory.
+    IF NOT (run$l_status =				! The number of bytes required for the quota list
+        LIB$GET_VM (%REF(list_k_entry_size * pql$_length), ! is computed as the size of a quota list entry
+                    run$a_quota))			! times the number of entries (including the terminator!).
+    THEN						! 
+        SIGNAL_STOP (run$_insvirmem, 0, .run$l_status);	! As usual, errors will be sent to the caller.
+
+        quota_ptr = .run$a_quota;			! Point to the first entry in the list.
+    END;
+
+quota_ptr [list_b_name] = .name;			! Set the quota name (pql$_xxxx).
+quota_ptr [list_l_value] = .value;			! Set the initial value.
+quota_ptr = .quota_ptr + list_k_entry_size;		! Point to the next quota list entry.
+
+END;    ! of ROUTINE insert_quota
+
+
+%SBTTL	'get_stsflgs -- Set up initial process state flags'
+ROUTINE get_stsflgs : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    This routine performs call backs to the CLI to obtain the initial
+!    process state flag settings.
+!
+! Implicit Inputs:
+!
+!    run$l_stsflg	adr	The address of the status flags vector.
+!
+! Implicit Outputs:
+!
+!    run$l_stsflg	adr	The various state flags have been set.
+!
+! Side Effects:
+!
+!    Several state flags have been defaulted to false.  They are:
+!    BATCH, INTER, DISAWS and NETWRK.
+!
+!--
+BEGIN
+
+run$l_stsflg [prc$v_ssrwait] = NOT (CLI$PRESENT (resource_wait));! Resource wait mode.
+run$l_stsflg [prc$v_ssfexcu] = CLI$PRESENT (service_fail);	! System service failure exception mode.
+run$l_stsflg [prc$v_pswapm] = NOT (CLI$PRESENT (swapping));	! Process swap mode.
+run$l_stsflg [prc$v_noacnt] = NOT (CLI$PRESENT (accounting));	! Process accounting.
+run$l_stsflg [prc$v_batch] = false;				! Not a batch process.
+run$l_stsflg [prc$v_inter] = false;				! Not an interactive process.
+run$l_stsflg [prc$v_hiber] = CLI$PRESENT (delay) OR		! Process hibernation state can be set
+			     CLI$PRESENT (interval) OR		! by any combination of the /DELAY,
+			     CLI$PRESENT (schedule);		! /INTERVAL or /SCHEDULE command qualifiers.
+run$l_stsflg [prc$v_login] = NOT (CLI$PRESENT (authorize));	! Process authorization if image is LOGINOUT.
+run$l_stsflg [prc$v_netwrk] = false;				! Not a network connect object.
+run$l_stsflg [prc$v_disaws] = false;				! Automatic working set adjustment state.
+run$l_stsflg [prc$v_imgdmp] = CLI$PRESENT (dump);		! Dump requested
+run$l_stsflg [prc$v_detach] = CLI$PRESENT (detach);		! Detached process
+
+END;    ! of ROUTINE get_stsflgs
+
+
+%SBTTL	'schedule_process -- Schedule the process for execution'
+ROUTINE schedule_process : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!    This routine is responsible for scheduling wake up request(s) for the
+!    created process.
+!
+! Implicit Inputs:
+!
+!    run$l_pid		adr	Address of the created process' PID.
+!    run$q_daytim	adr	Address of the wake up time quadword.
+!    run$q_interval	adr	Address of the repeat time quadword.
+!
+! Implicit Outputs:
+!
+!    The wake up request has been scheduled.
+!
+! Side Effects:
+!
+!    If any error is encounterd while attempting to schedule the wake up
+!    request(s), we will signal a warning diagnostic to the user and exit.
+!
+!--
+BEGIN
+
+IF NOT (run$l_status = $SCHDWK (PIDADR = run$l_pid,		! Schedule a wake up for the created process.
+				DAYTIM = run$q_daytim,		! At the specified time of day.
+				REPTIM = run$q_interval))	! Repeat the scheduled wake up at this interval.
+THEN
+    SIGNAL (run$_schdwk, 1, .run$l_pid, .run$l_status);		! Report any problems scheduling the wake up request.
+
+END;    ! of ROUTINE schedule_process
+
+END    ! of MODULE rundet
+ELUDOM

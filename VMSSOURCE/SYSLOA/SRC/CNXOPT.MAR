@@ -1,0 +1,695 @@
+	.TITLE	CNXOPT - Optimal Subcluster Computation
+	.IDENT	'V04-000'
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; FACILITY: EXECUTIVE, CLUSTER MANAGEMENT
+;
+; ABSTRACT: 
+;	This module contains the routines that compute an optimal fully-
+;	connected subcluster of a given set of nodes.
+;
+; ENVIRONMENT: VAX/VMS
+;
+; AUTHOR: Dave Thiel,	 CREATION DATE: 09-Dec-1983
+;
+; MODIFIED BY:
+;
+;	V03-005	DWT0223		David W. Thiel			27-Jun-1984
+;		Add debugging traps.  Correct calculation to do consistent
+;		bookkeeping.
+;
+;	V03-004	DWT0185		David W. Thiel			2-Mar-1984
+;		Fix blown register.
+;
+;	V03-003	DWT0175		David W. Thiel			21-Feb-1984
+;		Minimize quorum disk votes against value in CLUB.
+;
+;	V03-002	DWT0165		David W. Thiel			08-Feb-1984
+;		Set up R3 before calling REMOVE_AMAP at 230$.
+;
+;	V03-001	DWT0162		David W. Thiel			01-Feb-1984
+;		Add CNX$OPT_INIT entry point.  Add management of quorum
+;		disk bit in CSB$B_NODEMAP.  Correct coding errors present
+;		in first pass.
+;
+;--
+
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+	$CLUBDEF			; CLUster Block offsets
+	$CLUOPTDEF			; CLUster OPTimization block offsets
+	$CSBDEF				; CSB Offsets
+	$DYNDEF				; Data structure type codes
+	$FKBDEF				; Fork block offsets
+
+
+;***********************************************************************
+;
+; NOTE:	The following assumptions are in effect for this entire module.
+;
+;************************************************************************
+
+;
+; Assume that all bitmaps are of the same size
+;
+	ASSUME	CLUOPT$S_CMAP,EQ,CLUOPT$S_AMAP
+	ASSUME	CLUOPT$S_CMAP,EQ,CLUOPT$S_RMAP
+	ASSUME	CLUOPT$S_CMAP,EQ,CSB$S_NODEMAP
+	ASSUME	CLUOPT$S_CMAP,EQ,CLUB$S_NODEMAP
+
+	.DEFAULT	DISPLACEMENT,WORD
+
+	.PSECT	$$$100,LONG		; PSECT for code
+
+	.SBTTL	CNX$OPT_INIT - Compute Optimal Initial Subcluster
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is is called to compute the optimal completely
+;	interconnected subcluster of the nodes marked with the select bit.
+;	No previous suggested subcluster is assumed.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$OPT_INIT
+;	IPL is IPL$_SCS=IPL$_SYNCH
+;
+; INPUT PARAMETERS:
+;
+;	For all CSB's with the SELECTED bit bit:
+;	    CSB$B_NODEMAP is a (potentially optimistic) estimate of the
+;	    connectivity of the node.
+;	In both NODEMAP's, bit 0 is used to indicate the state of the
+;	"connection" to the quorum disk.  This bit should be set only
+;	if the quorum disk is the same as on the executing node and
+;	the disk/quorum file is accessible to the subject node.
+;
+; OUTPUT PARAMETERS:
+;
+;	CLUB$L_FMERIT is the figure of merit of the computed cluster.
+;	CLUB$B_NODEMAP describes the members of the computed cluster.
+;		Bit 0 indicates quorum disk participation.
+;
+; COMPLETION CODES:
+;
+;	R0 contains status.
+;	If R0 indicates success, R1 will always contain TRUE
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+;--
+
+CNX$OPT_INIT::
+	PUSHR	#^M<R2,R3,R4,R5>	; Save registers
+	MOVL	G^CLU$GL_CLUB,R4	; Fetch address of CLUB
+	CLRL	CLUB$L_FMERIT(R4)	; Clear previous figure of merit
+	MOVC5	#0,(SP),#0, -		; Zero previous description
+		#CLUB$S_NODEMAP, -
+		CLUB$B_NODEMAP(R4)
+	POPR	#^M<R2,R3,R4,R5>	; Restore registers
+;	BRB	CNX$OPT			; Fall into CNX$OPT
+
+
+	.SBTTL	CNX$OPT - Compute Optimal Subcluster
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is is called to compute the optimal completely
+;	interconnected subcluster of the nodes marked with the select bit.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CNX$OPT
+;	IPL is IPL$_SCS=IPL$_SYNCH
+;
+; INPUT PARAMETERS:
+;
+;	CLUB$B_NODEMAP is an initial cluster to try to better.
+;	CLUB$L_FMERIT is the figure of merit of the initial cluster.
+;	For all CSB's with the SELECTED bit bit:
+;	    CSB$B_NODEMAP is a (potentially optimistic) estimate of the
+;	    connectivity of the node.
+;	In both NODEMAP's, bit 0 is used to indicate the state of the
+;	"connection" to the quorum disk.  This bit should be set only
+;	if the quorum disk is the same as on the executing node and
+;	the disk/quorum file is accessible to the subject node.
+;
+; OUTPUT PARAMETERS:
+;
+;	CLUB$L_FMERIT is the figure of merit of the computed cluster.
+;	CLUB$B_NODEMAP describes the members of the computed cluster.
+;		Bit 0 indicates quorum disk participation.
+;
+; COMPLETION CODES:
+;
+;	R0 contains status.
+;	If R0 indicates success, R1 indicates whether an improved cluster
+;		(improved over the initial cluster described in CLUB$L_FMERIT
+;		 and CLUB$B_NODEMAP) was found.
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+; DESCRIPTION:
+;
+;	This procedure investigates all possible fully connected subclusters
+;	that include the local node and chooses the one with the largest figure
+;	of merit.  The figure of merit is defined as:
+;		(sum of the votes of the nodes * 256) + number of nodes
+;	The votes of the quorum disk are counted, but the quorum disk as a
+;	node is not counted.
+;
+;	The search is done recursively, using a linked list of CLUOPT structures
+;	as the stack for the recursion.  The CLUOPT structure contains the
+;	following interesting fields:
+;	CLUOPT$L_PREV:	Link to previous block
+;	CLUOPT$L_CMERIT: Sum of the votes of the VAX nodes in CMAP
+;	CLUOPT$L_ACMERIT: Sum of the votes of the VAX nodes in CMAP and AMAP
+;	CLUOPT$B_CMAP:	Bit map of nodes already included in the cluster being
+;			computed.  All of the nodes in CMAP are fully
+;			interconnected.
+;	CLUOPT$B_AMAP:	Bit map of nodes available for inclusion in the cluster
+;			being computed.
+;	CLUOPT$B_RMAP:	Bit map of nodes excluded from consideration in the
+;			cluster by virtue of at least one node in CMAP not
+;			having a connection to the node.
+;
+;	CLUB$B_NODEMAP and CLUB$L_FMERIT are updated every time a better cluster
+;	is found.
+;
+;	A direct implemention of the search required takes (N-1)! (factorial) steps.
+;	The execution time is kept within reason for the expected cases by the
+;	following heuristic techniques:
+;	1.  Whenever the upper bound on what may be attainable is worse than what
+;	    has already been achieved, the recursion is abandoned.
+;	2.  Whenever multiple nodes are equivalent, they are dealt with
+;	    simultaneously, reducing the breadth and depth of the search.
+;
+;--
+
+CNX$OPT::
+	PUSHR	#^M<R2,R3,R4,R5,R6,R7,R8,R9,R10>	; Save some registers
+	CLRL	-(SP)			; Flag indicating no improved cluster found
+	CLRQ	R9			; R9 is top of frame stack
+					; R10 is address of mapping vector
+	MOVZWL	#<<CSB$S_NODEMAP*8>*4>+12, - ; One longword per possible system
+		R1			;   plus standard header
+	BSBW	CNX$ALLOZMEM		; Allocate and zero memory
+	BLBC	R0,10$			; Branch on error
+	MOVL	R2,R10			; Address of mapping vector
+	MOVZBL	#<CSB$S_NODEMAP*8>-1,R0	; number of phoney cells
+5$:	MOVL	#1,12(R10)[R0]		; catch use of uninitialized cell
+	SOBGTR	R0,5$
+	MOVB	#DYN$C_CLU_CLUVEC, -	; Block subtype
+		FKB$B_TYPE+1(R10)	; Use block type of cluster vector
+;
+; This call enters the main body of the routine. 
+; It exists only so that several points in the routine can get
+; to the common exit with an RSB instruction.
+;
+	BSBB	100$			; Call main section
+10$:	PUSHL	R0			; Save return status
+20$:	MOVL	R9,R0			; Stack frame address
+	BEQL	30$			; Branch if no frame
+	MOVL	CLUOPT$L_PREV(R9),R9	; Pop the stack
+	JSB	G^EXE$DEANONPAGED	; Deallocate the frame
+	BRB	20$			; Iterate to flush more frames
+
+30$:	MOVL	R10,R0			; Vector address
+	BEQL	40$			; Branch if no
+	JSB	G^EXE$DEANONPAGED	; Deallocate vector
+40$:
+	BSBW	CNX$SCAN_CSBS		; Iterate over all CSBs
+	BLBC	R0,50$			; Branch when done
+	BICB	#1,CSB$B_NODEMAP(R3)	; Clear quorum disk bit
+	RSB
+
+50$:	BICB	#1,CLUB$B_NODEMAP(R4)	; Clear quorum disk bit in CLUB
+	POPR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10>	; Restore registers, fetch status
+60$:	RSB				; Best cluster is in CLUB$B_NODEMAP
+;
+; Main entrance to the optimal cluster allocation.
+; The first thing to do is to allocate the CLUOPT block that describes the basis
+; of the recursion.  Then, the selected nodes as placed into AMAP and into the
+; vector (R10) that maps bit numbers into CSB addresses.  The local node is the
+; only initial member of CMAP.  This initializes the recursion to start from a
+; point where the local node must be a member of any computed cluster and all other
+; selected nodes are potential cluster members.
+;
+100$:	MOVZBL	#CLUOPT$K_LENGTH,R1	; Length 
+	BSBW	CNX$ALLOZMEM		; Allocate and zero memory
+	BLBC	R0,60$			; Branch on error
+	MOVL	R2,R9			; Update stack frame
+	MOVB	#DYN$C_CLU_CLUOPT, -	; Block sub-type
+		CLUOPT$B_SUBTYPE(R9)
+	BSBW	CNX$SCAN_CSBS		; iterate over all CSBs
+	BLBC	R0,140$			; Branch when done
+	BBC	#CSB$V_SELECTED, -	; Branch if not selected
+		CSB$L_STATUS(R3),130$
+	BICB	#1,CSB$B_NODEMAP(R3)	; Clear quorum disk bit
+	BBC	#CSB$V_QF_SAME, -	; Branch if quorum disk not
+		CSB$L_STATUS(R3),110$	;   same as local node
+	BBC	#CSB$V_QF_ACTIVE, -	; Branch if quorum disk not
+		CSB$L_STATUS(R3),110$	;   accessible
+	BISB	#1,CSB$B_NODEMAP(R3)	; Mark connection to quorum disk
+110$:	MOVZWL	CSB$W_CSID_IDX(R3),R1	; CSID index
+	MOVL	R3,12(R10)[R1]		; Store CSB address in vector
+	BBSS	R1,CLUOPT$B_AMAP(R9),135$ ; Set bit in available map
+120$:	MOVZWL	CSB$W_VOTES(R3),R0	; Votes held by node
+	ASHL	#8,R0,R0		; Scale votes
+	INCL	R0			; Count the node
+	ADDL2	R0,CLUOPT$L_ACMERIT(R9)	; Update ACMERIT
+	BBC	#CSB$V_LOCAL, -		; Branch if not local CSB
+		CSB$L_STATUS(R3),130$
+	MOVL	R9,R2			; Stack frame for ADD_CMAP
+	BRW	ADD_CMAP		; Add the node to CMAP and return
+130$:	RSB
+
+135$:	BUG_CHECK	CNXMGRERR,FATAL	; funny data
+
+140$:	BBSS	#0,CLUOPT$B_AMAP(R9),135$ ; Mark the quorum disk available
+;
+; This is the entry point into the recursion.
+; R9 is the address of the CLUOPT block for the current level of recursion.
+;	CMAP(R9) is the map of nodes definitely in the cluster being computed.
+;	AMAP(R9) is the map of nodes that are still candidates for inclusion
+;			in the cluster being computed.
+;	PREV(R9) is the address of the previous CLUOPT block in the recursion.
+;	CMERIT(R9) is the figure of merit of the VAX nodes in CMAP.
+;	ACMERIT(R9) is the figure of merit of all of the VAX nodes in AMAP and
+;			CMAP.  It is thus an upper bound on the figure of merit
+;			of any possible cluster, exclusive of the contribution
+;			of a possible quorum disk.
+; R10 is the address of the CSB vector
+;
+200$:
+;
+; Remove from AMAP every node not connected to all nodes in CMAP
+;
+	PUSHAB	CLUOPT$B_AMAP(R9)	; Address of map to scan
+	BSBW	SCAN_MAP		; Initializer map scanner
+	BLBC	R0,240$			; Branch when done
+	MOVL	12(R10)[R1],R3		; CSB address
+	BBS	R1,CLUOPT$B_RMAP(R9),230$ ; Some node in CMAP is not connected to node
+	TSTL	R3			; Nonexistent CSB? (quorum disk)
+	BEQL	220$			; Ignore quorum disk
+	ASSUME	CLUOPT$S_CMAP&3,EQ,0	; Assume bitmap is an integral number of longwords
+	ASSUME	CLUOPT$S_CMAP,GE,4	; Assume at least one iteration
+	MOVL	#<CLUOPT$S_CMAP/4>-1,R0
+210$:	BICL3	CSB$B_NODEMAP(R3)[R0], - ; Look for missing connection to any node in
+		CLUOPT$B_CMAP(R9)[R0],R2 ;  CMAP
+	BNEQ	230$			; Branch if connection is missing
+	SOBGEQ	R0,210$			; Iterate over entire connection map
+220$:	RSB				; Return to scanner
+
+230$:	MOVL	R9,R2			; Stack frame for removal
+	BRW	REMOVE_AMAP		; Remove from AMAP and return to scanner
+
+240$:
+;
+; Loop at a given recursion depth.
+; R9 is CLUOPT block for this depth.
+; R10 is vector of CSB's.
+;
+300$:
+;
+; Determine whether the recursion can be discontinued because the best possible result
+; is not better than the best result already attained.
+; Compute an upper bound the the figure of merit by summing the votes of all nodes
+; in AMAP and CMAP with the minimum of the votes proposed for the quorum disk by
+; the nodes in CMAP.
+;
+	MOVL	G^CLU$GL_CLUB,R4	; Address of CLUB
+	MOVL	CLUOPT$L_ACMERIT(R9),R7	; Contribution of VAX nodes
+	BLBS	CLUOPT$B_RMAP(R9),310$	; Branch if quorum disk is excluded
+	BSBW	QDMERIT			; Calculate quorum disk contribution
+	ADDL2	R0,R7			; Include contribution of quorum disk
+310$:	CMPL	R7,CLUB$L_FMERIT(R4)	; Compare best attainable to best already
+	BLEQU	340$			; Branch if no improvement possible
+;
+; Pick a node from AMAP
+; If none are available, this recursion level is done
+;
+	ASSUME	CLUOPT$S_AMAP&3,EQ,0
+	ASSUME	CLUOPT$S_AMAP,GE,4	; Assume at least one iteration
+	MOVL	#CLUOPT$S_AMAP/4,R1	; Number of iterations
+	CLRL	R0			; Starting bit position
+320$:	FFS	R0,#32,CLUOPT$B_AMAP(R9),R0
+	BNEQ	400$			; Branch if bit found
+	SOBGTR	R1,320$			; Iterate over all longwords
+;
+; No nodes in list of remaining nodes.
+; We are at the bottom of the recursion.
+; Check for best cluster yet and store new best cluster.
+;
+	MOVL	CLUOPT$L_CMERIT(R9),R7	; VAX contribution to figure of merit
+	BLBC	CLUOPT$B_CMAP(R9),330$	; Branch if quorum disk not included
+	BSBW	QDMERIT			; Calculate disk contribution
+	ADDL2	R0,R7
+330$:	CMPL	R7,CLUB$L_FMERIT(R4)	; Compare this cluster to best seen so far
+	BLEQU	340$			; Branch if new one is no better, return
+	MOVL	R7,CLUB$L_FMERIT(R4)	; Save figure of merit
+	MOVC3	#CLUB$S_NODEMAP, -
+		CLUOPT$B_CMAP(R9), -
+		CLUB$B_NODEMAP(R4)
+	MOVL	S^#SS$_NORMAL,4(SP)	; Mark an improved cluster found
+340$:	MOVL	R9,R0			; Address of CLUOPT block
+	MOVL	CLUOPT$L_PREV(R9),R9	; POP CLUOPT block stack
+	JSB	G^EXE$DEANONPAGED	; Deallocate this CLUOPT block
+	TSTL	R9			; End of stack?
+	BNEQ	300$			; Branch if no to continue
+;
+; The recursion is complete.  This is the main exit.
+;
+	MOVL	S^#SS$_NORMAL,R0	; Successful return
+350$:	RSB
+;
+; A node (index in R0) has been chosen as the basis for constructing a new frame
+; and taking the recursion down a level.
+; Begin building a new frame.
+;
+400$:	MOVL	12(R10)[R0],R3		; CSB of basis node
+;
+; Regsister/Data available:
+;
+;	0(SP)	CSB for chosen basis node
+;	R8:	CLUOPT for previous frame
+;	R9:	CLUOPT for new current frame
+;	R10:	Vector of nodes
+;
+	MOVZBL	#CLUOPT$K_LENGTH,R1	; Length 
+	JSB	G^EXE$ALONONPAGED	; Allocate memory
+	BLBC	R0,350$			; Branch on error
+	MOVL	R9,R8			; New previous frame
+	MOVL	R2,R9			; New current frame
+	PUSHR	#^M<R1,R3>		; Save CSB address and frame length
+	MOVC5	CLUOPT$W_SIZE(R8),(R8), - ; Copy old block into the new
+		#0,R1,(R9)
+	CVTLW	(SP)+,CLUOPT$W_SIZE(R9)	; Restore size word
+	MOVL	R8,CLUOPT$L_PREV(R9)	; Link to previous frame
+;
+; Regsister/Data available:
+;
+;	0(SP)	CSB for chosen addition
+;	R8:	CLUOPT for previous frame
+;	R9:	CLUOPT for new current frame
+;	R10:	Vector of nodes
+;
+; Find equivalent nodes in set of remaining nodes (AMAP).
+; Nodes are equivalent if they see the same connectivity with respect to
+; cluster and available nodes that are seen by the chosen node.
+; Note that the chosen basis node is added by virtue of it being equivalent
+; to itself.  The quorum disk is treated as a special case because no CSB
+; exists for the disk proper.
+;
+	POPL	R4			; Is the chosen node the quorum disk?
+	BEQL	450$			; Branch if yes
+	PUSHAB	CLUOPT$B_AMAP(R8)	; Scan available nodes in previous frame
+	BSBW	SCAN_MAP		; Initialize scanner
+	BLBC	R0,460$			; Branch when done
+	MOVL	12(R10)[R1],R3		; CSB of node under consideration
+	BEQL	440$			; Branch if quorum disk and ignore it
+	ASSUME	CSB$S_NODEMAP&3,EQ,0	; Assume an integral number of longwords
+	ASSUME	CSB$S_NODEMAP,GE,4	; Assume at least one iteration
+	MOVL	#<CSB$S_NODEMAP/4>-1,R2	; Iterate over all bytes of map
+420$:	XORL3	CSB$B_NODEMAP(R4)[R2], - ; Compute differences between chosen
+		CSB$B_NODEMAP(R3)[R2],R5 ;   and candidate nodes
+;
+; Check if any of the differences reflect nodes in either the new CMAP or new AMAP.
+; Note that new CMAP .OR. new AMAP is a constant during the execution of this phase
+; since the only changes allowed move bits from one to the other.
+;
+	BITL	R5,CLUOPT$B_CMAP(R9)[R2] ; Check for differences with CMAP nodes connectivity
+	BNEQ	440$			; Branch on discrepancy and reject this addition
+	BITL	R5,CLUOPT$B_AMAP(R9)[R2] ; Check for differences with AMAP nodes' connectivity
+	BNEQ	440$			; Branch on discrepancy and reject this addition
+	SOBGEQ	R2,420$
+;
+; At this point, the node whose index is in R1 has the same connectivity, with respect
+; to nodes in CMAP and AMAP, as the basis node and is therefore equivalent to the basis
+; node in every respect.  The basis node plus all equivalent nodes are moved from AMAP
+; to CMAP simultaneously.  This is a major optimization of the direct implementation
+; of this search (which takes N! (N factial) steps) because the commonly anticipated
+; cases have large numbers of equivalent nodes.
+;
+; Note that a BSB call is made to this point to handle the quorum disk!
+;
+430$:	MOVL	R9,R2			; Stack frame for ADD_CMAP
+	BSBB	ADD_CMAP		; Add node to new CMAP
+	MOVL	R8,R2			; Use previous CLUOPT address
+	BSBB	REMOVE_AMAP		; Remove from old AMAP and return
+440$:	RSB
+
+450$:	CLRL	R1			; Disk is node 0
+	CLRL	R3			; No CSB
+	BSBB	430$			; Use same code as for normal case
+460$:	BRW	200$			; The new recursion is set up -- do it!
+
+	.SBTTL	ADD_CMAP - Add a node to CMAP
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine adds a node to CMAP, adjusts the figure of merit for the
+;	subcluster attained in CMAP and the best potential subcluster, and
+;	updates RMAP to reflect any additional nodes whose membership is
+;	incompatibile with the subject node.
+;	If the subject node is a member of AMAP, it is removed.
+;
+; CALLING SEQUENCE:
+;
+;	BSBB/BSBW/JSB	ADD_CMAP
+;
+; INPUT PARAMETERS:
+;
+;	R1:		Index of the node to add to CMAP
+;	R2:		Address of CLUOPT block containing the CMAP and AMAP
+;	R3:		Address of the CSB of the node to add
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	The contents of R0 are destroyed.
+;
+;--
+
+ADD_CMAP:
+	BBSS	R1,CLUOPT$B_CMAP(R2),30$ ; Add to new CMAP, branch if present
+	TSTL	R1			; Is the subject the quorum disk
+	BEQL	20$			; Branch if quorum disk
+	MOVZWL	CSB$W_VOTES(R3),R0	; Votes held by node
+	ASHL	#8,R0,R0		; Count each vote as 256 points
+	INCL	R0			; Include the node
+	ADDL2	R0,CLUOPT$L_CMERIT(R2)	; Add to CMERIT
+	ADDL2	R0,CLUOPT$L_ACMERIT(R2)	; Add to ACMERIT
+	ASSUME	CSB$S_NODEMAP&3,EQ,0	; Assume map is an integral number of longwords
+	ASSUME	CSB$S_NODEMAP,GE,4	; Assume at least one iteration
+	MOVL	#<CSB$S_NODEMAP/4>-1,R0	; Update rejection map
+10$:	MCOML	CSB$B_NODEMAP(R3)[R0],-(SP) ; Nodes not connected to subject node
+	BISL2	(SP)+,CLUOPT$B_RMAP(R2)[R0] ; Mark unconnected nodes as rejected
+	SOBGEQ	R0,10$			; Iterate over all longwords of map
+20$:	BSBB	REMOVE_AMAP		; Remove the node from AMAP
+	RSB				; Fall into REMOVE_AMAP
+
+30$:	BUG_CHECK	CNXMGRERR,FATAL	; Invalid state
+
+	.SBTTL	REMOVE_AMAP - Remove a node from AMAP
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine removes a node from AMAP and adjusts the figure of
+;	merit for the best potential subcluste to reflect the absence of
+;	this node.
+;
+; CALLING SEQUENCE:
+;
+;	BSBB/BSBW/JSB	REMOVE_AMAP
+;
+; INPUT PARAMETERS:
+;
+;	R1:		Index of the node to add to CMAP
+;	R2:		Address of CLUOPT block containing the CMAP and AMAP
+;	R3:		Address of the CSB of the node to add
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	The contents of R0 are destroyed.
+;
+;--
+
+REMOVE_AMAP:
+	BBCC	R1,CLUOPT$B_AMAP(R2),20$ ; Remove from AMAP, branch if not present
+	TSTL	R1			; Is the subject the quorum disk?
+	BEQL	10$			; Branch if yes
+	MOVZWL	CSB$W_VOTES(R3),R0	; Votes held by node
+	ASHL	#8,R0,R0		; Count each vote at 256 points
+	INCL	R0			; Include the node
+	SUBL2	R0,CLUOPT$L_ACMERIT(R2)	; Remove from ACMERIT
+10$:	RSB
+
+20$:	BUG_CHECK	CNXMGRERR,FATAL	; Invalid state
+
+	.SBTTL	QDMERIT - Quorum disk contribution to figure of merit
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine computes the contribution of the quorum disk to the figure
+;	of merit.  It assumes that the quorum disk does contribute.  The
+;	contribution is calculated as the minimum of the votes proposed for the
+;	quorum disk by each of the nodes in CMAP.  This minimum is scaled in
+;	the same way as the votes contributed by a VAX node.  However, the
+;	quorum disk does not get another point to represent the node itself.
+;	Thus a VAX node with 1 vote is more desirable than a 1 vote contribution
+;	from the quorum disk.
+;
+; CALLING SEQUENCE:
+;
+;	BSBB/BSBW/JSB	QDMERIT
+;
+; INPUT PARAMETERS:
+;
+;	R4:		Address of CLUB
+;	R9:		Address of CLUOPT block describing the tentative cluster
+;	R10:		Address of vector mapping bitmap indices to CSB addresses
+;
+; OUTPUT PARAMETERS:
+;
+;	R0 contains the quorum disk's contribution to the figure of merit
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	The contents of R1 and R2 are destroyed.
+;
+;--
+
+QDMERIT:
+	MOVZWL	CLUB$W_QDVOTES(R4),R2	; Accumulate minimum quorum disk votes in CMAP
+	PUSHAB	CLUOPT$B_CMAP(R9)	; Push address of map to process
+	BSBB	SCAN_MAP		; Get call-back for each bit
+	BLBC	R0,20$			; Branch if done
+	MOVL	12(R10)[R1],R0		; CSB address
+	BEQL	10$			; Branch if no CSB (quorum disk case)
+	CMPW	CSB$W_QDVOTES(R0),R2	; Votes proposed for quorum disk
+	BGEQU	10$			; Branch if old was lower
+	MOVZWL	CSB$W_QDVOTES(R0),R2	; Update minimum
+10$:	RSB				; Continue scanning bits
+
+20$:	ASHL	#8,R2,R0		; Scale votes
+	RSB				; Return, votes in R0
+
+	.SBTTL	SCAN_MAP - Scan bits in a specified bitmap
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called to scan all of the bits in one of the bitmaps
+;	(CMAP, AMAP, RMAP) used in the optimization computation.  For every
+;	bit in the map that is set, a co-routine call-back is made.
+;
+; CALLING SEQUENCE:
+;
+;	BSBB/BSBW/JSB	SCAN_MAP
+;
+; INPUT PARAMETERS:
+;
+;	4(SP):		Address of bitmap to scan
+;	0(SP):		Return/co-routine address
+;
+; OUTPUT PARAMETERS/COMPLETION CODES:
+;
+;	On a co-routine callback:
+;
+;		R0 has the low bit set
+;		R1 contains the index of the bit to process
+;
+;		The co-routine must return with R1 intact.
+;
+;	After the last bit has been processed
+;
+;		R0 has the low bit clear
+;
+; SIDE EFFECTS:
+;
+;	At the final return, R1 has been destroyed.
+;	Any registers modified by the co-routines are changed.
+;
+;--
+
+SCAN_MAP:
+	CLRL	R1			; Initialize bit number
+	ASSUME	CLUOPT$S_CMAP,GE,4	; Assume at least one longword of bitmap
+10$:	MOVL	#32,R0			; Do as many bits as VAX can
+20$:	FFS	R1,R0,@4(SP),R1		; Look for a bit in the map
+	BEQL	30$			; No bits found
+	MOVL	S^#SS$_NORMAL,R0	; Set success status
+	JSB	@(SP)			; Do co-routine callback
+	INCL	R1			; Bump over selected bit
+30$:	SUBL3	R1, -			; Is there at least a longword left?
+		#<CLUOPT$S_CMAP*8>-32,R0
+	BGEQ	10$			; Branch if yes
+	ADDL2	#32,R0			; Compute number of bits remaining
+	BGTR	20$			; Branch if some bits left
+	MOVL	(SP)+,(SP)		; Remove map address
+	CLRL	R0			; Set return status
+	RSB				; Return, scanning complete
+
+	.END

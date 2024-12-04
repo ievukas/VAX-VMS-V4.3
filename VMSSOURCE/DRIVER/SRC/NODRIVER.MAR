@@ -1,0 +1,4844 @@
+	.TITLE	NODRIVER- VAX/VMS DMF32 Async DDMCP Line Driver
+	.IDENT	'V04-001'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984      				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;++
+; FACILITY:
+;
+;	VAX/VMS Async DDCMP line driver
+;
+; ABSTRACT:
+;
+;	This module contains the Async DDCMP line driver FDT routines,
+;	interrupt dispatcher, interrupt service and fork routines.
+;
+; AUTHOR:
+;
+;	Meg Dumont 1-OCT-83
+;
+; MODIFIED BY:
+;
+;	V04-001	MMD0328		Meg Dumont,	5-Sep-1984  18:16
+;		Fix bugs in the xmt error, error paths.
+;
+;	V03-008	MMD0322		Meg Dumont,	13-Aug-1984  8:55
+;		Fix to SENSEMODE_CTRL where DDCMP could be called without
+; 		the protocol/NOB buffers having been set up.
+;
+;	V03-007	MMD0318		Meg Dumont,	25-Jul-1984  11:34
+;		Fix to clear the GFB before giving it to protocol and fix 
+;		to DEVTIMER, we were using the wrong register in testing the
+;		timeout conditions.
+;
+;	V03-006	LMP0275		L. Mark Pilant,		12-Jul-1984  12:30
+;		Initialize the ACL info in the ORB to be a null descriptor
+;		list rather than an empty queue.  This avoids the overhead
+;		of locking and unlocking the ACL mutex, only to find out
+;		that the ACL was empty.
+;
+;	V03-005	MMD0299		Meg Dumont,	18-May-1984  10:26
+;		Fix to returning of quota on line startup. Also fix to check
+;		that the buffers are allocated before using them in the 
+;		sensemode paths'.
+;
+;	V03-004	MMD0297		Meg Dumont,	14-May-1984  14:54
+;		Fix bug in COM_XMITFDT error path
+;
+;	V03-003	MMD0294		Meg Dumont,	23-Apr-1984  16:02
+;		Fix so that if the TFB address is not valid the driver won't
+;		try to do an XMIT. Fix to support a new interface with the
+;		protocol. This interface is designed to fix problems with
+;		retransmitting messages out of order.
+;
+;	V03-002	LMP0221		L. Mark Pilant,		27-Mar-1984  10:13
+;		Change UCB$L_OWNUIC to ORB$L_OWNER and UCB$W_VPROT to
+;		ORB$W_PROT.
+;
+;	V03-001	MMD0262		Meg Dumont,	22-Mar-1984  14:40
+;		Fix so that the driver doesn't crash if an XMT or RCV 
+;		is queued to the device before the device is started.
+;		Add support for timers on receives and transmits.
+;
+;--
+
+
+; System definitions
+
+	$ACBDEF					; AST control 
+	$CRBDEF					; Controller request block
+	$CXBDEF					; Complex buffer block
+	$DDBDEF					; Device data block
+	$DDCMPDEF				; Constant def's for DDCMP
+	$DEVDEF					; Device charateristics
+	$DLADEF					; Driver/protocol command defs
+	$DLKDEF					; Driver/protocol command defs
+	$DYNDEF					; Dynamic data structures
+	$DPTDEF					; Driver prologue table
+	$GFDEF					; Global field definitions
+	$IODEF					; I/O function codes
+	$IPLDEF					; Interrupt priority levels
+	$IRPDEF					; I/O packets
+	$JIBDEF					; Job information block
+	$MFDDEF					; Message field descriptor
+	$NMADEF					; Network management def's
+	$ORBDEF					; Object's Rights Block offsets
+	$PCBDEF					; Process control block
+	$SSDEF					; System service status
+	$TFDEF					; DDCMP buffer def's
+	$TTDEF					; Terminal characteristics
+	$TT2DEF					;    "        "
+	$TTYDEF					;    "        "
+	$TTYMACS				; Def terminal macros
+	$TTYDEFS				; Define terminal definitions
+	$TTYMODEM				; Define terminal modem signals
+	$TTYUCBDEF				; Terminal UCB extension
+	$TTYVECDEF				; Define terminal vectors
+	$TQEDEF					; Timer queue element def's
+	$UCBDEF					; Unit control block
+	$VECDEF
+	$XMDEF					; XMDRIVER symbols
+	$XMTQDEF				; Transmit Q def's
+
+
+; Local macros
+
+	.MACRO	SETBIT	POS,BAS,?L		; Set a single bit
+		BBSS	POS,BAS,L
+	L:
+	.ENDM	SETBIT
+
+	.MACRO	CLRBIT	POS,BAS,?L		; Clear a single bit
+		BBCC	POS,BAS,L
+	L:
+	.ENDM 	CLRBIT
+ 
+; Bit Definitions
+
+	.MACRO	BITDEF	BLK,SYM,BITVAL
+
+	'BLK'_V_'SYM' = BITVAL
+	'BLK'_M_'SYM' = 1@<BITVAL>
+
+	.ENDM
+
+; Constant definitions
+
+	.MACRO	CONSTDEF BLK,SYM,CONSTVAL
+
+	'BLK'$C_'SYM' = CONSTVAL
+	.ENDM
+
+; Set up the duetim table
+
+	.MACRO	STORE_DUETIM BAUDRATE,BITS,RESULT1,RESULT2,TABLE
+
+		DIVW3	#'BAUDRATE',BITS,RESULT1
+		ADDW2	#1,RESULT1
+		MOVZBL	#TT$C_BAUD_'BAUDRATE',RESULT2
+		MOVW	RESULT1,TABLE[RESULT2]
+
+	.ENDM	STORE_DUETIM
+
+	.MACRO	PARAM	TYPE,OFFSET,WIDTH,MIN,MAX,INVALID,BASE
+;++
+; 	INPUTS:
+;
+;		TYPE = Parameter type
+;		OFFSET = Offset in the data structure to current value
+;		WIDTH = Width of field in the data structure (B,W,L)
+;		MIN = Minimum value parameter is allowed to take
+;		MAX = Maximum value parameter is allowed to take
+;		INVALID = Invalid flags in status word
+;		BASE = Data base (LINE,TRIB)
+;--
+	.IF BLANK TYPE
+	.WORD	0
+	.IF_FALSE
+	$$$TYP = TYPE & PRM_M_TYPE		; Isolate type code
+	.IIF NOT_BLANK	<MIN>, $$$TYP = $$$TYP!PRM_M_MIN
+	.IIF NOT_BLANK	<MAX>, $$$TYP = $$$TYP!PRM_M_MAX
+	.IIF NOT_BLANK	<INVALID>, $$$TYP = $$$TYP!PRM_M_INVALID
+		.WORD	$$$TYP
+	$$$OFF = OFFSET & OFF_M_VALUE		; Isolate offset only
+	$$$WID = 0				; Set null width
+	.IIF IDN <WIDTH><B>, $$$WID = <1@OFF_V_WIDTH>
+	.IIF IDN <WIDTH><W>, $$$WID = <2@OFF_V_WIDTH>
+	.IIF IDN <WIDTH><L>, $$$WID = <3@OFF_V_WIDTH>
+		.WORD	$$$OFF!$$$WID
+	.IIF NOT_BLANK	<MIN>, .WORD	MIN
+	.IIF NOT_BLANK	<MAX>, .WORD	MAX
+	.IIF NOT_BLANK	<INVALID>, .WORD	INVALID
+	'BASE'_PRM_BUFSIZ = 'BASE'_PRM_BUFSIZ + 6
+	.ENDC
+	.ENDM	PARAM
+ 
+	.MACRO	SKIP	BIT,LOC,REG,CONTEXT=W,?L	; SKIP FIELD
+	BBC	#BIT,LOC,L		; Br if field not present
+	TST'CONTEXT	(REG)+		; Skip next field
+L:
+	.ENDM	SKIP
+
+
+;++
+; This macro translates into the CASEx instruction.  It calculates the
+; "base" and "limit" parameters from the <index,displacement> list
+; specfied in the 'vector' parameter.  The dispatch table is set up
+; such that any unspecified index value within the bounds of the
+; transfer vector is associated with a diplacement which transfers 
+; control to the first location after the CASE statement, i.e., behaves
+; as if the index were out of bounds.
+;
+; Example:
+;	$DISPATCH	R0,<-			; Message type in R0
+;
+;		;index	displacement
+;
+;		<CI,	NSP$RCV_CI>,-		; Process CI message
+;		<CC,	NSP$RCV_CC>,-		; Process CC message
+;		<DI,	NSP$RCV_DI>,-		; Process DI message
+;		<DC,	NSP$RCV_DI>,-		; Process DC message
+;	>
+;	BRW	NSP$RCV_ILLMSG			; Message type unknown
+;--
+.MACRO	$DISPATCH,	INDX,VECTOR,TYPE=W,NMODE=S^#,?MN,?MX,?S,?SS,?ZZ
+SS:
+
+	.MACRO	$DSP1,$DSP1_1
+		.IRP	$DSP1_2,$DSP1_1
+			$DSP2	$DSP1_2
+		.ENDR
+	.ENDM
+
+	.MACRO	$DSP2,$DSP2_1,$DSP2_2
+		.=<$DSP2_1-MN>*2 + S
+		.WORD	$DSP2_2-S
+	.ENDM
+
+
+	.MACRO	$BND1,$BND1_1,$BND1_2,$BND1_3
+		$BND2	$BND1_1,$BND1_2
+	.ENDM
+
+	.MACRO	$BND2,$BND2_1,$BND2_2
+		.IIF	$BND2_1,$BND2_2-.,	.=$BND2_2
+	.ENDM
+
+	.MACRO	$BND	$BND_1,$BND_2
+		.IRP	$BND_3,<$BND_2>
+			$BND1	$BND_1,$BND_3
+		.ENDR
+	.ENDM
+
+	.=0
+ZZ:
+	$BND	GT,<VECTOR>
+MX:
+	$BND	LT,<VECTOR>
+MN:
+	.=SS
+
+CASE'TYPE	INDX,#<MN-ZZ>,NMODE'<MX-MN>
+S:
+	.REPT	MX-MN+1
+	.WORD	<MX-MN>*2 + 2
+	.ENDR
+
+	.=S
+
+	$DSP1	<<VECTOR>>
+
+	.=<MX-MN>*2 + S + 2
+
+.ENDM
+
+
+
+	.SBTTL	Standard Driver Tables
+
+	.PSECT	$$$105_PROLOGUE
+
+; Driver Prologue Table
+
+NO$DPT:
+
+	DPTAB	-
+		END=DRIVER_END,-		; End of driver plus DDCMP
+		FLAGS=DPT$M_NOUNLOAD,-		; Set driver can't be reloaded
+		ADAPTER=NULL,-			; no hardware assoc with driver
+		UCBSIZE=UCB$C_TL_LENGTH,-	; UCB size
+		NAME=NODRIVER,-			; Driver name
+		VECTOR=ADDCMP_VECTOR		; Asynch DDCMP vector table
+
+	DPT_STORE INIT				; Initialization data
+	DPT_STORE UCB,UCB$B_FIPL,B,8		; Fork IPL
+	DPT_STORE UCB,UCB$B_DIPL,B,21		; Device IPL
+	DPT_STORE UCB,UCB$L_DEVCHAR,L,<-	; Device characteristics
+		DEV$M_NET!DEV$M_IDV!DEV$M_ODV>
+	DPT_STORE UCB,UCB$B_DEVCLASS,B,DC$_SCOM ; Device class
+	DPT_STORE UCB,UCB$B_DEVTYPE,B,DT$_ADDCMP ; Device type
+	DPT_STORE UCB,UCB$W_DEVSTS,W,0		; Internal status
+	DPT_STORE DDB,DDB$L_DDT,D,NO$DDT	; Driver dispatch table 
+	DPT_STORE UCB,UCB$L_NO_AST,L,0		; Attention AST listhead
+	DPT_STORE UCB,UCB$W_DEVBUFSIZ,W,256     ; Default buffer size
+	DPT_STORE UCB,UCB$L_DEVDEPEND,L,0	; Clear devdepend field
+	DPT_STORE UCB,UCB$L_DEVDEPND2,L,0	; Clear devdepend field
+	DPT_STORE ORB,ORB$B_FLAGS,B,-		; Protection block flags
+			   <ORB$M_PROT_16>	; SOGW protection word
+	DPT_STORE ORB,ORB$W_PROT,W,0		; default protection
+	DPT_STORE ORB,ORB$L_OWNER,L,<^X010001>	; [1,1] owns the device
+	DPT_STORE UCB,UCB$W_STS,0
+
+	DPT_STORE REINIT			; Init data also for reload
+	DPT_STORE CRB,CRB$L_INTD+VEC$L_INITIAL,D,NO$CONTROL_INIT ; Controller init
+	DPT_STORE CRB,CRB$L_INTD+VEC$L_UNITINIT,D,NO$UNIT_INIT ; Unit init routine
+	DPT_STORE END
+
+
+
+; $QIO parameter offsets
+
+P1	= 0					; Parameter 1
+P2	= 4					; Parameter 2
+P3	= 8					; Parameter 3
+P4	= 12					; Parameter 4
+P5	= 16					; Parameter 5
+
+; & temp until CLASS_LENGTH is define in TTYDEF.SDL
+
+CLASS_LENGTH = CLASSS_CLASS_DEF
+
+; & temp until defined in system
+
+DT$_ADDCMP = 200
+
+DSC$A_POINTER	= 4				; Descriptor buffer address
+MAX_RCVS = 4					; Max number of RCVS before
+NO$C_LINE_PAR = ^X<FFF3F300>			; Bits to clear in DEVDEPEND
+						; on start of line
+NO$C_CIR_PAR = ^X<FFFFF700>			; Bits to clear in DEVDEPEND
+						; on start of circuit
+NO$C_PAD = ^X<FFFF>				; Pads to send at end of message
+
+; Bits set in this constant indicate the parity and the chaarcter length
+; that we want the port driver to run at.
+
+NO$C_SET_LINE = ^X<18>
+
+; NODRIVER constants
+
+; Message fields with constant values
+
+CONSTDEF	NO,ENQ,5			; ENQ message identifier
+CONSTDEF	NO,SOH,129			; Data message identifier
+CONSTDEF	NO,DLE,144			; Maintenace message identifier
+CONSTDEF	NO,SYN,150			; SYN byte identifier
+CONSTDEF	NO,DEL,255			; DEL byte identifier
+
+; Receiver and transmitter states
+
+CONSTDEF	NO,SEAR_MSG,0			; Receive state sear for start
+						; of message
+CONSTDEF	NO,EMPTY,0			; Tranmit state nothing being send
+CONSTDEF	NO,HEADER,1			; Send header; recv header+crc
+CONSTDEF	NO,HCRC,2			; Send header crc
+CONSTDEF	NO,DATA,3			; Send data; recv data+crc
+CONSTDEF	NO,NOBUFFER,4			; Recv no buffer for data
+CONSTDEF	NO,DCRC,4			; Send data crc
+CONSTDEF	NO,PADS,5			; Send PADS on end of message
+CONSTDEF	NO,XMTERR,10			; Send enough data to clear xmt error
+
+; Misc constants
+
+CONSTDEF	NO,DEF_BUFSIZ,256		; Default buffer size
+CONSTDEF	NO,HEADER_LEN,DDCMP$C_HEADER	; Header length
+CONSTDEF	NO,HEADER_HCRC,DDCMP$C_HEADER+2 ; Header length plus crc length
+CONSTDEF	NO,DUETIM_TABLE_SIZE,256	; Default number of baud rates available
+
+; Bit definitions
+
+BITDEF		NO_FS,PORTFORK,0		; Fork on port
+BITDEF		NO_FS,IOFORK,1			; Fork for IO completion
+BITDEF		NO_FS,POWERFAIL,2		; Fork for powerfail completion
+
+; Overlay of IRP
+
+
+	$DEFINI	IRP
+
+. = IRP$W_FUNC+1				; Overlay function word
+
+$DEF	IRP$B_NOFUNC	.BLKB	1		; NODRIVER internal func code
+
+. = IRP$Q_STATION
+
+$DEF	IRP$W_QUOTA	.BLKW	1		; NODRIVER quota used for receives
+
+; Define driver internal function codes stored in IRP$B_NOFUNC of IRP.
+; NOTE:  These are not used as bit offsets, but as values.
+
+	_VIELD	NO_FC,0,<-			; Internal function codes
+		<STRT_CIR>,-			; Start a tributary
+		<STRT_LIN>,-			; Init the device inc UCB
+		<STOP_CIR>,-			; Stop a tributary
+		<STOP_LIN>,-			; Stop the device (inc stopping
+		<READ_MODEM>,-			; Read the modem status
+		>
+
+	$DEFEND	IRP				; End of IRP overlays
+
+
+; NODRIVER UCB OVERLAYS
+
+
+	$DEFINI	UCB
+
+.=UCB$Q_TL_BRKTHRU
+
+; Because we are limited to the size of the terminal driver UCB for our UCB
+; then when the device is started (the first QIO is issued to it) then we
+; will allocate a block from nonpaged pool which we will use as our UCB 
+; extension. This block will be deallocate on the last DEASSIGN to the device.
+
+$DEF	UCB$L_NO_BUFFER .BLKL 1			; Address of NOB buffer
+$DEF	UCB$L_NO_AST	.BLKL 1			; Attention AST list
+
+	$DEFEND	UCB				; End of UCB overlays
+
+; These assumptions are made in case the terminal people decide to change
+; the use of the UCB$W_DEVSTS field. Chagnes in bit definitions of that
+; field could drastically affect the operation of this driver.
+
+	ASSUME	UCB$V_TT_TIMO EQ 1
+	ASSUME	UCB$V_TT_NOTIF EQ 2
+	ASSUME	UCB$V_TT_HANGUP EQ 3
+	ASSUME	UCB$V_TT_NOLOGINS EQ 15
+	ASSUME	UCB$V_TT_DEVSTS_FILL EQ 4
+	ASSUME	UCB$S_TT_DEVSTS_FILL EQ 11
+
+; Device status bits
+
+.=0
+	_VIELD	NO_DS,4,<-			; UCB$W_DEVSTS bits
+		<XMTING,,M>,-			; Device XMTing if 0
+		<RCVING,,M>,-			; Device RCVing if 0
+		<INITED,,M>,-			; Unit initialized
+		<FORK_PEND,,M>,-		; Fork pending
+		<ILOOP_SUP,,M>,-		; Internal loop supported on device
+		<MSG_SENT,,M>,-			; Set when a msg was xmted
+		<SHUTDOWN,,M>,-			; Set when circuit going thru shutdown
+		<XMT_TIME,,M>,-			; Set if XMT_DUETIM is valid
+		<RCV_TIME,,M>,-			; Set if RCV_DUETIM is valid
+		>
+
+; Receive Flag field bit definitions
+
+BITDEF		RCV,CNTL,0			; Set if rcv msg is an ENQ msg
+
+; Receive buffer definition
+;
+; This structure must be the same size as the CXB
+
+	$DEFINI	RCV
+. = 0
+$DEF	RCV_L_LINK	.BLKL	2		; Forward and backward links
+$DEF	RCV_W_BLKSIZE	.BLKW	1		; Total block size
+$DEF	RCV_B_BLKTYPE	.BLKB	1		; Block type
+$DEF	RCV_B_FIPL	.BLKB	1		; Fork IPL
+$DEF	RCV_W_MSGSIZ	.BLKW	1		; Size of this part of the msg to  rcv
+$DEF	RCV_W_INDEX	.BLKW	1		; Index into rcved message
+$DEF	RCV_W_ERROR	.BLKW	1		; Error status
+$DEF	RCV_W_FLAGS	.BLKW	1		; Receive message flags
+$DEF	RCV_CXB_SPARE	.BLKB	CXB$K_HEADER-NO$C_HEADER_HCRC-.
+						; Spare bytes to allow for CXB
+$DEF	RCV_Z_HEADER	.BLKB	NO$C_HEADER_HCRC ; Size in bytes of msg header
+$DEF	RCV_T_DATA				; Receive data
+
+	ASSUME	RCV_Z_HEADER+8 EQ CXB$K_HEADER
+	ASSUME 	RCV_T_DATA GE CXB$K_HEADER
+
+	$DEFEND	RCV
+
+; P2 buffer header definition
+
+	$DEFINI	P2B
+.=0
+$DEF	P2B_L_POINTER	.BLKL	1	; Pointer to start of data
+$DEF	P2B_L_BUFFER	.BLKL	1	; Address of user's data buffer
+$DEF	P2B_W_SIZE	.BLKW	1	; Size of P2 buffer
+$DEF	P2B_B_TYPE	.BLKB	1	; Type of structure
+$DEF	P2B_B_SPARE	.BLKB	1	; Spare byte
+$DEF	P2B_C_LENGTH			; Size of P2 buffer header
+$DEF	P2B_T_DATA			; Start of data
+ 
+	$DEFEND	P2B
+
+
+; NODRIVER buffer definitions
+
+	$DEFINI	NOB
+.=0
+$DEF 	NOB$L_FLINK	.BLKL		; Nob buffer forward link
+$DEF	NOB$L_BLINK	.BLKL		; Nob buffer backward link
+$DEF	NOB$W_SIZE	.BLKW		; Size of Nob 
+$DEF	NOB$B_TYPE	.BLKB		; Type of buffer
+			.BLKB		; reserved
+$DEF	NOB$A_PRO_BUFFER .BLKL	1	; Address of the DDCMP buffer
+$DEF	NOB$Q_ATTN	.BLKQ	1	; Received messaeg list
+$DEF	NOB$Q_RCVS	.BLKQ	1	; Received I/O queue
+$DEF	NOB$Q_FREE	.BLKQ	1	; Free receive buffer queue
+$DEF	NOB$Q_POST	.BLKQ	1	; Receive and transmit buffers to comp
+$DEF	NOB$L_RCV_INPR	.BLKL	1	; Receive buffer awaiting data
+$DEF	NOB$L_XMT_INPR	.BLKL	1	; Transmit buffer to be sent
+$DEF	NOB$L_RCV_DUETIM .BLKL	1	; Receive message duetime
+$DEF	NOB$L_XMT_DUETIM .BLKL	1	; Transmit message duetime
+$DEF	NOB$W_QUOTA	.BLKW	1	; Byte quota for receive's
+$DEF	NOB$B_XSTATE	.BLKB	1	; Transmitter state
+$DEF	NOB$B_RSTATE	.BLKB	1	; Receiver state
+$DEF	NOB$W_PADS	.BLKW	1	; Pads to send at end of messages
+$DEF	NOB$W_XMTERR_SIZE .BLKW	1	; Number of pads to send on an error on an xnt
+$DEF	NOB$Z_HEADER	.BLKB	NO$C_HEADER_HCRC ; Area to receive header and crc
+$DEF	NOB$W_MSGSIZ	.BLKW	1	; Current number of bytes left in rec hdr
+$DEF	NOB$W_INDEX	.BLKW	1	; Index into receive header
+$DEF	NOB$W_ERROR	.BLKW	1	; Error on receive if any
+$DEF	NOB$W_FLAGS	.BLKW	1	; Flags for receive buffer after it is alloc
+$DEF	NOB$L_PID	.BLKL	1	; Process ID
+$DEF	NOB$W_CHANL	.BLKW	1	; Line channel number
+$DEF	NOB$W_CHANC	.BLKW	1	; Circuit channel number
+$DEF	NOB$Z_DDCMP	.BLKL	4	; Block for setable DDCMP parameters
+$DEF	NOB$C_SETPRM			; Start of UCB/LINE paramters
+$DEF	NOB$B_PRO	.BLKB	1	; Protocol selection
+$DEF	NOB$B_DUP	.BLKB	1	; Duplex setting
+$DEF	NOB$B_CON	.BLKB	1	; Controller loopback
+$DEF	NOB$B_BFN	.BLKB	1	; Number of receive buffers
+$DEF	NOB$W_DEVBUFSIZ	.BLKW	1	; Size of receive buffers
+$DEF	NOB$B_SPD	.BLKB	1	; Set line speed
+			.BLKB	1	; reserved
+$DEF	NOB$Z_DLA_ADDR 	.BLKB	DLA$C_ADDR_LENGTH ; Buffer to pass to prot with
+						  ; address of queues prot needs
+
+; Block to copy the control message into on transmit
+$DEF	NOB$Z_CTL_MSG	.BLKB	XMTQ$K_LENGTH 
+
+$DEF	NOB$C_LENGTH			; Length of the NODRIVER buffer
+$DEF	NOB$K_LENGTH			; Length of the NODRIVER buffer
+
+	$DEFEND	NOB
+	.PSECT	$$$115_DRIVER,LONG
+	
+
+; Driver Dispatch Table
+
+	DDTAB	DEVNAM=NO,-			; Device name
+		START=NO$STARTIO,-		; Start I/O routine
+		FUNCTB=NO$FUNCTABLE,-		; Function decision table
+		CANCEL=NO$CANCEL,-		; Cancel I/O routine
+		REGDMP=NO$REGDUMP,-		; Register dump routine
+		DIAGBF=<36+12>,-		; Diagnostic buffer size
+		ALTSTART=NO$ALT_ENTRY		; Alternate entry routine
+
+
+; Function Decision Table
+
+NO$FUNCTABLE:
+	FUNCTAB,-				; Legal functions
+		<WRITEVBLK,WRITELBLK,WRITEPBLK,-; Transmit functions
+		 READVBLK,READLBLK,READPBLK,-	; Receive functions
+		 SETMODE,SENSEMODE,SETCHAR,-	; Set mode functions
+		 >
+	FUNCTAB,-				; Buffered I/O functions
+		<WRITEVBLK,WRITELBLK,WRITEPBLK,-; Transmit functions
+		 READLBLK,READPBLK,READVBLK,-
+		 SETMODE,SENSEMODE,SETCHAR,-	; Set mode functions
+		 >
+
+	.IF	DF JNX$$$
+	functab	fillbuffer,-			; Buffered I/O functions
+		<writevblk,writelblk,writepblk,-; Transmit functions
+		 readvblk,readlblk,readpblk,-	; Receive functions
+		 setmode,sensemode,setchar,-	; Set mode functions
+		 >
+	.ENDC	;DF JNX$$$
+
+	FUNCTAB	NO$XMITFDT,-			; Transmit function dispatcher
+		<WRITELBLK,WRITEPBLK,WRITEVBLK>	
+	FUNCTAB	NO$RCVFDT,-			; Receive function dispatcher
+		<READLBLK,READPBLK,READVBLK>	
+	FUNCTAB	NO$SETMODEFDT,-			; FDT for set mode and set char
+		<SETMODE,SETCHAR>		; 
+	FUNCTAB	NO$SENSEMODEFDT,-		; FDT sensemode routine
+		<SENSEMODE>
+
+
+
+; The following is a table of services that the ASYNCH  DDCMP driver uses to
+; interface with the terminal lines' port driver. It initially contains
+; relative offsets to various routines and data structures needed by the 
+; terminal port driver. At driver load these relative offsets are reloacted
+; to actual virtual addresses. The list is terminated by a 0 longword to
+; signal te relocation routine where the list terminates. 
+; 
+; NOTE the because of how this table is indexed into the following order
+; can not be changed, and if the placement of the routines are changed we 
+; must know about it.
+
+	ASSUME	CLASS_GETNXT 	EQ 0
+	ASSUME 	CLASS_PUTNXT 	EQ 4
+	ASSUME	CLASS_SETUP_UCB EQ 8
+	ASSUME	CLASS_DS_TRAN 	EQ 12
+	ASSUME	CLASS_DDT 	EQ 16
+	ASSUME	CLASS_READERROR EQ 20
+	ASSUME	CLASS_DISCONNECT EQ 24
+	ASSUME	CLASS_FORK	EQ 28
+	ASSUME	CLASS_POWERFAIL EQ 32
+
+ADDCMP_VECTOR:
+	.LONG	NO$GETNXT -		NO$DPT	; Port driver calls to get next
+						; character to output
+	.LONG	NO$PUTNXT -		NO$DPT	; Port driver calls whenever a 
+						; character is received
+	.LONG	NO$SETUP_UCB -		NO$DPT	; Called to reset units' UCB, 
+						; called at powerfail and unit init
+	.LONG	NO$PORT_TRANSITION - 	NO$DPT  ; Handles modem transitions
+						; on the line
+	.LONG	NO$DDT -		NO$DPT	; Class drivers DDT 
+	.LONG	NO$READERROR -		NO$DPT	; Port driver detected an error 
+						; on the line
+	.LONG	NO$CLASS_DISCONNECT - 	NO$DPT	; Indicates that the terminal
+				        	; is no longer connect to the system
+	.LONG	NO$CLASS_PORTFORK - 	NO$DPT	; Used when the port driver 
+		   				; needs to issue a fork
+	.LONG	NO$CLASS_POWERACTION - 	NO$DPT	; Called in unit init when a
+						; powerfail occured
+	.LONG	0
+
+	.SBTTL	P2 buffer verification tables
+ 
+
+; Define P2 buffer verification offsets
+
+	$DEFINI	PARAM
+ 
+	_VIELD	PRM,0,<-			; Parameter bits and sizes
+		<TYPE,12,M>,-			; Parameter type
+		<MIN,1,M>,-			; Parameter minimum value
+		<MAX,1,M>,-			; Parameter maximum value
+		<INVALID,1,M>,-			; Parameter invalid flags
+		>
+ 
+	_VIELD	OFF,0,<-			; Offset word fields
+		<VALUE,14,M>,-			; Offset value
+		<WIDTH,2,M>,-			; Size of field in structure
+		>
+ 
+	$DEFEND	PARAM
+ 
+
+; Define UCB (line) parameters
+
+LINE_PRM_BUFSIZ	= 0				; Line parameter buffer size
+LINE_PARAM:					; Start of line parameters
+
+	PARAM	NMA$C_PCLI_PRO,-		; Protocol selection
+		OFFSET=NOB$B_PRO,WIDTH=B,-
+		MAX=NMA$C_LINPR_TRI,-
+		INVALID=NO_DS_M_INITED,-	; Device can't be ON
+		BASE=LINE
+ 
+	PARAM	NMA$C_PCLI_DUP,-		; Duplex mode
+		OFFSET=NOB$B_DUP,WIDTH=B,-
+		MAX=NMA$C_DPX_HAL,-
+		INVALID=NO_DS_M_INITED,-	; Device can't be ON
+		BASE=LINE
+
+	PARAM	NMA$C_PCLI_CON,-		; Controller mode
+		OFFSET=NOB$B_CON,WIDTH=B,-
+		MAX=NMA$C_LINCN_LOO,-
+		INVALID=NO_DS_M_INITED,-	; Device can't be On
+		BASE=LINE
+ 
+	PARAM	NMA$C_PCLI_BFN,-		; Number of receives
+		OFFSET=NOB$B_BFN,WIDTH=B,-
+		MIN=1,MAX=255,-
+		INVALID=NO_DS_M_INITED,-	; Device can't be ON
+		BASE=LINE
+ 
+	PARAM	NMA$C_PCLI_BUS,-		; Buffer size
+		OFFSET=NOB$W_DEVBUFSIZ,WIDTH=W,-
+		MIN=1,MAX=16383,-
+		INVALID=NO_DS_M_INITED,-	; Device can't be ON
+		BASE=LINE
+
+	PARAM	NMA$C_PCLI_RTT,-		; Retransmit timer
+		OFFSET=NOB$Z_DDCMP+DLK$W_REPWAIT,-
+		WIDTH=W,-
+		MIN=50,-
+		BASE=LINE
+
+	PARAM					; End of table
+
+; Define Trib parameters
+
+TRIB_PRM_BUFSIZ  = 0				; Trib parameter buffer size
+TRIB_PARAM:					; Start of trib parameters
+ 
+	PARAM	NMA$C_PCCI_TRI,-		; Trib address
+		OFFSET=DLK$B_TRIB,WIDTH=B,-
+		MIN=1,-
+		INVALID=XM$M_STS_ACTIVE,-	; Trib can't be established
+		BASE=TRIB
+ 
+	PARAM	NMA$C_PCCI_MTR,-		; Max number of messages sent
+		OFFSET=DLK$B_MSGCNT,WIDTH=B,-	; in a selection interval
+		MIN=1,-
+		MAX=100,-
+		BASE=TRIB
+ 
+	PARAM	NMA$C_PCCI_MST,-		; Maintenance state
+		OFFSET=DLK$B_MAINT,WIDTH=B,-
+		MAX=NMA$C_STATE_OFF,-
+		BASE=TRIB
+
+	PARAM	NMA$C_PCCI_MRB,-		; Maxium receive buffers
+		OFFSET=DLK$B_MRB,WIDTH=B,-
+		MIN=1,-
+		INVALID=XM$M_STS_ACTIVE,-
+		BASE=TRIB
+
+	PARAM					; End of trib tables
+
+
+
+
+; DEFAULT TRIBUTARY PARAMETERS for DDCMP
+
+DEF_TRIB_PARAM::
+	ASSUME	DLK$B_MSGCNT EQ DLK$B_TRIB+1
+	ASSUME	DLK$B_MAXREP EQ DLK$B_MSGCNT+1
+	ASSUME	DLK$B_MAXSEL EQ DLK$B_MAXREP+1
+	ASSUME	DLK$W_REPWAIT EQ DLK$B_MAXSEL+1
+	ASSUME	DLK$W_SELWAIT EQ DLK$W_REPWAIT+2
+	ASSUME	DLK$B_MAINT EQ DLK$W_SELWAIT+2
+	ASSUME	DLK$B_MRB EQ DLK$B_MAINT+1
+	.BYTE	1				; Default Trib address
+	.BYTE	4				; Max nmb of msgs sent / select
+	.BYTE	4				; Max nmb of sel intls allowed
+	.BYTE	3				; Max times to reXMT a msg
+	.WORD	3000				; Reply timeout timer
+	.WORD	3000				; Selection timer in sec
+	.BYTE	NMA$C_STATE_OFF			; Default is no maint mode
+	.BYTE	255				; Default to unlimited rcv buff
+	DEF_TRIB_PARAMSZ = .-DEF_TRIB_PARAM
+
+; Default line parameter values
+
+DEF_LINE_PARAM::
+	ASSUME	NOB$B_PRO EQ NOB$C_SETPRM
+	ASSUME	NOB$B_DUP EQ NOB$B_PRO+1
+	ASSUME	NOB$B_CON EQ NOB$B_DUP+1
+	ASSUME	NOB$B_BFN EQ NOB$B_CON+1
+	ASSUME	NOB$W_DEVBUFSIZ EQ NOB$B_BFN+1
+
+	.BYTE	NMA$C_LINPR_POI			; Protocol is point-point
+	.BYTE	NMA$C_DPX_FUL			; Duplex is full
+	.BYTE	NMA$C_LINCN_NOR			; Controller mode is normal
+	.BYTE	1				; Number of receive buffers
+	.WORD	NO$C_DEF_BUFSIZ			; Size of receive buffers
+
+	DEF_LINE_PARAMSZ = .-DEF_LINE_PARAM
+
+; Table to store all possible duetimes for receive and tranmsit messages.
+; The time to wait is store in this table and is calculated as follows:
+; ((default buffer size + the ddcmp overhead bytes) * eight bits per byte )
+; divided the baud rate. This table is calculated each time the line is
+; started so we will have the most recent information about the default buffer
+; size. The byte value of the terminal line speed is used to index into this
+; table.
+
+DUETIM_TABLE:
+	.BLKW	NO$C_DUETIM_TABLE_SIZE
+
+
+	.SBTTL	NO$CONTROL_INIT - Initialize Sync line device
+;++
+; NO$CONTROL_INIT - Initialize Sync line unit
+;
+; FUNCTINAL DESCRIPTION:
+;
+; This routine is called at driver load it sets up the global DPT for the
+; driver adn relocates the drivers vector tables.
+;
+;	INPUTS:
+;		R4 = Address of device CSR
+;		R5 = Address of device IDB
+;		R6 = Address of device DDB
+;		R8 = Address of device CRB
+;
+;	OUTPUTS:
+;		R4,R5,R8 are preserved
+;--
+NO$CONTROL_INIT:
+	MOVAL	NO$DPT,R1
+	MOVL	R1,G^NO$GL_DPT
+
+	MOVZWL	DPT$W_VECTOR(R1),R0
+	ADDL2	R1,R0
+	
+; Relocate the asynch ddcmp vector table
+
+5$:	TSTL	(R0)
+	BLEQ	10$
+	ADDL2	R1,(R0)+
+	BRB	5$
+
+10$:	RSB
+
+
+	.SBTTL	NO$UNIT_INIT - Initialize the device unit
+;++
+; NO$UNIT_INIT - Initialize the device unit
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine is called when the driver is loaded and during powerfailure
+; recovery.  It sets the unit status to ONLINE.  Also, if called during
+; powerfail recovery, it shuts down the device.
+;
+;	INPUTS:
+;		R4 = Address of the device CSR
+;		R5 = UCB address
+;
+;	OUTPUTS:
+;		R5 preserved
+;--
+NO$UNIT_INIT:					; Initialize the unit
+	BBC	#UCB$V_POWER,UCB$W_STS(R5),10$	; Br if not powerfail recovery
+	BBC	#XM$V_STS_ACTIVE,-		; Br if not previously active
+		UCB$L_DEVDEPEND(R5),10$
+	PUSHR	#^M<R0,R1,R2,R3>		; Save all registers
+	BSBW	SCHED_FORK_POWERFAIL
+	POPR	#^M<R0,R1,R2,R3>
+	RSB
+
+5$:	BUG_CHECK NOBUFPCKT,FATAL
+
+
+; This driver makes the assumption that IPL$_SYNC, IPL$_TIMER and the drivers
+; fork IPL are all equal. If any of these change the integrity of the driver
+; can not be assured. THIS DRIVER WILL NOT WORK ON PRE VERSION 4 SYSTEMS.
+
+
+	ASSUME IPL$_SYNCH EQ IPL$_TIMER
+
+
+; We must also be sure that SYNCH and the drivers FIPL are the same. If this
+; changes the integrity of the driver can not be assured with out some
+; major changes.
+
+10$:	CMPB 	#IPL$_SYNCH,UCB$B_FIPL(R5)	; If the IPLs are not equal then
+	BNEQ	5$				; cause a fatal bugcheck 
+	BISW	#UCB$M_ONLINE,UCB$W_STS(R5)	; Set software status ONLINE
+	RSB
+
+
+	.IF	DF JNX$$$
+fillbuffer:
+	movzbl	ucb$b_last(r5),r0
+	movl	r3,ucb$l_buffer(r5)[r0]
+	movq	#0,irp$l_media(r3)
+	incl	r0
+	bicl	#^c<jnx_size-1>,r0
+	movb	r0,ucb$b_last(r5)
+	rsb
+	.ENDC	;DF JNX$$$
+
+
+	.SBTTL NO$XMITFDT - Transmit I/O FDT routine
+;++
+; NO$XMITFDT - Transmit I/O FDT routine
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine allocates a system buffer for the QIO. Then calls the
+; common FDT routine give the buffer to DDCMP.
+;
+;	INPUTS:
+;		R3 = I/O packet address
+;		R4 = Current PCB address
+;		R5 = UCB address
+;		R6 = CCB address
+;
+;	OUTPUTS:
+;		R3,R4,R5,R6,R7,R8,R9 are preserved
+;
+;--
+NO$XMITFDT:					; Transmit FDT routine
+	PUSHR	#^M<R3,R4,R5,R6,R7,R8,R9>
+	MOVL	P1(AP),R7			; Get address of buffer
+	MOVL	P2(AP),R9			; Get the size of buffer
+	BEQL	10$				; If EQL then size is zero
+	MOVL	R7,R0				; Set up R0 and R1 for
+	MOVL	R9,R1				; write access check
+	JSB	G^EXE$WRITECHK			; Check the acc of users buffer
+	ADDL3	#XMTQ$K_LENGTH,R9,R1		; Get length of buffer to alloc
+	MOVL	R3,R6				; Save the IRP address
+	JSB	G^EXE$BUFFRQUOTA		; Check quota
+	BLBC	R0,20$				; If LBC not enough quota
+	JSB	G^EXE$ALLOCBUF			; Allocated the buffer
+	BLBC	R0,20$				; If LBC not buffer allocated
+	MOVL	R6,R3				; Retreive the IRP
+	MOVL	R2,R8				; Get buffer address in R8
+	MOVL	PCB$L_JIB(R4),R0		; Get the JIB address
+	SUBL2	R1,JIB$L_BYTCNT(R0)		; Adjust buffered I/O
+	MOVW	R1,IRP$W_BOFF(R3)		; Save byte offset
+	MOVL	R2,IRP$L_SVAPTE(R3)		; Save system PTE
+	CLRB	XMTQ$B_FLAG(R8)			; Clr bits, not "Internal" IRP
+5$:	BSBW	COP_BUFF			; Branch to copy into my buff
+	SETIPL	UCB$B_FIPL(R5)			; Sync to FIPL
+	BSBB	COM_XMITFDT			; Branch to common processing
+	BLBC	R0,20$				; If BC then error
+8$:	POPR	#^M<R3,R4,R5,R6,R7,R8,R9>
+	JMP	G^EXE$QIORETURN
+
+10$:	MOVZWL	S^#SS$_BADPARAM,R0		; Set status for abort
+20$:	POPR	#^M<R3,R4,R5,R6,R7,R8,R9>
+	JMP	G^EXE$ABORTIO
+
+
+	.SBTTL	COM_XMITFDT - Common transmit FDT routine
+;++
+;COM_XMITFDT - 	Common transmit FDT routine
+;
+; The allocated buffer is given to DDCMP where a header is added and if 
+; possible the buffer is added to the transmit queue. The buffer keeps various
+; information on the transmit as it progresses from the transmit to the
+; completion queues.
+;
+;	INPUTS:
+;		R3 = IRP address
+;		R5 = UCB address
+;		R7 = Address of the user/"Internal" IRP buffer
+;		R8 = Address of allocated buffer
+;		R9 = Size of user/"Internal" IRP buffer
+;
+;	IPL = Fork IPL
+;
+;	OUTPUTS:
+;		R0 = Status of operation
+;		R5,R8 are preserved
+;
+;--
+COM_XMITFDT:
+	MOVL	UCB$L_NO_BUFFER(R5),R4		; Get NOB address
+	BEQL	45$				; If eql device not started
+	PUSHR	#^M<R4,R5>			; Save these registers
+	MOVL	NOB$A_PRO_BUFFER(R4),R5		; Get addr of start of TFB
+	BEQL	43$
+	MOVZBL	#DLK$C_XMTMSG,R6		; Set that this is a msg to XMT
+	CLRL	R7				; Clear error bits
+	BSBW	DDCMP				; Branch to set up the header
+	POPR	#^M<R4,R5>			; Restore the registers
+	CMPB	#DLK$C_ACTNOTCOM,R6		; If EQL then protocol has not
+	BEQL	45$				; been started
+	BBS	#DLK$V_XMTERR,R7,35$		; If BS then problem with XMT
+	BBC	#DLK$V_XMTCMP,R7,20$		; If BC no XMT's to complete
+	BSBW	FINISH_XMT_IO			; Complete all XMT's
+20$:	BBS	#DLK$V_PRSTERR,R7,40$		; Branch BS persisent error
+	BITW	#<DLK$M_XMTACK!-		; If EQL then XMT not put on 
+		DLK$M_QFULERR>,R7		; either queue so abort it
+	BEQL	35$
+	CLRL	R1				; Set no status for start_transmit
+	BSBW	START_TRANSMIT			; Else start the xmt'r
+30$:	MOVZWL	S^#SS$_NORMAL,R0		; Set normal return
+	BRB	50$
+
+35$:	MOVZWL	S^#SS$_BADPARAM,R0		; Set status
+	BRB	50$
+
+40$:	SETBIT	#XM$V_ERR_FATAL,UCB$L_DEVDEPEND(R5) ; Set fatal error
+	BRB	30$				; Complete as normal timer 
+						; will shutdown the device
+43$:	POPR	#^M<R4,R5>			; Restore the registers
+45$:	MOVZWL	#SS$_DEVINACT,R0		; Set the device is not active
+50$:	MOVL	UCB$L_DEVDEPEND(R5),R1		; Set status for abort
+	RSB
+
+;++
+;COP_BUFF
+;
+; This routine takes the user or "Internal" IRP buffer which contains the
+; message to send and writes it into the allocated buffer. 
+;
+;	INPUTS:
+;		R1 = Size of allocated buffer
+;		R3 = IRP address
+;		R8 = Address of allocated buffer
+;		R7 = Address of buffer from which to move data
+;		R9 = Size of user/"Internal" IRP buffer
+;
+;	IPL = FIPL from ALT_ENTRY and ASTDEL from XMITFDT
+;
+;	OUTPUTS:
+;		Buffer is copied into allocated buffer
+;		R5,R8,R9 are preserved
+;
+;--
+COP_BUFF:	
+	MOVW	R1,XMTQ$W_BUFLEN(R8)		; Save the size of the buffer
+	MOVB	S^#DYN$C_BUFIO,-		; Set that this is an XMT
+		XMTQ$B_BUFTYP(R8)
+	MOVL	R3,XMTQ$L_IRP(R8)		; Save address of the IRP
+	ADDW3	#MFD$K_LENGTH,R9,-		; Get the msg size plus header
+		XMTQ$W_MSGSIZE(R8)		; for character count
+	PUSHL	R5				; Save R5 before the MOV
+	MOVC	R9,(R7),XMTQ$K_LENGTH(R8)	; Move data into system buffer
+	POPL	R5				; Restore R5
+	RSB
+
+	.SBTTL	NO$ALT_ENTRY - Alternate I/O entry
+;++
+; NO$ALT_ENTRY - Alternate I/O entry point
+;
+; This routine is called by the other drivers to pass an "internal" I/O
+; request to the driver.  "Internal" IRP's are not built via $QIO.
+; The action here is to setup the IRP fields as if the packet had been 
+; processed by the FDT routines.
+;
+; In this driver, the alternate entry point is called by the DECnet
+; Transport layer driver.
+;
+;	INPUTS:
+;		R3 = IRP address
+;		R5 = UCB address
+;		All pertinent fields of the IRP are assumed to be valid.
+;
+;	IPL = Fork IPL
+;
+;	OUTPUTS:
+;		R0 = Status of the request
+;		R3 and R5 preserved
+;--
+NO$ALT_ENTRY:					; Accept an "internal" IRP
+	.IF	DF JNX$$$
+	bsbw	fillbuffer
+	.ENDC	;DF jnx$$$
+
+	MOVZWL	#SS$_DEVINACT,IRP$L_MEDIA(R3)	; Assume device inactive
+	BBS	#XM$V_STS_ACTIVE,-		; If BS status active 
+		UCB$L_DEVDEPEND(R5),5$		; device is on line
+	BRW	IO_DONE				; Else comp request in error
+5$:	BBS	#IRP$V_FUNC,-			; If BS then receive function
+		IRP$W_STS(R3),ALT_RCVFDT
+	PUSHR	#^M<R3,R4,R5,R6,R7,R8,R9>	; Save registers
+	MOVZWL	IRP$W_BCNT(R3),R9		; Get the length of the buffer
+	BEQL	10$				; If EQL then bad parameter
+	ADDL3	R9,#XMTQ$K_LENGTH,R1		; Add the XMTQ length
+	MOVL	R3,R6				; Save the IRP
+	JSB	G^EXE$ALONONPAGED		; Allocated the buffer
+	BLBC	R0,20$				; If LBC not buffer allocated
+	MOVL	R6,R3				; Retreive the IRP
+	MOVL	R2,R8				; Get buffer address in R8
+	MOVB	#XMTQ$M_INTERNAL,-		; Set that the I/O is from
+		XMTQ$B_FLAG(R8)			; an "Internal" IRP
+
+	.IF	DF JNX$$$
+	movl	r2,irp$L_fr4(r3)
+	.ENDC	;DF jnx$$$
+
+	MOVL	@IRP$L_SVAPTE(R3),R7		; Get interal IRP buffer addr
+	BSBW	COP_BUFF			; Copy buffer into allcd buff
+	BSBW	COM_XMITFDT			; Branch for common processng
+	BLBC	R0,30$				; If BC complete in error
+	POPR	#^M<R3,R4,R5,R6,R7,R8,R9>	; Restore registers
+	RSB
+
+10$:	MOVZWL	S^#SS$_BADPARAM,IRP$L_MEDIA(R3)	; Set abort status
+20$:	POPR	#^M<R3,R4,R5,R6,R7,R8,R9>	; Restore registers
+	BRW	IO_DONE				; Complete the request
+
+30$:	MOVL	R8,R1				; Save R8 it contains XMTQ buff
+	POPR	#^M<R3,R4,R5,R6,R7,R8,R9>	; Restore registers
+	MOVL	R0,IRP$L_MEDIA(R3)		; Set status
+	BRW	TRANSMIT_IO_DONE		; Complete deall the buffer
+
+ALT_RCVFDT:
+	MOVL	IRP$L_SVAPTE(R3),R2		; Is there a buffer to reuse
+	BEQL	10$				; If EQL then no
+	CLRL	IRP$L_SVAPTE(R3)		; Clear so not deallocated
+	PUSHL	R4
+	MOVL	#SS$_DEVINACT,R0		; Assume failure
+	MOVL	UCB$L_NO_BUFFER(R5),R4		; Get NOB address
+	BEQL	20$
+	BSBW	ADDFREELIST			; Else add it to the free list
+	POPL	R4
+10$:	BSBW	COM_RCVFDT			; Do common processing
+	BLBC	R0,20$				; Br if unsuccessful
+	RSB
+
+20$:	MOVL	R0,IRP$L_MEDIA(R3)		; Set status
+	BRW	IO_DONE				; Complete IRP in error
+
+
+	.SBTTL	NO$RCVFDT - Receive I/O FDT routine
+;++
+; NO$RCVFDT - Receive I/O FDT routine
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; The specified buffer is checked for accessibility. The buffer address and 
+; count are saved in the packet. Then IPL is set to device fork IPL and if 
+; a message is available the operation is completed.  Otherwise the packet 
+; is queued onto the waiting receive list.
+;
+; For requests specifing IO$M_NOW, the I/O is completed with status of
+; SS$_ENDOFILE if no message is available when the test is made.
+;
+;
+;	INPUTS:
+;		R3 = I/O packet address
+;		R4 = PCB address
+;		R5 = UCB address
+;		R6 = CCB address
+;		R7 = Function code
+;		AP = Address of first I/O request parameter
+;
+;	OUTPUTS:
+;		R0 = Status of the receive request
+;		R3-R7 preserved.
+;--
+NO$RCVFDT:
+	MOVZWL	#SS$_BADPARAM,R0		; Assume illegal size
+	MOVZWL	P2(AP),R1			; Get size
+	BEQL	ABORTIO				; Br if none specified
+	MOVL	P1(AP),R0			; Get buffer address
+	MOVL	R0,IRP$L_MEDIA(R3)		; Save address
+	CLRW	IRP$W_BOFF(R3)			; No quota to return during
+						; completion
+	JSB	G^EXE$READCHK			; Check buffer accessibility
+						; (no return on no access)
+	SETIPL	UCB$B_FIPL(R5)			; Synchronize access to the UCB
+	BSBB	COM_RCVFDT			; Process the request
+	BLBC	R0,ABORTIO			; Br if error
+	JMP	G^EXE$QIORETURN			; Return to await completion
+ABORTIO:					; Abort the I/O request
+	CLRL	R1				; Don't return device status
+	JMP	G^EXE$ABORTIO			; 
+
+
+; Common receive processing
+
+COM_RCVFDT:					; Common receive processing
+	BBS	#XM$V_STS_ACTIVE,-		; Br if device active
+		UCB$L_DEVDEPEND(R5),10$
+	MOVZWL	#SS$_DEVINACT,R0		; Set return status
+	RSB
+
+
+; Check for an avaiable message and complete the receive
+
+10$:	PUSHL	R4
+	MOVL	UCB$L_NO_BUFFER(R5),R4		 ; Get NOB address
+	BEQL	30$				 ; If eql device not active
+	REMQUE	@NOB$Q_ATTN(R4),R2		 ; Dequeue a received message
+	BVS	15$				 ; Br if none
+	BSBW	FINISH_RCV_IO			 ; Comp the I/O request
+	POPL	R4
+	RSB
+
+; Queue the requst for future message arrival unless IO$M_NOW specified.
+; Receives are queued to the special receive wait queue.
+
+15$:	BBS	#IO$V_NOW,IRP$W_FUNC(R3),20$	; Br BS read NOW
+	INSQUE	(R3),@NOB$Q_RCVS+4(R4)		; Queue the I/O packet
+	POPL	R4
+	MOVZWL	S^#SS$_NORMAL,R0		; Set QIO status
+	RSB					; 
+
+20$:	POPL	R4
+	MOVZWL	#SS$_ENDOFFILE,IRP$L_MEDIA(R3)	; Set no message status
+	BSBW	IO_DONE				; Complete the I/O
+	MOVZWL	S^#SS$_NORMAL,R0		; Set normal completetion
+	RSB					; And return
+
+30$:	POPL	R4
+	MOVZWL	#SS$_DEVINACT,R0		; Set error
+	RSB					; And return
+
+
+	.SBTTL	NO$SETMODEFDT,  Set mode I/O operation FDT routine
+ 
+;++
+; NO$SETMODEFDT - Set mode I/O operation FDT routine
+;
+; Functional description:
+;
+; This routine is used to set the configuration of the terminal device
+; including configuration of software DDCMP. The first SETMODE done to the
+; device causes a the NOB to be allocated. This buffer is used in place
+; of an extension to the devices UCB. Subfunction modifier bits are used
+; to specify the type of action to be taken. The two characteristics buffers
+; (P1 and P2) are used to describe specific characteristics. 
+;
+; The QIO parameters for SETMODE are:
+;
+;	P1 = Optional address of quadword or longword buffer
+;	P2 = Optional address of buffer descriptor for extended characteristics
+;	P3 = Number of receive buffers to pre-allocate. Required on
+;	     controller startup.
+;
+;
+; The subfunction modifiers are as follows:
+;
+;
+; 	 o STARTUP - start the device - this modifier is used to
+;		start the device.
+;
+; 	o SHUTDOWN - shutdown the device - this modifier
+; 		is used to stop the device.
+;
+; 	o ATTNAST - request an attention AST - this modifier is used
+;	 	to set up an AST to be delivered when a change of
+;		status occurs on this device.
+;
+;	o CTRL - perform the request on the Controller not the
+;		 tributary.
+;
+;	o SET_MODEM - set line unit's mode register.
+;
+;	INPUTS:
+;		R3 = IRP address
+;		R4 = PCB address
+;		R5 = UCB address
+;		R6 = CCB address
+;		R7 = Function code
+;		AP = address of first QIO parameter
+;
+;	OUTPUTS:
+;		R0 = status of setmode request
+;		R3-R5 are preserved.
+;		R7-R9 = destroyed
+;
+;--
+NO$SETMODEFDT:
+	MOVL	UCB$L_NO_BUFFER(R5),R0		; If NEQ then BUFFER allocated
+	BNEQ	3$
+	MOVL	#NOB$K_LENGTH,R1		; Else set up to allocate the buffer
+	BSBW	ALLOC_BUFFER			; Call to allocate the buffer
+	BLBC	R0,28$				; If LBC buffer could not be allocated
+	PUSHL	R4
+	MOVL	R2,R4				; Setup NOB address
+	DSBINT	UCB$B_FIPL(R5)
+	BSBW	INIT_NO_BUFFER			; Setup initial states in NOB
+	MOVL	R4,UCB$L_NO_BUFFER(R5)		; Set address of NOB
+	ENBINT
+	POPL	R4
+3$:	MOVZWL	IRP$W_FUNC(R3),R7		; Get entire function code
+	BBC	#IO$V_CTRL,R7,5$		; Br if not controller request
+	BRW	SETMODE_CTRL			; Process controller request
+
+; Perform setmode request on a tributary
+
+5$:	BBC	#IO$V_ATTNAST,R7,30$		; Branch if not attention AST
+ 
+
+; User is requesting an attention AST.
+
+	MOVAL	UCB$L_NO_AST(R5),R7		; Get addr of AST list
+	JSB	G^COM$SETATTNAST		; Set up attention AST
+	MOVL	UCB$L_NO_BUFFER(R5),R0		; Get NOB address
+	MOVAB	NOB$Q_ATTN(R0),R1		; Check for empty rcv list
+	CMPL	R1,(R1)				; Empty?
+	BEQL	20$				; Yes, no need to inform user
+10$:	PUSHL	R3				; Else, save IRP address
+	BSBW	POKE_USER			; Inform the user
+	POPL	R3				; Restore IRP address
+20$:	MOVL	UCB$L_DEVDEPEND(R5),R1		; Get device characteristics
+23$:	MOVZWL	S^#SS$_NORMAL,R0		; Set success
+25$:	JMP	G^EXE$FINISHIO			; Complete the I/O
+
+28$:	JMP	G^EXE$ABORTIO			; Abort the request
+ 
+ 
+30$:	BSBW	GET_CHAR_BUFS			; Get P1 and P2 characteristics
+	BLBC	R0,40$				; Br if error - abort I/O
+	BBC	#IO$V_SHUTDOWN,R7,50$		; Branch if not trib shutdown
+
+; Shutdown tributary modifier specified.
+;	
+; Validate P2 buffer. Then update trib parameter block.
+
+	MOVB	S^#NO_FC_V_STOP_CIR,-		; Set internal function code
+		IRP$B_NOFUNC(R3)
+	MOVZWL	UCB$L_DEVDEPEND(R5),R2		; Else, get status
+35$:	DSBINT	UCB$B_FIPL(R5)			; Sync to get the UCB
+	BSBW	VALIDATE_P2_TRIB		; Validate the P2 buffer
+	ENBINT					; Restore IPL
+	MOVL	UCB$L_DEVDEPEND(R5),R1		; Assume no error
+	BLBC	R0,25$				; Br if error
+	DSBINT	UCB$B_FIPL(R5)			; Sync to get the UCB
+	BSBW	CHG_TRIB			; Change trib parameters
+	ENBINT					; Restore IPL
+	BRW	QUEPKT				; Queue packet to driver
+ 
+40$:	JMP	G^EXE$ABORTIO			; Abort the I/O request
+
+50$:	MOVZWL	UCB$L_DEVDEPEND(R5),R2		; Get status
+	DSBINT	UCB$B_FIPL(R5)			; Sync to get the UCB
+	BSBW	VALIDATE_P2_TRIB		; Validate the P2 buffer
+	ENBINT					; Restore IPL
+	BLBC	R0,40$				; Br if error
+60$:	DSBINT	UCB$B_FIPL(R5)			; Sync to get the UCB
+	BSBW	CHG_TRIB			; Change trib parameters
+	ENBINT					; Restore IPL
+	BBS	#IO$V_STARTUP,R7,80$		; Br if startup request
+	MOVZWL	S^#SS$_NORMAL,R0		; Else, set successful return
+	MOVL	UCB$L_DEVDEPEND(R5),R1		; Set IOSB return status
+	JMP	G^EXE$FINISHIO			; Finish the I/O request
+80$:	MOVB	S^#NO_FC_V_STRT_CIR,-		; Set internal function code
+		IRP$B_NOFUNC(R3)
+	BRW	QUEPKT
+
+
+	.SBTTL	SETMODE_CTRL,  Perform setmode FDT operation on controller
+ 
+;++
+; SETMODE_CTRL - Perform setmode FDT operation on controller
+;
+; Functional description:
+;
+; This routine performs the SETMODE FDT setup for the controller.
+;
+;	INPUTS:
+;		R3 = IRP address
+;		R4 = PCB address
+;		R5 = UCB address
+;		R7 = IRP function word
+;
+;	OUTPUTS:
+;		R0 = status of setmode request
+;		R3-R5 are preserved.
+;
+;--
+SETMODE_CTRL:					; Perform setmode on controller
+	BSBW	GET_CHAR_BUFS			; Get P1 and P2 characteristics
+	BLBC	R0,20$				; Br if error - Abort I/O
+
+	BITW	#<XM$M_CHR_CTRL!-		; If NEQ then not multipoint 
+		XM$M_CHR_DMC>,-			; control or DMC mode
+		IRP$L_MEDIA+4(R3)
+	BEQL	5$
+	MOVZWL	#SS$_BADPARAM,R0		; Else set bad parameter
+	BRB	20$
+5$:	CLRL	R6				; Assume no protocol specified
+	MOVZWL	#NMA$C_PCLI_PRO,R1		; Check P2 buffer for multi
+	DSBINT	UCB$B_FIPL(R5)			; Sync to get the UCB
+	BSBW	UNPACK_P2_BUF			; point control specification
+	ENBINT					; Restore IPL
+	BLBC	R0,14$				; If BC then no prot specified
+	CMPB	#NMA$C_LINPR_CON,R2		; If EQL then multipoint contrl
+	BEQL	10$				; specified
+	BRB	14$
+10$:	MOVZWL	#SS$_BADPARAM,R0		; Else set bad parameter
+	BRB	17$
+14$:	MOVZWL	UCB$W_DEVSTS(R5),R2		; Get device status
+	DSBINT	UCB$B_FIPL(R5)			; Sync to get the UCB
+	BSBW	VALIDATE_P2_UCB			; Validate the P2 buffer
+	ENBINT					; Restore IPL
+	BLBC	R0,20$				; Br if error
+	BBC	#IO$V_SHUTDOWN,R7,30$		; Br if not shutdown request
+
+; Shutdown modifier specified
+
+	MOVB	S^#NO_FC_V_STOP_LIN,-		; Set internal function code
+		IRP$B_NOFUNC(R3)
+	DSBINT	UCB$B_FIPL(R5)			; Sync to get NOB
+	BSBW	CHG_UCB_NOB			; Update the UCB and the NOB
+	ENBINT					; Lower IPL
+	BBC	#NO_DS_V_INITED,-		; Br if controller not up
+		UCB$W_DEVSTS(R5),15$
+	BRW	QUEPKT				; Queue packet to driver
+ 
+15$:	MOVL	UCB$L_DEVDEPEND(R5),R1		; Get IOSB1 return
+	MOVZWL	S^#SS$_NORMAL,R0		; Set success
+17$:	JMP	G^EXE$FINISHIO			; Complete the I/O request
+
+20$:	JMP	G^EXE$ABORTIO			; Abort the I/O request
+
+25$: 	BRW	50$				; Branch to compl request
+ 
+30$:	BBC	#IO$V_STARTUP,R7,25$		; Br if not startup request
+	MOVB	S^#NO_FC_V_STRT_LIN,-		; Set internal function code
+		IRP$B_NOFUNC(R3)
+	MOVZWL	P3(AP),R1			; If EQL then P3 not set up
+	BEQL	35$
+	MOVL	UCB$L_NO_BUFFER(R5),R0		; Get NOB address
+	BBC	#NO_DS_V_INITED,-		; If BC then device not inited
+		UCB$W_DEVSTS(R5),33$		; set number of buffers
+	CMPB	R1,NOB$B_BFN(R0)		; Are the buffer nmb's the same
+	BEQL	35$				; Br if yes
+	MOVZWL	#NMA$C_PCLI_BFN,R1		; Set IOSB1 return
+	MOVZWL	#SS$_BADPARAM,R0		; Set error return
+	BRB	17$				; Finish the I/O request
+33$:	DSBINT	UCB$B_FIPL(R5)			; Sync to get NOB
+	MOVB	R1,NOB$B_BFN(R0)		; Store new rcve buffer number
+	ENBINT					; Restore IPL
+
+; Set new P1, P2 parameters
+
+35$:	BBC	#NO_DS_V_INITED,-		; Br if device not already
+		UCB$W_DEVSTS(R5),36$		; inited
+	BRW	70$
+36$:	DSBINT	UCB$B_FIPL(R5)			; Sync to get UCB
+	BLBC	IRP$L_MEDIA(R3),37$		; Br if no P1
+	CLRB	UCB$L_DEVDEPEND(R5)		; Clear old characteristics
+37$:	BSBW	CHG_UCB_NOB			; Update the UCB and the NOB
+	ENBINT					; Restore IPL
+	MOVL	UCB$L_NO_BUFFER(R5),R0		; Get NOB address
+	MOVZBL	NOB$B_BFN(R0),R1		; Get number of receive buffers
+	MOVZWL	IRP$L_MEDIA+2(R3),R2		; Get message size from P1
+	BLBS	IRP$L_MEDIA(R3),40$		; Br if P1 buffer is valid
+	MOVZWL	UCB$W_DEVBUFSIZ(R5),R2		; Else, get buff size from UCB
+40$:	MOVZWL	#SS$_BADPARAM,R0		; Assume bad parameter
+	MULL	R1,R2				; Compute total needed for buff
+	BEQL	60$				; Br if zero - error
+	MOVZWL	R2,R7				; Copy quota
+	CMPL	R2,R7				; Overflow?
+	BNEQ	60$				; Br if error
+	PUSHL	R3				; Save R3
+	JSB	G^EXE$BUFQUOPRC			; Check caller's quota
+	POPL	R3				; Restore R3
+	BLBC	R0,60$				; Br if error
+	MOVW	R7,IRP$W_QUOTA(R3)		; Save quota in packet
+	MOVL	PCB$L_JIB(R4),R0		; Get JIB address
+	SUBL	R7,JIB$L_BYTCNT(R0)		; Charge user for rec. bufs
+
+; The following call is used to allocate a buffer for the protocol, DDCMP.
+; If the routine returns with a LBC the the buffer could not be allocated and
+; the device can not be started. 
+
+	ADDL3	#TF$K_LENGTH,#GF$K_LENGTH,R1
+	BSBW	ALLOC_BUFFER
+	BLBC	R0,60$				; If LBC then abort startup
+	DSBINT	UCB$B_FIPL(R5)
+	MOVL	UCB$L_NO_BUFFER(R5),R0		; Get NOB address
+	MOVL	R2,NOB$A_PRO_BUFFER(R0)		; Set protocol addess
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>		; Before queueing request zero
+	MOVC5	#0,(R5),#0,#GF$K_LENGTH,TF$K_LENGTH(R2) ; the GFB portion of
+	POPR	#^M<R0,R1,R2,R3,R4,R5>		; buffer
+	ENBINT
+	BRW	QUEPKT				; Queue request to driver
+
+; No modifier specified - change controller parameters
+
+50$:	SETIPL	UCB$B_FIPL(R5)			; Sync access to UCB
+	BBS	#NO_DS_V_INITED,-		; Br if already inited
+		UCB$W_DEVSTS(R5),70$
+	BLBC	IRP$L_MEDIA(R3),53$		; Br if no P1 buffer
+	CLRB	UCB$L_DEVDEPEND(R5)		; Clear old UCB characteristics
+53$:	BSBW	CHG_UCB_NOB			; Update the UCB and the NOB
+	MOVZWL	S^#SS$_NORMAL,R0		; Else, set success
+	MOVL	UCB$L_DEVDEPEND(R5),R1		; Set IOSB1 return
+55$:	JMP	G^EXE$FINISHIO			; Finish the I/O request
+ 
+60$:	JMP	G^EXE$ABORTIO			; Abort the I/O request
+
+; Device already inited - set new parameters and give them to device
+
+70$:	BLBC	IRP$L_MEDIA(R3),80$		; Br if no P1 buffer
+	CMPB	IRP$L_MEDIA+4(R3),-		; Are characteristics okay?
+		UCB$L_DEVDEPEND(R5)
+	BEQL	80$				; Yes - let it go
+	MOVZWL	#SS$_BADPARAM,R0		; Return error
+	MNEGL	S^#1,R1				; No specific parameter
+	BRB	55$				; Complete the I/O
+ 
+80$:	SETIPL	UCB$B_FIPL(R5)			; Sync to get UCB
+	BSBW	CHG_UCB_NOB			; Update the UCB and the NOB
+	MOVB	#<15@4>,R0			; Set only four parameters
+	MOVW	S^#SS$_NORMAL,R0
+	MOVL	UCB$L_DEVDEPEND(R5),R1
+	JMP	G^EXE$FINISHIO
+
+	.SBTTL	ALLOC_BUFFER, Allocate a buffer
+;++
+;ALLOC_BUFFER - Allocate protocol buffer routine
+;
+; This routine does all the necesary operations to allocate a buffer from
+; nonpaged pool.
+;
+;	INPUTS:
+;	 	R1 = Buffer size
+;		R4 = Address of the PCB
+;
+;	OUTPUTS:
+;		R2 = Address of buffer allocated
+;		R3 is preserved
+;
+;--
+ALLOC_BUFFER:
+	PUSHL	R3
+	JSB	G^EXE$BUFFRQUOTA		; Does the user have quota
+	BLBC	R0,10$				; If LBC no quota
+	JSB	G^EXE$ALLOCBUF			; Allocate the buffer
+	BLBC	R0,10$				; If LBC then not allocated
+	MOVL	PCB$L_JIB(R4),R0		; Get the users JIB
+	SUBL2	R1,JIB$L_BYTCNT(R0)		; Subtract the quota
+	MOVW	R1,UCB$W_SIZE(R2)		; Save the size of BUFFER allocated
+	MOVW	S^#DYN$C_BUFIO,UCB$B_TYPE(R2)	; Set buffer type
+	MOVZWL	S^#SS$_NORMAL,R0		; Set successful return
+10$:	POPL	R3
+	RSB
+
+
+	.SBTTL	INIT_NO_BUFFER - Initialize NOB extension
+ 
+;++
+; INIT_NO_BUFFER - Initialize NOB extension
+;
+; Functional description:
+;
+; This routine is called to initialize queues and reset parameters when the 
+; NOB has been allocated on a startup.
+;
+;	INPUTS:
+;		R4 = NOB address
+;		R5 = UCB address
+;
+;	IPL = FIPL
+;
+;	OUTPUTS:
+;		R0-R2 are destroyed.
+;
+;--
+INIT_NO_BUFFER:
+
+; Initialize queue headers
+
+	MOVAB	NOB$Q_RCVS(R4),NOB$Q_RCVS(R4)	; Receive list
+	MOVAB	NOB$Q_RCVS(R4),NOB$Q_RCVS+4(R4)
+	MOVAB	NOB$Q_FREE(R4),NOB$Q_FREE(R4)	; Free buffer list
+	MOVAB	NOB$Q_FREE(R4),NOB$Q_FREE+4(R4)
+	MOVAB	NOB$Q_POST(R4),NOB$Q_POST(R4) 	; Post list
+	MOVAB	NOB$Q_POST(R4),NOB$Q_POST+4(R4)
+	MOVAB	NOB$Q_ATTN(R4),NOB$Q_ATTN(R4)	; Full buffer list
+	MOVAB	NOB$Q_ATTN(R4),NOB$Q_ATTN+4(R4)
+
+	ASSUME	NOB$L_XMT_INPR EQ NOB$L_RCV_INPR+4
+
+	CLRQ	NOB$L_RCV_INPR(R4)
+	CLRB	NOB$B_XSTATE(R4)		; Clear xmter state
+	MOVW	#NO$C_PAD,NOB$W_PADS(R4)	; Set up field with pads to send
+
+
+; Enable the receiver. DDCMP STRT messages could be coming in on the
+; wire and we will start looking at them as soon as this buffer is
+; given to the device. ( The address is stored in UCB$L_NO_BUFFER.)
+; Since that is the case then we might as well start framing receive messages
+; as well. The protocol will not be brought up however until both
+; the line and circuit are turned on.
+
+	DSBINT	UCB$B_DIPL(R5)
+	BSBW	START_RECEIVE
+	ENBINT	
+
+
+; Set up the block allocated in the NOB to look like a DDCMP control message
+; buffer
+
+	MOVAL	NOB$Z_CTL_MSG(R4),R0
+	CLRL	XMTQ$L_IRP(R0)
+	MOVB	#XMTQ$M_CONTROL,XMTQ$B_FLAG(R0)
+
+; Please note that setting this of this parameter on device startup is
+; accomplished via the NOB$W_DEVBUFSIZ field in the NOB buffer. This
+; was done to make the validating and the setting of this field simpler
+
+	MOVW	#NO$C_DEF_BUFSIZ,UCB$W_DEVBUFSIZ(R5) ; Set default buffer size
+	MOVZWL	#DEF_LINE_PARAMSZ,R0		; Set size of defaults in bytes
+	MOVAB	DEF_LINE_PARAM,R1		; Set address of defaults
+	MOVAB	NOB$C_SETPRM(R4),R2		; Set address of parameters
+10$:	MOVB	(R1)+,(R2)+			; Set next default
+	SOBGTR	R0,10$				; Loop on all parameters
+	MOVZWL	#DEF_TRIB_PARAMSZ,R0		; Set size of defaults in bytes
+	MOVAB	DEF_TRIB_PARAM,R1		; Set address of defaults
+	MOVAB	NOB$Z_DDCMP(R4),R2		; Set address of parameters
+20$:	MOVB	(R1)+,(R2)+			; Set next default
+	SOBGTR	R0,20$				; Loop on all parameters
+	RSB
+
+
+	.SBTTL	NO$SENSEMODEFDT,  Sense Mode I/O operation FDT routine
+
+;++
+; NO$SENSEMODEFDT - Sense Mode FDT routine
+;
+; Functional Description:
+;
+;  This routine returns information to the caller about the configuration
+;  and status of the DMF32 device.  Depending on the function modifier,
+;  either the device characteristics, error counters contents are returned.
+;
+;
+;  The QIO parameters for SENSEMODE are:
+;
+;	P1 = optional address of quadword or longword buffer
+;	P2 = optional address of buffer descriptor for extended characteristics
+;	
+;
+;	INPUTS:
+;		R3 = IRP address
+;		R4 = PCB address
+;		R5 = UCB address
+;		R6 = CCB address
+;		R7 = Function code
+;		AP = Address of first function-dependent QIO parameter
+;
+;	OUTPUTS:
+;		R0 = status return of sensemode request
+;		R3,R5 are preserved.
+;
+;--
+NO$SENSEMODEFDT:
+	BBS	#NO_DS_V_INITED,UCB$W_DEVSTS(R5),2$ ; If inited then ok to read
+						     ; errors and characteristics
+	MOVZWL	#SS$_NORMAL,R0			; Else return no information
+	MOVL	UCB$L_DEVDEPEND(R5),R1
+	JMP	G^EXE$FINISHIO
+
+2$:	MOVW	IRP$W_FUNC(R3),R7		; Get entire function code
+ 
+	BBC	#IO$V_CTRL,R7,5$		; Br if not controller request
+	BRW	SENSEMODE_CTRL			; Else, process controller req.
+5$:	BITW	#<IO$M_RD_COUNT!-		; Check to see if either bit is
+		IO$M_CLR_COUNT>,R7		; Is set
+	BEQL	40$				; If EQL then read parameters
+	CLRL	R0				; Assume clear count
+	MOVZWL	S^#SS$_NORMAL,R1		; Assume success
+	BBC	#IO$V_RD_COUNT,R7,15$		; If BC then not read count
+
+; Read tributary counters - modifier RD_COUNT
+
+	BSBW	CHECK_P2			; Check P2 buffer
+	MOVZWL	#SS$_BADPARAM,R0		; Assume zero length buffer
+	MOVW	R1,IRP$L_MEDIA+4(R3)		; Save user size of P2 buffer
+	BEQL	30$				; Br if none
+	PUSHL	R4
+	MOVZWL	S^#SS$_NORMAL,R1		; Assume success
+	MOVL	UCB$L_NO_BUFFER(R5),R4		; Get NOB address
+	BEQL	35$				; If eql no info
+	MOVL	NOB$A_PRO_BUFFER(R4),R4		; Get prot buffer address
+	BEQL	35$				; If eql no info
+	MOVZWL	TF$W_TEB(R4),R0			; Get size of buffer needed
+	CMPW	IRP$L_MEDIA+4(R3),R0		; IF GEQU then buffer ok
+	BGEQU	10$
+	MOVZWL	#SS$_BUFFEROVF,R1		; Return partial success
+	MOVZWL	IRP$L_MEDIA+4(R3),R0		; Set size of copy
+10$:	PUSHR	#^M<R0,R1,R3,R4,R5>		; Save the registers
+	MOVC3	R0,TF$K_ERRSTRT(R4),(R2)	; Get the errors
+	POPR	#^M<R0,R1,R3,R4,R5>
+	BBC	#IO$V_CLR_COUNT,R7,20$		; Br if not clear counts
+15$:	MOVZWL	#<DLK$M_TRIB!DLK$M_CLEAR>,R7	; Set counters to read/clear
+	SETIPL	UCB$B_FIPL(R5)			; Set to fork IPL
+	PUSHR	#^M<R0,R1,R3,R5>		; Save registers
+	CLRL	R8				; Set no parameters to return
+	MOVL	R4,R5				; Set address of trib block
+	MOVZBL	#DLK$C_REQEBA,R6		; Set operation to perform
+	BSBW	DDCMP				; Branch to protocol
+	POPR	#^M<R0,R1,R3,R5>
+20$:	ASHL	#16,R0,R0			; Shift size of buffer return
+	MOVW	R1,R0				; Set success status
+	POPL	R4
+	MOVL	UCB$L_DEVDEPEND(R5),R1		; Set devdepend info
+	JMP	G^EXE$FINISHIO			; Complete the request
+
+30$:	JMP	G^EXE$ABORTIO			; Abort the I/O request
+
+35$:	CLRL	R0
+	BRB	20$
+
+; Read tributary parameters 
+
+40$:	MOVZWL	S^#SS$_NORMAL,R0		; Assume success
+	MOVZWL	S^#8,R1				; Size of P1 buffer if present
+	BSBW	CHECK_BUFS			; Check P1 and P2 buffers
+	MOVW	R1,IRP$L_MEDIA+4(R3)		; Save user P2 buffer length
+	BEQL	60$				; Br if no P2 buffer present
+
+	MOVW	S^#SS$_NORMAL,IRP$L_MEDIA+6(R3)	; Assume success
+	MOVW	#TRIB_PRM_BUFSIZ,IRP$W_BCNT(R3)	; Set size of required buffer
+	CMPW	R1,#TRIB_PRM_BUFSIZ		; If GEQU then user buffer is
+	BGEQU	50$				; large enough
+	MOVW	#SS$_BUFFEROVF,IRP$L_MEDIA+6(R3) ; Return partial success
+	MOVW	R1,IRP$W_BCNT(R3)		; Set size to use in move
+50$:	MOVAB	TRIB_PARAM,R1			; Get address of return table
+	PUSHL	R4
+	MOVL	UCB$L_NO_BUFFER(R5),R4		; Get NOB address
+	BEQL	55$				; If Neql buffer is available
+	MOVAB	NOB$Z_DDCMP(R4),R4		; Get trib param block address
+	BNEQ	56$				; If Neql buffer is available
+55$:	CLRW	IRP$W_BCNT
+	BRB	58$
+56$:	BSBW	RETURN_P2			; Return the P2 parameters
+58$:	POPL	R4
+	MOVW	IRP$W_BCNT(R3),R0		; Return size of buffer
+	ASHL	#16,R0,R0			; Shift size of buffer return
+	MOVW	IRP$L_MEDIA+6(R3),R0		; Set size of return
+ 
+60$:	MOVL	IRP$L_MEDIA(R3),R2		; Retrieve P1 buffer address
+	BEQL	70$				; Br if none
+	MOVQ	UCB$B_DEVCLASS(R5),(R2)		; Else, return characteristics
+	BISL	UCB$L_DEVDEPEND(R5),4(R2)	;	...
+70$:	MOVL	UCB$L_DEVDEPEND(R5),R1		; Get device dependend info
+	JMP	G^EXE$FINISHIO			; Complete the I/O request
+
+	.SBTTL	SENSEMODE_CTRL,  Perform SENSEMODE FDT processing for controller
+ 
+;++
+; SENSEMODE_CTRL - Perform SENSEMODE FDT processing for controller
+;
+; Functional description:
+;
+; This routine performs all FDT checking for a controller SENSEMODE request.
+; The P2 buffer if present is check for write access and if okay, a system
+; buffer is allocated for temporarily saving the needed information. The
+; P1 sensemode information is returned through IRP$L_MEDIA and IRP$L_MEDIA+4.
+;
+;	INPUTS:
+;		R3 = IRP address
+;		R4 = PCB address
+;		R5 = UCB address
+;		R7 = Function code
+;
+;	OUTPUTS:
+;		R0 = status return for request
+;		R3-R5 are preserved.
+;
+;--
+SENSEMODE_CTRL:					; Process controller sensemode FDT
+	BITW	#<IO$M_RD_COUNT!-		; Check to see if either bit is
+		IO$M_CLR_COUNT>,R7		; Is set
+	BNEQ	5$				; If NEQ then not read parameter
+	BRW	40$				; else read parameters
+5$:	BBC	#IO$V_RD_MODEM,R7,8$		; If BC not a read modem IO
+	BRW	SENSE_MODEM			; Else branch to read modem FDT
+8$:	CLRL	R0				; Assume clear count
+	MOVZWL	S^#SS$_NORMAL,R1		; Assume success
+	MOVL	UCB$L_NO_BUFFER(R5),R2		; Get NOB address
+	BEQL	35$				; If eql no buffer available
+	TSTL	NOB$A_PRO_BUFFER(R2)		; Check for address of protocol buffer
+	BEQL	35$				; If eql no buffer available
+	BBC	#IO$V_RD_COUNT,R7,15$		; Br if not read counters
+
+; Read controller counters - modifier RD_COUNT for DDCMP mode only
+
+	BSBW	CHECK_P2			; Check P2 buffer
+	MOVZWL	#SS$_BADPARAM,R0		; Assume zero length buffer
+	MOVW	R1,IRP$L_MEDIA+4(R3)		; Save user size of P2 buffer
+	BEQL	30$				; Br if none
+	PUSHL	R4
+	MOVL	UCB$L_NO_BUFFER(R5),R4		; Get NOB address
+	MOVL	NOB$A_PRO_BUFFER(R4),R4		; Set address of protocol buffer
+	MOVZWL	S^#SS$_NORMAL,R1		; Assume success
+	MOVZWL	GF$W_GEB+TF$K_LENGTH(R4),R0	; Get size of buffer needed
+	CMPW	IRP$L_MEDIA+4(R3),R0		; IF GEQU then buffer ok
+	BGEQU	10$
+	MOVZWL	#SS$_BUFFEROVF,R1		; Return partial success
+	MOVZWL	IRP$L_MEDIA+4(R3),R0		; Set size of copy
+10$:	PUSHR	#^M<R0,R1,R3,R4,R5>		; Save the registers
+	MOVC3	R0,GF$K_ERRSRT+TF$K_LENGTH(R4),(R2) ; Get the errors
+	POPR	#^M<R0,R1,R3,R4,R5>
+	POPL	R4
+	BBC	#IO$V_CLR_COUNT,R7,20$		; Br if not clear counts
+15$:	MOVZWL	#<DLK$M_GLOB!DLK$M_CLEAR>,R7	; Set counters to read/clear
+	SETIPL	UCB$B_FIPL(R5)			; Set to fork IPL
+	PUSHR	#^M<R0,R1,R3,R4,R5>		; Save registers
+	CLRL	R8				; Set no parameters to return
+	MOVL	UCB$L_NO_BUFFER(R5),R5		; Get NOB address
+	MOVL	NOB$A_PRO_BUFFER(R5),R5		; Set address of protocol buffer
+	MOVZBL	#DLK$C_REQEBA,R6		; Set operation to perform
+	BSBW	DDCMP				; Branch to protocol
+	POPR	#^M<R0,R1,R3,R4,R5>
+20$:	ASHL	#16,R0,R0			; Shift size of buffer return
+	MOVW	R1,R0				; Set success status
+	MOVL	UCB$L_DEVDEPEND(R5),R1		; Set devdepend info
+	JMP	G^EXE$FINISHIO			; Complete the request
+
+30$:	JMP	G^EXE$ABORTIO			; Abort the I/O request
+
+35$:	CLRL	R0
+	BRB	20$
+
+; Read controller parameters
+
+40$:	MOVZWL	S^#SS$_NORMAL,R0		; Assume success
+	MOVZWL	S^#8,R1				; Size of P1 buffer if present
+	BSBW	CHECK_BUFS			; Check P1 and P2 buffers
+	MOVL	R1,IRP$L_MEDIA+4(R3)		; Save user P2 buffer length
+	BEQL	60$				; Br if no P2 buffer
+
+	MOVW	S^#SS$_NORMAL,IRP$L_MEDIA+6(R3)	; Assume success
+	MOVW	#LINE_PRM_BUFSIZ,IRP$W_BCNT(R3)	; Set size of required buffer
+	CMPW	R1,#LINE_PRM_BUFSIZ		; If GEQU then user buffer is
+	BGEQU	50$				; large enough
+	MOVW	#SS$_BUFFEROVF,IRP$L_MEDIA+6(R3) ; Return partial success
+	MOVW	R1,IRP$W_BCNT(R3)		; Set size to use in move
+50$:	MOVAB	LINE_PARAM,R1			; Get address of return table
+	PUSHL	R4
+	MOVL	UCB$L_NO_BUFFER(R5),R4		; Get line param block address
+	BNEQ	52$				; If neq buffer available
+	CLRW	IRP$W_BCNT(R3)
+	BRB	54$
+52$:	BSBW	RETURN_P2			; Return the P2 parameters
+54$:	POPL	R4
+55$:	MOVW	IRP$W_BCNT(R3),R0		; Return size of buffer
+	ASHL	#16,R0,R0			; Shift size of buffer return
+	MOVW	IRP$L_MEDIA+6(R3),R0		; Set size of return
+
+60$:	MOVL	IRP$L_MEDIA(R3),R2		; Retrieve P1 buffer address
+	BEQL	70$				; Br if none
+	MOVQ	UCB$B_DEVCLASS(R5),(R2)		; Else, return characteristics
+70$:	MOVL	UCB$L_DEVDEPEND(R5),R1		; Get device dependend info
+	JMP	G^EXE$FINISHIO			; Complete the I/O request
+
+
+	.SBTTL	SENSE_MODEM - Perform SENSEMODE READ_MODEM FDT processing
+;++
+;SENSE_MODEM - Perform SENSEMODE READ_MODEM FDT processing
+;
+; This routine performs all FDT checking for a SENSEMODE read modem reqeust.
+; The P1 buffer is checked for write access and the request is queued to
+; the driver.
+;
+;	INPUTS:
+;		R3 = IRP address
+;		R4 = PCB address
+;		R5 = UCB address
+;		R7 = Fucntion code
+;
+;	OUTPUTS:
+;		R0 = Status for return 
+;		R3-R5 are preserved
+;--
+SENSE_MODEM:
+	MOVZWL	S^#4,R1				; Size of P1 buffer
+	BSBW	CHECK_P1			; Check access to P1
+						; (no return on no access)
+	BSBW	ALLOC_P2BUF			; Allocate a P2 buffer
+	BLBS	R0,10$				; Branch if success
+	BRW	ABORTIO				; Else abort the request
+
+;& WHAT DO WE DO HERE?????
+
+10$:	MOVL	IRP$L_SVAPTE(R3),R1		; Get system buffer address
+	MOVL	IRP$L_MEDIA(R3),P2B_L_BUFFER(R1) ; Set user buffer VA
+	CLRL	IRP$L_MEDIA(R3)			; Clear buffer
+	MOVB	#NO_FC_V_READ_MODEM,IRP$B_NOFUNC(R3) ; Set funcition
+	;BRB	QUEPKT				;Give request o driver
+
+
+
+; I/O request packet to driver
+
+QUEPKT:
+	SETIPL	UCB$B_FIPL(R5)			; Queue packet to driver
+	JSB	G^IOC$INITIATE			; Initiate I/O reuqest
+	JMP	G^EXE$QIORETURN			; Lower IPL, and return
+
+
+	.SBTTL	GET_CHAR_BUFS,  Get P1 and P2 characteristics buffers
+ 
+;++
+; GET_CHAR_BUFS - Get P1 and P2 characteristics buffers
+;
+; Functional description:
+;
+; This routine saves the P1 and P2 buffers for later use by the driver.
+; The P1 buffer is saved in the IRP (IRP$L_MEDIA) as a quadword value.
+; The P2 buffer is saved by allocating the appropriate amount of memory from
+; non-paged pool.   The user's quota is checked before the allocation is made.
+; And the non-paged pool buffer is charged against the user's quota. The P2
+; system buffer address is passed in IRP$L_SVAPTE of the IRP.
+;
+;
+; 	INPUTS:
+;		R3 = IRP address
+;		R4 = PCB address
+;		R5 = UCB address
+;
+;	OUTPUTS:
+;		R0 = status of buffers
+;		R3-R5 are preserved.
+;
+;--
+GET_CHAR_BUFS:					; Get characteristics buffers
+
+; Check access to P1 buffer and save P1 characteristics
+
+	CLRQ	IRP$L_MEDIA(R3)			; Reset P1 chars
+	MOVL	P1(AP),R2			; Get address of P1 char buf
+	BEQL	10$				; Branch if no P1 buffer
+	MOVZWL	#SS$_ACCVIO,R0			; Assume access violation
+	IFNORD	#8,(R2),20$			; Check access
+	MOVQ	(R2),IRP$L_MEDIA(R3)		; Save P1 characteristics
+	MOVB	#1,IRP$L_MEDIA(R3)		; Indicate valid P1 buffer
+
+; Check access to P2 buffer and check process's buffer quota
+
+10$:	MOVL	P2(AP),R2			; Get address P2 char buf desc
+	BEQL	40$				; Br if no P2 buffer
+	MOVZWL	#SS$_ACCVIO,R0			; Assume access violation
+	IFNORD	#8,(R2),20$			; Check access to descriptor
+	MOVZWL	(R2),R1				; Get buffer length in bytes
+	BICL	#1,R1				; Must be multiple of 2 bytes
+	BEQL	40$				; Br if size is zero
+	MOVL	DSC$A_POINTER(R2),R2		; Get buffer address
+	MOVL	R2,R0				; Copy buffer address
+	PUSHR	#^M<R2,R3>			; Save R2, R3
+	JSB	G^EXE$WRITECHKR			; Check entire buffer
+	BLBC	R0,15$				; Branch if error
+	JSB	G^EXE$BUFQUOPRC			; Check for buffered quota
+15$:	POPR	#^M<R2,R3>			; Restore R2, R3
+	BLBS	R0,30$				; Branch if quota ok
+20$:	RSB					; Return
+ 
+
+; Quota OKAY, allocate buffer and copy info.
+
+30$:	BSBW	ALLOC_P2BUF			; Allocate buffer
+	BLBC	R0,50$				; Br if error
+	MOVL	IRP$L_SVAPTE(R3),R0		; Get P2 buffer address
+	PUSHR	#^M<R3,R4,R5>			; Save sacred registers
+	MOVC3	R1,(R2),P2B_T_DATA(R0)		; Save P2 char buffer
+	POPR	#^M<R3,R4,R5>			; Restore registers
+40$:	MOVZWL	S^#SS$_NORMAL,R0		; Set success
+50$:	RSB					; Return
+
+	.SBTTL	CHECK_BUFS,  Check P1 and P2 buffers for write access
+ 
+;++
+; CHECK_BUFS - Check P1 and P2 buffers for write access
+;
+; Functional description:
+;
+; This routines checks the P1 and P2 buffers for write access if supplied.
+;
+; 	INPUTS:
+;		R1 = Size of P1 buffer needed for write access
+;		R3 = IRP address
+;		R4 = PCB address
+;		R5 = UCB address
+;		R7 = Function code
+;		R9 = CDB address
+;
+;	OUTPUTS:
+;		R1 = Length of P2 buffer (zero if no P2 buffer)
+;		R2 = Address of P2 buffer in user's process space
+;		R0-R1 are destroyed.
+;
+;	No RETURN on NO ACCESS
+;
+;	IMPLICIT OUTPUTS:
+;
+;		IRP$V_FUNC bit set in IRP$W_STS by EXE$READCHK subroutine.
+;
+;--
+CHECK_BUFS:
+	BSBB	CHECK_P1			; Check P1 buffer
+CHECK_P2:
+	CLRL	R1				; Assume no P2 buffer desc
+	MOVL	P2(AP),R2			; Get address of P2 desc
+	BEQL	10$				; Br if no P2
+	IFNORD	#8,(R2),ACCESS			; Br if no access
+	MOVZWL	(R2),R1				; Get length of buffer
+	BICL	#1,R1				; Must be multiple of 2 bytes
+	BEQL	10$				; Br if zero
+	MOVL	DSC$A_POINTER(R2),R0		; Get buffer address
+	JSB	G^EXE$READCHK			; Check write access to buffer
+						; (no return no access)
+						; Also sets IRP$V_FUNC in IRP
+	MOVL	R0,R2				; Copy buffer address
+10$:	RSB					; Return to caller
+ 
+ACCESS:	MOVZWL	#SS$_ACCVIO,R0			; Return access violation
+	BRW	ABORTIO				; Abort the I/O request
+
+	.SBTTL	CHECK_P1,  Check P1 buffer address for write access
+ 
+;++
+; CHECK_P1 - Check P1 buffer address for write access
+;
+; Functional description:
+;
+;  This routine checks the P1 buffer and if okay, the buffer address
+;  is saved in IRP$L_MEDIA of the IRP.
+;
+; 	INPUTS:
+;		R1 = Size of buffer for write access
+;		R3 = IRP address
+;		R4 = PCB address
+;		R5 = UCB address
+;		R7 = Function code
+;		R9 = CDB address
+;
+;	OUTPUTS:
+;		R0 is destroyed.
+;
+;	No RETURN on NO ACCESS.
+;
+;	IMPLICIT OUTPUTS:
+;
+;		IRP$L_MEDIA(R3) = User P1 buffer address.
+;		IRP$V_FUNC bit set in IRP$W_STS by EXE$READCHK subroutine.
+;
+;--
+CHECK_P1:
+	CLRL	IRP$L_MEDIA(R3)			; Assume no P1 buffer
+	MOVL	P1(AP),R0			; Get address of user buffer
+	BEQL	10$				; Br if none
+	JSB	G^EXE$READCHK			; Check access to buffer
+						; (No return - no access)
+	MOVL	R0,IRP$L_MEDIA(R3)		; Save P1 buffer address in IRP
+10$:	RSB					; Return to caller
+
+	.SBTTL	ALLOC_P2BUF,  Allocate a P2 buffer and charge user's quota
+ 
+;++
+; ALLOC_P2BUF - Allocate a P2 buffer and charge user's quota
+;
+; Functional description:
+;
+; This routine allocates a system buffer and returns the address in the IRP at
+; IRP$L_SVAPTE.  The size of the allocation, including buffer header must
+; be at least 24 bytes in length.
+;
+; 	INPUTS:
+;		R1 = Size of allocation desired
+;		R3 = IRP address
+;
+;	OUTPUTS:
+;		R0 = status of request
+;		R1-R5 are preserved.
+;
+;	IMPLICIT OUTPUTS:
+;		IRP$L_SVAPTE(R3) = address of system buffer
+;		IRP$W_BOFF(R3) = byte count charged to user's process
+;		IRP$W_BCNT(R3) = original byte count requested
+;
+;	All parts of the P2 buffer header are initialized, except for the
+;	user's P2 buffer address.
+;
+;--
+ALLOC_P2BUF:					; Allocate a non-paged buffer
+	TSTL	R1				; Zero length buffer?
+	BEQL	30$				; Br if yes
+	PUSHR	#^M<R1,R2,R3>			; Save registers
+	MOVW	R1,IRP$W_BCNT(R3)		; Save original byte count
+	CMPL	R1,S^#24-P2B_C_LENGTH		; Is buffer big enough?
+	BGTRU	5$				; Br if yes
+	MOVL	S^#24-P2B_C_LENGTH,R1		; Else, set size to minimum
+5$:	ADDL2	S^#P2B_C_LENGTH,R1		; Add in size of header
+	JSB	G^EXE$BUFQUOPRC			; Check for buffered quota
+	BLBC	R0,10$				; Branch if quota bad
+
+; Quota OKAY, allocate buffer and copy info.
+
+	PUSHL	R1				; Save size to charge user
+	JSB	G^EXE$ALONONPAGED		; Go allocate a buffer
+	BLBS	R0,20$				; Br if success
+	TSTL	(SP)+				; Pop saved size
+10$:	POPR	#^M<R1,R2,R3>			; Restore registers
+	RSB					; Return with error code in R0
+
+; System buffer allocated decrement user's quota
+
+20$:	POPL	R3				; Restore user quota charge
+	MOVAB	P2B_T_DATA(R2),P2B_L_POINTER(R2) ; Set address to start of data
+	MOVW	R3,P2B_W_SIZE(R2)		; Save buffer size in buffer
+	MOVB	S^#DYN$C_BUFIO,P2B_B_TYPE(R2)	; Set structure type
+	MOVL	R2,R0				; Save P2 char buf addr
+	MOVL	PCB$L_JIB(R4),R2		; Get JIB address
+	SUBL	R3,JIB$L_BYTCNT(R2)		; Decrement user's quota
+	POPR	#^M<R1,R2,R3>			; Restore registers
+	MOVL	R0,IRP$L_SVAPTE(R3)		; Save P2 buffer address in IRP
+	MOVW	P2B_W_SIZE(R0),IRP$W_BOFF(R3)	; Return buffer size in IRP
+30$:	MOVZWL	S^#SS$_NORMAL,R0		; Set success
+	RSB					; Return to caller
+
+	.SBTTL	CHG_UCB_NOB,  Change UCB and the NOB parameter values
+ 
+;++
+; CHG_UCB_NOB  -  Change UCB and the NOB parameter values
+;
+; Functional description:
+;
+; This routine is called to initialize the NOB with new P1 and P2 buffer
+; characteristics. It is assumed here that the parameters have already
+; been validated.
+;
+;	INPUTS:
+;
+;		R3 = IRP address
+;		R5 = UCB address
+;		R6 = Protocol mode in which to run the driver 
+;
+;	IPL = FIPL
+;
+;	OUTPUTS:
+;		R0-R2 = destroyed.
+;
+;--
+CHG_UCB_NOB:
+	PUSHL	R4				; Save R4
+	MOVL	UCB$L_NO_BUFFER(R5),R4		; Get NOB address
+	BLBC	IRP$L_MEDIA(R3),10$		; Br if no P1 buffer
+
+; Set new P1 buffer characteristics
+
+	BBS	#NO_DS_V_INITED,-		; Br if device inited
+		UCB$W_DEVSTS(R5),5$ 
+
+; Please note that setting this of this parameter on device startup is
+; usually accomplished via the NOB$W_DEVBUFSIZ field in the NOB buffer. This
+; was done to make the validating and the setting of this field simpler.
+
+	MOVW	IRP$L_MEDIA+2(R3),UCB$W_DEVBUFSIZ(R5) ; Set new buffer size
+	MOVW	UCB$W_DEVBUFSIZ(R5),NOB$W_DEVBUFSIZ(R4) ; Make sure both are updated
+		
+5$:	INSV	#0,#8,#24,UCB$L_DEVDEPEND(R5)	; Reset all Read/Write flags
+	BISL	IRP$L_MEDIA+4(R3),-		; Set new characteristics
+		UCB$L_DEVDEPEND(R5) 
+
+; Now update UCB based on P1 buffer
+
+	ASSUME	NMA$C_LINPR_POI EQ 0
+
+	CLRB	NOB$B_PRO(R4)			; Assume point to point mode
+
+	ASSUME	NMA$C_LINCN_NOR EQ 0
+
+6$:	CLRB	NOB$B_CON(R4)			; Assume normal mode
+	BBC	#XM$V_CHR_LOOPB,-		; Br if not loopback mode
+		UCB$L_DEVDEPEND(R5),7$
+	ASSUME	NMA$C_LINCN_LOO EQ 1
+	INCB	NOB$B_CON(R4)			; Must be loopback mode
+7$:	ASSUME	NMA$C_DPX_FUL EQ 0
+	CLRB	NOB$B_DUP(R4)			; Assume full duplex
+	BBC	#XM$V_CHR_HDPLX,-		; Br if not half duplex
+		UCB$L_DEVDEPEND(R5),10$
+	ASSUME	NMA$C_DPX_HAL EQ 1
+	INCB	NOB$B_DUP(R4)			; Must be half duplex
+
+
+; Set new P2 buffer characteristics
+
+10$:	MOVAB	LINE_PARAM,R1			; Get address of verification table
+	BSBW	UPDATE_P2			; Update the UCB
+
+; Please note that setting this of this parameter on device startup is
+; usually accomplished via the NOB$W_DEVBUFSIZ field in the NOB buffer. This
+; was done to make the validating and the setting of this field simpler.
+
+	MOVW	NOB$W_DEVBUFSIZ(R4),UCB$W_DEVBUFSIZ(R5) ; Set def buffer size
+
+; Set device characteristics and device mode definition
+
+	CLRB	UCB$L_DEVDEPEND(R5)		; Reset all characteristics
+20$:	SETBIT	#XM$V_CHR_HDPLX,UCB$L_DEVDEPEND(R5) ; Assume half duplex mode
+	ASSUME	NMA$C_DPX_FUL EQ 0
+	TSTB	NOB$B_DUP(R4)			; Full duplex mode?
+	BNEQ	30$				; Br if no - okay
+	CLRBIT	#XM$V_CHR_HDPLX,UCB$L_DEVDEPEND(R5) ; Set to full duplex mode
+30$:	ASSUME	NMA$C_LINCN_NOR EQ 0
+	TSTB	NOB$B_CON(R4)			; Is line in normal mode?
+	BEQL	40$				; Br if yes
+	SETBIT	#XM$V_CHR_LOOPB,UCB$L_DEVDEPEND(R5) ; Set loopback mode
+40$:	POPL	R4				; Restore R4
+	RSB
+
+
+
+	.SBTTL	CHG_TRIB,  Change trib parameter values
+ 
+;++
+; CHG_TRIB - Change trib parameter values
+;
+; Functional description:
+;
+; This routine is called to initialize the trib parameter block with 
+; new P1 and P2 buffer characteristics. It is assumed here that the 
+; parameters have already been validated.
+;
+;	INPUTS:
+;		R3 = IRP address
+;		R5 = UCB address
+;
+;	IPL = FIPL
+;
+;	OUTPUTS:
+;		R1,R2 = destroyed.
+;
+;--
+CHG_TRIB:					; Validate P2 buffer
+	PUSHL	R4				; Save R4
+	MOVL	UCB$L_NO_BUFFER(R5),R4		; Get NOB address
+	MOVAB	TRIB_PARAM,R1			; Get address of verify table
+	MOVAB	NOB$Z_DDCMP(R4),R4		; Get the addr of param block
+	BLBC	IRP$L_MEDIA(R3),10$		; Br if no P1 buffer
+
+; Set new P1 buffer characteristics
+
+	BISL	IRP$L_MEDIA+4(R3),UCB$L_DEVDEPEND(R5) ; Set new char
+
+	ASSUME	NMA$C_STATE_ON EQ 0
+	ASSUME	NMA$C_STATE_OFF EQ 1
+
+	CLRB	DLK$B_MAINT(R4)			; Assume MOP
+	BBS	#XM$V_CHR_MOP,UCB$L_DEVDEPEND(R5),10$ ; Branch BS if true
+	INCB	DLK$B_MAINT(R4)			; Set NORMAL mode
+
+; Set new P2 buffer characteristics
+
+10$:	BSBW	UPDATE_P2			; Update trib parameters
+	CLRBIT	#XM$V_CHR_MOP,UCB$L_DEVDEPEND(R5) ; Assume NORMAL mode
+	BLBS	DLK$B_MAINT(R4),20$		; Branch LBS if true
+	SETBIT	#XM$V_CHR_MOP,UCB$L_DEVDEPEND(R5) ; Set MOP mode
+20$:	POPL	R4				; Restore R4
+	RSB					; Return to caller
+
+
+	.SBTTL	NO$STARTIO - Start setmode I/O operation
+;++
+; NO$STARTIO - Start setmode operation
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine is entered to process a setmode request.  All setmode requests
+; are queued through the UCB to single-stream them.
+;
+; SETMODE FUNCTIONS --
+;
+;	For all functions a change in the characteristics is done.
+;
+;	For control startup, the UCB is initialized, and the DDCMP timer is 
+;	started.
+;	For trib startup, the protocol is set up with charateristics and 
+;	started, and transmits and receives are started on the board.
+;
+;	For control shutdown, the DDCMP timer is stopped,
+;	all quotas are returned; and a call is made to trib shutdown to shut
+;	the trib.
+;	For trib shutdown, all buffers and IRP's are returned,
+;	and the protocol is halted.
+;
+; 	INPUTS:
+;		R3 = I/O packet address
+;		R5 = UCB address
+;
+;	OUTPUTS:
+;		R3 and R5 preserved.
+;
+;--
+	.ENABL	LSB
+NO$STARTIO:					; Start I/O routine
+	MOVZBL	IRP$B_NOFUNC(R3),R1		; Get the function code
+	PUSHL	R4
+	BSBB	START_DISP			; Branch to case
+	POPL	R4
+	MOVL	UCB$L_DEVDEPEND(R5),R1		; Set device characteristics
+	REQCOM					; Complete the request
+
+START_DISP:
+	$DISPATCH	R1,TYPE=B,-
+	<-	; Function		Action
+		<NO_FC_V_STRT_CIR	START_CIRCUIT>,-
+		<NO_FC_V_STRT_LIN	START_LINE>,-
+		<NO_FC_V_STOP_CIR	SHUTDOWN_CIRCUIT>,-
+		<NO_FC_V_STOP_LIN	SHUTDOWN_LINE>,-
+		<NO_FC_V_READ_MODEM	READ_MODEM>,-
+	>
+
+5$:	BUG_CHECK NOBUFPCKT,FATAL		; Anything else is fatal
+
+	.DSABL	LSB
+
+
+	.SBTTL	START_TRANSMIT - Start transmit I/O
+;++
+; START_TRANSMIT - Start transmit I/O
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine is entered to start tranmitting over the async port driver. In 
+; order to do this the transmit is split into several pieces. The header, the
+; header CRC, data, data CRC, and the PADS. It works by checking to see if
+; the transmiter is busy. The transmitter is busy if the UCB$V_INT bit is set in
+; UCB$W_STS. If the port is not busy then a transmit is started by calling
+; the PORT_STARTIO routine and the UCB$V_INT is set in UCB#W_STS. The transmit
+; finsihes in GETNXT routine after all the parts of the message has been 
+; transmitted. If the device is running half duplex then transmits will only be
+; sent until the select flag is sent.
+;
+; 	INPUTS:
+;		R1 = Status information from routine calling START_TRANSMIT
+;		     More specifically it is an interface between the protocol
+;		     timer routine and this routine to tell start transmit that
+;		     the protocol timer has expired therefore send the message.
+;		R4 = NOB address
+;		R5 = UCB address
+;
+;	OUTPUTS:
+;		NONE
+;
+;--
+START_TRANSMIT:
+
+; If the DDCMP timer has expired a message may need to be sent
+
+	BBS	#DLK$V_TMREXPD,R1,20$
+10$:	BBS	#NO_DS_V_XMTING,-		; If BS then the xmt'r is off
+		UCB$W_DEVSTS(R5),25$
+20$:	DSBINT	UCB$B_DIPL(R5)
+	BBSS	#UCB$V_INT,UCB$W_STS(R5),30$	; If BS then port is busy
+	TSTB	NOB$B_XSTATE(R4)		; If NEQ then the transmitter is busy
+	BNEQ	30$
+	BSBW	GET_XMT				; Get next message to send
+	ENBINT
+	BLBC	R0,40$				; If LBC no message to send
+	MOVL	UCB$L_TT_PORT(R5),R2		; Get port vector table
+	MOVAL	XMTQ$B_MSGHDR(R8),UCB$L_TT_OUTADR(R5) ; Set address of block to send
+	MOVZBW	#NO$C_HEADER_LEN,UCB$W_TT_OUTLEN(R5) ; Set size of block to send
+	PUSHL	R4
+	DSBINT	UCB$B_DIPL(R5)
+	MOVB	#NO$C_HEADER,NOB$B_XSTATE(R4)	; Set transmitter state
+
+; The following instruction must be the last instruction executed before
+; the return to the port output routine. The reason for this is that the
+; condition codes must correctly so that the port does the right transfer
+
+	MNEGB	#1,UCB$B_TT_OUTYPE(R5)		; Set block transfer to port
+	JSB	@PORT_STARTIO(R2)		; Call at port startio routine
+	ENBINT
+	POPL	R4
+25$:	MOVZWL	S^#SS$_NORMAL,R0
+	RSB
+
+30$:	CLRBIT	#UCB$V_INT,UCB$W_STS(R5)	; Reset port in use
+	ENBINT
+	MOVZWL	S^#SS$_NORMAL,R0
+	RSB
+
+40$:	DSBINT	UCB$B_DIPL(R5)
+	CLRBIT	#UCB$V_INT,UCB$W_STS(R5)	; Clear nothing given to port
+	ENBINT
+	BBCC	#NO_DS_V_MSG_SENT,UCB$W_DEVSTS(R5),50$ ; If BC do not try tosend an ACK
+	MOVZWL	S^#SS$_NORMAL,R0
+	RSB
+
+
+50$:	PUSHR	#^M<R4,R5>
+	MOVZBL	#DLK$C_XMTMSG,R6		; Inform DDCMP that the last
+	MOVZBL	#DLK$M_QEMPTY,R7		; msg on queue was sent
+	MOVL	NOB$A_PRO_BUFFER(R4),R5		; Get addr of start of TFB
+	BSBW	DDCMP				; Branch to protocol
+	POPR	#^M<R4,R5>			; Restore registers
+
+	ASSUME DLK$V_MSGSENT EQ 0
+	CMPB	#DLK$C_XMTMSG,R6		; If NEQ no ACK to be xmted
+	BNEQ	60$
+	BLBC	R7,60$				; If BC no  ACK need be sent
+	CLRL	R1				; Set no status info
+	BRW	START_TRANSMIT			; Else send the ACK
+60$:	MOVZWL	S^#SS$_NORMAL,R0		; Set status
+	RSB
+
+
+	.SBTTL	GET_XMT - Get next transmit ti send
+;++
+; GET_XMT - Get next transmit to send
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine checks the various tranmit queues and sets up the device  with
+; the next message to transmit. This means that it increments the transmit
+; count and decides if the transmitter must be shut down after this message
+; is sent (for half duplex only). You will notice a hack pertaining to the
+; control message buffer. The reason for this is that DDCMP makes the
+; assumption that it can change the data inside the control messages at
+; will. There is no problem with that for most devices, however for AYSNCH
+; DDCMP we calculate our own CRC's and thus if data gets changed from under
+; us we will lose the message (in a most inefficient way we should note).
+;
+;	INPUTS:
+;		R4 = NOB address
+;		R5 = UCB address
+;
+;	IPL = DIPL
+;
+;	OUTPUTS:
+;		R0 = status LBS then message to send, LBC no message to send
+;		R4,R5 are preserved
+;		R8 = address of message to send
+;
+;--
+GET_XMT:
+	CLRL	R0				; Assume no message to send
+	MOVL	NOB$A_PRO_BUFFER(R4),R6		; Get protocol buffer address
+	REMQUE	@TF$Q_CTLQ(R6),R1		; Check control queue
+	BVC	50$				; If VC then messaeg to send
+	REMQUE	@TF$Q_XMTQ(R6),R8		; Check data queue
+	BVS	40$				; If VS then no message to send
+	CMPB	S^#DYN$C_BUFIO,XMTQ$B_BUFTYP(R8) ; If NEQ then a problem with 
+	BNEQ	60$				; queues
+10$:	BBS	#XMTQ$V_CONTROL,XMTQ$B_FLAG(R8),20$ ; If BS then cntrl msg don't increase xqcnt
+	INCB	TF$B_XQCNT(R6)
+20$:	BBCC	#XMTQ$V_SELECT,XMTQ$B_FLAG(R8),30$ ; If BC do not turn link
+	BBC	#XM$V_CHR_HDPLX,UCB$L_DEVDEPEND(R5),30$ ; If Not half duplex dont' turn link
+	SETBIT	#NO_DS_V_XMTING,UCB$W_DEVSTS(R5) ; Set xmter off, but finish xmting this msg
+30$:	TSTL	NOB$L_XMT_INPR(R4)
+	BNEQ	60$
+	MOVL	R8,NOB$L_XMT_INPR(R4)		; Set up xmt inprogress
+
+; Note although this may look wrong the instruction is correct because
+; teh terminal line speed is really a two byte field. The low byte is the 
+; transmit speed and the high byte is the receive speed. If the receive
+; speed is zero then it is the same as the transmit speed.
+	MOVZBL	UCB$W_TT_SPEED(R5),R0
+
+; Set the due time on the transmit to be given to the port.
+
+	MOVZWL	DUETIM_TABLE[R0],R0
+	MOVL	G^EXE$GL_ABSTIM,R1
+	ADDL3	R0,R1,NOB$L_XMT_DUETIM(R4)
+	SETBIT	#NO_DS_V_XMT_TIME,UCB$W_DEVSTS(R5)
+	MOVZWL	S^#SS$_NORMAL,R0
+40$:	RSB
+
+50$:	MOVAL	NOB$Z_CTL_MSG(R4),R8		; Get the address of buffer to use
+	BISB	XMTQ$B_FLAG(R1),XMTQ$B_FLAG(R8) ; Copy control message flags
+	BICB	#XMTQ$M_SELECT!XMTQ$M_ONQUEUE,XMTQ$B_FLAG(R1) ; Clear flags 
+	MOVW	XMTQ$W_HCRC(R1),XMTQ$W_HCRC(R8) ; Get CRC
+	MOVL	XMTQ$B_MSGHDR(R1),XMTQ$B_MSGHDR(R8) ; Get first longword of hdr
+	MOVW	XMTQ$B_MSGHDR+4(R1),XMTQ$B_MSGHDR+4(R8) ; Get second word
+	BRB	10$				; Cont processing
+
+60$:	BUG_CHECK	NOBUFPCKT,FATAL
+
+
+	.SBTTL	READ_MODEM - Read device modem register
+;++
+;READ_MODEM - Read device modem register
+;
+; This routine returns the device modem register in the buffer passed.
+; These are set according to the XMDEF's for modem bits.
+;
+;	INPUTS:
+;		R3 = IRP address
+;		R5 = UCB address
+;
+;--
+READ_MODEM:
+
+;& WHAT DO WE DO HERE??????
+
+	BBS	#NO_DS_V_INITED,UCB$W_DEVSTS(R5),5$ ; If BS then read register
+	MOVZWL	#SS$_DEVINACT,R0		; Else return device inactive
+	RSB
+
+5$:	MOVZWL	S^#SS$_NORMAL,R0
+	RSB
+
+	.SBTTL	FILL DUETIME_TABLE - Set up the due time table
+;++
+; FILL_DUETIME_TABLE
+;
+; Functional description:
+;
+; This routine sets up the default values in the table as well as sets up the
+; known terminal line speeds based on the default buffer size due times.
+; The due time is the max length of time we believe it should take to
+; transmit of receive a given message based on the speed of the line
+;
+; 	INPUTS:
+;		R5 = UCB address
+;
+;	OUTPUTS:
+;		The DUETIM_TABLE is filled.
+;
+;--
+FILL_DUETIM_TABLE:
+	PUSHR	#^M<R0,R1,R2>
+
+; Set up table with defaults. This is in case a terminal line supports a 
+; speed that we don't know about. We wish to make this reasonable so we will 
+; wait at least one second.
+
+	MOVZWL	#NO$C_DUETIM_TABLE_SIZE,R0
+	CLRL	R1
+10$:	MOVW	#1,DUETIM_TABLE[R1]
+	INCB	R1
+	SOBGTR	R0,10$
+	ADDW3	#12,UCB$W_DEVBUFSIZ(R5),R0		; Get the max msg size
+	MULW2	#8,R0					; mult by 8 bits per byte
+	STORE_DUETIM	50,R0,R1,R2,DUETIM_TABLE
+	STORE_DUETIM	75,R0,R1,R2,DUETIM_TABLE
+	STORE_DUETIM	110,R0,R1,R2,DUETIM_TABLE
+	STORE_DUETIM	134,R0,R1,R2,DUETIM_TABLE
+	STORE_DUETIM	150,R0,R1,R2,DUETIM_TABLE
+	STORE_DUETIM	300,R0,R1,R2,DUETIM_TABLE
+	STORE_DUETIM	600,R0,R1,R2,DUETIM_TABLE
+	STORE_DUETIM	1200,R0,R1,R2,DUETIM_TABLE
+	STORE_DUETIM	1800,R0,R1,R2,DUETIM_TABLE
+	STORE_DUETIM	2000,R0,R1,R2,DUETIM_TABLE
+	STORE_DUETIM	2400,R0,R1,R2,DUETIM_TABLE
+	STORE_DUETIM	3600,R0,R1,R2,DUETIM_TABLE
+	STORE_DUETIM	4800,R0,R1,R2,DUETIM_TABLE
+	STORE_DUETIM	7200,R0,R1,R2,DUETIM_TABLE
+	STORE_DUETIM	9600,R0,R1,R2,DUETIM_TABLE
+	STORE_DUETIM	19200,R0,R1,R2,DUETIM_TABLE
+	POPR	#^M<R0,R1,R2>
+	RSB
+
+	.SBTTL	START - Start unit, device and/or protocol
+;++
+; START_LINE - Start unit
+;
+; Functional description:
+;
+; This routine initializes the UCB; allocates the map registers for
+; transmits and receives; and master clears the device.
+;
+; If a failure occurs the line shutdown sequence is entered.
+;
+; 	INPUTS:
+;		R3 = I/O packet
+;		R5 = UCB address
+;
+;	IMPLICIT INPUTS:
+;
+;		IRP$L_MEDIA contains a copy of the mode buffer specified 
+;			    by the user.
+;		IRP$W_QUOTA contains the quota taken from the user for the unit.
+;
+;	OUTPUTS:
+;		The request is completed.
+;
+;--
+START_LINE:					; Start protocol operation
+	BBC	#NO_DS_V_INITED,-		; If BC then device not inited
+		UCB$W_DEVSTS(R5),5$		; Branch to set up idle UCB
+	MOVZWL	#SS$_DEVACTIVE,R0		; Set device active
+	RSB					; ... and return
+
+5$:	MOVL	UCB$L_NO_BUFFER(R5),R4		; Get NOB address
+	BICL	#NO$C_LINE_PAR,UCB$L_DEVDEPEND(R5) ; Reset all Read/Write flags
+	MOVW	IRP$W_QUOTA(R3),NOB$W_QUOTA(R4)	; Set quota for RCV's
+	CLRW	IRP$W_QUOTA(R3)			; Quota is return is handled by us
+
+	MOVL	IRP$L_PID(R3),NOB$L_PID(R4)	; Save starter's PID
+	MOVW	IRP$W_CHAN(R3),NOB$W_CHANL(R4)	; Save channel number
+	BSBW	FILL_DUETIM_TABLE		; Fill in xmt/rcv message due times
+	BISW	#NO_DS_M_INITED,UCB$W_DEVSTS(R5) ; Indicate UCB initialized
+
+; Call the terminal port driver to set line speed and parity. This call
+; may affect the UCB$L_DEVDEPEND field, thus we must save this field
+; so that information does not get lost.
+
+	PUSHL	UCB$L_DEVDEPEND(R5)
+	MOVL	UCB$L_TT_PORT(R5),R2		; Get port vector table
+	DSBINT	UCB$B_DIPL(R5)
+	MOVB	#NO$C_SET_LINE,UCB$B_TT_PARITY(R5) ; We must always send 8 bits of data
+
+; Make sure that the device does not do XON/XOFF. If it should be doing
+; this, you can notice this because transmits appear to just stop
+; on the line.
+
+	CLRBIT	#TTY$V_PC_XOFENA,UCB$W_TT_PRTCTL(R5)	
+
+; Set the port up so that it takes advantage of the DMA capabilities
+; of the device. Devices like the DMF32 do DMA output.
+
+	BISW2	#TTY$M_PC_DMAENA!TTY$M_PC_PRMMAP!TTY$M_PC_NOTIME,-
+		UCB$W_TT_PRTCTL(R5)
+	PUSHL	R4
+	JSB	@PORT_SET_LINE(R2)		; Jump to tell the port
+
+; Now call the port to clear the line.
+
+	JSB	@PORT_ABORT(R2)
+	JSB	@PORT_RESUME(R2)
+	POPL	R4
+	ENBINT
+	POPL	UCB$L_DEVDEPEND(R5)		; Restore the devdepend field
+
+		
+
+; Set up DDCMP defaults and other information necessary for the protocol
+
+	PUSHR	#^M<R6,R7,R8,R9>
+	MOVL	NOB$A_PRO_BUFFER(R4),R0		; Get protocol buffer
+	MOVB	UCB$B_FIPL(R5),GF$B_FIPL+TF$K_LENGTH(R0) ; Set fork IPL for DDCMP
+	MOVB	UCB$B_DIPL(R5),GF$B_DIPL+TF$K_LENGTH(R0) ; Set device IPL for DDCMP
+	CLRB	GF$B_STATE+TF$K_LENGTH(R0)	; Make sure state is halted
+	MOVAL	TF$K_LENGTH(R0),TF$A_GFB(R0) 	; Set address of global field
+	PUSHR	#^M<R3,R4,R5>
+	MOVAB	NOB$Z_DDCMP(R4),R8		; Set addr of buf with param
+	MOVAB	NOB$Z_DLA_ADDR(R4),R9		; Set addr of buffer for addresses
+	MOVAB	NOB$L_XMT_INPR(R4),R1		; Set up addresses
+	MOVL	R1,DLA$A_XMT_INPR(R9) 
+	MOVAB	NOB$Q_POST(R4),R1
+	MOVL	R1,DLA$A_POSTQ(R9)
+	MOVL	R0,R5				; Get addr of start of TFB
+	MOVZBL	#DLK$C_CHAR,R6			; Set DDCMP default char
+	CLRL	R7				; Zero the register
+	BISW	#<DLK$M_MSGCNT!-		; indicate chara to set
+		DLK$M_SELTIM!-
+		DLK$M_SELWAIT!-
+		DLK$M_REPTIM!-
+		DLK$M_REPWAIT!-
+		DLK$M_SETDEF>,R7
+	BSBW	DDCMP
+	POPR	#^M<R3,R4,R5>
+
+; Before starting up the DDCMP timer make sure that the driver can not
+; be reloaded or unloaded while the timer is running.
+
+	BISB	#DPT$M_NOUNLOAD,DPT$TAB+DPT$B_FLAGS
+
+; Start up the DDCMP timer. First set up registers with params for call
+; then make the call to the protocol.
+
+	PUSHR	#^M<R3,R4,R5>
+	MOVZBL	#DLK$C_START_TIMER,R6		; Set up R6 with the DDCMP comm
+	MOVAL	W^DEVTIMER,R7			; R7 must have device timer addr
+	MOVL	R5,R8				; R8 must have UCB addr
+	CLRL	R9				; Clear R9
+	MOVL	NOB$A_PRO_BUFFER(R4),R5		; Get addr of start of TFB
+	BSBW	DDCMP				; Call protocol
+	POPR	#^M<R3,R4,R5>
+	POPR	#^M<R6,R7,R8,R9>
+	MOVZWL	S^#SS$_NORMAL,R0		; Set success
+	RSB
+
+START_CTRL_ERROR:
+	PUSHL	R0				; Save abort reason
+	BSBW	SHUTDOWN_LINE			; Shut down the device
+	POPL	R0				; Restore abort reason
+	RSB
+
+
+
+;++
+; START_CIRCUIT- Start device and protocol
+;
+; Functional description:
+;
+; This routine sets up the protocol and device charateristics; sets up receive
+; buffers for the device; starts the protocol; and finally gives the first
+; transmit and receives to the board.
+;
+; If a failure occurs the circuit shutdown sequence is entered.
+;
+; 	INPUTS:
+;		R3 = I/O packet
+;		R5 = UCB address
+;
+;	IMPLICIT INPUTS:
+;
+;		IRP$L_MEDIA contains a copy of the mode buffer specified 
+;			    by the user.
+;
+;	 OUTPUTS:
+;		The request is completed.
+;
+;--
+START_CIRCUIT:					; Start the circuit
+	BBC	#XM$V_STS_ACTIVE,-		; If BC then device and
+		UCB$L_DEVDEPEND(R5),5$		; protocol are not active
+	MOVZWL	#SS$_DEVACTIVE,R0		; Return error
+	RSB
+
+5$:	MOVL	UCB$L_NO_BUFFER(R5),R4		; Get NOB address
+	BBS	#NO_DS_V_INITED,-		; If BS then line started
+		UCB$W_DEVSTS(R5),8$
+	MOVZWL	#SS$_DEVINACT,R0		; Else return device inactive
+	RSB
+
+; Reset bit fields
+
+8$:	PUSHR	#^M<R6,R7,R8,R9>
+	BICW	#^C<NO_DS_M_INITED>,UCB$W_DEVSTS(R5)
+	BICL	#NO$C_CIR_PAR,UCB$L_DEVDEPEND(R5) ; Reset all Read/Write flags
+	BSBW	SET_CHAR			; Set protocol char
+	DSBINT	#IPL$_POWER			; Interlock powerfail
+	BBC	#UCB$V_POWER,UCB$W_STS(R5),10$	; BR if no power failed
+	ENBINT					; Enable intterrupts at FIPL
+	BRB	START_POWERFAIL			; Branch to report powerfail
+10$:	BISW	#XM$M_STS_ACTIVE,-
+		UCB$L_DEVDEPEND(R5)		; Set active state
+	ENBINT					; Return to fork IPL
+	MOVZBL	#DLK$C_USRINT,R6		; Set to start the protocol
+	BBC	#XM$V_CHR_MOP,-			; If BC then don't enter
+		UCB$L_DEVDEPEND(R5),15$		; maint mode
+	MOVZBL	#DLK$M_MAINT,R7			; Set to start maint mode
+	BRW	20$
+15$:	MOVZBL	#DLK$M_START,R7			; Else simply start the prot
+20$:	PUSHR	#^M<R3,R4,R5>			; Save registers
+	MOVL	NOB$A_PRO_BUFFER(R4),R5		; Get addr of start of TFB
+	CLRQ	R8
+	BSBW	DDCMP				; Jump to the protocol
+	POPR	#^M<R3,R4,R5>			; Restore registers
+	CMPB	#DLK$C_ACTNOTCOM,R6		; If EQL then protocol not
+	BEQL	25$				; in halted state don't reinit
+	BSBW	FILLFREELIST			; Fill rcv free buffer Q
+	BLBC	R0,START_CIRCUIT_ERROR		; Branch to shutdown the device
+	CLRL	R1				; Set no status for start transmit
+	BSBW	START_TRANSMIT			; Branch to send STRT message
+	BLBC	R0,START_CIRCUIT_ERROR		; Branch to shutdown the device
+	MOVZWL	S^#SS$_NORMAL,R0		; Set normal return
+	BRB	START_CIRCUIT_COMP		; Comp the request
+
+25$:	MOVZWL	#SS$_DEVACTIVE,R0		; Set reason for abort
+	SETBIT	#XM$V_ERR_TRIB,-		; Set to restart ciruit
+		UCB$L_DEVDEPEND(R5)
+	BRB	START_CIRCUIT_ERROR
+START_POWERFAIL:
+	MOVZWL	#SS$_POWERFAIL,R0		; Set reason to abort
+START_CIRCUIT_ERROR:
+	PUSHL	R0				; Save reason to abort
+	BSBW	SHUTDOWN_CIRCUIT		; Shutdown the circuit
+	POPL	R0				; Restore reason for abort
+START_CIRCUIT_COMP:
+	MOVL	UCB$L_IRP(R5),R3		; Retreive packet address
+	MOVW	R0,UCB$W_BOFF(R5)		; Set success
+	POPR	#^M<R6,R7,R8,R9>
+	RSB					; Jump to complete the request
+
+
+
+	.SBTTL	Set protocol characteristic
+;++
+; SET_CHAR - Set characteristics of protocol
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine is entered to set characteristic on a halted protocol.
+;
+;	INPUTS:
+;		R4 = NOB address
+;		R5 = UCB address
+;
+;
+;	OUTPUTS:
+;		New protocol characteristics given to protocol.
+;
+;--
+SET_CHAR:
+	CLRL	R7				; Set no charac to change
+	MOVAB	NOB$Z_DDCMP(R4),R8		; Get trib parameter block
+	MOVB	DLK$B_MSGCNT(R8),-		; Use this field for RTO's
+		DLK$B_MAXREP(R8)
+	MOVB	DLK$B_MSGCNT(R8),-		; And for number of Select
+		DLK$B_MAXSEL(R8)		; intervals
+	MOVW	DLK$W_REPWAIT(R8),-		; Use repwait for selwait
+		DLK$W_SELWAIT(R8)
+	BISW	#<DLK$M_MSGCNT!-		; Set to reset these param
+		DLK$M_SELTIM!-
+		DLK$M_SELWAIT!-
+		DLK$M_REPTIM!-
+		DLK$M_REPWAIT!-
+		DLK$M_LNTYP>,R7
+
+	ASSUME	NMA$C_LINPR_POI EQ 0
+	SETBIT	#DLK$V_SETDEF,R7		; Set default char
+	TSTB	NOB$B_PRO(R4)			; If EQL then point to point
+	BEQL	10$
+	CLRBIT	#DLK$V_SETDEF,R7		; Use user given char
+	SETBIT	#DLK$V_STATYP,R7		; Else set trib
+10$:	ASSUME	NMA$C_DPX_FUL EQ 0
+	TSTB	NOB$B_DUP(R4)			; If EQL the full duplex
+	BEQL	20$
+	SETBIT	#DLK$V_DUPLEX,R7		; Else set half duplex
+20$:	PUSHR	#^M<R3,R4,R5>			; Save registers
+	MOVL	NOB$A_PRO_BUFFER(R4),R5		; Get addr of start of TFB
+	MOVZBL	#DLK$C_CHAR,R6			; Set charac in DDCMP
+	CLRL	R9
+	BSBW	DDCMP
+	POPR	#^M<R3,R4,R5>			; Restore the registers
+30$:	RSB
+
+	
+
+	.SBTTL	FILLFREELIST - FILL MESSAGE FREE LIST
+;++
+; FILLFREELIST - Fill message block free list
+; ADDFREELIST - Add a buffer to receive list
+;
+; Functional description:
+;
+; This routine fills the receive buffer free list up to the quota specified
+; at device startup.
+;
+;	Inputs:
+;
+;		R2 = Buffer address (ADDFREELIST only)
+;		R4 = NOB address
+;		R5 = UCB address
+; 
+;	IPL = FIPL
+;
+;	Outputs:
+;		R3,R4,R5 are preserved
+;		R1,R2 destroyed.
+;--
+FILLFREELIST:					; Fill free list
+	CLRL	R2				; Clear buffer address
+	BBS	#XM$V_STS_ACTIVE,-		; Continue if device active
+		UCB$L_DEVDEPEND(R5),ADDFREELIST
+	RSB
+ADDFREELIST:					; Add to receive buffer list
+	PUSHL	R3				; Save registers
+5$:	CMPW	UCB$W_DEVBUFSIZ(R5),-		; Can new block be allocated ?
+		NOB$W_QUOTA(R4)	
+	BGTRU	20$				; Br if no - list filled
+	CLRL	R1				; Zero size 
+	ADDW3	#RCV_T_DATA+CXB$C_TRAILER,-	; Compute needed block size
+		UCB$W_DEVBUFSIZ(R5),R1
+	TSTL	R2				; Buffer allocated already?
+	BNEQ	7$				; Br if yes
+	JSB	G^EXE$ALONONPAGED		; Allocate nonpaged memory
+	BLBC	R0,10$				; Br if failure
+7$:	MOVW	R1,RCV_W_BLKSIZE(R2)		; Insert block size
+	MOVB	S^#DYN$C_NET,RCV_B_BLKTYPE(R2)	; Insert block type
+	CLRW	RCV_W_ERROR(R2)			; Clear error status
+	INSQUE	(R2),NOB$Q_FREE(R4)		; Insert block on list
+	SUBW	UCB$W_DEVBUFSIZ(R5),-		; Decrement quota
+		NOB$W_QUOTA(R4)	
+	CLRL	R2				; Clear buffer pointer
+	BRB	5$
+
+10$:	SETBIT	#XM$V_STS_BUFFAIL,-		; Set buffer alloc failure
+		UCB$L_DEVDEPEND(R5)
+	BRB	30$
+
+20$:	CLRBIT	#XM$V_STS_BUFFAIL,-		; Clear buffer alloc failure
+		UCB$L_DEVDEPEND(R5) 
+	MOVL	R2,R0				; Set address of buffer
+	BEQL	30$				; Br if none
+	JSB	G^COM$DRVDEALMEM		; Deallocate it
+30$:	MOVZWL	S^#SS$_NORMAL,R0		; Set for normal return
+	POPL	R3				; Restore registers
+	RSB
+
+
+	.SBTTL	START_RECEIVE and GET RECEIVE - Start receive and Get a receive buff 
+;++
+; START_RECEIVE - Start receives 
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine sets up the driver to start receive the header. The header is
+; receive into some fields of the NOB so that even if no buffer has been 
+; allocated or can be allocated we can still get the header and the byte
+; count of the message.
+;
+;	INPUTS:
+;		R4 = NOB address
+;		R5 = UCB address
+;		IPL = Device IPL
+;
+;	OUTPUTS:
+;		R4, R5 are preserved
+;
+;--
+START_RECEIVE:
+	CLRB	NOB$B_RSTATE(R4)		; Reset receiver state
+
+	ASSUME	NOB$W_FLAGS EQ NOB$W_ERROR+2
+
+	CLRW	NOB$W_INDEX(R4)			; Clear index into rcv buffer
+	CLRL	NOB$W_ERROR(R4)			; Reset flag and error fields
+
+; Set up message count with size of header and crc
+
+	MOVZBW	#NO$C_HEADER_HCRC,NOB$W_MSGSIZ(R4)
+	RSB
+
+
+;++
+; GET_RECEIVE - Get a receive buffer if one is available
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine sets up the driver to receive the data. It gets the next
+; free buffer from the queue. And sets up the fields in the
+; buffer to start receive the data. This buffer is posted
+; when the driver has finished receiveing the data for it.
+;
+;	INPUTS:
+;		R4 = NOB address
+;		R5 = UCB address
+;		IPL = Device IPL
+;
+;	OUTPUTS:
+;		R0 = LBC no buffer available
+;		     LBS buffer is available and returned in R2
+;		R2 = Address of buffer to receive into if a buffer was available
+;		R4, R5 are preserved
+;
+;--
+GET_RECEIVE:
+	CLRL	R0				; Assume no buffer
+
+; If line is in process of being shutdown do not try to get a receive buffer
+
+	BBS	#NO_DS_V_SHUTDOWN,UCB$W_DEVSTS(R5),10$
+	REMQUE	@NOB$Q_FREE(R4),R2		; Get next available buffer
+	BVS	10$				; If VS none available
+	MOVL	R2,NOB$L_RCV_INPR(R4)		; Set receive buffer address
+
+	ASSUME	NOB$W_INDEX EQ NOB$W_MSGSIZ+2
+	ASSUME	NOB$W_ERROR EQ NOB$W_INDEX+2
+	ASSUME	NOB$W_FLAGS EQ NOB$W_ERROR+2
+
+	ASSUME	RCV_W_INDEX EQ RCV_W_MSGSIZ+2
+	ASSUME	RCV_W_ERROR EQ RCV_W_INDEX+2
+	ASSUME	RCV_W_FLAGS EQ RCV_W_ERROR+2
+
+	MOVQ	NOB$W_MSGSIZ(R4),RCV_W_MSGSIZ(R2)
+
+	ASSUME NO$C_HEADER_HCRC EQ 8
+
+	MOVQ	NOB$Z_HEADER(R4),RCV_Z_HEADER(R2)
+	MOVZWL	S^#SS$_NORMAL,R0		; Set normal return
+10$:	RSB
+
+
+	.SBTTL	NO$GETNXT - Class driver GETNXT routine
+;++
+;  NO$GETNXT - Class driver GETNXT routine entry point for PORT driver
+;
+; FUNCTIONAL DESCRIPTION
+;
+; This is the ASYNCH DDCMP transmit "interrupt" service routine. This routine
+; will be called whenever the terminal port driver has completed the current
+; character or burst of characters given to it by the ASYNCH DDCMP class driver.
+; When called this routine will calculate the next character or burst of
+; characters to transmit over the port driver. If data is returned by
+; GETNXT then a timer is set in the port driver and the bit UCB$V_INT
+; must be set in UCB$W_STS to say that the port is still busy. Remeber that
+; messages are tranmitted over the port driver in chunks of data (See
+; START_TRANSMIT to get break down).
+;
+; Note that UCB$B_TT_OUTYPE is always set to negative (unless there is
+; no data to send), becasue we always send data in bursts.
+;
+;	INPUTS:
+;		R5 = UCB address
+;
+;	IPL = DIPL
+;
+;	OUTPUTS:
+;		R3 = character to output 
+;		R5 = UCB address
+;
+;	IMPLICIT OUTPUTS:
+;		UCB$B_TT_OUTYPE = Zero - no data to output
+;				  One - single character in R3
+;				  Negative - output a burst of data
+;		Burst mode only:
+;		UCB$L_TT_OUTADR = Address of the first character of the burst
+;		UCB$W_TT_OUTLEN = Length of the burst
+;
+;		R0 preserved, All others destroyed
+;
+;--
+NO$GETNXT:
+	PUSHR	#^M<R0,R4,R6,R7,R8,R9>
+	MOVL	UCB$L_NO_BUFFER(R5),R4		; Get NOB address 
+	BEQL	20$
+	MOVL	NOB$L_XMT_INPR(R4),R8		; Get transmit address
+	BEQL	30$				; If EQL no buffer to transmit
+	SETBIT	#UCB$V_INT,UCB$W_STS(R5)	; Assume we always have data to send
+
+; Increment the transmiter state to say that we should send the next block
+; of the transmit. If we increment past the sending of pads then that
+; means we are thru with this data block and we should post this
+; data message for complete and start the next message transmitting.
+	ASSUME NO$C_HEADER EQ NO$C_EMPTY+1
+	ASSUME NO$C_HCRC EQ NO$C_HEADER+1
+	ASSUME NO$C_DATA EQ NO$C_HCRC+1
+	ASSUME NO$C_DCRC EQ NO$C_DATA+1
+	ASSUME NO$C_PADS EQ NO$C_DCRC+1
+
+10$:	CMPB	#NO$C_XMTERR,NOB$B_XSTATE(R4)	; If NEQ normal xmt states
+	BNEQ	12$
+	BRW	SEND_XMTERR			; Else handle the xmt error
+12$:	INCB	NOB$B_XSTATE(R4)
+	MOVZBL	NOB$B_XSTATE(R4),R0		; Get state for dispatch
+	$DISPATCH R0,TYPE=B,-
+	<-	; Functon		; Action
+		<NO$C_EMPTY		25$>,-
+		<NO$C_HEADER		SEND_HEADER>,-
+		<NO$C_HCRC		SEND_HCRC>,-
+		<NO$C_DATA		SEND_DATA>,-
+		<NO$C_DCRC		SEND_DCRC>,-
+		<NO$C_PADS		SEND_PADS>,-
+	>
+
+; Fall thru to complete the buffer and start up the next transfer if possible
+
+14$:	CLRBIT	#NO_DS_V_XMT_TIME,UCB$W_DEVSTS(R5) ; Clear due time not valid
+	CLRL	NOB$L_XMT_INPR(R4)		; Clear addr from inprogess
+	BBS	#XMTQ$V_CONTROL,XMTQ$B_FLAG(R8),15$ ; If BS cntrl msg don't post
+	INSQUE	(R8),@NOB$Q_POST+4(R4)		; Post the buffer for completion
+	PUSHL	R4
+	BSBW	SCHED_FORK_IO			; Schedule the fork
+	POPL	R4
+15$:	CLRB	NOB$B_XSTATE(R4)		; Reset the transmiter state
+	BBS	#NO_DS_V_XMTING,UCB$W_DEVSTS(R5),20$ ; If BS then turn link don't xmt
+
+; If the following bit is set then the circuit is going thru shutdown, 
+; therefore do not start up any other transmits over the port.
+
+	BBS	#NO_DS_V_SHUTDOWN,UCB$W_DEVSTS(R5),20$
+	BSBW	GET_XMT				; Else get next transmit to send
+	BLBS	R0,10$				; If LBS then data to send
+20$:	CLRBIT	#UCB$V_INT,UCB$W_STS(R5)	; Set port not busy
+	POPR	#^M<R0,R4,R6,R7,R8,R9>		; Restore registers
+
+; The following instruction must be the last instruction executed before
+; the return to the port input routine. The reason for this is that the
+; condition codes must correctly so that the port does the right transfer
+
+	CLRB	UCB$B_TT_OUTYPE(R5)		; Else set no data to send
+	RSB
+
+25$:	BUG_CHECK	NOBUFPCKT,FATAL
+
+; This code is here because DDCMP retransmission of messages must take the
+; message in porgress away from the device. This is to ensure that 
+; messages are not transmitted out of order. Since we do not want to
+; cut the message short we will send pads until the message byte count
+; has run out.
+
+30$:	TSTB	NOB$B_XSTATE(R4)		; If EQL not sending anything
+	BEQL	20$
+	MOVB	NOB$B_XSTATE(R4),R0		; Get state
+	INCB	R0				; Set to next state
+	MOVB	#NO$C_XMTERR,NOB$B_XSTATE(R4)	; Set new state for xmter
+	$DISPATCH R0,TYPE=B,-
+	<- 	;Function		; Action
+		<NO$C_EMPTY		25$>,-
+		<NO$C_HEADER		40$>,-
+		<NO$C_HCRC		45$>,-
+		<NO$C_DATA		50$>,-
+		<NO$C_DCRC		55$>,-
+		<NO$C_PADS		60$>,-
+	>
+	MOVW	NOB$W_XMTERR_SIZE(R4),R0
+	BRB	65$
+
+40$:	ADDW3	#10,UCB$W_DEVBUFSIZ(R5),R0	; Set the bytes to xmt given state
+	BRB	65$
+45$:	ADDW3	#4,UCB$W_DEVBUFSIZ(R5),R0
+	BRB	65$
+50$:	MOVZBW	#4,R0
+	BRB	65$
+55$:	MOVZBW	#2,R0
+	BRB	65$
+60$:	MOVZBW	#2,R0
+	MOVB	#NO$C_PADS,NOB$B_XSTATE(R5)
+65$:	MOVAL	NOB$Z_CTL_MSG(R4),NOB$L_XMT_INPR(R4) ; Set to fake out xmter
+	MOVW	R0,NOB$W_XMTERR_SIZE(R4)
+	MOVAL	NOB$W_PADS(R4),UCB$L_TT_OUTADR(R5)
+	MOVZBW	#2,UCB$W_TT_OUTLEN(R5)
+	MNEGB	#1,UCB$B_TT_OUTYPE(R5)
+	POPR	#^M<R0,R4,R6,R7,R8,R9>
+	RSB
+
+; Set up the port to transmit the header portion of the message
+
+SEND_HEADER:
+	MOVB	#NO$C_HEADER,NOB$B_XSTATE(R4)	; Set sending header state
+	MOVAL	XMTQ$B_MSGHDR(R8),UCB$L_TT_OUTADR(R5) ; Set address of header
+	MOVZBW	#NO$C_HEADER_LEN,UCB$W_TT_OUTLEN(R5) ; Set length of header
+	POPR	#^M<R0,R4,R6,R7,R8,R9>
+
+; The following instruction must be the last instruction executed before
+; the return to the port output routine. The reason for this is that the
+; condition codes must correctly so that the port does the right transfer
+
+	MNEGB	#1,UCB$B_TT_OUTYPE(R5)		; Set block transfer to port
+	RSB
+
+; Set up the port to transmit the header CRC portion of the message
+
+SEND_HCRC:
+	MOVB	#NO$C_HCRC,NOB$B_XSTATE(R4)	; Set sending HCRC state
+	MOVAL	XMTQ$W_HCRC(R8),UCB$L_TT_OUTADR(R5) ; Set address of HCRC
+	MOVZBW	#2,UCB$W_TT_OUTLEN(R5) 		; Set length of HCRC
+	POPR	#^M<R0,R4,R6,R7,R8,R9>
+
+; The following instruction must be the last instruction executed before
+; the return to the port output routine. The reason for this is that the
+; condition codes must correctly so that the port does the right transfer
+
+	MNEGB	#1,UCB$B_TT_OUTYPE(R5)		; Set block transfer to port
+	RSB
+
+; Set up the port to transmit the data portion of the message
+
+SEND_DATA:
+; If the control bit is set then this is a control message and there is no
+; data to send with this message. Thus we want to send the pads out 
+; now.
+
+	BBS	#XMTQ$V_CONTROL,XMTQ$B_FLAG(R8),SEND_PADS
+	MOVB	#NO$C_DATA,NOB$B_XSTATE(R4)	; Set sending data state
+	MOVAL	XMTQ$K_LENGTH(R8),UCB$L_TT_OUTADR(R5) ; Set address of data
+
+; Set length of the data message. Remember that DDCMP adds the header size
+; into the message size, so we should subtract it before giving the size
+; to the port.
+
+	SUBW3	#NO$C_HEADER_LEN,XMTQ$W_MSGSIZE(R8),UCB$W_TT_OUTLEN(R5)
+	POPR	#^M<R0,R4,R6,R7,R8,R9>
+
+; The following instruction must be the last instruction executed before
+; the return to the port output routine. The reason for this is that the
+; condition codes must correctly so that the port does the right transfer
+
+	MNEGB	#1,UCB$B_TT_OUTYPE(R5)		; Set block transfer to port
+	RSB
+
+; Set up the port to transmit the data CRC portion of the message
+
+SEND_DCRC:
+	MOVB	#NO$C_DCRC,NOB$B_XSTATE(R4)	; Set sending data crc state
+	MOVAL	XMTQ$W_DCRC(R8),UCB$L_TT_OUTADR(R5) ; Set address of data crc
+	MOVZBW	#2,UCB$W_TT_OUTLEN(R5) 		; Set length of data CRC
+	POPR	#^M<R0,R4,R6,R7,R8,R9>
+
+; The following instruction must be the last instruction executed before
+; the return to the port output routine. The reason for this is that the
+; condition codes must correctly so that the port does the right transfer
+
+	MNEGB	#1,UCB$B_TT_OUTYPE(R5)		; Set block transfer to port
+	RSB
+
+; Set up the port to transmit the pads for the message
+
+SEND_PADS:
+	MOVB	#NO$C_PADS,NOB$B_XSTATE(R4)	; Set sending pads state
+	MOVAL	NOB$W_PADS(R4),UCB$L_TT_OUTADR(R5) ; Set address of pads
+	MOVZBW	#2,UCB$W_TT_OUTLEN(R5) 		; Set length of pads
+	POPR	#^M<R0,R4,R6,R7,R8,R9>
+
+; The following instruction must be the last instruction executed before
+; the return to the port output routine. The reason for this is that the
+; condition codes must correctly so that the port does the right transfer
+
+	MNEGB	#1,UCB$B_TT_OUTYPE(R5)		; Set block transfer to port
+	RSB
+
+
+; There was an error on the line and this mechanism is used to ensure
+; that the other side gets enough data to cause a CRC error. Please
+; note that that the last time thru we set the PAD state in order
+; to start up the next XMT 
+
+SEND_XMTERR:
+	SUBW2	#2,NOB$W_XMTERR_SIZE(R4)	; Decr number of pads to send
+	BGTR	10$				; If gtr continue
+	MOVB	#NO$C_PADS,NOB$B_XSTATE(R4)	; Else reset state to start transmit next time thru
+10$:	MOVAL	NOB$W_PADS(R4),UCB$L_TT_OUTADR(R5) ; Set address of pads
+	MOVZBW	#2,UCB$W_TT_OUTLEN(R5) 		; Set length of pads
+	POPR	#^M<R0,R4,R6,R7,R8,R9>
+
+; The following instruction must be the last instruction executed before
+; the return to the port output routine. The reason for this is that the
+; condition codes must correctly so that the port does the right transfer
+
+	MNEGB	#1,UCB$B_TT_OUTYPE(R5)		; Set block transfer to port
+	RSB
+
+	.SBTTL	NO$PUTNXT - Asynch class driver receive character routine
+;++
+; NO$PUTNXT - Asynch class driver receive character routine
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine is called whenever the terminal port driver has received a 
+; character. Because of the nature of ASYNCH DDCMP this routine will
+; not return data to transmit over the port. 
+;
+;	INPUTS:
+;		R3 = Input character
+;		R5 = UCB address
+;
+;	OUTPUTS:
+;		R5 = UCB address
+;		R0 is preserved ALL other registers are destroyed
+;
+;	IMPLICT OUTPUTS:
+;		UCB$B_TT_OUTYPE = Zero no data to send
+;
+;--
+NO$PUTNXT:
+	PUSHR	#^M<R0,R4,R6,R7,R8,R9>
+	MOVL	UCB$L_NO_BUFFER(R5),R4		; Get address of NOB
+	BEQL	30$				; If EQL device not started
+10$:	MOVZBL	NOB$B_RSTATE(R4),R0		; Get receiver state
+	$DISPATCH R0,TYPE=B,-
+	<-	; Function		; Action
+		<NO$C_SEAR_MSG	SEARCH_MESSAGE>,-
+		<NO$C_HEADER	RCV_HEADER>,-
+		<NO$C_DATA	RCV_DATA>,-
+		<NO$C_NOBUFFER	RCV_NOBUFFER>,-
+	>
+	BUG_CHECK	NOBUFPCKT,FATAL
+
+30$:	POPR	#^M<R0,R4,R6,R7,R8,R9>		; Else ignore the char and return
+
+; The following instruction must be the last instruction executed before
+; the return to the port input routine. The reason for this is that the
+; condition codes must correctly so that the port does the right transfer
+
+	CLRB	UCB$B_TT_OUTYPE(R5)		; Else set no data to send
+	RSB
+
+; This searches for the start of a DDCMP message. All characters are ignored
+; until a start of message is received.
+
+SEARCH_MESSAGE:
+	CMPB	R3,#NO$C_SOH			; Is this a start of a data message
+	BEQL	10$				; If EQL then it is
+	CMPB	R3,#NO$C_DLE			; Start of a maintenance msg?
+	BEQL	10$				; If EQL then yes
+	CMPB	R3,#NO$C_ENQ			; Start of control message?
+	BNEQ	20$				; If NEQ then no
+	SETBIT	#RCV_V_CNTL,NOB$W_FLAGS(R4)	; Set this is a control msg
+
+	ASSUME NO$C_HEADER EQ NO$C_SEAR_MSG+1
+
+; The terminal line receive speed is store in the UCB$W_TT_SPEED+1 unless
+; the field is zero in which case it is the transmit speed
+10$:	MOVZBL	UCB$W_TT_SPEED+1(R5),R0
+	BNEQ	15$
+	MOVZBL	UCB$W_TT_SPEED(R5),R0
+15$:	MOVZWL	DUETIM_TABLE[R0],R0
+	MOVL	G^EXE$GL_ABSTIM,R1
+	ADDL3	R0,R1,NOB$L_RCV_DUETIM(R4)
+	SETBIT	#NO_DS_V_RCV_TIME,UCB$W_DEVSTS(R5)
+	INCB	NOB$B_RSTATE(R4)		; Move to next state rcving hdr
+	MOVB	R3,NOB$Z_HEADER(R4)		; Save character rcvd in hdr area
+	INCW	NOB$W_INDEX(R4)			; Incr the index into buffer
+	DECW	NOB$W_MSGSIZ(R4)		; Decr the number of bytes to rcv
+20$:	POPR	#^M<R0,R4,R6,R7,R8,R9>
+
+; The following instruction must be the last instruction executed before
+; the return to the port input routine. The reason for this is that the
+; condition codes must correctly so that the port does the right transfer
+
+	CLRB	UCB$B_TT_OUTYPE(R5)		; Else set no data to send
+	RSB
+
+; This routine inputs each character into the header of the rcv buffer unitl
+; both the header and header CRC are input.
+
+RCV_HEADER:
+	MOVZWL	NOB$W_INDEX(R4),R0		; Get index into rcv buffer
+	MOVAL	NOB$Z_HEADER(R4),R1		; Get pointer to start of rcv buffer
+	MOVB	R3,(R1)[R0]			; Move char into buffer
+	INCW	NOB$W_INDEX(R4)			; Incr the index
+	DECW	NOB$W_MSGSIZ(R4)		; Decr the bytes to rcv
+	BGTR	10$				; If GTR still more bytes to rcv
+
+; After the entire header and crc's are received copy them into a buffer.
+; Set up the unit to make it start receiving the data into the message
+
+;	BBS	#NO_DS_V_SHUTDOWN,UCB$W_DEVSTS(R5),30$ ; If device is shut dont start rcv
+	BSBW	GET_RECEIVE			; Start receive
+	BLBC	R0,20$				; If LBS then buffer to rcv into
+
+	ASSUME	RCV_V_CNTL EQ 0
+
+	BLBS	RCV_W_FLAGS(R2),COMP_RCV	; If LBS complete the control msg
+	MOVW	MFD$W_CNTFLG(R1),R0		; Else get size of data portion of message
+	BICW2	#<MFD$M_SELECT!MFD$M_QSYNC>,R0	; Clear the flags from the msg size
+
+; The following code is here so that we can catch the fact that systems run
+; with different buffer sizes. We don't want to corrupt pool if
+; we receive a message that is too large for our receive buffer. Incidently,
+; the CRC checking should catch this as an error and drop the message on the
+; floor.
+
+	CMPW	UCB$W_DEVBUFSIZ(R5),R0		; If GEQ then not larger than our buff
+	BGEQ	5$
+	MOVW	UCB$W_DEVBUFSIZ(R5),R0		; Use the smaller of the two
+5$:	ADDW3	#2,R0,RCV_W_MSGSIZ(R2)		; Set size of msg plus 2 for CRC
+	MOVB	#NO$C_DATA,NOB$B_RSTATE(R4)	; Set receive data state
+10$:	POPR	#^M<R0,R4,R6,R7,R8,R9>
+
+; The following instruction must be the last instruction executed before
+; the return to the port input routine. The reason for this is that the
+; condition codes must correctly so that the port does the right transfer
+
+	CLRB	UCB$B_TT_OUTYPE(R5)		; Else set no data to send
+	RSB
+
+; Come here when we did not have a buffer in which to receive the data
+
+20$:	BLBS	NOB$W_FLAGS(R4),COMP_RCV_NOBUFFER ; If LBS complete the control msg
+	MOVW	MFD$W_CNTFLG(R1),R0		; Else get size of data portion of message
+	BICW2	#<MFD$M_SELECT!MFD$M_QSYNC>,R0	; Clear the flags from the msg size
+	ADDW3	#2,R0,NOB$W_MSGSIZ(R4)		; Set size of msg plus 2 for CRC
+	MOVB	#NO$C_NOBUFFER,NOB$B_RSTATE(R4)	; Set nobuffer receive data state
+	POPR	#^M<R0,R4,R6,R7,R8,R9>
+
+; The following instruction must be the last instruction executed before
+; the return to the port input routine. The reason for this is that the
+; condition codes must correctly so that the port does the right transfer
+
+	CLRB	UCB$B_TT_OUTYPE(R5)		; Else set no data to send
+	RSB
+
+; This routine inputs each character into the data part of the rcv buffer unitl
+; both the data and data CRC are input.
+
+RCV_DATA:
+	MOVL	NOB$L_RCV_INPR(R4),R2		; Get buffer
+	BEQL	10$				; Branch to return if not there
+	MOVZWL	RCV_W_INDEX(R2),R0		; Get index into rcv buffer
+	MOVAL	RCV_Z_HEADER(R2),R1		; Get pointer to start of rcv buffer
+	MOVB	R3,(R1)[R0]			; Move char into buffer
+	INCW	RCV_W_INDEX(R2)			; Incr the index
+	DECW	RCV_W_MSGSIZ(R2)		; Decr the bytes to rcv
+	BLEQ	COMP_RCV			; If LEQ then rcv is complete
+10$:	POPR	#^M<R0,R4,R6,R7,R8,R9>
+
+; The following instruction must be the last instruction executed before
+; the return to the port input routine. The reason for this is that the
+; condition codes must correctly so that the port does the right transfer
+
+	CLRB	UCB$B_TT_OUTYPE(R5)		; Else set no data to send
+	RSB
+
+; This routine posts the current receive for IO completion then sets up
+; up the next buffer into which to receive.	
+
+COMP_RCV:
+	CLRL	NOB$L_RCV_INPR(R4)		; Clear no rcv buffer inprg
+	INSQUE	(R2),@NOB$Q_POST+4(R4)		; Send buffer to post
+	PUSHL	R4
+	BSBW	SCHED_FORK_IO			; Set up fork
+	POPL	R4
+COMP_RCV_NOBUFFER:
+	CLRBIT	#NO_DS_V_RCV_TIME,UCB$W_DEVSTS(R5) ; Set due time not valid
+	BSBW	START_RECEIVE			; Set up next receive
+	POPR	#^M<R0,R4,R6,R7,R8,R9>
+
+; The following instruction must be the last instruction executed before
+; the return to the port input routine. The reason for this is that the
+; condition codes must correctly so that the port does the right transfer
+
+	CLRB	UCB$B_TT_OUTYPE(R5)		; Else set no data to send
+	RSB
+
+RCV_NOBUFFER:
+	DECW	NOB$W_MSGSIZ(R4)
+	BLEQ	COMP_RCV_NOBUFFER
+	POPR	#^M<R0,R4,R6,R7,R8,R9>
+
+; The following instruction must be the last instruction executed before
+; the return to the port input routine. The reason for this is that the
+; condition codes must correctly so that the port does the right transfer
+
+	CLRB	UCB$B_TT_OUTYPE(R5)		; Else set no data to send
+	RSB
+
+
+
+
+	.SBTTL	NO$CLASS_PORTFORK - Asycnh DDCMP fork routines
+;++
+; NO$CLASS_PORTFORK - Asynch DDCMP port fork routine
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine is called by the port driver when the port driver needs to start
+; up a fork process. This routine only schedules a fork if no fork is already
+; scheduled. If a fork is scheduled then a bit is set in UCB$L_FR3 to indicate
+; that the port driver must be called at its FORK entry point.
+;
+; 	INPUTS:
+;		R5 = UCB address
+;
+;	OUTPUTS:
+;		FORK may be scheduled
+;
+;--
+NO$CLASS_PORTFORK:
+	BBSS	#NO_DS_V_FORK_PEND,UCB$W_DEVSTS(R5),10$	; If BS then fork pending
+	PUSHAW	W^FORK_DONE			; Set address of fork routine
+	MOVZBL	#NO_FS_M_PORTFORK,R3		; Set type of fork
+	JMP	G^EXE$FORK
+
+10$:	SETBIT	#NO_FS_V_PORTFORK,UCB$L_FR3(R5)	; Set port fork pending
+	RSB
+
+;++
+; SCHED_FORK_IO - Schedules forks for asynch ddcmp class driver 
+;
+; FUNCTIONAL DESCRIPTION:
+; 
+; This routine schedules the IO completion forks for the asynch class
+; driver. If there is a fork pending on the device then no fork
+; is scheduled but a bit is set in UCB$L_FR3 indicating that there is
+; some IO to complete when the fork is processed.
+;
+;	INPUTS:
+;		R5 = UCB address
+;
+;	OUTPUTS:
+;		FORK may be scheduled
+;
+;--
+SCHED_FORK_IO:
+	BBSS	#NO_DS_V_FORK_PEND,UCB$W_DEVSTS(R5),10$	; If BS then fork pending
+	PUSHAW	W^FORK_DONE			; Set address of fork routine
+	MOVZBL	#NO_FS_M_IOFORK,R3		; Set IO fork
+	JMP	G^EXE$FORK
+
+10$:	SETBIT	#NO_FS_V_IOFORK,UCB$L_FR3(R5)	; Set port fork pending
+	RSB
+
+SCHED_FORK_POWERFAIL:
+	BBSS	#NO_DS_V_FORK_PEND,UCB$W_DEVSTS(R5),10$	; If BS then fork pending
+	PUSHAW	W^FORK_DONE			; Set address of fork routine
+	MOVZBL	#NO_FS_M_POWERFAIL,R3		; Set Powerfail fork
+	JMP	G^EXE$FORK
+
+10$:	SETBIT	#NO_FS_V_POWERFAIL,UCB$L_FR3(R5) ; Set port fork pending
+	RSB
+
+
+	.SBTTL	NO$SETUP_UCB - Asynch DDCMP set up UCB 
+;++
+; NO$SETUP_UCB - Asynch DDCMP set up UCB 
+; 
+; FUNCTIONAL DESCRIPTION:
+; 
+; This does nothing
+;
+;	INPUTS:
+;		R5 = UCB address
+;
+;	OUTPUTS:
+;		NONE
+;
+;--
+NO$SETUP_UCB:
+	RSB
+
+
+	.SBTTL	NO$PORT_TRANSITION - Asynch DDCMP port transition routine
+;++
+; NO$PORT_TRANSITION - Asynch DDCMP port transition routine
+; 
+; FUNCTIONAL DESCRIPTION:
+; 
+; This does nothing
+;
+;	INPUTS:
+;		R1 = Transition type (one of the following)
+;		     MODEM$C_INIT - initialize the modem control
+;		     MODEM$C_SHUTDWN - Shut down the line and protocol
+;		     MODEM$C_DATASET - Data set signal changes
+;		R2 = Type specific argument
+;		     MODEM$C_DATASET - new receive modem mask
+;		R5 = UCB address
+;
+;	OUTPUTS:
+;		NONE
+;
+;--
+NO$PORT_TRANSITION:
+	RSB
+
+
+
+
+	.SBTTL	NO$READERROR - Asynch DDCMP read error routine
+;++
+; NO$READERROR - Asynch DDCMP read error routine
+; 
+; FUNCTIONAL DESCRIPTION:
+; 
+; This routine deciphers the error sent by the port driver into an
+; error code to give to the protocol.
+;
+;	INPUTS:
+;		R3 = Character and flags:
+;		     Flags: 
+;			   Bit 12 - parity error on the given character
+;			   Bit 13 - framing error on the given character
+;			   Bit 14 - data overrun
+;		R5 = UCB address
+;
+;	OUTPUTS:
+;		NONE
+;
+;--
+NO$READERROR:
+	PUSHR	#^M<R0,R2,R4,R6,R7,R8>
+	MOVL	UCB$L_NO_BUFFER(R5),R4		; Get NOB address
+	BEQL	10$
+	MOVZBL	NOB$B_RSTATE(R4),R0		; Get receiver state
+	$DISPATCH R0,TYPE=B,-
+	<-	; Function		; Action
+		<NO$C_SEAR_MSG		NO_ERROR>,-
+		<NO$C_HEADER		HEADER_ERROR>,-
+		<NO$C_DATA		DATA_ERROR>,-
+		<NO$C_NOBUFFER		NOBUFFER_ERROR>,-
+	>
+	BUG_CHECK	NOBUFPCKT,FATAL
+10$:
+NO_ERROR:
+	POPR	#^M<R0,R2,R4,R6,R7,R8>
+	RSB
+
+; If the device is rcving the header and it did not get an overrun error 
+; then set that this is a header crc error.
+
+HEADER_ERROR:
+
+; Get a buffer from the queue of free buffers.  If there 
+; is no buffer available then the error cna not be reported.
+
+	BSBW	GET_RECEIVE
+	BLBC	R0,NOBUFFER_ERROR
+	BBS	#^XE,R3,OVERRUN_ERROR
+	MOVW	#DLK$M_HDRCRC,RCV_W_ERROR(R2)
+	BRB	COMP_RCV_ERROR
+
+; Set that the device got a receive overrun error
+
+OVERRUN_ERROR:
+	MOVW	#DLK$M_RCVOVR,RCV_W_ERROR(R2)
+	BRB	COMP_RCV_ERROR
+
+; If the device was receiving data then set that this is a data crc error.
+
+DATA_ERROR:
+	MOVL	NOB$L_RCV_INPR(R4),R2		; Get receive buffer
+	BBS	#^XE,R3,OVERRUN_ERROR
+	MOVW	#DLK$M_DATACRC,RCV_W_ERROR(R2)
+	;BRB	COMP_RCV_ERROR
+
+COMP_RCV_ERROR:
+	CLRL	NOB$L_RCV_INPR(R4)		; Clear rcv inpr 
+	INSQUE	(R2),@NOB$Q_POST+4(R4)		; Put buffer on queue to comp
+	PUSHL	R4
+	BSBW	SCHED_FORK_IO			; Sched a fork to comp buffer
+	POPL	R4
+NOBUFFER_ERROR:
+	BSBW	START_RECEIVE			; Start up next receive
+	POPR	#^M<R0,R2,R4,R6,R7,R8>
+	RSB
+
+
+
+	.SBTTL	NO$CLASS_DISCONNECT - Asynch DDCMP class disconnect 
+;++
+; NO$CLASS_DISCONNECT - Asynch DDCMP class disconnect
+; 
+; FUNCTIONAL DESCRIPTION:
+; 
+; This does nothing
+;
+;	INPUTS:
+;		R5 = UCB address
+;
+;	OUTPUTS:
+;		NONE
+;
+;--
+NO$CLASS_DISCONNECT:
+	RSB
+
+
+
+	.SBTTL	NO$CLASS_POWERACTION - Asynch DDCMP power action
+;++
+; NO$CLASS_POWERACTION - Asynch DDCMP power action
+; 
+; FUNCTIONAL DESCRIPTION:
+; 
+; This routine forks to shutdown the device on a power fail.
+;
+;	INPUTS:
+;		R5 = UCB address
+;
+;	OUTPUTS:
+;		NONE
+;
+;--
+NO$CLASS_POWERACTION:
+	BSBW	SCHED_FORK_POWERFAIL
+	RSB
+
+	.SBTTL	NO$NULL - Asynch DDCMP null routine
+;++
+; NO$NULL - Asynch DDCMP null routine
+; 
+; FUNCTIONAL DESCRIPTION:
+; 
+; This does nothing
+;
+;	INPUTS:
+;		R5 = UCB address
+;
+;	OUTPUTS:
+;		NONE
+;
+;--
+NO$NULL:
+	RSB
+
+
+
+	.SBTTL	FORKDONE - Fork process
+;++
+; FORKDONE - Fork process 
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine is entered for two reasons either to complete some IO, or
+; because the port has some work that must be done at FORK level.
+;
+;	INPUTS:
+;
+;		R4 = NOB address
+;		R5 = UCB address
+;
+;	IMPLICIT INPUTS:
+;		UCB$L_FR3 = Type of fork
+;
+;	IPL = FIPL
+;
+;	OUTPUTS:
+;		R5 = UCB address
+;		R0,R6 - R9 are preserved.
+;
+;	If a receive I/O request is pending, the receive is completed.
+;	Otherwise, queue the message for a future I/O.
+;
+;--
+	.WORD	TIMEOUT-.
+FORK_DONE:
+	DSBINT	UCB$B_DIPL(R5)			; Disable device interrupts
+	CLRBIT	#NO_DS_V_FORK_PEND,UCB$W_DEVSTS(R5) ; Clear fork pending
+	BBCC	#NO_FS_V_PORTFORK,UCB$L_FR3(R5),5$ ; If BC don't call portfork
+	ENBINT	
+	MOVL	UCB$L_TT_PORT(R5),R0		; Get port vector table
+	JSB	@PORT_FORKRET(R0)		; Call port fork routine
+	BRB	10$
+5$:	ENBINT
+10$:	DSBINT	UCB$B_DIPL(R5)			; Disable device interrupts
+	CLRBIT	#NO_FS_V_IOFORK,UCB$L_FR3(R5)
+
+; Check for a powerfail and shut down the device if one has happened
+
+	BBSC	#NO_FS_V_POWERFAIL,UCB$L_FR3(R5),45$
+	ENBINT
+	MOVL	UCB$L_NO_BUFFER(R5),R4		; Get NOB address
+	PUSHR	#^M<R6,R7,R8,R9>		; Save registers
+15$:	REMQUE	@NOB$Q_POST(R4),R2		; Get next buffer to complete 
+	BVS	30$				; If VS then no buffer found
+	CMPB	IRP$B_TYPE(R2),S^#DYN$C_BUFIO	; If NEQ then not XMT buffer
+	BNEQ	20$
+	BSBW	TRANSMIT_DONE			; Complete the transmit
+	BLBC	R0,40$				; If BC then error on buffer
+	BRB	15$				; Get next entry to post
+20$:	CMPB	IRP$B_TYPE(R2),S^#DYN$C_NET	; If EQL then RCV buffer
+	BNEQ	60$
+	BSBW	RECEIVE_DONE			; Complete the Receive
+	BLBC	R0,40$				; If BC then error on buffer
+	BRB	15$				; Get next entry to post
+30$:	MOVZWL	S^#SS$_NORMAL,R0		; Set status
+	POPR	#^M<R6,R7,R8,R9>		; Restore registers
+	RSB					; Return
+
+40$:	POPR	#^M<R6,R7,R8,R9>		; Restore registers
+	BBC	#XM$V_ERR_TRIB,-		; Assume trib shutdown
+		UCB$L_DEVDEPEND(R5),50$
+	BRW	SHUTDOWN_CIRCUIT
+
+45$:	ENBINT
+	INCW	UCB$W_ERRCNT(R5)
+	BSBW	POKE_USER
+50$:	SETBIT	#XM$V_ERR_FATAL,UCB$L_DEVDEPEND(R5) ; Set fatal error 
+	BRW	SHUTDOWN_LINE			; Br to shut down the device
+
+60$:	BUG_CHECK NOBUFPCKT,FATAL		; Else fatal, error
+
+
+	.SBTTL	RECEIVE_DONE - Complete a receive buffer
+
+;++
+;RECEIVE_DONE
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; When the class driver finishes a receive buffer this routine is called to 
+; post the receive. First
+; a call is made to the protocol to strip off the header and check the CRC's
+; to ensure the data made it over the wire ok. If an error is detected then 
+; the error is recorded in the protocol and the buffer is returned to the 
+; free buffer pool, and NOT given to the user. If no error occurs and the 
+; buffer is a protocol control message then the buffer is returned to the free 
+; buffer pool. If this is a data message and a IRP is free the buffer is 
+; completed with the IRP, else it is put on a queue to await I/O completion.
+;
+;	INPUTS:
+;		R2 = Message buffer address
+;		R4 = NOB address
+;		R5 = UCB address
+;
+;	OUTPUTS:
+;		R0 = Status
+;		R2,R3,R4, and R5 are preserved
+;--
+RECEIVE_DONE:					; Receive done 
+	PUSHR	#^M<R2,R3,R4,R5>		; Save registers
+	MOVZBL	#DLK$C_RCVMSG,R6		; Set that this is a RCV
+	MOVW	RCV_W_ERROR(R2),R7		; Set error bits
+	MOVAL	RCV_Z_HEADER(R2),R8		; Get buffer address
+	CLRL	R9				; Clear reg
+	MOVL	NOB$A_PRO_BUFFER(R4),R5		; Set protocol buffer address
+	BSBW	DDCMP
+	POPR	#^M<R2,R3,R4,R5>		; Restore registers
+	MOVW	R9,RCV_W_MSGSIZ(R2)		; Set transfer size
+	CMPB	#DLK$C_ACTNOTCOM,R6		; If EQL then protl not active
+	BEQL	40$
+	BITW	#<DLK$M_PRSTERR!-		; If NEQ then fatal protocol
+		DLK$M_HDRERR>,R7		; error go to shutdown the
+	BNEQ	55$				; circuit
+	BITW	#<DLK$M_STRTRCV!-		; If NEQ then trib error
+		DLK$M_MNTRCV>,R7		; go to shutdown the circuit
+	BNEQ	60$
+	BBS	#DLK$V_CRC,R7,40$		; If CRC failed don't complete buff
+	BBC	#DLK$V_TRNLK,R7,20$		; If BC don't turn link
+	BICW	#NO_DS_M_XMTING,-		; Start transmitter
+		UCB$W_DEVSTS(R5)
+	PUSHR	#^M<R2,R7>			; Save the register
+	CLRL	R1				; Set no status for start xmt
+	BSBW	START_TRANSMIT			; Start the tranmsit
+	POPR	#^M<R2,R7>			; Restore the register
+	BLBC	R0,70$				; Branch on error
+20$:	BBC	#DLK$V_XMTCMP,R7,23$		; If BC no transmit to complete
+	PUSHL	R2				; Save receive buffer
+	BSBW	FINISH_XMT_IO			; Else branch to post the I/O
+	POPL	R2				; Restore receive buffer
+23$:	BBC	#DLK$V_RCVACK,R7,40$		; If BC then not a data message
+
+	REMQUE	@NOB$Q_RCVS(R4),R3		; Remov waiting rcv I/O request
+	BVS	25$				; VS then no packet to complete
+	BRB	FINISH_RCV_IO			; If found then finish the I/O
+
+25$:	INSQUE	(R2),@NOB$Q_ATTN+4(R4)		; Else, queue message buffer
+30$:	PUSHL	R4
+	BSBW	POKE_USER			; Poke the user
+	POPL	R4
+	BRB	45$
+
+40$:	INSQUE	(R2),@NOB$Q_FREE+4(R4)		; Return the buff to free list
+45$:	MOVZWL	S^#SS$_NORMAL,R0		; Set normal return
+	RSB
+
+55$:	SETBIT	#XM$V_ERR_FATAL,UCB$L_DEVDEPEND(R5) ; Set that a fatal error occurd
+		
+
+	.IF	DF ERR$$$
+	incw	ucb$w_xg_prst(r5)		; inc persitant error count
+	.ENDC	;DF ERR$$$
+
+58$:	BRB	65$	
+60$:	BISL	#<XM$M_ERR_START!-		; Assume the trib error occurrd
+		XM$M_ERR_TRIB>,-		; because a STRT was received
+		UCB$L_DEVDEPEND(R5)
+	BBC	#DLK$V_MNTRCV,R7,65$		; If BC then true
+	CLRBIT	#XM$V_ERR_START,UCB$L_DEVDEPEND(R5)
+	SETBIT	#XM$V_ERR_MAINT,UCB$L_DEVDEPEND(R5) ; Else set maint msg rcv'd
+65$:	MOVZWL	#SS$_DEVINACT,R0		; Set protocol inactive
+70$:	INSQUE	(R2),@NOB$Q_FREE+4(R4)		; Return the buff to free list
+	RSB
+
+
+	.SBTTL	FINISH_RCV_IO - Finish receive I/O processing
+;++
+; FINISH_RCV_IO - Finish receive I/O processing
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine completes a receive operation that has been matched with a
+; message block. After the receive has been completed the message free list is 
+; filled and a receive is started if needed.
+;
+; 	INPUTS:
+;		R2 = message buffer address
+;		R3 = I/O packet address
+;		R4 = NOB address
+;		R5 = UCB address
+;
+;	IPL = FIPL
+;
+; 	OUTPUTS:
+;		R5 = UCB address
+;
+;	The request is completed via I/O post.
+;--
+FINISH_RCV_IO:					; Finish receive I/O request
+	MOVAL	RCV_T_DATA(R2),(R2)		; Insert address of the data
+	MOVZWL	RCV_W_MSGSIZ(R2),R0		; Get size of transfer
+	CLRL	R1				; Assume error
+	MOVL	R2,IRP$L_SVAPTE(R3)		; Save block address
+	MOVL	IRP$L_MEDIA(R3),4(R2)		; Insert saved user VA
+	ADDW	UCB$W_DEVBUFSIZ(R5),-		; Adjust unit quota
+		NOB$W_QUOTA(R4)
+	CMPW	R0,IRP$W_BCNT(R3)		; Request larger than actual?
+	BLEQU	20$				; Br if no
+	MOVZWL	IRP$W_BCNT(R3),R0		; Set size to min. of two sizes
+20$:	MOVW	R0,IRP$W_BCNT(R3)		; Set size to transfer
+	ASHL	#16,R0,R0			; Set up status
+	BNEQ	25$				; Br if success
+	MOVW	#SS$_CTRLERR,R0			; Set data path error
+	BRB	30$
+25$:	MOVW	S^#SS$_NORMAL,R0		; Set success
+30$:	MOVL	R0,IRP$L_MEDIA(R3)		; Set status and size
+
+	MOVB	#DYN$C_BUFIO,IRP$B_TYPE(R2)	; PSI expects this in all buffs
+	BSBB	IO_DONE				; Post the I/O request
+	BSBW	FILLFREELIST			; Return rcv buffer to free q
+	RSB					; and start next RCV
+
+
+; Complete a transfer I/O operation
+
+TRANSMIT_IO_DONE:
+	BBC	#XMTQ$V_INTERNAL,-		; If BC then not an "Interal"
+		XMTQ$B_FLAG(R1),IO_DONE		; IRP, else must dealloc the
+						; buffer used to transmit
+	MOVL	R1,R0				; Set to dealloc the buffer
+	JSB	G^COM$DRVDEALMEM		; Deall the buffer
+IO_DONE:					; Comp a transfer I/O operation
+	MOVL	UCB$L_DEVDEPEND(R5),-		; Set other info
+		IRP$L_MEDIA+4(R3) 
+	BBC	#IRP$V_DIAGBUF,-		; Br if no diagnostic buffer
+		IRP$W_STS(R3),20$ 
+	ADDL3	#8,@IRP$L_DIAGBUF(R3),R0 	; Addr buffer past start time
+	MOVQ	G^EXE$GQ_SYSTIME,(R0)+		; Insert stop time
+	MOVZWL	UCB$W_ERRCNT(R5),(R0)+		; Insert error counter
+	BSBW	NO$REGDUMP
+20$:	JMP	G^COM$POST			; Post the I/O
+
+
+
+	.SBTTL	TRANSMIT_DONE - Transmit completion routine
+;++
+; TRANSMIT_DONE - Transmit completion routine
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine is called when a transmit buffer needs completion. If the
+; transmit buffer completed was a protocol control buffer then nothing
+; happens with the buffer. In fact it should be part of an the NOB 
+; structure . If the transmit was a data buffer, the routine
+; calls the protocol to deal with the buffer. If the protocol notifies the
+; driver that it has XMT's to send to I/O completion, the driver pulls these
+; buffers off the complete queue and sends them off to complete via COM$POST.
+;
+; 	INPUTS:
+;		R2 = Address of buffer to complete
+;		R3 = If error then contains the error from the device
+;		R4 = NOB address
+;		R5 = UCB address
+;
+;	IPL = FIPL
+;
+; 	OUTPUTS:
+;		R4,R5 are preserved
+;
+;--
+TRANSMIT_DONE:
+	MOVL	R2,R8				; Put buffer addr into R8
+	PUSHR	#^M<R4,R5>			; Save registers
+	MOVL	NOB$A_PRO_BUFFER(R4),R5		; Set protocol buffer address
+	MOVZBL	#DLK$C_XMTMSG,R6		; Set up to put on RTOQ if the
+	MOVZBL	#DLK$M_MSGSENT,R7		; msg needs to be timed out
+	CLRL	R9
+	BSBW	DDCMP				; Branch to protocol
+	POPR	#^M<R4,R5>			; Restore registers
+	BBC	#DLK$V_XMTCMP,R7,30$		; If BC then no XMT's to compl
+	BSBB	FINISH_XMT_IO			; Else complete the XMT
+30$:	MOVZWL	S^#SS$_NORMAL,R0		; Set normal return
+	RSB
+
+FINISH_XMT_IO:
+	PUSHR	#^M<R6,R7,R8,R9>		; Save registers
+	MOVL	NOB$A_PRO_BUFFER(R4),R6		; Get protocol buffer address
+5$:	REMQUE	@TF$Q_CMPQ(R6),R8		; Get the next entry on queue
+	BVS	20$				; If VS then branch to finish
+	MOVL	XMTQ$L_IRP(R8),R3		; Get IRP associated with XMT
+	MOVZWL	XMTQ$W_MSGSIZE(R8),R0		; Get transfer size
+	SUBW2	#NO$C_HEADER_LEN,R0		; Subtract out the protocol hdr
+	ASHL	#16,R0,R0			; Set up status
+	BNEQ	10$				; Br if data transmitted
+	MOVW	#SS$_CTRLERR,R0			; Set device error
+	BRB	15$
+10$:	MOVW	#SS$_NORMAL,R0			; Assume success
+15$:	MOVL	R0,IRP$L_MEDIA(R3)
+	MOVL	R8,R1				; Set XMTQ buff address
+	BSBW	TRANSMIT_IO_DONE		; Complete the IO
+	BRB	5$				; Get next to complete
+20$:	MOVZWL	S^#SS$_NORMAL,R0
+	POPR	#^M<R6,R7,R8,R9>		; Restore registers
+	RSB
+
+
+;++
+; DEVTIMER - Device wakeup routine
+;
+; Functional Description:
+;
+; This routine is called when the protocol timer every second when the
+; protocol timer ticks to start any transmits the protocol may
+; have queued as a result of the timer going off. 
+;
+;	INPUTS:
+;		R1 = Error status from protocol specific timer routine
+;		R5 = Address of the UCB
+;
+;
+;	OUTPUTS:
+;		R0 = Status of line is LBS then line is up
+;				       LBC then line is down
+;		On error the line is shut down, however the UCB is not
+;		deallocated
+;
+;--
+	.ENABL	LSB
+DEVTIMER:
+	MOVL	UCB$L_NO_BUFFER(R5),R4		; Get NOB address
+	BBS	#XM$V_ERR_FATAL,UCB$L_DEVDEPEND(R5),30$ ; If BS then fatal err
+	BBS	#DLK$V_PRSTERR,R1,30$		; If BS then psrt err shut down
+						; the device
+
+; Before we do anything else we should check to see if the xmts and/or 
+; receives in progress timed out.
+
+	DSBINT	UCB$B_DIPL(R5)
+	MOVL	G^EXE$GL_ABSTIM,R2
+	BBC	#NO_DS_V_XMT_TIME,UCB$W_DEVSTS(R5),5$ ; If clear time not valid
+	CMPL	R2,NOB$L_XMT_DUETIM(R4)		; If LEQ time not up
+	BLEQ	5$
+	BSBW	TIMEOUT				; Else timeout message
+	MOVZBL	UCB$W_TT_SPEED(R5),R0		; Reset due time
+	MOVZWL	DUETIM_TABLE[R0],R0
+	ADDW3	R0,R2,NOB$L_XMT_DUETIM(R4)
+5$:	BBC	#NO_DS_V_RCV_TIME,UCB$W_DEVSTS(R5),8$ ; If clear time not valid
+	CMPL	R0,NOB$L_RCV_DUETIM(R4)		; If LEQ time not up
+	BLEQ	8$
+	BSBW	TIMEOUT				; Else timeout message
+	MOVZBL	UCB$W_TT_SPEED+1(R5),R0		; Reset due time	
+	BNEQ	6$
+	MOVZBL	UCB$W_TT_SPEED(R5),R0
+6$:	MOVZWL	DUETIM_TABLE[R0],R0
+	ADDW3	R0,R2,NOB$L_RCV_DUETIM(R4)
+8$:	ENBINT
+	MOVZWL	S^#SS$_NORMAL,R0		; Assume everything ok
+	
+; If the protocol timer has expired then clear the XMTING flag so that
+; the control message which must be sent can be. This is true when the
+; device is running half duplex. If the message with the select flag is dropped
+; then we must be sure that we can send anouthe message with a select flag.
+
+	BBC	#DLK$V_TMREXPD,R1,10$
+	CLRBIT	#NO_DS_V_XMTING,UCB$W_DEVSTS(R5)
+10$:	PUSHL	R1
+	BSBW	START_TRANSMIT			; Else try to start a transmit
+	POPL	R1
+	BLBC	R0,30$				; If LBC then fatal error
+	BICW	#DLK$M_TMREXPD,R1		; Clear timer expired
+20$:	RSB
+
+;&&&&&&&&&&&&& WHAT TO DO &&&&&&&&&&&
+
+25$:	SETBIT	#XM$V_STS_DISC,UCB$L_DEVDEPEND(R5)  ; Set modem disconnect sts
+
+; TFB/GFB blocks are deallocated on shutdown. Make sure R0 is
+; clear so that the timer routine does not try to access them.
+
+30$:	SETBIT	#XM$V_ERR_FATAL,UCB$L_DEVDEPEND(R5) ; Set fatal error
+	BSBW	SHUTDOWN_LINE			; Shut down the device
+ 	CLRL	R0
+	RSB
+	.DSABL	LSB
+
+
+	.SBTTL	NO$REGDUMP - Error log and diagnostics register dump
+;++
+; NO$REGDUMP -Diagnostics register dump routine
+;
+; Functional description:
+;
+; This routine is used to return ?????
+;
+; 	INPUTS:
+;		R0 = ADDRESS OF THE BUFFER
+;		R5 = UCB ADDRESS OF THE UNIT
+;
+; 	OUTPUTS:
+;		R0,R1 ARE USED
+;		R5 = UCB ADDRESS OF THE UNIT
+;--
+NO$REGDUMP:
+	BBC	#XM$V_STS_ACTIVE,-	; BR if not active
+		UCB$L_DEVDEPEND(R5),20$	
+20$:	RSB
+
+
+	.SBTTL  Poke user process on attention condition
+
+;++
+; POKE_USER - Poke user process on attention condition
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine is used when data is avaliable or the unit is shutdown.
+; The action is to declare the ast's and send a message to the assoc. mailbox.
+;
+; 	INPUTS:
+;		R4 = Message type -- 0 if no message
+;		R5 = Unit UCB address
+;
+; 	OUTPUTS:
+;		R0 = Low bit clear only if user is not notified
+;		R5 = UCB ADDRESS
+;--
+POKE_USER:					; POKE USER
+	DSBINT	UCB$B_FIPL(R5)			; Sync to Fork
+	CLRL	-(SP)				; Assume failure
+	MOVAB	UCB$L_NO_AST(R5),R1		; Get AST listhead
+	TSTL	(R1)				; Empty ?
+	BEQL	17$				; If so, branch
+	INCL	(SP)				; Indicate success
+	MOVL	R1,R4				; Copy list head address
+10$:	MOVL	(R1),R1				; Address a block
+	BEQL	15$				; If EQL then done
+	MOVL	UCB$L_DEVDEPEND(R5),^X01C(R1)	; Change param
+	BRB	10$
+15$:	JSB	G^COM$DELATTNAST		; Deliver AST'S
+17$:	POPL	R0				; Set status
+	ENBINT					; Enable interrupts
+	RSB
+
+	.SBTTL	TIMEOUT - TIMEOUT 
+;++
+; TIMEOUT - Timeout 
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine is entered on device timeout. The action is to shut
+; the unit down.
+;
+; 	INPUTS:
+;		R5 = UCB address
+;
+; 	OUTPUTS:
+;		NONE
+;
+;	IPL = Device IPL
+;--
+TIMEOUT:				; TIMEOUT OR POWERFAIL
+	BBC	#XM$V_STS_ACTIVE,-	; Br BC device is not active
+		 UCB$L_DEVDEPEND(R5),20$
+10$:	BBC	#UCB$V_POWER,-		; Br unless powerfail
+		 UCB$W_STS(R5),30$
+	BSBW	SCHED_FORK_POWERFAIL	; Create the error fork process
+20$:	RSB
+
+; Because some devices are flaky when driven as hard as DECnet drives the line,
+; we have added code here to clear the device in case it gets stuck. A side
+; effect of clearing the device is that any transmit data it had outstanding 
+; gets lost. In order to handle that condition we will transmit enough pads
+; to make up for the size of the message that we feel has been dropped. This
+; is decided by the state the device is in and the type of message is was
+; transmitting.
+; 
+; There is another case we must worry about here and that is if the reply
+; timeout timer has gone off. In that case the protocol takes the xmt away
+; from the device, so that messages are not retransmitted out of order.
+; Thus we will check for this condition (the NOB$L_XMT_INPR field is clear)
+; and if it occurs then we will send out pads to fill the messaege length,
+; with our best guess. We also put the ctrl msg address in the inpr field
+; to fake the xmter into thinking that the message is still active.
+
+30$:	INCW	UCB$W_ERRCNT(R5)		; Incr the error counter
+	PUSHR	#^M<R1,R2,R3,R4,R5>
+	MOVL	UCB$L_TT_PORT(R5),R2		; Get the port vector
+	JSB	@PORT_ABORT(R2)			; Reset the device
+	JSB	@PORT_RESUME(R2)
+	MOVL	UCB$L_NO_BUFFER(R5),R4		; Get the no buffer
+	CLRL	R3
+	MOVZBL	NOB$B_XSTATE(R4),R1		; Get old state 
+	MOVB	#NO$C_XMTERR,NOB$B_XSTATE(R4)	; Set new state
+	$DISPATCH R1,TYPE=B,-
+	<-	;function		;action
+		<NO$C_EMPTY		40$>,-
+		<NO$C_HEADER		TIMEOUT_HEADER>,-
+		<NO$C_HCRC		TIMEOUT_HCRC>,-
+		<NO$C_DATA		TIMEOUT_DATA>,-
+		<NO$C_DCRC		TIMEOUT_DCRC>,-
+		<NO$C_PADS		TIMEOUT_PADS>,-
+		<NO$C_XMTERR		TIMEOUT_XMTERR>,-
+	>
+
+40$:	CLRB	NOB$B_XSTATE(R4)		; Reset state
+	POPR	#^M<R1,R2,R3,R4,R5>
+	RSB
+
+TIMEOUT_HEADER:
+	ADDW3	#10,UCB$W_DEVBUFSIZ(R5),R3	; Assume xmt is gone
+	MOVL	NOB$L_XMT_INPR(R4),R1
+	BEQL	TIMEOUT_END
+	BBS	#XMTQ$V_CONTROL,XMTQ$B_FLAG(R1),10$
+
+; Set send field high enough to cover xmting of header, hcrc, data, and dcrc.
+
+	ADDW3	#4,XMTQ$W_MSGSIZE(R1),R3
+	BRB	TIMEOUT_END
+
+; Set send length field high enough to cover xmitng of header and hcrc
+
+10$:	MOVW	#NO$C_HEADER_LEN,R3
+	BRB	TIMEOUT_END
+
+TIMEOUT_HCRC:
+	ADDW3	#4,UCB$W_DEVBUFSIZ(R5),R3	; Assume xmt is gone
+	MOVL	NOB$L_XMT_INPR(R4),R1
+	BEQL	TIMEOUT_END
+	BBS	#XMTQ$V_CONTROL,XMTQ$B_FLAG(R1),10$
+
+; Set send field high enough to cover xmting of hcrc, data, and dcrc.
+
+	ADDW3	#4,XMTQ$W_MSGSIZE(R1),R3
+	SUBW2	#NO$C_HEADER_LEN,R3		; XMTQ$W_MSGSIZ includes HEADER size
+	BRB	TIMEOUT_END
+
+; Set send length field high enough to cover xmitng of hcrc
+
+10$:	MOVW	#2,R3
+	BRB	TIMEOUT_END
+
+TIMEOUT_DATA:
+	ADDW3	#2,UCB$W_DEVBUFSIZ(R5),R3	; Assume xmt is gone
+	MOVL	NOB$L_XMT_INPR(R4),R1
+	BEQL	TIMEOUT_END
+
+; Set send field high enough to cover xmting of data, and dcrc.
+
+	ADDW3	#2,XMTQ$W_MSGSIZE(R1),R3
+	SUBW2	#NO$C_HEADER_LEN,R3		; XMTQ$W_MSGSIZ includes HEADER size
+	BRB	TIMEOUT_END
+	
+TIMEOUT_DCRC:
+	MOVW	#2,R3				; Set the field to send DCRC
+	BRB	TIMEOUT_END
+
+TIMEOUT_PADS:
+	MOVW	#2,R3				; Set the field to send DCRC
+	MOVB	#NO$C_PADS,NOB$B_XSTATE(R4)	; Set to finish message
+	BRB	TIMEOUT_END
+
+TIMEOUT_XMTERR:
+	MOVW	NOB$W_XMTERR_SIZE(R4),R3
+	;BRB	TIMEOUT_END
+
+TIMEOUT_END:
+
+	TSTL	NOB$L_XMT_INPR(R4)		; If NEQ then message avaialable
+	BNEQ	10$				
+	MOVAL	NOB$Z_CTL_MSG(R4),NOB$L_XMT_INPR(R4) ; Else set to fake xmter
+10$:	MOVW	R3,NOB$W_XMTERR_SIZE(R4)	; Set size to xmt
+	MOVAL	NOB$W_PADS(R4),UCB$L_TT_OUTADR(R5) ; set to send pads
+	MOVZBW	#2,UCB$W_TT_OUTLEN(R5)		; set length
+	MNEGB	#1,UCB$B_TT_OUTYPE(R5)		; Set to send a burst
+	POPR	#^M<R1,R2,R3,R4,R5>
+	RSB
+
+
+	.SBTTL	NO$CANCEL - Cancel I/O rotuine
+;++
+; NO$CANCEL - Cancels all I/O in progress
+;
+; If the NO buffer has not been alloacted that means the device is
+; not running, set normal return to decrement the reference count 
+; and return. This condition can happen when the line gets switched
+; from a static terminal port to a static ddcmp port.
+; By looking at the channel number saved at line startup time, cancel 
+; determines which entity (line or circuit) to shut down. Only on the 
+; last deassign to the channels does the buffer allocated for the 
+; TT UCB's extension get deallocated.
+; 
+;	INPUTS:
+;		R2 = channel number
+;		R3 = current IRP address
+;		R4 = PCB address
+;		R5 = UCB address
+;		R8 = Cancel reason code (zero vanilla flavored cancel)
+;
+;	IPL = FIPL
+;
+;	OUTPUTS:
+;		R0 - R3 are destroyed
+;
+;--
+NO$CANCEL:
+	MOVL	UCB$L_NO_BUFFER(R5),R0		; Get NOB addess
+	BEQL	30$				; If EQL device not active
+	CMPL	NOB$L_PID(R0),PCB$L_PID(R4)	; If not starters PID then
+	BNEQ	30$				; do not process cancel
+	CMPW	NOB$W_CHANL(R0),R2		; If EQL match on line channel
+	BEQL	10$
+	BSBW	SHUTDOWN_CIRCUIT		; Else shutdown the circuit
+	BRB	15$
+10$:	BSBW	SHUTDOWN_LINE
+15$:	PUSHL	R0
+	TSTW	UCB$W_REFC(R5)			; If reference count is nonzero
+	BNEQ	20$				; do not deallocate nob or disc port
+	BSBW	CLEAR_NO_BUFFER			; Else do
+20$:	POPL	R0				; Set status from shutdown
+	RSB
+
+30$:	MOVZWL	#SS$_NORMAL,R0
+	RSB
+
+	.SBTTL	CLEAR_NO_BUFFER - Clear NO buffer and disconnect the port
+;++
+; CLEAR_NO_BUFFER - Clear NO buffer and disconnect the port
+; 
+; This routine is called on the last deassign to the device. It deallocates
+; the NO buffer which was used as an extension to the devices UCB. And
+; it disconnects with out deallocating the UCB from the port.
+;
+; 	INPUTS:
+;		R4 = PCB address
+;		R5 = UCB address
+;
+;	IPL = FIPL
+;	
+;	OUTPUTS:
+;		All registers are preserved.
+;
+;--
+CLEAR_NO_BUFFER:
+	PUSHR	#^M<R1,R2,R3,R4,R5,R6,R7>
+	MOVL	UCB$L_NO_BUFFER(R5),R0		; If EQL buffer no allocated
+	BEQL	10$
+	CLRL	UCB$L_NO_BUFFER(R5)		; Set buffer no longer available
+	MOVL	NOB$L_PID(R0),R7		; Save starters' PID
+	MOVZWL	UCB$W_SIZE(R0),R2		; get size of buffer
+	PUSHR	#^M<R2,R4,R5>
+	JSB	G^COM$DRVDEALMEM		; Deallocate the block
+	POPR	#^M<R2,R4,R5>
+
+; Call the port driver to disconnect the port. Do not delete the UCB.
+
+	MOVL	UCB$L_TT_PORT(R5),R1
+	JSB	@PORT_DISCONNECT(R1)
+	CMPL	R7,PCB$L_PID(R4)		; Current PID same as starter's PID
+	BNEQ	10$				; NEQ then don't restore quota
+	MOVL	PCB$L_JIB(R4),R0		; Get JIB
+	ADDL2	R2,JIB$L_BYTCNT(R0)		; Restore the byte count
+
+10$:	POPR	#^M<R1,R2,R3,R4,R5,R6,R7>
+	RSB
+		
+
+
+	.SBTTL SHUTDOWN - Shut down unit, device and/or protocol
+;++
+; SHUTDOWN_LINE - Shut down unit 
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine is used to shut down the unit as a result of a 
+; setmode shutdown on the controller or a fatal error. The mapping 
+; registers are returned, a call is made to shutdown the circuit; and
+; all quotas are returned. If this was the last deassign of a channel
+; to the device then the NOB is deallocated.
+;
+; 	INPUTS:
+;		R5 = UCB address
+;
+;	For SHUTDOWN_LINE_ALT
+;
+;		R1 = 0 if DTR can be dropped on shut down
+;		     1 if DTR can not be dropped on shut down
+;
+;	OUTPUTS:
+;		R5 = UCB address
+;		R6 - R9 are preserved
+;		R0-R3 are destroyed.
+;--
+SHUTDOWN_LINE:					; Shut down unit
+	MOVL	#1,R1				; Do not dealloacte NOB 
+SHUTDOWN_LINE_ALT:
+	BBC	#NO_DS_V_INITED,-
+		UCB$W_DEVSTS(R5),5$		; BR if not inited
+	BBS	#UCB$V_ONLINE,-
+		UCB$W_STS(R5),10$		; Br if online
+5$:	MOVZWL	#SS$_DEVINACT,R0		; Set status 
+	RSB					; ... and return
+
+10$:	PUSHR	#^M<R2,R3,R4,R6,R7,R8,R9>	; Save the registers
+
+	BICW	#UCB$M_POWER!-
+		UCB$M_TIM,UCB$W_STS(R5)		; Reset device status
+	BICW	#^C<NO_DS_M_XMTING!-		; Clear all but xmt off
+		    NO_DS_M_RCVING!-		; rcv off
+		    NO_DS_M_ILOOP_SUP>,-	; internal loop
+		UCB$W_DEVSTS(R5)
+		
+
+; Shut down the circuit
+
+	PUSHL	R1				; Save NOB deallocate status
+	BSBW	SHUTDOWN_CIRCUIT		; Shutdown the circuit
+	MOVL	UCB$L_NO_BUFFER(R5),R4		; Get NOB address
+
+; Stop the DDCMP timer. First set up registers with params for call
+; then make the call to the protocol.
+
+	PUSHR	#^M<R4,R5>
+	MOVZBL	#DLK$C_STOP_TIMER,R6		; Set up R6 with the DDCMP comm
+	CLRQ	R7				; CLR all registers
+	CLRL	R9				; Clear R9
+	MOVL	NOB$A_PRO_BUFFER(R4),R5		; Set up R5 with TF block addr
+	BSBW	DDCMP				; Call protocol
+	MOVL	R5,R0				; Need to deallocate protocol buffer
+	POPR	#^M<R4,R5>
+
+; After the timer has been stopped it is ok to reload the driver.
+
+	BICB	#DPT$M_NOUNLOAD,DPT$TAB+DPT$B_FLAGS
+
+; Deallocate the protocol buffer
+
+	CLRL	NOB$A_PRO_BUFFER(R4)		; Clear all knowledge of protocol buffer
+	MOVZWL	UCB$W_SIZE(R0),R2		; Get the size
+	PUSHR	#^M<R2,R4,R5>
+	JSB	G^COM$DRVDEALMEM		; Dealloc the buffer
+	POPR	#^M<R2,R4,R5>		
+
+
+; Restore the buffered I/O quota and protocol buffer quota to the starter
+
+	MOVZWL	NOB$L_PID(R4),R0		; Get pid of last starter
+	MOVL	G^SCH$GL_PCBVEC,R1		; Address PCB vector
+	MOVL	(R1)[R0],R0			; Get PCB of owner
+	MOVL	PCB$L_PID(R0),R6		; Save pid of PCB
+	MOVL	NOB$L_PID(R4),R7		; Save PID of starter
+	MOVZWL	NOB$W_QUOTA(R4),R1		; Get quota
+	CLRW	NOB$W_QUOTA(R4)			; Clear quota returned
+	ADDL	R1,R2				; Get bytes quota to return
+	POPL	R1				; Restore drop DTR status
+	CMPL	R6,R7				; Do the PIDs match
+	BNEQ	20$				; If NEQ no don't return quota
+	MOVL	PCB$L_JIB(R0),R0		; Get JIB
+	ADDL	R2,JIB$L_BYTCNT(R0)		; Return byte count quota
+20$:	MOVZWL	S^#SS$_NORMAL,R0		; Set status
+	POPR	#^M<R2,R3,R4,R6,R7,R8,R9>	; Save the registers
+	RSB
+
+
+
+
+;++
+; SHUTDOWN_CIRCUIT - Shut down device and protocol
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine is used to shut down the circuit as a result of a setmode
+; shutdown on the tributary or on the controller or by a fatal error on
+; the device. The routines frees allocated blocks; completes IRP's with
+; the active bit clear; and halts the protocol.
+;
+; 	INPUTS:
+;		R5 = UCB address
+;
+; 	OUTPUTS:
+;		R5 = UCB address
+;		R6 - R9 are preserved
+;		R0-R3 are destroyed.
+;--
+SHUTDOWN_CIRCUIT:
+	BBSC	#XM$V_STS_ACTIVE,UCB$L_DEVDEPEND(R5),10$ ; If BS then trib is active
+	MOVZWL	#SS$_DEVINACT,R0		; Else set status and return
+	RSB
+
+10$:	PUSHR	#^M<R2,R3,R4,R6,R7,R8,R9>	; Save the registers
+	BISW	#<NO_DS_M_XMTING!-		; Set the XMTer and
+		  NO_DS_M_RCVING!-		; RCVer off
+		  NO_DS_M_SHUTDOWN>,UCB$W_DEVSTS(R5) ; and set device is shuting down
+
+; What we are about to do is in direct violation of the DDCMP standard.
+; But as it is we can not think of what else to do. If anyone out there 
+; has a better suggestion please feel free to send it to us. We are however
+; going to abort the receiver and tranmitter in the next few instructions.
+; The ddcmp standard says that the transmitter should not be aborted, but
+; in order to make this true under all conditions we would have to 
+; wait at this spot for as much as 90 seconds.
+
+	DSBINT	UCB$B_DIPL(R5)
+	MOVL	UCB$L_TT_PORT(R5),R2		; Get the port vector
+	JSB	@PORT_ABORT(R2)			; Reset the device
+	JSB	@PORT_RESUME(R2)
+	MOVL	UCB$L_NO_BUFFER(R5),R4		; Get NOB address
+	CLRB	NOB$B_XSTATE(R4)		; Reset transmitter state
+	BSBW	START_RECEIVE			; Reset receiver state
+
+
+; Clear any receives or transmits currently inprogress
+
+	MOVL	NOB$L_RCV_INPR(R4),R6		; If EQL then on receive pending
+	BEQL	20$
+	CLRL	NOB$L_RCV_INPR(R4)		; Clear receive from inprogress
+	INSQUE	(R6),@NOB$Q_FREE+4(R4)		; Queue to free queue
+20$:	MOVL	NOB$L_XMT_INPR(R4),R1		; Comp XMT's on inprogress Q
+	BEQL	30$				; If EQL none to complete
+	CLRL	NOB$L_XMT_INPR(R4)		; Clear transmit from inprogress
+	BBS	#XMTQ$V_CONTROL,-		; If BS then control message
+		XMTQ$B_FLAG(R1),30$		; don't put on post queue
+	INSQUE	(R1),@NOB$Q_POST+4(R4)		; Insert to be completed
+30$:	ENBINT					; Return to fork level
+
+; Deallocate all the attention AST control blocks
+
+	PUSHL	R4
+40$:	MOVAB	UCB$L_NO_AST(R5),R7		; Address list head for AST's
+	MOVL	(R7),R0				; Anything in the list?
+	BEQL	45$				; If EQL then empty
+	MOVZWL	ACB$L_KAST+10(R0),R6		; Force channel
+	MOVZWL	ACB$L_KAST+12(R0),R2		; Get PID index
+	MOVL	G^SCH$GL_PCBVEC,R4
+	MOVL	(R4)[R2],R4			; Get PCB
+	JSB	G^COM$FLUSHATTNS		; Flush the attention AST's
+	BRB	40$				; Continue until done
+45$:	POPL	R4
+
+; Clear the post queue
+
+50$:	REMQUE	@NOB$Q_POST(R4),R6		; Get next buffer to complete 
+	BVS	60$				; If VS then no buffer found
+	CMPB	IRP$B_TYPE(R6),S^#DYN$C_BUFIO	; If NEQ then not XMT buffer
+	BNEQ	55$
+	MOVL	XMTQ$L_IRP(R6),R3		; If EQL then no IRP to comp
+	BEQL	50$
+	MOVL	R6,R1				; Set up R1 for branch
+	MOVZWL	#SS$_ABORT,IRP$L_MEDIA(R3)	; Set abort status and compl
+	BSBW	TRANSMIT_IO_DONE		; the request
+	BRB	50$
+55$:	CMPB	IRP$B_TYPE(R6),S^#DYN$C_NET	; If EQL then RCV buffer
+	BNEQ	85$
+	INSQUE	(R6),@NOB$Q_FREE+4(R4)		; Put on free Q to complete
+	BRB	50$
+
+; Deallocate all receive buffers
+
+60$:	MOVAB	NOB$Q_FREE(R4),R6		; Get queue listhead
+	BSBB	70$				; Empty queue
+	MOVAB	NOB$Q_ATTN(R4),R6		; Get queue listhead
+	BSBB	70$				; Empty queue
+	BRB	90$				; Continue
+
+70$:	REMQUE	@(R6),R0			; Get buffer
+	BVS	80$				; If VS then none
+	ADDW	UCB$W_DEVBUFSIZ(R5),NOB$W_QUOTA(R4) ; Restore quota
+	PUSHL	R4
+	JSB	G^COM$DRVDEALMEM		; Deallocate buffer
+	POPL	R4
+	BRB	70$				; Loop
+80$:	RSB
+
+85$:	BUG_CHECK NOBUFPCKT,FATAL
+
+; Complete all associated receive IO packets
+
+90$:	REMQUE	@NOB$Q_RCVS(R4),R3		; If VS then queue is empty
+	BVS	100$
+	MOVZWL	#SS$_ABORT,IRP$L_MEDIA(R3)	; Set status and size
+	BSBW	IO_DONE				; Complete the request
+	BRB	90$				; Branch to get next IRP
+
+; Complete all XMITS
+
+100$:	DSBINT	UCB$B_DIPL(R5)			; Lock out interrupts
+	BICW	#UCB$M_TIM!UCB$M_INT,UCB$W_STS(R5)
+	ENBINT					; Reset interrupts
+	PUSHR	#^M<R3,R4,R5>			; Save registers
+	MOVZBL	#DLK$C_USRINT,R6		; Set up to halt the protocol
+	MOVZBL	#DLK$M_STOP,R7
+	CLRQ	R8
+	MOVL	NOB$A_PRO_BUFFER(R4),R5		; Set protocol buffer
+	BSBW	DDCMP
+	MOVAB	TF$Q_CMPQ(R5),R6		; Get queue to complete from
+	POPR	#^M<R3,R4,R5>			; Restore the registers
+110$:	REMQUE	@(R6),R1			; Complete all XMT's 
+	BVS	120$				; If VS then no more to cmplt
+	CMPB	XMTQ$B_BUFTYP(R1),S^#DYN$C_BUFIO ; Branch NEQ not a valid buff
+	BNEQ	85$
+	MOVL	XMTQ$L_IRP(R1),R3		; Get associated IRP
+	MOVZWL	#SS$_ABORT,IRP$L_MEDIA(R3)	; Set aborted status
+	BSBW	TRANSMIT_IO_DONE		; Complete the I/O
+	BRB	110$				; Branch to get next
+120$:	MOVZWL	S^#SS$_NORMAL,R0		; Assume shutdown
+	POPR	#^M<R2,R3,R4,R6,R7,R8,R9>	; Save the registers
+	RSB
+
+
+	.SBTTL	VALIDATE_P2,  Validate P2 buffer parameters
+	.SBTTL	VALIDATE_P2_TRIB,  Validate P2 buffer with Trib param
+	.SBTTL	VALIDATE_P2_UCB,  Validate P2 buffer with UCB
+ 
+;++
+; VALIDATE_P2 - Validate P2 buffer parameters
+; VALIDATE_P2_TRIB - Validate P2 buffer with trib parameters
+; VALIDATE_P2_UCB - Validate P2 buffer with UCB
+;
+; This routine is called to validate the P2 buffer parameters. The parameters
+; are checked against a parameter table which verifies that the minimum value
+; and maximum value is not violated, and that invalid status flags are not set.
+;
+; Inputs:
+;
+;	R1 = Address of parameter verification table (VALIDATE_P2 entry only)
+;	R2 = Status word from UCB
+;	R3 = IRP address
+;	R4 = NOB or trib parameter block address for value 
+;	     checking (VALIDATE_P2 entry only)
+;	R5 = UCB address
+;
+;	IPL = FIPL
+;
+; Outputs:
+;
+;	R0 = status return of parameters
+;
+; If no error:
+;	R1 = Address of parameter verification table
+; If error:
+;	R1 = Bad parameter value
+;
+;	All other registers are preserved.
+;
+;--
+	.ENABL	LSB
+VALIDATE_P2_TRIB:				; Validate P2 buffer with TFB
+	PUSHL	R4				; Save R4
+	MOVAB	TRIB_PARAM,R1			; Get address of verification table
+	MOVL	UCB$L_NO_BUFFER(R5),R4		; Get NOB address
+	MOVAB	NOB$Z_DDCMP(R4),R4		; Get address of block to set
+						; DDCMP parameters
+	BRB	10$
+VALIDATE_P2_UCB:				; Validate P2 buffer with UCB
+	PUSHL	R4				; Save R4
+	MOVAB	LINE_PARAM,R1			; Get address of verification table
+	MOVL	UCB$L_NO_BUFFER(R5),R4		; Get NOB address
+10$:	BSBB	VALIDATE_P2			; Do the validation
+	POPL	R4				; Restore R4
+	RSB					; Return to caller
+	.DSABL	LSB
+ 
+VALIDATE_P2:					; Validate P2 buffer parameters
+	PUSHR	#^M<R1,R2,R3,R5,R6,R7,R8,R9>	; Save registers
+						; NB:R1 must be on top of stack
+	MOVL	IRP$L_SVAPTE(R3),R6		; Get system P2 buffer address
+	BNEQ	10$				; Br if a system buffer
+	BRW	150$				; Else, leave
+10$:	MOVZWL	IRP$W_BCNT(R3),R8		; Get size of P2 buffer
+	DIVL	#6,R8				; Calculate number of parameters
+	MOVL	P2B_L_POINTER(R6),R6		; Point to start of P2 data
+
+; Loop to check next parameter in P2 buffer
+
+30$:	MOVZWL	(R6)+,R0			; Get parameter type from P2
+	MOVL	(R6)+,R5			; Get parameter value from P2
+	MOVL	(SP),R7				; Get parameter table address
+
+; Loop to check P2 buffer parameter to Line parameter table
+
+40$:	MOVW	(R7)+,R9			; Get parameter + flags
+	BEQL	170$				; Br if end of verify table
+	CMPZV	#PRM_V_TYPE,#PRM_S_TYPE,R9,R0	; Parameters match?
+	BEQL	50$				; Br if yes
+	TSTW	(R7)+				; Skip offset word
+	SKIP	PRM_V_MIN,R9,R7			; Skip minimum value
+	SKIP	PRM_V_MAX,R9,R7			; Skip maximum value
+	SKIP	PRM_V_INVALID,R9,R7		; Skip invalid flags
+	BRB	40$				; Try next parameter
+
+; Match found - nullify if same value & check min,max,valid,invalid
+
+50$:	MOVW	(R7)+,R1			; Get offset + width
+	TSTL	R4				; Is data structure present?
+	BEQL	100$				; Br if not - check values
+	EXTZV	#OFF_V_WIDTH,#OFF_S_WIDTH,R1,R3	; Get width only
+	EXTZV	#OFF_V_VALUE,#OFF_S_VALUE,R1,R1	; Get offset only
+	ADDL	R4,R1				; Calculate address of datum
+	CASE	R3,TYPE=B,LIMIT=#1,<-		; Br to handler
+		60$,-				;   Byte value
+		70$,-				;   Word value
+		80$>				;   Longword value
+
+; Byte value in structure
+
+60$:	CMPB	R5,(R1)				; Is this the same?
+	BRB	90$				; Check result
+
+; Word value
+
+70$:	CMPW	R5,(R1)				; Is this the same?
+	BRB	90$				; Check result
+ 
+80$:	CMPL	R5,(R1)				; Is this the same?
+90$:	BNEQ	100$				; Br if no - continue checks
+	CLRW	-6(R6)				; Nullify the parameter code
+	BRB	140$				; Try next parameter - skip checks
+
+100$:	BBC	#PRM_V_MIN,R9,110$		; Br if no minimum value
+	CMPW	R5,(R7)+			; Is the value too small?
+	BLSSU	170$				; Br if yes - error
+110$:	BBC	#PRM_V_MAX,R9,130$		; Br if no maximum value
+	CMPW	R5,(R7)+			; Is the value too big?
+	BGTRU	170$				; Br if yes - error
+130$:	BBC	#PRM_V_INVALID,R9,140$		; Br if no invalid flags
+	BITW	(R7)+,R2			; Check invalid bits
+	BNEQ	170$				; Br if on - error
+140$:	SOBGTR	R8,30$				; Loop if more parameters
+ 
+150$:	MOVZWL	S^#SS$_NORMAL,R0		; Set success return
+	BRB	180$				; And return
+ 
+170$:	MOVZWL	R0,(SP)				; Return bad parameter code
+						; * R1 Must be on top of stack
+	MOVZWL	#SS$_BADPARAM,R0		; Set error return
+180$:	POPR	#^M<R1,R2,R3,R5,R6,R7,R8,R9>	; Restore registers
+	RSB					; Return to caller
+
+	.SBTTL	UPDATE_P2,  Update UCB/TRIB based on P2 buffer parameters
+ 
+;++
+; UPDATE_P2 - Update UCB/TRIB with P2 buffer parameters
+;
+; This routine is called to update the UCB/TRIB with the P2 buffer parameters.
+; The parameters are stored in the appropriate cells of the UCB/TRIB.
+;
+; Inputs:
+;
+;	R1 = Address of parameter verification table
+;	R3 = IRP address
+;	R4 = NOB or ddcmp parameter block  address for storing
+;	R5 = UCB address
+;
+;	IPL = FIPL
+;
+; Outputs:
+;
+;	R0 = destroyed.
+;	All other registers are preserved.
+;
+;--
+ 
+UPDATE_P2:					; Update the UCB/DDCMP parametr
+	PUSHR	#^M<R1,R2,R5,R6,R7,R8,R9>	; Save registers
+						; NB:R1 must be on top of stack
+	MOVL	IRP$L_SVAPTE(R3),R6		; Get system P2 buffer address
+	BEQL	80$				; Br if no system buffer
+	MOVZWL	IRP$W_BCNT(R3),R8		; Get size of P2 buffer
+	DIVL	#6,R8				; Calculate number of parameters
+	MOVL	P2B_L_POINTER(R6),R6		; Point to start of data
+
+; Loop to get next parameter from P2 buffer
+
+10$:	MOVZWL	(R6)+,R0			; Get parameter type from P2
+	MOVL	(R6)+,R5			; Get parameter value from P2
+	MOVL	(SP),R7				; Get parameter table address
+
+; Loop to store buffer parameter in UCB/DDCMP parameter block
+
+20$:	MOVW	(R7)+,R9			; Get parameter + flags
+	BEQL	70$				; Br if end of verify table
+	EXTZV	#PRM_V_TYPE,#PRM_S_TYPE,R9,R1	; Get type field
+	CMPW	R0,R1				; Parameters match?
+	BEQL	30$				; Br if yes
+	TSTW	(R7)+				; Skip offset word
+	SKIP	PRM_V_MIN,R9,R7			; Skip minimum value
+	SKIP	PRM_V_MAX,R9,R7			; Skip maximum value
+	SKIP	PRM_V_INVALID,R9,R7		; Skip invalid flags
+	BRB	20$				; Try next parameter
+
+; Match found - nullify if same value & check min,max,valid,invalid
+
+30$:	MOVW	(R7)+,R1			; Get offset + width
+	EXTZV	#OFF_V_WIDTH,#OFF_S_WIDTH,R1,R2	; Get width only
+	EXTZV	#OFF_V_VALUE,#OFF_S_VALUE,R1,R1	; Get offset only
+	ADDL	R4,R1				; Calculate address of datum
+	CASE	R2,TYPE=B,LIMIT=#1,<-		; Br to handler
+		40$,-				;   Byte value
+		50$,-				;   Word value
+		60$>				;   Longword value
+
+; Byte, word, longword value in structure
+
+40$:	MOVB	R5,(R1)				; Store byte value
+	BRB	70$				; 
+50$:	MOVW	R5,(R1)				; Store word value
+	BRB	70$
+60$:	MOVL	R5,(R1)				; Store longword value
+70$:	SOBGTR	R8,10$				; Br if more parameters
+ 
+80$:	POPR	#^M<R1,R2,R5,R6,R7,R8,R9>	; Restore registers
+	RSB					; Return to caller
+
+	.SBTTL	RETURN_P2,  Return UCB/DDCMP buffer parameters
+ 
+;++
+; RETURN_P2 - Return P2 buffer parameters
+;
+; This routine is called to return the UCB/DDCMP buffer parameters.
+;
+; Inputs:
+;
+;	R1 = Address of return table (same format as verification table)
+;	R2 = Address of user buffer in which to return the parameters
+;	R3 = IRP address
+;	R4 = NOB or DDCMP paramter block address for storing
+;	R5 = UCB address
+;	IRP$W_BCNT(R3) = Size of transfer
+;
+; Outputs:
+;
+;	R0 = destroyed.
+;	All other registers are preserved.
+;
+;--
+ 
+RETURN_P2:					; Return P2 buffer parameters
+	PUSHR	#^M<R1,R2,R5,R6,R7,R8>		; Save registers
+	MOVL	R2,R6				; Get user buffer address
+	BEQL	60$				; Br if no system buffer
+	MOVZWL	IRP$W_BCNT(R3),R8		; Get size of buffer
+	DIVL	#6,R8				; Calculate the number of param
+
+; Loop to return next parameter
+
+10$:	MOVW	(R1)+,R5			; Get parameter + flags
+	BEQL	60$				; Br if end of verify table
+	EXTZV	#PRM_V_TYPE,#PRM_S_TYPE,R5,R7	; Get type field
+	MOVW	R7,(R6)+			; Return parameter
+	MOVW	(R1)+,R7			; Get offset + width
+	EXTZV	#OFF_V_WIDTH,#OFF_S_WIDTH,R7,R2	; Get width only
+	EXTZV	#OFF_V_VALUE,#OFF_S_VALUE,R7,R7	; Get offset only
+	ADDL	R4,R7				; Calculate address of datum
+	CASE	R2,TYPE=B,LIMIT=#1,<-		; Br to handler
+		20$,-				;   Byte value
+		30$,-				;   Word value
+		40$>				;   Longword value
+
+; Byte, word, longword value in structure
+
+20$:	MOVZBL	(R7),(R6)+			; Store byte value
+	BRB	50$				; 
+30$:	MOVZWL	(R7),(R6)+			; Store word value
+	BRB	50$
+40$:	MOVL	(R7),(R6)+			; Store longword value
+50$:	SKIP	PRM_V_MIN,R5,R1			; Skip minimum value
+	SKIP	PRM_V_MAX,R5,R1			; Skip maximum value
+	SKIP	PRM_V_INVALID,R5,R1		; Skip invalid flags
+	SOBGTR	R8,10$				; Try for more parameters
+ 
+60$:	POPR	#^M<R1,R2,R5,R6,R7,R8>		; Restore registers
+	RSB					; Return to caller
+
+	.SBTTL	UNPACK_P2_BUF,  Unpack a P2 parameter from P2 buffer
+ 
+;++
+; UNPACK_P2_BUF - Unpack a P2 parameter from P2 buffer
+;
+; Functional description:
+;
+; This routine is called to get a P2 parameter from the P2 buffer.
+;
+; Inputs:
+;
+;	R1 = Parameter type code
+;	R3 = IRP address
+;	R5 = UCB address
+;
+; Outputs:
+;
+;	R0 = Low bit set if specified Parameter type code is found in P2
+;	R2 = Parameter value if success else destroyed
+;
+;	All other registers are preserved.
+;
+;--
+ 
+UNPACK_P2_BUF:					; Unpack P2 buffer
+	PUSHR	#^M<R5,R6,R7>			; Save registers
+	MOVL	IRP$L_SVAPTE(R3),R6		; Get system P2 buffer address
+	BEQL	20$				; Br if none
+	MOVZWL	IRP$W_BCNT(R3),R7		; Get size of P2 buffer
+	DIVL	#6,R7				; Caculate number of parameters
+	MOVAB	P2B_T_DATA(R6),R6		; Point to start of data
+	MOVZWL	S^#SS$_NORMAL,R0		; Assume success
+
+; Loop to check next parameter in P2 buffer
+
+10$:	MOVZWL	(R6)+,R5			; Get parameter type from P2
+	MOVL	(R6)+,R2			; Get parameter value from P2
+	CMPW	R1,R5				; Parameters match?
+	BEQL	30$				; Br if yes
+	SOBGTR	R7,10$				; Br if more parameters
+ 
+20$:	CLRL	R0				; Return error
+30$:	POPR	#^M<R5,R6,R7>			; Restore registers
+	RSB					; Return to caller
+
+XG_END:
+	.END
+

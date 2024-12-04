@@ -1,0 +1,1357 @@
+MODULE PAS$$FILE_UTIL ( %TITLE 'File manipulation utility procedures'
+		IDENT = '1-005'		! File: PASFILEUT.B32 Edit: SBL1005
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	Pascal Language Support
+!
+! ABSTRACT:
+!
+!	Utility procedures to manipulate the global list of files.
+!
+! ENVIRONMENT:	User mode - AST reentrant
+!
+! AUTHOR: Steven B. Lionel, CREATION DATE: 1-April-1981
+!
+! MODIFIED BY:
+!
+! 1-001	- Original.  SBL 1-April-1981
+! 1-002 - Don't assume that PFV contains valid information in PAS$CLOSE_LOCAL_R3.
+!	  Use DO_CLOSE_HANDLER to display error messages from DO_CLOSE.
+!	  SBL 28-Jun-1982
+! 1-003 - Set all PFV fields that are needed to close the file in PAS$$CLOSE_LOCAL.
+!	  SBL 29-Jun-1982
+! 1-004 - Move FCB$L_STATUS to PFV$L_STATUS in PAS$$REMOVE_FILE. 
+!	  QAR FT3-2  SBL 30-Aug-1982
+! 1-005 - Allow PAS$$REMOVE_FILE to be called without the queue having been
+!	  initialized.  This can occur if the first file opened in the program
+!	  fails to open and the OPEN is unwound.  SBL 10-Jan-1983
+!--
+
+
+%SBTTL 'Declarations'
+!
+! PROLOGUE DEFINITIONS:
+!
+
+REQUIRE 'RTLIN:PASPROLOG';			! Linkages, externals, PSECTs, structures
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+    PAS$$ADD_FILE: NOVALUE,			! Add file to global list
+    PAS$$REMOVE_FILE: NOVALUE,			! Remove file from global list
+    PAS$$PROMPT_ALL: NOVALUE,			! Prompt on all enabled files
+    PAS$$PROMPT_FILE: JSB_PROMPT_FILE NOVALUE,	! Prompt on a file
+    PAS$$CLOSE_ALL: NOVALUE,			! Close all files
+    PAS$CLOSE_LOCAL_R3: JSB_CLOSE_LOCAL NOVALUE,! Close all local files
+    PAS$$CLOSE_LOCAL: JSB_CLOSE_LOCAL NOVALUE,	! Internally callable
+    DO_CLOSE: NOVALUE,				! Close a file
+    DO_CLOSE_HANDLER,				! Handler for DO_CLOSE
+    INITIALIZE_QUEUE: NOVALUE,			! Initialize FILE_QUEUE
+    SERVICE_REQUEST: NOVALUE;			! Service remove request
+
+!
+! MACROS:
+!
+!	NONE
+!
+! EQUATED SYMBOLS:
+!
+!	NONE
+!
+! FIELDS:
+!
+!	NONE
+!
+! OWN STORAGE:
+!
+
+OWN
+    FILE_QUEUE: VECTOR [2, LONG],			! Queue of FCBs
+    REQUEST_LEVEL: INITIAL (-1),			! Reentrancy level
+    QUEUE_INITIALIZED: INITIAL (0),			! True if queue initialized
+    REMOVE_REQUESTED: INITIAL (0);			! Remove requested from AST level
+
+%SBTTL 'PAS$$ADD_FILE - Add file to queue'
+GLOBAL ROUTINE PAS$$ADD_FILE ( 
+    FCB: REF $PAS$FCB_CONTROL_BLOCK
+    ): NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Adds a file's FCB to the queue of files.
+!
+! CALLING SEQUENCE:
+!
+!	PAS$$ADD_FILE (FCB.r.r)
+!
+! FORMAL PARAMETERS:
+!
+!	FCB		File Control Block for file
+!
+! IMPLICIT INPUTS:
+!
+!	FILE_QUEUE	
+!	REQUEST_LEVEL	
+!	QUEUE_INITIALIZED
+!	REMOVE_REQUESTED
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS: 
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Inserts FCB onto head of FILE_QUEUE.
+!
+! SIGNALLED ERRORS:
+!
+!	NONE
+!--
+
+    BEGIN
+
+    BUILTIN
+	INSQUE;
+
+    !+
+    ! Initialize the queue if necessary.
+    !-
+
+    IF NOT .QUEUE_INITIALIZED
+    THEN
+	INITIALIZE_QUEUE ();
+
+    !+
+    ! Increment REQUEST_LEVEL.
+    !-
+
+    REQUEST_LEVEL = .REQUEST_LEVEL + 1;
+
+    !+
+    ! Insert FCB onto FILE_QUEUE at head.
+    !-
+
+    INSQUE (FCB [FCB$L_QUEUE_FLINK], FILE_QUEUE);
+
+    !+
+    ! Mark the FCB as being on the queue.
+    !-
+
+    FCB [FCB$V_ON_QUEUE] = 1;
+
+    !+
+    ! Decrement REQUEST_LEVEL.
+    !-
+
+    REQUEST_LEVEL = .REQUEST_LEVEL - 1;
+
+    !+
+    ! If a remove request has been made, service it.
+    !-
+
+    IF .REMOVE_REQUESTED
+    THEN
+	SERVICE_REQUEST ();
+
+    RETURN;
+
+    END;					! End of routine PAS$$ADD_FILE
+
+!<BLF/PAGE>
+
+%SBTTL 'PAS$$REMOVE_FILE - Remove file from queue'
+GLOBAL ROUTINE PAS$$REMOVE_FILE ( 
+    FCB: REF $PAS$FCB_CONTROL_BLOCK
+    ): NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Remove a file's FCB from the queue of files.
+!
+! CALLING SEQUENCE:
+!
+!	PAS$$REMOVE_FILE (FCB.r.r)
+!
+! FORMAL PARAMETERS:
+!
+!	FCB		File Control Block for file
+!
+! IMPLICIT INPUTS:
+!
+!	FILE_QUEUE	
+!	REQUEST_LEVEL	
+!	QUEUE_INITIALIZED
+!	REMOVE_REQUESTED
+!
+! IMPLICIT OUTPUTS:
+!
+!	FILE_QUEUE	
+!	REQUEST_LEVEL	
+!	QUEUE_INITIALIZED
+!	REMOVE_REQUESTED
+!	FCB [FCB$V_DEALLOC]
+!
+! COMPLETION STATUS: 
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Removes FCB from FILE_QUEUE or requests deallocation.
+!
+! SIGNALLED ERRORS:
+!
+!	NONE
+!--
+
+    BEGIN
+
+    BUILTIN
+	REMQUE;
+
+    !+
+    ! Initialize the queue if necessary.
+    !-
+
+    IF NOT .QUEUE_INITIALIZED
+    THEN
+	INITIALIZE_QUEUE ();
+
+    !+
+    ! Invalidate FCB pointer in PFV.
+    !-
+
+    BEGIN
+    LOCAL
+	PFV: REF $PAS$PFV_FILE_VARIABLE;
+    PFV = .FCB [FCB$A_PFV];
+    PFV [PFV$V_FCB_VALID] = 0;
+    PFV [PFV$L_STATUS] = .FCB [FCB$L_STATUS];	! Overlays PFV$A_FCB
+    END;
+
+
+    !+
+    ! If the FCB is not on the queue then simply free the
+    ! storage and return.
+    !-
+
+    IF NOT .FCB [FCB$V_ON_QUEUE]
+    THEN
+	BEGIN
+	LOCAL
+	    BLOCK_ADDR;	! Address of allocated block
+	BLOCK_ADDR = FCB [FCB$L_QUEUE_FLINK];
+	PAS$$FREE_VM (PAS$K_FILE_DYN_BLN, BLOCK_ADDR);
+	END
+
+    ELSE
+
+	BEGIN
+	!+
+	! Increment REQUEST_LEVEL.  If we are at level zero, then we can do the
+	! REMQUE directly, so do it and free the storage.  
+	! Otherwise set the DEALLOC bit in the FCB and set REMOVE_REQUESTED.
+	!-
+    
+	IF (REQUEST_LEVEL=.REQUEST_LEVEL+1) EQL 0
+	THEN
+	    BEGIN
+	    LOCAL
+		ITEM_ADDR;			! Output from REMQUE
+	    REMQUE (FCB [FCB$L_QUEUE_FLINK], ITEM_ADDR);
+    	    FCB [FCB$V_ON_QUEUE] = 0;
+	    PAS$$FREE_VM (PAS$K_FILE_DYN_BLN, ITEM_ADDR);
+	    END
+	ELSE
+	    BEGIN
+	    FCB [FCB$V_DEALLOC] = 1;
+	    REMOVE_REQUESTED = 1;
+	    END;
+    
+	!+
+	! Decrement REQUEST_LEVEL.
+	!-
+    
+	REQUEST_LEVEL = .REQUEST_LEVEL - 1;
+    
+	END;
+
+    !+
+    ! If a remove request has been made, service it.
+    !-
+
+    IF .REMOVE_REQUESTED
+    THEN
+	SERVICE_REQUEST ();
+
+    RETURN;
+
+    END;					! End of routine PAS$$REMOVE_FILE
+
+!<BLF/PAGE>
+
+%SBTTL 'PAS$$PROMPT_ALL - Prompt on all prompt-enabled files'
+GLOBAL ROUTINE PAS$$PROMPT_ALL  
+    : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Finds all files for which prompting is enabled and which have
+!	partial lines and writes the partial lines.
+!
+! CALLING SEQUENCE:
+!
+!	PAS$$PROMPT_ALL ()
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	FILE_QUEUE	
+!	REQUEST_LEVEL	
+!	QUEUE_INITIALIZED
+!	REMOVE_REQUESTED
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS: 
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!
+! SIGNALLED ERRORS:
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	FCB: REF $PAS$FCB_CONTROL_BLOCK;	! File control block
+
+    BIND
+	RAB = FCB: REF BLOCK [, BYTE];		! RAB is FCB
+
+    BUILTIN
+	TESTBITCS;
+
+    !+
+    ! If queue is not initialize, bugcheck.
+    !-
+
+    IF NOT .QUEUE_INITIALIZED
+    THEN
+	$PAS$BUGCHECK (BUG_FQNOTINIT);
+
+    !+
+    ! Increment REQUEST_LEVEL.
+    !-
+
+    REQUEST_LEVEL = .REQUEST_LEVEL + 1;
+
+    !+
+    ! Get the first file from the queue.
+    !-
+
+    FCB = .FILE_QUEUE [0];
+
+    !+
+    ! While there are files left, look for files to prompt on.
+    !-
+
+    WHILE (FCB [FCB$R_FCB] NEQA FILE_QUEUE) DO	! Stop when we get back to header
+	BEGIN
+	FCB = FCB [FCB$R_FCB] + FCB$K_BLN;	! Set correct FCB origin
+	IF .FCB [FCB$V_PROMPT_ENABLE] AND
+	    .FCB [FCB$V_GENERATION] AND
+	    NOT .FCB [FCB$V_DEALLOC]
+	THEN
+	    BEGIN
+	    LOCAL
+		PFV: REF $PAS$PFV_FILE_VARIABLE;	! Pascal File Variable
+	    PFV = .FCB [FCB$A_PFV];	! Get file variable
+	    IF PFV [PFV$R_PFV] NEQA 0
+	    THEN
+		IF TESTBITCS (PFV [PFV$V_LOCK])	! Test and set file lock
+		THEN
+		    BEGIN
+		    !+
+		    ! File is locked.  See if it is in Generation mode
+		    ! and has a partial line in the buffer.  If so, call
+		    ! PAS$$PROMPT_FILE to output the prompt.
+		    !-
+
+		    IF .FCB [FCB$V_GENERATION] AND
+			(.FCB [FCB$A_RECORD_CUR] NEQA .FCB [FCB$A_RECORD_BEG])
+		    THEN
+			PAS$$PROMPT_FILE (PFV [PFV$R_PFV], FCB [FCB$R_FCB]);
+
+		    !+
+		    ! Unlock file.
+		    !-
+
+		    PFV [PFV$V_LOCK] = 0;
+		    END;
+
+	    END;
+
+	!+
+	! Get next file from queue.
+	!-
+
+	FCB = .FCB [FCB$L_QUEUE_FLINK];
+	END;
+
+    !+
+    ! Decrement REQUEST_LEVEL.
+    !-
+
+    REQUEST_LEVEL = .REQUEST_LEVEL - 1;
+
+    !+
+    ! If a remove request has been made, service it.
+    !-
+
+    IF .REMOVE_REQUESTED
+    THEN
+	SERVICE_REQUEST ();
+
+    RETURN;
+
+    END;					! End of routine PAS$$PROMPT_ALL
+
+!<BLF/PAGE>
+
+%SBTTL 'PAS$$PROMPT_FILE - Prompt on a prompt-enabled files'
+GLOBAL ROUTINE PAS$$PROMPT_FILE (
+    PFV: REF $PAS$PFV_FILE_VARIABLE,		! Pascal File Variable
+    FCB: REF $PAS$FCB_CONTROL_BLOCK		! File Control Block
+    ) : JSB_PROMPT_FILE NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Performs a partial-line write on a prompt-enabled file.
+!
+! CALLING SEQUENCE:
+!
+!	PAS$$PROMPT_FILE (PFV.mr.r, FCB.mr.r)
+!
+! FORMAL PARAMETERS:
+!
+!	PFV		- The Pascal File Variable for the file.
+!
+!	FCB		- The File Control Block for the file.
+!
+! IMPLICIT INPUTS:
+!
+!	It is assumed that the file is a prompt-enabled textfile which
+!	is locked and in Generation mode.
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS: 
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	A partial line is written to the file, with the cursor left at
+!	the end of the text written.
+!
+! SIGNALLED ERRORS:
+!
+!	ERRDURPRO - error during prompting
+!--
+
+    BEGIN
+
+    LOCAL
+	CHARS_IN_LINE;				! Number of characters in the line
+
+    BIND
+	RAB = FCB: REF BLOCK [, BYTE];		! RAB is FCB
+
+    !+
+    ! If the record has any characters in it, write the partial line.
+    !-
+
+    CHARS_IN_LINE = .FCB [FCB$A_RECORD_CUR] - .FCB [FCB$A_RECORD_BEG];
+    IF .CHARS_IN_LINE NEQ 0
+    THEN
+	BEGIN
+	!+
+	! Set up record pointer in RAB for $PUT.
+	!-
+    
+	RAB [RAB$L_RBF] = .FCB [FCB$A_RECORD_BEG];
+	RAB [RAB$W_RSZ] = .CHARS_IN_LINE;
+    
+	!+
+	! Set carriagecontrol depending on whether a partial
+	! line has been previously written.
+	!-
+
+	IF .FCB [FCB$V_PARTIAL_LINE]
+	THEN
+	    FCB [FCB$W_PROMPT_CC] = FCB$K_CC_NULL	! Nothing before, nothing
+	ELSE
+	    FCB [FCB$W_PROMPT_CC] = FCB$K_CC_LFNL;	! LF before, nothing after
+    
+	!+
+	! Do the $PUT and check for errors.
+	!-
+    
+	IF NOT $PAS$RMS_OP ($PUT (RAB=.RAB))
+	THEN
+	    $PAS$IO_ERROR (PAS$_ERRDURPRO);
+
+	!+
+	! Reset the record buffer.
+	!-
+
+	FCB [FCB$A_RECORD_CUR] = .FCB [FCB$A_RECORD_BEG];
+	FCB [FCB$V_PARTIAL_LINE] = 1;
+
+	END;
+
+    RETURN;
+
+    END;					! End of routine PAS$$PROMPT_FILE
+
+!<BLF/PAGE>
+
+%SBTTL 'PAS$$CLOSE_ALL - Close all open files'
+GLOBAL ROUTINE PAS$$CLOSE_ALL  
+    : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Closes all open files.  This procedure is called from the exit
+!	handler declared by PAS$$OPEN.
+!
+! CALLING SEQUENCE:
+!
+!	PAS$$CLOSE_ALL ()
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	FILE_QUEUE	
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS: 
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Closes all open files, and removes their control blocks
+!	from the queue.
+!
+! SIGNALLED ERRORS:
+!
+!	NONE
+!--
+
+    BEGIN
+
+    LOCAL
+	FCB: REF $PAS$FCB_CONTROL_BLOCK,	! File control block
+	DUMMY_PFV: $PAS$PFV_FILE_VARIABLE,	! Dummy PFV for local use
+	AST_STATUS;				! Status from $SETAST
+
+    BUILTIN
+	REMQUE;
+
+    !+
+    ! If queue not initialized, nothing to close.
+    !-
+
+    IF NOT .QUEUE_INITIALIZED
+    THEN
+	RETURN;
+
+    !+
+    ! Set up dummy PFV.  We will use this to close files since
+    ! the true PFV may be invalid.
+    !-
+
+    DUMMY_PFV [PFV$W_FLAGS] = 0;
+
+    !+
+    ! Disable ASTs
+    !-
+
+    AST_STATUS = $SETAST (ENBFLG=0);
+
+    !+
+    ! Remove all files from the queue, and close those still open.
+    !-
+
+    UNTIL (REMQUE (.FILE_QUEUE [0], FCB)) DO	! True when REMQUE fails
+	BEGIN
+	FCB = FCB [FCB$R_FCB] + FCB$K_BLN;		! Get correct FCB origin
+	IF NOT .FCB [FCB$V_DEALLOC]
+	THEN
+	    BEGIN
+	    !+
+	    ! Use dummy PFV to do the close.
+	    !-
+	    DUMMY_PFV [PFV$A_FCB] = FCB [FCB$R_FCB];
+	    DUMMY_PFV [PFV$A_PFD] = .FCB [FCB$A_PFD];
+	    DUMMY_PFV [PFV$V_FCB_VALID] = 1;
+	    DO_CLOSE (DUMMY_PFV [PFV$R_PFV]);	! Close the file
+	    END;
+	END;
+
+    !+
+    ! If ASTs were previously enabled, reenable them.
+    !-
+
+    IF .AST_STATUS EQL SS$_WASSET
+    THEN
+	$SETAST (ENBFLG = 1);
+
+    RETURN;
+
+    END;					! End of routine PAS$$CLOSE_ALL
+
+!<BLF/PAGE>
+
+%SBTTL 'PAS$CLOSE_LOCAL_R3 - Close local files'
+GLOBAL ROUTINE PAS$CLOSE_LOCAL_R3
+     : JSB_CLOSE_LOCAL NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Closes all open files which were declared local by our caller.
+!
+! CALLING SEQUENCE:
+!
+!	JSB PAS$CLOSE_LOCAL_R3
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	Current FP (Caller's)
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS: 
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Preserves registers 0 and 1.
+!	See PAS$$CLOSE_LOCAL
+!
+! SIGNALLED ERRORS:
+!
+!	NONE
+!--
+
+    BEGIN
+
+    BUILTIN
+	FP;
+
+    !+
+    ! Call PAS$$CLOSE_LOCAL with one argument, the current FP.  This
+    ! will get pushed on the stack.
+    !-
+
+    PAS$$CLOSE_LOCAL (.FP);
+
+    RETURN;
+
+    END;					! End of routine PAS$$CLOSE_LOCAL_R3
+
+!<BLF/PAGE>
+
+%SBTTL 'PAS$$CLOSE_LOCAL - Close local files'
+GLOBAL ROUTINE PAS$$CLOSE_LOCAL (PROCEDURE_FP)
+     : JSB_CLOSE_LOCAL NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Closes all open files which were declared local by our caller.
+!
+! CALLING SEQUENCE:
+!
+!	JSB PAS$$CLOSE_LOCAL (PROCEDURE_FP.rlu.v)
+!
+! FORMAL PARAMETERS:
+!
+!	PROCEDURE_FP - This is the frame pointer of the procedure for
+!		       which we are closing its local files.  This
+!		       value is passed on the stack.
+!
+! IMPLICIT INPUTS:
+!
+!	Our SP
+!	FILE_QUEUE	
+!	REQUEST_LEVEL	
+!	QUEUE_INITIALIZED
+!	REMOVE_REQUESTED
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS: 
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Closes all open files whose PFVs are between PROCEDURE_FP and SP
+!	(i.e. declared locally in our caller's procedure).
+!
+! SIGNALLED ERRORS:
+!
+!	NONE
+!--
+
+    BEGIN
+
+    LOCAL
+	FCB: REF $PAS$FCB_CONTROL_BLOCK,	! File control block
+	NEXT_FCB,				! Next FCB in QUEUE
+	REMQUE_OK;				! TRUE if ok to do REMQUEs
+
+    BUILTIN
+	REMQUE,
+	SP;
+
+    !+
+    ! If queue not initialized, nothing to close.
+    !-
+
+    IF NOT .QUEUE_INITIALIZED
+    THEN
+	RETURN;
+
+    !+
+    ! Increment REQUEST_LEVEL and set REMQUE_OK appropriately.
+    !-
+
+    IF (REQUEST_LEVEL = .REQUEST_LEVEL + 1) NEQ 0
+    THEN
+	REMQUE_OK = 0
+    ELSE
+	REMQUE_OK = 1;
+
+    !+
+    ! Get the first FCB from the queue.
+    !-
+
+    FCB = .FILE_QUEUE [0];		! Forward link
+
+    !+
+    ! While there are files left, look for local files to close.
+    !-
+
+    WHILE (FCB [FCB$R_FCB] NEQA FILE_QUEUE) DO	! Stop when we get back to header
+	BEGIN
+	FCB = FCB [FCB$R_FCB] + FCB$K_BLN;	! Get correct FCB origin
+	NEXT_FCB = .FCB [FCB$L_QUEUE_FLINK];	! Next file in queue
+	IF NOT .FCB [FCB$V_DEALLOC] AND NOT .FCB [FCB$V_STATIC]
+	THEN
+	    BEGIN
+	    LOCAL
+		PFV: REF $PAS$PFV_FILE_VARIABLE;
+	    PFV = .FCB [FCB$A_PFV];	! Get PFV
+	    IF PFV [PFV$R_PFV] LSSA .PROCEDURE_FP AND PFV [PFV$R_PFV] GTRA .SP
+	    THEN
+		BEGIN
+		!+
+		! We have a local file.  We can't be guaranteed that the
+		! contents of the PFV are valid, so set the necessary items
+		! here.  Close the file.
+		!-
+		
+		PFV [PFV$W_FLAGS] = 0;
+		PFV [PFV$V_LOCK] = 1;
+		PFV [PFV$V_FCB_VALID] = 1;
+		PFV [PFV$A_FCB] = FCB [FCB$R_FCB];
+		PFV [PFV$A_PFD] = .FCB [FCB$A_PFD];
+		DO_CLOSE (PFV [PFV$R_PFV]);
+
+		!+
+		! Remove the file from the queue.  This will either be
+		! a REMQUE or a request to remove.
+		!-
+
+		IF .REMQUE_OK
+		THEN
+		    BEGIN
+		    LOCAL
+			ITEM_ADDR;			! Output from REMQUE
+		    REMQUE (FCB [FCB$L_QUEUE_FLINK], ITEM_ADDR);
+		    PAS$$FREE_VM (PAS$K_FILE_DYN_BLN, ITEM_ADDR);
+		    END
+		ELSE
+		    BEGIN
+		    FCB [FCB$V_DEALLOC] = 1;
+		    REMOVE_REQUESTED = 1;
+		    END;
+		END;
+	    END;
+	!+
+	! Get next FCB from queue.
+	!-
+	FCB = .NEXT_FCB;
+	END;
+
+    !+
+    ! Decrement REQUEST_LEVEL.
+    !-
+
+    REQUEST_LEVEL = .REQUEST_LEVEL - 1;
+
+    !+
+    ! If a remove request has been made, service it.
+    !-
+
+    IF .REMOVE_REQUESTED
+    THEN
+	SERVICE_REQUEST ();
+
+    RETURN;
+
+    END;					! End of routine PAS$$CLOSE_LOCAL
+
+!<BLF/PAGE>
+
+%SBTTL 'DO_CLOSE - Close a file'
+ROUTINE DO_CLOSE (				! Close a file
+	PFV: REF $PAS$PFV_FILE_VARIABLE 	! File variable
+    ): NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine closes a Pascal file.  This entry is called from
+!	PAS$$CLOSE_ALL and PAS$CLOSE_LOCAL.  It is different from
+!	PAS$CLOSE2 only in that it does not call PAS$$REMOVE_FILE to
+!	remove the FCB from the list of open files.
+!
+! CALLING SEQUENCE:
+!
+!	CALL DO_CLOSE (PFV.mr.r)
+!
+! FORMAL PARAMETERS:
+!
+!	PFV		- The Pascal File Variable (PFV) passed by reference.
+!			  The structure of the PFV is defined in PASPFV.REQ.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	See PAS$$CLOSE
+!
+! SIGNALLED ERRORS:
+!
+!	ERRDURCLO - error during CLOSE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	PFV_ADDR: VOLATILE;			! Enable argument
+
+    !+
+    ! Enable a local condition handler to intercept any signals from 
+    ! trying to close the file.
+    !-
+
+    ENABLE
+	DO_CLOSE_HANDLER (PFV_ADDR);
+
+    !+
+    ! Lock PFV  We don't care if it is already locked.
+    !-
+
+    PFV [PFV$V_LOCK] = 1;
+
+    !+
+    ! Set PFV_ADDR enable argument.
+    !-
+
+    PFV_ADDR = PFV [PFV$R_PFV];
+
+    !+
+    ! Call PAS$$CLOSE to do the work.
+    !-
+
+    PAS$$CLOSE (PFV [PFV$R_PFV]);
+
+    !+
+    ! Invalidate information in PFV
+    !-
+
+    PFV [PFV$V_FCB_VALID] = 0;
+    PFV [PFV$A_FCB] = 0;
+
+    RETURN;
+
+    END;					! End of routine DO_CLOSE
+
+!<BLF/PAGE>
+
+%SBTTL 'DO_CLOSE_HANDLER - Error handler for DO_CLOSE'
+ROUTINE DO_CLOSE_HANDLER (
+    	SIGNAL_ARGS: REF BLOCK [, BYTE], 	! Signal arguments array
+    	MECH_ARGS: REF BLOCK [, BYTE],		! Mechanism arguments array
+    	ENABLE_ARGS: REF VECTOR [, LONG]	! Enable arguments array
+    ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This is the condition handler enabled by DO_CLOSE.
+!	If the current exception is a PAS$ message for the file
+!	our establisher was processing, intercept the signal, use
+!	$PUTMSG to display the message text, and unwind to our
+!	establisher's caller.
+!
+!	The reason for using $PUTMSG is that DO_CLOSE may be called
+!	from PAS$HANDLER during an unwind.  The current VAX
+!	condition handling architecture does not specify what happens
+!	when an exception occurs during an unwind, and the current
+!	implementation performs the search for handlers incorrectly.
+!	We are safe as long as we don't let the signal outside of the RTL.
+!
+! CALLING SEQUENCE:
+!
+!	status.wlc.v = DO_CLOSE_HANDLER (SIGNAL_ARGS.rl.ra, MECH_ARGS.rl.ra
+!					, ENABLE_ARGS.rl.ra)
+!
+! FORMAL PARAMETERS:
+!
+!	SIGNAL_ARGS	- The signal argument list.
+!
+!	MECH_ARGS	- The mechanism argument list.
+!
+!	ENABLE_ARGS	- An array with the following
+!			  format:
+!
+!				+----------------+
+!				|   ENB_COUNT    |  <-- ENABLE_ARGS
+!				+----------------+
+!				|  ENB_PFV_ADDR  |
+!				+----------------+
+!
+!			  ENB_COUNT is the count of following enable arguments.
+!			  The count is always 1.
+!
+!			  ENB_PFV_ADDR - If non-zero, the address of a longword
+!			  containing the PFV our establisher is operating on.
+!
+! IMPLICIT INPUTS:
+!
+!	The signaller's PFV placed as the first FAO argument in the primary
+!	signalled message.
+!
+! IMPLICIT OUTPUTS:
+!
+!	May use $PUTMSG to write a message
+!
+! ROUTINE VALUE:
+!
+!	SS$_RESIGNAL
+!
+! SIDE EFFECTS:
+!
+!	May cause an unwind.
+!
+!--
+
+    BEGIN
+
+    LITERAL
+	ENB_COUNT = 0,		! Count of enable arguments
+	ENB_PFV_ADDR = 1;	! Address of address of PFV
+
+    BUILTIN
+	ACTUALCOUNT;
+
+    !+
+    ! Determine if this is an unwind.
+    !-
+
+    IF .SIGNAL_ARGS [CHF$L_SIG_NAME] NEQU SS$_UNWIND
+    THEN
+	BEGIN
+
+	LOCAL
+	    COND_NAME: BLOCK [4, BYTE];	! Primary condition name
+
+	!+
+	! Get primary condition name.
+	!-
+    
+	COND_NAME = .SIGNAL_ARGS [CHF$L_SIG_NAME];
+
+	!+
+	! Is this a PAS$ error?  If not, resignal.
+	!-
+
+	IF .COND_NAME [STS$V_FAC_NO] NEQU PAS$_FACILITY
+	THEN
+	    RETURN SS$_RESIGNAL;
+
+	!+
+	! See if the error message is one which is "trapped"
+	! by ERROR:=CONTINUE.  This is done by comparing the
+	! message number against a select range.
+	!-
+
+	IF .COND_NAME [STS$V_CODE] GEQU PAS$$K_MSGCONTLO AND ! Lowest number
+	   .COND_NAME [STS$V_CODE] LEQU PAS$$K_MSGCONTHI
+	THEN
+	    BEGIN
+
+	    !+
+	    ! See if the PFVs match.  The signaller's PFV is the
+	    ! first FAO parameter in the primary message.
+	    !-
+
+	    IF .SIGNAL_ARGS [12,0,32,0] EQLA ..ENABLE_ARGS [ENB_PFV_ADDR]
+	    THEN
+		BEGIN
+
+		!+
+		! We want to use $PUTMSG to display the message, and then
+    		! unwind to our establisher's caller.  First, subtract two
+		! from the signal argument count so that $PUTMSG doesn't see
+		! the PC and PSL.
+		!-
+
+		SIGNAL_ARGS [CHF$L_SIG_ARGS] = .SIGNAL_ARGS [CHF$L_SIG_ARGS] - 2;
+		COND_NAME [STS$V_SEVERITY] = STS$K_ERROR;	! Make E severity
+		SIGNAL_ARGS [CHF$L_SIG_NAME] = .COND_NAME;
+		$PUTMSG (MSGVEC = SIGNAL_ARGS [CHF$L_SIG_ARGS]);
+		SIGNAL_ARGS [CHF$L_SIG_ARGS] = .SIGNAL_ARGS [CHF$L_SIG_ARGS] + 2;
+
+		IF NOT $UNWIND ()
+		THEN
+		    $PAS$BUGCHECK (BUG_UNWINDFAIL);
+		END;
+	    END;
+	END; 	
+	
+    RETURN SS$_RESIGNAL;			! Resignal error
+
+    END;					! End of routine DO_CLOSE_HANDLER
+
+!<BLF/PAGE>
+
+%SBTTL 'INITIALIZE_QUEUE - Initialize FILE_QUEUE'
+ROUTINE INITIALIZE_QUEUE  
+    : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Initializes FILE_QUEUE to be an empty queue.
+!
+! CALLING SEQUENCE:
+!
+!	INITIALIZE_QUEUE ()
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	FILE_QUEUE	
+!	QUEUE_INITIALIZED
+!
+! IMPLICIT OUTPUTS:
+!
+!	FILE_QUEUE	
+!	QUEUE_INITIALIZED
+!
+! COMPLETION STATUS: 
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Makes FILE_QUEUE an empty queue.
+!
+! SIGNALLED ERRORS:
+!
+!	NONE
+!--
+
+    BEGIN
+
+    LOCAL
+	AST_STATUS;				! Previous AST enable status
+
+    BUILTIN
+	TESTBITCS;
+
+    !+
+    ! Disable ASTs.
+    !-
+
+    AST_STATUS = $SETAST (ENBFLG = 0);
+
+    !+
+    ! If QUEUE_INITIALIZED is still clear, initialize FILE_QUEUE to
+    ! be an empty queue.  Set QUEUE_INITIALIZED.
+    !-
+
+    IF TESTBITCS (QUEUE_INITIALIZED)
+    THEN
+	BEGIN
+	FILE_QUEUE [0] = FILE_QUEUE;		! Set forward link
+	FILE_QUEUE [1] = .FILE_QUEUE [0];	! Set backward link
+	END;
+
+    !+
+    ! Reenable ASTs if previously enabled.
+    !-
+
+    IF .AST_STATUS EQL SS$_WASSET
+    THEN
+	$SETAST (ENBFLG = 1);
+
+    RETURN;
+
+    END;					! End of routine INITIALIZE_QUEUE
+
+!<BLF/PAGE>
+
+%SBTTL 'SERVICE_REQUEST - Service remove request'
+ROUTINE SERVICE_REQUEST  
+    : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Removes all FCBs from FILE_QUEUE that have DEALLOC set.
+!
+! CALLING SEQUENCE:
+!
+!	SERVICE_REQUEST ()
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	FILE_QUEUE	
+!	REQUEST_LEVEL	
+!	REMOVE_REQUESTED
+!
+! IMPLICIT OUTPUTS:
+!
+!	FILE_QUEUE
+!	REQUEST_LEVEL
+!	REMOVE_REQUESTED
+!
+! COMPLETION STATUS: 
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Removes FCBs from queue.
+!
+! SIGNALLED ERRORS:
+!
+!	NONE
+!--
+
+    BEGIN
+
+    LOCAL
+	FREE_LIST: REF VECTOR [, LONG];		! List of FCBs we deallocated
+
+    BUILTIN
+	REMQUE;
+
+    !+
+    ! Initialize FREE_LIST.
+    !-
+
+    FREE_LIST = 0;
+
+    !+
+    ! Increment REQUEST_LEVEL.  If we are at level zero, then we can
+    ! scan the queue and do REMQUEs.
+    !-
+
+    IF (REQUEST_LEVEL=.REQUEST_LEVEL+1) EQL 0
+    THEN
+	BEGIN
+
+	LOCAL
+	    AST_STATUS,			! Previous AST enable status
+	    CURRENT_FCB: REF VECTOR [, LONG];	! Current FCB to look at
+
+	!+
+	! Disable ASTs and remember previous status.  This makes us
+	! multi-stream AST reentrant.
+	!-
+
+	AST_STATUS = $SETAST (ENBFLG = 0);
+
+	!+
+	! Get first FCB on FILE_QUEUE.
+	!-
+
+	CURRENT_FCB = .FILE_QUEUE [0];	! Forward link
+
+	!+
+	! Clear RENOVE_REQUESTED.
+	!-
+
+	REMOVE_REQUESTED = 0;
+
+	!+
+	! While we haven't run out of FCBs, look for FCBs with the
+	! DEALLOC bit set, remove them from the queue, and insert them
+	! on the list of blocks to be freed.
+	!-
+
+	WHILE (.CURRENT_FCB NEQA FILE_QUEUE) DO	! Back at queue header?
+	    BEGIN
+	    !+
+	    ! Allow offset to zero-origin of FCB.
+	    !-
+	    LOCAL
+		FCB_ORIGIN: REF $PAS$FCB_CONTROL_BLOCK;
+	    FCB_ORIGIN = .CURRENT_FCB + FCB$K_BLN;
+	    IF .FCB_ORIGIN [FCB$V_DEALLOC]
+	    THEN
+		BEGIN
+		LOCAL
+		    TEMP;		! Output from REMQUE
+		REMQUE (CURRENT_FCB [0], TEMP);
+		CURRENT_FCB [0] = .FREE_LIST;	! Add FCB to free list
+		FREE_LIST = .CURRENT_FCB;
+		END;
+
+	    !+
+	    ! Get next FCB from the queue.
+	    !-
+
+	    CURRENT_FCB = .CURRENT_FCB [0];	! Forward link
+	    END;
+		
+	!+
+	! Reenable ASTs if they were previously enabled.
+	!-
+
+	IF .AST_STATUS EQL SS$_WASSET
+	THEN
+	    $SETAST (ENBFLG = 1);
+
+	END;
+
+    !+
+    ! Decrement REQUEST_LEVEL.
+    !-
+
+    REQUEST_LEVEL = .REQUEST_LEVEL - 1;
+
+    !+
+    ! Free all blocks on FREE_LIST.
+    !-
+
+    WHILE (.FREE_LIST NEQA 0) DO
+	BEGIN
+	LOCAL
+	    BLOCK_ADDR;
+	BLOCK_ADDR = .FREE_LIST;
+	FREE_LIST = .FREE_LIST [0];
+	PAS$$FREE_VM (PAS$K_FILE_DYN_BLN, BLOCK_ADDR);
+	END;
+
+    RETURN;
+
+    END;					! End of routine SERVICE_REQUEST
+
+!<BLF/PAGE>
+
+END						! End of module PAS$$FILE_UTIL
+
+ELUDOM

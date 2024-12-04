@@ -1,0 +1,775 @@
+MODULE MAIL$PRINT( %TITLE 'QUEUE MAIL MESSAGE FOR PRINTING'
+		IDENT = 'V04-000' ) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	VAX/VMS MAIL UTILITY
+!
+! ABSTRACT:	QUEUE THE CURRENT MESSAGE FOR PRINTING
+!
+! ENVIRONMENT:	NATIVE/USER MODE
+!
+! AUTHOR: LEN KAWELL, CREATION DATE: 10-JUN-1979
+!
+! MODIFIED BY:
+!
+!	V03-008	ROP0019		Robert Posniak		 6-JUL-1984
+!		Again - Unless /MAIL, use process default protection on
+!		EXTRACT.
+!
+!	V03-007	BLS0272		Benn Schreiber		18-FEB-1984 13:38:20 
+!		Sigh.  Missing dot.
+!
+!	V03-006	BLS0263		Benn Schreiber		 5-FEB-1984
+!		Unless /MAIL, use process default protection on EXTRACT.
+!
+!	V03-005	BLS0255		Benn Schreiber		28-Dec-1983
+!		Include extract command code in here.  Add extract/mail
+!		to create sequential mail file.  When printing, set
+!		flag_first and no-trail if we can.
+!
+!	V03-004	BLS0227		Benn Schreiber		 6-Jul-1983
+!		Upgrade to latest job controller
+!
+!	V03-003	BLS0225		Benn Schreiber		17-Jun-1983
+!		Set FOP=SQO on temp file
+!
+!	V03-002	BLS0222		Benn Schreiber		19-May-1983
+!		Make temp file in SYS$SCRATCH:
+!
+!	V03-001	BLS0211		Benn Schreiber		 7-Jan-1983
+!		Add support for ISAM mail files.  Recursively translate
+!		queue name.
+!--
+
+!
+! INCLUDE FILES:
+!
+	LIBRARY 'SYS$LIBRARY:STARLET';
+	REQUIRE 'SRC$:MAILREQ';
+	LIBRARY	'LIB$:MAILDEF';
+!
+! TABLE OF CONTENTS:
+!
+FORWARD ROUTINE
+	MAIL$PRINT: NOVALUE,				! Print message
+	CANCEL_GETQUI : NOVALUE,			! Cancel GETQUI in progress
+	CLOSE_JOB : NOVALUE;				! Close current job
+
+OWN
+	CURQUE_DESC : DYN_DESC_DECL,		! Current queue descriptor
+	DEFDIRDESC : DYN_DESC_DECL,		! Default dir + '.mai'
+	CURJOBID,				! Current job ID
+	FILES_QUEUED,				! Number of files queued
+	EXITSTATUS:	LONG,			! Exit status
+	GETQUIEXITBLOCK: VECTOR[4]		! Exit handler control block
+			INITIAL(0,		!  declared during GETQUI
+				CANCEL_GETQUI,	!  routine address
+				1,
+				EXITSTATUS),
+	EXITBLOCK:	VECTOR[4]		! Exit handler control block
+			INITIAL(0,		!  Forward link
+				CLOSE_JOB,	!  Routine address
+				1,		!  Argument count
+				EXITSTATUS),	!  Location to receive status
+	EXITDECLARED:	LONG;			! Exit handler declared flag
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL
+    MAIL$GL_FLAGS : $BBLOCK,		!mail control flags
+    MAIL$L_NMSG,			!Number of messages currently in vector
+    MAIL$L_CURMSG: REF $BBLOCK,		!Pointer to current message block
+    MAIL$L_MSG_NUM,			!Current message number
+    MAIL$L_MSG_STS,			!Message status
+    MAIL$L_MSG_RADR,			!Sequential msg address
+    MAIL$W_MSG_RSIZ : WORD,		!Sequential msg size
+    MAIL$L_MSGBUFSIZ,			!Size of whole message buffer (seq file)
+    MAIL$Q_USERDEF : $BBLOCK,		!Descriptor of mail dir
+    MAIL$B_MSGTRAN : BYTE;		!Transition for isam msg reading
+
+EXTERNAL ROUTINE
+	CLI$PRESENT,			!True if qualifier present
+	CLI$GET_VALUE,			!Get qualifier value
+	MAIL$FIND_MSG,			!Find sequential message
+	MAIL$FIND_I_MSG,		!Find isam msg
+	MAIL$GET_I_MSG,				! Get ISAM message text
+	MAIL$GET_MSG,				! Get message text
+	MAIL$GETMSG,				! Get text for signal code
+	MAIL$PUT_OUTPUT,			! Put to SYS$OUTPUT
+	MAIL$REWIND_I_MSG,		!Rewind isam message
+	MAIL$REWIND_MSG,		!Rewind sequential message
+	MAIL$TEST_SUBJ,			!Test presence of subj: line
+	STR$COPY_DX,				! String copy
+	STR$CONCAT,			!Concatenate strings
+	STR$FREE1_DX,				! Deallocate dynamic string
+	UTIL$GETFILENAME,		!Get filename spec
+	UTIL$REPORT_IO_ERROR;			! Signal I/O error
+!
+! Define protection mask
+!
+LITERAL
+    PRO_SYS = $BITPOSITION(XAB$V_SYS),
+    PRO_OWN = $BITPOSITION(XAB$V_OWN),
+    PRO_GRP = $BITPOSITION(XAB$V_GRP),
+    PRO_WLD = $BITPOSITION(XAB$V_WLD),
+    NO_ACCESS = XAB$M_NOREAD OR XAB$M_NOWRITE OR XAB$M_NOEXE OR XAB$M_NODEL,
+
+    SND_PRO		= 			! Send file protection
+(				  XAB$M_NOEXE OR XAB$M_NODEL) ^ PRO_SYS OR
+(				  XAB$M_NOEXE OR XAB$M_NODEL) ^ PRO_OWN OR
+(XAB$M_NOREAD OR XAB$M_NOWRITE OR XAB$M_NOEXE OR XAB$M_NODEL) ^ PRO_GRP OR
+(XAB$M_NOREAD OR XAB$M_NOWRITE OR XAB$M_NOEXE OR XAB$M_NODEL) ^ PRO_WLD,
+
+    FILE_PRO =
+	(XAB$M_NOEXE ^ PRO_SYS) OR
+	(XAB$M_NOEXE ^ PRO_OWN) OR
+	(NO_ACCESS ^ PRO_GRP) OR
+	(NO_ACCESS ^ PRO_WLD);
+!
+! Define local names for shared messages
+!
+$SHR_MSGDEF(MAIL,126,LOCAL,
+	(CREATED,INFO),
+	(CONFQUAL,WARNING),
+	(INVQUAVAL,WARNING),
+	(OPENOUT,ERROR),
+	(CLOSEOUT,ERROR),
+	(READERR,WARNING),
+	(WRITEERR,ERROR));
+
+BIND
+    FF_STRING = UPLIT(BYTE(FF)),
+    LISTFILE_DESC  = $DESCRIPTOR('SYS$SCRATCH:MAIL.LIS') : $BBLOCK;
+
+SD(
+    'APPEND',
+    'ALL',
+    'EXTF',
+    'HEADER',
+    'MAIL');
+
+ROUTINE WRITE_REC (SND_RAB) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Write record to output file
+!
+! INPUTS:
+!
+!	SND_RAB is address of rab, RSZ and RBF filled in
+!--
+BEGIN
+
+RETURN $PUT(RAB=.SND_RAB,ERR=UTIL$REPORT_IO_ERROR)
+END;
+
+ROUTINE WRITE_FF (SND_RAB) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Write formfeed record to output file
+!
+! INPUTS:
+!
+!	SND_RAB is address of rab
+!--
+BEGIN
+MAP
+    SND_RAB : REF $BBLOCK;
+
+SND_RAB[RAB$W_RSZ] = 1;
+SND_RAB[RAB$L_RBF] = FF_STRING;
+
+RETURN WRITE_REC(.SND_RAB)
+END;
+
+GLOBAL ROUTINE MAIL$EXTRACT_MESSAGE(HEADER_FLAG,SND_RAB) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Extract the current msg to the output file
+!
+! INPUTS:
+!
+!	HEADER_FLAG = 1 to include msg header, 0 if not
+!	SND_RAB is address of output rab
+!--
+BEGIN
+
+MAP
+    SND_RAB : REF $BBLOCK;
+
+LOCAL
+    MORE_FLAG,
+    DESC : VECTOR[2,LONG];
+
+IF .MAIL$GL_FLAGS[MAIF_V_ISAM]
+THEN BEGIN
+    MAIL$REWIND_I_MSG();
+    IF NOT .HEADER_FLAG
+	THEN MAIL$B_MSGTRAN = MMB_C_TEXT;
+    WHILE MAIL$GET_I_MSG(DESC,MORE_FLAG)
+    DO BEGIN
+	SND_RAB[RAB$W_RSZ] = .DESC[0];
+	SND_RAB[RAB$L_RBF] = .DESC[1];
+	IF_ERR(WRITE_REC(.SND_RAB);,
+		RETURN .STATUS);
+	END;
+    END
+ELSE BEGIN
+    MAIL$REWIND_MSG();
+    IF NOT .HEADER_FLAG
+	THEN INCRU I FROM 0 TO (IF MAIL$TEST_SUBJ() THEN 3 ELSE 2)
+	    DO IF NOT MAIL$GET_MSG() THEN EXITLOOP;
+
+    DO BEGIN
+	SND_RAB[RAB$W_RSZ] = .MAIL$W_MSG_RSIZ;
+	SND_RAB[RAB$L_RBF] = .MAIL$L_MSG_RADR;
+	IF_ERR(WRITE_REC(.SND_RAB);,
+		RETURN .STATUS);
+	END
+    WHILE MAIL$GET_MSG();
+    END;
+RETURN TRUE
+END;
+
+ROUTINE EXTRACT_ALL_ISAM(HEADER_FLAG,SND_RAB) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Extract all messages from the current folder/seq. file to the output
+!	file.
+!
+! INPUTS:
+!
+!	HEADER_FLAG = 1 if all msgs, 0 if current msg only
+!	SND_RAB is address of output file rab
+!	
+!--
+BEGIN
+
+LOCAL
+    STATUS;
+
+BUILTIN
+    AP,
+    CALLG;
+
+MAIL$L_MSG_NUM = 0;
+WHILE MAIL$FIND_I_MSG(0)
+DO BEGIN
+    IF .MAIL$L_MSG_NUM NEQ 1
+	THEN WRITE_FF(.SND_RAB);
+    IF NOT (STATUS = CALLG(.AP,MAIL$EXTRACT_MESSAGE))
+	THEN RETURN .STATUS;
+    END;
+RETURN TRUE
+END;
+
+ROUTINE EXTRACT_ALL_SEQ(HEADER_FLAG,SND_RAB) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Extract all sequential msgs to the output file
+!
+! INPUTS:
+!
+!	HEADER_FLAG = 1 to include msg headers, 0 if not
+!	SND_RAB is address of output rab
+!
+!--
+BEGIN
+
+BUILTIN
+    AP,
+    CALLG;
+
+LOCAL
+    STATUS;
+MAIL$L_MSG_NUM = 0;
+WHILE MAIL$FIND_MSG(0)
+DO BEGIN
+    IF .MAIL$L_MSG_NUM NEQ 1
+	THEN WRITE_FF(.SND_RAB);
+    IF NOT (STATUS = CALLG(.AP,MAIL$EXTRACT_MESSAGE))
+	THEN RETURN .STATUS;
+    END;
+RETURN TRUE
+END;
+
+GLOBAL ROUTINE MAIL$CMD_EXTRACT =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Handle the EXTRACT command, to extract a message out to a separate
+!	sequential file
+!--
+BEGIN
+
+LOCAL
+    SND_FAB : $FAB_DECL,
+    SND_RAB : $RAB_DECL,
+    SND_NAM : $NAM_DECL,
+    SND_RSS : $BBLOCK[NAM$C_MAXRSS],
+    SND_XABPRO : $XABPRO_DECL,
+    SND_DESC : VECTOR[2,LONG],
+    CREATE_STATUS,
+    STATUS,
+    HEAD_FLAG : BYTE,
+    APPEND_FLAG : BYTE,
+    MAIL_FLAG : BYTE,
+    ALL_FLAG : BYTE;
+
+OWN
+    DYN_DESC : DYN_DESC_DECL;
+
+ALL_FLAG = CLI$PRESENT(SD_ALL);
+APPEND_FLAG = CLI$PRESENT(SD_APPEND);
+HEAD_FLAG = CLI$PRESENT(SD_HEADER);
+MAIL_FLAG = CLI$PRESENT(SD_MAIL);
+IF .MAIL_FLAG
+    AND NOT .HEAD_FLAG
+    THEN RETURN SIGNAL(MAIL$_CONFQUAL);
+
+IF_ERR(CLI$GET_VALUE(SD_EXTF,DYN_DESC);,
+	RETURN .STATUS);
+
+IF NOT .ALL_FLAG
+THEN BEGIN
+    IF (IF .MAIL$GL_FLAGS[MAIF_V_ISAM]
+	THEN .MAIL$L_CURMSG EQL 0
+	ELSE (NOT .MAIL$L_MSG_STS AND .MAIL$L_MSG_STS NEQ 0))
+    THEN RETURN SIGNAL(MAIL$_NOTREADIN);
+    END
+ELSE BEGIN
+    IF (IF .MAIL$GL_FLAGS[MAIF_V_ISAM]
+	THEN .MAIL$L_NMSG EQL 0
+	ELSE .MAIL$L_MSGBUFSIZ EQL 0)
+	THEN RETURN SIGNAL(MAIL$_NOMSGS);
+    END;
+
+$FAB_INIT(FAB=SND_FAB,
+	FNS=.DYN_DESC[DSC$W_LENGTH],
+	FNA=.DYN_DESC[DSC$A_POINTER],
+	DNM='.TXT',
+	FAC=(PUT,TRN),
+	CTX=MAIL$_OPENOUT,
+	NAM=SND_NAM,
+	RAT=CR,
+	RFM=VAR);
+
+$XABPRO_INIT(XAB=SND_XABPRO,
+	UIC=(0,0));
+
+IF .MAIL_FLAG
+THEN BEGIN
+    APPEND_FLAG = 1;
+    IF .DEFDIRDESC[DSC$W_LENGTH] EQL 0
+	THEN STR$CONCAT(DEFDIRDESC,MAIL$Q_USERDEF,$DESCRIPTOR('.MAI'));
+    SND_FAB[FAB$B_DNS] = .DEFDIRDESC[DSC$W_LENGTH];
+    SND_FAB[FAB$L_DNA] = .DEFDIRDESC[DSC$A_POINTER];
+    SND_FAB[FAB$L_XAB] = SND_XABPRO;
+    SND_XABPRO[XAB$W_PRO] = SND_PRO;
+    END;
+
+$NAM_INIT(NAM=SND_NAM,
+	ESA=SND_RSS,
+	ESS=NAM$C_MAXRSS,
+	RSA=SND_RSS,
+	RSS=NAM$C_MAXRSS);
+SND_DESC[1] = SND_RSS;
+
+IF .APPEND_FLAG
+    THEN SND_FAB[FAB$V_CIF] = TRUE;
+
+CREATE_STATUS = $CREATE(FAB=SND_FAB,ERR=UTIL$REPORT_IO_ERROR);
+IF NOT .CREATE_STATUS
+    THEN RETURN .CREATE_STATUS;
+
+IF .SND_FAB[FAB$B_ORG] NEQ FAB$C_SEQ
+THEN BEGIN
+    SND_FAB[FAB$L_STS] = RMS$_IOP;
+    UTIL$REPORT_IO_ERROR(SND_FAB);
+    $CLOSE(FAB=SND_FAB);
+    RETURN RMS$_IOP
+    END;
+
+$RAB_INIT(RAB=SND_RAB,
+	CTX=MAIL$_OPENOUT,
+	FAB=SND_FAB);
+
+IF .APPEND_FLAG
+    THEN SND_RAB[RAB$V_EOF] = TRUE;
+
+IF_ERR($CONNECT(RAB=SND_RAB,ERR=UTIL$REPORT_IO_ERROR);,
+	IF NOT .APPEND_FLAG
+	    THEN SND_FAB[FAB$V_DLT] = 1;
+	$CLOSE(FAB=SND_FAB);
+	RETURN .STATUS);
+
+SND_RAB[RAB$L_CTX] = MAIL$_WRITEERR;
+CH$MOVE(DSC$C_S_BLN,UTIL$GETFILENAME(SND_FAB),SND_DESC);
+
+IF (IF .APPEND_FLAG
+	THEN (.CREATE_STATUS EQL RMS$_CREATED)
+	ELSE NOT .SND_FAB[$FAB_DEV(TRM)])
+    THEN IF .MAIL$GL_FLAGS[MAIF_V_ITERM]
+	THEN SIGNAL(MAIL$_CREATED,1,SND_DESC);
+
+IF .APPEND_FLAG
+    THEN WRITE_FF(SND_RAB);
+
+IF NOT .ALL_FLAG
+THEN STATUS = MAIL$EXTRACT_MESSAGE(.HEAD_FLAG,SND_RAB)
+ELSE IF .MAIL$GL_FLAGS[MAIF_V_ISAM]
+    THEN STATUS = EXTRACT_ALL_ISAM(.HEAD_FLAG,SND_RAB)
+    ELSE STATUS = EXTRACT_ALL_SEQ(.HEAD_FLAG,SND_RAB);
+
+SND_FAB[FAB$L_CTX] = MAIL$_CLOSEOUT;
+$CLOSE(FAB=SND_FAB,ERR=UTIL$REPORT_IO_ERROR);
+
+RETURN .STATUS
+END;
+
+ROUTINE CANCEL_GETQUI : NOVALUE =
+BEGIN
+!++
+! This routine cancels any GETQUI in progress.  Called if an image exit done
+! while getqui request outstanding
+!
+!--
+
+$GETQUIW(FUNC=QUI$_CANCEL_OPERATION);
+RETURN;
+END;
+
+ROUTINE GET_FLAG_TRAILER (FLAG_ITEM,TRAILER_ITEM) : NOVALUE =
+BEGIN
+!++
+! This routine does a $GETQUIW on the current queue (in CURQUE_DESC)
+! and returns the correct flag and trailer options to use in create job.
+!
+! IMPLICIT INPUTS:
+!
+!	curque_desc = descriptor of queue
+! OUTPUTS:
+!
+!	FLAG_ITEM contains the sjc$_ code for flg page, TRAILER_ITEM
+!	contains code for trailer page.
+!
+!--
+LOCAL
+    GETQLST : $ITMLST_DECL(ITEMS=3),
+    QUEUE_FLAGS : $BBLOCK[8] VOLATILE,
+    IOSB : VECTOR[4,WORD],
+    SEARCH_FLAGS,
+    STATUS;
+
+.FLAG_ITEM = SJC$_FILE_FLAG_ONE;
+.TRAILER_ITEM = SJC$_NO_FILE_TRAILER;
+SEARCH_FLAGS = QUI$M_SEARCH_WILDCARD OR QUI$M_SEARCH_SYMBIONT;
+$ITMLST_INIT(ITMLST=GETQLST,
+	(ITMCOD=QUI$_SEARCH_NAME,
+		BUFADR=.CURQUE_DESC[DSC$A_POINTER],
+			BUFSIZ=.CURQUE_DESC[DSC$W_LENGTH]),
+	(ITMCOD=QUI$_SEARCH_FLAGS,
+		BUFADR=SEARCH_FLAGS,
+		BUFSIZ=4),
+	(ITMCOD=QUI$_QUEUE_FLAGS,BUFADR=QUEUE_FLAGS));
+
+$GETQUIW(FUNC=QUI$_CANCEL_OPERATION);
+$DCLEXH(DESBLK=GETQUIEXITBLOCK);
+STATUS = $GETQUIW(FUNC=QUI$_DISPLAY_QUEUE,
+	ITMLST=GETQLST,
+	IOSB=IOSB);
+$GETQUIW(FUNC=QUI$_CANCEL_OPERATION);
+$CANEXH(DESBLK=GETQUIEXITBLOCK);
+IF .STATUS
+    THEN STATUS = .IOSB[0];
+
+IF NOT .STATUS
+    THEN RETURN;
+
+IF NOT (.QUEUE_FLAGS[QUI$V_QUEUE_FILE_FLAG]
+	OR .QUEUE_FLAGS[QUI$V_QUEUE_FILE_FLAG_ONE])
+    THEN .FLAG_ITEM = SJC$_NO_FILE_FLAG;
+IF (.QUEUE_FLAGS[QUI$V_QUEUE_FILE_TRAILER]
+	OR .QUEUE_FLAGS[QUI$V_QUEUE_FILE_TRAILER_ONE])
+    THEN .TRAILER_ITEM = SJC$_FILE_TRAILER_ONE;
+RETURN;
+END;
+
+GLOBAL ROUTINE MAIL$PRINT(QUEUE,COPIES,PRQ_FLAGS) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called to queue a copy of the current message
+!	for printing.  The first time it is called, a job is
+!	created and the message is copied to a file that is added to the
+!	job.  Each time it is called, and the queue name is the same as
+!	the last time, the current file will be added to the open job.
+!	If this routin is called with a different queue name, the previous
+!	job is closed, releasing it for printing, and a new job is opened.
+!
+!	If no queue name is specified, the queue specified in the previous
+!	call is assumed.  If no queue name is specified the first call,
+!	SYS$PRINT is assumed.
+!
+!	An exit handler is declared on the first call to close the open
+!	job should this routine never be called with a different queue name.
+!
+! INPUTS:
+!
+!	QUEUE = Address of specified queue name descriptor.
+!	COPIES = Number of copies, default is 1
+!
+! OUTPUTS:
+!
+!	Temporary file created, message copied to it, print job created
+!	for specified queue, and temporary file added to job.
+!--
+BEGIN
+MAP
+	QUEUE: 		REF BLOCK[,BYTE],		! Queue name descriptor
+	PRQ_FLAGS:	BLOCK[,BYTE];
+LOCAL
+	STATUS,						! Routine status
+	PTR,
+	FLAG_ITEM,
+	TRAILER_ITEM,
+	CREJOBLIST:	$ITMLST_DECL(ITEMS=5),
+	ADDFILELIST:	$ITMLST_DECL(ITEMS=5),
+	ALTJOBLIST:	$ITMLST_DECL(ITEMS=3),
+	JBCIOSB:	VECTOR[2,LONG],
+	RECDESC:	$BBLOCK[DSC$C_S_BLN],
+	MOREFLAG,
+	TMP_FAB:	$FAB_DECL,			! Temp file FAB
+	TMP_RAB:	$RAB_DECL,			! Temp file RAB
+	TMP_NAM:	$NAM_DECL,			! Temp file NAM block
+	TMP_ESNAM:	BLOCK[NAM$C_MAXRSS,BYTE],	! Temp file name buffer
+	BUFF:		BLOCK[MAIL$K_INBUFFSZ,BYTE];	! Temp file I/O buffer
+
+IF .FILES_QUEUED NEQ 0
+    AND .PRQ_FLAGS[PRQ_V_NOTIFY]
+THEN BEGIN
+    $ITMLST_INIT(ITMLST=ALTJOBLIST,
+	(ITMCOD=SJC$_QUEUE,
+		BUFSIZ=.CURQUE_DESC[DSC$W_LENGTH],
+		BUFADR=.CURQUE_DESC[DSC$A_POINTER]),
+	(ITMCOD=SJC$_ENTRY_NUMBER,
+		BUFADR=CURJOBID),
+	(ITMCOD=SJC$_NOTIFY,
+		BUFSIZ=0,
+		BUFADR=0));
+    STATUS = $SNDJBCW(FUNC=SJC$_ALTER_JOB,
+		ITMLST=ALTJOBLIST,
+		IOSB=JBCIOSB);
+    IF NOT .STATUS
+	OR NOT (STATUS = .JBCIOSB[0])
+	THEN SIGNAL(MAIL$_ALTPRIJOB,2,.CURJOBID,CURQUE_DESC,.STATUS);
+    END;
+!
+! If FORCE is specified, simply call close_job and return
+!
+IF .PRQ_FLAGS[PRQ_V_FORCE]
+    THEN IF .FILES_QUEUED EQL 0
+	THEN RETURN SIGNAL(MAIL$_NOMSGPRI)
+        ELSE RETURN CLOSE_JOB();
+!
+! If there is no job currently open, or if a queue name is specified, and 
+! it isn't the same as the current job's close the open job, and open 
+! a new print job.
+!
+IF .CURQUE_DESC[DSC$W_LENGTH] EQL 0
+OR (.QUEUE[DSC$W_LENGTH] NEQ 0
+    AND CH$NEQ(.QUEUE[DSC$W_LENGTH],.QUEUE[DSC$A_POINTER],
+	  .CURQUE_DESC[DSC$W_LENGTH],.CURQUE_DESC[DSC$A_POINTER],0))
+THEN	BEGIN
+	CLOSE_JOB();					! Close any open job
+	STR$COPY_DX(CURQUE_DESC,(IF .QUEUE[DSC$W_LENGTH] NEQ 0
+					THEN .QUEUE
+					ELSE $DESCRIPTOR('SYS$PRINT')));
+	GET_FLAG_TRAILER(FLAG_ITEM,TRAILER_ITEM);
+	$ITMLST_INIT(ITMLST=CREJOBLIST,
+		(ITMCOD=SJC$_ENTRY_NUMBER_OUTPUT,BUFADR=CURJOBID),
+		(ITMCOD=SJC$_QUEUE,BUFSIZ=.CURQUE_DESC[DSC$W_LENGTH],
+			BUFADR=.CURQUE_DESC[DSC$A_POINTER]),
+		(ITMCOD=(IF .PRQ_FLAGS[PRQ_V_NOTIFY]
+			THEN SJC$_NOTIFY
+			ELSE SJC$_NO_NOTIFY),
+			BUFADR=0,
+			BUFSIZ=0),
+		(ITMCOD=.FLAG_ITEM,BUFADR=0,BUFSIZ=0),
+		(ITMCOD=.TRAILER_ITEM,BUFADR=0,BUFSIZ=0));
+
+	STATUS = $SNDJBCW(FUNC=SJC$_CREATE_JOB,
+				ITMLST=CREJOBLIST,
+				IOSB=JBCIOSB);
+	IF NOT .STATUS
+	    OR NOT (STATUS = .JBCIOSB[0])
+	THEN BEGIN
+	    SIGNAL(MAIL$_CREPRIJOB,1,CURQUE_DESC,.STATUS);
+	    RETURN STR$FREE1_DX(CURQUE_DESC);	!No current queue
+	    END;
+	END;
+!
+! Create a temporary file
+!
+$FAB_INIT(	FAB = TMP_FAB,				! Create a FAB
+		FNA = .LISTFILE_DESC[DSC$A_POINTER],	!  File name address
+		FNS = .LISTFILE_DESC[DSC$W_LENGTH],	!  File name size
+		CTX = MAIL$_OPENOUT,
+		FOP = (TMP,SQO),			!  Temporary file
+		NAM = TMP_NAM,				!  Name block address
+		RAT = CR);				!  CR/LF records
+$RAB_INIT(	RAB = TMP_RAB,				! Create a RAB
+		FAB = TMP_FAB,				!  FAB address
+		CTX = MAIL$_OPENOUT,
+		UBF = BUFF,				!  Record buffer addr
+		USZ = MAIL$K_INBUFFSZ);			!  Record buffer size
+$NAM_INIT(	NAM = TMP_NAM,				! Name block
+		RSA = TMP_ESNAM,
+		RSS = NAM$C_MAXRSS,
+		ESA = TMP_ESNAM,			!  Name buffer address
+		ESS = NAM$C_MAXRSS);			!  Name buffer size
+
+STATUS = $CREATE(FAB = TMP_FAB,ERR=UTIL$REPORT_IO_ERROR);! Create the file
+IF NOT .STATUS
+    THEN RETURN .STATUS;
+!
+! Copy the message to the file
+!
+IF_ERR($CONNECT(RAB = TMP_RAB,ERR=UTIL$REPORT_IO_ERROR);,
+	TMP_FAB[FAB$V_DLT] = TRUE;
+	$CLOSE(FAB=TMP_FAB);
+	RETURN .STATUS);
+TMP_RAB[RAB$L_CTX] = MAIL$_WRITEERR;
+
+IF NOT .PRQ_FLAGS[PRQ_V_ALL]
+THEN STATUS = MAIL$EXTRACT_MESSAGE(1,TMP_RAB)
+ELSE IF .MAIL$GL_FLAGS[MAIF_V_ISAM]
+    THEN STATUS = EXTRACT_ALL_ISAM(1,TMP_RAB)
+    ELSE STATUS = EXTRACT_ALL_SEQ(1,TMP_RAB);
+
+IF NOT .STATUS						! If failure
+THEN	BEGIN
+	TMP_FAB[FAB$V_DLT] = 1; $CLOSE(FAB = TMP_FAB);	! Delete file
+	RETURN;
+	END;
+TMP_FAB[FAB$L_CTX] = MAIL$_CLOSEOUT;
+IF_ERR($CLOSE(FAB = TMP_FAB,ERR=UTIL$REPORT_IO_ERROR);,	! Close the file
+	RETURN);
+!
+! Add the file to the print job
+!
+PTR = CH$MOVE(NAM$S_DVI,TMP_NAM[NAM$T_DVI],BUFF);	! Set device name
+PTR = CH$MOVE(NAM$S_FID,TMP_NAM[NAM$W_FID],.PTR);	! Set file ID
+CH$MOVE(NAM$S_DID,TMP_NAM[NAM$W_DID],.PTR);		! directory ID
+$ITMLST_INIT(ITMLST=ADDFILELIST,
+	(ITMCOD=SJC$_FILE_IDENTIFICATION,
+		BUFSIZ=NAM$S_DVI+NAM$S_FID+NAM$S_DID,
+		BUFADR=BUFF),
+	(ITMCOD=SJC$_DELETE_FILE,
+		BUFADR=0,
+		BUFSIZ=0),
+	(ITMCOD=SJC$_FILE_COPIES,
+		BUFADR=COPIES));
+STATUS = $SNDJBCW(FUNC=SJC$_ADD_FILE,
+			ITMLST=ADDFILELIST,
+			IOSB=JBCIOSB);
+IF NOT .STATUS
+    OR NOT (STATUS = .JBCIOSB[0])
+THEN SIGNAL(MAIL$_CREPRIJOB,1,CURQUE_DESC,.STATUS)
+ELSE BEGIN
+	FILES_QUEUED = .FILES_QUEUED + 1;
+	IF NOT .EXITDECLARED				! If no exit handler
+	THEN	BEGIN
+		EXITDECLARED = $DCLEXH(DESBLK=EXITBLOCK);! Declare exit handler
+		IF NOT .EXITDECLARED
+		THEN
+			SIGNAL(.EXITDECLARED);
+		END;
+	END;
+END;
+
+ROUTINE CLOSE_JOB : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called to close any currently open print job,
+!	releasing it for printing.
+!
+!	It is also called as an exit handler at image run down.
+!
+! INPUTS:
+!
+!	CURQUEUE = Current queue name.
+!		 = zero if none.
+!
+! OUTPUTS:
+!
+!	CURQUEUE = zero.
+!
+!	If a print job is open, it is closed.
+!--
+BEGIN
+
+LOCAL
+    STATUS,
+    CLOSEJOBLIST : $ITMLST_DECL(ITEMS=1),
+    JBCSTSBUF : $BBLOCK[NAM$C_MAXRSS],
+    DESC : VECTOR[2,LONG],
+    JBCIOSB : VECTOR[2,LONG];
+
+IF .CURQUE_DESC[DSC$W_LENGTH] NEQ 0
+THEN	BEGIN
+	$ITMLST_INIT(ITMLST=CLOSEJOBLIST,
+		(ITMCOD=SJC$_JOB_STATUS_OUTPUT,
+			BUFSIZ=NAM$C_MAXRSS,
+			BUFADR=JBCSTSBUF,
+			RETLEN=DESC[0]));
+	DESC[0] = 0;
+	DESC[1] = JBCSTSBUF;
+	IF (STATUS = $SNDJBCW(FUNC=SJC$_CLOSE_JOB,
+		ITMLST=CLOSEJOBLIST,
+		IOSB=JBCIOSB))
+	    AND (STATUS = .JBCIOSB[0])
+	THEN BEGIN
+	    IF .FILES_QUEUED NEQ 0
+		THEN MAIL$PUT_OUTPUT(DESC);
+	    END
+	ELSE IF .FILES_QUEUED NEQ 0
+	    THEN SIGNAL(MAIL$_CREPRIJOB,1,CURQUE_DESC,.STATUS);
+	STR$FREE1_DX(CURQUE_DESC);			!No current queue
+	FILES_QUEUED = 0;
+	END;
+END;
+
+END
+ELUDOM

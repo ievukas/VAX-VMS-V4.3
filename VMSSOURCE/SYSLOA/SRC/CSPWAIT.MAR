@@ -1,0 +1,393 @@
+
+	.TITLE	 CSPWAIT
+	.IDENT	'V04-000'
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+;
+; FACILITY:	VMS Cluster Server Process
+;
+; ABSTRACT:	Subroutines to initiate "wait" states for Cluster Servers
+;		and to create new threads of context.
+;
+; AUTHOR:	Paul R. Beck
+;
+; DATE:		 3-MAR-1983 	Last Edit:  22-JUN-1983 19:17:35 
+;
+; REVISION HISTORY:
+;
+;	V03-005	ADE0004		Alan D. Eldridge		24-Apr-1984
+;		Use CSP$$CRASH rather than BUG_CHECK.
+;
+;	V03-004	ADE0003		Alan D. Eldridge		22-Mar-1984
+;		Fix synchronization between CSP$$WAIT and CSP$$RESUME.
+;
+;	V03-003	ADE0002		Alan D. Eldridge		28-Feb-1984
+;		Change name of CSP$$OPCOM o CSP$TELL_OPCOM
+;
+;	V03-002	ADE0001		Alan D. Eldridge	 	3-Dec-1983
+;		Move CSP$SAVE_STACK to this module from CSP.B32 since BLISS is 
+;		not really appropriate for munging the stack.  Move CSP$RESUME,
+;		CSP$CREATE_CTX, and CSP$DELETE_CTX as well so that all routines
+;		callable by the client threads are in one module.  Changed 
+;		synchronization between CSP$$RESUME and CSP$$WAIT.
+;		
+;
+;	V03-001	PRB0205		Paul Beck		 	6-JUN-1983 
+;		Change CTX$ symbols to CLX$ to prevent conflict with RCP.
+;--
+
+;
+; Include files
+;
+	$SFDEF				; define stack frame offsets
+	$CLXDEF				; define context block offsets
+
+;
+; Own storage
+;
+CONTEXT_ID:	.LONG	1		; Storage for next CLX index
+CLX_SIZE:	.LONG	CLX$K_LENGTH	; CLX length used as input an parameter
+					; when 'call by reference' is needed
+
+
+.SBTTL	'CSP$$RESUME'
+;++
+;
+;  Completion of AST for asynchronous calls.  Reschedule the thread.  This 
+;  routine can be specified directly as an AST, or it may be called from 
+;  another AST.
+;
+;  CALLING SEQUENCE:	Standard AST (or called from and AST jacket routine).
+;			May also be called from "normal" level
+;
+;  FORMAL PARAMETERS:	P1 =	address of thread's context block
+;
+;  COMPLETION CODES:	N/A
+;
+;--
+.ENTRY  CSP$$RESUME, 0				; Save nothing
+	;
+	;
+	;    This routine, since it is most often called via an AST, can
+	;    come before or may interrupt the execution of CSP$$WAIT.
+	;
+	;
+	MOVL    4(AP),R0			 ; Get context block
+	BBCS    #CLX$V_MUTEX,CLX$B_FLAGS(R0),10$ ; If BS, blocked by CSP$$WAIT
+	;
+	;
+	;    MUTEX was set.  We cannot use the queue linkage in the CLX
+	;
+	;
+	BBSS	#CLX$V_RESUME_REQ,-		; Tell CSP$$WAIT we interrupted
+		 CLX$B_FLAGS(R0),70$		; its execution
+	BRB	50$				; Done
+10$:	;
+	;
+	;    MUTEX was clear.  The queue linkage in the CLX is ours to use.
+	;
+	;
+	BBCS	#CLX$V_QUEUED,CLX$B_FLAGS(R0),30$ ; If BC, not yet queued
+	REMQUE  (R0),R0				; Remove block from old queue
+30$:	INSQUE	(R0),@CSP$GQ_RESUME+4		; ...and reschedule the thread
+	BBCC	#CLX$V_MUTEX,CLX$B_FLAGS(R0),90$; Release interlock
+	$WAKE_S					; Wake the CSP for processing
+50$:	RET					; Done
+
+70$:	PUSHL	#SS$_NOPRIVSTRT+4		; RESUME_REQ should have been 0
+	BRB	100$				;
+90$:	PUSHL	#SS$_NOPRIVSTRT+8		; MUTEX should have been set
+100$:	CALLS	#1,CSP$$CRASH			; Report bug
+	HALT					; Should never get here
+
+
+.SBTTL		CSP$$WAIT - Asynchronous wait for AST completion.
+;++
+;
+;  The current stack is saved in an allocated block, which is saved in the 
+;  current thread's context block. A test is then done to see if the completion
+;  AST completed prior to this routine; if so, the context is rescheduled.  The
+;  routine then forces a scheduler run by collapsing the stack and returning.
+;
+;  CALLING SEQUENCE: 	CALL	- never called from an AST routine.
+;
+;  INPUT PARAMETERS:	none
+;
+;  OUTPUT PARAMETERS:	N/A
+;
+;  COMPLETION CODES:	N/A
+;
+;--
+.ENTRY	CSP$$WAIT,^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; save all registers
+	;
+	;
+	;    Save the current thread context.  The context is now on the stack 
+	;    including all registers except R0 and R1.  R0 and R1 are saved 
+	;    separately since the calling standard enforced by the VAX 
+	;    architecture does not allow saving them in the entry mask.
+	;
+	;
+	JSB	G^CSP$$SAVE_STACK		; Save stack in current CLX
+	MOVL	G^CSP$GL_CURCTX,R4		; Get current CLX
+	CLRL	G^CSP$GL_CURCTX			; This thread no longer active
+	;
+	;
+	;    We must test for a race condition with the completion AST. 
+	;
+	;    Since this routine is never called from AST level, it may be
+	;    interrupted by CSP$$RESUME -- but never vice versa.
+	;
+	;
+	BBSS    #CLX$V_MUTEX, CLX$B_FLAGS(R4),90$	; If BS, interlocked
+	BBSS	#CLX$V_QUEUED,CLX$B_FLAGS(R4),50$	; If BS, RESUME occured 
+							; before we interlocked
+	INSQUE	(R4),@CSP$GQ_WAIT+4			; Queue it to wait list
+50$:	;
+	;
+	;    Return to the scheduler. This is done by collapsing the stack to a
+	;    known point, where there is a call frame used to enter the 
+	;    scheduler.  Then return with a success code.  This will cause the 
+	;    scheduler to be reentered.
+	;
+	;
+	BBCC	#CLX$V_MUTEX,CLX$B_FLAGS(R4),90$	; Release interlock
+	BBCC	#CLX$V_RESUME_REQ,CLX$B_FLAGS(R4),70$	; If BS, RESUME occured
+							; since we interlocked
+	REMQUE	(R4),R4					; Remove CLX from WAIT
+	INSQUE	(R4),@CSP$GQ_RESUME+4			; Que it to RESUME list
+70$:	MOVL	G^CSP$GL_BASE_FP,FP			; Point to scheduler 
+							; stack frame
+	MOVL	S^#SS$_NORMAL,R0			; Declare success
+	RET						; Go reschedule.
+
+90$:	PUSHL	#SS$_NOPRIVSTRT+12			; Use phoney status
+	CALLS	#1,CSP$$CRASH 				; report MUTEX conflict
+	HALT						; Should never get here
+
+.dsabl	lsb
+
+.SBTTL		CSP$$FORK - create new execution thread
+;++
+;
+;  This is a fork routine. A new context block is allocated and initialized, 
+;  and the current context is saved and queued to the thread resume (grant) 
+;  queue. The stack is NOT reclaimed, and the scheduler is NOT called.  When the
+;  scheduler is eventually entered, each thread thus queued is resumed at the 
+;  return from this routine. The completion code is used to determine whether 
+;  the execution context is the new thread (SS$_NORMAL) or simply the creator 
+;  of the thread (0). For example:
+;
+;		CALLS	#0,CSP$$FORK
+;		BLBC	R0, 10$		; continue executing old thread
+;		BRW	NEW_THREAD	; start executing new thread
+;
+;
+;
+;				CAVEAT
+;
+;	When creating a thread this way, be aware that the context saved
+;	is in the registers and stack. Local variables should be so defined.
+;
+;  CALLING SEQUENCE:	CALL
+;
+;  FORMAL PARAMETERS:	none
+;
+;  COMPLETION CODES:
+;
+;		SS$_NORMAL = 	The new thread has been resumed by the scheduler
+;		0 =		The thread has been queued, context is intact
+;--
+.entry	CSP$$FORK,^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; save all registers
+						;
+	PUSHL	G^CSP$GL_CURCTX			; Temp save current context
+	;
+	;
+	;    First, create the context block. 
+	;
+	;
+	JSB	G^CSP$$CREATE_CTX		; Allocate new CLX block
+	MOVL	R0,R2				; Copy of new CLX pointer 
+	BEQL	10$				; If EQL, allocation failure
+	;
+	;
+	;    Now, save the current stack in the context block. This requires 
+	;    faking out CSP$$SAVE_STACK as to which is the current context.
+	;
+	;
+	MOVL	R2,G^CSP$GL_CURCTX		; Store new context pointer
+	JSB	G^CSP$$SAVE_STACK		; Save stack in new CLX
+	;
+	;
+	;    Next, schedule it.  Force the saved R0 to SS$_NORMAL so that
+	;    upon rescheduling the caller will sense that this is the fork 
+	;    thread executing.
+	;
+	;
+	MOVL	S^#SS$_NORMAL,CLX$L_R0(R2) 	; "jam" success code
+	PUSHL	R2				; Setup parameter
+	CALLS	#1,CSP$$RESUME			; ...and reschedule the thread
+	;
+	;
+	;   Return with status=0 indicating that this isn't the fork thread yet.
+	;
+	;
+	CLRL	R0				; "SS$_NOT_FORK"
+10$:	POPL	G^CSP$GL_CURCTX			; Restore current CLX pointer
+	RET
+
+
+.SBTTL	'CSP$$SAVE_STACK - save stack frames prior to suspending thread'
+;++
+;
+;  Allocate memory to save the current stack (from top to the scheduler call 
+;  frame), and store it in the current thread's context block.
+;
+;  CALLING SEQUENCE:	JSB
+;
+;  FORMAL PARAMETERS:	none
+;
+;  IMPLIED INPUTS:	CSP$GL_CURCTX =	address of context block in which to store
+;					the saved stack.
+;
+;  COMPLETION CODES:	SS$_NORMAL, or failure code from LIB$$GET_VM
+;
+;--
+
+	  .PSECT  $PLIT$,NOWRT,NOEXE,2
+
+P.AAK:  .ASCII  'CSP$$SAVE_STACK: CURCTX=0'<0><0><0>	      ;
+							      ;
+P.AAJ:  .LONG   17694745				      ;
+	.ADDRESS P.AAK					      ;
+
+	  .PSECT  $CODE$,NOWRT,2
+
+CSP$$SAVE_STACK::
+	PUSHR   #^M<R2,R3,R4,R5,R6>		; Save regs
+						; 
+	MOVL    CSP$GL_CURCTX,R2		; Get current CLX block
+	BNEQ    10$				; If NEQ, it's there
+	PUSHAB  P.AAJ				; Setup message desc.
+	CALLS   #1, CSP$TELL_OPCOM		; Display message
+	CLRL	R0				; Indicate error
+	BRB	40$				; Take common exit
+10$:	;
+	;
+	;    We save the stack from CSP$GL_BASE_FP up to and including the
+	;    current stack frame (note JSB interface).  This assumes that this
+	;    routine is always called from a WAIT or a FORK routine which has
+	;    been CALL'ed by the thread which needs the context block saved.
+	;
+	;
+	ASSUME	CLX$L_R1  EQ  4+CLX$L_R0
+	MOVQ	R0,CLX$L_R0(R2)				; Save R0,R1
+	BICB	#CLX$M_LOCAL_STACK,CLX$B_FLAGS(R2)	; Init flag
+	SUBL3	FP,G^CSP$GL_BASE_FP,CLX$L_STACKSIZE(R2)	; Determine stack size
+	CMPL	CLX$L_STACKSIZE(R2),#CLX$K_LOCAL_STACK	; Overflow CLX?
+	BGTRU	20$					; If GTRU, yes
+	MOVAB	CLX$B_LOCAL_STACK(R2),CLX$A_STACK(R2)	; Setup stack ptr
+	BISB	#CLX$M_LOCAL_STACK,CLX$B_FLAGS(R2)	; Indicate CLX stack
+	BRB	30$					; Continue
+20$:	;
+	;
+	;    Must allocate a block to hold the stack
+	;
+	;
+	PUSHAB	CLX$A_STACK(R2)			; Point to block ptr
+	PUSHAB  CLX$L_STACKSIZE(R2)		; Point to block size
+	CALLS   #2,G^LIB$GET_VM			; Allocate the block
+	BLBC	R0,40$				; If LBC, failed
+30$:	MOVC3   CLX$L_STACKSIZE(R2),(FP), -	; Copy stack
+		@CLX$A_STACK(R2)		; 
+						;
+	MOVL	#1,R0				; Setup success status
+40$:	POPR    #^M<R2,R3,R4,R5,R6>		; Restore regs
+	RSB					; Done
+
+
+	.SBTTL	'CSP$$CREATE_CTX - allocate and initialize context block'
+;++
+;
+;  Allocate and initialize a context block.
+;
+;  CALLING SEQUENCE: 	JSB
+;
+;  INPUT PARAMETERS:	R0	Scratch
+;
+;  OUTPUT PARAMETERS:	R0	Address of context block is returned 
+;				(0 if error).
+;
+;--
+CSP$$CREATE_CTX::
+	PUSHR   #^M<R0,R1,R2,R3,R4,R5>		; Save regs
+						;
+	PUSHAB	(SP)				; Address of block pointer
+	PUSHAB	CLX_SIZE			; Address of block length  
+	CALLS   #2,G^LIB$GET_VM			; Allocate the block
+						;
+	BLBC    R0,10$				; If LBC, then failed
+	MOVC5   #0,(SP),#0,#CLX$K_LENGTH,@(SP)	; Zero it
+	MOVL    (SP),R0				; Pickup the block
+	MOVL    CONTEXT_ID,CLX$L_INDEX(R0)	; Enter the i.d.
+	INCL    CONTEXT_ID			; Bump the i.d. for next time
+	BRB     20$				; Take common exit
+10$:	CLRL    (SP)				; Say "no block allocated"
+						;
+20$:	POPR    #^M<R0,R1,R2,R3,R4,R5>		; Restore regs
+	RSB					; Done
+
+
+	.SBTTL	'CSP$$DELETE_CTX - terminate thread'
+;++
+;
+;  Terminate an execution thread by deleting the context block and
+;  clearing the pointer.
+;
+;  CALLING SEQUENCE:	JSB
+;
+;  FORMAL PARAMETERS:	None
+;
+;  COMPLETION CODES:	N/A
+;
+;--
+CSP$$DELETE_CTX::
+	PUSHAB	G^CSP$GL_CURCTX			; Create pointer to CLX pointer
+						;
+	TSTL	@(SP)				; Test current CLX block ptr
+	BNEQ	10$				; If NEQ, there was one
+	CALLS   #0, MUMBLE			; Report bug
+	BRB	20$				; Take common exit
+						;
+10$:	PUSHL	(SP)				; Setup ptr to block ptr
+	PUSHAB  CLX_SIZE			; Setup ptr to length
+	CALLS   #2,G^LIB$FREE_VM		; Deallocate the block
+						;
+20$:	CLRL	@(SP)+				; Zero CSP$GL_CURCTX, fix stack
+	RSB					; Return
+
+
+
+.end

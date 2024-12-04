@@ -1,0 +1,82 @@
+$ !
+$ !	[ I N S T A L . C O M ] I N S T A L B L D . C O M
+$ !
+$ !	THIS COMMAND FILE BUILDS THE INSTALL UTILITY.
+$ !
+$ GOTO 'PHASE'
+$
+$INIT:
+$ !
+$ !	Create the Directories
+$ !
+$ @SYSBLDCOM$:CREATEDIR
+$ EXIT
+$
+$UPDATE:
+$ !
+$ !	Create updated sources.
+$ !
+$ SRCUPDATE INSMSG.MSG
+$ SRCUPDATE INSDEF.SDL
+$ SRCUPDATE RSXLBLDF.SDL
+$ SRCUPDATE INSPREFIX.REQ
+$ SRCUPDATE INSOLDCMD.CLD
+$ SRCUPDATE INSCMD.CLD
+$ SRCUPDATE INSTALHLP.HLP
+$ EXIT
+$
+$SRCLIB:
+$ !
+$ ! Build library containing error message codes and severity levels.
+$ !
+$ ON ERROR THEN CONTINUE
+$ SDL /LANGUAGE=BLISS=LIB$ /LIS=LIS$ SRC$:INSDEF
+$ SDL /LANGUAGE=BLISS=LIB$ /LIS=LIS$ SRC$:RSXLBLDF
+$ LIBRAR/HELP/CREATE=(BLOCKS:8,MODULE:16,GLOBALS:0) OBJ$:INSTALHLP SRC$:INSTALHLP
+$ EXIT
+$
+$ASSEM:
+$ !
+$ !	Delete and re-create the INSTALL objects and listings
+$ !
+$ DELETE OBJ$:*.OBJ;*,*.OBB;*,LIS$:*.LIS;*
+$ @SYSBLDCOM$:FASM 'FACNAM "" N 'UPDATES
+$ SET COMMAND SRC$:INSOLDCMD /OBJECT=OBJ$:INSOLDCMD /LISTING=LIS$:INSOLDCMD
+$ SET COMMAND SRC$:INSCMD /OBJECT=OBJ$:INSCMD /LISTING=LIS$:INSCMD
+$ CPYSYSMSG OBJ$:INSMSG.OBB
+$ EXIT
+$
+$OBJLIB:
+$ !
+$ !	Create object library from object modules.
+$ !
+$ @SYSBLDCOM$:OBJLIB INSTAL
+$ EXIT
+$
+$LNKLIB:
+$ !
+$ ! Null LNKLIB phase
+$ !
+$ EXIT
+$
+$LINK:
+$ !
+$ !	Delete INSTALL map and image then re-create EXE$:INSTALL.EXE
+$ !			and MAP$:INSTALL.MAP
+$ !
+$ DELETE EXE$:INSTALL.EXE;*, MAP$:.MAP;*
+$ @COM$:INSTALLNK
+$ EXIT
+$
+$RESULT:
+$ !
+$ !	Copy the EXE and MAP to a System area
+$ !
+$ CPYRESEXE  EXE$:INSTALL.EXE
+$ CPYRESMAP  MAP$:INSTALL.MAP
+$ CPYSYSHLP  OBJ$:INSTALHLP.HLB
+$ !
+$ !	Build the concatenated listing RESLIS$:INSTALL.LSS
+$ !
+$ CPYRESLIS  LIS$:*.LIS  INSTALL.LSS
+$ EXIT

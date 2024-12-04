@@ -1,0 +1,668 @@
+	.title pli$cvtpic - convert numeric and picture
+	.ident	/1-003/					; Edit CGN1003
+							; Edit WHM1002
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;
+;++
+; facility:
+;
+;	VAX/VMS PL1 Run-Time library.
+;
+; abstract:
+;
+; This module contains routines to convert numeric to picture and picture
+; to numeric.
+;
+; author: R. Heinen 21-JAN-1980
+;
+; modified on 13-Feb-1981 by R. Heinen
+;	fixed problem with convert from overpunched sign character.
+;
+;	1-002	Bill Matthews	29-September-1982
+;
+;		Invoke macros $defdat and rtshare instead of $defopr and share.
+;
+;	1-003	Chip Nylander	04-April-1983
+;
+;		Fix conversion to picture with floating sign and no non-zero
+;		digits to the left of the decimal point.
+;
+;		The fix is as follows:  when there is a floating sign, the
+;		floating sign must be placed into the picture when
+;		significance is established.  Significance is established
+;		in three ways: any non-zero digit in the source, any
+;		non-suppressed digit in the picture specification (e.g. "9"),
+;		or an overt significance specifier ("V").
+;
+;		Move_zero_supress and move_digits take care of the first
+;		two cases.  The third case was previously neglected;
+;		set_significance now takes care of it.
+;
+;--
+ 
+;
+; external definitions
+;
+	$defpic				; define picture constant
+;
+; local definitions
+;
+; define arguments for both routines
+;
+	picture_constant = 4		;
+	source_size	 = 8		;
+	source_address	 = 12		;
+	target_size	 = 16		;
+	target_address	 = 20		;
+ 
+;
+; define stack for numeric to picture
+;
+	sign		= -4		; sign byte
+	float		= -5		; float byte
+	significance	= -6		; significance indicator
+	fill		= -7		; fill character
+	zero_indic	= -8		; zero indicator
+	cvt_to_pic_stack= 9		; size of stack
+ 
+;
+; define picture to numeric stack
+;
+	found_sign	= -4		; sign found
+	inter_result	= -40		; 31 bytes of storage for numeric value
+	cvt_fr_pic_stack= 40		; stack size
+	
+;
+; local data
+;
+	rtshare
+;
+; conversion tables for over punch
+;
+plus_over_punch:
+	.byte	123,65,66,67,68,69,70,71,72,73
+minus_over_punch:
+	.byte	125,74,75,76,77,78,79,80,81,82
+packed_zero:
+	.packed	0
+valid_char_table:
+	.ascii	/0123456789/
+	.ascii	'+-/.,$CcDd *'
+	.byte	123,65,66,67,68,69,70,71,72,73
+	.byte	125,74,75,76,77,78,79,80,81,82
+valid_char_size = .-valid_char_table
+over_punch_value:
+	.ascii	/09876543210/			; 0,R,Q,P,O,N,M,L,K,J,}
+	.ascii	/9876543210/			; I,H,G,F,E,D,C,B,A,{
+	.ascii	/000403/			; pick up extra D anc C	
+	.page
+	.sbttl	pli$cvt_to_pic - convert numeric to picture
+;++
+; pli$cvt_to_pic - convert numeric to picture
+;
+; functional description:
+;
+; This routine converts a packed decimal string described by source_size(ap)
+; and source_address(ap) to a character string described by target_size(ap)
+; and target_address(ap) based on the picture constant block addressed by
+; picture_constant(ap).
+;
+; inputs:
+;
+;	0(ap) = 5
+;	4(ap) = picture_constant address
+;	8(ap) = source size	 
+;	12(ap) = source address	 
+;	16(ap) = target size	 
+;	20(ap) = target address	 
+;
+; outputs:
+;
+;	target string is filled in.
+;
+; ERROR maybe signalled.
+;
+;--
+	.entry	pli$cvt_to_pic,^m<iv,dv,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11>
+	movl	picture_constant(ap),r11; address picture constant
+	tstb	pic$b_language(r11)	; type runtime?
+	beql	5$			; if eql then yes
+;
+; process editpc type
+;
+	brw	error			; temp---- error
+;
+; interpret subroutine at runtime
+;
+5$:	subl	#cvt_to_pic_stack,sp	; allocate stack space
+;
+; convert source string to internal buffer
+;
+	movl	source_address(ap),r8	; get address of the source string
+	movzbl	source_size(ap),r6	; get source digit size
+	cmpw	source_size(ap),pic$w_pq(r11); source same p,q as result?
+	beql	7$			; continue if yes
+	movzbl	source_size+1(ap),r0	; get scale of source
+	movzbl	pic$w_pq(r11),r9	; get size of result
+	movzbl	pic$w_pq+1(r11),r2	; get scale of result
+	subl	r0,r2			; source - result = shift
+	subl	r9,sp			; allocate space for shift
+	ashp	r2,r6,(r8),#0,r9,(sp)	;
+	movl	r9,r6			; use new size
+	movab	(sp),r8			; address it
+7$:	subl	r6,sp			; allocate room for result
+	decl	sp			; allocate for sign
+	clrb	zero_indic(fp)		; assume zero
+	cvtps	r6,(r8),r6,(sp)		; convert to character
+	beql	10$			; if eql then zero
+	incb	zero_indic(fp)		; set non zero
+;
+; blank out the target field in case of error
+;
+10$:	movc5	#0,@target_address(ap),#32,target_size(ap),@target_address(ap);
+;
+; initialize the assumed values
+;
+	clrb	float(fp)		; float is undefined
+	clrb	significance(fp)	; significance is off
+	movb	#^a/ /,fill(fp)		; fill begins as blank
+	movab	(sp),r1			; address source string ( movc side effect)
+	movb	(r1),sign(fp)		; get sign
+	cmpb	(r1)+,#^a/+/		; positive?
+	beql	15$			; if eql then yes
+	bbc	#pic_v_has_sign,pic$b_flags(r11),error; else must have sign specifier
+;
+; allocate space for initial target string
+;
+15$:	movzbl	pic$b_byte_size(r11),r0	; get max size of target
+	subl	r0,sp			; allocate the space
+	movab	(sp),r3			; address it ( movc side effect )
+	movab	pic$b_program(r11),r10	; address edit program
+;
+; main loop of interpreter
+;
+fetch_next:
+;
+; interpret edit program
+;
+	movzbl	(r10)+,r2		; get opcode
+	movzbl	(r10)+,r0		; get argument
+	case	r2,<-
+		move_zero_supress,-
+		insert_character,-
+		set_fill_character,-
+		insert_significant,-
+		move_digits,-
+		insert_minus,-
+		insert_plus,-
+		insert_sign,-
+		set_float_character,-
+		set_float_minus,-
+		set_float_plus,-
+		set_float_sign,-
+		skip_if_zero,-
+		fill_field,-
+		set_significance,-
+		end_edit,-
+		supress_digit,-
+		move_digit_minus,-
+		move_digit_plus,-
+		move_digit_sign-
+		>
+ 
+error:
+; 
+	pushl	#pli$_cnverr		; conversion error
+	clrl	-(sp)			; signal error
+	pushl	#pli$_error		;	
+	calls	#3,g^lib$signal		;
+	ret
+;
+; end edit
+;
+end_edit:
+	subl	sp,r3			; calc size of return string
+	movc5	r3,(sp),#32,target_size(ap),@target_address(ap); copy it
+	ret				; done
+
+	.sbttl	edit interpret routines
+;
+; zero_supress move
+;
+move_zero_supress:
+	blbs	significance(fp),move_character; br if significance on
+10$:	cmpb	(r1),#^a/0/		; zero digit?
+	bneq	15$			; if neq then insert it
+	incl	r1			; pass zero digit
+	movb	fill(fp),(r3)+		; insert fill character
+	sobgtr	r0,10$			; continue until done
+	brw	fetch_next		;
+15$:	bisb	#1,significance(fp)	; turn on significance
+	tstb	float(fp)		; float byte defined?
+	beql	move_character		; br if no
+	movb	float(fp),(r3)+		; insert floab byte
+;
+; move characters
+;
+move_character:
+	movc3	r0,(r1),(r3)		; move characters to output
+	brw	fetch_next		;
+;
+; insert_character
+;
+insert_character:
+	movb	r0,(r3)+		; insert character
+	brw	fetch_next		;
+;
+; set_fill_character
+;
+set_fill_character:
+	movb	r0,fill(fp)		;
+	brw	fetch_next		;
+;
+; significant_insert
+;
+insert_significant:
+	blbs	significance(fp),10$	; br if significance on
+	movb	fill(fp),r0		; get fill character
+10$:	movb	r0,(r3)+		; insert character
+	brw	fetch_next		;
+;
+; move_digits
+;
+move_digits:
+	blbs	significance(fp),10$	; br if significance is on
+	movb	float(fp),r2		; get float byte
+	beql	5$			; br if not defined
+	movb	r2,(r3)+		; insert float byte
+5$:	incb	significance(fp)	; set significance on
+10$:	brb	move_character		; continue in common
+;
+; insert minus
+;
+insert_minus:
+	cmpb	sign(fp),#^a/-/		; negative
+	beql	10$			; if eql then yes
+	movb	fill(fp),r0		; insert blank or star
+10$:	movb	r0,(r3)+		; insert character if yes
+	brw	fetch_next		; continue
+;
+; insert plus
+;
+insert_plus:
+	cmpb	sign(fp),#^a/+/		; positive?
+	beql	10$			; if eql then yes
+	movb	fill(fp),r0		; insert blankor fill
+10$:	movb	r0,(r3)+		; insert character if yes
+	brw	fetch_next		; continue
+;
+; insert sign
+;
+insert_sign:
+	movb	sign(fp),(r3)+		; insert sign byte
+	brw	fetch_next		;
+;
+; set float character
+;
+set_float_character:
+	movb	r0,float(fp)		;
+	brw	fetch_next		;
+;
+; set float minus
+;
+set_float_minus:
+	cmpb	sign(fp),#^a/-/		; negative?
+	bneq	10$			; if neq then no
+	movb	r0,float(fp)		; set float if true
+	brw	fetch_next		;
+10$:	movb	fill(fp),float(fp)	; save as fill character
+	brw	fetch_next
+;
+; set float plus
+;
+set_float_plus:
+	cmpb	sign(fp),#^a/+/		; positive
+	bneq	10$			; if neq then no
+	movb	r0,float(fp)		; set float if true
+	brw	fetch_next		;
+10$:	movb	fill(fp),float(fp)	;
+	brw	fetch_next
+;
+; set float sign
+;
+set_float_sign:
+	movb	sign(fp),float(fp)	;
+	brw	fetch_next		;
+;
+; skip_if_zero
+;
+skip_if_zero:
+	tstb	zero_indic(fp)		; zero?
+	bneq	10$			; if neq then not zero
+	movaw	(r10)[r0],r10		; set new edit pc
+10$:	brw	fetch_next		;
+;
+; fill_field
+;
+fill_field:
+	movc5	#0,(r3),fill(fp),r0,(r3);
+	brw	fetch_next		; 
+;
+; set_significance
+;
+set_significance:
+	blbs	significance(fp),10$	; br if significance is on
+	movb	float(fp),r2		; get float byte
+	beql	5$			; br if not defined
+	movb	r2,(r3)+		; insert float byte
+5$:	bisb	#1,significance(fp)	; turn on significance
+10$:	brw	fetch_next		;
+
+;
+; supress_digit
+;
+supress_digit:
+	movb	(r1)+,r0		; get next source digit
+	cmpb	r0,#^a/0/		; zero?
+	bneq	10$			; if neq then no
+	movb	#^a/ /,r0		; insert blank
+10$:	movb	r0,(r3)+		; move character
+	brw	fetch_next		;
+;
+; move_digit_minus
+;
+move_digit_minus:
+	movzbl	(r1)+,r0		; get next source digit
+	cmpb	sign(fp),#^a/-/		; negative source?
+	bneq	10$			; if neq then no
+	subb	#^a/0/,r0		;
+	movb	w^minus_over_punch[r0],r0; get new character
+10$:	movb	r0,(r3)+		; insert character
+	brw	fetch_next		;
+;
+; move_digit_plus
+;
+move_digit_plus:
+	movzbl	(r1)+,r0		; get next source character
+	cmpb	sign(fp),#^a/+/		; positive?
+	bneq	10$			; if neq then no
+	subb	#^a/0/,r0		;
+	movb	w^plus_over_punch[r0],r0; get new character
+10$:	movb	r0,(r3)+		; insert new character
+	brw	fetch_next		;
+;
+; move_digit_sign
+;
+move_digit_sign:
+	movab	w^minus_over_punch,r2	; address minus set
+	cmpb	sign(fp),#^a/-/		; negative?
+	beql	10$			; if eql then yes
+	movab	w^plus_over_punch,r2	; address positive set
+10$:	movzbl	(r1)+,r0		; get source character
+	subb	#^a/0/,r0		;
+	movb	(r2)[r0],(r3)+		; insert new character
+	brw	fetch_next		;
+	.page
+	.sbttl	pli$cvt_fr_pic - convert picture to numeric
+;++
+; pli$cvt_fr_pic - convert picture to numeric
+;
+; functional description:
+;
+; This routine converts a picture character string described by 8(ap) and 12(ap)
+; to a numeric value described by 16(ap) and 20(ap) based on the picture constant
+; addressed by picture_constant(ap).
+;
+; inputs:
+;
+;	0(ap) = 5
+;	4(ap) = picture_constant address
+;	8(ap) = source size	 
+;	12(ap) = source address	 
+;	16(ap) = target size	 
+;	20(ap) = target address	 
+;
+; outputs:
+;
+;	target string is filled in.
+;
+; ERROR maybe signalled.
+;
+;--
+	.entry	pli$cvt_fr_pic,^m<iv,dv,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11>
+	subl	#cvt_fr_pic_stack,sp	; allocate stack space
+	clrb	found_sign(fp)		; set no sign found
+	movl	picture_constant(ap),r11; address picture constant
+;
+; calc size of source string
+;
+	movzbl	pic$b_byte_size(r11),r6	; get picture designate size
+	cmpw	r6,source_size(ap)	; less or greater than source?
+	bleq	10$			; if leq then use it
+	movzwl	source_size(ap),r6	; use smaller size
+10$:	movl	source_address(ap),r7	; get source address
+	subl	r6,sp			; allocate space for ascii text
+	movab	(sp),r8			; copy address of space
+;
+; set result to zero
+;
+	movzbl	target_size(ap),r0	; get target size p value
+	ashp	#0,#1,w^packed_zero,#0,r0,@target_address(ap);
+;
+; loop through string, extracting digits and picking up sign
+;
+locate_char:
+	movzbl	(r7)+,r3		; get character
+	locc	r3,#valid_char_size,w^valid_char_table; locate character in valid  table
+	bneq	select_action		; if neq then valid character found
+	brw	error			; signal error
+;
+;
+; get next character
+;
+next_character:
+	sobgtr	r6,locate_char		; continue in more to scan
+;
+; converet number to numeric
+;
+; setup default sign based on presence of '+' or I format
+;
+	tstb	found_sign(fp)		; sign found?
+	bneq	15$			; if neq then yes
+	movb	#^a/+/,found_sign(fp)	; assume positive
+	bbc	#pic_v_minus,pic$b_flags(r11),15$; br if not negative default
+	movb	#^a/-/,found_sign(fp)	;
+15$:
+	subl3	sp,r8,r0		; get size of character string
+	movb	found_sign(fp),-(sp)	; insert sign at front of buffer
+	beql	100$			; if eql then answer is zero
+	cmpl	r0,#31			; more than maximum?
+	bleq	10$			; if leq then ok
+	movl	#31,r0			; convert maximum
+10$:	cvtsp	r0,(sp),#31,inter_result(fp); convert to packed
+;
+; scale intermediate result to requested precision
+;
+	movzbl	target_size+1(ap),r0	;
+	movzbl	pic$w_pq+1(r11),r1	; 
+	subl3	r1,r0,r1		; calc shift count
+	movzbl	target_size(ap),r0	; get prec of target
+	ashp	r1,#31,inter_result(fp),#0,r0,@target_address(ap);
+100$:	ret				; done
+;
+; select action based on character type
+;
+select_action:
+	case	r0,<-			; case on character location in table
+		error,-			; zero is bad case
+		pass_nega_digit,-	; pass overpunched digit
+		pass_nega_digit,-	; pass overpunched digit
+		pass_nega_digit,-	; pass overpunched digit
+		pass_nega_digit,-	; pass overpunched digit
+		pass_nega_digit,-	; pass overpunched digit
+		pass_nega_digit,-	; pass overpunched digit
+		pass_nega_digit,-	; pass overpunched digit
+		pass_nega_digit,-	; pass overpunched digit
+		pass_nega_digit,-	; pass overpunched digit
+		pass_nega_digit,-	; pass overpunched digit
+		pass_pos_digit,-	; pass overpunched digit
+		pass_pos_digit,-	; pass overpunched digit
+		pass_pos_digit,-	; pass overpunched digit
+		pass_pos_digit,-	; pass overpunched digit
+		pass_pos_digit,-	; pass overpunched digit
+		pass_pos_digit,-	; pass overpunched digit
+		pass_pos_digit,-	; pass overpunched digit
+		pass_pos_digit,-	; pass overpunched digit
+		pass_pos_digit,-	; pass overpunched digit
+		pass_pos_digit,-	; pass overpunched digit
+		next_character,-	; skip star
+		next_character,-	; skip space
+		db_test,-		; test for db
+		db_test,-		; test for db
+		cr_test,-		; test for cr
+		cr_test,-		; test for cr
+		next_character,-	; skip $
+		next_character,-	; skip ,
+		next_character,-	; skip .
+		next_character,-	; skip /
+		pass_sign,-		; found -
+		pass_sign,-		; found +
+		pass_digit,-		; move normal digit
+		pass_digit,-		; move normal digit
+		pass_digit,-		; move normal digit
+		pass_digit,-		; move normal digit
+		pass_digit,-		; move normal digit
+		pass_digit,-		; move normal digit
+		pass_digit,-		; move normal digit
+		pass_digit,-		; move normal digit
+		pass_digit,-		; move normal digit
+		pass_digit,-		; move normal digit
+		pass_digit>		; move normal digit
+;
+; case subroutines
+;
+pass_digit:
+	movb	r3,(r8)+		; pass digit
+	brw	next_character		;
+pass_sign:
+	tstb	found_sign(fp)		; sign found already?
+	bneq	10$			; if neq then error
+	movb	r3,found_sign(fp)	; save sign character
+	brw	next_character		; 
+10$:	brw	error			; signal error
+ 
+	.enabl	lsb
+db_test:
+	cmpl	#2,r6			; one character left?
+	bneq	5$			; if neq then must be digit
+	cmpb	(r7),#^a/b/		; lower b?
+	beql	10$			; if eql then ok
+	cmpb	(r7),#^a/B/		; upper b?
+	beql	10$			; if eql then yes
+	brb	5$			; treat as positive digit
+cr_test:
+	cmpl	#2,r6			; one character left?
+	bneq	5$			; if neq then must be digit
+	cmpb	(r7),#^a/r/		; lower r?
+	beql	10$			; if eql then ok
+	cmpb	(r7),#^a/R/		; upper r?
+	beql	10$			; if eql then ok
+5$:	brb	pass_pos_digit		; pass positive overpunch digit
+10$:	incl	r7			; pass second character
+	decl	r6			; sount the character
+	movb	#^a/-/,found_sign(fp)	; set sign
+	brw	next_character		; try next character
+20$:	brw	error			; not valid string
+ 
+	.dsabl	lsb
+pass_pos_digit:
+	tstb	found_sign(fp)		; sign character seen?
+	bneq	10$			; if neq then no
+	bitb	#pic_m_t_format!pic_m_i_format,pic$b_flags(r11); legal in set?
+	beql	10$			; if eql then no
+	movb	#^a/+/,found_sign(fp)	; set sign character
+	movb	over_punch_value[r0],(r8)+; insert character based on table index
+	brw	next_character		;
+10$:	brw	error			; signal error
+pass_nega_digit:
+	tstb	found_sign(fp)		; sign character seen?
+	bneq	10$			; if neq then no
+	bitb	#pic_m_t_format!pic_m_r_format,pic$b_flags(r11); legal in set?
+	beql	10$			; if eql then no
+	movb	#^a/-/,found_sign(fp)	; set sign character
+	movb	over_punch_value[r0],(r8)+; insert character based on table index
+	brw	next_character		;
+10$:	brw	error			; signal error
+	.page
+	.sbttl	pli$valid_pic - validate picture value
+;++
+; pli$valid_pic - validate picture value
+;
+; functional description:
+;
+; This routine is used by the valid-bif and EDIT I/O to validate picture
+; values.
+;
+; inputs:
+;
+;	0(ap) = 3
+;	4(ap) = picture constant address
+;	8(ap) = size of the test string
+;	12(ap) = address of the test string
+;
+; outputs:
+;
+;	r0 = validity indicator
+;
+; ERROR maybe signalled.
+;--
+	.entry	pli$valid_pic,^m<r2,r3,r4,r5,r6>
+	movl	4(ap),r6		; address picture constant
+	subl	#31,sp			; allocate enough space for convert
+	movl	sp,r5			; copy address of target string
+	pushl	r5			; convert to numeric
+	movzwl	pic$w_pq(r6),-(sp)	; target p,q
+	pushl	12(ap)			; pass source address
+	pushl	8(ap)			; pass source size
+	pushl	r6			; pass constant address
+	calls	#5,w^pli$cvt_fr_pic	; convert to numeric
+	movzbl	pic$b_byte_size(r6),r4	; get size of result
+	subl	r4,sp			; allocate space
+	movl	sp,r3			; copy result address
+	pushl	r3			; convert to picture
+	pushl	r4			;
+	pushl	r5			;
+	movzwl	pic$w_pq(r6),r2		; 
+	pushl	r2			;
+	pushl	r6			;
+	calls	#5,w^pli$cvt_to_pic	;
+	cmpc5	r4,(r3),#32,8(ap),@12(ap); compare strings
+	bneq	10$			; if neq then continue
+	movl	#1,r0			; set success
+	ret
+10$:	clrl	r0			; set failure
+	ret
+	.end

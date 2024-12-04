@@ -1,0 +1,689 @@
+MODULE MESSAGE (%TITLE 'Print Symbiont -- message routines'
+	IDENT = 'V04-000',
+	ADDRESSING_MODE (EXTERNAL = GENERAL)
+	) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:
+!	Print Symbiont.
+!
+! ABSTRACT:
+!	Processes messages received from the job controller.
+!
+! ENVIRONMENT:
+!	VAX/VMS user mode.
+!--
+!
+! AUTHOR: G. Robert, CREATION DATE: 31-Aug-1982
+!
+! MODIFIED BY:
+!
+!	3B-007  RRB3007		Rowland R. Bradley	20-Jul-1984
+!		Change Signal_Stop(...,PSM$_INVREQCOD) to CODEERR_.
+!
+!	3B-006	GRR3006		Gregory R. Robert	29-Apr-1984
+!		FT2 bugfixes.  Call output routine with explicit OPEN
+!		and CLOSE functions.
+!
+!	3B-005	RRB3005		Rowland R. Bradley	27-Apr-1984
+!		Properly increment the job burst character.  Added the
+!		reference to last_entry_number.
+!
+!	3B-004	GRR3004		Gregory R. Robert	23-Mar-1984
+!		Replace burst_character with job_burst_char and
+!		file_burst_char.
+!
+!	3B-003	GRR3003		Gregory R. Robert	23-Aug-1983
+!		Bugfixes, page_setup_modules, form_setup_modules,
+!		sheet_feed, symbiont initiated pause_task and stop_stream,
+!		hangup code, read and write item services
+!
+!	3B-002	GRR3002		Gregory R. Robert	03-Aug-1983
+!		Rewrite for new design.
+!
+!	3B-001	GRR3001		Gregory R. Robert	23-Jul-1983
+!		Created new module.
+!
+!
+!**
+
+LIBRARY 'SYS$LIBRARY:LIB';
+REQUIRE 'LIB$:SMBDEF';
+REQUIRE 'SRC$:SMBREQ';
+
+EXTERNAL ROUTINE
+	PSM$ALLOCATE_SCB,
+	PSM$FUNCTION_DISPATCH,
+	PSM$INITIALIZE_SCB,
+	SMB$READ_MESSAGE,
+	PSM$RESET_SCB,
+	SMB$SEND_TO_JOBCTL,
+	PSM$STORE_ERRORS,
+	PSM$UPDATE_SCB
+	;
+
+EXTERNAL
+	PSM$GL_SCBVEC	: VECTOR,
+	PSM$SRV	: BLOCKVECTOR[,SRV_S_SRV, BYTE]
+	;
+
+FORWARD ROUTINE
+	PSM$RECEIVE_MESSAGE_AST	,
+
+	KEEP_ALIVE		: NOVALUE,
+	NOTIFY_ALL		,
+	PAUSE_TASK		: NOVALUE,
+	RESUME_TASK		: NOVALUE,
+	START_STREAM		: NOVALUE,
+	START_TASK		: NOVALUE,
+	STOP_STREAM		: NOVALUE,
+	STOP_TASK		: NOVALUE
+	;
+
+OWN
+	TIMER_ACTIVE	: WORD
+	;
+
+%SBTTL 'RECEIVE_MESSAGE_AST'
+! Functional Description:
+!		?desc
+!
+! Formal Parameters:
+!		?desc
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		none
+!--
+GLOBAL ROUTINE PSM$RECEIVE_MESSAGE_AST 
+	=
+BEGIN
+
+OWN
+	MSGSRV_TABLE	: VECTOR [8] PSECT (CODE) PRESET (
+	    [0]				= 0,
+	    [SMBMSG$K_PAUSE_TASK]	= PAUSE_TASK,
+	    [SMBMSG$K_RESET_STREAM]	= STOP_STREAM,
+	    [SMBMSG$K_RESUME_TASK]	= RESUME_TASK,
+	    [SMBMSG$K_START_STREAM]	= START_STREAM,
+	    [SMBMSG$K_START_TASK]	= START_TASK,
+	    [SMBMSG$K_STOP_STREAM]	= STOP_STREAM,
+	    [SMBMSG$K_STOP_TASK]	= STOP_TASK)
+	;
+
+LOCAL
+	MSG_DESC	: $DYNAMIC_DESC,
+	NOTIFY_STATUS	,
+	REQUEST		,
+	SCB		: REF $BBLOCK,
+	STREAM
+	;
+
+SIGNAL_IF_ERROR_ (SMB$READ_MESSAGE (STREAM, MSG_DESC, REQUEST));
+
+IF .REQUEST GEQU %ALLOCATION (MSGSRV_TABLE) / 4
+OR .MSGSRV_TABLE [.REQUEST] EQL 0
+THEN
+    CODEERR_ ;
+
+SCB = .PSM$GL_SCBVEC [.STREAM];
+
+IF .SCB EQL 0
+THEN
+    BEGIN
+    PSM$ALLOCATE_SCB (SCB);
+    PSM$INITIALIZE_SCB (.SCB);
+    PSM$GL_SCBVEC [.STREAM] = .SCB;
+    SCB[PSM$L_STREAM_INDEX] = .STREAM;
+    SCB[PSM$B_FILE_BURST_CHAR] = %C 'Z';
+    SCB[PSM$B_JOB_BURST_CHAR] = %C '9';
+    END;
+
+
+IF .REQUEST EQL SMBMSG$K_START_STREAM
+THEN
+    BEGIN
+    VECTOR [SCB[PSM$T_CONDITION_AREA],0] = 0;
+    SCB[PSM$L_SERVICE_STATUS] = SS$_NORMAL;
+    END;
+
+
+IF .REQUEST EQL SMBMSG$K_START_TASK
+THEN
+    PSM$RESET_SCB (.SCB);
+
+
+! If currently paused by job controller then clear pending
+!
+IF TESTBITSC (SCB[PSM$V_RESUME_WAIT])
+THEN
+    SCB[PSM$L_SERVICE_STATUS] = SS$_NORMAL;
+
+
+SCB [PSM$L_REQUEST_RESPONSE] = .REQUEST;
+PSM$UPDATE_SCB (.SCB, MSG_DESC);
+
+NOTIFY_STATUS = NOTIFY_ALL (.SCB, .REQUEST);
+
+IF NOT .NOTIFY_STATUS THEN PSM$STORE_ERRORS (SCB, .NOTIFY_STATUS);
+
+BLISS (.MSGSRV_TABLE [.REQUEST], .SCB);
+
+SS$_NORMAL
+
+END;
+
+%SBTTL 'KEEP_ALIVE'
+! Functional Description:
+!		?desc
+!
+! Formal Parameters:
+!		?desc
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		none
+!--
+ROUTINE KEEP_ALIVE ( 
+	STARTUP
+	) : NOVALUE =
+BEGIN
+
+PARAMETER_INDEX_ (STARTUP);
+
+LOCAL
+	BUSY_STREAM	: INITIAL (0)
+	;
+
+DECR I FROM PSM$K_MAXSTREAMS - 1
+DO
+    BEGIN
+    LOCAL SCB	: REF $BBLOCK;
+    SCB = .PSM$GL_SCBVEC [.I];
+    IF .SCB NEQ 0
+    THEN
+	IF .SCB[PSM$V_BUSY]
+	THEN
+	    BEGIN
+	    BUSY_STREAM = 1;
+	    IF .SCB[PSM$L_REQUEST_RESPONSE] NEQ SMBMSG$K_PAUSE_TASK
+	    AND NOT .SCB[PSM$V_SUPPRESS_OUTPUT]
+	    THEN
+		IF .SCB[PSM$L_KEEP_ALIVE] EQL .SCB[PSM$L_OUTPUT_QIOS]
+		THEN
+		    BEGIN
+		    IF TESTBITCS
+			($BBLOCK[SCB[PSM$L_DEVICE_STATUS],SMBMSG$V_STALLED])
+		    THEN
+			SMB$SEND_TO_JOBCTL (
+			    SCB[PSM$L_STREAM_INDEX],	! - stream number
+			    0,				! - asynchronous response
+			    0,				! - no accounting
+			    0,				! - no checkpoint
+			    SCB[PSM$L_DEVICE_STATUS]	! - device status
+				);
+		    END
+		ELSE
+		    SCB[PSM$L_KEEP_ALIVE] = .SCB[PSM$L_OUTPUT_QIOS];
+	    END;
+    END;
+
+IF .BUSY_STREAM
+THEN
+    BEGIN
+    SIGNAL_IF_ERROR_ ($SETIMR (DAYTIM=UPLIT(-300000000,-1), ASTADR=KEEP_ALIVE));
+    TIMER_ACTIVE = 1;
+    END
+ELSE
+    TIMER_ACTIVE = 0;
+
+END;
+
+%SBTTL 'NOTIFY_ALL'
+! Functional Description:
+!		?desc
+!
+! Formal Parameters:
+!		?desc
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		none
+!--
+ROUTINE NOTIFY_ALL ( 
+	SCB	: REF $BBLOCK,
+	REQUEST	
+	) =
+BEGIN
+
+! Generate a table that converts SMBMSG$ request codes to their
+! corresponding PSM$K_FUNC codes
+!
+OWN
+	REQFUN_TABLE	: VECTOR [8] PSECT (CODE) PRESET (
+	    [0]				= 0,
+	    [SMBMSG$K_PAUSE_TASK]	= PSM$K_PAUSE_TASK,
+	    [SMBMSG$K_RESET_STREAM]	= PSM$K_STOP_STREAM,
+	    [SMBMSG$K_RESUME_TASK]	= PSM$K_RESUME_TASK,
+	    [SMBMSG$K_START_STREAM]	= PSM$K_START_STREAM,
+	    [SMBMSG$K_START_TASK]	= PSM$K_START_TASK,
+	    [SMBMSG$K_STOP_STREAM]	= PSM$K_STOP_STREAM,
+	    [SMBMSG$K_STOP_TASK]	= PSM$K_STOP_TASK)
+	;
+
+LOCAL SERVICE_STATUS : INITIAL (SS$_NORMAL);
+
+INCRU I TO PSM$K_MAX - 1
+DO
+    BEGIN
+    BIND SERVICE = PSM$SRV[.I, 0,0,0,0] : $BBLOCK;
+
+    IF .SERVICE[SRV_A_SERVICE] NEQ 0
+    THEN
+	SERVICE_STATUS = BLISS (
+	    .SERVICE[SRV_A_SERVICE],		!  - all services
+	    SCB,				!  - SCB address by reference
+	    SCB[PSM$R_USER_CONTEXT_AREA],	!  - user context area
+	    REQFUN_TABLE[.REQUEST],		!  - request --> function
+	    0,					!  - <not used>
+	    0					!  - <not used>
+	    );
+
+    IF NOT .SERVICE_STATUS THEN EXITLOOP;
+    IF .SERVICE_STATUS EQL PSM$_PENDING THEN CODEERR_ ;
+
+    END;
+
+.SERVICE_STATUS
+
+END;
+
+%SBTTL 'PAUSE_TASK'
+! Functional Description:
+!		?desc
+!
+! Formal Parameters:
+!		?desc
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		none
+!--
+ROUTINE PAUSE_TASK ( 
+	SCB	: REF $BBLOCK
+	)	: NOVALUE =
+BEGIN
+
+REQUEST_FLAG_ (PAUSE_COMPLETE) = 1;
+
+SCB[PSM$L_STOP_PAGE] = .SCB[PSM$L_PAGE] + 1;
+
+PSM$FUNCTION_DISPATCH (.SCB);
+
+END;
+
+%SBTTL 'RESUME_TASK'
+! Functional Description:
+!		?desc
+!
+! Formal Parameters:
+!		?desc
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		none
+!--
+ROUTINE RESUME_TASK ( 
+	SCB	: REF $BBLOCK
+	)	: NOVALUE =
+BEGIN
+
+LOCAL
+	TARGET	: SIGNED
+	;
+
+! First compute the start page
+!
+
+! Assume the current page
+!
+TARGET = .SCB[PSM$L_PAGE];
+
+
+! START /QUEUE /TOP_OF_FORM
+!
+IF TESTBITSC (REQUEST_FLAG_ (TOP_OF_FILE)) THEN TARGET = 1;
+
+
+! START /QUEUE /FORWARD=pages or /BACKWARD=pages
+!
+IF TESTBITSC (ITEM_PRESENT_ (RELATIVE_PAGE))
+THEN
+    TARGET = .TARGET + .SCB[PSM$L_RELATIVE_PAGE];
+
+
+! Range check -- PRINT /PAGES=(first,last)
+!
+IF .TARGET LSSU 1 THEN TARGET = 1;
+IF .TARGET LSSU .SCB[PSM$L_FIRST_PAGE] THEN TARGET = .SCB[PSM$L_FIRST_PAGE];
+IF .ITEM_PRESENT_ (LAST_PAGE)
+THEN
+    IF .TARGET GTRU .SCB[PSM$L_LAST_PAGE] THEN TARGET = .SCB[PSM$L_LAST_PAGE];
+
+SCB[PSM$L_START_PAGE] = .TARGET;
+
+PSM$FUNCTION_DISPATCH (.SCB);
+
+END;
+
+%SBTTL 'START_STREAM'
+! Functional Description:
+!		?desc
+!
+! Formal Parameters:
+!		?desc
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		none
+!--
+ROUTINE START_STREAM ( 
+	SCB	: REF $BBLOCK
+	)	: NOVALUE =
+BEGIN
+
+BIND OUTPUT = PSM$SRV [PSM$K_OUTPUT,0,0,0,0] : $BBLOCK;
+
+LOCAL
+	STATUS_1
+	;
+
+SCB[PSM$V_ACTIVE] = 1;			! Mark queue started
+
+STATUS_1 = BLISS (
+    .OUTPUT[SRV_A_SERVICE],		!  - output service
+    SCB,				!  - SCB address by reference
+    SCB[PSM$R_USER_CONTEXT_AREA],	!  - user context area
+    UPLIT (PSM$K_OPEN),			!  - OPEN function
+    SCB[PSM$Q_DEVICE_NAME],		!  - Device name
+    SCB[PSM$L_DEVICE_STATUS]		!  - Device status
+    );
+
+IF NOT .STATUS_1 THEN PSM$STORE_ERRORS (SCB, .STATUS_1);
+
+SMB$SEND_TO_JOBCTL (
+	SCB[PSM$L_STREAM_INDEX],		! - stream number
+	SCB[PSM$L_REQUEST_RESPONSE],		! - responding to ...
+	0,					! - no accounting
+	0,					! - no checkpoint
+	SCB[PSM$L_DEVICE_STATUS],		! - device status
+	SCB[PSM$T_CONDITION_AREA]		! - errors, if any
+	);
+
+END;
+
+%SBTTL 'START_TASK'
+! Functional Description:
+!		?desc
+!
+! Formal Parameters:
+!		?desc
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		none
+!--
+ROUTINE START_TASK ( 
+	SCB	: REF $BBLOCK
+	)	: NOVALUE =
+BEGIN
+
+BIND
+	PFLAGS = SCB[PSM$L_PRINT_CONTROL]	: $BBLOCK,
+	SERVICE = PSM$SRV[PSM$K_MAIN_INPUT, 0,0,0,0] : $BBLOCK
+	;
+
+SCB[PSM$V_BUSY] = 1;
+
+IF NOT .TIMER_ACTIVE
+THEN
+    KEEP_ALIVE ();
+
+
+! Advance the job sequence character if a new or restarted job
+!
+IF (.SCB[PSM$L_ENTRY_NUMBER] NEQU .SCB[PSM$L_LAST_ENTRY_NUMBER])
+OR .REQUEST_FLAG_ (RESTARTING)
+THEN
+    BEGIN
+    SCB[PSM$L_LAST_ENTRY_NUMBER] = .SCB[PSM$L_ENTRY_NUMBER];
+    INCREMENT_ (SCB[PSM$B_JOB_BURST_CHAR]);
+    IF .SCB[PSM$B_JOB_BURST_CHAR] GTRU %C '9'
+    THEN
+	SCB[PSM$B_JOB_BURST_CHAR] = %C '0';
+    END;
+
+
+! Always advance the file sequence character
+!
+INCREMENT_ (SCB[PSM$B_FILE_BURST_CHAR]);
+IF .SCB[PSM$B_FILE_BURST_CHAR] GTRU %C 'Z'
+THEN
+    SCB[PSM$B_FILE_BURST_CHAR] = %C 'A';
+
+
+IF (.SCB[PSM$L_FORM_LENGTH] - .SCB[PSM$L_TOP_MARGIN]) -
+    .SCB[PSM$L_BOTTOM_MARGIN] LSSU 3
+THEN
+    PFLAGS[SMBMSG$V_PAGE_HEADER] = 0;
+
+SIGNAL_IF_ERROR_ ($GETTIM (TIMADR = SCB[PSM$Q_TIME_PRINTED]));
+
+IF 1				  THEN SERVICE_LIST_ (JOB_SETUP)	= 1;
+IF 1				  THEN SERVICE_LIST_ (FORM_SETUP)	= 1;
+IF .SEPARATE_FLAG_ (JOB_FLAG)	  THEN SERVICE_LIST_ (JOB_FLAG)		= 1;
+IF .SEPARATE_FLAG_ (JOB_BURST)	  THEN SERVICE_LIST_ (JOB_BURST)	= 1;
+IF 1				  THEN SERVICE_LIST_ (FILE_SETUP)	= 1;
+IF .SEPARATE_FLAG_ (FILE_FLAG)	  THEN SERVICE_LIST_ (FILE_FLAG)	= 1;
+IF .SEPARATE_FLAG_ (FILE_BURST)	  THEN SERVICE_LIST_ (FILE_BURST)	= 1;
+IF 1				  THEN SERVICE_LIST_ (FILE_SETUP_2)	= 1;
+IF .ITEM_PRESENT_ (FILE_IDENTIFICATION) THEN SERVICE_LIST_ (MAIN_INPUT)= 1
+				  ELSE PSM$STORE_ERRORS (.SCB, PSM$_NOFILEID);
+IF .ITEM_PRESENT_ (MESSAGE_VECTOR)THEN SERVICE_LIST_ (FILE_INFORMATION)	= 1;
+IF .SEPARATE_FLAG_ (FILE_TRAILER) THEN SERVICE_LIST_ (FILE_TRAILER)	= 1;
+IF .SEPARATE_FLAG_ (JOB_RESET)	  THEN SERVICE_LIST_ (JOB_RESET)   	= 1;
+IF .SEPARATE_FLAG_ (JOB_TRAILER)  THEN SERVICE_LIST_ (JOB_TRAILER)	= 1;
+IF 1				  THEN SERVICE_LIST_ (JOB_COMPLETION)	= 1;
+
+SCB[PSM$B_STATE] = 0;
+
+PSM$FUNCTION_DISPATCH (.SCB)
+
+END;
+
+%SBTTL 'STOP_STREAM'
+! Functional Description:
+!		?desc
+!
+! Formal Parameters:
+!		?desc
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		none
+!--
+ROUTINE STOP_STREAM ( 
+	SCB	: REF $BBLOCK
+	)	: NOVALUE =
+BEGIN
+
+BIND OUTPUT = PSM$SRV [PSM$K_OUTPUT,0,0,0,0] : $BBLOCK;
+
+LOCAL
+	STATUS_1	,
+	STATUS_2
+	;
+
+
+PSM$STORE_ERRORS (SCB, .SCB[PSM$L_STOP_CONDITION]);
+SCB[PSM$V_RESET] = 1;
+SCB[PSM$V_EOF] = 1;
+
+STATUS_1 = BLISS (
+    .OUTPUT[SRV_A_SERVICE],		!  - output service
+    SCB,				!  - SCB address by reference
+    SCB[PSM$R_USER_CONTEXT_AREA],	!  - user context area
+    UPLIT (PSM$K_CANCEL),		!  - CANCEL function
+    0,					!  - <not used>
+    0					!  - <not used>
+    );
+
+IF NOT .STATUS_1 THEN PSM$STORE_ERRORS (SCB, .STATUS_1);
+
+STATUS_2 = BLISS (
+    .OUTPUT[SRV_A_SERVICE],		!  - output service
+    SCB,				!  - SCB address by reference
+    SCB[PSM$R_USER_CONTEXT_AREA],	!  - user context area
+    UPLIT (PSM$K_CLOSE),		!  - CLOSE function
+    0,					!  - <not used>
+    0					!  - <not used>
+    );
+
+IF NOT .STATUS_2 THEN PSM$STORE_ERRORS (SCB, .STATUS_2);
+
+SCB[PSM$V_ACTIVE] = 0;			! Mark queue stopped
+
+PSM$FUNCTION_DISPATCH (.SCB);
+
+END;
+
+%SBTTL 'STOP_TASK'
+! Functional Description:
+!		?desc
+!
+! Formal Parameters:
+!		?desc
+! Implicit Inputs:
+!		none
+!
+! Implicit Outputs:
+!		none
+!
+! Returned Value:
+!		none
+!
+! Side Effects:
+!		none
+!--
+ROUTINE STOP_TASK ( 
+	SCB	: REF $BBLOCK
+	)	: NOVALUE =
+BEGIN
+
+BIND OUTPUT = PSM$SRV [PSM$K_OUTPUT,0,0,0,0] : $BBLOCK;
+
+LOCAL
+	STATUS_1
+	;
+
+PSM$STORE_ERRORS (.SCB, .SCB[PSM$L_STOP_CONDITION]);
+
+STATUS_1 = BLISS (
+    .OUTPUT[SRV_A_SERVICE],		!  - output service
+    SCB,				!  - SCB address by reference
+    SCB[PSM$R_USER_CONTEXT_AREA],	!  - user context area
+    UPLIT (PSM$K_CANCEL),		!  - CANCEL function
+    0,					!  - <not used>
+    0					!  - <not used>
+    );
+
+IF NOT .STATUS_1 THEN PSM$STORE_ERRORS (SCB, .STATUS_1);
+
+PSM$FUNCTION_DISPATCH (.SCB);
+
+END;
+
+END
+ELUDOM

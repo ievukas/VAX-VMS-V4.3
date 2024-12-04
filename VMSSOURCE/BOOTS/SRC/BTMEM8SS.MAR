@@ -1,0 +1,353 @@
+	.TITLE	BTMEM8SS - Configure and Test 11/8SS Memory
+	.IDENT	'V04-000'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+;
+; FACILITY:
+;
+;	Linked with VMB.EXE - part of the
+;	bootstrap module for VAX 11/8SS hardware.
+;
+; ENVIRONMENT:
+;
+;	Runs at IPL 31, kernel mode, memory management is OFF, IS=1
+;	(running on interrupt stack), and code must be PIC.
+;
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is 11/8SS specific and
+;	determines how many memory controllers are on the system,
+;	where they are, how much memory they control, which pages
+;	of that memory are present (and good). Then the routines
+;	set bits in the PFN bitmap to represent each present (and
+;	good) page of memory.
+;
+;	As a side effect, the routines store the type of adapter located
+;	at each bus slot in the RPB.
+;
+; INPUTS:
+;
+;	R7	- address of the SCB
+;	R11	- address of the RPB
+;
+; IMPLICIT INPUTS:
+;
+;	The positions on the 11/8SS system bus, the BI, are called nodes, and
+;	are identified by node numbers 0-15.
+;
+;	BI I/O space begins at ^x20000000 (512MB), and each node occupies
+;	an 8KB node space of registers.
+;
+;	BI nodes are self identifying in that the first register (relative 0)
+;	in the node space is constrained to be the DEVTYPE register.  The
+;	format of this register is as follows:
+;
+;        31                           16 15 14         8 7             0
+;	+-------------------------------+--+------------+---------------+
+;	|                               |N |MBZ for     |               |
+;	|                               |D |   memory   |               |
+;       |       Revision Code           +--+------------+---------------+
+;	|                               |                               |
+;	|                               |          Device Type          |
+;	+-------------------------------+-------------------------------+
+;
+;	This register is to be interpreted as follows:
+;
+;		 The Device Type field is broken up into three sub-fields.
+;		   The main sub-field of interest here is the one defined
+;		   by bits <14:08>.  If this sub-field is zero then this
+;		   node is a BI memory node.  All other types of node,
+;		   i.e. processors, adapters, etc., are constrained to
+;		   have non-zero values here.
+;
+;		   The ND field, bit <15>, if non-zero, indicates that the
+;		   node is a non-DEC device.
+;
+;
+; OUTPUTS:
+;
+;	R7, R8, R11, and SP are preserved
+;	All others (including AP and FP) are altered
+;
+; IMPLICIT OUTPUTS:
+;
+;	The PFN bitmap is modified to describe all of physical memory.
+;
+;	RPB$L_PFNCNT stores the number of pages of physical memory.
+;
+;
+; AUTHOR:
+;
+;	Robert L. Rappaport, creation date 10-Oct-1983
+;
+; REVISION HISTORY:
+;
+;	V03-002	RLR0001		Robert L. Rappaport	6-Apr-1984
+;		Several modifications.  1) Test for BROKE bit, and do NOT
+;		test memory if set; 2) Clear error bits in CSR1 and CSR2;
+;		3) move replacement of Machine Check handler from loop;
+;		4) PUSHL original Machine Check handler addr and POPL it
+;		after loop.
+;
+;--
+
+	.SBTTL	Declarations
+
+	.DEFAULT DISPLACEMENT, WORD
+
+;
+; Macros to describe VMS data structures
+;
+
+	$BIICDEF			; BIIC registers
+	$BIMEMDEF			; BI Memory registers
+	$DMPDEF				; System dump file header definitions
+	$IO8SSDEF			; 11/8SS definitions
+	$NDTDEF				; Nexus device types
+	$PRDEF				; Processor registers
+	$PR8SSDEF			; CPU Specific Processor registers
+	$RPBDEF				; Restart parameter block
+	$BUADEF				; BI-UNIBUS adapter
+
+;
+; Macros
+;
+
+	.MACRO	ERROR,STR		; Outputs an error string to the
+	BSBW	ERROUT			; console terminal.
+	.ASCIZ	STR
+	.ENDM	ERROR
+
+	.PSECT	YBTMEM,LONG
+
+	.SBTTL	CHECKMEM_8SS, Identify 11/8SS memory
+
+;++
+;
+; CHECKMEM_8SS, Locate and test memory for 11/8SS
+;
+;--
+
+CHECKMEM_8SS::				; Entry for 11/8SS.
+
+;
+; Start testing slot positions to find adapters. First save the stack
+; position so it can be restored after a machine check.
+;
+
+INIT_SEARCH:				; Start searching for adapters
+
+; Save original machine check handler address on stack.
+
+	PUSHL	4(R7)			; Save original handler address.
+	MOVL	SP,FP			; Save current top of stack.
+
+;
+; Set up the physical address of the 1st slot on the system bus and
+; the address of the adapter type table.
+;
+
+	MOVAB	@#IO8SS$AL_IOBASE,R4	; Get address of 1st slot.
+	MOVZBL	#IO8SS$AL_NNEX,AP	; Set up NEXUS loop counter.
+
+;
+; During this memory locate and test loop, the following registers are
+; used:
+;
+;	R0	- the contents of the slot's configuration register
+;	R4	- address of the configuration register at the current
+;		  slot position
+;	R7	- address of the SCB
+;	R9	- bit setting in memory present map;
+;		  starting page number in this controller
+;	R10	- address of the memory description list in RPB (pagcnt & pfn)
+;	R11	- address of the RPB
+;
+; Initialize R10 (RPB  memory descripter list pointer) for search loop
+;
+	MOVAB	RPB$L_MEMDSC(R11),R10	; Set pointer to memory description list
+	BICL	#<RPB$M_MPM ! RPB$M_USEMPM ! RPB$M_FINDMEM>, -
+		RPB$L_BOOTR5(R11)	; Clear all MA780-specific boot flags
+ 
+
+TRY_NEXUS_8SS:				; Memory locate and test loop.
+
+; Set up a machine check fault handler to gain control if the main loop
+; here addresses a non-existent configuration register (an empty slot).
+; Note we do this within the loop since we re-set to another machine
+; check handler later on in the loop.
+
+	MOVAB	B^DO_NEXT_8SS+1,4(R7)	; Set up fault handler (+1 for
+					; handler execution on the
+					; interrupt stack).
+
+; Then read the slot's configuration register.
+
+	MOVL	(R4),R0			; Read CR at current slot.
+
+;
+; Execution continues here if the configuration register is present.
+; If the adapter type is a memory controller, proceed to test memory.
+; Otherwise, move to the next BI slot.
+;
+
+
+	EXTZV	#BIIC$V_MEMNODE,-	; Extract sub-field of BI devtype
+		#BIIC$S_MEMNODE,R0,R0	;  field that tells if we have memory.
+	BNEQ	DO_NEXT_8SS		; No, advance to next slot.
+
+; Here check BROKE bit to see if memory passed self test.
+
+	MOVL	BIMEM$L_CSR1(R4),R0	; Read CSR containing BROKE bit.
+	BBS	#BIMEM$V_BROKE,-	; If BROKE, ignore this node.
+		R0,DO_NEXT_8SS
+
+; Memory controller found:
+
+	MOVL	BIIC$L_SAR(R4),R0	; R0 = Starting Address for this memory.
+	MOVL	BIIC$L_EAR(R4),R1	; R1 = Ending Address for this memory.
+	ROTL	#<32-9>,R0,R9		; Equivalent of ASHL #-9,R0,R9. Result
+					;  is starting PFN to R9.
+	SUBL3	R0,R1,R3		; R3 = length of memory segment in bytes.
+	ROTL	#<32-9>,R3,R3		; Equivalent of ASHL #-9,R3,R3. Result
+					;  is # of pages to R3.
+
+	MOVL	R3,(R10)+		; Save # of pages in this memory
+	ASSUME	DMP$V_TR EQ 24
+	ASSUME	DMP$S_TR EQ 8
+	MOVB	#IO8SS$AL_NNEX,-1(R10)	; Compute the TR number for this
+	SUBB	AP,-1(R10)		; memory and store in descriptor
+	MOVL	R9,(R10)+		; Save starting PFN for this memory
+
+;
+; Before starting memory test, establish a page skipping handler for
+; machine checks, and turn off the cache so that writes followed by
+; reads to memory don't write to memory and then read from the cache.
+; Also, enable CRD error reporting if requested by the RPB BOOTR5 flag.
+;
+
+	MOVAB	PAGE_MCHECK_8SS+1,4(R7)	; Set page skipping handler (+1
+					; for interrupt stack).
+	MTPR	#PR8SS$M_CADR_D,-	; Turn off memory cache.
+		#PR8SS$_CADR
+	MOVAB	TEST_QUAD_8SS,R2	; Page test routine address
+	BSBW	BOO$TEST_MEM		; Test the specified range of PFN's
+	BRB	DO_NEXT_8SS		; Do the next controller if any
+
+	.ALIGN	LONG			; Longword-aligned handler.
+
+;
+; Fault handler for non-existent configuration register, or unreadable
+; registers, or a non-memory controller slot device. Restore stack
+; pointer, clear all errors, and try for another slot if any remain.
+;
+
+DO_NEXT_8SS:				; Skip to next slot.
+	MOVL	FP,SP			; Restore stack pointer.
+	MTPR	#-1,#PR$_MCESR		; Clear any faults.
+	MOVAB	IO8SS$AL_PERNEX(R4),R4	; Move to next slot.
+	SOBGTR	AP,TRY_NEXUS_8SS	; If still a slot, loop.
+
+;
+; Reestablish the normal machine check fault handler.
+;
+
+	ASSUME	PR8SS$V_CADR_D	EQ	0
+	MTPR	#0,#PR8SS$_CADR		; Re-enable cache.
+	POPL	4(R7)			; Restore original handler address.
+	CLRL	(R10)+			; Indicate end of RPB memory descr list
+	RSB				; Return to main routine.
+
+;++
+;
+; Functional Description:
+;
+;	Test a page of 8SS memory,
+;
+; Calling Sequence:
+;
+;	JSB	TEST_QUAD_8SS
+;
+; Inputs:
+;
+;	R0 =  starting address to test
+;	R1 =  Quad word iteration count (64)
+;	R4 => Node Registers
+;	R11=  Address of RPB
+;
+; Outputs:
+;
+;	Returns via RSB if the entire page is OK
+;	Error exit via Machine Check code to BOO$PAGE_MCHECK
+;
+;--
+
+TEST_QUAD_8SS:				; Test 1 quadword at a time.
+	CLRQ	(R0)			; Clear a quadword.
+	CMPL	(R0)+,(R0)+		; Read both longwords, and
+					; advance to next quadword.
+
+;
+; If no gross errors occur in the clear to the quadword or in the
+; subsequent read instruction, then execution continues below. Otherwise
+; execution goes to the fault handler.
+;
+
+	SOBGTR	R1,TEST_QUAD_8SS	; Continue clearing unless done.
+	MOVL	BIMEM$L_CSR1(R4),R1	; Read memory CSR1.
+	MOVL	R1,BIMEM$L_CSR1(R4)	; Re-write (write 1 to clear) CSR1.
+	MOVL	BIMEM$L_CSR2(R4),R1	; Read memory CSR2 and retain value
+					;  in R1 for later testing CRD bit.
+	MOVL	R1,BIMEM$L_CSR2(R4)	; Re-write (write 1 to clear) CSR2.
+	BBC	#RPB$V_CRDTEST,-	; Branch if CRD test is requested.
+		RPB$L_BOOTR5(R11),10$
+5$:	RSB
+;
+; Check if a CRD error occurred on this page.
+;
+10$:
+	BITL	#BIMEM$M_CRDLOGR,R1	; Test if CRD errors encountered.
+	BEQL	5$			; Branch if no CRD error occurred.
+	BRB	ERR_EXIT_8SS		; Else take error path.
+
+	.ALIGN	LONG			; All handlers longword-aligned.
+
+;
+; Handler that gains control when a page has gross memory errors. Just
+; clear the error, recover the stack top, and advance to the next page.
+;
+
+PAGE_MCHECK_8SS:			; Handle machine check.
+	MOVL	BIMEM$L_CSR1(R4),R1	; Read memory CSR1.
+	MOVL	R1,BIMEM$L_CSR1(R4)	; Re-write (write 1 to clear) CSR1.
+	MOVL	BIMEM$L_CSR2(R4),R1	; Read memory CSR2.
+	MOVL	R1,BIMEM$L_CSR2(R4)	; Re-write (write 1 to clear) CSR2.
+	MTPR	#-1,#PR$_MCESR		; Clear error indicator.
+ERR_EXIT_8SS:
+	BRW	BOO$PAGE_MCHECK		; Exit to common bad page code
+	.END

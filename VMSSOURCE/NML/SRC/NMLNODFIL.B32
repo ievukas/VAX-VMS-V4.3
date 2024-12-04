@@ -1,0 +1,1077 @@
+%TITLE	'Node File Routines for Network Management'
+MODULE NMLNODFIL (
+		LANGUAGE (BLISS32),
+		ADDRESSING_MODE (NONEXTERNAL=GENERAL),
+		ADDRESSING_MODE (EXTERNAL=GENERAL),
+		IDENT = 'V04-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	DECnet Network Management Listener (NML)
+!
+! ABSTRACT:
+!
+!	This module contains routines which manage the node permanent database
+!	files used by network management.  This file contains permanent data
+!	about the configuration of nodes in the network.
+!
+!	When AREA support was added to DECnet, the node database grew to a
+!	size that made the old database too slow (a SHOW NODE FOO searched
+!	through the database reading one record at a time, until FOO was
+!	found.  This module was created to use a four keyed file that
+!	allows single $GETs and $PUTs for each node, which is much faster.
+!	All other entities permanent databases have been left in the old
+!	format.
+!
+! ENVIRONMENT:	VAX/VMS Operating System
+!
+! AUTHOR:	Kathy Perko	, CREATION DATE:  6-July-1983
+!
+! MODIFIED BY:
+!	V03-005	MKP0005		Kathy Perko		2-July-1984
+!		Fix previous fix so that PURGE KNOWN NODES works.  The
+!		RFA is cleared when a record is deleted, so the check
+!		to see if the RFA has changed between passes, and the subsequent
+!		$GET gets an EOF.  Enhance the RFA check to skip the
+!		$GET if the RFA is zero.
+!		
+!	V03-004	MKP0004		Kathy Perko		23-April-1984
+!		Change NML$READ_KNOWN_NODE_REC to save the RFA (record file
+!		address) in case an intermediate operation (between the
+!		sequential reads) moves the "next record".  If the RFA
+!		has changed, do a $GET before reading the next node
+!		record.
+!
+!	V03-003	MKP0003		Kathy Perko		31-Mar-1984
+!		Move the node database conversion to the upgrade module
+!		(NMLUPGRAD)
+!
+!	V03-002	MKP0002		Kathy Perko		2-Mar-1984
+!		Fix node file create to use default name string of
+!		SYS$SYSTEM:.DAT.
+!
+!	V03-001	MKP0001		Kathy Perko		7-Feb-1984
+!		When converting the node database from the old format
+!		to the new, do the conversion to a temporary file in case
+!		the system crashes part way through.  Rename the file to
+!		it's correct name when done.
+!
+!--
+
+%SBTTL	'Definitions'
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+    NML$OPEN_NODE_FILE,			! Open node database file
+    NML$CLOSE_NODE_FILE,		! Close node database file
+    NML$READ_NODE_REC,			! Read a record from node database file
+    NML$WRITE_NODE_REC,			! Write a record from node database file
+    NML$DELETE_NODE_REC,		! Delete a record from node database file
+    NML_MAP_KEYS,			! Set up key used to access node db.
+    NML$READ_LOOPNODE,			! Get a loopnode for a specified circuit
+    NML$READ_KNOWN_NODE_REC,		! Read known records from node
+					!	database file
+    NML$CREATE_NODE_DB,			! Create new node database file
+    NML$CONNECT_NODE_RAB;		! Connect RAB for node database file
+!
+! INCLUDE FILES:
+!
+
+LIBRARY 'LIB$:NMLLIB.L32';
+LIBRARY 'SHRLIB$:NMALIBRY.L32';
+LIBRARY 'SYS$LIBRARY:STARLET.L32';
+
+!
+! OWN STORAGE:
+!
+OWN
+    nml$a_netnode_fab:		$FAB_DECL,
+    nml$a_netnode_rab:		$RAB_DECL,
+    nml$a_protection_xab:	$XABPRO_DECL,
+    nml$a_summary_xab:		$XABSUM_DECL,
+    nml$a_node_address_xab:	$XABKEY_DECL,
+    nml$a_node_name_xab:	$XABKEY_DECL,
+    nml$a_node_type_xab:	$XABKEY_DECL,
+    nml$a_node_list_xab:	$XABKEY_DECL,
+    nml$t_key_value:		VECTOR [3, WORD];
+
+GLOBAL
+    nml$gq_node_file_dsc	: VECTOR [2]
+		INITIAL (%CHARCOUNT ('NETNODE'),
+			 UPLIT BYTE ('NETNODE'));
+
+EXTERNAL LITERAL
+    nml$_nodcvterr;
+
+!
+! Declare common NML external references.
+!
+$nml_extdef;
+
+EXTERNAL ROUTINE
+    nma$searchfld,
+    nml$chkfileio,
+    nml$upgrade_perm_dbs,
+    nml$debug_txt,
+    nml$logfileop,
+    nml$logrecordop;
+
+
+%SBTTL 'nml$open_node_file  Open node permanent database file'
+GLOBAL ROUTINE nml$open_node_file =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine opens the node permanant database file.
+!
+! FORMAL PARAMETERS:
+!	None
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!	Failure or RMS error
+!
+!--
+
+BEGIN
+    
+LOCAL
+    fab:	REF BBLOCK,
+    status;
+
+status = rms$_suc;
+fab = nml$a_netnode_fab;
+IF .fab [fab$w_ifi] EQL 0 THEN		! If file isn't open, do it.
+    BEGIN
+    !
+    ! Open node database.  If there isn't one, create a new node database
+    ! file.  If the open succeeds, but the file only has one key, it's the
+    ! old node database format, so convert it.
+    !
+    $FAB_INIT (	FAB = .fab,
+		FAC = (GET,PUT,UPD,DEL),
+		DNM = 'SYS$SYSTEM:.DAT',	! Default filename string
+		FNA = .nml$gq_node_file_dsc [1],
+		FNS = .nml$gq_node_file_dsc [0],
+		SHR = (UPD, PUT, GET, DEL), 	! File sharing options
+		XAB = nml$a_summary_xab		! XAB Chain
+		);
+    $XABSUM_INIT (XAB = nml$a_summary_xab);	! XAB address
+
+    status = $OPEN (FAB = .fab);
+    IF .status THEN
+	BEGIN
+	!
+	! If the node file has one key, it's the old node database format,
+	! so do a conversion to the new format.
+	!
+	IF .nml$a_summary_xab [xab$b_nok] EQL 1 THEN
+	    BEGIN
+	    !
+	    ! Close old permanent database (which was opened using the
+	    ! new permanent database XABs, etc.).
+	    !
+	    nml$close_node_file ();
+	    !
+	    ! Do a V4.0 upgrade on the permanent database files.  The upgrade
+	    ! procedure will force this call.  The procedure involves converting
+	    ! area 0 to either a customer supplied area number or area 1, and
+	    ! it involves converting the node database to a faster format.
+	    !
+	    status = nml$upgrade_perm_dbs ();
+	    IF .status THEN
+		BEGIN
+		nml$a_netnode_fab [fab$l_fna] = .nml$gq_node_file_dsc [1];
+		nml$a_netnode_fab [fab$b_fns] = .nml$gq_node_file_dsc [0];
+		status = $OPEN (FAB = .fab);
+		END;
+	    END;
+	END
+    ELSE
+	!
+	! If the node database doesn't already exist, create one and
+	! connect the RAB record stream.
+	!
+	IF .status EQL rms$_fnf THEN
+	    status = nml$create_node_db (nml$gq_node_file_dsc, fab);
+    !
+    ! Connect the RAB to the file.
+    ! If NML$LOG is defined with file io bit set, log a "file opened"
+    ! message.
+    !
+    IF .status THEN
+	BEGIN
+	status = nml$connect_node_rab ();
+	nml$logfileop (dbg$c_fileio,
+			nma$c_opn_node,
+			$ASCID ('file opened.'));
+	END;
+    END;
+RETURN .status;
+
+END;		! of NML$OPEN_NODE_FILE
+
+%SBTTL 'nml$close_node_file  Close node permanent database file'
+GLOBAL ROUTINE nml$close_node_file  =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine closes the node permanant database file.
+!
+! FORMAL PARAMETERS:
+!	None
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Failure or RMS error
+!
+!--
+
+BEGIN
+
+LOCAL
+    fab	:	REF BBLOCK,
+    status;
+
+status = nma$_success;
+!
+! If the file isn't open, don't try to close it.
+!
+fab = nml$a_netnode_fab;
+IF .fab [fab$w_ifi] NEQ 0 THEN
+    BEGIN
+    status = $CLOSE (FAB = nml$a_netnode_fab);
+    !
+    ! If NML$LOG is defined with file io bit set, log a "file closed"
+    ! message.
+    !
+    IF .status THEN
+	nml$logfileop (dbg$c_fileio,
+			nma$c_opn_node,
+			$ASCID ('file closed'));
+    END;
+RETURN .status;
+END;		! of	nml$close_node_file
+
+%SBTTL 'nml$read_node_rec   Get a Record in the Node File'
+GLOBAL ROUTINE nml$read_node_rec (key, key_value_dsc,
+				  node_type,
+				  buffer_dsc, data_dsc) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine performs $GETs to the node permanent database.  The
+!	database is organized with one record per node, four keys per
+!	record.  The four keys are:
+!			node type (executor, remote node, loop node)
+!			node address
+!			node name
+!			list node (node address concatenated with node type -
+!				used for LISTing nodes).
+!
+! FORMAL PARAMETERS:
+!
+!	key		key to use to identify the node's record.
+!	key_value_dsc	Descriptor of key value to use to identify the
+!				node's record.
+!	node_type	Address for returning node type key value
+!	buffer_dsc	Address of a descriptor of a buffer to use
+!	data_dsc	Address of a descriptor to return descriptor of data
+!				read.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NMA or RMS error status
+!
+!--
+
+BEGIN
+
+MAP
+    buffer_dsc: REF VECTOR,		! Buffer to use for record
+    data_dsc: REF VECTOR;		! Return data descriptor
+
+LOCAL
+    ptr:	REF BBLOCK,
+    fab:	REF BBLOCK,
+    rab:	REF BBLOCK,
+    buf_ptr:	REF BBLOCK,
+    local_dsc:	VECTOR [2],
+    status;
+
+fab = nml$a_netnode_fab;
+IF .fab [fab$w_ifi] EQL 0 THEN		! If the node file isn't open
+    RETURN .fab [fab$l_sts];		!	return open failure status.
+!
+! Map the input key parameter to the key of reference number for that
+! parameter.  If the key being used for this operation is different from the
+! one the RAB is set up for, switch keys.
+!
+status = nml_map_keys (nmn$c_get_rec, .key, .key_value_dsc);
+IF .status THEN
+    BEGIN
+    rab = nml$a_netnode_rab;
+    buf_ptr = .buffer_dsc [1];
+    rab [rab$w_usz] = .buffer_dsc [0];
+    rab [rab$l_ubf] = .buf_ptr;
+
+    status = $GET (RAB = .rab);
+    END;
+
+IF .status THEN
+    BEGIN
+    !
+    ! Don't include keys in descriptor returned to caller.  Just return the
+    ! NICE parameters and values.
+    !
+    data_dsc [0] = .rab [rab$w_rsz] - nmn$k_node_keys_len;
+    data_dsc [1] = .buf_ptr + nmn$k_node_keys_len;
+    !
+    ! Return the node entity type since this is the only key that isn't
+    ! duplicated in the NICE parameters.
+    !
+    .node_type = 
+	(SELECTONEU .buf_ptr [nmn$w_key_typ] OF
+	    SET
+	    [nmn$c_typ_remote]:		nml$c_node;
+	    [nmn$c_typ_exec]:		nml$c_executor;
+	    [nmn$c_typ_loopnode]:	nml$c_loopnode;
+	    TES);
+    local_dsc [0] = .rab [rab$w_rsz];
+    local_dsc [1] = .buf_ptr;
+    nml$logrecordop (dbg$c_fileio,
+		     nma$c_opn_node,
+		     $ASCID ('record read'),
+		     local_dsc);
+    END;
+RETURN .status;
+END;		! Of	nml$read_node_rec
+
+%SBTTL 'nml$write_node_rec     Write a Record to the Node File'
+GLOBAL ROUTINE nml$write_node_rec (write_type, node_type, buffer_dsc) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine performs $PUTs to the node permanent database.  The
+!	database is organized with one record per node, four keys per
+!	record.  The four keys are:
+!			node type (executor, remote node, loop node)
+!			node address
+!			node name
+!			list node (node address concatenated with node type -
+!				used for LISTing nodes in order by address).
+!
+! FORMAL PARAMETERS:
+!	write_type	nmn$c_put_rec - do a $PUT
+!			nmn$c_update_rec - do a $UPDATE
+!	node_type	Node entity type - in case it's changed.
+!	buffer_dsc	Address of a descriptor of the buffer to write.
+!			This descriptor does not include the keys - only
+!			the NICE parameters.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NMA or RMS error status
+!
+!--
+
+BEGIN
+
+MAP
+    buffer_dsc: REF VECTOR;		! Buffer to use for record
+
+LOCAL
+    buf_ptr:	REF BBLOCK,
+    fab:	REF BBLOCK,
+    rab:	REF BBLOCK,
+    local_dsc:	VECTOR [2],
+    param_dsc:	VECTOR [2],
+    old_node_del_key,
+    old_node_dsc:VECTOR [2],
+    status;
+
+fab = nml$a_netnode_fab;
+IF .fab [fab$w_ifi] EQL 0 THEN		! If the node file isn't open
+    RETURN .fab [fab$l_sts];		!	return open failure status.
+local_dsc [0] = .buffer_dsc [0] + nmn$k_node_keys_len;
+local_dsc [1] = .buffer_dsc [1] - nmn$k_node_keys_len;
+buf_ptr = .local_dsc [1];
+!
+! First, get the node address from the NICE parameters in the permanent database
+! record.  The node address is the primary key into the node permanent
+! database.  Therefore, if it has changed the old record must be deleted
+! before the new one can be written (since primary keys cannot be modified).
+!
+param_dsc [1] = 0;
+IF NOT nma$searchfld (.buffer_dsc, nma$c_pcno_add, param_dsc [0], param_dsc [1]) THEN
+    param_dsc [1] = UPLIT (0);
+IF .buf_ptr [nmn$w_key_add] NEQ .(.param_dsc [1])<0,16> THEN
+    BEGIN
+    !
+    ! If it's a brand new node, don't try to delete the old address's record.
+    !
+    IF .write_type NEQ nmn$c_put_rec THEN
+	!
+	! It isn't a brand new node.  Delete the node using the address key if
+	! it's a remote node.  Use the type key if it's the exec - in case it
+	! has an address of 0 which could be confused with a loopnode.  Loopnodes
+	! never change addresses, so you never get here for loopnode operations.
+	!
+	BEGIN
+	IF .buf_ptr [nmn$w_key_typ] EQL nmn$c_typ_exec THEN
+	    BEGIN
+	    old_node_del_key = nmn$c_typ_key_ref;
+	    old_node_dsc [0] = nmn$c_typ_key_len;
+	    old_node_dsc [1] = uplit (nml$c_executor);
+	    END
+	ELSE
+	    BEGIN
+	    old_node_del_key = nma$c_pcno_add;
+	    old_node_dsc [0] = nmn$c_add_key_len;
+	    old_node_dsc [1] = .buf_ptr;
+	    END;
+	nml$delete_node_rec (.old_node_del_key,
+				old_node_dsc);
+	write_type = nmn$c_put_rec;
+	END;
+    buf_ptr [nmn$w_key_add] = .(.param_dsc [1]);	! Put new address key
+							!	into record.
+    END;
+!
+! In case the node name, address or type has changed as a result of the
+! NICE command being processed, change the corresponding key values as well.
+! Now, get the node name from the NICE parameters.  If there isn't one,
+! set up a null name.
+!
+param_dsc [1] = 0;
+IF nma$searchfld (.buffer_dsc, nma$c_pcno_nna, param_dsc [0], param_dsc [1]) THEN
+    CH$COPY (.param_dsc [0], .param_dsc [1],
+	     %C' ',
+	     nmn$s_key_nam,
+	     buf_ptr [nmn$t_key_nam])
+ELSE
+    CH$FILL (%C' ', nmn$s_key_nam, buf_ptr [nmn$t_key_nam]);
+!
+! The third key is the node type.  The three node types are executor,
+! remote, and loop node.
+!
+buf_ptr [nmn$w_key_typ] = 
+    (SELECTONEU .node_type OF
+	SET
+	[nml$c_nodebyname, nml$c_node]:	nmn$c_typ_remote;
+	[nml$c_executor]:		nmn$c_typ_exec;
+	[nml$c_loopnode]:		nmn$c_typ_loopnode;
+	TES);
+	
+!
+! Set up the buffer size and address to include the keys.
+!
+rab = nml$a_netnode_rab;
+rab [rab$w_rsz] = .local_dsc [0];
+rab [rab$l_rbf] = .local_dsc [1];
+
+IF .write_type EQL nmn$c_put_rec THEN
+    status = $PUT (RAB = .rab)
+ELSE
+    status = $UPDATE (RAB = .rab);
+
+IF .status THEN
+    BEGIN
+    nml$logrecordop (dbg$c_fileio,
+		     nma$c_opn_node,
+		     $ASCID ('record written'),
+		     local_dsc);
+    END;
+RETURN .status;
+END;		! Of	nml$write_node_rec
+
+%SBTTL 'nml$delete_node_rec     Delete a Record from the Node File'
+GLOBAL ROUTINE nml$delete_node_rec (key, key_value_dsc) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine performs $DELETEs on the node permanent database.  The
+!	database is organized with one record per node, four keys per
+!	record.  The four keys are:
+!			node type (executor, remote node, loop node)
+!			node address
+!			node name
+!			list node - node type concatenated with node address -
+!				used for LISTing nodes.
+!
+! FORMAL PARAMETERS:
+!
+!	key		Value mapped to the key of reference to use to
+!			identify the node's record.
+!	key_value_dsc	Descriptor of key value to use to identify the
+!				node's record.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NMA or RMS error status
+!
+!--
+
+BEGIN
+
+LOCAL
+    rab: REF BBLOCK,
+    status;
+
+!
+! Map the input key parameter to the key of reference number for that
+! parameter.  If the key being used for this operation is different from the
+! one the RAB is set up for, switch keys.
+!
+rab = nml$a_netnode_rab;
+status = rms$_suc;
+IF .key_value_dsc NEQ 0 THEN
+    status = nml_map_keys (nmn$c_delete_rec, .key, .key_value_dsc);
+IF .status THEN
+    status = $DELETE (RAB = .rab);
+
+IF .status THEN
+    BEGIN
+    IF .key_value_dsc NEQ 0 THEN
+	nml$logrecordop (dbg$c_fileio,
+			nma$c_opn_node,
+			$ASCID ('record deleted'),
+			.key_value_dsc)
+    ELSE
+	nml$debug_txt (dbg$c_fileio, $ASCID ('record deleted'));
+    END;
+RETURN .status;
+END;		! Of	nml$delete_node_rec
+
+%SBTTL 'nml_map_keys		Switch key used to access node database'
+ROUTINE nml_map_keys (function, key_param, key_value_dsc) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine is called whenever a record in the node permanent
+!	database is accessed.  It sets up the key reference, length, and
+!	value so the next RMS operation is done on the correct record.
+!
+! FORMAL PARAMETERS:
+!	function	nmn$c_put_rec = doing a put.
+!			nmn$c_get_rec = doing a read.
+!			nmn$c_delete_rec = deleteing a record.
+!			nmn$c_update_rec = updating a record.
+!	key_param	Value mapped to the key of reference to use to
+!			identify the node's record.
+!	key_value_dsc	Descriptor of key value to use to identify the
+!				node's record.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Failure or RMS error
+!
+!--
+
+BEGIN
+
+MAP
+    key_value_dsc: REF VECTOR;		! Descriptor for key value
+
+LOCAL
+    rab: REF BBLOCK,
+    fab: REF BBLOCK,
+    key_ref,
+    key_addr,
+    key_len,
+    name_buf: BBLOCK [nmn$c_nam_key_len],
+    do_find,
+    status;
+
+rab = nml$a_netnode_rab;
+fab = nml$a_netnode_fab;
+IF .fab [fab$w_ifi] EQL 0 THEN		! If the node file isn't open
+    status = .fab [fab$l_sts]		!	return open failure status.
+ELSE
+    BEGIN
+    !
+    ! Fill in key value.  This identifies the specific node record to get, put,
+    ! or delete.  Also, set up the buffer size and address.
+    !
+    key_len = .key_value_dsc [0];
+    rab [rab$l_kbf] = nml$t_key_value;
+    rab [rab$v_kge] = 0;
+    SELECTONEU .key_param OF
+	SET
+	!
+	! If the key is list node or node type, map it to the key values used
+	! in the node database file.  The value is passed to this routine as
+	! an 'NML$C_' node entity type.  The list key overlaps with the node
+	! address key to allow the LIST command to get nodes by type and,
+	! within type, sequentially by address.  The list key value contains
+	! a zero for the node address; hence when you do a $GET of (type OR 0)
+	! with a match type of GTR, it will get the first node of that type
+	! in the file.  Subsequent sequential reads will return the nodes of
+	! that type in ascending order by address.
+	!
+	[nmn$c_typ_key_ref,nmn$c_lis_key_ref]:
+	    BEGIN
+	    key_addr = (SELECTONEU .(.key_value_dsc [1]) OF
+		SET
+		[nml$c_nodebyname,
+		 nml$c_node]:		UPLIT WORD (0, nmn$c_typ_remote);
+		[nml$c_executor]:	UPLIT WORD (0, nmn$c_typ_exec);
+		[nml$c_loopnode]:	UPLIT WORD (0, nmn$c_typ_loopnode);
+		TES);
+	    IF .key_param EQL nmn$c_typ_key_ref THEN
+		key_addr = .key_addr + 2
+	    ELSE
+	        rab [rab$v_kge] = 1;
+	    key_ref = .key_param;
+	    END;
+	[nma$c_pcno_add]:
+	    BEGIN
+	    key_ref = nmn$c_add_key_ref;
+	    key_addr = .key_value_dsc [1];
+	    END;
+	[nma$c_pcno_nna]:
+	    BEGIN
+	    key_ref = nmn$c_nam_key_ref;
+	    key_addr = name_buf;
+	    key_len = nmn$c_nam_key_len;
+	    CH$COPY (.key_value_dsc [0], .key_value_dsc [1], %C' ',
+		nmn$c_nam_key_len, name_buf);
+	    END;
+	TES;
+    !
+    ! If doing an update or delete operation, check to see if the
+    ! key from the last operation is different (DEF EXEC NAME requires
+    ! that the name be checked, so an intermediate read is done between
+    ! the $GET of the executor node entry, and the $UPDATE).  If the key
+    ! is different, do a $FIND so that RMS has the correct current record
+    ! for the update or delete.
+    !
+    IF .function EQL nmn$c_update_rec OR
+       .function EQL nmn$c_delete_rec THEN
+	BEGIN
+	IF .key_ref NEQ .rab [rab$b_krf] OR
+	   CH$NEQ (.key_len, .key_addr,
+		   .rab [rab$b_ksz], .rab [rab$l_kbf], %C' ') THEN
+	    do_find = true
+	ELSE
+	    do_find = false;
+	END;
+    !
+    ! Put the new key reference, key size, and key value into the RAB.  These
+    ! are the fields that identify the node record to RMS.
+    !
+    rab [rab$b_krf] = .key_ref;    
+    rab [rab$b_ksz] = .key_len;
+    rab [rab$l_kbf] = nml$t_key_value;
+    CH$MOVE (.key_len, .key_addr, nml$t_key_value);
+    status = rms$_suc;
+    IF .do_find THEN
+	status = $FIND (RAB = .rab);
+    END;
+RETURN .status;
+END;		! of   nml_map_keys
+
+%SBTTL 'nml$read_loopnode	Get a loopnode in the Node File'
+GLOBAL ROUTINE nml$read_loopnode (the_circuit_dsc,
+					buffer_dsc, data_dsc) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine searches through the node permanent database for
+!	a loopnode on the specified circuit.  Loopnodes must be set up
+!	with unique circuit ids.
+!	This routine is called for such functions as:
+!		LIST CIRCUIT 	- in case the circuit is set up as a loopnode,
+!				  to get the loopnode name.
+!		DEFINE NODE node-id CIRCUIT circuit-id   - to make sure there
+!				  isn't already a loopnode on that circuit.
+!
+! FORMAL PARAMETERS:
+!
+!	the_circuit_dsc	Address of descriptor of circuit ID to look for.
+!	buffer_dsc	Address of a descriptor of a buffer to use for
+!			returning the loopnode data.
+!	data_dsc	Address of a descriptor to return descriptor of data
+!				read.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NMA or RMS error status
+!
+!--
+
+BEGIN
+
+MAP
+    the_circuit_dsc: REF VECTOR;
+
+LOCAL
+    a_circuit_dsc: VECTOR [2],
+    rewind_flag,
+    status;
+
+!
+! Read through the known loopnodes in the node permanent database, looking
+! for a loopnode on the circuit specified by the input parameter.
+!
+rewind_flag = true;
+WHILE status = nml$read_known_node_rec (nml$c_loopnode,
+					.buffer_dsc,
+					.data_dsc,
+					.rewind_flag) DO
+	
+    BEGIN
+    rewind_flag = false;
+    a_circuit_dsc [0] = 0;
+    a_circuit_dsc [1] = 0;
+    !
+    ! Find the circuit ID for this loopnode, and, if it matches the
+    ! circuit I'm looking for, return the loopnode data to the caller.
+    !
+    IF nma$searchfld (.data_dsc,
+		  	  nma$c_pcno_nli,
+		  	  a_circuit_dsc [0],
+		  	  a_circuit_dsc [1]) AND
+	CH$EQL (.the_circuit_dsc [0], .the_circuit_dsc [1],
+		.a_circuit_dsc [0], .a_circuit_dsc [1]) THEN
+	EXITLOOP;
+    END;
+RETURN .status;
+END;		! of nml$read_loopnode
+
+%SBTTL 'nml$read_known_node_rec   Get a known Record in the Node File'
+GLOBAL ROUTINE nml$read_known_node_rec (node_type,
+					buffer_dsc,
+					data_dsc,
+					rewind_flag) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine performs sequential $GETs to the node permanent
+!	database.  The 	database is organized with one record per node,
+!	The four keys are:
+!			node type (executor, remote node, loop node)
+!			node address
+!			node name
+!			list node - node type concatenated with node address -
+!				used for LISTing nodes.
+!	If the node key and value are different from the last time
+!	this routine was called, do the $GET with a record access mode
+!	of keyed.  If they are the same, do the $GET with a record access
+!	mode of sequential.  The latter will cause RMS to return the
+!	next record in the file greater which matches the key and is
+!	greater than the key value.  This is useful for KNOWN NODES and
+!	KNOWN LOOPNODES operations.
+!
+! FORMAL PARAMETERS:
+!
+!	node_type	Node entity type
+!	buffer_dsc	Address of a descriptor of a buffer to use
+!	data_dsc	Address of a descriptor to return descriptor of data
+!				read.
+!	rewind_flag	Set if the caller wants to begin reading at the
+!			beginning of the node file.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NMA or RMS error status
+!
+!--
+
+BEGIN
+
+MAP
+    buffer_dsc: REF VECTOR,		! Buffer to use for record
+    data_dsc: REF VECTOR;		! Return data descriptor
+
+LOCAL
+    rab: REF BBLOCK,
+    key_value_dsc:	VECTOR [2],	! Descriptor for key value
+    rec_node_type,
+    status;
+
+OWN
+    last_RFA0,				! Record file address of last record
+    last_RFA4 : WORD;			!	read by this routine.
+
+rab = nml$a_netnode_rab;
+key_value_dsc [0] = nmn$c_lis_key_len;
+key_value_dsc [1] = node_type;
+status = nml$_sts_suc;
+!
+! Known nodes are found using the Type and Address keys with a search type
+! of "greater than or equal to".  If the last operation was to a node in the
+! middle of the type being LISTed, RMS's "next record" will cause it to start
+! reading node records from there.  So, do a $REWIND so RMS starts at the
+! beginning of the file.
+!
+IF .rewind_flag THEN
+    BEGIN
+    last_RFA0 = 0;
+    last_RFA4 = 0;
+    status = $REWIND (RAB = .rab);
+    END;
+IF .status THEN
+    BEGIN
+    !
+    ! If this is the second (or later) time this routine is being called to
+    ! find a node record, set up the RAB to do the next read sequentially.  
+    !
+    IF NOT .rewind_flag THEN
+	BEGIN
+	!
+	! Some operations, such as LIST KNOWN NODES CHARACTERISTICS, must
+	! read random node records between the sequential operations done
+	! by this routine.  For example, when listing a node which has the HOST
+	! parameter set, the HOST node's record must be read in to determine
+	! the host node's name to include in the LIST response.  If the Record
+	! File Address in the RAB has moved, do a $GET to get back to where
+	! we were.
+	!
+	! PURGE KNOWN NODES ALL deletes a record between each call to this
+	! routine.  In this case the RFA is zeroed, so check for that too
+	! before doing the $GET.
+	!
+	IF (.last_RFA0 NEQ .rab [rab$l_rfa0] OR
+	   .last_RFA4 NEQ .rab [rab$w_rfa4])
+	   		AND
+	   (.rab [rab$l_rfa0] NEQ 0 OR
+	    .rab [rab$w_rfa4] NEQ 0)
+	THEN
+	    BEGIN
+	    rab [rab$b_rac] = rab$c_rfa;
+	    rab [rab$l_rfa0] = .last_RFA0;
+	    rab [rab$w_rfa4] = .last_RFA4;
+	    rab [rab$w_usz] = .buffer_dsc [0];
+	    rab [rab$l_ubf] = .buffer_dsc [1];
+	    status = $GET (RAB = .rab);
+	    END;
+	rab [rab$b_rac] = rab$c_seq;
+	END;
+    !
+    ! Get the record from the node file.
+    !
+    IF .status THEN
+	status = nml$read_node_rec (nmn$c_lis_key_ref,
+				key_value_dsc,
+				rec_node_type,
+				.buffer_dsc, .data_dsc);
+    !
+    ! Restore record access mode to keyed in case this is the last time this
+    ! routine is called for a known record.
+    !
+    rab [rab$b_rac] = rab$c_key;
+    last_RFA0 = .rab [rab$l_rfa0];
+    last_RFA4 = .rab [rab$w_rfa4];
+    IF .node_type NEQ .rec_node_type OR
+       .status EQL rms$_eof OR
+       .status EQL rms$_rnf THEN
+	RETURN rms$_eof;
+    END;
+RETURN nml$chkfileio (nma$c_sts_fio,
+		      .status);
+END;		! Of	nml$read_known_node_rec
+
+%SBTTL 'nml$create_node_db		Create node permanent database file'
+GLOBAL ROUTINE nml$create_node_db (file_name_dsc, fab) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine is called to create a new node database file under two
+!	conditions:
+!	      - None already exists.
+!	      - If the node permanent database has only 1 key - it's the
+!		old node database format, and must be converted to four
+!		keys (this conversion is for performance reasons).  Create
+!		the file here, convert it later.
+!
+! FORMAL PARAMETERS:
+!	FILE_NAME_DSC	Descriptor of name of file.  Used because, when
+!			converting from the old database format to the new,
+!			the new file is given a temporary file name until
+!			complete.
+!	FAB		Address at which to return address of FAB.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Failure or RMS error
+!
+!--
+
+BEGIN
+
+MAP
+    file_name_dsc: REF VECTOR;
+    
+LOCAL
+    status;
+
+.fab = nml$a_netnode_fab;
+$FAB_INIT (	FAB = nml$a_netnode_fab,
+		ALQ = 60,			! Initial file block size.
+		BKS = 3,			! Bucket size
+		FAC = (UPD, PUT, GET, DEL),	! File access options
+		DNM = 'SYS$SYSTEM:.DAT',	! Default filename string
+		FNA = .file_name_dsc [1],	! File name
+		FNS = .file_name_dsc [0], 	! File name size
+		FOP = (CBT,MXV),		! File Options (contiguous best
+						!	try, max versions)
+		ORG = IDX,			! Organization = indexed
+		RFM = VAR,			! Record format = variable
+		SHR = (UPD, PUT, GET, DEL),	! File sharing options
+		XAB = nml$a_node_address_xab);	! XAB Chain
+!
+! Set up the XABs to describe the four keys which will be used
+! to get information from the file.
+!
+!
+! First, initialize primary key XAB with key = node address.  Allow duplicates
+! for this key because any loopnode can have an address of zero.
+!
+$XABKEY_INIT (XAB = nml$a_node_address_xab,	! XAB address
+	      DTP = BN2,			! Key data type = 2 byte binary
+	      FLG = (DUP, DAT_NCMPR, IDX_NCMPR,
+			KEY_NCMPR),		! Key flags
+	      KREF = nmn$c_add_key_ref,		! Key reference number
+	      POS = 0,				! Key position in record
+	      SIZ = nmn$c_add_key_len,		! Key size in record
+	      NXT = nml$a_node_type_xab);	! XAB chain pointer
+!
+! Next, initialize key XAB with key = node type (executor, remote, loop).
+!
+$XABKEY_INIT (XAB = nml$a_node_type_xab,	! XAB address
+	      DTP = BN2,			! Key data type = 2 byte binary
+	      FLG = (CHG, DUP, IDX_NCMPR),	! Key flags
+	      KREF = nmn$c_typ_key_ref,		! Key reference number
+	      POS = 2,				! Key position in record
+	      SIZ = nmn$c_typ_key_len,		! Key size in record
+	      NXT = nml$a_node_name_xab);	! XAB chain
+
+!
+! Initialize key XAB with key = node name
+!
+$XABKEY_INIT (XAB = nml$a_node_name_xab,	! XAB address
+	      DTP = STG,			! Key data type = string
+	      FLG = (CHG, NUL, IDX_NCMPR),	! Key flags
+	      KREF = nmn$c_nam_key_ref,		! Key reference number
+	      POS = 4,				! Key position in record
+	      SIZ = nmn$c_nam_key_len,		! Key size in record
+	      NUL = %C' ',			! Null key = blank
+	      NXT = nml$a_node_list_xab);	! XAB chain
+
+!
+! Initialize key XAB with key = list node.
+! This key concatenates the the node address key with the node type key to
+! allow the LIST command to get nodes by type and, within type, sequentially
+! by address.  The list key value must be set up with a zero for the node
+! address; hence when you do a $GET of (type OR 0) with a match type of GTR,
+! it will get the first node of that type in the file.  Subsequent sequential
+! reads will return the nodes of that type in ascending order by address.
+!
+$XABKEY_INIT (XAB = nml$a_node_list_xab,	! XAB address
+	      DTP = BN4,			! Key data type = 4 byte binary
+	      FLG = (CHG, DUP, IDX_NCMPR),	! Key flags
+	      KREF = nmn$c_lis_key_ref,		! Key reference number
+	      POS = 0,				! Key position in record
+	      SIZ = nmn$c_lis_key_len,		! Key size in record
+	      NXT = nml$a_protection_xab);	! XAB chain
+
+$XABPRO_INIT (XAB = nml$a_protection_xab,	! XAB address
+	      UIC = (1, 4),			! UIC of owner
+	      PRO = (RWED, RWED, , ));		! Protection (group and world
+						!	no access)
+
+
+status = $CREATE (FAB = nml$a_netnode_fab);
+
+IF .status THEN
+    nml$logfileop (dbg$c_fileio,
+		   nma$c_opn_node,
+		   $ASCID ('file created'));
+RETURN .status;
+
+END;		! of 		nml$create_node_db
+
+%SBTTL 'nml$connect_node_rab    Open node permanent database file'
+GLOBAL ROUTINE nml$connect_node_rab  =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This builds a RAB for accessing the node database file and
+!	issues a connect.
+!
+! FORMAL PARAMETERS:
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!	Failure or RMS error
+!
+!--
+
+BEGIN
+    
+!
+! Initialize most of RAB here.  Init it to use the primary key
+! (node address) to begin with.  This is changed when other keys
+! are needed.
+!
+$RAB_INIT (RAB = nml$a_netnode_rab,
+	   FAB = nml$a_netnode_fab,
+	   KRF = nmn$c_add_key_ref,	! primary key = node address
+	   MBF = 10,
+	   RAC = KEY,
+	   ROP = UIF);
+
+!
+! Connect RMS record stream.
+!
+RETURN $CONNECT (RAB = nml$a_netnode_rab);
+END;		! of   nml$connect_node_rab
+
+END					! End of module
+
+ELUDOM

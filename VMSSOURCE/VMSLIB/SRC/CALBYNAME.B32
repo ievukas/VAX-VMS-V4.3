@@ -1,0 +1,562 @@
+MODULE util$call_by_name(		! File: CALBYNAME.B32 Edit: BLS0225
+		LANGUAGE (BLISS32),
+		ADDRESSING_MODE(EXTERNAL=GENERAL,NONEXTERNAL=GENERAL),
+		IDENT = 'V04-000'
+		) =
+BEGIN
+%TITLE	'Dynamically call routine in shareable image by name';
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  Run time library
+!
+! ABSTRACT:
+!
+!	This set of procedures implements dynamic linking to shareable images
+!
+! ENVIRONMENT:
+!
+!	VAX native, user mode.
+!
+!--
+!
+!
+! AUTHOR:  Benn Schreiber
+!
+! CREATION DATE: 5-Feb-1983
+!
+! MODIFIED BY:
+!
+!	V03-004	BLS0225		Benn Schreiber		16-Jun-1983
+!		Add flags argument to call to util$read_object.  Upcase
+!		routine name before looking up.
+!
+!	V03-003	BLS0222		Benn Schreiber		20-May-1983
+!		Copy file spec to hdrbuf if error before signalling.
+!		spec goes away if message file image activated
+!
+!	V03-002	PDG0002		Peter D Gilbert		22-Mar-1983
+!		Remove .ADDRESS reference in UTIL$FIND_SYMBOL
+!
+!	V03-001	BLS0208		Benn Schreiber		18-Feb-1983
+!		Report full file spec on failed activation if available
+!--
+
+%SBTTL	'Declarations';
+!
+! BLISS Libraries
+!
+LIBRARY
+    'SYS$LIBRARY:LIB';			!Need to get IFD definitions from LIB
+!
+! Define UTIL$ psects
+!
+PSECT
+    CODE = _UTIL$CODE,
+    GLOBAL = _UTIL$DATA,
+    OWN = _UTIL$DATA,
+    PLIT = _UTIL$CODE;
+
+FIELD
+!
+! Define the Module information descriptor.  There is one for each image
+! mapped.
+!
+    mid_fields =
+	SET
+	mid_l_next =	[0,0,32,0],	!Next in list or 0 if end
+	mid_l_symlst =	[4,0,32,0],	!Listhead of symbols this image
+	mid_l_base =	[8,0,32,0],	!Base of image in memory
+	mid_l_vbn =	[12,0,32,0],	!VBN of GST
+	mid_b_namlen =	[16,0,8,0],	!Length of name
+	mid_t_name =	[17,0,0,0]	!Start of image name
+	TES;
+!
+! Define a symbol descriptor
+!
+FIELD
+    msd_fields =
+	SET
+	msd_l_left =	[0,0,32,0],	!Left subtree pointer
+	msd_l_right =	[4,0,32,0],	!Right subtree pointer
+	msd_w_bal =	[8,0,16,0],	!Balance this node
+	msd_l_value =	[10,0,32,0],	!Value of this symbol
+	msd_b_namlen =	[14,0,8,0],	!Length of name
+	msd_t_name =	[15,0,0,0]	!Start of symbol name
+	TES;
+
+LITERAL
+    msd_c_size = 15;			!Length of msd without name
+
+GLOBAL
+    util$gl_imagelist : REF $BBLOCK FIELD(mid_fields); !Mapped image listhead
+
+EXTERNAL LITERAL
+    util$m_lnk_1mod : UNSIGNED(8);	!Only read one module
+
+EXTERNAL ROUTINE
+    lib$get_vm,				!Allocate virtual memory
+    lib$free_vm,			!Deallocate it
+    lib$insert_tree,			!Insert element into binary tree
+    lib$lookup_tree,			!Lookup element in binary tree
+    lib$scopy_r_dx,			!Dynamic string copy
+    str$free1_dx,			!Free dynamic string
+    str$upcase,				!Convert string to upper case
+    util$getfilename,			!Get filename descr. from fab/nam
+    util$report_io_error,		!Report I/O error
+    util$read_object;			!Read object file
+!
+! Define facility-specific names for shared messages
+!
+$SHR_MSGDEF(UTIL,286,LOCAL,
+	(actimage,error),		!Error activating image
+	(insvirmem,error),		!Insufficient virtual memory
+	(openin,error),			!Error opening input file
+	(closein,warning),		!Error closing input file
+	(readerr,error));		!Read error
+
+%SBTTL	'get_rec - Read GST record';
+ROUTINE get_rec(datavector,recdesc) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Read the next record of the GST.  This routine called by
+!	UTIL$READ_OBJECT
+!
+! INPUTS:
+!
+!	datavector = address of data vector passed by read_gst
+!			1st longword is current MID block
+!			2nd longword is file RAB
+!	recdesc = address of dynamic string descriptor to return record
+!
+!--
+MAP
+    datavector : REF VECTOR[,LONG];
+
+BIND
+    midptr = .datavector[0] : $BBLOCK FIELD(mid_fields),
+    irab = .datavector[1] : $BBLOCK;
+
+LOCAL
+    status;
+
+!
+! Read the record.  If successful read, copy record to dynamic string
+!
+status = $GET(RAB=irab,ERR=util$report_io_error);
+IF NOT .status
+    THEN RETURN .status;
+
+lib$scopy_r_dx(irab[rab$w_rsz],.irab[rab$l_rbf],.recdesc);
+
+RETURN ss$_normal
+END;
+
+%SBTTL	'compare_symbols - Compare new symbol to node';
+ROUTINE compare_symbols(desc,node) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Compare symbol against symbol in current node
+!
+! INPUTS:
+!
+!	desc = address of descriptor of new symbol
+!	node = pointer to an MSD block
+!
+!--
+MAP
+    desc : REF $BBLOCK,
+    node : REF $BBLOCK FIELD(msd_fields);
+
+LOCAL
+    retval;
+
+IF (retval = CH$COMPARE(.desc[dsc$w_length],.desc[dsc$a_pointer],
+			.node[msd_b_namlen],node[msd_t_name],0)) NEQ 0
+    THEN RETURN .retval
+    ELSE RETURN SIGN(.desc[dsc$w_length] - .node[msd_b_namlen])
+END;
+
+%SBTTL	'alloc_symbol - Allocate MSD block for new symbol';
+ROUTINE alloc_symbol(desc,retadr) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Allocate an MSD block for new symbol
+!
+! INPUTS:
+!
+!	desc = address of string descriptor of new symbol
+!	retadr = address of longword to return address in
+!
+!--
+MAP
+    desc : REF $BBLOCK,
+    retadr : REF VECTOR[,LONG];
+
+LOCAL
+    status,
+    msdptr : REF $BBLOCK FIELD (msd_fields);
+
+status = lib$get_vm(%REF(msd_c_size+.desc[dsc$w_length]),msdptr);
+IF NOT .status
+THEN BEGIN
+    SIGNAL(util$_insvirmem,0,.status);
+    RETURN .status
+    END;
+
+msdptr[msd_l_value] = 0;
+msdptr[msd_b_namlen] = .desc[dsc$w_length];
+CH$MOVE(.msdptr[msd_b_namlen],.desc[dsc$a_pointer],msdptr[msd_t_name]);
+retadr[0] = .msdptr;
+
+RETURN ss$_normal
+END;
+
+%SBTTL	'global_routine - Process global symbol from GST';
+ROUTINE global_routine(symbol_desc,symbol_value,symbol_flags,
+				entry_mask,datavector,gsd_desc) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine called with global symbol from shareable image.  A
+!	block describing the symbol is allocated and put in the symbols
+!	list for this image.
+!
+!--
+MAP
+    symbol_desc : REF $BBLOCK,
+    symbol_value : REF VECTOR[,LONG],
+    symbol_flags : REF VECTOR[,LONG],
+    datavector : REF VECTOR[,LONG];
+
+BIND
+    midptr = .datavector[0] : $BBLOCK FIELD(mid_fields);
+
+LOCAL
+    msdptr : REF $BBLOCK FIELD(msd_fields),
+    status;
+
+status = lib$insert_tree(midptr[mid_l_symlst],.symbol_desc,%REF(1),
+				compare_symbols,alloc_symbol,msdptr);
+IF NOT .status
+    THEN RETURN .status;
+!
+! Set symbol value.  Relocate if needed
+!
+msdptr[msd_l_value] = .symbol_value[0];
+IF (.symbol_flags[0] AND gsy$m_rel) NEQ 0
+    THEN msdptr[msd_l_value] = .msdptr[msd_l_value] + .midptr[mid_l_base];
+
+RETURN ss$_normal
+END;
+
+%SBTTL	'read_gst - Read GST from image';
+ROUTINE read_gst (ifdptr,midptr) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Read the GST of the image just loaded
+!
+! INPUTS:
+!
+!	ifdptr = address of the image IFD (image file descriptor)
+!	midptr = address of MID block for image
+!--
+MAP
+    ifdptr : REF $BBLOCK,
+    midptr : REF $BBLOCK FIELD(mid_fields);
+
+LOCAL
+    status,
+    datavector : VECTOR[2,LONG],
+    ubuf : $BBLOCK[obj$c_maxrecsiz],
+    ifab : $FAB_DECL,
+    irab : $RAB_DECL,
+    inam : $NAM_DECL,
+    esbuf : $BBLOCK[nam$c_maxrss];
+
+$FAB_INIT(FAB=ifab,
+	FNS=.(ifdptr[ifd$q_curprog])<0,16,0>,
+	FNA=.(ifdptr[ifd$q_curprog])<32,32,0>,
+	FAC=(BRO,GET),
+	NAM=inam,
+	SHR=(GET,PUT,UPI));
+
+$NAM_INIT(NAM=inam,
+	RSS=nam$c_maxrss,
+	RSA=esbuf,
+	ESS=nam$c_maxrss,
+	ESA=esbuf);
+
+ifab[fab$l_ctx] = util$_openin;
+status = $OPEN(FAB=ifab,ERR=util$report_io_error);
+IF NOT .status
+    THEN RETURN .status;
+
+$RAB_INIT(RAB=irab,
+	FAB=ifab,
+	UBF=ubuf,
+	USZ=obj$c_maxrecsiz,
+	ROP=LOC);
+
+irab[rab$l_ctx] = util$_openin;
+status = $CONNECT(RAB=irab,ERR=util$report_io_error);
+IF NOT .status
+THEN BEGIN
+    $CLOSE(FAB=ifab);
+    RETURN .status
+    END;
+!
+! Tell RMS that records are variable length, so we can read the GST
+!
+ifab[fab$v_esc] = 1;
+ifab[fab$l_ctx] = rme$c_setrfm;
+ifab[fab$b_rfm] = fab$c_var;
+status = $MODIFY(FAB=ifab,ERR=util$report_io_error);
+IF NOT .status
+THEN BEGIN
+    $CLOSE(FAB=ifab);
+    RETURN .status
+    END;
+!
+! Point to and read the GST
+!
+irab[rab$l_rfa0] = .midptr[mid_l_vbn];
+irab[rab$w_rfa4] = 0;
+irab[rab$b_rac] = rab$c_rfa;
+irab[rab$l_ctx] = util$_readerr;
+status = $FIND(RAB=irab,ERR=util$report_io_error);
+IF NOT .status
+THEN BEGIN
+    $CLOSE(FAB=ifab);
+    RETURN .status
+    END;
+irab[rab$b_rac] = rab$c_seq;
+
+datavector[0] = .midptr;
+datavector[1] = irab;
+
+status = util$read_object(get_rec,%REF(util$m_lnk_1mod),
+				datavector,global_routine);
+ifab[fab$l_ctx] = util$_closein;
+$CLOSE(FAB=ifab,ERR=util$report_io_error);
+
+RETURN .status
+END;
+
+%SBTTL	'find_image - Find image in mapped images list';
+ROUTINE find_image(desc,midptr) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Look up image in mapped image list
+!
+! INPUTS:
+!
+!	desc = address of descriptor of image name
+!	midptr = address of longword to store MID block address if found
+!--
+MAP
+    desc : REF $BBLOCK,
+    midptr : REF VECTOR[,LONG];
+
+LOCAL
+    ptr : REF $BBLOCK FIELD(mid_fields);
+
+ptr = util$gl_imagelist;
+
+WHILE (ptr = .ptr[mid_l_next]) NEQ 0
+DO IF CH$EQL(.desc[dsc$w_length],.desc[dsc$a_pointer],
+		.ptr[mid_b_namlen],ptr[mid_t_name],0)
+THEN BEGIN
+    midptr[0] = .ptr;
+    RETURN ss$_normal
+    END;
+
+RETURN 0
+END;
+
+%SBTTL	'util$find_symbol - Find symbol by string name';
+GLOBAL ROUTINE util$find_symbol (image_desc,routine_desc,retadr) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Return the address of the named routine. 
+!
+! INPUTS:
+!
+!	image_desc = Address of string descriptor for image name.  If 0,
+!		the system shareable image library will be searched
+!	routine_desc = Address of string descriptor of symbol to find
+!	retadr = Address to return symbol value in
+!
+! OUTPUTS:
+!
+!	If the image can be found and the symbol is found in the image, the
+!	relocated (if needed) symbol value will be returned in the longword
+!	pointed to by retadr.
+!
+! ROUTINE VALUE:
+!
+!	ss$_normal = found, value returned ok
+!	any errors from services called
+!--
+MAP
+    image_desc : REF $BBLOCK,
+    routine_desc : REF $BBLOCK,
+    retadr : REF VECTOR[,LONG];
+
+LOCAL
+    status,
+    tempvec : REF VECTOR[,LONG],
+    d_desc : $BBLOCK[dsc$c_s_bln],
+    desc : VECTOR[2,LONG],
+    ptr : REF $BBLOCK,
+    ifdptr : REF $BBLOCK,
+    midptr : REF $BBLOCK FIELD(mid_fields),
+    msdptr : REF $BBLOCK FIELD (msd_fields),
+    dflnam : VECTOR[2,LONG],
+    adrvec : VECTOR[2,LONG];
+
+IF NOT find_image(.image_desc,midptr)
+THEN BEGIN
+    !
+    ! Image not yet mapped.  Attempt to map it and then read in the GST
+    !
+    IF NOT (status = lib$get_vm(%REF(512),midptr))
+    THEN BEGIN
+	SIGNAL(util$_insvirmem,0,.status);
+	RETURN .status
+	END;
+
+    adrvec[0] = 1;
+    adrvec[1] = 0;
+    dflnam[0] = %CHARCOUNT('SYS$SHARE:.EXE');
+    dflnam[1] = UPLIT BYTE('SYS$SHARE:.EXE');
+    status = $IMGACT(NAME=.image_desc,
+		DFLNAM=dflnam,
+		HDRBUF=.midptr,
+		IMGCTL=iac$m_merge OR iac$m_expreg,
+		INADR=adrvec,
+		RETADR=adrvec);
+    IF .status
+	THEN status = $IMGFIX;
+    IF NOT .status
+    THEN BEGIN
+	tempvec = .midptr;
+	ptr = .tempvec[2];			!Get FAB address
+	IF .ptr NEQ 0
+	    THEN CH$MOVE(dsc$c_s_bln,util$getfilename(.ptr),desc);
+	IF .desc[0] EQL 0
+	    THEN CH$MOVE(dsc$c_s_bln,.image_desc,desc);
+	CH$MOVE(.desc[0],.desc[1],.midptr);		!Copy the file spec
+	desc[1] = .midptr;
+	SIGNAL(util$_actimage,1,desc,.status);
+	lib$free_vm(%REF(512),midptr);
+	RETURN .status
+	END;
+    !
+    ! Image is now mapped.  Insert into the mapped image list ad
+    ! then read the GST
+    !
+    tempvec = .midptr;			!Get IFD address to get filespec
+    ptr = .tempvec[0];
+    ptr = .ptr + .ptr[ihd$w_symdbgoff];
+    ifdptr = .tempvec[1];
+    midptr[mid_l_next] = .util$gl_imagelist;
+    util$gl_imagelist = .midptr;
+    midptr[mid_l_symlst] = 0;
+    midptr[mid_l_base] = .adrvec[0];
+    midptr[mid_l_vbn] = .ptr[ihs$l_gstvbn];
+    midptr[mid_b_namlen] = .image_desc[dsc$w_length];
+    CH$MOVE(.image_desc[dsc$w_length],.image_desc[dsc$a_pointer],
+		midptr[mid_t_name]);
+
+    read_gst(.ifdptr,.midptr);
+    END;
+!
+! Image is mapped, lookup and return symbol value
+!
+d_desc[dsc$w_length] = 0;
+d_desc[dsc$b_class] = dsc$k_class_d;
+d_desc[dsc$b_dtype] = dsc$k_dtype_t;
+d_desc[dsc$a_pointer] = 0;
+str$upcase(d_desc,.routine_desc);
+status = lib$lookup_tree(midptr[mid_l_symlst],d_desc,
+				compare_symbols,msdptr);
+str$free1_dx(d_desc);
+IF .status
+THEN BEGIN
+    retadr[0] = .msdptr[msd_l_value];
+    RETURN ss$_normal
+    END
+ELSE BEGIN
+    SIGNAL((.status AND NOT sts$m_severity) OR sts$k_error);
+    retadr[0] = 0;
+    RETURN .status
+    END;
+
+END;
+
+%SBTTL	'util$call_symbol - Call routine by string name';
+GLOBAL ROUTINE util$call_symbol(image_desc,routine_desc,arglst) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Call a routine by name.  ARGLST argument is the start of the argument
+!	list (i.e. the count of arguments), and .ARGLST arguments follow.
+!
+! CALLING SEQUENCE:
+!
+!	CALL UTIL$CALL_SYMBOL("IMAGE-NAME","ROUTINE-NAME",
+!					ARGCOUNT,ARG1,ARG2...)
+!
+!--
+BUILTIN
+    CALLG;
+
+LOCAL
+    status,
+    routine_addr;
+
+IF NOT (status = util$find_symbol(.image_desc,.routine_desc,routine_addr))
+    THEN RETURN .status;
+
+RETURN CALLG(arglst,.routine_addr)
+END;
+
+END ELUDOM

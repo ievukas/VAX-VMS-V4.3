@@ -1,0 +1,1331 @@
+	.TITLE	CLSIODB - Build a Local Copy of a Cluster I/O Database
+	.IDENT	'V04-000'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+;
+; FACILITY:  UETP, Regression Tests and Performance Measurement
+;
+; ABSTRACT:
+;	This module steps through the I/O databases maintained by VMS to keep
+;	track of peripherals in a cluster.  From that (potentially) changing
+;	database in system space accessible only in exec or kernel modes,
+;	the module builds a stable representation in P0 space accessible in
+;	user mode.  That representation is consistent within itself; by the
+;	time the routine which calls UETP$CLSIODB reads the representation,
+;	it may no longer reflect the state of the cluster.
+;
+;
+; ENVIRONMENT:
+;	Runs in kernel mode.  Runs at elevated IPL and holds a mutex during
+;	which time system services and error recovery are prohibited.  Must
+;	prevent paging while at elevated IPL.
+;
+;
+;--
+;
+; AUTHOR:  Richard N. Holstein, CREATION DATE:  06-Jan-1983
+;
+; MODIFIED BY:
+;
+;	V03-006	RNH0006		Richard N. Holstein,	02-May-1984
+;		Fix bug in V3-5 causing exception above ASTDEL.
+;
+;	V03-005	RNH0005		Richard N. Holstein,	30-Mar-1984
+;		Ignore UDAs when collecting system blocks.
+;
+;	V03-004	RNH0004		Richard N. Holstein,	22-Dec-1983
+;		Return PB$W_STATE, PB$B_RSTATE, PB$B_CBL_STS, PB$B_P0_STS
+;		and PB$B_P1_STS.
+;
+;	V03-003	RNH0003		Richard N. Holstein,	15-Jul-1983
+;		Return UCB$L_DEVCHAR and UCB$L_DEVCHAR2.
+;
+;	V03-002	RNH0002		Richard N. Holstein,	23-Jun-1983
+;		Fix bugs with word length arithmetic on addresses.  Fix bug
+;		with allocating sufficient memory.
+;
+;	V03-001	RNH0001		Richard N. Holstein,	14-Jan-1983
+;		Fix access violations.
+;
+;**
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+;	SYS$LIBRARY:LIB.MLB		; For varoius macro definitions
+;	SYS$LIBRARY:UETP.MLB		; For UETP-specific definitions
+;	SYS$SYSTEM:SYS.STB		; Required during linking
+
+;
+; MACROS:
+;
+	.ENABLE SUPPRESSION
+
+	$ADPDEF				; Adapter control block
+	$DDBDEF				; Device data block
+	$IPLDEF				; Interrupt priority levels
+	$MPMDEF				; Mulitport memory
+	;$PAPDTDEF			; CI-specific extensions to the PDT
+	;$PDTDEF			; Port descriptor table
+	$PBDEF				; Path block offsets
+	$PRDEF				; Processor register addresses
+	$PSLDEF				; Processor status longword bits
+	$SBDEF				; System block offsets
+	$SHBDEF				; Shared memory control block
+	$SHDDEF				; Shared memory datapage
+	$SHRDEF				; Shared messages
+	$SSDEF				; System Service condition codes
+	$STSDEF				; Status return values
+	$UCBDEF				; Unit control block
+	$UETIDBDEF			; UETP I/O database definitions
+	$UETPDEF			; UETP
+
+;
+; EQUATED SYMBOLS:
+;
+	CLS_POINTER = 4			; Offset on calling argument list of...
+					; ...the address to which we return...
+					; ...a pointer to our cluster database
+	LCL_POINTER = 8			; Offset on calling argument list of...
+					; ...the address to which we return...
+					; ...a pointer to our local database
+	MPM_POINTER = 12		; Offset on calling argument list of...
+					; ...the address to which we return...
+					; ...a pointer to our shared memory...
+					; ... database
+	FLAGS = 16			; Offset on calling argument list of...
+					; ...flags governing our execution.
+					; See $UETIDBDEF for definitions
+
+	UETP$_NOTCMPLT = -		; Status return...
+	  UETP$_FACILITY@STS$V_FAC_NO!-	; ...if we run out of P0 space...
+	  SHR$_NOTCMPLT!STS$K_ERROR	; ...before we run out of database
+
+	.SBTTL	Local Storage for the Routine
+;
+; For generality's sake, use the stack for local storage.  We use an absolute
+; .PSECT to define offsets into the stack.  What appear to be labels below
+; are really offsets.  Because we are also using the stack for subroutine
+; calls, we must explicitly pass a reference if we want to access any of these
+; locations.
+;
+	.PSECT	$ABS$,ABS
+	. = 0				; Reset us to define offsets
+
+SAVE_R0:				; Temporary R0 storage
+	.BLKL	1
+
+SETSFM:					; If SETSFM then SS fail mode...
+	.BLKB	1			; ...was set on entry to the routine
+	.BLKB	3			; Keep this longword aligned
+
+CURRENT_AREA:				; Points to start of current data area.
+	.BLKQ	1			; Quadword so it can accept the...
+					; ...result of a memory mgt. service
+
+DB_COUNT:				; Count of the amount of space we'll...
+	.BLKL	1			; ...need to store a particular P0 db
+
+OUR_FLAGS:				; Convenient storage of flags...
+	.BLKL	1			; ...governing the info we're to return
+
+LOCAL_LENGTH = .			; Length of stack to reserve...
+					; ...for local storage
+
+	.SBTTL	CLSIODB - Entry and Initialization
+
+	.DEFAULT DISPLACEMENT,WORD
+	.PSECT	_UETP$CODE,EXE,NOWRT,PIC,SHR
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This module steps through the I/O databases maintained by VMS to keep
+;	track of peripherals in a cluster.  From that (potentially) changing
+;	database in system space accessible only in exec or kernel modes,
+;	the module builds a stable representation in P0 space accessible in
+;	user mode.  That representation is consistent within itself; by the
+;	time the routine which calls UETP$CLSIODB reads the representation,
+;	it may no longer reflect the state of the cluster.
+;
+;	The representation built consists of seven kinds of records:  a system
+;	record, a path record, a DDB record, a UCB record, a shared memory
+;	record, an end record and a null record.  The first five correspond
+;	to similar items in the VMS I/O database.  The end record gives a
+;	convenient way to end if one traverses the data structure sequentially
+;	or if there are no records in a group (groups are defined below).
+;	The null record is available to allow some housekeeping functions.  It
+;	typically will not be present.  See the $UETIDBDEF macro for record
+;	definitions.
+;
+;	Those records are organized into three groups, corresponding to the
+;	way VMS organizes its internal database.  The first group has the
+;	cluster database:  system blocks, path blocks and devices accessible
+;	only via SCS protocol.  The second group has the local peripherals
+;	on a system, devices that can be directly allocated.  The third
+;	group has shared memory devices.  An end record terminates each group.
+;
+;	A formal parameter is allocated to return pointers for each group.
+;	Another parameter allows the omission of entire groups or of items
+;	within a group.  The parameter descriptions below give more detail.
+;
+;	The database may be read two ways.  One may read through each group
+;	of records sequentially.  In that case, each group looks like a tree
+;	stretched out:  a branch followed by all its subbranches, followed
+;	by the next branch.  If a record points to any other dependent
+;	records, those records will follow it in sequence.  For example, a
+;	DDB record will be followed by all of its UCB records.  The address
+;	of the next record is the sum of the address of the current record
+;	and the contents of the length field of the current record.  One may
+;	also selectively go through the database records one wants.  In that
+;	case, one chains through record types and to their subtypes as one
+;	would access the VMS databases.
+;
+;	This section of the code receives control from the calling program.
+;	It initializes our data structures and starts the various routines
+;	which build up the P0 databases.
+;
+; CALLING SEQUENCE:
+;
+;	NOTE THAT CLSIODB IS TYPICALLY NOT CALLED DIRECTLY!  RATHER IT IS
+;	CALLED BY A CHANGE MODE TO KERNEL SYSTEM SERVICE!
+;
+;		ret_status.wlc.v = SYS$CMKRNL (UETP$CLSIODB,arglst.rz.ra)
+;			WHERE arglst CONTAINS:
+;			count-of-longwords-to-follow.rl.v
+;			cls-pointer.wa.ra
+;			lcl-pointer.wa.ra
+;			mpm-pointer.wa.ra
+;			flags.rlu.v
+;
+;	OR IF ALREADY IN KERNEL MODE:
+;
+;		ret_status.wlc.v = UETP$CLSIODB ([cls-pointer.wa.ra],-
+;			[lcl-pointer.wa.ra],[mpm-pointer.wa.ra][,flags.rlu.v])
+;
+; INPUT PARAMETERS:
+;
+;	flags
+;		If argument missing or if present and bits are set, return
+;		record type assigned to each bit.  If bit is clear, do not
+;		return record type corresponding to that bit.  Bits are defined
+;		in $UETIDBDEF.  The bits are not all independent; see the
+;		PARAMS_CHECK subroutine.  Optional argument.
+;
+; IMPLICIT INPUTS:
+;
+;	VMS's internal database of cluster peripherals.
+;
+; OUTPUT PARAMETERS:
+;
+;	cls-pointer
+;		If reference is present, a 2-longword array to receive
+;		starting and ending addresses of the P0 database that we
+;		build for cluster items.  Required argument, but may be
+;		specified as 0 if information is not required.
+;
+;	lcl-pointer
+;		If reference is present, a 2-longword array to receive
+;		starting and ending addresses of the P0 database that we
+;		build for local peripherals.  Required argument, but may be
+;		specified as 0 if information is not required.
+;
+;	mpm-pointer
+;		If reference is present, a 2-longword array to receive
+;		starting and ending addresses of the P0 database that we
+;		build for shared memories.  Required argument, but may be
+;		specified as 0 if information is not required.
+;
+; IMPLICIT OUTPUTS:
+;
+;	The database in P0 space described in the Functional Description,
+;	above.
+;
+; COMPLETION CODES:
+;
+;	SS$_NORMAL
+;		We were able to build a P0 database.
+;
+;	UETP$_NOTCMPLT
+;		We though enough space was allocated to copy the database, but
+;		we ran out of room anyway.
+;
+;	VMS error code otherwise.
+;
+; SIDE EFFECTS:
+;
+;	P0 space is expanded dynamically.  Note that it is possible for a
+;		process to release this area (or areas) once the process is
+;		finished with it (them).
+;
+;--
+
+	.ENTRY	UETP$CLSIODB,^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+
+	SUBL2	#LOCAL_LENGTH,SP	; Allocate space for our local storage
+	MOVL	SP,R9			; Keep a copy so we can still use stack
+	MOVC5	#0,#0,#0,#LOCAL_LENGTH,(R9) ; Clear out our local storage
+	MOVAL	OUR_FLAGS(R9),R8	; Set up defaults and see if...
+	BSBW	PARAMS_CHECK		; ...UETP$CLSIODB was correctly called
+	$SETSFM_S ENBFLG = #0		; Clear SS fail mode locally
+	CMPL	#SS$_WASSET,R0		; Was it in effect previously?
+	BNEQ	10$			; BR if it was not
+	INCB	SETSFM(R9)		; Flag the fact if it was
+10$:
+	MOVAL	CURRENT_AREA(R9),R6	; R6 retains this address
+	MOVAL	DB_COUNT(R9),R7		; R7 retains this address
+	MOVAL	UETP$CLSIODB,-		; We must lock ourself in our WS...
+		CURRENT_AREA(R9)
+	MOVAL	UETP$CLSIODB_END,-	; ...because...
+		CURRENT_AREA+4(R9)	; ...we won't be able to page...
+	$LKWSET_S INADR = (R6)		; ...once we're at elevated IPL
+
+	TSTL	CLS_POINTER(AP)		; Need we return shape of the cluster?
+	BNEQ	20$			; BR if not
+	BRW	80$
+20$:	SETIPL	#IPL$_SCS		; Raise IPL to keep a constant database
+	MOVL	#UIDEND$K_FFREE,(R7)	; Initialize counter to minimum space
+	MOVAL	G^SCS$GQ_CONFIG,R0	; Get the start of the cluster db...
+	MOVL	SB$L_FLINK(R0),R1	; ...and point to the first real SB
+	BBS	#UIDFLAG$V_MYSYS,-	; BR if we want to see the list of...
+		OUR_FLAGS(R9),30$	; ...devices on the system calling us
+	MOVL	SB$L_FLINK(R1),R1	; Otherwise, check other nodes only
+30$:
+	PUSHL	R0			; Start out counting the cluster db
+	PUSHL	OUR_FLAGS(R9)
+	PUSHL	R7
+	PUSHAL	SID_COUNT
+	PUSHL	R1
+	CALLS	#5,CALL_IT
+	SETIPL	#0			; Reset IPL
+	BLBS	R0,40$			; BR if everything went OK
+	BRW	200$			; BR - we failed to count cluster db
+40$:	PUSHL	(R7)			; Calculate, allocate and lock in WS...
+	PUSHL	CLS_POINTER(AP)		; ...the space we'll use for...
+	CALLS	#2,EXPREG		; ...the cluster database
+	BLBS	R0,50$			; BR if there were no problems
+	BRW	200$			; We had problems - bail out
+50$:	SETIPL	#IPL$_SCS		; Raise IPL to keep a constant database
+	MOVAL	G^SCS$GQ_CONFIG,R0	; Get the start of the cluster db...
+	MOVL	SB$L_FLINK(R0),R1	; ...and point to the first real SB
+	BBS	#UIDFLAG$V_MYSYS,-	; BR if we want to see the list of...
+		OUR_FLAGS(R9),60$	; ...devices on the system calling us
+	MOVL	SB$L_FLINK(R1),R1	; Otherwise, check other nodes only
+60$:
+	PUSHL	R0			; Copy the cluster database
+	PUSHL	OUR_FLAGS(R9)
+	PUSHL	#0
+	PUSHAL	SID_TRAVERSE
+	PUSHL	R1
+	CALLS	#5,CALL_IT
+	SETIPL	#0			; Reset IPL
+	BLBS	R0,70$			; BR if everything went OK
+	BRW	200$			; BR - we failed to get cluster db
+70$:	$ULWSET_S INADR = (R6)		; Allow that area to page again
+	MOVL	#UID$K_END_RTYPE,-	; Put a cap on what we return
+		UIDGNRC$B_TYPE(R11)
+
+80$:
+	TSTL	LCL_POINTER(AP)		; Need we return local peripherals?
+	BNEQ	90$			; BR if not
+	BRW	120$			; BR to shared memory
+90$:	MOVL	G^SCH$GL_CURPCB,R4	; We want the mutex on the local I/O db
+	JSB	G^SCH$IOLOCKR		; Grab the mutex, goto IPL$_ASTDEL
+	MOVL	#UIDEND$K_FFREE,(R7)	; Initialize counter to minimum space
+	PUSHL	#0			; Count items in the local I/O database
+	PUSHL	OUR_FLAGS(R9)
+	PUSHL	R7
+	PUSHAL	DDB_COUNT
+	PUSHL	G^IOC$GL_DEVLIST
+	CALLS	#5,CALL_IT
+	PUSHR	#^M<R0>			; Save status of counting routines
+	MOVL	G^SCH$GL_CURPCB,R4	; We must release mutex on local I/O db
+	JSB	G^SCH$IOUNLOCK		; Release mutex...
+	SETIPL	#0			; ...and reset IPL
+	POPR	#^M<R0>
+	BLBS	R0,100$			; BR if we got local peripheral db
+	BRW	200$			; We failed to get local db
+100$:	PUSHL	(R7)			; Calculate, allocate and lock in WS...
+	PUSHL	LCL_POINTER(AP)		; ...the space we'll use for...
+	CALLS	#2,EXPREG		; ...the local database
+	BLBS	R0,110$			; BR if there was no problem
+	BRW	200$			; There was some problem
+110$:	MOVL	G^SCH$GL_CURPCB,R4	; We want the mutex on the local I/O db
+	JSB	G^SCH$IOLOCKR		; Grab the mutex, goto IPL$_ASTDEL
+	PUSHL	#0			; Copy the local I/O database
+	PUSHL	OUR_FLAGS(R9)
+	PUSHL	#0
+	PUSHAL	DDB_TRAVERSE
+	PUSHL	G^IOC$GL_DEVLIST
+	CALLS	#5,CALL_IT
+	PUSHR	#^M<R0>			; Save status of traversing routines
+	MOVL	G^SCH$GL_CURPCB,R4	; We must release mutex on local I/O db
+	JSB	G^SCH$IOUNLOCK		; Release mutex...
+	SETIPL	#0			; ...and reset IPL
+	POPR	#^M<R0>
+	BLBC	R0,200$			; BR if we failed to get local db
+	$ULWSET_S INADR = (R6)		; Allow normal paging in that area
+	MOVL	#UID$K_END_RTYPE,-	; Put a cap on what we return
+		UIDGNRC$B_TYPE(R11)
+
+120$:
+	TSTL	MPM_POINTER(AP)		; Need we return shared memory info?
+	BEQL	200$			; BR if not
+	MOVL	#UIDEND$K_FFREE,(R7)	; Initialize counter to minimum space
+	PUSHL	#0			; Now count the shared memory list
+	PUSHL	OUR_FLAGS(R9)
+	PUSHL	R7
+	PUSHAL	MPM_COUNT
+	PUSHL	G^EXE$GL_SHBLIST
+	CALLS	#5,CALL_IT
+	BLBC	R0,200$			; BR if we failed to count it
+	PUSHL	(R7)			; Calculate, allocate and lock in WS...
+	PUSHL	MPM_POINTER(AP)		; ...the space we'll use for...
+	CALLS	#2,EXPREG		; ...the shared memory database
+	BLBC	R0,200$			; BR if there was any problem
+	PUSHL	#0			; Copy the shared memory database
+	PUSHL	OUR_FLAGS(R9)
+	PUSHL	#0
+	PUSHAL	MPM_TRAVERSE
+	PUSHL	G^EXE$GL_SHBLIST
+	CALLS	#5,CALL_IT
+	BLBC	R0,200$			; BR if we failed to copy it
+	$ULWSET_S INADR = (R6)		; Allow that area to page again
+	MOVL	#UID$K_END_RTYPE,-	; Put a cap on what we return
+		UIDGNRC$B_TYPE(R11)
+
+	MOVL	#UETP$_NORMAL,R0	; Indicate that all went well
+200$:
+	MOVL	R0,SAVE_R0(R9)		; Save our return status over SS calls
+	$ULWSET_S INADR = (R6)		; Allow paging of db in case error path
+	MOVAL	UETP$CLSIODB,-		; We can unlock our code, too
+		CURRENT_AREA(R9)
+	MOVAL	UETP$CLSIODB_END,-
+		CURRENT_AREA+4(R9)
+	$ULWSET_S INADR = (R6)		; Allow regular paging - we're IPL 0
+	MOVL	SETSFM(R9),R8
+	$SETSFM_S ENBFLG = R8		; Reset original SS fail mode
+	MOVL	SAVE_R0(R9),R0		; Restore our return status
+	BLBC	R0,210$			; Exit now if there was an error
+	MOVL	#SS$_NORMAL,R0		; Otherwise, give status people expect
+210$:
+	RET
+
+	.SBTTL	Traversing Subroutines - System Block
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;	Extracts information from a system block in VMS's cluster
+;	database and puts it into a SID record in P0 space.
+;
+; CALLING SEQUENCE:
+;	BSBW	SID_TRAVERSE	; Always called by CALL_IT,
+;				; ...uses CALL_IT's params
+;
+; INPUT PARAMETERS:
+;	Same as those for CALL_IT.
+;	12(AP) is 0 or the address of a longword which will link to the current
+;		record.
+;
+; IMPLICIT INPUTS:
+;	R10 and R11 form a descriptor for the amount of free space left in the
+;		current area of P1 space we've allocated for our database.
+;
+; OUTPUT PARAMETERS:
+;	12(AP) - Updated for link to subtree in current record.
+;	04(AP) - Updated to point to the next SID block if there is one.  If
+;		there is none, undefined.
+;
+; IMPLICIT OUTPUTS:
+;	R10 and R11 are updated to point to the next free byte in P0 space.
+;
+; COMPLETION CODES:
+;	UETP$_NORMAL if we were able to extract useful information and there
+;		is presumed to be another SID block to go.
+;	UETP$_FINISHED if we've reached the last SID or there are none.
+;	UETP$_NOTCMPLT if we run out of room to copy the database.
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+SID_TRAVERSE:
+
+	MOVL	04(AP),R8		; Get address of presumed system block
+	BEQL	10$			; BR if obviously bogus
+	CMPL	R8,(R8)			; Check for an empty circular list
+	BEQL	10$			; BR if we have one
+	CMPL	20(AP),R8		; Check for pointing to list header
+;	BEQL	10$			; BR if we are
+;	BBS	#UIDFLAG$V_SID,16(AP),10$ ; We know caller wants SID records
+;	CLRL	R8			; Force bogus address otherwise
+10$:
+	BSBW	SANITY_CHECK		; See if we have a good address
+	FFC	#<SB$S_SYSTEMID*8>-1,#1,- ; A UDA is indicated by the high...
+		SB$B_SYSTEMID(R8),R0	  ; ...bit in the system id...
+	BNEQ	15$
+	BRW	40$			  ; ...and we want to ignore them
+15$:	CMPL	#UIDSID$K_FFREE,R10	; Have we enough space for this record?
+	BLEQ	20$			; BR if we have
+	MOVL	#UETP$_NOTCMPLT,R0	; Return with an error if not
+	RSB
+20$:
+	MOVW	#UIDSID$K_FFREE,-	; Save length of record
+		UIDGNRC$W_SIZE(R11)
+	MOVB	#UID$K_SID_RTYPE,-	; Indicate that it's a SID record
+		UIDGNRC$B_TYPE(R11)
+	TSTL	12(AP)			; Are we chained to a previous record?
+	BEQL	30$			; BR if not
+	MOVL	R11,@12(AP)		; Forge a link if we are
+30$:
+	MOVC3	#SB$S_SYSTEMID,-	; Transfer...
+		SB$B_SYSTEMID(R8),-	; ...the system id...
+		UIDSID$B_SYSTEMID(R11)	; ...to our SID record in P0 space
+	MOVL	SB$T_SWTYPE(R8),-	; Transfer the software type...
+		UIDSID$T_SWTYPE(R11)
+	MOVL	SB$T_SWVERS(R8),-	; ...the software version...
+		UIDSID$T_SWVERS(R11)
+	MOVQ	SB$Q_SWINCARN(R8),-	; ...the software incarnation number...
+		UIDSID$Q_SWINCARN(R11)
+	MOVL	SB$T_HWTYPE(R8),-	; ...the hardware type...
+		UIDSID$T_HWTYPE(R11)
+	MOVC3	#SB$S_HWVERS,-		; ...the hardware version...
+		SB$B_HWVERS(R8),-
+		UIDSID$B_HWVERS(R11)
+	MOVC3	#SB$S_NODENAME,-	; ...and the SCS nodename...
+		SB$T_NODENAME(R8),-
+		UIDSID$T_NODENAME(R11)	; ...to our SID record
+
+	MOVL	R11,R9			; Make a temporary copy of our base...
+	MOVZWL	UIDGNRC$W_SIZE(R9),R0	; ...
+	SUBL2	R0,R10			; ...because we and routines we call...
+	ADDL2	R0,R11			; ...update the free space descriptor
+
+	PUSHL	#0			; DDB list terminates by itself
+	PUSHL	16(AP)			; Form a copy of flags for subtree
+	PUSHAL	UIDSID$L_DDB(R9)	; Save DDB link for CALL_IT call
+	PUSHAL	DDB_TRAVERSE		; Now set up all DDBs and UCBs...
+	PUSHL	SB$L_DDB(R8)		; ...attached to this system block
+	CALLS	#5,CALL_IT
+	BLBC	R0,50$			; Exit immediately on an error
+
+	PUSHL	SB$L_PBFL(R8)		; Path blocks are in a circular list
+	PUSHL	16(AP)			; Form a copy of flags for subtree
+	PUSHAL	UIDSID$L_PBFL(R9)	; Save path block link for CALL_IT call
+	PUSHAL	PATH_TRAVERSE		; Now set up all the path blocks...
+	PUSHL	SB$L_PBFL(R8)		; ...attached to this system block
+	CALLS	#5,CALL_IT
+	BLBC	R0,50$			; Exit immediately on an error
+
+	MOVAL	UIDGNRC$A_FLINK(R9),12(AP) ; Set up link for next SID record
+40$:
+	MOVL	SB$L_FLINK(R8),04(AP)	; Point to next possible system block
+	MOVL	#UETP$_NORMAL,R0	; Return fat and happy
+50$:
+	RSB
+
+	.SBTTL	Traversing Subroutines - Path Block
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;	Extracts information from a path block in VMS's cluster database and
+;	puts it into a PATH record in P0 space.
+;
+; CALLING SEQUENCE:
+;	BSBW	PATH_TRAVERSE	; Always called by CALL_IT,
+;				; ...uses CALL_IT's params
+;
+; INPUT PARAMETERS:
+;	Same as those for CALL_IT.
+;	12(AP) is 0 or the address of a longword which will link to the current
+;		record.
+;
+; IMPLICIT INPUTS:
+;	R10 and R11 form a descriptor for the amount of free space left in the
+;		current area of P0 space we've allocated for our database.
+;
+; OUTPUT PARAMETERS:
+;	12(AP) - Updated for link to subtree in current record.
+;	04(AP) - Updated to point to the next path block if there is one.  If
+;		there is none, undefined.
+;
+; IMPLICIT OUTPUTS:
+;	R10 and R11 are updated to point to the next free byte in P0 space.
+;
+; COMPLETION CODES:
+;	UETP$_NORMAL if we were able to extract useful information and there
+;		is presumed to be another path block to go.
+;	UETP$_FINISHED if we've reached the last path block or there are none.
+;	UETP$_NOTCMPLT if we run out of room to copy the database.
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+PATH_TRAVERSE:
+
+	MOVL	04(AP),R8		; Get address of presumed path block
+	BEQL	10$			; BR if obviously bogus
+	CMPL	R8,(R8)			; Check for an empty circular list
+	BBS	#UIDFLAG$V_PATH,16(AP),10$ ; BR if caller wants path records
+	CLRL	R8			; Force bogus address otherwise
+10$:
+	BSBW	SANITY_CHECK		; See if we have a good address
+	CMPL	#UIDPATH$K_FFREE,R10	; Have we enough space for this record?
+	BLEQ	20$			; BR if we have
+	MOVL	#UETP$_NOTCMPLT,R0	; Return with an error if not
+	RSB
+20$:
+	MOVW	#UIDPATH$K_FFREE,-	; Save length of record
+		UIDGNRC$W_SIZE(R11)
+	MOVB	#UID$K_PATH_RTYPE,-	; Indicate it's a path block record
+		UIDGNRC$B_TYPE(R11)
+	TSTL	12(AP)			; Are we chained to a previous record?
+	BEQL	30$			; BR if not
+	MOVL	R11,@12(AP)		; Forge a link if we are
+30$:
+	MOVL	PB$T_LPORT_NAME(R8),-	; Copy over the local port name
+		UIDPATH$T_LPORT_NAME(R11)
+	MOVW	PB$W_STATE(R8),-	; Copy the state of the virtual circuit
+		UIDPATH$W_STATE(R11)
+	MOVB	PB$B_RSTATE(R8),-	; Copy the state of the remote node
+		UIDPATH$B_RSTATE(R11)
+	MOVB	PB$B_CBL_STS(R8),-	; Copy the overall state of the cable
+		UIDPATH$B_CBL_STS(R11)
+	MOVB	PB$B_P0_STS(R8),-	; Copy the state of path A
+		UIDPATH$B_P0_STS(R11)
+	MOVB	PB$B_P1_STS(R8),-	; Copy the state of path B
+		UIDPATH$B_P1_STS(R11)
+
+	MOVL	R11,R9			; Make a temporary copy of our base...
+	MOVZWL	UIDGNRC$W_SIZE(R9),R0	; ...
+	SUBL2	R0,R10			; ...because we...
+	ADDL2	R0,R11			; ...update the free space descriptor
+
+	MOVAL	UIDGNRC$A_FLINK(R9),12(AP) ; Set up link for next path block
+	MOVL	PB$L_FLINK(R8),04(AP)	; Point to the next possible path block
+	CMPL	@04(AP),20(AP)		; We are in a circular queue...
+	BNEQ	40$			; ...so BR if we've not gone around...
+	CLRL	04(AP)			; ...but force an end if we have
+40$:
+	MOVL	#UETP$_NORMAL,R0	; Return fat and happy
+	RSB
+
+	.SBTTL	Traversing Subroutines - Device Data Blocks
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;	Extracts information from a DDB in VMS's I/O database and puts it
+;	into a DDB record in P0 space.
+;
+; CALLING SEQUENCE:
+;	BSBW	DDB_TRAVERSE	; Always called by CALL_IT,
+;				; ...uses CALL_IT's params
+;
+; INPUT PARAMETERS:
+;	Same as those for CALL_IT.
+;	12(AP) is 0 or the address of a longword which will link to the current
+;		record.
+;
+; IMPLICIT INPUTS:
+;	R10 and R11 form a descriptor for the amount of free space left in the
+;		current area of P0 space we've allocated for our database.
+;
+; OUTPUT PARAMETERS:
+;	12(AP) - Updated for link to subtree in current record.
+;	04(AP) - Updated to point to the next DDB if there is one.  If
+;		there is none, undefined.
+;
+; IMPLICIT OUTPUTS:
+;	R10 and R11 are updated to point to the next free byte in P0 space.
+;
+; COMPLETION CODES:
+;	UETP$_NORMAL if we were able to extract useful information and there
+;		is presumed to be another DDB to go.
+;	UETP$_FINISHED if we've reached the last DDB or there are none.
+;	UETP$_NOTCMPLT if we run out of room to copy the database.
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+DDB_TRAVERSE:
+
+	MOVL	04(AP),R8		; Get address of the DDB
+	BBS	#UIDFLAG$V_DDB,16(AP),10$ ; BR if caller wants DDB records
+	CLRL	R8			; Force bogus address otherwise
+10$:
+	BSBW	SANITY_CHECK		; See if we have a good address
+	ADDB3	#UIDDDB$K_FFREE,-	; Figure how much space we'll need...
+		DDB$T_NAME(R8),R7
+	MOVZBL	R7,R7			; ...for our P0 DDB record
+	CMPL	R7,R10			; Have we enough?
+	BLEQ	20$			; BR if we have
+	MOVL	#UETP$_NOTCMPLT,R0	; Return with an error if not
+	RSB
+20$:
+	MOVW	R7,UIDGNRC$W_SIZE(R11)	; Save length of record
+	MOVB	#UID$K_DDB_RTYPE,-	; Indicate that it's a DDB record
+		UIDGNRC$B_TYPE(R11)
+	TSTL	12(AP)			; Are we chained to a previous record?
+	BEQL	30$			; BR if not
+	MOVL	R11,@12(AP)		; Forge a link if we are
+30$:
+	MOVZBW	DDB$T_NAME(R8),R7	; Transfer...
+	MOVC3	R7,DDB$T_NAME+1(R8),-	; ...the device controller name...
+		UIDDDB$K_FFREE(R11)	; ...to our DDB record in P0 space
+	MOVB	R7,UIDDDB$T_NAME(R11)	; Make the name an ASCIC string
+
+	MOVL	R11,R9			; Make a temporary copy of our base...
+	MOVZWL	UIDGNRC$W_SIZE(R9),R0	; ...
+	SUBL2	R0,R10			; ...because we and routines we call...
+	ADDL2	R0,R11			; ...update the free space descriptor
+
+	PUSHL	#0			; UCB list terminates by itself
+	PUSHL	16(AP)			; Form a copy of flags for subtree
+	PUSHAL	UIDDDB$L_UCB(R9)	; Save UCB link for CALL_IT call
+	PUSHAL	UCB_TRAVERSE		; Now set up all the UCBs...
+	PUSHL	DDB$L_UCB(R8)		; ...attached to this DDB
+	CALLS	#5,CALL_IT
+	BLBC	R0,40$			; Exit immediately on an error
+
+	MOVAL	UIDGNRC$A_FLINK(R9),12(AP) ; Set up link for next DDB
+	MOVL	DDB$L_LINK(R8),04(AP)	; Point to the next possible DDB
+	MOVL	#UETP$_NORMAL,R0	; Return fat and happy
+40$:
+	RSB
+
+	.SBTTL	Traversing Subroutines - Unit Control Block
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;	Extracts information from a UCB in VMS's I/O database and puts it
+;	into a UCB record in P0 space.
+;
+; CALLING SEQUENCE:
+;	BSBW	UCB_TRAVERSE	; Always called by CALL_IT,
+;				; ...uses CALL_IT's params
+;
+; INPUT PARAMETERS:
+;	Same as those for CALL_IT.
+;	12(AP) is 0 or the address of a longword which will link to the current
+;		record.
+;
+; IMPLICIT INPUTS:
+;	R10 and R11 form a descriptor for the amount of free space left in the
+;		current area of P0 space we've allocated for our database.
+;
+; OUTPUT PARAMETERS:
+;	04(AP) - Updated to point to the next UCB if there is one.  If
+;		there is none, undefined.
+;
+; IMPLICIT OUTPUTS:
+;	R10 and R11 are updated to point to the next free byte in P0 space.
+;
+; COMPLETION CODES:
+;	UETP$_NORMAL if we were able to extract useful information and there
+;		is presumed to be another UCB to go.
+;	UETP$_FINISHED if we've reached the last UCB or there are none.
+;	UETP$_NOTCMPLT if we run out of room to copy the database.
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+UCB_TRAVERSE:
+
+	MOVL	04(AP),R8		; Get the address of the UCB
+	BBS	#UIDFLAG$V_UCB,16(AP),10$ ; BR if caller wants UCB records
+	CLRL	R8			; Force bogus address otherwise
+10$:
+	BSBW	SANITY_CHECK		; See if we have a good address
+	CMPL	#UIDUCB$K_FFREE,R10	; Have we enough space for this record?
+	BLEQ	20$			; BR if we have
+	MOVL	#UETP$_NOTCMPLT,R0	; Return with an error if not
+	RSB
+20$:
+	MOVW	#UIDUCB$K_FFREE,-	; Save length of record
+		UIDGNRC$W_SIZE(R11)
+	MOVB	#UID$K_UCB_RTYPE,-	; Indicate that it's a UCB record
+		UIDGNRC$B_TYPE(R11)
+	TSTL	12(AP)			; Are we chained to a previous record?
+	BEQL	30$			; BR if not
+	MOVL	R11,@12(AP)		; Forge a link if we are
+30$:
+	MOVW	UCB$W_UNIT(R8),-	; Save the unit number...
+		UIDUCB$W_NUMBER(R11)	; ...in our P0 UCB record
+	MOVB	UCB$B_DEVCLASS(R8),-	; Save the device class
+		UIDUCB$B_DEVCLASS(R11)
+	MOVB	UCB$B_DEVTYPE(R8),-	; Save the device type
+		UIDUCB$B_DEVTYPE(R11)
+	MOVL	UCB$L_DEVCHAR(R8),-	; Save all the device...
+		UIDUCB$L_DEVCHAR(R11)
+	MOVL	UCB$L_DEVCHAR2(R8),-	; ...independent characteristics
+		UIDUCB$L_DEVCHAR2(R11)
+
+	MOVL	R11,R9			; Make a temporary copy of our base...
+	MOVZWL	UIDGNRC$W_SIZE(R9),R0	; ...
+	SUBL2	R0,R10			; ...because we...
+	ADDL2	R0,R11			; ...update the free space descriptor
+
+	MOVAL	UIDGNRC$A_FLINK(R9),12(AP) ; Set up link for next UCB
+	MOVL	UCB$L_LINK(R8),04(AP)	; Point to the next possible UCB
+	MOVL	#UETP$_NORMAL,R0	; Return fat and happy
+	RSB
+
+	.SBTTL	Traversing Subroutines - Shared Memory Blocks
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;	Extracts information from a SHB-SHD-ADP set in VMS's I/O database and
+;	puts it into an MPM record in P0 space.
+;
+; CALLING SEQUENCE:
+;	BSBW	MPM_TRAVERSE	; Always called by CALL_IT,
+;				; ...uses CALL_IT's params
+;
+; INPUT PARAMETERS:
+;	Same as those for CALL_IT.
+;	12(AP) is 0 or the address of a longword which will link to the current
+;		record.
+;
+; IMPLICIT INPUTS:
+;	R10 and R11 form a descriptor for the amount of free space left in the
+;		current area of P0 space we've allocated for our database.
+;
+; OUTPUT PARAMETERS:
+;	04(AP) - Updated to point to the next SHB if there is one.  If
+;		there is none, undefined.
+;
+; IMPLICIT OUTPUTS:
+;	R10 and R11 are updated to point to the next free byte in P0 space.
+;
+; COMPLETION CODES:
+;	UETP$_NORMAL if we were able to extract useful information and there
+;		is presumed to be another SHB to go.
+;	UETP$_FINISHED if we've reached the last SHB or there are none.
+;	UETP$_NOTCMPLT if we run out of room to copy the database.
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+MPM_TRAVERSE:
+
+	; R8 will point to the SHB, R7 to the SHD, and R6 to the ADP.
+	MOVL	04(AP),R8		; Get address of the SHB
+;	BBS	#UIDFLAG$V_MPM,16(AP),10$ ; We know caller wants MPM records
+;	CLRL	R8			; Force bogus address otherwise
+10$:
+	BSBW	SANITY_CHECK		; See if we have a good address
+	MOVL	SHB$L_DATAPAGE(R8),R7	; Point to corresponding SHD
+	ADDB3	#UIDMPM$K_FFREE,-	; Figure how much space we'll need...
+		SHD$T_NAME(R7),R5
+	MOVZBL	R5,R5			; ...for our P0 MPM record
+	CMPL	R5,R10			; Have we enough?
+	BLEQ	20$			; BR if we have
+	MOVL	#UETP$_NOTCMPLT,R0	; Return with an error if not
+	RSB
+20$:
+	MOVW	R5,UIDGNRC$W_SIZE(R11)	; Save length of record
+	MOVB	#UID$K_MPM_RTYPE,-	; Indicate that it's an MPM record
+		UIDGNRC$B_TYPE(R11)
+	TSTL	12(AP)			; Are we chained to a previous record?
+	BEQL	30$			; BR if not
+	MOVL	R11,@12(AP)		; Forge a link if we are
+30$:
+	MOVL	SHB$L_ADP(R8),R6	; Point to the ADP for this memory
+	MOVL	ADP$L_CSR(R6),R5	; Point to the ADP's CSR
+	MOVL	MPM$L_MR(R5),R5		; (I/O space refernce restriction)
+	EXTZV	#MPM$V_MR_UNIT,-	; Get the unit number of our memory
+		#MPM$S_MR_UNIT,R5,R5
+	MOVW	R5,UIDMPM$W_NUMBER(R11)	; Save it in our P0 MPM record
+	MOVZBW	SHD$T_NAME(R7),R6	; Transfer...
+	MOVC3	R6,SHD$T_NAME+1(R7),-	; ...the device controller name...
+		UIDMPM$K_FFREE(R11)	; ...to our MPM record in P0 space
+	MOVB	R6,UIDMPM$T_NAME(R11)	; Make the name an ASCIC string
+
+	MOVL	R11,R9			; Make a temporary copy of our base...
+	MOVZWL	UIDGNRC$W_SIZE(R9),R0	; ...
+	SUBL2	R0,R10			; ...because we...
+	ADDL2	R0,R11			; ...update the free space descriptor
+
+	MOVAL	UIDGNRC$A_FLINK(R9),12(AP) ; Set up link for next MPM record
+	MOVL	SHB$L_LINK(R8),04(AP)	; Point to the next possible SHB
+	MOVL	#UETP$_NORMAL,R0	; Return fat and happy
+	RSB
+
+	.SBTTL	Counting Subroutines
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;	Counts up the space we'll need to allocate in order to copy VMS's
+;	database into P0 space.
+;
+; CALLING SEQUENCE:
+;	BSBW	xxxx_COUNT		; Always called by CALL_IT...
+;					; ...and uses CALL_IT's parameters
+;
+; INPUT PARAMETERS:
+;	Same as those for CALL_IT.
+;	12(AP) is the address of a longword in which we accumulate a count.
+;
+; IMPLICIT INPUTS
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	12(AP) is incremented by the length of a record.
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	UETP$_NORMAL if we counted a record.
+;	UETP$_FINISHED if the address of the VMS data structure is bogus.
+;
+; SIDE EFFECTS:
+;	Will not return to calling routine if the address is bogus.  Since
+;		this routine and address checking routine are called by BSBx,
+;		address checking routine can RET to return to caller's caller.
+;
+;--
+
+SID_COUNT:
+	MOVL	04(AP),R4		; Get address of presumed system block
+	BEQL	10$			; BR if obviously bogus
+	CMPL	R4,(R4)			; Check for an empty circular list
+	BEQL	10$			; BR if we have one
+	CMPL	20(AP),R4		; Check for pointing to list header
+;	BEQL	10$			; BR if we are
+;	BBS	#UIDFLAG$V_SID,16(AP),10$ ; We know caller wants SID records
+;	CLRL	R4			; Force bogus address otherwise
+10$:
+	BSBW	SANITY_CHECK		; See if we have a good address
+	CLRQ	R0			; Assume for now that we see a UDA
+	FFC	#<SB$S_SYSTEMID*8>-1,#1,- ; A UDA is indicated by the high...
+		SB$B_SYSTEMID(R4),R2	  ; ...bit in the system id...
+	BEQL	20$			  ; ...and we want to ignore them
+	MOVZBL	#UIDSID$K_FFREE,R0	; SID block records are fixed length
+	MOVAL	DDB_COUNT,R1		; We count DDB space...
+	MOVL	SB$L_DDB(R4),R2
+;	CLRL	R5
+	BSBW	COMMON_COUNT
+	CLRL	R0			; ...this SID block space, once...
+	MOVAL	PATH_COUNT,R1		; ...and path block space, too
+	MOVL	SB$L_PBFL(R4),R2
+20$:
+	MOVL	SB$L_FLINK(R4),R3	; Point to the next possible sys block
+	MOVL	R2,R5			; Set up terminator for path block list
+	BRB	COMMON_COUNT
+
+PATH_COUNT:
+	MOVL	04(AP),R4		; Get address of the presumed path block
+	BEQL	10$			; BR if obviously bogus
+	CMPL	R4,(R4)			; Check for an empty circular list
+	BBS	#UIDFLAG$V_PATH,16(AP),10$ ; BR if caller wants path records
+	CLRL	R4			; Force bogus address otherwise
+10$:
+	BSBW	SANITY_CHECK		; See if we have a good address
+	MOVL	#UIDPATH$K_FFREE,R0	; Path block records are fixed length
+	CLRL	R1			; We have no subtrees to count
+	MOVL	PB$L_FLINK(R4),R3	; Point to the next possible path block
+	CMPL	(R3),20(AP)		; We are in a circular queue...
+	BNEQ	20$			; ...so BR if we've not gone around...
+	CLRL	R3			; ...but force an end if we have
+20$:
+;	CLRL	R5
+	BRB	COMMON_COUNT
+
+DDB_COUNT:
+	MOVL	04(AP),R4		; Get address of the VMS data structure
+	BBS	#UIDFLAG$V_DDB,16(AP),10$ ; BR if caller wants DDB records
+	CLRL	R4			; Force bogus address otherwise
+10$:
+	BSBB	SANITY_CHECK		; See if we have a good address
+	ADDB3	#UIDDDB$K_FFREE,-	; DDB records have variable length...
+		DDB$T_NAME(R4),R0	; ...device names
+	MOVZBL	R0,R0
+	MOVAL	UCB_COUNT,R1		; We'll have to count UCB space...
+	MOVL	DDB$L_UCB(R4),R2
+	MOVL	DDB$L_LINK(R4),R3	; Point to next DDB
+;	CLRL	R5
+	BRB	COMMON_COUNT
+
+UCB_COUNT:
+	MOVL	04(AP),R4		; Get address of the VMS data structure
+	BBS	#UIDFLAG$V_UCB,16(AP),10$ ; BR if caller wants UCB records
+	CLRL	R4			; Force bogus address otherwise
+10$:
+	BSBB	SANITY_CHECK		; See if we have a good address
+	MOVL	#UIDUCB$K_FFREE,R0	; UCB records are fixed length
+	CLRL	R1			; We have no subtrees to count
+	MOVL	UCB$L_LINK(R4),R3	; Point to next UCB
+;	CLRL	R5
+	BRB	COMMON_COUNT
+
+MPM_COUNT:
+	MOVL	04(AP),R4		; Get address of the VMS data structure
+;	BBS	#UIDFLAG$V_MPM,16(AP),10$ ; We know caller wants MPM records
+;	CLRL	R4			; Force bogus address otherwise
+10$:
+	BSBB	SANITY_CHECK		; See if we have a good address
+	MOVL	SHB$L_DATAPAGE(R4),R1	; Point to corresponding SHD
+	ADDB3	#UIDMPM$K_FFREE,-	; MPM records have variable length...
+		SHD$T_NAME(R1),R0	; ...memory names
+	MOVZBL	R0,R0
+	CLRL	R1			; We have no subtrees to count
+	MOVL	SHB$L_LINK(R4),R3	; Point to next SHB
+;	CLRL	R5
+	BRB	COMMON_COUNT
+
+COMMON_COUNT:
+	ADDL2	R0,@12(AP)		; It's good, add in space we'll need
+	TSTL	R1			; Have we a subtree to count?
+	BEQL	10$			; BR if not
+	PUSHL	R5			; Count subtree space - terminator...
+	PUSHL	16(AP)			; ...flags...
+	PUSHL	12(AP)			; ...current count...
+	PUSHL	R1			; ...counting routine address...
+	PUSHL	R2			; ...and first item in subtree
+	CALLS	#5,CALL_IT
+10$:
+	MOVL	R3,04(AP)		; Point to current level's next str
+	MOVL	#UETP$_NORMAL,R0	; Indicate that we finished normally
+	RSB
+
+	.SBTTL	Utility Subroutines - SANITY_CHECK
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;	Checks that we have a reasonable address in system space.
+;
+; CALLING SEQUENCE:
+;	BSBW	SANITY_CHECK
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS
+;	PSL condition codes have been set by accessing the address of a
+;		supposed VMS data structure.
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	UETP$_FINISHED if the address is bogus.
+;	None, otherwise.
+;
+; SIDE EFFECTS:
+;	Will not return to calling routine if the address is bogus.  Since
+;		this routine is called by BSBx, does a RET to return to
+;		caller's caller.
+;
+;--
+
+SANITY_CHECK:
+
+	BEQL	10$			; Assume condition codes are set
+	RSB				; We have a reasonable address
+10$:
+	MOVL	#UETP$_FINISHED,R0	; A bogus address - we're through
+	RET				; Force our caller to exit
+
+	.SBTTL	Utility Subroutines - CALL_IT
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;	Repeatedly calls one of the VMS I/O database traversal routines or
+;	space counting routines until that routine either finishes
+;	(UETP$_FINISHED) or has an error (low bit clear in R0).
+;
+;	This routine must be reentrent because it is called by various levels
+;	of data structure traversing routines to call the next lower level.
+;
+;	Note that CALL_IT itself only RETurns if it sees an error.  The
+;	routines to which we JSB will RETurn to CALL_IT's caller when they
+;	are finished.
+;
+; CALLING SEQUENCE:
+;	CALLS	#5,CALL_IT
+;
+; INPUT PARAMETERS:
+;	20(AP) - For circular lists, the address of the first item on the list.
+;		Trash, otherwise.  (A routine that counts or traverses a list
+;		must understand the data structure of any sublists.)
+;	16(AP) - Copy of the flag longword telling which record types are
+;		to be counted or written.
+;	12(AP) - P0 address of a longword which will point to the current
+;		record, address of a longword in which we accumulate a count
+;		of the space we need for records, or 0.
+;	08(AP) - Address of the routine we'll call to do the traversal or
+;		counting.
+;	04(AP) - Pointer to first data structure on a list in system space.
+;
+;	NOTE THAT THESE INPUTS ARE USED BY THE TRAVERSING AND COUNTING
+;	SUBROUTINES AS WELL, BECAUSE THOSE ROUTINES ARE CALLED VIA JSB!
+;
+; IMPLICIT INPUTS
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	04(AP) - Updated by repeated calls to the traversing routine.  Should
+;		be regarded as trash upon exiting CALL_IT.
+;	12(AP) - Updated so that chains of records are created or a count is
+;		kept of the space we'll need for records.
+;
+; IMPLICIT OUTPUTS:
+;	P0 database is built by the routines called by this routine.
+;
+; COMPLETION CODES:
+;	UETP$_FINISHED if we're able to build a part of the P0 database.
+;	Error code from a called routine otherwise.
+;
+; SIDE EFFECTS:
+;	Note that R10 and R11 are in use by routines which call CALL_IT and
+;		by routines which CALL_IT calls.  The registers cannot be
+;		altered except for their assigned purpose, and they cannot
+;		be saved in the entry mask either, because they are updated
+;		by the routines which CALL_IT calls.
+;
+;--
+
+CALL_IT:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9>
+
+10$:
+	JSB	@08(AP)			; Go explore a system data structure
+	BLBS	R0,10$			; Explore next str at this level if OK
+	RET				; Return with status
+
+	.SBTTL	Utility Subroutines - EXPREG
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;	Sets up a new data area at the end of P0 space and a descriptor to the
+;	area.  Request twice the calculated space in case there has been a
+;	configuration change since we calculated it.  No explicit check is
+;	made for system service success or for the amount of memory we actually
+;	receive.  We assume that System Service failure mode is in effect and
+;	thus we are assured of getting what we need or a reasonable error.
+;	Note that this routine may only run at IPL 0.
+;
+; CALLING SEQUENCE:
+;	CALLS	#2,EXPREG
+;
+; INPUT PARAMETERS:
+;	04(AP) - Pointer to a quadword to get the result of $EXPREG.
+;	08(AP) - The amount of space we're told we'll need.
+;
+; IMPLICIT INPUTS
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	04(AP) - Quadword is updated with the result of $EXPREG.
+;
+; IMPLICIT OUTPUTS:
+;	R10 and R11 become a descriptor for the free space in the new area.
+;
+; COMPLETION CODES:
+;	Result of $EXPREG.
+;
+; SIDE EFFECTS:
+;	P0 space is expanded.
+;	System service error if we can't allocate space.
+;
+;--
+
+EXPREG:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9>
+
+	ADDL3	#^X100,08(AP),R10	; Round up estimate by half a page...
+	MULL2	#2,R10			; ...so we can grab twice required space
+	ASHL	#-9,R10,R6		; Convert words to pages
+					; (Apologies to numerical analysts.)
+	$EXPREG_S PAGCNT = R6,-		; Allocate some new address space
+		  RETADR = @04(AP),-
+		  ACMODE = #PSL$C_USER
+	MOVL	@04(AP),R11		; Get the address of the new area
+					; R10 and R11 now form a descriptor
+	$LKWSET_S INADR = @04(AP)	; We can't page the area...
+					; ...once we elevate IPL
+	RET
+
+	.SBTTL	Utility Subroutines - PARAMS_CHECK
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	See if UETP$CLSIODB was called with a legal set of parameters.  This
+;	means that the count of parameters must be correct and that
+;	combinations of parameters must make sense.  Fill in defaults for
+;	those parameters which need them.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	PARAMS_CHECK
+;
+; INPUT PARAMETERS:
+;
+;	NONE
+;
+; IMPLICIT INPUTS:
+;
+;	R8 has the address of our local copy of the FLAGS parameter.
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;
+;	Local copy of the FLAGS parameter is set up with user's value or a
+;		default.
+;
+; COMPLETION CODES:
+;
+;	SS$_ACCVIO if one of the pointers cannot be written by the caller.
+;	SS$_BADPARAM if flags or CLS_POINTER, LCL_POINTER or MPM_POINTER are
+;		inconsistent.
+;	SS$_INSFARG if not all pointers are either present or defaulted.
+;	NONE if we return to UETP$CLSIODB.
+;
+; SIDE EFFECTS:
+;
+;	Returns to UETP$CLSIODB's caller if an illegal call is detected.
+;
+;--
+
+PARAMS_CHECK:
+	MOVL	#SS$_INSFARG,R0		; Set up default for too few args
+	CMPL	#3,00(AP)		; How many args were supplied to us?
+	BGTR	110$			; BR if too few args supplied
+	BEQL	200$			; BR if default flags - check ptrs only
+	MOVL	FLAGS(AP),(R8)		; Check caller's flags, too, otherwise
+	MOVL	#SS$_BADPARAM,R0	; Set up default for a bum parameter
+	TSTL	CLS_POINTER(AP)		; Check that some info will be...
+	BNEQ	10$			; ...returned - cluster...
+	BBS	#UIDFLAG$V_PATH,(R8),110$ ; (BR if path wanted but not cluster)
+	BBS	#UIDFLAG$V_MYSYS,(R8),110$ ; (BR if my own wanted but not cluster)
+	TSTL	LCL_POINTER(AP)		; ...or local peripherals...
+	BNEQ	30$
+	TSTL	MPM_POINTER(AP)		; ...or shared memory
+	BNEQ	50$
+	RET				; Error if no info to be returned
+; A pointer for cluster info was passed.
+10$:
+	IFNOWRT	#2,@CLS_POINTER(AP),-	; BR if we won't be able to store ptrs
+		100$,#PSL$C_USER
+	BBC	#UIDFLAG$V_SID,(R8),110$ ; BR if cluster but not system blocks
+	BBC	#UIDFLAG$V_UCB,(R8),20$	; If no UCBs, don't care about DDBs
+	BBC	#UIDFLAG$V_DDB,(R8),110$ ; If UCBs, must have DDBs, too
+; A pointer for cluster info was passed, we don't know for what detail.
+20$:
+	TSTL	LCL_POINTER(AP)		; Must check local stuff, too?
+	BEQL	40$			; BR if not - check for shared memory
+; Pointers for local and maybe cluster peripheral info were passed.
+30$:
+	IFNOWRT	#2,@LCL_POINTER(AP),-	; BR if we won't be able to store ptrs
+		100$,#PSL$C_USER
+	BBC	#UIDFLAG$V_DDB,(R8),110$ ; DDBs must be set for local info
+40$:
+	TSTL	MPM_POINTER(AP)		; Shared memory info as well?
+	BNEQ	60$			; BR if so
+	BRB	70$			; Check that really not wanted
+; Only a pointer for shared memory was passed.
+50$:
+	BITL	#UIDFLAG$M_SID!-	; Only shared memory stuff wanted...
+		UIDFLAG$M_MYSYS!-	; ...
+		UIDFLAG$M_PATH!-	; ...so none of the flags...
+		UIDFLAG$M_DDB!-		; ...for other info...
+		UIDFLAG$M_UCB,(R8)	; ...may be set
+	BNEQ	110$			; BR if one or more were
+; A pointer for shared memory was passed, and maybe others as well.
+60$:
+	IFNOWRT	#2,@MPM_POINTER(AP),-	; BR if we won't be able to store ptrs
+		100$,#PSL$C_USER
+	BBC	#UIDFLAG$V_MPM,(R8),110$ ; The shared mem stuff must be wanted
+	RSB				; Passed all consistency checks
+; Either cluster or local peripheral pointers were passed, but not sh. memory.
+70$:
+	BBS	#UIDFLAG$V_MPM,(R8),110$ ; Can't be set if no sh. mem stuff
+	RSB				; Passed all consistency checks
+100$:
+	MOVL	#SS$_ACCVIO,R0		; Argument can't be written by caller
+110$:
+	RET				; Miscellaneous consistency problems
+
+; Flags argument was defaulted - we must check only pointers.
+200$:
+	MCOML	#0,(R8)			; Default flags - all are set
+	MOVL	#SS$_BADPARAM,R0	; Set up default for a bum parameter
+	TSTL	CLS_POINTER(AP)		; Check that some info will be...
+	BNEQ	210$			; ...returned - cluster...
+	TSTL	LCL_POINTER(AP)		; ...or local peripherals...
+	BNEQ	220$
+	TSTL	MPM_POINTER(AP)		; ...or shared memory
+	BNEQ	230$
+	RET				; Error if no info to be returned
+210$:
+	IFNOWRT	#2,@CLS_POINTER(AP),-	; BR if we won't be able to store ptrs
+		100$,#PSL$C_USER
+	TSTL	LCL_POINTER(AP)		; Do we want local peripherals, too?
+	BEQL	220$			; BR if not - check shared memory
+220$:
+	IFNOWRT	#2,@LCL_POINTER(AP),-	; BR if we won't be able to store ptrs
+		100$,#PSL$C_USER
+	TSTL	MPM_POINTER(AP)		; Do we want shared memory as well?
+	BEQL	240$			; BR if not
+230$:
+	IFNOWRT	#2,@MPM_POINTER(AP),-	; BR if we won't be able to store ptrs
+		100$,#PSL$C_USER
+240$:
+	RSB				; Passed all consistency checks
+
+UETP$CLSIODB_END:			; End of routine for $LKWSET
+	.END

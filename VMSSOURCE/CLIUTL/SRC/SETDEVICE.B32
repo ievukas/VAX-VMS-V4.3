@@ -1,0 +1,1165 @@
+MODULE setdevice ( IDENT = 'V04-001',
+		ADDRESSING_MODE (EXTERNAL = GENERAL, NONEXTERNAL=LONG_RELATIVE)
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  SET Command
+!
+! ABSTRACT:
+!
+!	This module implements the DCL command SET DEVICE.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system, user mode
+!
+! AUTHOR:  Gerry Smith				23-Feb-1983
+!
+! Modified by:
+!
+!	V04-001 AEW0006		Anne E. Warner		05-Sep-1984
+!		Make changes in routine SETSERVED so that MSCP served
+!		devices cannot be reserved.
+!
+!	V03-011 AEW0005		Anne E. Warner		28-Aug-1984
+!		Change the check of the reference count from 2 to 1
+!		before trying to SET DEV/NOSPOOL.  This is to insure
+!		that there are no open files or second channels to the
+!		device.  This change is in routine SETNOSPOOL.
+!
+!	V03-010	AEW0004		Anne E. Warner		10-Aug-1984
+!		Add a check in SETPROT that if the device is unowned
+!		and has no ACL present to require SYSPRV before its 
+!		protection can be changed.
+!
+!	V03-009 AEW0003		Anne E. Warner		07-Aug-1984
+!		Add the error message set$_mscpnotld for the SET DEV/SER
+!		return status is ss$_devoffline.  This message is much
+!		more clear to tell the user that the server code is not
+!		loaded
+!
+!	V03-008 AEW0002		Anne E. Warner		02-Aug-1984
+!		Comment out code concerning the /NOWRITE and /CONTROLLER
+!		qualifiers of SET DEVICE/SERVED.  These qualifiers are
+!		no longer legal qualifiers but the code remains for future
+!		work.
+!
+!	V03-007 AEW0001		Anne E. Warner		25-Jul-1984
+!		Add sanity checks in SETSERVED for SET DEVICE/SERVED.
+!		Replace cli$_ivdevtype error message with set$_invdev
+!		error message which explains what happened better.
+!
+!	V03-006	DAS0001		David Solomon		09-Jul-1984
+!		Fix truncation errors; make nonexternal refs LONG_RELATIVE.
+!
+!	V03-005	ROW0342		Ralph O. Weber		10-APR-1984
+!		Add SET DEVICE /[NO]DIAGNOSTIC, to shutdown ports for 
+!		class/port devices where running the device-local diagnostics 
+!		inteacts adversely with normal host polling functions.
+!
+!	V03-004	LMP0221		L. Mark Pilant,		10-Apr-1984  12:22
+!		Change UCB$L_OWNUIC to ORB$L_OWNER and UCB$W_VPROT to
+!		ORB$W_PROT.
+!
+!	V03-003	PCG0001	Peter George		30-Mar-1984
+!		Add SET DEVICE/SERVED/NOWRITE/CONTROLLER=A.
+!
+!	V03-002	TCM0001	Trudy C. Matthews	19-Aug-1983
+!		Set DEV$V_CLU bit on SET DEVICE/DUAL_PORT command.
+!
+!	V03-001	GAS0112				29-Mar-1983
+!		Remove references to old CLI interface.
+!--
+
+!
+! Include files
+!
+LIBRARY 'SYS$LIBRARY:LIB';			! VAX/VMS common definitions
+REQUIRE 'SRC$:SHOWDEF';				! SHOW common definitions
+
+
+!
+! Define bit settings for the flags longword
+!
+MACRO
+    set$v_log		=	0, 0, 1, 0%,		! /LOG
+    set$v_availset	=	0, 1, 1, 0%,		! 
+    set$v_avail		=	0, 2, 1, 0%,		! /[NO]AVAILABLE
+    set$v_dualset	=	0, 3, 1, 0%,		! 
+    set$v_dual		=	0, 4, 1, 0%,		! /[NO]DUAL_PORT
+    set$v_errorset	=	0, 5, 1, 0%,		! 
+    set$v_error		=	0, 6, 1, 0%,		! /[NO]ERROR_LOG
+    set$v_spool		=	0, 7, 1, 0%,		! /SPOOL
+    set$v_nospool	=	1, 0, 1, 0%,		! /NOSPOOL
+    set$v_prot		=	1, 1, 1, 0%,		! SET PROT/DEVICE
+    set$v_uic		=	1, 2, 1, 0%,		! UIC set explicitly 
+    set$v_nowrite	=	1, 3, 1, 0%,		! /NOWRITE
+    set$v_diagset	=	1, 4, 1, 0%,		! /[NO]DIAGNOSTIC
+    set$v_diag		=	1, 5, 1, 0%;		!
+
+
+!
+! Define the linkages for the routines to lock and unlock the I/O database,
+! as well as allocate and deallocate non-paged pool.
+!
+LINKAGE
+    IOLOCK = JSB (REGISTER = 4):		! R4 = process PCB
+		  NOPRESERVE (1,2,3),		! R1-R3 destroyed
+    ALLO   = JSB (REGISTER = 1; 		! R1 = size (on input)
+    		  REGISTER = 1,			! R1 = size of block
+    		  REGISTER = 2):		! R2 = address of block
+    		  NOPRESERVE (3,4,5),		! R3, R4, R5 destroyed
+    DEALLO = JSB (REGISTER = 0):		! R0 = address of block
+    		  NOPRESERVE (1,2,3,4,5);	! R1-R5 destroyed
+
+
+
+!
+! Table of contents
+!
+
+FORWARD ROUTINE
+    set$device : NOVALUE,		! Main module of SET DEVICE
+    setbits,				! Set device characteristics
+    setspool,				! Make a device spooled
+    setnospool,				! Make a device un-spooled
+    setprot,				! Set device protection and ownership
+    setserved,				! MSCP serve a device
+    setgetportname;			! Given a device determine the device 
+    					! name of its port
+
+!
+! External routines
+!
+EXTERNAL ROUTINE
+    tran_queue,				! Convert input name to queue name
+    get_prot : NOVALUE,			! Convert ASCII protection to binary
+    parse_uic,				! Convert ASCII UIC to longword
+    expand_prot : NOVALUE,		! Convert binary prot to ASCII
+    lib$cvt_dtb,			! Convert ASCII to binary
+    cli$get_value,			! Get value from CLI
+    cli$present,			! See if qualifier is present
+    exe$alononpaged : ALLO,		! Get a chunk of non-paged pool
+    exe$deanonpaged : DEALLO,		! Deallocate non-paged pool
+    sch$iolockw : IOLOCK,		! Lock the I/O database for write
+    sch$iounlock : IOLOCK,		! Unlock the I/O database
+    mscp$addunit;			! Alloc and fill in UCB for MSCP server
+
+!
+! External references
+!
+EXTERNAL
+    ctl$gq_procpriv : $BBLOCK[8],	! Process privilege mask
+    ctl$gl_pcb      : REF $BBLOCK,	! Address of process PCB
+    ctl$gl_ccbbase;			! Beginning of channel control blocks
+
+!
+! Declare some shared messages
+!
+$SHR_MSGDEF	(SET,119,LOCAL,
+    		(invquaval,	error));
+
+!
+! Declare literals defined elsewhere
+!
+EXTERNAL LITERAL
+    set$_writeerr,			! Error modifying device
+    set$_devset1,			! characteristic set
+    set$_devset2,
+    set$_devpset,			! Device protection set
+    set$_invdev,			! Device is invalid for requested operation
+    set$_spooled,			! Device spooled
+    set$_mscpnotld,			! MSCP-Server code not loaded
+    set$_notuqport,			! Device doesn't have a UNIBUS/QBUS port
+    cli$_devnotfor,			! Device not mounted foreign
+    cli$_devnotspl,			! Device not spooled
+    cli$_devalspl,			! Device already spooled
+    cli$_absent, 			! Qualifier absent
+    cli$_negated,			! Qualifier explicitly negated
+    cli$_present;			! Qualifier explicitly present
+
+
+GLOBAL ROUTINE set$device (dummy) : NOVALUE =
+BEGIN
+
+!++
+! Functional description
+!
+!	This is the routine for the SET DEVICE command.  It is called
+!	from the SET command processor,	and sets certain characteristics 
+!	of devices.
+!
+! Inputs
+!	None
+!
+! Outputs
+!	None
+!
+!----
+
+BUILTIN
+    ACTUALCOUNT;
+
+LOCAL
+    status,				! Status return
+    uic : VOLATILE,			! UIC for device protection
+    prot_mask : WORD VOLATILE,		! Mask to show what protections changed
+    new_prot : WORD VOLATILE,		! New protections to set
+    result_prot : WORD VOLATILE,	! Final device protection
+    dev_desc : $BBLOCK[dsc$c_s_bln],	! Device descriptor
+    que_desc : $BBLOCK[dsc$c_s_bln],	! Queuename descriptor
+    uic_desc : $BBLOCK[dsc$c_s_bln],	! /OWNER_UIC descriptor
+    intdev_desc : $BBLOCK[dsc$c_s_bln],	! Descriptor for intermediate device
+    flags : $BBLOCK[4] INITIAL(0),	! Flags longword
+    info_desc : VECTOR[2],		! $GETCHN descriptor
+    info_block : $BBLOCK[12], 		! $GETCHN information block
+    chan : WORD,			! I/O channel
+    intchan : WORD,			! Intermediate device I/O channel
+    iosb : VECTOR[4,WORD],		! I/O status block
+    dev_string : VECTOR[16,BYTE],	! Translated string for spooled dev
+    que_string : VECTOR[16,BYTE],	! Translated string for que name
+    arglist : VECTOR[8],		! $CMKRNL argument list
+    cont_desc : $BBLOCK[dsc$c_s_bln],	! Descriptor for controller name
+    controller : INITIAL(0),		! Controller letter
+    port_desc : $BBLOCK[dsc$c_s_bln],	! Descriptor for port device name
+    port_string : VECTOR[ 20, BYTE ],	! Port device name string
+    port_chan : WORD;			! Channel to port device
+
+!
+! Collect the name of the device.
+!
+$init_dyndesc(dev_desc);		! Make the descriptors dynamic
+$init_dyndesc(que_desc);
+$init_dyndesc(uic_desc);
+$init_dyndesc(intdev_desc);
+$init_dyndesc(cont_desc);
+$init_dyndesc(port_desc);
+
+cli$get_value(%ASCID 'FILE',		! Get the device name
+		     dev_desc);
+
+!
+! See if the user has OPER privilege.
+!
+IF NOT .ctl$gq_procpriv[prv$v_oper]
+THEN
+    BEGIN
+    SIGNAL(set$_writeerr, 1, dev_desc, ss$_nooper);
+    RETURN;
+    END;
+
+!
+! Assign a channel to the device. 
+!
+IF NOT (status = $ASSIGN(DEVNAM = dev_desc,
+			 CHAN   = chan))
+THEN
+    BEGIN
+    SIGNAL(set$_writeerr, 1, dev_desc, .status);
+    RETURN;
+    END;
+
+
+!
+! See if logging is required.
+!
+flags[set$v_log] = cli$present(%ASCID 'LOG');
+
+!
+! If the device protection is to change, get the protections, as well as
+! perhaps a UIC to give as the device's owner.  To get device protection
+! changed, we first went thru the SET PROTECTION routine, which called
+! this routine with a dummy argument.  So, if the number of actual arguments
+! is 1, we know that it's really protection that should be changed.
+!
+IF ACTUALCOUNT() EQL 1
+THEN
+    BEGIN
+    LOCAL
+    	buffer : VECTOR[20],
+    	desc : VECTOR[2];
+
+    uic = 0;					! Initialize UIC
+    get_prot(prot_mask, new_prot);		! Get protection masks
+
+!
+! If a UIC was specified, check it.
+!
+    IF (flags[set$v_uic] = cli$get_value(%ASCID 'OWNER_UIC', uic_desc))
+    THEN IF NOT parse_uic(uic_desc, uic)
+    THEN
+	BEGIN
+	SIGNAL(set$_invquaval, 2, uic_desc, %ASCID 'OWNER_UIC');
+	RETURN;
+	END;
+
+!
+! Call the kernel mode routine to set the protection, and then simply
+! return.
+!
+    arglist[0] = 5;
+    arglist[1] = flags;				! FLAGS says what to do
+    arglist[2] = .ctl$gl_ccbbase - .chan;	! Put CCB address here
+    arglist[3] = prot_mask;			! Which class(es) to set
+    arglist[4] = new_prot;			! New protections
+    arglist[5] = uic;				! Final owner UIC
+    IF NOT (status = $CMKRNL(ROUTIN = setprot,
+    			     ARGLST = arglist))
+    THEN
+	BEGIN
+	SIGNAL(set$_writeerr, 1, dev_desc, .status);
+	END
+    ELSE IF .flags[set$v_log]
+    THEN
+	BEGIN
+	expand_prot(arglist, .new_prot, 1);
+	SIGNAL(set$_devpset, 6, dev_desc, 
+			     .arglist[0],
+			     .arglist[1],
+			     .arglist[2],
+			     .arglist[3],
+			     .uic);
+	END;
+    RETURN;
+    END;
+
+!
+! Determine whether or not /[NO]DIAGNOSTIC was specified and whether it is 
+! setting or clearing the "diagnostic" state.
+!
+status = cli$present( %ASCID 'DIAGNOSTIC' );	! DIAGNOSTIC qualifier present?
+IF .status NEQ cli$_absent			! If not absent,
+THEN						! then ...
+    BEGIN
+    flags[set$v_diagset] = 1;			! indicate it is present
+    flags[set$v_diag] = .status;		! save its value (yes/no)
+    END;
+!
+! One set of qualifiers do nothing more than set/clear bits in the
+! device characteristics longword.
+!
+status = cli$present(%ASCID 'AVAILABLE');	! See what CLI$PRESENT returned
+IF .status NEQ cli$_absent			! If the qualifier was 
+THEN						! explicitly mentioned,
+    BEGIN					! set the flag bit 
+    flags[set$v_availset] = 1;			! saying it was mentioned
+    flags[set$v_avail] = .status;		! and set the yes/no bit
+    END;
+!
+! For all you Bliss hackers out there, a more concise way of expressing
+! the above is shown below, for the /[NO]DUAL_PORT and /[NO]ERROR_LOGGING
+! qualifiers.
+!
+flags[set$v_dualset] = ((flags[set$v_dual] = cli$present(%ASCID 'DUAL_PORT')) NEQ cli$_absent);
+flags[set$v_errorset] = ((flags[set$v_error] = cli$present(%ASCID 'ERROR_LOGGING')) NEQ cli$_absent);
+
+!
+! If a device is to SPOOLed, then a queue name and intermediate device
+! must be acquired.
+!
+IF (flags[set$v_spool] = cli$present(%ASCID 'SPOOLED')) NEQ cli$_absent
+THEN
+    BEGIN
+    IF .flags[set$v_spool]
+    THEN
+	BEGIN
+	IF NOT tran_queue(dev_desc, dev_string)
+	THEN
+	    BEGIN
+	    SIGNAL(set$_invquaval, 2, dev_desc, %ASCID 'SPOOLED');
+	    RETURN;
+	    END
+	ELSE
+	    BEGIN
+	    dev_desc[dsc$w_length] = .dev_string[0];
+	    dev_desc[dsc$a_pointer] = dev_string[1];
+	    END;
+	IF NOT cli$get_value(%ASCID 'SPOOLED', que_desc)
+	THEN
+	    BEGIN
+	    que_desc[dsc$w_length] = .dev_desc[dsc$w_length];
+	    que_desc[dsc$a_pointer] = .dev_desc[dsc$a_pointer];
+	    END
+	ELSE
+	    BEGIN
+	    IF NOT tran_queue(que_desc, que_string)
+	    THEN
+		BEGIN
+		SIGNAL(set$_invquaval, 2, que_desc, %ASCID 'SPOOLED');
+		RETURN;
+		END
+	    ELSE
+		BEGIN
+		que_desc[dsc$w_length] = .que_string[0];
+		que_desc[dsc$a_pointer] = que_string[1];
+		END;
+	    END;
+	IF NOT cli$get_value(%ASCID 'SPOOLED', intdev_desc)
+	THEN
+	    BEGIN
+	    intdev_desc[dsc$w_length] = %CHARCOUNT('SYS$DISK');
+	    intdev_desc[dsc$a_pointer] = UPLIT BYTE('SYS$DISK');
+	    END;
+	IF NOT (status = $ASSIGN(DEVNAM = intdev_desc,
+				 CHAN   = intchan))
+	THEN
+	    BEGIN
+	    SIGNAL(set$_writeerr, 1, intdev_desc, .status);
+	    RETURN;
+	    END;
+    	END;
+!
+! If /NOSPOOL, then no additional information is  needed.
+!
+    flags[set$v_nospool] = NOT .flags[set$v_spool];	! Set the /NOSPOOL flag
+    END;
+
+
+!
+! If /[NO]DIAGNOSTIC was specified, then locate the port device and
+! send is an IO$_STOP or an IO$_INITIALIZE, as specified by the qualifier.
+!
+IF .flags[set$v_diagset]
+THEN
+    BEGIN
+    IF NOT .ctl$gq_procpriv[prv$v_diagnose]
+    THEN
+	BEGIN
+	SIGNAL(set$_writeerr, 1, dev_desc, ss$_nodiagnose);
+	RETURN;
+	END;
+    IF NOT .ctl$gq_procpriv[prv$v_phy_io]
+    THEN
+	BEGIN
+	SIGNAL(set$_writeerr, 1, dev_desc, ss$_nophy_io);
+	RETURN;
+	END;
+
+    arglist[0] = 3;
+    arglist[1] = .ctl$gl_ccbbase - .chan;
+    arglist[2] = 20;
+    arglist[3] = port_string;
+    IF NOT (status = $CMKRNL( ROUTIN = setgetportname,
+			      ARGLST = arglist ))
+    THEN
+	BEGIN
+	SIGNAL(set$_writeerr, 1, dev_desc, .status);
+	RETURN;
+	END;
+
+    port_desc[dsc$w_length] = .arglist[2];
+    port_desc[dsc$a_pointer] = port_string;
+
+    IF NOT (status = $ASSIGN( DEVNAM = port_desc,
+			      CHAN   = port_chan ))
+    THEN
+	BEGIN
+	SIGNAL(set$_writeerr, 1, dev_desc, .status);
+	RETURN;
+	END;
+
+	BEGIN
+	LOCAL port_func;
+	IF .flags[set$v_diag]
+	THEN  port_func = IO$_STOP
+	ELSE  port_func = IO$_INITIALIZE;
+	IF NOT (status = $QIOW( CHAN = .port_chan,
+				FUNC = .port_func ))
+	THEN
+	    BEGIN
+	    SIGNAL(set$_writeerr, 1, dev_desc, .status);
+	    RETURN;
+	    END;
+	END;
+
+    $DASSGN( CHAN = .port_chan );
+
+    END;
+
+
+!
+! If the bit-tweaking options were requested, call the subroutine
+! that does that.  Signal any errors or successes.
+!
+IF .flags[set$v_availset]
+OR .flags[set$v_dualset]
+OR .flags[set$v_errorset]
+OR .flags[set$v_diagset]
+THEN
+    BEGIN
+    arglist[0] = 2;
+    arglist[1] = flags;
+    arglist[2] = .ctl$gl_ccbbase - .chan;
+    status = $CMKRNL(ROUTIN = setbits,
+    		     ARGLST = arglist);
+    IF .status NEQ 1
+    THEN
+	BEGIN
+	SIGNAL(set$_writeerr, 1, dev_desc, .status);
+	END
+    ELSE IF .flags[set$v_log]
+    THEN
+	BEGIN
+	IF .flags[set$v_availset]
+	THEN
+	    BEGIN
+	    IF .flags[set$v_avail]
+	    THEN SIGNAL(set$_devset1, 2, dev_desc, %ASCID 'AVAILABLE')
+	    ELSE SIGNAL(set$_devset1, 2, dev_desc, %ASCID 'NOAVAILABLE');
+	    END;
+	IF .flags[set$v_dualset]
+	THEN
+	    BEGIN
+	    IF .flags[set$v_dual]
+	    THEN SIGNAL(set$_devset1, 2, dev_desc, %ASCID 'DUAL_PORT')
+	    ELSE SIGNAL(set$_devset1, 2, dev_desc, %ASCID 'NODUAL_PORT');
+	    END;
+	IF .flags[set$v_errorset]
+	THEN
+	    BEGIN
+	    IF .flags[set$v_error]
+	    THEN SIGNAL(set$_devset1, 2, dev_desc, %ASCID 'ERROR_LOGGING')
+	    ELSE SIGNAL(set$_devset1, 2, dev_desc, %ASCID 'NOERROR_LOGGING');
+	    END;
+	END;
+    END;
+
+!
+! If the device is to be spooled or despooled, then call the routine that
+! performs those functions.  Signal any errors or successes.
+!
+IF .flags[set$v_spool]
+THEN
+    BEGIN
+    arglist[0] = 4;
+    arglist[1] = .ctl$gl_ccbbase - .chan;	! Put CCB address here
+    arglist[2] = .ctl$gl_ccbbase - .intchan;	! Need the CCB of the int device
+    arglist[3] = que_desc;			! Name of  the queue
+    arglist[4] = intdev_desc;			! Name of the intermediate device
+    IF NOT (status = $CMKRNL(ROUTIN = setspool,
+			     ARGLST = arglist))
+    THEN
+	BEGIN
+	SIGNAL(set$_writeerr, 1, dev_desc, .status);
+	END
+    ELSE IF .flags[set$v_log]
+    THEN SIGNAL(set$_spooled, 3, dev_desc, que_desc, intdev_desc);
+    END;
+
+
+IF .flags[set$v_nospool]
+THEN
+    BEGIN
+    arglist[0] = 1;
+    arglist[1] = .ctl$gl_ccbbase - .chan;	! Put CCB address here
+    IF NOT (status = $CMKRNL(ROUTIN = setnospool,
+			     ARGLST = arglist))
+    THEN
+	BEGIN
+	SIGNAL(set$_writeerr, 1, dev_desc, .status);
+	END
+    ELSE IF .flags[set$v_log]
+    THEN SIGNAL(set$_devset1, 2, dev_desc, %ASCID 'NOSPOOL');
+    END;
+    
+!
+! If a device is to SERVED, then serve it.
+!
+IF cli$present(%ASCID 'SERVED')
+THEN
+    BEGIN		      ! The nowrite flag is not used so permanently set
+			      ! set to 0.  However the original code is left 
+			      ! if anyone wants to change this back.
+    flags[set$v_nowrite] = 0; !cli$present(%ASCID 'WRITE') EQL cli$_negated;
+    controller = 0;
+!
+!  Controller is not presently a legal qualifier but the code is left incase 
+!  this changes in the future
+!    IF cli$present(%ASCID 'CONTROLLER')
+!    THEN 
+!	IF cli$get_value(%ASCID 'CONTROLLER', cont_desc)
+!	THEN 
+!	    IF .cont_desc [dsc$w_length] GEQ 1
+!	    THEN controller = .(.cont_desc [dsc$a_pointer]) <0,8,0>;
+    
+    arglist[0] = 3;
+    arglist[1] = flags;				! Flags
+    arglist[2] = .ctl$gl_ccbbase - .chan;	! CCB address 
+    arglist[3] = .controller;			! Controller letter
+
+    IF NOT (status = $CMKRNL(ROUTIN = setserved,
+			     ARGLST = arglist))
+    THEN
+	BEGIN
+	SIGNAL(set$_writeerr, 1, dev_desc, .status);
+	END
+
+    ELSE IF .flags[set$v_log]
+    THEN 
+	BEGIN
+	SIGNAL(set$_devset1, 2, dev_desc, %ASCID 'SERVED');
+	IF .flags[set$v_nowrite]
+	THEN SIGNAL(set$_devset1, 2, dev_desc, %ASCID 'NOWRITE');
+	cont_desc [dsc$w_length] = 1;
+	IF .controller NEQ 0
+	THEN SIGNAL(set$_devset2, 3, dev_desc, %ASCID 'CONTROLLER', cont_desc);
+	END;
+    END;
+
+RETURN;
+END;
+
+ROUTINE setbits (flags, ccb) =
+BEGIN
+
+!++
+! Functional description
+!
+!	This is the kernel mode routine to set bits in the UCB. Based on
+!	the bit settings of the FLAGS longword, the device database is 
+!	modified to show the specified characteristics.
+!
+! Inputs
+!	FLAGS   - options longword
+!
+! Outputs
+!	None.  The device database is modified.  
+!	If an error is detected, an appropriate error status is returned.
+!
+!----
+
+MAP
+    flags : REF $BBLOCK,
+    ccb : REF $BBLOCK;
+
+BIND
+    ucb = .ccb[ccb$l_ucb] : $BBLOCK,
+    char = ucb[ucb$l_devchar] : $BBLOCK,
+    char2 = ucb[ucb$l_devchar2] : $BBLOCK;
+
+!
+! First some sanity checks.  If /[NO]AVAILABLE, the device must be a
+! dismounted disk.  For /[NO]DUAL_PORT, the device must be a disk, and for
+! /NODUAL, the disk must be dismounted
+!
+IF .flags[set$v_availset]		! If /[NO]AVAILABLE
+OR .flags[set$v_dualset]		! or /[NO]DUAL_PORT
+THEN
+    BEGIN
+    IF .ucb[ucb$b_devclass] NEQU dc$_disk	! device must be disk
+    THEN RETURN set$_invdev;
+    IF .char[dev$v_mnt]			! disk must be dismounted
+    THEN RETURN ss$_devnotdism;
+    END;
+
+!
+! Set the bits as appropriate.
+!
+IF .flags[set$v_dualset]
+    THEN BEGIN
+	char[dev$v_dua] = .flags[set$v_dual];
+	char2[dev$v_clu] = .flags[set$v_dual];
+    END;
+IF .flags[set$v_availset]
+THEN char[dev$v_avl] = .flags[set$v_avail];
+IF .flags[set$v_errorset]
+THEN char[dev$v_elg] = .flags[set$v_error];
+IF .flags[set$v_diagset]
+THEN 
+    BEGIN
+    ucb[ucb$v_online] = NOT .flags[set$v_diag];
+    char[dev$v_avl] = NOT .flags[set$v_diag];
+    END;
+
+RETURN 1; 
+END;
+
+ROUTINE setspool (ccb, intccb, que_desc, int_desc) =
+BEGIN
+
+!++
+! Functional description
+!
+!	This is the kernel mode routine to make a device spooled.
+!
+! Inputs
+!	CCB      - address of the device's channel control block
+!	INTCCB   - address of the intermediate device's CCB
+!	QUE_DESC - descriptor for the queue name
+!	INT_DESC - descriptor for the name of the intermediate device
+!
+! Outputs
+!	None.  The device database is modified.  
+!	If an error is detected, an appropriate error status is returned.
+!
+!----
+
+MAP
+    ccb : REF $BBLOCK,
+    intccb : REF $BBLOCK,
+    que_desc : REF $BBLOCK,
+    int_desc : REF $BBLOCK;
+
+BIND
+    ucb = .ccb[ccb$l_ucb] : $BBLOCK,
+    char = ucb[ucb$l_devchar] : $BBLOCK,
+    int_ucb = .intccb[ccb$l_ucb] : $BBLOCK,
+    int_char = int_ucb[ucb$l_devchar] : $BBLOCK,
+    int_vcb = .int_ucb[ucb$l_vcb] : $BBLOCK;
+
+LOCAL
+    status;
+
+
+!
+! Lock the I/O database for write access.
+!
+sch$iolockw(.ctl$gl_pcb);
+
+!
+! Make checks to insure that the device is the right kind of device,
+! that it is not assigned to some other process, and that the intermediate
+! device is a file-oriented disk.
+!
+status = 1;
+IF .ucb[ucb$b_devclass] NEQU dc$_term		! Device must be either a
+AND .ucb[ucb$b_devclass] NEQU dc$_lp		! terminal or printer
+THEN status = set$_invdev
+ELSE IF .char[dev$v_spl]
+THEN status = cli$_devalspl			! Can't be already spooled
+ELSE IF .ucb[ucb$w_refc] NEQ 1
+THEN status = ss$_devassign 			! Can't be assigned to anyone
+ELSE IF NOT .int_char[dev$v_fod]		! Intermediate device must be
+     OR NOT .int_char[dev$v_rnd]		! a file-oriented disk
+THEN status = ss$_notfiledev
+ELSE IF .int_char[dev$v_dmt]			! Intermediate device must be
+OR NOT .int_char[dev$v_mnt]			! mounted
+THEN status = ss$_devnotmount;
+ 
+!
+! If the devices meet all the criteria, then try to allocate a chunk
+! of non-paged pool to put information about the queue.  If the
+! allocation request is not successful, indicate an error.
+!
+IF .status EQL 1
+THEN
+    BEGIN
+    LOCAL
+	block : REF $BBLOCK,
+	size;
+
+    status = exe$alononpaged(irp$c_length; size, block);
+    IF NOT .status
+    THEN status = ss$_insfmem
+    ELSE
+	BEGIN
+!
+! Move the queue's name into the block of non-paged pool, and put the
+! address of the block into the UCB.
+!
+	status = 1;				! Put in return status = success
+	ucb[ucb$l_vcb] = .block;		! Put block's address in UCB
+	block[vcb$w_size] = .size;		! Set queue block's size
+	block[vcb$b_type] = dyn$c_vcb;	! Say it's a VCB (pseudo)
+	block[vcb$b_status] = .que_desc[dsc$w_length];
+	CH$MOVE(.que_desc[dsc$w_length],
+		.que_desc[dsc$a_pointer],
+		block[vcb$w_trans]);
+
+!
+! Now juggle the intermediate and spooled device UCB's to reflect this change.
+! Specifically, the intermediate device's reference count and transaction count 
+! are incremented, the intermediate device UCB is stored in the spooled device
+! UCB, and the spooled device's spool bit is set.
+!
+	int_ucb[ucb$w_refc] = .int_ucb[ucb$w_refc] + 1;
+	int_vcb[vcb$w_trans] = .int_vcb[vcb$w_trans] + 1;
+	ucb[ucb$l_amb] = int_ucb;			! Store intdev UCB
+	char[dev$v_spl] = 1;				! Set it spooled
+	ucb[ucb$l_pid] = 0;				! Clear owner field
+	END;
+    END;
+
+!
+! Unlock the I/O database, set the IPL to 0, and return whatever 
+! status.
+!
+sch$iounlock(.ctl$gl_pcb);
+set_ipl(0);
+
+RETURN .status;
+END;
+
+ROUTINE setnospool (ccb) =
+BEGIN
+
+!++
+! Functional description
+!
+!	This is the kernel mode routine to unspool a device.
+!
+! Inputs
+!	CCB      - address of the device's channel control block
+!
+! Outputs
+!	None.  The device database is modified.  
+!	If an error is detected, an appropriate error status is returned.
+!
+!----
+
+MAP
+    ccb : REF $BBLOCK;
+
+BIND
+    ucb = .ccb[ccb$l_ucb] : $BBLOCK,
+    char = ucb[ucb$l_devchar] : $BBLOCK;
+
+LOCAL
+    int_ucb : REF $BBLOCK,
+    int_vcb : REF $BBLOCK,
+    status;
+
+
+!
+! Lock the I/O database for write access.
+!
+sch$iolockw(.ctl$gl_pcb);
+
+!
+! Make checks to insure that the device is the spooled, and that the reference
+! count is correct (i.e., no one else has assigned a channel to it).
+!
+status = 1;					! Assume everything's wonderful
+IF NOT .char[dev$v_spl]
+THEN status = cli$_devnotspl			! Must be spooled
+ELSE IF .ucb[ucb$w_refc] GTR 1			! If the refcount is greater than
+						! one that means that there is a
+						! file open in which case the
+						! device cannot be despooled
+THEN status = ss$_devassign			! Can't be assigned to anyone
+ELSE
+
+!
+! If the device looks good, mark it as being no longer spooled, and
+! reduce the reference count by one.
+!
+    BEGIN
+    char[dev$v_spl] = 0;			! Device is not spooled
+    ucb[ucb$w_refc] = .ucb[ucb$w_refc] - 1;	! Decrement the ref count
+
+!
+! Deallocate the chunk of pool that holds the queue name.  
+!
+
+    exe$deanonpaged(.ucb[ucb$l_vcb]);		! Return queue block to pool 
+    ucb[ucb$l_vcb] = 0;				! Clear pointer to queue block
+
+!
+! Decrement the transaction count of the intermediate device, since we're no
+! longer spooling to it.
+!
+    int_ucb = .ucb[ucb$l_amb];			! Locate intermediate device's
+    int_vcb = .int_ucb[ucb$l_vcb];		! UCB and VCB.
+    int_vcb[vcb$w_trans] = .int_vcb[vcb$w_trans] -1;
+
+!
+! Clear the pointer to the intermediate device, since the soon-to-be-
+! despooled device no longer needs it.  Also put the address of the 
+! intermediate device into the channel control block.
+!
+    ccb[ccb$l_ucb] = .int_ucb;
+    ucb[ucb$l_amb] = 0;
+    END;
+
+!
+! Unlock the I/O database, set the IPL to 0, and return whatever 
+! status.
+!
+sch$iounlock(.ctl$gl_pcb);
+set_ipl(0);
+
+RETURN .status;
+END;
+
+ROUTINE setprot (flags, ccb, mask, prot, uic) =
+BEGIN
+
+!++
+! Functional description
+!
+!	This is the kernel mode routine to set bits in the UCB. Based on
+!	the bit settings of the FLAGS longword, the device database is 
+!	modified to show the specified characteristics.
+!
+! Inputs
+!	FLAGS   - options longword
+!
+! Outputs
+!	None.  The device database is modified.  
+!	If an error is detected, an appropriate error status is returned.
+!
+!----
+
+MAP
+    flags : REF $BBLOCK,
+    ccb : REF $BBLOCK,
+    prot : REF VECTOR[,WORD],
+    mask : REF VECTOR[,WORD],
+    uic : REF VECTOR;
+
+BIND
+    ucb = .ccb[ccb$l_ucb] : $BBLOCK,
+    orb = .ucb[ucb$l_orb] : $BBLOCK,
+    char = ucb[ucb$l_devchar] : $BBLOCK;
+
+LOCAL
+    temp_prot : WORD;
+
+!
+! Check that the device is not file-oriented.
+!
+IF .char[dev$v_fod]
+THEN RETURN set$_invdev;
+
+!
+! If the device is unowned and there is no ACL present, require SYSPRV to
+! change the ACL.
+!
+
+IF .orb[orb$l_owner] EQL 0
+AND (IF .orb[orb$v_acl_queue]
+     THEN .orb[orb$l_aclfl] EQLA orb[orb$l_aclfl]
+     ELSE 1)
+AND NOT .$BBLOCK [ctl$gl_pcb[pcb$q_priv], prv$v_sysprv]
+THEN RETURN ss$_nopriv;
+
+!
+! Set the new protection.  Then return the full device protection.
+!
+IF .orb[orb$v_prot_16]
+THEN temp_prot = .orb[orb$w_prot]
+ELSE
+    BEGIN
+    temp_prot<0,4> = .(orb[orb$l_sys_prot])<0,4>;
+    temp_prot<4,4> = .(orb[orb$l_own_prot])<0,4>;
+    temp_prot<8,4> = .(orb[orb$l_grp_prot])<0,4>;
+    temp_prot<12,4> = .(orb[orb$l_wor_prot])<0,4>;
+    END;
+orb[orb$w_prot] = (.temp_prot AND NOT .mask[0]) OR (.prot[0] AND .mask[0]);
+prot[0] = .orb[orb$w_prot];
+orb[orb$v_prot_16] = 1;
+
+!
+! If no UIC was given, then take this process UIC as the owner.
+!
+IF NOT .flags[set$v_uic]
+THEN uic[0] = .$BBLOCK[.ctl$gl_pcb, pcb$l_uic];
+orb[orb$l_owner] = .uic[0];
+
+RETURN 1;
+END;
+
+ROUTINE setserved (flags, ccb, letter) =
+BEGIN
+
+!++
+! Functional description
+!
+!	This is the kernel mode routine to serve a device.
+!
+! Inputs
+!	FLAGS	 - options longword
+!	CCB      - address of the device's channel control block
+!	LETTER	 - controller letter
+!
+! Outputs
+!	None.  The device database is modified.  
+!	If an error is detected, an appropriate error status is returned.
+!
+!----
+
+MAP
+    ccb : REF $BBLOCK,
+    flags : REF $BBLOCK;
+
+BIND
+    ucb = .ccb[ccb$l_ucb] : $BBLOCK,
+    char = ucb[ucb$l_devchar] : $BBLOCK,
+    char2 = ucb[ucb$l_devchar2] : $BBLOCK,
+    cddb = .ucb[ucb$l_cddb] : $BBLOCK,
+    p_cddb =.ucb[ucb$l_2p_cddb] : $BBLOCK;
+
+LOCAL
+    status,
+    stat1,
+    stat2;
+
+!
+! First check to see if the device can be served
+!
+status = 0;
+
+IF ((.ucb[ucb$b_devclass] eqlu dc$_disk) and	! If all of these conditions
+    (.ucb[ucb$b_devtype]  nequ dt$_rx01) and	! then ok so far
+    (.ucb[ucb$b_devtype]  nequ dt$_rx02) and
+    (.ucb[ucb$b_devtype]  nequ dt$_rx04) and
+    (.char2[dev$v_srv]    nequ 1))
+THEN status = 1;
+
+IF .status
+THEN
+    IF  .char[dev$v_mnt] eqlu 1			! If the device is mounted
+    THEN					! then it must be cluster 
+	BEGIN
+        status = .char2[dev$v_clu];  		! accessible to be served.
+	IF NOT .status THEN RETURN ss$_devnotdism;
+	END;
+
+
+stat1 = stat2 = 0;
+
+IF  .status 					! If ok so far then check rest
+THEN						! of conditions
+    IF .char2[dev$v_mscp]
+    THEN
+    BEGIN
+        stat1 = .cddb[cddb$w_cntrlflgs] AND mscp$m_cf_mlths;
+        IF .char2[dev$v_2p]
+        THEN
+            stat2 = .p_cddb[cddb$w_cntrlflgs] AND mscp$m_cf_mlths;
+        IF (.stat1 OR .stat2) NEQU 0		! If the above conditions are 
+        THEN					! true then cannot serve device
+    	    status = 0;
+    END;
+IF NOT .status					! If not a valid device to serve
+THEN						! return with invalid device 
+    RETURN set$_invdev; 			! status.  Else continue.
+!
+! Lock the I/O database for write access.
+!
+sch$iolockw(.ctl$gl_pcb);
+
+!
+! Call the routine to set the specified characteristics.
+!
+status = mscp$addunit(.ccb[ccb$l_ucb], .flags[set$v_nowrite], .letter);
+
+!
+! Unlock the I/O database, set IPL back to 0, and return whatever status.
+!
+sch$iounlock(.ctl$gl_pcb);
+set_ipl(0);
+IF .status EQLU ss$_devoffline
+THEN
+    RETURN set$_mscpnotld
+ELSE
+    RETURN .status;
+END;
+
+ROUTINE setgetportname ( ccb, length, string ) =
+BEGIN
+
+!++
+! Functional description:
+!
+!	This routine uses the UCB stored in the input CCB to locate a PDT and 
+!	finally a port device UCB.  The port device UCB address is fed to 
+!	IOC$CVT_DEVNAM to build a device name string suitable for use in a 
+!	channel assignment.  Several consistancy checks are made along the way 
+!	and if any of them fails and error status is returned.
+!
+! Inputs:
+!
+!	CCB	Channel Control Block address
+!	LENGTH	maximum device name string length
+!	STRING	beginning address for device name string
+!
+! Outputs:
+!
+!	LENGTH	actual length of device name string
+!	.STRING	device name string
+!--
+
+MAP
+    ccb : REF $BBLOCK,
+    length : REF VECTOR[ 1, WORD ],
+    string : REF VECTOR[ 20, BYTE ];
+
+LINKAGE
+    DEVNAM = JSB ( REGISTER = 0,		! R0 = length of name buffer
+		   REGISTER = 1,		! R1 = address of name buffer
+		   REGISTER = 4,		! R4 = conversion type flag
+		   REGISTER = 5;		! R5 = UCB address
+		   REGISTER = 1 );		! R1 = device name length
+
+EXTERNAL ROUTINE
+    ioc$cvt_devnam : DEVNAM;			! Convert UCB to device name
+
+BIND
+    ucb = .ccb[ccb$l_ucb] : $BBLOCK,
+    char2 = ucb[ucb$l_devchar2] : $BBLOCK;
+
+LOCAL
+    status;
+
+!
+! Only MSCP devices can be connected to a U/Q port.
+!
+
+IF NOT .char2[dev$v_mscp] THEN RETURN set$_notuqport;
+
+!
+! Now, a decent contents for UCB$L_PDT has been assured.
+!
+
+    BEGIN
+
+    BIND
+	pdt = .ucb[ucb$l_pdt] : $BBLOCK,
+	port_ucb = .pdt[pdt$l_ucb0] : $BBLOCK;
+
+    IF .pdt[pdt$b_pdt_type] NEQ pdt$c_pu
+    OR .port_ucb[ucb$b_devclass] NEQ dc$_bus
+    THEN RETURN set$_notuqport;
+
+    ! Lock the I/O database for write access, convert the UCB address to
+    ! a device name, and release the I/O database.
+
+    sch$iolockw(.ctl$gl_pcb);
+    status = IOC$CVT_DEVNAM( .length, .string, 0, port_ucb; length );
+    IF .status EQL ss$_bufferovf THEN status = set$_notuqport;
+    sch$iounlock(.ctl$gl_pcb);
+    set_ipl(0);
+
+    END;
+
+RETURN .status;
+END;
+
+END
+ELUDOM

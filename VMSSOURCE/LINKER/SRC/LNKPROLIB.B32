@@ -1,0 +1,667 @@
+module lnk_procslib (				! OBJECT LIBRARY PROCESSING
+		ident = 'V04-000',
+		addressing_mode (external = general, nonexternal = long_relative)
+		) =
+begin
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!++
+! FACILITY:	LINKER
+!
+! ABSTRACT:	ROUTINES TO DO ALL PASS 1 OBJECT LIBRARY PROCESSING
+!
+!
+! ENVIRONMENT:	VMS NATIVE MODE
+!
+! AUTHOR:	T.J. PORTER, CREATION DATE: 16-MAY-77
+!
+! MODIFIED BY:
+!
+!	V03-011	JWT0168		Jim Teague		21-Mar-1984
+!		LBR$SEARCH will now return a status other than true,
+!		so when the Linker returns a 0 from LNK$ADDIMAGE to 
+!		stop the library search, it must be prepared to see
+!		that 0 propagated all the way back through the 
+!		LBR$SEARCH call.
+!
+!	V03-010	JWT0099		Jim Teague		14-Mar-1983
+!		New CLI interface.
+!
+!	V03-009	JWT0063		Jim Teague		26-Oct-1982
+!		Correct bug in shareable image name manipulation.
+!
+!	V03-008 JWT0044		Jim Teague		30-Jul-1982
+!		Open file performance boost.  Also correct weak
+!		shr-img-symbol bug.
+!
+!	V03-007	BLS0170		Benn Schreiber		13-Apr-1982
+!		Beef up error handling from lbr$ calls
+!
+!	V03-006	BLS0159		Benn Schreiber		17-Mar-1982
+!		Also check for angles in directory spec
+!
+!--
+!
+! INCLUDE FILES:
+!
+
+library 'STARLETL32';				! STARLET DATA STRUCTURES
+
+require 'PREFIX';				! GENERAL DEFINITIONS
+
+library 'DATBAS';				! INTERNAL DATA BASE
+
+forward routine
+    lnk$bintim,					! CONVERT TIME TO BINARY
+    lnk$addimage;				! ADD SHAREABLE IMAGE TO CLUSTER LIST
+
+!
+! EQUATED SYMBOLS:
+!
+global literal
+    lnk$k_libblocks = 10 : short;		! NUMBER OF BLOCKS IN A WINDOW
+						! OF A LIBRARY
+!
+! EXTERNAL REFERENCES:
+!
+external literal
+    lbr$_keynotfnd,				! KEY NOT FOUND
+    lin$_format,				! FORMAT BAD
+    lin$_libfind,				! FIND FAILURE IN LIBRARY
+    lin$_libnamlng,				! ILLEGAL MODULE NAME LENGTH
+    lin$_nosuchmod,				! MODULE NOT IN LIBRARY ERROR
+    lin$_readerr;				! READ ERROR
+
+external
+    lbr$gl_rmsstv,				! STV RETURNED BY LIBRARIAN
+    lnk$gl_ctlmsk : block [, byte],		! LINKER CONTROL FLAGS
+    lnk$gl_curfil : ref block [, byte],		! POINTER TO CURRENT (LIBRARY) FILE DESCRIPTOR
+    lnk$gl_curclu : ref block [, byte],		! POINTER TO CURRENT CLUSTER DESCRIPTOR
+    lnk$gl_clulst,				! HEAD OF CLUSTER DESCRIPTOR LIST
+    lnk$gl_clutree,				! TREE HEAD OF CLUSTER TREE
+    lnk$gl_lastclu : ref block [, byte],	! POINTER TO LAST CLUSTER DESCRIPTOR
+    lnk$gl_udflst,				! UNDEFINED SYMBOL LISTHEAD
+    lnk$gw_nudfsyms : word,			! NUMBER OF UNDEFINED SYMBOLS
+    lnk$gl_objrecs,				! NUMBER OF RECORDS PROCESSED
+    lnk$gb_pass : byte,				! LINKER PASS
+    lnk$al_rab : block [rab$c_bln, byte];	! RAB TO USE FOR READS
+
+external routine
+    lib$lookup_tree,				! LOOKUP ITEM IN TREE
+    lbr$find,					! POINT TO MODULE
+    lbr$set_module,				! READ MODULE HEADER
+    lbr$get_record,				! READ RECORD OF MODULE
+    lbr$lookup_key,				! LOOKUP KEY IN LIBRARY
+    lbr$set_index,				! SET INDEX NUMBER
+    lbr$search,					! SEARCH INDEX FOR ENTRIES
+    lnk$alloblk,				! DYNAMIC MEMORY ALLOCATOR
+    lnk$dealblk,				! AND DEALLOCATOR
+    lnk$allocluster,				! ALLOCATE CLUSTER DESCRIPTOR
+    lnk$insert_clu,				! INSERT CLUSTER INTO CLUSTER TREE
+    lnk$allofdb,				! ALLOCATE FILE DESCRIPTOR BLOCK
+    lnk$procsobj,				! PROCESS OBJ FILES
+    lnk$pointobj;				! POINT TO OBJ IN A LIBRARY
+!
+! MODULE OWN STORAGE:
+!
+own
+    shrdefext : quadvector [1] initial (stringdesc ('SYS$LIBRARY:.EXE')),
+						! DEFAULT NAME STRING FOR SHR IMAGES
+    savedrecount,				! RECORD COUNT A BEGINNING OF LIBRARY MODULE
+    modnamindex : initial (1),			! MODULE NAME INDEX IS INDEX 1
+    gstnamindex : initial (2),			! GLOBAL SYMBOL INDEX IS INDEX 2
+    gstmisscnt;					! NUMBER OF UNSUCCESSFUL GST SEARCHS THIS CALL
+
+global
+    lnk$gl_futlsrch,				! ACCUMULATED FUTILE SEARCHES
+    lnk$gl_librecs,				! NUMBER OF RECORDS PROCESSED IN LIBRARIES
+    lnk$gl_libsym : ref block [, byte],		! POINTER TO THE SYMBOL THAT CAUSED
+    lnk$gl_nmodsexp,				! NUMBER OF EXPLICITLY EXTRACTED MODULES
+    lnk$gl_nmodsrch;				!   "    EXTRACTED BECAUSE THEY RESOLVE SYMBOLS
+						! A MODULE TO LOAD FROM LIBRARY.
+literal
+    lnk$k_stopsearch = 0;			! Flag to stop library search
+
+
+global routine lnk$procslib (arglist) = 	! PROCESS LIBRARY
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+! THIS ROUTINE IS CALLED DURING PASS 1 OF
+! LINKING TO PROCESS A RELOCATABLE OBJECT MODULE LIBRARY
+! WHICH HAS ALREADY BEEN OPENED. THERE ARE TWO FUNCTIONS
+! PERFORMED, (IN ORDER IF BOTH SPECIFIED):
+!	(1) IF EXPLICIT MODULE INCLUSION HAS BEEN SPECIFIED,
+!	    THE NAMED MODULES ARE SEARCHED FOR IN THE
+!	    LIBRARY'S MODULE NAME TABLE AND, IF  FOUND,
+!	    PROCESSED SEQUENTIALLY BY CALLING LNK$PROCSOBJ FOR EACH.
+!	(2) IF SEARCH FOR UNRESOLVED SYMBOLS IS SPECIFIED, AND THERE
+!	    EXIST CURRENTLY UNDEFINED SYMBOLS ON THE UNDEFINED LIST,
+!	    SEARCH THE LIBRARY GLOBAL SYMBOL TABLE FOR EACH SYMBOL.
+!	    WHEN ONE IS FOUND, PROCESS THE DEFINING MODULE BY
+!	    CALLING LNK$PROCSOBJ.
+!
+! FORMAL PARAMETERS:
+!	ARGLIST IS THE ADDRESS OF THE ORIGINAL ARGUMENT LIST FROM
+!	THE IMAGE ACTIVATOR. AT OFFSET CLI$A_UTILSERV IS THE
+!	ADDRESS AT WHICH TO RE-CALL CLI TO PROVIDE THE MODULE
+!	NAMES ON AN EXPLICIT MODULE EXTRACTION FROM LIBRARY
+!
+! IMPLICIT INPUTS:
+!
+!	LNK$GL_CURFIL - POINTS TO CURRENT OBJ FILE (IN THIS
+!			CASE A LIBRARY) DESCRIPTOR BLOCK.
+!	FLAG BITS IN THE DESCRIPTOR SPECIFY THE KIND OF
+!	LIBRARY SEARCH (MODULE OR SYMBOL OR BOTH). IF
+!	MODULE SEARCH IS SPECIFIED, THE FILE DESCRIPTOR CONTAINS
+!	THE POINTERS TO THE CLI DATA WHICH DESCRIBES MODULES TO
+!	BE INCLUDED.
+!	LNK$GW_NUDFSYMS - NUMBER OF UNDEFINED (STRONGLY REFERENCED)
+!           		  SYMBOLS
+!	LNK$GL_UDFLST -   LISTHEAD FOR DOUBLY LINKED LIST OF
+!			  UNDEFINED SYMBOLS.
+!
+! IMPLICIT OUTPUTS:
+!
+!	THE MODULES SELECTED FOR PROCESSING ARE PROCESSED BY LNK$PROCSOBJ
+!	IN ADDITION:
+!		LNK$GL_LIBSYM	RECEIVES THE ADDRESS OF THE
+!				ENTRY IN THE SYMBOL TABLE WHEN
+!				A SYMBOL SEARCH IS SUCCESSFUL.
+!
+! ROUTINE VALUE:
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	AS PERFORMED BY LNK$PROCSOBJ
+!
+!--
+    begin
+    local
+	moduleptr,
+	nextptr,
+	status,
+	keydesc : block [dsc$c_s_bln, byte],	! STRING DESCRIPTOR
+	nextsym : ref block [, byte],		! NEXT UNDEFINED SYMBOL IN LIST
+	modulerfa : block [6, byte];		! FILE ADDRESS OF FIRST RECORD OF
+    						! THE ASSOCIATED MODULE. FIRST 4
+    						! BYTES ARE VBN, FOLLOWED BY THE
+    						! OFFSET INTO BLOCK
+    map
+	arglist : ref block [, byte];
+    bind
+	auxfnb = lnk$gl_curfil [fdb$t_auxfnb] : block [nam$c_bln, byte];
+						! AUXILLIARY FILE NAME BLOCK IN FDB
+    if not .lnk$gl_curfil [fdb$v_libextr]	! IF NOT EXTRACTING SPECIFIC MODULES AND
+    then
+	if .lnk$gw_nudfsyms eql 0 then return true;	! THERE ARE NO UNDEFINED SYMBOLS
+
+    if .lnk$gl_curfil [fdb$v_libextr]		! IF THIS IS INCLUSION OF EXPLICITLY
+    then
+	begin
+	lnk$gl_libsym = 0;			! INVALIDATE LIBRARY SYMBOL
+	status = lbr$set_index (%ref (.lnk$gl_curfil [fdb$w_ifi]), modnamindex);
+						! SET TO LOOK AT MODULE NAME INDEX
+	moduleptr = .lnk$gl_curfil[fdb$l_omdlst];
+	lnk$gl_curfil[fdb$l_omdlst] = 0;
+
+	if not .status
+	then
+	    begin
+	    signal (lin$_readerr, 1, lnk$gl_curfil [fdb$q_filename], .status);
+	    return true;			! DON'T ABORT THE LINK, THO
+	    end;
+!
+! NOW LOOP, GRABBING THE NEXT MODULE NAME IN THE LINKED
+! LIST, SEARCHING MODULE NAME TABLE FOR THAT MODULE THEN,
+! IF FOUND PROCESSING THE MODULE
+!
+	while .moduleptr neq 0			! THAT IS WHILE THERE
+	do
+	    begin				! REMAINS MORE TEXT ON THE
+	    nextptr = .(.moduleptr);
+	    keydesc[dsc$w_length] = .(.moduleptr+4)<0,8>;
+	    keydesc[dsc$a_pointer] = .moduleptr + 5;
+	    if .keydesc [dsc$w_length] eql 0	! GO GET NEXT NAME (ALLOWING
+		or .keydesc [dsc$w_length] gtru sym$c_maxlng
+						! CLI TO USE THE LIBRARY HEADER BUFFER)
+	    then
+		begin
+		signal (lin$_libnamlng, 2, 	! CHECK A VALID NAME
+		    keydesc [dsc$w_length], .keydesc[dsc$w_length]);	! AND ISSUE ERROR IF AN
+		keydesc [dsc$w_length] = sym$c_maxlng;	! ILLEGAL LENGTH, SET TO MAXIMUM
+		end;
+	    if not (status = lbr$lookup_key (%ref (.lnk$gl_curfil [fdb$w_ifi]), keydesc, modulerfa))
+						! LOOKUP THE MODULE NAME
+	    then
+		begin
+		if .status eql lbr$_keynotfnd
+		then
+		    signal (lin$_nosuchmod, 2, keydesc [dsc$w_length],
+			lnk$gl_curfil [fdb$q_filename])
+		else
+		    signal (lin$_readerr, 1, lnk$gl_curfil [fdb$q_filename], .status, .lbr$gl_rmsstv);
+		end
+	    else
+		begin
+		if .lnk$gl_curfil [fdb$v_imglib]	! IF THIS IS SHR IMG STB LIBRARY
+		then
+		    lnk$addimage (keydesc, modulerfa)	!  THEN JUST ADD TO THE CLUSTER LIST
+		else
+		    begin
+		    savedrecount = .lnk$gl_objrecs;	! SAVE CURRENT RECORD COUNT
+		    lnk$gl_nmodsexp = .lnk$gl_nmodsexp + 1;	! COUNT ONE MORE EXPLICITLY EXTRACTED
+		    lnk$pointobj (modulerfa);	! FOUND IT SO GO POINT TO
+
+		    if not lnk$procsobj (modulerfa) then return false;	! THE MODULE IN THE LIBRARY
+		    lnk$gl_librecs = .lnk$gl_librecs + .lnk$gl_objrecs -
+						! ACCUMULATE THE NUMBER OF RECORDS
+		    .savedrecount;		! FOUND IN LIBRARIES
+		    end;
+		end;
+	    lnk$dealblk(.keydesc[dsc$w_length]+5, .moduleptr);
+	    moduleptr = .nextptr;
+	    end;
+	end;					! AND PROCESS IT
+!
+! NOW CHECK WHETHER THIS LIBRARY IS TO BE SEARCHED FOR
+! CURRENTLY UNDEFINED SYMBOLS. EXIT NOW IF NOT
+!
+    if .lnk$gl_curfil [fdb$v_libsrch]		! IF A SYMBOL SEARCH REQUIRED
+    then
+	begin
+	lnk$gl_curfil [fdb$v_newudf] = false;	! RESET UNDEFINED SYMBOLS CONTRIBUTED
+	gstmisscnt = 0;				! RESET COUNT OF SYMBOLS NOT FOUND
+	nextsym = .lnk$gl_udflst;		! START AT TOP OF LIST, AND
+	status = lbr$set_index (%ref (.lnk$gl_curfil [fdb$w_ifi]), gstnamindex);
+						! LOOK IN GLOBAL SYMBOL INDEX
+	if not .status
+	then
+	    begin
+	    signal (lin$_readerr, 1, lnk$gl_curfil [fdb$q_filename], .status);
+	    return true;			! DON'T ABORT THE LINK, THO
+	    end;
+
+	if .lnk$gl_curfil [fdb$v_imglib]	! IF THIS IS SHR IMG STB LIBRARY
+	then
+	    begin
+	    while .nextsym neq lnk$gl_udflst do
+		begin
+		bind
+		    nextsymnam = .nextsym - .nextsym [sym$b_namlng] - snb$c_fxdlen : block [, byte];
+		if not .nextsym [sym$v_weak]
+		then
+		    begin
+		    keydesc [dsc$w_length] = .nextsym [sym$b_namlng];
+		    keydesc [dsc$a_pointer] = nextsymnam [snb$t_name];
+
+		    if (status = lbr$lookup_key (%ref (.lnk$gl_curfil [fdb$w_ifi]), keydesc, modulerfa))
+						! IF SYMBOL IS IN LIBRARY
+		    then
+			begin
+			status = lbr$search (%ref (.lnk$gl_curfil [fdb$w_ifi]), modnamindex,
+						! FIND THE MODULE NAME
+			    modulerfa, lnk$addimage);
+			if (not .status)  and (.status neq lnk$k_stopsearch)
+			then 
+			    signal (lin$_readerr, 1, lnk$gl_curfil [fdb$q_filename], .status);
+			end
+		    else
+
+			if .status neq lbr$_keynotfnd
+			then
+			    signal (lin$_readerr, 1,
+				lnk$gl_curfil [fdb$q_filename], .status, .lbr$gl_rmsstv);
+		    end;
+
+		nextsym = .nextsym [sym$l_udflink];	! LINK TO NEXT UNDEFINED SYMBOL
+		end
+	    end
+	else
+
+	    while .lnk$gw_nudfsyms neq 0	! WHILE IT CONTAINS SOME UN-
+						! DEFINED SYMBOLS, GET
+		and (if (lnk$gl_libsym = .nextsym) neq lnk$gl_udflst	! NEXT ENTRY. HOWEVER
+		then true			! IF BACK AT THE LISTHEAD
+		else if not .lnk$gl_curfil [fdb$v_newudf]	! AND THIS FILE DID NOT ADD
+		    then false			! MORE UNDEFINED SYMBOLS-WE ARE DONE
+		    else
+			begin			! IF IT DID ADD MORE, GET
+			lnk$gl_libsym = .lnk$gl_libsym [sym$l_udflink];	! TOP ENTRY IN LIST
+			lnk$gl_curfil [fdb$v_newudf] = false;	! RESET THE UNDEFINED SYMBOLS CONTRIBUTED FLAG
+			true			! AND CONTINUE THE
+			end
+		)				! SEARCH
+	    do
+		begin				! FOR A SYMBOL ON THE
+
+		bind
+		    libsymnam = .lnk$gl_libsym - .lnk$gl_libsym [sym$b_namlng] - snb$c_fxdlen : block [, byte]
+		;				! POINT TO NAME PART
+
+		keydesc [dsc$w_length] = .lnk$gl_libsym [sym$b_namlng];	! MAKE STRING DESCRIPTOR FOR NAME
+		keydesc [dsc$a_pointer] = libsymnam [snb$t_name];	! ...
+		nextsym = .lnk$gl_libsym [sym$l_udflink];	! UNDEFINED LIST AND
+
+		if (.lnk$gl_libsym [sym$w_flags] and gsy$m_weak) eql 0	! PROVIDED IT IS NOT A WEAK
+		    and not .lnk$gl_libsym [sym$v_gstmiss]	! REFERENCE AND THAT WE
+		then 				! HAVE NOT BEFORE FAILED TO
+						! FIND IT IN THIS LIBRARY,
+
+		    if (status = lbr$lookup_key (%ref (.lnk$gl_curfil [fdb$w_ifi]), keydesc, modulerfa))
+						! GO LOOK FOR THE SYMBOL
+		    then
+			begin			! RETURN RECORD'S FILE ADDRESS
+			lnk$gl_nmodsrch = .lnk$gl_nmodsrch + 1;	! COUNT THE NUMBER OF MODULES
+			savedrecount = .lnk$gl_objrecs;	! SAVE CURRENT RECORD COUNT
+			lnk$pointobj (modulerfa);	! TO POINT TO THE MODULE
+
+			if not lnk$procsobj (modulerfa) then return false;	! AND GO PROCESS IT
+			lnk$gl_librecs = .lnk$gl_librecs + .lnk$gl_objrecs - 	! ACCUMULATE THE NUMBER OF
+			.savedrecount;		! RECORDS FROM LIBRARIES
+			nextsym = .lnk$gl_libsym;	! RETRIEVE NEXT IN LIST (SINCE THE
+						! ONE WE HAD MAY HAVE JUST BEEN
+						! DEFINED BY THAT MODULE)
+			end
+		    else
+			begin			! IF THE SYMBOL WAS NOT
+
+			if .status neq lbr$_keynotfnd
+			then
+			    signal (lin$_readerr, 1,
+				lnk$gl_curfil [fdb$q_filename], .status, .lbr$gl_rmsstv);
+
+			gstmisscnt = .gstmisscnt + 1;	! FOUND IN LIBRARY, COUNT
+			lnk$gl_libsym [sym$v_gstmiss] = true;	! ANOTHER MISS AND SUPPRESS
+						! ANY MORE SEARCHES FOR IT
+			end;			! END OF SYMBOL LIST LOOP
+		end;
+	lnk$gl_libsym = 0;			! INVALIDATE THE SYMBOL POINTER
+!
+! NOW FINISHED LOOKING FOR UNDEFINED SYMBOLS IN THE CURRENT LIBRARY
+! MUST NOW GO DOWN WHAT IS LEFT OF THE UNDEFINED SYMBOL LIST, TURNING
+! OFF THE GST MISS FLAG IN EACH SYMBOL DESCRIPTOR.
+!
+	nextsym = lnk$gl_udflst;
+	if .gstmisscnt neq 0			! IF THERE WERE NO MISSES
+	then
+	    while (nextsym = .nextsym [sym$l_udflink]) neq lnk$gl_udflst	! FORGET IT
+	    do
+		nextsym [sym$v_gstmiss] = false;	! TURN OFF FLAG
+
+	lnk$gl_futlsrch = .lnk$gl_futlsrch + .gstmisscnt;	! ACCUMULATE FUTILE SEARCH COUNT
+	end;
+
+    lnk$gl_curfil [fdb$v_selser] = false;	! RESET THE POSSIBLE SELECTIVE SEARCH FLAG
+    return true;				! AND ALL DONE
+    end;					! END OF ROUTINE
+
+
+global routine lnk$bintim (asctim, bintim) =
+    begin
+!
+!	THIS ROUTINE CONVERTS A DATE/TIME STRING FROM A MODULE
+!	HEADER TO BINARY.
+!
+! INPUTS:
+!
+!	ASCTIM		ADDRESS OF 17-BYTE ASCII DATE/TIME
+!	BINTIM		ADDRESS OF QUADWORD TO STORE BINARY TIME
+!
+!--
+    local
+	timedesc : block [dsc$c_s_bln, byte],
+	timestring : vector [23, byte];
+
+    ch$move (17, .asctim, timestring);		! COPY ASCII STRING FOR DATE/TIME
+    ch$fill (%c'0', 6, timestring [17]);	! FILL REST OF STRING WITH 0'S
+    timestring [17] = %c':';			! FIX PUNCTUATION AS REQUIRED
+    timestring [20] = %c'.';
+    timedesc [dsc$w_length] = 23;
+    timedesc [dsc$a_pointer] = timestring;
+    $bintim (timbuf = timedesc, timadr = .bintim);
+    return true
+    end;
+
+global routine lnk$addimage (moduledesc, modulerfa, retcludesc, foundflag) =
+    begin
+!
+!	THIS ROUTINE IS CALLED BY THE LIBRARIAN WHEN IT FINDS A MODULE
+!	NAME WITH THE SAME RFA AS THE GLOBAL SYMBOL JUST LOCATED.  WE
+!	CHECK TO SEE IF THIS SHAREABLE IMAGE HAS ALREADY BEEN REQUESTED.
+!	IF NOT, THEN A CLUSTER DESCRIPTOR AND FDB ARE ALLOCATED.
+!
+!	IF MODULERFA IS NOT PRESENT (NULLPARAMETER), THEN NO LIBRARY READING
+!	IS DONE, THE CLUSTER DESCRIPTOR AND FILE DESCRIPTOR BLOCKS ARE CREATED,
+!	HOWEVER.
+!
+!	IF RETCLUDESC IS PASSED, IT IS THE ADDRESS OF A LONGWORD TO STORE
+!	THE ALLOCATED CLUSTER DESCRIPTOR ADDRESS.  NOTE THAT THE ONLY WAY
+!	TO DETERMINE IF AN IMAGE WAS REQUESTED IS TO CHECK FOR RETCLUDESC
+!	BEING NON-0, SINCE THIS ROUTINE ALWAYS RETURNS FALSE TO STOP LBR SEARCH
+!
+!	IF FOUNDFLAG IS PASSED, IT IS THE ADDRESS OF A LONGWORD TO STORE
+!	A 1 (FOUND) OR 0 (INSERTED)
+!
+    routine compareclu (keydesc, clunode) =
+	begin
+!
+! LOCAL ROUTINE TO COMPARE A NAME OF NODE WITH ANOTHER NAME
+!
+	map
+	    keydesc : ref block [, byte],	! POINTER TO STRING DESCRIPTOR
+	    clunode : ref block [, byte];	! NODE FOR DESCRIPTOR BEING EXAMINED
+	local
+	    clu : ref block [, byte];
+	clu = .clunode [node$l_ptr];		! POINT TO CLUSTER DESCRIPTOR
+	return ch$compare (.keydesc [dsc$w_length], .keydesc [dsc$a_pointer], .clu [clu$b_namlng],
+		clu [clu$t_name])
+	end;
+!
+! MAIN BODY OF LNK$ADDIMAGE
+!
+    map
+	moduledesc : ref block [, byte],
+	modulerfa : ref block [, byte],
+	retcludesc : ref vector [, long],
+	foundflag : ref vector [, long];
+    builtin
+	nullparameter;
+    local
+	status,
+	read_library,
+	mhdbuf : block [lbr$c_maxhdrsiz, byte],	! BUFFER TO READ MODULE HEADER
+	mhdbufdesc : block [dsc$c_s_bln, byte],	! STRING DESCRIPTOR OF MHDBUF
+	bufdesc : block [dsc$c_s_bln, byte],
+	prevclu : ref block [, byte],		! POINTER TO PREVIOUS CLUSTER
+	nextclu : ref block [, byte],
+	lastclu : ref block [, byte],
+	fdb : ref block [, byte],		! POINTER TO CREATED FDB
+	clu : ref block [, byte];		!  AND CLUSTER
+
+!
+! SEARCH THE CLUSTER LIST TO SEE IF THIS SHAREABLE IMAGE ALREADY REQUESTED
+!
+    if not nullparameter (3) then retcludesc [0] = 0;
+    if not nullparameter (4) then foundflag [0] = 0;
+    if lib$lookup_tree (lnk$gl_clutree, .moduledesc, compareclu, clu)	! LOOK IT UP
+    then
+	begin
+	if not nullparameter (4) then foundflag [0] = 1;
+	if not nullparameter (3) then retcludesc [0] = .clu [node$l_ptr];
+	return lnk$k_stopsearch;			!  RETURN FALSE TO STOP SEARCH IF FOUND
+	end;
+!
+! IMAGE NOT REQUESTED.  READ AND VERIFY MODULE HEADER.  THEN CREATE CLUSTER DESCRIPTOR
+!
+    if (read_library = not nullparameter (2))	! SET FLAG IF PARAMETER SPECIFIED
+    then
+	begin
+
+	if not (status = lbr$find (%ref (.lnk$gl_curfil [fdb$w_ifi]), .modulerfa))	! POINT TO THE MODULE
+	then
+	    begin
+	    signal ((lin$_libfind and not sts$m_severity) or sts$k_error, 4, 	! REPORT ERROR
+		.modulerfa [rfa$l_vbn], .modulerfa [rfa$w_offset], .moduledesc [dsc$a_pointer] - 1,
+		lnk$gl_curfil [fdb$q_filename], lin$_format, 0, .status, .lbr$gl_rmsstv);
+	    return lnk$k_stopsearch;			! RETURN TO STOP SEARCH
+	    end;
+
+	bufdesc [dsc$w_length] = .lnk$al_rab [rab$w_usz];
+						! SET UP BUFFER DESCRIPTOR TO READ OBJ MODULE HEADER REC
+	bufdesc [dsc$a_pointer] = .lnk$al_rab [rab$l_ubf];
+	if not (status = lbr$get_record (%ref (.lnk$gl_curfil [fdb$w_ifi]), bufdesc, bufdesc))
+						! READ FIRST RECORD OF OBJ MODULE
+	then
+	    begin
+	    signal (lin$_readerr, 1, lnk$gl_curfil [fdb$q_filename], .status, .lbr$gl_rmsstv);
+	    return lnk$k_stopsearch;
+	    end;
+	mhdbufdesc [dsc$w_length] = lbr$c_maxhdrsiz;
+						! READ LIBRARY MODULE HEADER...SET UP BUFFER DESCRIPTOR
+	mhdbufdesc [dsc$a_pointer] = mhdbuf;
+	if not (status = lbr$set_module (%ref (.lnk$gl_curfil [fdb$w_ifi]), .modulerfa, 	! READ IT NOW
+		mhdbufdesc, mhdbufdesc))
+	then
+	    begin
+	    signal (lin$_readerr, 1, lnk$gl_curfil [fdb$q_filename], .status, .lbr$gl_rmsstv);
+	    return lnk$k_stopsearch;
+	    end;
+	begin
+	bind
+	    hdrec = .bufdesc [dsc$a_pointer] : block [, byte],	! NAME THE HEADER RECORD
+	    mhdid = hdrec [mhd$t_name] + .hdrec [mhd$b_namlng] : vector [, byte];
+						! AND THE MODULE ID PART OF HEADER
+	if .hdrec [obj$b_rectyp] neq obj$c_hdr	! MAKE SURE IT LOOKS LIKE AN OBJ MODULE HEADER
+	    or .hdrec [obj$b_subtyp] neq obj$c_hdr_mhd
+	then
+	    begin
+	    signal (lin$_readerr, 1, lnk$gl_curfil [fdb$q_filename], lin$_format, 0);
+	    return lnk$k_stopsearch;
+	    end;
+
+	end;
+	end;					! OF READ_LIBRARY
+!
+! NOW ALLOCATE A CLUSTER DESCRIPTOR FOR THE NEW SHAREABLE IMAGE
+!
+    lnk$allocluster (clu, 1);			! CREATE CLUSTER DESCRIPTOR, DON'T LINK INTO LIST
+    if not nullparameter (3)			! IF CALLER WANTS DESCRIPTOR ADDRESS
+    then
+	retcludesc [0] = .clu;			!  THEN RETURN IT
+
+    lastclu = .lnk$gl_curclu [clu$l_lastclu];	! GET POINTER TO LAST IMAGE CONTAINED IN THIS ONE
+
+    if .lastclu neq 0				! IF THERE IS ONE, INSERT AFTER IT
+    then
+	begin
+	nextclu = .lastclu [clu$l_nxtclu];
+	lastclu [clu$l_nxtclu] = .clu;
+	clu [clu$l_prevclu] = .lastclu;
+	end
+    else
+	begin					! THIS IS THE FIRST, INSERT AFTER CURRENT CLUSTER
+	nextclu = .lnk$gl_curclu [clu$l_nxtclu];
+	lnk$gl_curclu [clu$l_nxtclu] = .clu;
+	clu [clu$l_prevclu] = .lnk$gl_curclu;
+	end;
+
+    if (clu [clu$l_nxtclu] = .nextclu) neq 0	! SET PREVCLU IN NEXT CLUSTER
+    then
+	nextclu [clu$l_prevclu] = .clu
+    else
+	lnk$gl_lastclu = .clu;			! OR MAKE THIS THE LAST CLUSTER IF IT IS
+
+    lnk$gl_curclu [clu$l_lastclu] = .clu;	! MAKE THIS THE NEW LAST CLUSTER
+    clu [clu$v_shrimg] = true;			! FLAG CLUSTER AS SHAREABLE IMAGE
+    clu [clu$v_intclu] = true;			! FLAG AS INTERNALLY CREATED
+    ch$move ((clu [clu$b_namlng] = .moduledesc [dsc$w_length]),
+						! SET MODULE NAME INTO CLUSTER DESCRIPTOR
+	.moduledesc [dsc$a_pointer], clu [clu$t_name]);
+    lnk$insert_clu (.clu);			! INSERT CLUSTER INTO CLUSTER TREE
+
+    if .read_library				! IF READING LIBRARY, SET MORE INFO INTO CLUSTER DESCRIPTOR
+    then
+	begin
+	bind
+	    hdrec = .bufdesc [dsc$a_pointer] : block [, byte],	! NAME THE HEADER RECORD
+	    mhdid = hdrec [mhd$t_name] + .hdrec [mhd$b_namlng] : vector [, byte],
+						! AND THE MODULE ID PART OF HEADER
+	    mhdgsmatch = mhdid [1] : long,	!
+	    mhdcredat = mhdid [0] + .mhdid [0] + 1 : vector [, byte],	! AND THE CREATE DATE/TIME
+	    modheader = .mhdbufdesc [dsc$a_pointer] : block [, byte],	! THE LIBRARY MODULE HEADER
+	    modgsmatch = modheader [mhd$t_objident] : long;	! THE GSMATCH STORED IN LIBRARY MODULE HEADER
+
+	lnk$bintim (mhdcredat, clu [clu$q_credat]);	! CONVERT CREATION DATE/TIME FOR LATER
+	clu [clu$l_gsmatch] = .modgsmatch;	! SAVE THE GSMATCH FOUND IN THE LIBRARY
+	end;
+!
+! ALLOCATE AN FDB
+!
+    lnk$allofdb (fdb);
+    clu [clu$l_fstfdb] = clu [clu$l_lstfdb] = .fdb;
+    lnk$alloblk ((fdb [fdb$w_usrnamlen] = .moduledesc [dsc$w_length]), fdb [fdb$l_usrnamadr]);
+    ch$move (.fdb [fdb$w_usrnamlen], .moduledesc [dsc$a_pointer], .fdb [fdb$l_usrnamadr]);
+
+    if .lnk$gl_ctlmsk [lnk$v_intfil]
+    then
+	ch$move (dsc$c_s_bln, shrdefext, fdb [fdb$w_defnamlen])	! SET DEFAULT FILENAME STRING
+    else
+	begin
+	local
+	    ptr,
+	    ptr1;
+!
+! THE DEFAULT FILENAME STRING CONSISTS OF THE RESULTANT
+! FILENAME OF THE CURRENT FILE WITH THE EXTENSION SET TO ".EXE"
+!
+	if (ptr = ch$find_ch (.lnk$gl_curfil [fdb$w_defnamlen], 	! FIND END OF DIRECTORY
+		.lnk$gl_curfil [fdb$l_defnamadr], %ascii']')) eql 0
+	then
+	    ptr = ch$find_ch (.lnk$gl_curfil [fdb$w_defnamlen], .lnk$gl_curfil [fdb$l_defnamadr], %ascii'>');
+
+	ptr1 = ch$find_ch (.lnk$gl_curfil [fdb$w_defnamlen] - (.ptr - .lnk$gl_curfil [fdb$l_defnamadr]),
+	    .ptr, %ascii'.');			! THEN FIND START OF EXTENSION
+	lnk$alloblk (.ptr1 - .lnk$gl_curfil [fdb$l_defnamadr] + 4, fdb [fdb$l_defnamadr]);
+						! ALLOCATE BLOCK TO HOLD MODIFIED NAME(+4 FOR .EXE)
+	ptr = ch$move (.ptr1 - .lnk$gl_curfil [fdb$l_defnamadr], .lnk$gl_curfil [fdb$l_defnamadr],
+						! MOVE IN FIRST PART OF NAME
+	    .fdb [fdb$l_defnamadr]);
+	ptr1 = ch$move (4, uplit ('.EXE'), .ptr);	! SET THE EXTENSION
+	fdb [fdb$w_defnamlen] = .ptr1 - .fdb [fdb$l_defnamadr];	! COMPUTE LENGTH OF DEFAULT NAME
+	end;
+    ch$move (dsc$c_s_bln, lnk$gl_curfil [fdb$q_filename], fdb [fdb$q_libnamdsc]);
+						! COPY LIBRARY FILE DESCRIPTOR
+    fdb [fdb$v_shr] = true;			! FLAG FILE AS SHAREABLE IMAGE
+    return lnk$k_stopsearch			! RETURN FALSE TO STOP SEARCH
+    end;					! OF ADDIMAGE
+
+end
+eludom
+						! End of module

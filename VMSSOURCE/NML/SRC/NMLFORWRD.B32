@@ -1,0 +1,581 @@
+%TITLE 'Network Management Listener module to forward NICE messages'
+MODULE NML$FORWARD (
+		ADDRESSING_MODE (NONEXTERNAL=GENERAL),
+		ADDRESSING_MODE (EXTERNAL=GENERAL),
+		IDENT = 'V04-000') =
+
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+ 
+!++
+! FACILITY:  DECnet-VAX Network Management Listener
+!
+! ABSTRACT:
+!
+!	This module forwards NICE messages from NCP to two other programs.
+!	These programs are:
+!
+!	The Maintenance Operations Module (MOM):
+!	It's function is to perform maintenance functions such as down line
+!	load, up line dump, trigger, and loop line, circuit or node.
+!
+!	The NI Configurator Module:
+!	It's function is to gather information about the various circuits
+!	on the NI and, when requested, return this information to NCP.  NML
+!	is a conduit for the request and the returned information.  In this
+!	module, NML establishes a logical link to the NI Configurator Module
+!	and forwards the NICE message from NCP to it.  It then takes whatever
+!	responses returned by the NI Configurator Module, and sends them back
+!	to NCP.
+!
+! ENVIRONMENT:  VAX/VMS Operating System
+!
+! AUTHOR:  Kathy Perko
+!
+! CREATION DATE:  17-Jan-1983
+!
+! MODIFIED BY:
+!	V03-006	MKP0006		Kathy Perko		11-April-1984
+!		Add NCP version to buffer passed to MOM.
+!
+!	V03-005	MKP0005		Kathy Perko		4-Mar-1984
+!		Don't create a new mailbox every time MOM is invoked.  It
+!		eats up bytlm quota.
+!
+!	V03-004	MKP0004		Kathy Perko		3-Jan-1984
+!		Convert old $TRNLOG system service to new $TRNLNM for
+!		translating logical names.
+!
+!	V03-003	MKP0003		Kathy Perko		10-May-1983
+!		Fix mailbox communication with MOM so that NML$MOM_MBX
+!		goes into the process logical name table instead of the
+!		group logical name table.  This will force multiple incarnations
+!		of NML and MOM to use separate mailboxes.
+!
+!	V03-002	MKP0002		Kathy Perko		29-April-1983
+!		Upcase the logical name of the mailbox used to communicate
+!		with MOM.
+!
+!	V03-001	MKP0001		Kathy Perko		21-April-1983
+!		Use a command procedure when invoking MOM.  Also, if
+!		the SPAWN to start up MOM fails, assume it's being run
+!		from a batch job, and start it up again with null input
+!		and output devices.
+!
+!--
+
+%SBTTL 'Declarations'
+
+!
+! INCLUDE FILES:
+!
+ 
+LIBRARY 'LIB$:NMLLIB';			! Facility-wide definitions
+LIBRARY 'SHRLIB$:NMALIBRY';		! NICE definitions
+LIBRARY 'SHRLIB$:NET';			! NETACP QIO interface
+LIBRARY 'SYS$LIBRARY:STARLET';		! VMS common definitions
+
+!
+! TABLE OF CONTENTS:
+!
+ 
+FORWARD ROUTINE
+    nml$call_mom:	NOVALUE,
+    nml$call_ni_config:	NOVALUE,
+    nml_open_config_link:NOVALUE,
+    nml_config_qio,
+    nml_chkerr:		NOVALUE;
+
+!
+! Externals
+!
+$nml_extdef;
+
+EXTERNAL
+    nml$gb_ncp_version;
+
+EXTERNAL LITERAL
+    nml$_opabterm;
+
+EXTERNAL ROUTINE
+    LIB$SPAWN,
+    LIB$ASN_WTH_MBX,
+    nml$bld_reply,
+    nml$send,
+    nml$debug_msg;
+
+LITERAL
+    nml$c_maxmbxmsg = 200;
+
+OWN
+    nml$w_mom_mbx_chan: WORD INITIAL (0),! Channel to Mailbox for communicating
+					!	with MOM.
+    nml$w_config_chan:	WORD,		! Logical link channel to NICONFIG.
+    nml$w_mbxchan:	WORD,		! Logical link's Mailbox channel.
+    nml$q_mbx_iosb:	$iosb,		! IOSB for mailbox QIOs.
+    nml$a_mbxmsg:			! Mailbox message buffer.
+		VECTOR [nml$c_maxmbxmsg, BYTE];
+
+ 
+MACRO
+    $nml_niconfig_ncb =
+	%STRING ('::',			! Local node
+		'"TASK=$NICONFIG/',	! Declared task name
+		%CHAR (0,0),		! Word of zero
+		'"' )
+	%;
+
+BIND
+    nml$q_ncb = UPLIT (
+			LONG (%CHARCOUNT ($nml_niconfig_ncb),
+			UPLIT PSECT ($OWN$) ($nml_niconfig_ncb))
+			);
+
+
+%SBTTL 'NML$CALL_MOM   Routine to invoke Maintenance Operations Module'
+GLOBAL ROUTINE NML$CALL_MOM: NOVALUE =
+
+BEGIN
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	The Maintenance Operations Module (MOM) is a separate program from
+!	NML and NCP.  It's function is to perform various maintance operations
+!	such as down line load, up line dump, trigger, and loop circuit, node,
+!	or line.  For operator requested maintenance functions, NML is
+!	a conduit for the NICE request and response.  In this module, NML
+!	establishes a mailbox to which it writes the NICE messages, and
+!	then spawns MOM.  MOM performs the function and puts a NICE response
+!	in the mailbox.  NML then forwards this NICE response to NCP.
+!
+! FORMAL PARAMETERS:
+!	None
+!
+! IMPLICIT INPUTS:
+!	The NICE message in nml$ab_rcvbuffer.
+!
+! IMPLICIT OUTPUTS:
+!	A NICE message is sent to NCP.
+!
+! SIDE EFFECTS:
+!	The Maintenance Operations Module (MOM) is run.
+!
+!--
+
+FIELD
+    itmlst_fields =
+	SET
+	itm_buf_len	= [0,0,16,0],
+	itm_item_code	= [2,0,16,0],
+	itm_buf_add	= [4,0,32,0],
+	itm_ret_len	= [8,0,32,0],
+	itm_list_end	= [12,0,32,0]
+	TES;
+
+LOCAL
+    status,
+    mom_status,
+    msg_len,
+    getdvi_itmlst:	BBLOCK [4] FIELD (itmlst_fields),
+    crelnm_itmlst:	BBLOCK [4] FIELD (itmlst_fields);
+
+OWN
+    mbx_name: BBLOCK [64];
+
+!
+!  Create mailbox with which to communicate with MOM.  Create a logical name
+! for the mailbox in the process logical name table.  MOM inherits NML's logical
+! names as a result of the SPAWN, and putting the logical name in the process
+! table makes sure that other incarnations of NML and MOM do not use this
+! mailbox.
+!
+IF .nml$w_mom_mbx_chan EQL 0 THEN
+    BEGIN
+    status = $CREMBX (CHAN = nml$w_mom_mbx_chan,
+		      MAXMSG = nml$k_rcvbflen,	! Max length for a NICE message.
+		      PROMSK = %B'1111111100000000');! Protection = S:RWED, O:RWED, G, W
+    nml_chkerr (.status, 0);	 
+    END;
+getdvi_itmlst [itm_buf_len] = 64;
+getdvi_itmlst [itm_item_code] = dvi$_devnam;
+getdvi_itmlst [itm_buf_add] = mbx_name;
+getdvi_itmlst [itm_ret_len] = crelnm_itmlst [itm_buf_len];
+getdvi_itmlst [itm_list_end] = 0;
+status = $GETDVI (CHAN = .nml$w_mom_mbx_chan,
+		  ITMLST = getdvi_itmlst);
+nml_chkerr (.status, 0);
+crelnm_itmlst [itm_item_code] = lnm$_string;
+crelnm_itmlst [itm_buf_add] = mbx_name;
+crelnm_itmlst [itm_ret_len] = crelnm_itmlst [itm_buf_len];
+crelnm_itmlst [itm_list_end] = 0;
+status = $CRELNM (TABNAM = %ASCID 'LNM$PROCESS_TABLE',	! Process logical name table,
+		  LOGNAM = %ASCID 'NML$MOM_MBX',
+		  ITMLST = crelnm_itmlst);
+nml_chkerr (.status, 0);	 
+!
+! Put the NCP network management version number at the beginning of the NICE
+! message being passed to MOM.
+!
+CH$MOVE (.nml$gl_rcvdatlen, nml$ab_rcvbuffer, nml$ab_rcvbuffer+3);
+CH$MOVE (3, nml$gb_ncp_version, nml$ab_rcvbuffer);
+msg_len = .nml$gl_rcvdatlen + 3;
+!
+! Write NICE message to mailbox
+!
+nml_config_qio (.nml$w_mom_mbx_chan,
+		io$_writevblk OR io$m_now,
+		nml$ab_rcvbuffer,
+		msg_len);
+!
+! Spawn the Maintenance Operations Module (MOM).  MOM will translate the
+! logical name, NML$MOM_MBX, and then read the NICE message and process it.
+! When it is done, it will write a response NICE message to the mailbox.
+!
+status = LIB$SPAWN (%ASCID '$ @SYS$SYSTEM:MOM.COM',
+		    0,0,0,0,0,
+		    mom_status);
+IF NOT .status THEN
+    status = LIB$SPAWN (%ASCID '$ @SYS$SYSTEM:MOM.COM',
+			%ASCID 'NL:',	! Null input device
+			%ASCID 'NL:',	! Null output device
+			0,0,0,
+			mom_status);
+nml_chkerr (.status, mom_status);	 
+!
+! Read mailbox to get the NICE response MOM puts there when it's finished.
+!
+msg_len = nml$k_sndbflen;
+nml_config_qio (.nml$w_mom_mbx_chan,
+		io$_readvblk OR io$m_now,
+		nml$ab_sndbuffer,
+		msg_len);
+!
+! Check to make sure that the message I got back isn't the one I just
+! wrote to the mailbox.  This can happen if MOM isn't successfully
+! started up.
+!
+IF CH$EQL (.nml$gl_rcvdatlen, nml$ab_rcvbuffer,
+	   .msg_len, nml$ab_sndbuffer, 0) THEN
+    nml_chkerr (ss$_endoffile, 0);
+!
+! Send msg to NCP.
+!
+nml$send (nml$ab_sndbuffer, .msg_len);
+END;			! of  nml$call_mom
+
+%SBTTL 'NML$CALL_NI_CONFIG   Routine to talk to NI Configurator Module'
+GLOBAL ROUTINE NML$CALL_NI_CONFIG: NOVALUE =
+
+BEGIN
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine is called when NML receives a
+!		SET/SHOW MODULE CONFIGURATOR command.
+!	It establishes a logical link to the NI Configurator Module
+!	(NICONFIG), and then drives the process of sending and receiving
+!	NICE messages between NCP and NICONFIG.
+!
+! FORMAL PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	The NICE message in nml$ab_rcvbuffer.
+!
+! IMPLICIT OUTPUTS:
+!	NICE response message(s) from NICONFIG in nml$ab_sndbuffer.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+LOCAL
+    msg_len;
+
+!
+! Open a logical link to configurator module.
+!
+nml_open_config_link ();
+!
+! Send the NICE message to the NI Configurator Module via the logical
+! link just established.
+!
+nml_config_qio (.nml$w_config_chan,
+		io$_writevblk,
+		nml$ab_rcvbuffer,
+		nml$gl_rcvdatlen);
+!
+! Now read the response message (or messages) returned by the
+! NICONFIG, and forward them to NCP.
+!
+msg_len = nml$k_sndbflen;
+nml_config_qio (.nml$w_config_chan,
+		io$_readvblk,
+		nml$ab_sndbuffer,
+		msg_len);
+!
+! If NICONFIG is returning multiple responses, go into a loop until all
+! have been forwarded to NCP.  Note that the "more" and "done" messages
+! are not forwarded because NML already sends them on it's own.
+!
+IF .nml$ab_sndbuffer <0,8> EQL nma$c_sts_mor THEN
+    BEGIN
+    WHILE true DO
+	BEGIN
+	msg_len = nml$k_sndbflen;
+	nml_config_qio (.nml$w_config_chan,
+			io$_readvblk,
+			nml$ab_sndbuffer,
+			msg_len);
+	!
+	! When NICONFIG returns a "done" message, exit.  A "done" message
+	! is sent to NCP later.
+	!
+	IF .nml$ab_sndbuffer <0,8> EQL (nma$c_sts_don AND %X'FF') THEN
+	    EXITLOOP
+	ELSE
+	    !
+	    ! Forward NICONFIG's response to NCP.
+	    !
+	    nml$send (nml$ab_sndbuffer, .msg_len);
+	END;
+    END
+ELSE
+    !
+    ! Send msg to NCP.
+    !
+    nml$send (nml$ab_sndbuffer, .msg_len);
+END;			! of  nml$call_ni_config
+
+%SBTTL 'nml_open_config_link	Open link to NICONFIG'
+ROUTINE nml_open_config_link: NOVALUE =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine opens a logical link to the NI Configurator Module.
+!
+! FORMAL PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+! IMPLICIT OUTPUTS:
+!	 nml$w_config_chan =  Channel to Configurator Module.
+!	 nml$w_mbxchan =  Channel to mailbox.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+ 
+BEGIN
+
+LOCAL
+    iosb :	$iosb,	! IO status block
+    status;
+
+!!    OWN
+!!	OBJNAM_DESC : BBLOCK [DSC$C_S_BLN]
+!!		INITIAL (%CHARCOUNT ('$NICONFIG'), 
+!!			UPLIT PSECT ($OWN$) (%ASCII '$NICONFIG'));
+
+!
+! If there is already a link to the NI Configurator Module, just return.
+!
+IF .nml$w_config_chan NEQ 0 THEN
+    RETURN ss$_normal;
+
+status = LIB$ASN_WTH_MBX ( %ASCID '_NET:',	! Assign channel to NETACP
+	 0,0,					! mailbox MAXMSG, BUFQUO (ignored)
+	 nml$w_config_chan, 			! Channel to Configurator Module
+	 nml$w_mbxchan);			! Channel to mailbox
+
+nml_chkerr (.status, 0);			! Check completion status and
+						!	signal if there's an error
+status = $QIOW (
+		FUNC = io$_access,		! Request connect
+		CHAN = .nml$w_config_chan,	! Use assigned channel
+		IOSB = iosb,
+		P2 = nml$q_ncb);		! Network connect block
+
+nml_chkerr (.status, iosb);			! Check completion status and
+						!	signal if error.
+status = $QIOW (
+		FUNC = io$_readvblk,		! Request read on mailbox
+		CHAN = .nml$w_mbxchan,		! Use assigned channel
+		IOSB = iosb,
+		P1 = nml$a_mbxmsg,		! Buffer to contain mailbox message
+		P2 = nml$c_maxmbxmsg);		! Size maximum on mailbox message
+
+nml_chkerr (.status, iosb);			! Check completion status and
+						!	signal if error.
+IF .nml$a_mbxmsg [0] NEQ msg$_confirm THEN
+    nml_chkerr (ss$_endoffile, 0);		! The connect was  not accepted.
+
+RETURN;
+END;			! of   nml_open_config_link
+
+%SBTTL 'nml_config_qio		Issue QIO to NICONFIG'
+ROUTINE nml_config_qio (forward_chan, function, buffer_addr, buffer_len) =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!	Issue a read or a write on the logical link to NICONFIG.
+!
+! FORMAL PARAMETERS:
+!	forward_chan - channel on which to do QIO
+!	function - io$_readvblk or io$_writevblk
+!	buffer_addr - Address of buffer from which to put or get data.
+!	buffer_len - byte count of data to write, or size of buffer
+!		to receive data.
+!
+! OUTPUTS:
+!	buffer_len - length of data read (if it's a read).
+!
+! IMPLICIT INPUTS:
+!
+!
+! IMPLICIT OUTPUTS:
+!
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+ 
+BEGIN
+
+LOCAL
+    status,
+    iosb:	$iosb;
+
+IF .function EQL io$_writevblk THEN
+    nml$debug_msg (dbg$c_netio,
+		   .buffer_addr,
+		   ..buffer_len,
+		   %ASCID 'NICE message forwarded to NICONFIG or MOM');
+status = $QIOW (CHAN = .forward_chan,
+		FUNC = .function,
+		IOSB = iosb,
+		P1 = .buffer_addr,
+		P2 = ..buffer_len);
+
+nml_chkerr (.status, iosb);			! Check completion status and
+						!	signal if error.
+IF .function EQL io$_readvblk OR
+   .function EQL (io$_readvblk OR io$m_now) THEN
+    BEGIN
+    .buffer_len = .iosb [ios$w_count];
+    nml$debug_msg (dbg$c_netio,
+		   .buffer_addr,
+		   ..buffer_len,
+		   %ASCID 'NICE message received from NICONFIG or MOM');
+    END;
+RETURN nml$_sts_suc;
+
+END;			! of nml_config_qio
+
+%SBTTL 'nml_chkerr	Check QIO completion status'
+ROUTINE nml_chkerr (status, iosb): NOVALUE =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine is called to check the status returns for QIOs
+!	on the logical link to NICONFIG.  If there is an error, a response
+!	message is built, and sent to NCP via the handler.
+!
+! FORMAL PARAMETERS:
+!	status - the completion status of the QIO
+!	iosb - the address of the iosb for the QIO.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+!--
+ 
+BEGIN
+
+MAP
+    iosb:	REF $iosb;
+
+LOCAL
+    msgsize;
+
+IF .status AND
+   .iosb NEQ 0 THEN
+    status = .iosb [ios$w_status];
+IF NOT .status THEN
+    BEGIN
+    !
+    ! Get rid of the logical link to NICONFIG, and clear the channel number
+    ! so the next request to NICONFIG causes NML to establish another logical
+    ! link to NICONFIG.
+    !
+    $DASSGN (CHAN = .nml$w_config_chan);
+    nml$w_config_chan = 0;
+    !
+    ! Send an error response to NCP.
+    !
+    nml$ab_msgblock [msb$b_code] = nma$c_sts_ope;
+    IF .status EQL ss$_endoffile THEN
+	BEGIN
+	nml$ab_msgblock [msb$l_flags] = msb$m_msg_fld;
+	nml$ab_msgblock [msb$l_text] = nml$_opabterm;
+	END
+    ELSE
+	BEGIN
+	nml$ab_msgblock [msb$l_flags] = msb$m_msg_fld OR msb$m_sysm_fld;
+	nml$ab_msgblock [msb$l_text] = .status;
+	END;
+    nml$bld_reply (nml$ab_msgblock, msgsize);
+    $signal_msg (nml$ab_sndbuffer, .msgsize);
+    END;
+
+END;		! of    nml_chkerr
+
+
+END
+ELUDOM

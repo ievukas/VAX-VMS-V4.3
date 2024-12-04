@@ -1,0 +1,771 @@
+	.TITLE	LIB$FIXUP_DEC - Fixup decimal reserved operand
+	.IDENT	/V04-000/		; File: LIBFIXUPD.MAR Edit: PDG002
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; FACILITY: General Utility Library
+;
+; ABSTRACT:
+;
+;	LIB$FIXUP_DEC fixes up decimal reserved operands when a
+;	reserved operand fault occurs so that execution may continue
+;	at that instruction or the next instruction.  It is designed
+;	to be a condition handler or to be called from a condition handler.
+;
+; ENVIRONMENT: Runs at any access mode, AST Reentrant
+;
+; AUTHOR: Peter D Gilbert,	Version 1, CREATION DATE: 03-DEC-1980
+;				Adapted from LIB$FIXUP_DEC
+;
+; MODIFIED BY:
+;
+;	V02-002		PDG002		PDG	25-Oct-1983
+;		Modify the source if possible.  If not, copy the source before
+;		attempting the instruction.  Also, store the condition codes.
+;
+;	V02-001		PDG001		PDG	10-Aug-1982
+;		Fix a problem with searching the translation table.
+;
+;	V02-000		Original
+;
+;--
+
+	.SBTTL	DECLARATIONS
+;
+; LIBRARY MACRO CALLS:
+;
+	$SFDEF			; Stack frame symbols
+	$PSLDEF			; Processor Status Longword symbols
+	$CHFDEF			; Condition handling facility symbols
+	$STSDEF			; Status value symbols
+	$SSDEF			; System status values
+;
+; EXTERNAL DECLARATIONS:
+;
+	.DSABL	GBL		; Force all external symbols to be declared
+	.EXTRN	SYS$UNWIND	; Unwind stack frames
+	.EXTRN	LIB$_BADSTA	; Bad stack frame
+	.EXTRN	SYS$CALL_HANDL	; System routine that calls handlers
+;
+; MACROS:
+;
+;	NONE
+;
+; EQUATED SYMBOLS:
+;
+	R0_OFF	= 0*4			; R0 register offset in register image
+	R1_OFF	= 1*4			; R1 register offset
+	R2_OFF	= 2*4			; R2 register offset
+	R3_OFF	= 3*4			; R4 register offset
+	AP_OFF	= 12*4			; AP register offset
+	FP_OFF	= 13*4			; FP register offset
+	SP_OFF	= 14*4			; SP register offset
+	PC_OFF	= 15*4			; PC register offset
+	PSL_OFF	= 16*4			; PSL offset 
+
+	STACK =	0			; Used by DCL macro
+	.MACRO	DCL, SYM, LEN		; Declare stack temp offsets
+	STACK =	STACK - 4*LEN		; Allocate LEN longwords
+	SYM =	STACK			; Define SYM
+	.ENDM
+
+	DCL	REG_IMAGE, 17		; FP offset for image vector of registers
+	DCL	ADR_IMAGE, 17		; FP offset for image vector of addresses
+					; where registers have been saved in stack
+	DCL	OPD_IMAGE, 6		; Addresses of operands
+
+	IMAGE_PSL = -4			; FP offset of PSL image
+	IMAGE_PC = -8			; FP offset of PC image
+
+
+; Define codes used to denote operand types in opcode/operand tables
+; to follow.
+
+	OP_Z	= 0			; No more operands to process
+	OP_W	= 1			; Word
+	OP_D	= 2			; Decimal
+	OP_P	= 3			; Packed
+	OP_A	= 4			; Address
+;
+; OWN STORAGE:
+;
+	.PSECT _LIB$CODE PIC, USR, CON, REL, LCL, SHR, -
+			EXE, RD, NOWRT, LONG
+;
+
+; Tables of opcodes and operand types.  The first byte in each entry
+; is the opcode. The remaining bytes (up to 6) are OP_x codes defined
+; above that specify what datatype each operand is for that instruction.
+; If an operand type is 0, then no more operands are processed for that
+; instruction.  The opcodes must be in decreasing order, and the final
+; opcode byte must be a zero.
+;
+; Table for single byte opcodes.
+;
+SING_TAB:
+	.BYTE	^X26, OP_W, OP_D, OP_A, OP_W, OP_P, 0, 0 ; CVTTP
+	.BYTE	^X09, OP_W, OP_D, OP_W, OP_P,    0, 0, 0 ; CVTSP
+	.BYTE	0
+
+; Table for registers used in this instruction.
+; The high order word is used for auto-increment/decrement.
+; These entries must be in the same order as the SING_TAB entries.
+;
+	.ALIGN	LONG
+REGS_TAB:
+	.LONG	^X7FFF000F				; CVTTP
+	.LONG	^X7FFF000F				; CVTSP
+
+; Table of context amounts listed in OP_x code order
+;
+OP_CONTEXT:
+	.BYTE	0		; OP_Z
+	.BYTE	2		; OP_W
+	.BYTE	1		; OP_D
+	.BYTE	1		; OP_P
+	.BYTE	1		; OP_A
+
+;
+; PSECT DECLARATIONS:
+;
+	.PSECT _LIB$CODE PIC, USR, CON, REL, LCL, SHR, -
+			EXE, RD, NOWRT, LONG
+
+
+	.SBTTL	LIB$FIXUP_DEC - Fixup decimal reserved operand
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	LIB$FIXUP_DEC finds the reserved operand of the decimal instructions
+;	CVTTP or CVTSP after a reserved operand fault has been signaled.
+;	If possible, LIB$FIXUP_DEC will change the reserved digit(s) to "zero".
+;	Otherwise, execution proceeds with the next instruction.
+;
+; Exceptions:
+;
+;	LIB$FIXUP_DEC can not handle the following cases and will return
+;	a status of SS$_RESIGNAL if any of them occur.
+;
+;	    1.  The currently active signaled condition is not SS$_ROPRAND.
+;	    2.  The reserved operand's datatype is not Decimal or Packed.
+;
+; CALLING SEQUENCE:
+;
+;      ret_status.wlc.v = LIB$FIXUP_DEC	(chf$l_sigarglst.rl.ra,
+;					 chf$l_mcharglst.rl.ra )
+;
+; FORMAL PARAMETERS:
+;
+;	CHF$L_SIGARGLST	= Address of signal argument vector.
+;	CHF$L_MCHARGLST	= Address of mechanism argument vector.
+;
+; IMPLICIT INPUTS:
+;
+;	The stack frames back to that of the instruction which faulted.
+;	The instruction which faulted and its operands.
+;
+; IMPLICIT OUTPUTS:
+;
+;	The reserved decimal operand, if found, is replaced by "zero".
+;
+; COMPLETION STATUS:
+;
+;	SS$_CONTINUE - continue execution at point of condition
+;	    Routine successfully completed.  The  reserved  operand  was
+;	    found and was fixed up.
+;
+;	SS$_ACCVIO - access violation
+;	    An argument to LIB$FIXUP_DEC or an operand of  the  faulting
+;	    instruction could not be read or written.
+;
+;	SS$_RESIGNAL - resignal condition to next handler
+;	    The condition signaled  was not SS$_ROPRAND or the  reserved
+;	    operand  was not a decimal value.
+;
+;	LIB$_BADSTA - bad stack
+;	    The stack frame linkage had been corrupted since the time of
+;	    the reserved operand exception.
+;
+;	Note:  If the status value returned from LIB$FIXUP_DEC is seen by
+;	the  condition  handling  facility,  (as  would  be  the  case if
+;	LIB$FIXUP_DEC was the handler), any success value  is  equivalent
+;	to  SS$_CONTINUE,  which  causes the instruction to be restarted.
+;	Any failure value is equivalent to SS$_RESIGNAL, which will cause
+;	the  condition  to  be  resignalled to the next handler.  This is
+;	because the condition handler (LIB$FIXUP_DEC)  failed  to  handle
+;	the condition correctly.
+;
+; SIDE EFFECTS:
+;
+;	If the reserved operand is fixed up, the instruction which
+;	faulted is restarted.
+;
+;--
+
+;+
+; Registers used:
+;
+;	R0 =	scratch
+;	R1 =	scratch
+;	R2 =	pointer into opcode/operand table
+;	R3 =	context index or 0
+;	R4 =	OA1 (operand address) of bits 31:0
+;	R5 =	OA2 (operand address) of bits 63:32 which may not be
+;		OA1+4 since registers not necessarily saved contiguously.
+;	R6 = 	register number of operand specifier
+;	R7 =	pointer into operand image block
+;	R8 =	scratch
+;	R9 =	mask of registers used in operands
+;-
+
+	.ENTRY LIB$FIXUP_DEC, ^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+					; save all registers so that all will be 
+					; found in stack during back scan.
+					; disable IV (content index multiply)
+	MOVAB	B^SIG_TO_RET, (FP)	; Enable condition handler
+	MOVL	CHF$L_SIGARGLST(AP), R0	; R0 = adr. of signal arg list array
+	CMPZV	#STS$V_COND_ID, -	; position of message identification
+		#STS$S_COND_ID, -	; size of id
+		CHF$L_SIG_NAME(R0), -	; compare 29-bit VAX-11 signal code
+		#<SS$_ROPRAND@-STS$V_COND_ID> ; with reserved operand code
+	BNEQ	RESIGNAL		; resignal the error
+2$:	MOVAB	STACK(SP), SP		; allocate stack space
+	BSBW	GET_REGS		; setup the two image vectors in local storage
+					; do not return here if error, instead RET with
+					; error completion status
+;+
+; Get instruction opcode.  Determine if this is an instruction which
+; we can handle.  If not, resignal.  If so, load R2 with the address
+; of the operand table entry for that opcode.
+;-
+	BSBW	NEXT_BYTE		; Get first opcode byte
+	MOVAB	W^SING_TAB, R2		; Table base
+3$:	CMPB	(R2), R0		; Is this the opcode?
+	BEQL	MATCH			; Yes, we have a match
+	ADDL2	#8, R2			; Skip to next entry
+	TSTB	(R2)			; At end of table?
+	BNEQ	3$			; No, continue searching
+RESIGNAL:
+	MOVZWL	#SS$_RESIGNAL, R0	; We can't handle this exception, return SS$_RESIGNAL.
+	RET				; R0 = RESIGNAL error completion code
+SIG_TO_RET:	.WORD	0
+	MOVL	4(AP),R1
+	CMPL	4(R1),#SS$_UNWIND
+	BNEQ	1$
+	MOVL	#SS$_NORMAL,R0
+	RET
+1$:	MOVL	8(AP),R0
+	MOVL	4(R1),12(R0)
+	CLRQ	-(SP)
+	CALLS	#2,G^SYS$UNWIND
+	RET     
+MATCH:
+	MOVAB	OPD_IMAGE(FP), R7	; Address of operand address block
+	CLRL	R9			; No registers are used yet
+;+
+; Scan the operand list, getting the addresses of all operands
+;-
+SCAN:
+	INCL	R2			; Get next operand type byte
+	TSTB	(R2)			; No more operands to test?
+	BEQL	ALLOPDS			; Yes, we have all the operands
+	BSBB	NEXT_OPERAND		; Look at next operand
+	MOVL	R4, (R7)+		; Save address of operand
+	BRB	SCAN
+
+ALLOPDS:				; All operand addresses are available
+	BSBW	TRY_TO_FIX		; Try to fix the error
+	BLBC	R0, RESIGNAL		; If we can't, resignal the error
+	BICL2	#PSL$M_FPD, @PSL_OFF+ADR_IMAGE(FP)	; Clear FPD bit
+	MOVL	#SS$_NORMAL, R0		; Everything is okay
+	RET				; return
+
+	.SBTTL NEXT_OPERAND - Get next operand
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	Interpret the instruction stream and gets the next operand.
+;
+; CALLING SEQUENCE
+;
+;	JSB	NEXT_OPERAND
+;
+; INPUT PARAMETERS:
+;
+;	R2 = address of operand type table
+;
+; IMPLICIT INPUTS:
+;
+;	REG_IMAGE(FP)		; The image of the registers including PC
+;	instruction stream
+;
+; OUTPUT PARAMETERS:
+;
+;	R4 = OA1 (operand address of bits 31:0 of operand)
+;	R5 = OA2 (operand address of bits 63:32 of operand) if R1 = 8
+;	R9 = mask of registers used in the operands
+;
+; IMPLICIT OUTPUT:
+;
+;	Saved image of PC is updated as operand stream is interpreted.
+;
+; COMPLETION STATUS
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	NONE - uses registers R0:R9 - see LIB$FIXUP_DEC for register usage
+;--
+
+NEXT_OPERAND:
+	CLRL	R3			; R3 = initial context index register
+	MOVZBL	(R2), R0		; Get operand type byte
+	MOVZBL	W^OP_CONTEXT[R0], R1	; Get context amount
+;+
+; Loop to get operand specifier - loop back here (once) if operand specifier is index
+;-
+
+LOOP_OP:
+	BSBW	NEXT_BYTE		; R0 = next I-stream byte (sign extended)
+	EXTZV	#0, #4, R0, R6		; R6 = register field
+	EXTZV	#4, #4, R0, R0		; R0 = operand specifier 7:4
+	BITB	#^B1100, R0		; Do we use the register?
+	BEQL	LITERAL			; branch if not
+	ASHL	R6, #1, R8		; Mask of register used
+	ASHL	R0, #^X01C00000, -4(SP)	; Is a register modified by this?
+	BGEQ	1$			; branch if not
+	INSV	R8, #16, #16, R8	; Also set the register modified bit
+1$:	BISL2	R8, R9			; Include into other modified registers
+	CASEB	R0, #4, #15-4		; Dispatch on operand specifier code
+10$:	.WORD	INDEXED-10$		; 4
+	.WORD	REG-10$			; 5
+	.WORD	REG_DEF-10$		; 6
+	.WORD	AUTO_DECR-10$		; 7
+	.WORD	AUTO_INCR-10$		; 8
+	.WORD	AUTO_INCR_DEF-10$	; 9
+	.WORD	BYTE_DISPL-10$		; 10
+	.WORD	BYTE_DISPL_DEF-10$	; 11
+	.WORD	WORD_DISPL-10$		; 12
+	.WORD	WORD_DISPL_DEF-10$	; 13
+	.WORD	LONG_DISPL-10$		; 14
+	.WORD	LONG_DISPL_DEF-10$	; 15
+
+LITERAL:				; We may want to reference the literal
+	MOVAL	-(SP), R5		; Address of high half of operand
+	MOVAL	4(SP), R4		; Address of low half of operand
+	MOVL	(R4), -(SP)		; Push the return address back
+	EMUL	R0, #16, R6, (R4)	; Store operand
+	RSB				; All done
+
+INDEXED:				; Save context index and loop back
+	MULL3	REG_IMAGE(FP)[R6],R1,R3	; R3 = context index
+	CLRL	R1			; See if already had an index
+	BRB	LOOP_OP			; Go back and get next specifier
+
+REG:	MOVL	ADR_IMAGE(FP)[R6], R4	; R4 = OA1 = adr where Rn  saved in stack
+	MOVL	ADR_IMAGE+4(FP)[R6], R5	; R5 = OA2 = adr where Rn+1 saved in stack
+	RSB
+
+AUTO_DECR:
+	SUBL	R1, REG_IMAGE(FP)[R6]	; decrement Rn by operand size
+REG_DEF:
+	MOVL	REG_IMAGE(FP)[R6], R4 	; R4 = OA = contents of Rn
+	BRB	SET_OA2			; set OA2, check op and RSB
+
+AUTO_INCR:
+	MOVL	REG_IMAGE(FP)[R6], R4	; R4 = OA = contents of Rn
+	ADDL	R1, REG_IMAGE(FP)[R6]	; increment Rn by operand size
+	BRB	SET_OA2			; set OA2, check op and RSB
+
+AUTO_INCR_DEF:
+	MOVL	REG_IMAGE(FP)[R6], R4	; R4 = contents of Rn
+	MOVL	(R4), R4 		; R4 = OA
+	ADDL	#4, REG_IMAGE(FP)[R6]	; increment Rn by 4 (size of address)
+	BRB	SET_OA2			; set OA2, check op, and RSB
+
+BYTE_DISPL:
+	BSBB	NEXT_BYTE		; R0 = next I-stream byte
+	BRB	DISPL			; add to PC
+
+BYTE_DISPL_DEF:
+	BSBB	NEXT_BYTE 		; R0 = next I-stream byte
+	BRB	DISPL_DEF 		; add to PC and defer
+
+WORD_DISPL:
+	BSBB	NEXT_WORD 		; R0 = next I-stream word
+	BRB	DISPL			; add to PC 
+
+WORD_DISPL_DEF:
+	BSBB	NEXT_WORD 		; R0 = next I-stream word
+	BRB	DISPL_DEF 		; add to PC and defer
+
+LONG_DISPL:
+	BSBB	NEXT_LONG 		; R0 = next I-stream longword
+DISPL:	ADDL3	R0, REG_IMAGE(FP)[R6], R4	; R4 = OA = (Rn) + displacement
+	BRB	SET_OA2			; set OA2, check OP, and RSB
+
+LONG_DISPL_DEF:
+	BSBB	NEXT_LONG 		; R0 = Next I-stream longword
+DISPL_DEF:				; here for displacement deferred
+	ADDL3	R0, REG_IMAGE(FP)[R6], R4 	; R4 = (Rn) + displacement
+	MOVL	(R4), R4		; R4 = OA = (OA) (do defer)
+
+;+
+; add context index or 0
+; Set OA2 (operand address 2) from OA+4 since
+; operand is in memory not a register and therefore is contiguous
+;-
+
+SET_OA2:
+	ADDL	R3, R4			; R4 = OA + context index or 0
+	ADDL3	R4, #4, R5		; R5 = OA2 = OA + 4
+	RSB
+
+;+
+; routines to get next byte, word, or long from I-stream and sign extend
+;-
+
+NEXT_BYTE:
+	CVTBL	@IMAGE_PC(FP), R0	; R0 = next byte
+	INCL	IMAGE_PC(FP)		; update PC
+	RSB				; return
+
+NEXT_WORD:
+	CVTWL	@IMAGE_PC(FP), R0	; R0 = next word
+	ADDL	#2, IMAGE_PC(FP)	; update PC
+	RSB				; return
+
+NEXT_LONG:
+	MOVL	@IMAGE_PC(FP), R0	; R0 = next longword
+	ADDL	#4, IMAGE_PC(FP)	; update PC
+	RSB				; return
+
+	.SBTTL TRY_TO_FIX - Try to fix the operands of the instruction
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	Try to fix the operands of the instruction.
+;
+; CALLING SEQUENCE
+;
+;	JSB	TRY_TO_FIX
+;
+; INPUT PARAMETERS:
+;
+;	R2 = address in operand type table
+;	R9 = mask of registers used
+;
+; IMPLICIT INPUTS:
+;
+;	REG_IMAGE(FP)		; The image of the registers including PC
+;	instruction stream
+;
+; OUTPUT PARAMETERS:
+;
+;	R0 = 1 if successful, 0 otherwise
+;	R9 = mask of registers used in the operands
+;
+; IMPLICIT OUTPUT:
+;
+;	NONE
+;
+; COMPLETION STATUS
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;--
+
+TRY_TO_FIX:
+;+
+; Find which registers are clobbered by the instruction
+;-
+	MOVAB	SING_TAB, R0		; Base address of R2
+	SUBL3	R0, R2, R2		; R2 less SING_TAB
+	ASHL	#-3, R2, R1		; divided by 8
+	MOVAQ	SING_TAB[R1], R2	; Restore pointer to opcode value
+	BITL	REGS_TAB[R1], R9	; Did we use any clobbered registers?
+	BNEQ	100$			; Yes, we can't find the source
+;+
+; Try to find the invalid byte.
+;-
+	MOVQ	OPD_IMAGE(FP), R4	; Get the source
+	MOVL	(R4), R4
+	MOVL	R5, R6			; Grab original source address
+	CMPB	(R2), #^X09		; Was the instruction CVTSP?
+	BNEQ	40$			; No, don't check the sign
+	INCL	R4
+40$:	PROBEW	#0, R4, (R5)		; Check if source is writable
+	BNEQ	43$			; Branch if writable
+;+
+; Copy the source string onto the stack
+;-
+	MOVL	(SP)+, R0		; Save return address
+	SUBL2	R4, SP			; Make stack space for the string
+	MOVL	SP, R1			; New source string address
+	PUSHL	R0			; Push return address
+	MOVL	R4, R0			; Copy byte-length to a temporary
+	MOVL	R1, 4+OPD_IMAGE(FP)	; Address of new source
+	BRB	42$			; Jump to end of loop
+41$:	MOVB	(R5)+, (R1)+		; Move a byte
+42$:	SOBGEQ	R0, 41$			; More bytes to move?
+	SUBL3	R4, R1, R5		; Get new source address
+43$:	DECL	R4
+	CMPB	(R2), #^X09		; Was the instruction CVTSP?
+	BNEQ	60$			; No, don't check the sign
+	CMPB	(R5), #^A/ /
+	BEQL	30$
+	CMPB	(R5), #^A/-/
+	BEQL	30$
+	CMPB	(R5), #^A/+/
+	BEQL	30$
+	MOVB	#^A/ /, (R5)		; Put a space into the sign position
+30$:	INCL	R5			; Skip the sign byte
+	BRB	60$
+100$:	CLRL	R0			; Indicate an error
+	RSB				; And return
+50$:	SUBB3	#^A/0/, (R5)+, R1
+	CMPB	R1, #10			; Valid byte?
+	BLSSU	60$			; Branch if so
+	MOVB	#^A/0/, -1(R5)		; Move a zero to that byte
+60$:	SOBGEQ	R4, 50$			; Try for more bytes
+;+
+; See if the instruction now works.
+;-
+	MOVAB	OPD_IMAGE(FP), R7
+	CMPB	(R2), #^X09		; Was the instruction CVTSP?
+	BEQL	70$			; Yes, don't check the trailing byte
+;+
+; Check the overpunch character.  If it's not valid, change it.
+;-
+	MOVZBL	(R5), R1			; The overpunch byte
+	MOVL	8+OPD_IMAGE(FP), R2		; The translation table
+	MOVB	(R2)[R1], R1			; The translated byte
+	CMPB	R1, #^XA0			; Is the digit valid?
+	BGEQU	61$				; Branch if not valid
+	CMPZV	#0, #4, R1, #^X0A		; Is the sign valid?
+	BGEQU	64$				; Branch if okay
+61$:	CLRL	R1				; Look for a good character
+	BRB	63$				; Jump into the loop
+62$:	INCB	R1				; Less characters to try
+	BCS	100$				; We couldn't find a good byte
+63$:	MOVB	(R2)+, R0			; Grab this translated byte
+	CMPB	R0, #^XA0			; Is the digit valid?
+	BGEQU	62$				; Branch if not valid
+	CMPZV	#0, #4, R0, #^X0A		; Is the sign valid?
+	BLSSU	62$				; Branch if valid
+	MOVB	R1, (R5)			; Store the valid byte
+64$:	CVTTP	@(R7)+, @(R7)+, @(R7)+, @(R7)+, @(R7)+
+	BRB	110$
+70$:	CVTSP	@(R7)+, @(R7)+, @(R7)+, @(R7)+
+	BRB	110$
+;+
+; We really shouldn't be using the state of the output registers to zero
+; the destination, but we do so anyway.
+;-
+;	SUBL3	R2_OFF+REG_IMAGE(FP), #1, R2	; 2 + nibbles
+;	ASHL	#-1, R2, R1			; bytes
+;	SUBL3	R1, R3_OFF+REG_IMAGE(FP), R3	; dst + bytes - bytes
+;	SUBL2	#2, R2				; nibbles
+;	MOVB	#^X0C, -(SP)
+;	ASHP	#0, #0, (SP)+, #0, R2, (R3)	; Clear destination
+110$:	MOVPSL	R0
+	INSV	R0, #0, #4, @PSL_OFF+ADR_IMAGE(FP)	; Store NZVC bits
+	CLRL	@R0_OFF+ADR_IMAGE(FP)		; R0 = 0
+	MOVL	R6, @R1_OFF+ADR_IMAGE(FP)	; R1 = address of source
+	CLRL	@R2_OFF+ADR_IMAGE(FP)		; R2 = 0
+	MOVL	R3, @R3_OFF+ADR_IMAGE(FP)	; R3 = address of destination
+	MOVL	IMAGE_PC(FP), @PC_OFF+ADR_IMAGE(FP)
+	MOVL	#1, R0				; Indicate success
+	RSB
+
+	.SBTTL GET_REGS Get contents and addresses of all save registers in stack
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	GET_REGS scans the stack and finds all registers saved
+;	in call frames back to the signal facility. Thus it
+;	makes an image of the registers at the time of the
+;	exception or CALL LIB$SIGNAL/STOP. Because a double
+;	operand may be saved in two different places, an image
+;	array of addresses where the registers are saved is also created.
+;	Note: GET_REGS assumes:
+;	caller has saved R2:R11 in frame using its entry mask so all registers
+;	are in memory somewhere. Stack scan is defensive against bad stacks.
+;	Note:
+;	To reconstruct contents of SP at time of exception or call LIB$SIGNAL,
+;	Use the fact that the signal args list is pushed on stack first.
+;	That is SP is = adr of last signal arg/ +4.
+;	Also depends on saved PC being SYS$CALL_HANDL+4.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	GET_REGS
+;
+; INPUT PARAMETERS:
+;
+;	NONE
+;
+; IMPLICIT INPUTS:
+;
+;	CHF$L_SIGARGLST.(AP)		; Adr. of array of signal args
+;	CHF$L_MCHARGLST.(AP)		; Adr. of array of mechanism args
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;
+;	REG_IMAGE(FP)			; set reg image array R0:PC/PSL
+;	ADR_IMAGE(FP)			; Set adr where reg saved R0:PC/PSL
+;					; except adr. where SP SAVED = 0, since not saved.
+;
+; COMPLETION CODES:
+;
+;	NONE JSB
+;
+; SIDE EFFECTS:
+;
+;	If error, RET with error code
+;--
+
+;+
+; Registers used:
+;
+;	R0 = scratch
+;	R1 = pointer to register image array (REG_IMAGE)
+;	R2 = stack frame pointer
+;	R3 = Adr. of register save area in frame
+;	R4 = Loop count
+;	R5 = pointer to address image array (ADR_IMAGE)
+;	R6 = register save mask
+;-
+
+GET_REGS: 				; get register image
+
+;+
+; Setup loop to scan back through stack
+;-
+
+	MOVAL	REG_IMAGE(FP), R1	; R1 = Adr. reg image vector
+	MOVL	FP, R2			; R2 = Adr. of current frame
+					; where all callers register saved
+	ASHL	#16, #1, R4		; R4 = max loop count = 65K
+	MOVAL	ADR_IMAGE(FP), R5	; R5 = adr. of array of address where
+					; registers are saved.
+;+
+; Loop to scan call stack back to signal exception
+;-
+
+LOOP:	ADDL3	R2, #SF$L_SAVE_REGS, -	; stack frame adr + offset to first reg saved in frame
+		R3			; R3 = adr. of first saved reg.
+	CLRL	R0			; R0 = first possible register # saved
+	EXTZV	#SF$V_SAVE_MASK, -	; position of save mask
+		#SF$S_SAVE_MASK, -	; size of save mask
+		SF$W_SAVE_MASK(R2), R6	; R6 = register save mask
+
+;+
+; loop to copy saved registers R0:R11 from one call stack frame
+; to register image array also set address of register image array.
+;-
+
+LOOP1:	FFS	R0, #12, - 		; find next register in saved bit mask
+		R6, R0			; R0 = register number of next saved reg.
+
+	BEQL	10$			; branch if finished 12-bit reg mask
+	PROBEW	#0, #4, (R3)		; check if stack still writeable
+	BEQL	BAD_STACK1		; branch if stack bad
+	MOVL	R3, (R5)[R0]		; store address of where Rn saved
+	MOVL	(R3)+, (R1)[R0]	        ; copy saved Rn to image + Rn
+	BBSC	R0, R6, LOOP1		; clear bit n for Rn, get next bit
+
+;+
+; check if frame just saved is that of call to handler from signal or exception
+;-
+
+10$:	CMPL	SF$L_SAVE_PC(R2), -	; saved PC the one from call to handler?
+		#SYS$CALL_HANDL+4	; absolute system vector adr
+	BEQL	END_SCAN		; branch if yes
+
+;+
+; step (cautiously) to previous frame
+;-
+
+	PROBEW	#0, #SF$L_SAVE_REGS,-	; check if fixed part of previous frame ok
+		@SF$L_SAVE_FP(R2)	;
+	BEQL	BAD_STACK1		; branch if frame not writeable
+	MOVL	SF$L_SAVE_FP(R2), R2	; R2 = adr. of previous frame
+	SOBGTR	R4, LOOP		; go back if haven't scanned too many frames
+
+;+
+; here if bad stack - return LIB$_BADSTA to caller of LIB$FLT_FIXUP
+;-
+
+BAD_STACK1:
+	MOVL	#LIB$_BADSTA, R0	; R0 = BAD STACK completion code
+	RET				; return to caller of LIB$FIXUP_DEC
+					; not JSB caller of GET_REGS
+
+;+
+; Here when scanned all frames back to call to handler
+; Copy R0:R1 from mechanism vector. Set AP,FP,SP,PC,PSL
+; Also set address where each of these registers is saved
+;-
+
+END_SCAN:
+	MOVL	CHF$L_MCHARGLST(AP), R0	; R0 = adr. of signal mechanism arglist
+	MOVAL	CHF$L_MCH_SAVR0(R0), -	; adr. where R0 saved
+		R0_OFF(R5)		; to vector of addresses
+	MOVAL	CHF$L_MCH_SAVR1(R0), -	; adr. where R1 saved
+		R1_OFF(R5)		; to image address vector
+	MOVQ	CHF$L_MCH_SAVR0(R0), -	; saved R0/R1
+		R0_OFF(R1)		; to register image vector
+	ADDL	#AP_OFF, R1		; R1 = adr. in image vector of AP/FP
+	ADDL	#AP_OFF, R5		; R5 = adr. in image address vector of AP/FP
+	MOVAL	SF$L_SAVE_AP(R2), -	; adr of saved AP
+		(R5)+			; to image address vector
+	MOVAL	SF$L_SAVE_FP(R2), -	; adr of saved FP
+		(R5)+			; to image address vector
+	MOVQ	SF$L_SAVE_AP(R2), -	; saved AP/FP
+		(R1)+			; to image register vector
+	MOVZBL	@CHF$L_SIGARGLST(AP), R0	; R0 = # of signal args
+	MOVAL	@CHF$L_SIGARGLST(AP)[R0], R0	; R0 = adr of last signal arg
+	ADDL	#4, R0			; R0 = SP at time of exception or call LIB$SIGNAL
+					; NOTE: this a spec from LIB$SIGNAL and
+					; exception processing of operating system!!!
+	CLRL	(R5)+			; SP not saved anywhere so set IMAGE _ADR TO 0
+	MOVL	R0, (R1)+		; set image SP
+	MOVQ	-(R0), (R1)+ 		; copy PC/PSL to image (always last
+					; 2 signal arguments)
+	MOVAL	(R0)+, (R5)+		; set adr. where PC saved
+	MOVAL	(R0)+, (R5)+ 		; set adr. where PSL saved
+	RSB				; return (to LIB$FIXUP_DEC)
+
+	.END				; end of LIB$FIXUP_DEC

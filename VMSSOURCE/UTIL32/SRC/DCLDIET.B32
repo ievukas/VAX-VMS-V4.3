@@ -1,0 +1,552 @@
+%title 'DCLDIET - Put a DCL Procedure on a Diet'
+	MODULE dcldiet (main=dcldiet$main, ident = 'V04-000') =
+BEGIN
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! Facility:	DCLDIET, Put a DCL Procedure on a Diet
+!
+! Abstract:	The purpose of this program is to reduce the size of a DCL
+!		command procedure.  This is done principally by removing
+!		all comments.  We also eliminate lines that only contain a
+!		dollar sign, and reduce all whitespace to a single blank.
+!
+!		By shipping command procedures in this reduced format, we
+!		save space and speed them up.
+!
+! Restrictions:	The following restrictions must be obeyed in order that this
+!		program produce a correct command procedure.
+!
+!		1.  Quoted strings must have closing quotation marks.
+!
+!		2.  Continuation hypens and comment exclamation points may
+!		    not be lexically substituted into or out of a line.
+!
+!		3.  The DECK and EOD commands may not be abbreviated.
+!
+! Environment:	Native, User mode.
+!
+! Author: Paul C. Anagnostopoulos, Creation Date: 7 September 1982
+!
+! Revision History:
+!
+!	V03-001	DAS0001		David Solomon		30-Apr-1984
+!		Fix two accvios resulting from reading zero-length records.
+!--
+
+
+library 'sys$library:starlet';
+
+%sbttl 'Module Definitions'
+
+! Macro Definitions:
+!
+! The following definitions are used to create extensions to the Bliss 
+! language.  This makes writing programs easier, and hopefully also
+! facilitates reading them.
+
+! We begin with the definition of a boolean data type.
+
+macro boolean =
+	byte
+%;
+
+literal
+	false	= 0,
+	true	= 1;
+
+! Let's define symbolic names for various control characters that we use
+! a lot.
+
+literal
+	HT	= %x'09';
+
+! Now let's define a descriptor data type.  This allows us to declare
+! variables, particularly parameters, as descriptors.
+
+field descriptor_fields = set
+	len	= [dsc$w_length],
+	typ	= [dsc$b_dtype],
+	cls	= [dsc$b_class],
+	ptr	= [dsc$a_pointer]
+	tes;
+
+macro descriptor =
+	block[8,byte] field(descriptor_fields)
+%;
+
+! Now we need some macros to better deal with strings.  We will begin with
+! three that can be used to generate string constants.
+
+macro text(string) =
+	uplit byte(string)
+%,
+      ctext(string) =
+	uplit byte(%ascic string)
+%,
+      dtext(string) =
+	%ascid string
+%;
+
+! Now we will define a macro that generates a buffer with accompanying
+! descriptor.  The user can specify the name and length of the buffer.
+! This macro can appear in global or own declarations.
+
+macro dbuffer(name,length) =
+	name: block[8+length,byte] field(descriptor_fields) preset(
+			[len]	= length,
+			[typ]	= 0,
+			[cls]	= 0,
+			[ptr]	= name + 8
+			)
+%;
+
+! We also want a macro which helps us fill in a descriptor dynamically.
+! It lets us specify the descriptor, and the length and address to fill in.
+
+macro build_descriptor(name,length,address) =
+	(name[len]	= length;
+	 name[typ]	= 0;
+	 name[cls]	= 0;
+	 name[ptr]	= address;)
+%;
+
+! Now we are going to define some constructs that let us do common sorts
+! of operations more elegantly.  They make things more meaningful and
+! are also faster to write.
+
+! Begin with two macros to increment and decrement a variable.
+
+macro increment(variable) =
+	(variable = .variable + 1)
+%,
+      decrement(variable) =
+	(variable = .variable - 1)
+%;
+
+! Define a macro that can check a status.  If not successful, then it will
+! signal the remaining arguments.
+
+macro check(status) =
+	(if not status then 
+		signal(%remaining);)
+%;
+
+! Table of Contents:
+
+forward routine
+	dcldiet$main: novalue,
+	dcldiet$reduce: novalue,
+	dcldiet$scrunch_line: novalue,
+	dcldiet$skip_whitespace: novalue;
+
+! External References:
+
+external routine
+	cli$get_value: addressing_mode(general);
+
+! Shared Messages:
+
+$shr_msgdef(dcldiet, 3, local,
+		(closein, warning),
+		(closeout, warning),
+		(openin, severe),
+		(openout, severe),
+		(readerr, error),
+		(writeerr, error));
+
+! Own Variables:
+!
+! We need a set of RMS control blocks to open and read the input file.
+
+own
+	dbuffer(input_esa,nam$c_maxrss),
+	dbuffer(input_rsa,nam$c_maxrss),
+
+	input_nam: $nam(esa=input_esa+8,
+			ess=nam$c_maxrss,
+			rsa=input_rsa+8,
+			rss=nam$c_maxrss),
+
+	input_fab: $fab(dnm='.com',
+			fac=get,
+			nam=input_nam,
+			shr=get),
+
+	input_ubf: block[1024,byte],
+
+	input_rab: $rab(fab=input_fab,
+			mbc=4,
+			mbf=2,
+			rac=seq,
+			ubf=input_ubf,
+			usz=1024);
+
+! We need a set of RMS control blocks to create the output file.
+
+own
+	dbuffer(output_esa,nam$c_maxrss),
+
+	output_nam: $nam(rlf=input_nam,
+			esa=output_esa+8,
+			ess=nam$c_maxrss),
+
+	output_fab: $fab(fac=put,
+			fop=ofp,
+			mrs=1024,
+			nam=output_nam,
+			org=seq,
+			rat=cr,
+			rfm=var),
+
+	output_ubf: block[1024,byte],
+
+	output_rab: $rab(fab=output_fab,
+			mbc=4,
+			mbf=2,
+			rac=seq);
+
+%sbttl 'DCLDIET$MAIN - Main Routine'
+!++
+! Functional Description:
+!	This is the main routine for the DCLDIET command.  It parses the
+!	command line and then opens up the input file.
+!
+! Formal Parameters:
+!	none
+!
+! Returned Value:
+!	none
+!
+! Notes:
+!	none
+!--
+
+
+GLOBAL ROUTINE dcldiet$main:			novalue = BEGIN
+
+local
+	status: long,
+	work_dsc: descriptor;
+
+
+! Begin by obtaining the name of the input file and opening it.
+
+status = cli$get_value(dtext('P1'),input_esa);
+input_fab[fab$l_fna] = .input_esa[ptr];
+input_fab[fab$b_fns] = .input_esa[len];
+status = $open(fab=input_fab);
+dcldiet$scrunch_line(input_esa);
+check(.status, dcldiet$_openin,1,input_esa,.status,.input_fab[fab$l_stv]);
+status = $connect(rab=input_rab);
+check(.status, dcldiet$_openin,1,input_esa,.status,.input_rab[rab$l_stv]);
+
+! Now we can open the output file.  The optional /OUTPUT qualifier will
+! tell us the name of the output file.
+
+status = cli$get_value(dtext('OUTPUT'),output_esa);
+output_fab[fab$l_fna] = .output_esa[ptr];
+output_fab[fab$b_fns] = .output_esa[len];
+status = $create(fab=output_fab);
+dcldiet$scrunch_line(output_esa);
+check(.status, dcldiet$_openout,1,output_esa,.status,.output_fab[fab$l_stv]);
+status = $connect(rab=output_rab);
+check(.status, dcldiet$_openout,1,output_esa,.status,.output_rab[rab$l_stv]);
+
+! Call a routine to process the input command procedure and produce the output.
+
+dcldiet$reduce();
+
+! Close the input and output files.
+
+status = $close(fab=input_fab);
+check(.status, dcldiet$_closein,1,input_esa,.status,.input_fab[fab$l_stv]);
+status = $close(fab=output_fab);
+check(.status, dcldiet$_closeout,1,output_esa,.status,.output_fab[fab$l_stv]);
+
+return;
+END;
+
+%sbttl 'DCLDIET$REDUCE - Reduce a Command Procedure'
+!++
+! Functional Description:
+!	This procedure is responsible for reducing the size of a command
+!	procedure by eliminating comments and compressing any whitespace.
+!	We read the entire input file and generate a new output file.
+!
+! Formal Parameters:
+!	none
+!
+! Returned Value:
+!	none
+!
+! Notes:
+!	none
+!--
+
+
+GLOBAL ROUTINE dcldiet$reduce				: novalue = BEGIN
+
+local
+	status: long,
+	line_dsc: descriptor,
+	work_dsc: descriptor,
+	continuation_line: boolean,
+	within_deck: boolean,
+	dcl_command: boolean;
+
+
+! We will reduce the command procedure by reading each line, processing it,
+! and perhaps writing a new line into the output file.
+
+continuation_line = within_deck = false;
+
+while true do (
+
+	! Begin by getting the next line.  We're done on end-of-file.
+
+	status = $get(rab=input_rab);
+if .status eqlu rms$_eof then exitloop;
+	check(.status, dcldiet$_readerr,1,input_esa,.status,.input_rab[rab$l_stv]);
+
+	! Set up the output RAB for writing the line.  Also set up a working
+	! descriptor in case the line must be modified.
+
+	output_rab[rab$w_rsz] = .input_rab[rab$w_rsz];
+	output_rab[rab$l_rbf] = .input_rab[rab$l_rbf];
+	build_descriptor(work_dsc,.input_rab[rab$w_rsz],.input_rab[rab$l_rbf]);
+
+	! Update the work descriptor to skip initial whitespace.
+
+	dcldiet$skip_whitespace(work_dsc);
+
+	! Now we have to determine whether this is a DCL commmand line
+	! or a data line.
+
+	dcl_command =
+		(if not .within_deck and .work_dsc[len] gtru 0
+		then
+		    (ch$rchar(.work_dsc[ptr]) eqlu '$')
+		else
+		    false)
+		or .continuation_line;
+
+	! If it's a DCL command line, we have to scrunch it.  Skip to the
+	! beginning of the verb, call the scrunching routine, and then put
+	! back a dollar sign if necessary.
+
+	if .dcl_command then (
+		if not .continuation_line then (
+			decrement(work_dsc[len]);
+			increment(work_dsc[ptr]);
+		);
+		dcldiet$skip_whitespace(work_dsc);
+		dcldiet$scrunch_line(work_dsc);
+		if not .continuation_line then (
+			increment(work_dsc[len]);
+			decrement(work_dsc[ptr]);
+			ch$wchar('$',.work_dsc[ptr]);
+		);
+	);
+
+	! Now we want to write the line into the output file.  Don't bother
+	! if it's a DCL command line with only a dollar sign.
+
+	if .work_dsc[len] gtru 1 or
+	   .continuation_line or
+	   not .dcl_command	then (
+		if .dcl_command then (
+			output_rab[rab$w_rsz] = .work_dsc[len];
+			output_rab[rab$l_rbf] = .work_dsc[ptr];
+		);
+		status = $put(rab=output_rab);
+		check(.status, dcldiet$_writeerr,1,output_esa,.status,.output_rab[rab$l_stv]);
+	);
+
+	! Next we determine the state of our two control flags.
+	! The continuation flag is set if we just processed a DCL command
+	! line and it has a hyphen at the end.
+
+	continuation_line =
+		(if .dcl_command
+		then
+		    (ch$rchar(.work_dsc[ptr]+.work_dsc[len]-1) eqlu '-')
+		else false
+		);
+
+	! The setting of the deck flag depends upon whether or not we just
+	! processed a DCL command.  If so, the flag is set if we had a DECK
+	! command.  If not, the flag is left alone unless we had an EOD command
+	! while in a deck, in which case it is reset.
+
+	if .dcl_command then
+		within_deck =	.work_dsc[len] eqlu 5 and
+				 ch$rchar(.work_dsc[ptr]  )             eqlu '$' and
+				(ch$rchar(.work_dsc[ptr]+1) and %x'df') eqlu 'D' and
+				(ch$rchar(.work_dsc[ptr]+2) and %x'df') eqlu 'E' and
+				(ch$rchar(.work_dsc[ptr]+3) and %x'df') eqlu 'C' and
+				(ch$rchar(.work_dsc[ptr]+4) and %x'df') eqlu 'K'
+	else if .within_deck then
+		if ch$rchar(.work_dsc[ptr]) eqlu '$' then (
+			decrement(work_dsc[len]);
+			increment(work_dsc[ptr]);
+			dcldiet$skip_whitespace(work_dsc);
+			if .work_dsc[len] eqlu 3 and
+			   (ch$rchar(.work_dsc[ptr]  ) and %x'df') eqlu 'E' and
+			   (ch$rchar(.work_dsc[ptr]+1) and %x'df') eqlu 'O' and
+			   (ch$rchar(.work_dsc[ptr]+2) and %x'df') eqlu 'D' then
+				within_deck = false;
+
+			);
+);
+
+return;
+END;
+
+%sbttl 'DCLDIET$SCRUNCH_LINE - Remove Comments and Squeeze Whitespace'
+!++
+! Functional Description:
+!	This procedure is called to scrunch a line in the command procedure.
+!	It removes any comments from the line.  It also squeezes any
+!	whitespace down to a single blank.  Trailing whitespace is eliminated.
+!
+! Formal Parameters:
+!	line_dsc	Descriptor of line.  Line is scrunched by rearranging
+!			line buffer and updating descriptor.
+!
+! Returned Value:
+!	none
+!
+! Notes:
+!	none
+!--
+
+
+GLOBAL ROUTINE dcldiet$scrunch_line(line_dsc: ref descriptor)
+							: novalue = BEGIN
+
+local
+	scan_dsc: descriptor,
+	char: byte;
+
+
+! If the line is null, forget it.
+
+if .line_dsc[len] eqlu 0 then
+	return;
+
+! Begin by copying the line descriptor so we can scan the line.  Then reset
+! the length of the descriptor to zero so we can rebuild the line.
+
+build_descriptor(scan_dsc,.line_dsc[len],.line_dsc[ptr]);
+line_dsc[len] = 0;
+
+! Now we will sit in a loop in order to find the first quotation mark
+! or exclamation point in the line.  As we go, we'll compress any whitespace
+! down to a single blank.
+
+while .scan_dsc[len] gtru 0 do (
+	char = ch$rchar(.scan_dsc[ptr]);
+if .char eqlu '"' or .char eqlu '!' then exitloop;
+	decrement(scan_dsc[len]);
+	increment(scan_dsc[ptr]);
+	if .char eqlu ' ' or .char eqlu HT then (
+		ch$wchar(' ',.line_dsc[ptr]+.line_dsc[len]);
+		dcldiet$skip_whitespace(scan_dsc);
+	) else
+		ch$wchar(.char,.line_dsc[ptr]+.line_dsc[len]);
+	increment(line_dsc[len]);
+);
+
+! If we found a quotation mark, we have some more work to do.
+
+if .char eqlu '"' then (
+
+	! We have to be careful with the rest of the ine, because the
+	! quotation rules in DCL are haphazard.  Begin by moving down
+	! the rest of the line so it's adjacent to the part we compressed.
+
+	ch$move(.scan_dsc[len],.scan_dsc[ptr], .line_dsc[ptr]+.line_dsc[len]);
+	line_dsc[len] = .line_dsc[len] + .scan_dsc[len];
+
+	! If there is an exclamation point at the end of the line, not
+	! followed by a quotation mark, then it's a comment.
+
+	scan_dsc[ptr] = .line_dsc[ptr] + .line_dsc[len] - 1;
+	while .scan_dsc[ptr] geqa .line_dsc[ptr] and
+	      ch$rchar(.scan_dsc[ptr]) nequ '"'	do (
+		if ch$rchar(.scan_dsc[ptr]) eqlu '!' then (
+			line_dsc[len] = .scan_dsc[ptr] - .line_dsc[ptr];
+			exitloop;
+		);
+		decrement(scan_dsc[ptr]);
+	);
+);
+
+! If, after all that work, we ended up with trailing whitespace, then
+! get rid of it.
+
+scan_dsc[ptr] = .line_dsc[ptr] + .line_dsc[len] - 1;
+while .scan_dsc[ptr] geqa .line_dsc[ptr] and
+      (ch$rchar(.scan_dsc[ptr]) eqlu ' ' or ch$rchar(.scan_dsc[ptr]) eqlu HT) do (
+	decrement(line_dsc[len]);
+	decrement(scan_dsc[ptr]);
+);
+
+return;
+END;
+
+%sbttl 'DCLDIET$SKIP_WHITESPACE - Skip Whitespace in a Line'
+!++
+! Functional Description:
+!	This procedure is called to skip past the whitespace in a line.
+!	Whitespace is any sequence of blanks or tabs.
+!
+! Formal Parameters:
+!	line_dsc	Descriptor of line.  Initial whitespace is skipped
+!			by updating descriptor.
+!
+! Returned Value:
+!	none
+!
+! Notes:
+!	none
+!--
+
+
+GLOBAL ROUTINE dcldiet$skip_whitespace(line_dsc: ref descriptor)
+							: novalue = BEGIN
+
+
+while .line_dsc[len] gtru 0 and
+      (ch$rchar(.line_dsc[ptr]) eqlu ' ' or ch$rchar(.line_dsc[ptr]) eqlu HT) do (
+		decrement(line_dsc[len]);
+		increment(line_dsc[ptr]);
+);
+
+return;
+END;
+
+END ELUDOM

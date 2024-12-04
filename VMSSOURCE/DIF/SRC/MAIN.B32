@@ -1,0 +1,1124 @@
+MODULE DIF_MAIN (			! Differences main routine
+		LANGUAGE (BLISS32),
+		ADDRESSING_MODE (EXTERNAL=GENERAL,
+				 NONEXTERNAL=LONG_RELATIVE),
+		MAIN = DIF$START,
+		IDENT = 'V04-000'
+		) =
+BEGIN
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:	DCL Differences command
+!
+! ABSTRACT:	
+!		The DCL DIFFERENCES command compares the contents of
+!		two files.
+!
+! ENVIRONMENT:	
+!		VAX native, user mode
+!
+!--
+!
+! AUTHOR:	Peter George, Benn Schreiber	CREATION DATE:	1-August-1981
+!
+! MODIFIED BY:
+!
+!	V03-003	PCG0005		Peter George		13-Oct-1983
+!		Fix bugs in maximum differences logic.
+!		Let image rundown clean up VM usage.
+!
+!	V03-002	BLS0212		Benn Schreiber		14-Mar-1983
+!		Correct handling of 0-length records which caused problem
+!		with /ignore=exact.  Set rdb$v_edited if tabs converted to
+!		blanks.
+!
+!	V03-001	PCG0004		Peter George		05-Jan-1983
+!		Clean up some code.  Speed up record editing code.
+!--
+
+
+LIBRARY
+    'SYS$LIBRARY:STARLET.L32';
+
+REQUIRE
+	'DIFPRE';				! DIF prefix file
+REQUIRE
+	'DIFDEF';				! DIF data structures
+
+!
+! Difference global data
+!
+EXTERNAL
+    dif$gl_commdesc : BBLOCK,			! Desc for buffer of comment delimiters
+    dif$gl_commflgs : BITVECTOR,		! Bit is set if corresponding char must be in first column
+    dif$gl_ignore : BBLOCK,			! Flags of characters to ignore
+    dif$gl_cmdesc : BBLOCK,			! Command line descriptor
+    dif$gl_header,				! No. of lines to skip as header
+    dif$gl_match,				! No. of records that constitute a match
+    dif$gl_maxdif,				! Maximum number of unmatched records
+    dif$gl_merged,				! No. of matched lines to follow each list of merged differences
+    dif$gl_parallel,				! No. of matched lines to follow each list of parallel differences
+    dif$gl_wndwsiz,				! No. of records to search before declaring a mismatch
+    dif$gl_flags : BBLOCK,			! Flags
+    dif$gl_difrec,				! No. of different records detected
+    dif$gl_difsec,				! No. of difference sections detected
+    dif$gl_width,				! Width of lines in output listing
+    dif$gl_inbuf,				! Address of the input record buffer
+    dif$gl_outbsiz,				! Allocated size of output buffer
+    dif$gl_outbuf,				! Address of the output record buffer
+!
+! Input and output file data structures
+!
+    dif$gl_masfdb : BBLOCK,			! Master file fdb
+    dif$gl_masrab : BBLOCK,			! RAB for master file
+    dif$gl_maseof : BBLOCK,			! Master file EOF RDB
+    dif$gl_revfdb : BBLOCK,			! Revision file fdb
+    dif$gl_revrab : BBLOCK,			! RAB for revision file
+    dif$gl_reveof : BBLOCK;			! Revision file EOF RDB
+
+EXTERNAL ROUTINE
+    dif$getcmd,					! Initialize global data
+    dif$open_mas,				! Open master input file
+    dif$open_rev,				! Open revision input file
+    dif$open_out,				! Open output file
+    dif$close_in,				! Close input file
+    dif$close_out,				! Close output file
+    lib$get_vm,					! Allocate virtual memory
+    lib$free_vm,				! Deallocate virtual memory
+    sys$fao;					! FAO conversion routine
+
+EXTERNAL ROUTINE
+    additional_output,				! Output 2nd, 3rd, ... listings
+    init_hex_octal,				! Prepare for hex or octal output
+    output_listing_trailer,			! Output listing trailer
+    put_record,					! Output a record in appropriate radix
+    write_mismatch;				! Output records in a mismatch
+
+FORWARD ROUTINE
+    allocate_rdb,				! Allocate an RDB
+    compare,					! Compare two records
+    get_record,					! Get a record from the list or file
+    mark_match,					! Mark all matched records in list
+    mismatch,					! Mismatch found, find next match
+    print_and_quit,				! Print last records processed and quit
+    process_record,				! Delete ignore chars from record
+    purge_rdb,					! Purge processed RDB's
+    read_record,				! Read a record from a file
+    set_move_flags,				! Set fdb move flags
+    test_match;					! Verify match contains enough records
+
+EXTERNAL LITERAL
+    dif$_filaredif,
+    dif$_insvirmem,
+    dif$_maxdif,
+    dif$_readerr,
+    dif$_samefile;
+
+GLOBAL ROUTINE dif$start =
+BEGIN
+
+!++
+! 
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called after the Difference command has been
+!	parsed by the CLI.  It calls appropriate initialization routines,
+!	and then starts the actual differences processing.  A simple
+!	loop is executed in which lines from each file are compared until 
+!	either a mismatch is detected, or the end of both files has been 
+!	reached.  On completion, routines are called to output any additional
+!	listings that have been requested and to close all open files.
+!
+! INPUTS:
+!
+!	None
+!
+! OUTPUTS:
+!
+!	The requested differences listing is generated.
+!
+! IMPLICIT INPUTS:
+!
+!	The command line is parsed and the appropriate global symbols
+!	have been initialized.
+!
+! ROUTINE VALUES:
+!
+!	Always true.
+!
+!--
+LOCAL
+    inbufalloc,			! Flag indicating that input buffer was allocated
+    masrdb : REF BBLOCK,	! Temporary storage for a master file RDB address
+    revrdb : REF BBLOCK,	! Temporary storage for a revision file RDB address
+    status;			
+
+!
+! Call initialization routines.
+!
+dif$getcmd ();			! Initialize global data
+dif$open_mas ();		! Open master input file
+dif$open_rev ();		! Open revision input file
+dif$open_out ();		! Open output file
+set_move_flags ();		! Set FDB move flags
+
+!
+! Adjust value of /WIDTH to:
+!	Avoid problems with huge values
+!	Avoid problems with tiny values
+!	Prevent data truncation with /SLP output
+!
+dif$gl_width = MAXU (MINU (.dif$gl_width, 65535), dif$c_minlisiz);
+IF .dif$gl_flags [dif$v_slp]
+THEN
+    dif$gl_width = MAXU (
+	.dif$gl_width,			! /WIDTH value
+	.dif$gl_masrab [rab$w_usz],	! master file record size bound
+	.dif$gl_revrab [rab$w_usz]);	! revision file record size bound
+
+!
+! Allocate memory for the output buffer.  The size calculation is based on
+! an examintion of all used of this buffer.  The calculation was complicated
+! enough that it may not be completely accurate.
+!
+dif$gl_outbsiz = MAXU (
+   .dif$gl_width + 		! specified /WIDTH value plus
+	20,			!  pad
+   12,				! OUTPUT for stars
+   dif$c_minlisiz,		! minimum size of listing boilerplate
+   19+dif$c_entrysize-dif$c_linenum,	! OUTPUT put_record_hex_octal routine
+   (8 + 4*dif$c_linenum)/3,	! OUTPUT output_parallel routine
+   2*dif$c_linenum);		! OUTPUT output_slp routine
+IF NOT (status = LIB$GET_VM (dif$gl_outbsiz, dif$gl_outbuf))
+   THEN SIGNAL_STOP (.status);
+
+!
+! Allocate memory for the input buffer, if required, and set the input
+! buffer allocation flag appropriately.
+!
+IF .dif$gl_flags [dif$v_hex] OR .dif$gl_flags [dif$v_octal]
+   THEN BEGIN
+	inbufalloc = true;
+	IF NOT (status = LIB$GET_VM (%REF (MAXU (.dif$gl_masrab [rab$w_usz],
+		.dif$gl_revrab [rab$w_usz])), dif$gl_inbuf))
+	   THEN SIGNAL_STOP (.status);
+	END
+   ELSE inbufalloc = false;
+
+!
+! If the first listing will be in hex or octal, then initialize the appropriate
+! global data.
+!
+IF NOT .dif$gl_flags [dif$v_ascii]
+   THEN init_hex_octal ();
+
+!
+! Set flag for output routine to output header.
+!
+dif$gl_flags [dif$v_init] = true;
+
+!
+! This is the main loop that drives the search for differences.  It processes
+! matches itself, and calls mismatch to process differences.
+!
+DO BEGIN
+
+!
+! For each input file, get the RDB for the next record.  If we run out of
+! virtual memory, then set up the appropriate data so that we can die gracefully.
+!
+IF NOT (status = get_record (dif$gl_masfdb))
+	OR NOT (status = get_record (dif$gl_revfdb))
+   THEN BEGIN
+	dif$gl_masfdb [fdb$v_move] = false;		! So that we don't generate any more listings
+	dif$gl_revfdb [fdb$v_move] = false;
+	EXITLOOP;
+	END;
+
+!
+! If we are only using an input file's records in one listing file, then
+! purge those RDB's that we are permanently finished with.
+!
+IF NOT .dif$gl_masfdb [fdb$v_move]
+   THEN purge_rdb (dif$gl_masfdb);
+
+IF NOT .dif$gl_revfdb [fdb$v_move]
+   THEN purge_rdb (dif$gl_revfdb);
+
+!
+! Compare the two records that we have just fetched.
+! If they differ, init the FIRSTDIF and CURREC FDB fields and call mismatch 
+! to process the difference section.  If mismatch encounters too many differences
+! or runs out of VM, then die gracefully.
+! If they are the same, and if we are generating a change bar listing,
+! then print the master file record.  
+!
+IF NOT compare (.dif$gl_masfdb [fdb$l_currec], .dif$gl_revfdb [fdb$l_currec])	! Compare the two records
+   THEN BEGIN									! They differ
+	dif$gl_masfdb [fdb$l_firstdif] = .dif$gl_masfdb [fdb$l_currec];		! Init ptrs to start of dif sec
+	dif$gl_revfdb [fdb$l_firstdif] = .dif$gl_revfdb [fdb$l_currec];
+	dif$gl_masfdb [fdb$l_comp1rec] = .dif$gl_masfdb [fdb$l_currec];		! Init ptrs for first records to 
+	dif$gl_revfdb [fdb$l_comp1rec] = .dif$gl_revfdb [fdb$l_currec];		!   try and match
+	status = mismatch (.dif$gl_wndwsiz);					! Call mismatch with window size
+	IF (.status EQL dif$_maxdif) OR						! Check return status
+	   (.status EQL dif$_insvirmem)
+	   THEN BEGIN								! If some problem
+		dif$gl_masfdb [fdb$v_move] = false;				! Then die gracefully
+		dif$gl_revfdb [fdb$v_move] = false;
+		EXITLOOP;
+		END;
+	masrdb = .dif$gl_masfdb [fdb$l_currec];					! Othewise, point to matched records
+	revrdb = .dif$gl_revfdb [fdb$l_currec];
+	END
+
+   ELSE BEGIN										! If records are the same, and if 
+	IF NOT .dif$gl_flags [dif$v_merged] AND NOT .dif$gl_flags [dif$v_parallel]	!   currently outputing change bar 
+	   AND NOT .dif$gl_flags [dif$v_separated]					!   listing, then output matched
+	   THEN IF .dif$gl_masfdb [fdb$v_changebar]					!   record.
+		   THEN put_record (dif$gl_masfdb, 2)
+		   ELSE IF .dif$gl_revfdb [fdb$v_changebar]
+			   THEN put_record (dif$gl_revfdb, 2);
+	masrdb = .dif$gl_masfdb [fdb$l_currec];					! Point to matched records
+	revrdb = .dif$gl_revfdb [fdb$l_currec];
+	masrdb [rdb$v_match] = revrdb [rdb$v_match] = true;			! Indicate that they are matches
+	END;
+	
+END
+UNTIL (.masrdb [rdb$v_eof]);							! Quit if end of both files reached.
+
+!
+! Finish off current listing and then output any other listings required.
+!
+dif$gl_masfdb [fdb$l_firstdif] = .dif$gl_masfdb [fdb$l_firstrec];		! Set up ptrs for additional output
+dif$gl_revfdb [fdb$l_firstdif] = .dif$gl_revfdb [fdb$l_firstrec];
+dif$gl_masfdb [fdb$l_compnrec] = dif$gl_maseof;
+dif$gl_revfdb [fdb$l_compnrec] = dif$gl_reveof;
+dif$gl_masfdb [fdb$l_lastrfa] = 0;
+dif$gl_revfdb [fdb$l_lastrfa] = 0;
+additional_output ();								! Call output routine
+
+!
+! Determine completion status.  Use worst possible.
+!
+IF (.status NEQ dif$_maxdif) AND (.status NEQ dif$_insvirmem)
+   THEN (IF (.dif$gl_difsec EQL 0)
+	    THEN status = dif$_samefile
+	    ELSE status = dif$_filaredif);
+
+!
+! Output information at bottom of listing.
+!
+output_listing_trailer ();
+
+!
+! Close open files.
+!
+dif$close_in (dif$gl_masfdb);			! Close master input file
+dif$close_in (dif$gl_revfdb);			! Close revision input file
+dif$close_out ();				! Close output file
+
+RETURN .status;
+END;						! Of main
+
+ROUTINE mismatch (window) =
+BEGIN
+
+!++
+! 
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called when a mismatch has been detected
+!	in the main loop.  For each file, we get a new record, and
+!	then compare it with all the records that we have on hand
+!	from the other file.  If a match is detected, the appropriate
+!	number of trailing records are examined to guarantee that it is 
+!	a real match.  If no match is detected, the files are switched 
+!	and the procedure is repeated.  If a match is not found within
+!	the specified WINDOW number of records from each file,
+!	then each file's COMP1REC pointer is moved forward one record
+!	and mismatch calls itself again.  Eventually, a match will be 
+!	found, since every file is terminated by an EOF RDB that points
+!	to itself.
+!
+! INPUTS:
+!
+!	window =  The size of the window to search for a match.
+!
+! IMPLICIT INPUTS:
+!
+!	The COMP1REC pointers from the two FDB's mark the beginning
+!	of the comparisons.
+!
+! OUTPUTS:
+!
+!	The file FDB's are updated so that they point to the next match.
+!
+! ROUTINE VALUES:
+!
+!	Always true.
+!
+!--
+
+LOCAL
+    end_of_list,			! Flag indicating time to get a new record
+    fdb1 : REF BBLOCK,			! Local storage for input FDB addresses
+    fdb2 : REF BBLOCK,
+    fdb2_lastrec : REF BBLOCK,		! Last record in list - set EOL flag
+    tempfdb : REF BBLOCK,		! Temp used to swap FDB addresses
+    status;
+
+fdb1 = dif$gl_masfdb;					! Init pointers to two FDB's
+fdb2 = dif$gl_revfdb;
+
+INCRU i FROM 1 TO 2*(.window)				! Limit depth of search for next match
+DO BEGIN
+
+   IF (.dif$gl_difrec + (.i-1)/2 + 1) EQL .dif$gl_maxdif! If too many differnce records 
+      THEN RETURN print_and_quit (.i, dif$_maxdif);	! Then tidy up and quit
+
+   IF NOT (status = get_record (.fdb1))			! Get next record
+      THEN RETURN print_and_quit (.i, .status);		! If insvirmem, then get out
+
+   fdb1 [fdb$l_compnrec] = .fdb1 [fdb$l_currec];	! Use record just fetched from one file
+   fdb2 [fdb$l_compnrec] = .fdb2 [fdb$l_comp1rec];	! Use first compare record from other file
+   fdb2_lastrec = .fdb2 [fdb$l_currec];			! End with last record read from other file
+   fdb2 [fdb$l_currec] = .fdb2 [fdb$l_comp1rec];	! Init for test_match
+
+   end_of_list = false;					! Init end of list flag
+
+   WHILE NOT .end_of_list 				! While not past end of list
+   DO BEGIN						! Compare against each record in other file's list
+
+      IF compare (.fdb1 [fdb$l_compnrec], .fdb2 [fdb$l_compnrec])	! Compare two records
+	 THEN IF (status = test_match ())				! Same, then do enough records match?
+		 THEN BEGIN						! Yes,
+		      mark_match (dif$gl_masfdb);			! Mark matched records
+		      mark_match (dif$gl_revfdb);
+		      write_mismatch();					! Output unmatched records	
+		      fdb1 [fdb$l_currec] = .fdb1 [fdb$l_compnrec];	! Set CURREC's to first matches
+		      fdb2 [fdb$l_currec] = .fdb2 [fdb$l_compnrec];
+		      dif$gl_difrec = .dif$gl_difrec + (.i-1)/2 + 1;	! Update difference count
+		      IF .dif$gl_difrec EQL .dif$gl_maxdif		! If too many differnce records 
+			 THEN RETURN (dif$_maxdif);			! Then return the error
+		      RETURN true;					! Return to dif$start
+		      END
+									! If not enough records in match
+		 ELSE IF .status EQL dif$_insvirmem			! Then make sure we didn't run out of VM
+			 THEN RETURN print_and_quit (.i, .status);	! If we did, then quit
+
+      IF (.fdb2 [fdb$l_compnrec] EQL .fdb2_lastrec)  			! If at end of list
+	 THEN end_of_list = true					! Then set flag
+	 ELSE BEGIN							! Else get next record
+	      fdb2 [fdb$l_compnrec] = ..fdb2 [fdb$l_currec];
+	      fdb2 [fdb$l_currec] = ..fdb2 [fdb$l_currec];
+	      END;
+
+      END;
+
+   tempfdb = .fdb1;					! Exchange FDB's
+   fdb1 = .fdb2;
+   fdb2 = .tempfdb;
+
+   END;
+
+fdb1 [fdb$l_comp1rec] = ..fdb1 [fdb$l_comp1rec];	! Reset ptrs to first compare records
+fdb2 [fdb$l_comp1rec] = ..fdb2 [fdb$l_comp1rec];
+
+dif$gl_difrec = .dif$gl_difrec + .window;		! Update count of difference records
+
+RETURN mismatch (1);					! Recursively call mismatch with window size of 1
+END;							! Of mismatch  
+
+ROUTINE test_match =
+BEGIN
+
+!++
+! 
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called when a match has been detected
+!	by mismatch.  It checks to see that the match is long
+!	enough to be a legal match, and signals its result via
+!	the return status.
+!
+! INPUTS:
+!
+!	None.
+!
+! OUTPUTS:
+!
+!	None.
+!
+! ROUTINE VALUES:
+!
+!	True, if the match is long enough.
+!	False, if it is not long enough.
+!	DIF$C_INSVIRMEM, if get_record fails due to insufficient VM.
+!
+!--
+LOCAL
+    status;
+
+
+INCR i FROM 1 TO .dif$gl_match - 1			! Do DIF$GL_MATCH - 1 number of compares 
+DO BEGIN
+   
+   IF NOT (status = get_record (dif$gl_masfdb))		! Get the next record from each file
+      THEN RETURN .status;
+   IF NOT (status = get_record (dif$gl_revfdb))
+      THEN RETURN .status;
+
+   IF NOT (compare (.dif$gl_masfdb [fdb$l_currec], 	! Compare the two fetched records
+		    .dif$gl_revfdb [fdb$l_currec]))
+      THEN BEGIN					! If different, then restore ptrs
+	   dif$gl_masfdb [fdb$l_currec] = .dif$gl_masfdb [fdb$l_compnrec];
+	   dif$gl_revfdb [fdb$l_currec] = .dif$gl_revfdb [fdb$l_compnrec];
+	   RETURN false;				! Return false
+	   END;
+
+   END;
+
+RETURN true;					! Same, return true
+END;						! Of test_match
+
+ROUTINE compare (rdb1, rdb2) =
+BEGIN
+
+!++
+! 
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is to compare to records.  Since every
+!	record has already been preprocessed by the time it gets
+!	here, all this routine needs to do is check the length
+!	and content of the records.
+!
+! INPUTS:
+!
+!	rdb1, rdb2 =	The addresses of the RDB's of the two records
+!			that are to be compared.
+!
+! OUTPUTS:
+!
+!	None.
+!
+! ROUTINE VALUES:
+!
+!	True, if the records are the same.
+!	False, if the records differ.
+!
+!--
+
+MAP
+    rdb1 : REF BBLOCK,
+    rdb2 : REF BBLOCK;
+
+IF .rdb1 [rdb$w_length] NEQ .rdb2 [rdb$w_length]	! Compare lengths
+   THEN RETURN false;
+
+IF .rdb1 [rdb$v_eof] AND .rdb2 [rdb$v_eof]		! Special case EOF's
+   THEN RETURN true;
+
+IF CH$NEQ (.rdb1 [rdb$w_length], rdb1 [rdb$t_text],	! Compare content
+	   .rdb2 [rdb$w_length], rdb2 [rdb$t_text])
+   THEN RETURN false
+   ELSE RETURN true;
+
+END;
+
+ROUTINE mark_match (fdb) =
+BEGIN
+
+!++
+! 
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called to mark the most recent set of matched records.
+!	The match records start with COMPNREC and extend DIF$GL_MATCH number of
+!	records from there.
+!
+! INPUTS:
+!
+!	fdb =  	The address of the FDB for the file whose matched records are
+!		to be marked.
+!
+! OUTPUTS:
+!
+!	The MATCH bit in the RDB's of the matched records are set.
+!	The MATCHONE bit in the RDB of the first match record is set.
+!
+! ROUTINE VALUES:
+!
+!	Always true.
+!
+!--
+
+MAP
+    fdb : REF BBLOCK;
+
+LOCAL
+    rdb : REF BBLOCK;			! Address of current RDB
+
+rdb = .fdb [fdb$l_compnrec];		! Locate first match
+rdb [rdb$v_matchone] = true;		! Mark it as first match
+
+INCR i FROM 1 TO .dif$gl_match		! Locate all matches
+DO BEGIN
+   rdb [rdb$v_match] = true;		! Mark each as a match
+   rdb = .rdb [rdb$l_flink];		! Get next match
+   END;
+
+RETURN true;
+END;
+
+ROUTINE get_record (fdb) =
+BEGIN
+
+!++
+! 
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called to supply the next record, from the specified
+!	file.  It determines whether there is a need to go to the file for 
+!	the record (i.e., it checks to see if an RDB already exists for the 
+!	record), and it keeps examining records until it finds one that is 
+!	not supposed to be ignored in all comparisons.
+!
+! INPUTS:
+!
+!	fdb =	The address of the FDB for the input file.  CURREC specifies
+!		the record just before the one to be fetched.
+!
+! OUTPUTS:
+!
+!	The address of the fetched record is strored in the CURREC
+!	field of the FDB.
+!
+! ROUTINE VALUES:
+!
+!	DIF$_INSVIRMEM, if read_record failed due to insufficient VM,
+!	true, otherwise.
+!
+!--
+
+MAP
+    fdb : REF BBLOCK;
+
+LOCAL
+    rdb : REF BBLOCK,					! Address of current RDB
+    status;
+
+status = true;						! Assume no problem reading record
+
+DO BEGIN
+   IF (rdb = .fdb [fdb$l_currec]) EQL 0			! If no previous record in memory
+	THEN status = read_record (.fdb)		! then read a new record from the file
+	ELSE IF (rdb = .rdb [rdb$l_flink]) EQL 0	! or, if next record is not in memory
+		THEN status = read_record (.fdb);	! then read a new record
+   IF NOT .status 					! If error reading
+      THEN RETURN .status;				! Then return error
+   IF .rdb EQL 0					! If new record read
+      THEN rdb = .fdb [fdb$l_lastrec];			! then get its address
+   fdb [fdb$l_currec] = .rdb;				! Set current field to fetched record
+   END
+
+UNTIL (NOT .rdb [rdb$v_ignored]);			! Read records until not ignored
+
+RETURN true;
+END;							! Of get_record
+
+ROUTINE read_record (fdb) =
+BEGIN
+
+!++
+! 
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called to get the next record from the specified
+!	input file, put it in an RDB, process it for any ignore fields or 
+!	characters, and link it's RDB with already existing RDB's.
+!
+! INPUTS:
+!
+!	fdb =	The address of the FDB for the input file.
+!
+! OUTPUTS:
+!
+!	The RDB is allocated, filled in, and returned in the LASTREC field of the FDB.
+!
+! ROUTINE VALUES:
+!
+!	DIF$_INSVIRMEM, if RDB allocation fails due to insufficient VM,
+!	true otherwise.
+!
+!--
+
+MAP
+    fdb : REF BBLOCK;
+
+LOCAL
+    lastrdb : REF BBLOCK,		! Local for last RDB in list
+    rab : REF BBLOCK,			! Local for file RAB
+    rdb : REF BBLOCK,			! Local for RDB just allocated
+    status;
+
+!
+! Try to get a record from the file.  Handle special EOF case.
+!
+rab = .fdb [fdb$l_rabptr];					! Get address of RAB
+IF NOT (status = $GET (RAB = .rab))				! Get record from file
+   THEN IF .status NEQ RMS$_EOF					! If error and not EOF
+	   THEN SIGNAL_STOP (dif$_readerr,			! Then signal error
+			1, .fdb [fdb$l_fildesc], .status,
+			.rab [rab$l_stv])
+	   ELSE BEGIN						! Else link static EOF RDB to list
+
+		IF (rdb = .fdb [fdb$l_lastrec]) EQL 0			! If first record 
+		   THEN BEGIN						! Then use as head of list
+			fdb [fdb$l_firstrec] = .fdb [fdb$l_eofrec];
+			fdb [fdb$l_comp1rec] = .fdb [fdb$l_eofrec];
+			END
+		   ELSE rdb [rdb$l_flink] = .fdb [fdb$l_eofrec];	! Else link to end of list
+
+		fdb [fdb$l_lastrfa] = .rdb;			! Remember last successful read
+		rdb = .fdb [fdb$l_eofrec];			! Get address of EOF RDB
+		fdb [fdb$l_numrec] = .fdb [fdb$l_numrec] + 1;	! Incr record number in FDB
+		rdb [rdb$l_number] = .fdb [fdb$l_numrec];	! Assign EOF record number in RDB
+		fdb [fdb$l_lastrec] = .rdb;			! Update FDB last record read ptr
+
+		RETURN true;
+		END;
+
+!
+! Record successfully read from file.  So get an RDB, link it to the list, and fill in some
+! simple fields in the RDB and FDB.
+!
+IF NOT (status = allocate_rdb (rdb, .rab [rab$w_rsz]))		! Allocate a RDB for the new record
+   THEN RETURN .status;						! Return if unsuccessful
+
+IF (lastrdb = .fdb [fdb$l_lastrec]) EQL 0			! If first record 
+   THEN BEGIN							! Then use as head of list
+	fdb [fdb$l_firstrec] = .rdb;
+	fdb [fdb$l_comp1rec] = .rdb;
+	END
+   ELSE lastrdb [rdb$l_flink] = .rdb;				! Else link to end of list
+
+fdb [fdb$l_lastrec] = .rdb;					! Update FDB last record read ptr
+
+fdb [fdb$l_numrec] = .fdb [fdb$l_numrec] + 1;			! Incr number of record in FDB
+rdb [rdb$l_number] = .fdb [fdb$l_numrec];			! Assign record number in RDB
+rdb [rdb$w_length] = .rab [rab$w_rsz];				! Move record size into the RDB
+
+!
+! If record size is non-zero, then move the text and RFA into the RDB and 
+! process the record for any ignore characters.  Otherwise, check if we are 
+! ignoring blank lines, and if we are, set ignore flag for this record.
+!
+CH$MOVE (rfa$c_size, rab [rab$w_rfa], rdb [rdb$w_rfa]);		! Get RFA
+IF .rdb [rdb$w_length] GTRU 0					! Is length non-zero?
+   THEN BEGIN							! Yes
+	CH$MOVE (.rdb [rdb$w_length],				! Get text
+		 .rab [rab$l_rbf],
+		 rdb [rdb$t_text]);
+	IF (.dif$gl_ignore AND NOT (ign$m_exact OR ign$m_pretty)) NEQ 0		! If some edit flag is set
+	   THEN process_record (.fdb);				! Process the text
+	END
+
+   ELSE IF .dif$gl_ignore [ign$v_blnklin]			! No, do we ignore blank lines
+	   THEN rdb [rdb$v_ignored] = true;			! Yes, then mark the RDB
+
+RETURN true;
+END;								! OF read_record
+
+ROUTINE process_record (fdb) =
+BEGIN
+
+!++
+! 
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called to remove all ignore characters from a record that
+!	has just been read.
+!
+! INPUTS:
+!
+!	fdb =	   The address of the FDB for the input file.  LASTREC contains the
+!		   address of the RDB for the record that is to be processed.
+!
+! OUTPUTS:
+!
+!	The LENGTH and TEXT fields of the RDB are modified to reflect any editing
+!	that was performed.  The IGNORE flag is set if all text has been deleted and
+!	we are ignoring blank lines.
+!
+! ROUTINE VALUES:
+!
+!	Always true.
+!
+!--
+
+MAP
+    fdb : REF BBLOCK;
+
+LOCAL
+    rdb : REF BBLOCK,					! Address of RDB of record to process
+    blankseen,						! Flag indicating last char was a blank
+    ignore,						! Flag indicating this char should be ignored
+    working_len,					! Local working length of record 
+    charptr : REF VECTOR [,BYTE],			! Ptr to char being tested
+    moveptr : REF VECTOR [,BYTE];			! Ptr to byte after last moved char
+
+rdb = .fdb [fdb$l_lastrec];					! Get RDB of record to process
+charptr = rdb [rdb$t_text];					! Point to start of text
+working_len = .rdb [rdb$w_length];				! Working copy of the lnegth
+
+!
+! If ignoring headers, and if this record is part of the header, then ignore it.
+!
+IF .dif$gl_ignore [ign$v_header]				! If ignoring headers
+   THEN IF .fdb [fdb$l_headcnt] LSSU .dif$gl_header		! And if record is part of header
+	   THEN BEGIN						! Then ignore it
+		fdb [fdb$l_headcnt] = 				! Incr count of header records
+			.fdb [fdb$l_headcnt] + 1;		!
+   		rdb [rdb$v_ignored] = true;			! Mark the record
+		RETURN true;					! Return
+		END						!
+
+	   ELSE IF (.working_len NEQ 0)				! If first char is <FF>
+			AND (.charptr [0] EQL %X'0C') 		!
+		   THEN BEGIN					!
+			IF .working_len EQL 1			! Then if only one char in record
+		   	   THEN fdb [fdb$l_headcnt] = 0		! Then start header with next record
+			   ELSE BEGIN				! Then start a new header
+				fdb [fdb$l_headcnt] = 1;	! One record found
+				rdb [rdb$v_ignored] = true;	! Ignore the record 
+				END;				!
+			RETURN true;				! Return done
+			END;					!
+
+
+!
+! If ignoring comments, and if part of this record is a comment, 
+! then ignore that part of the record.
+!
+IF .dif$gl_ignore [ign$v_comments]				! Ignoring comments?
+   THEN BEGIN							! Then look for comments
+	LOCAL index, bestptr, currptr;				!
+	index = 0;						! Init comment char count
+	bestptr = .charptr + .working_len;			! Point to end of string
+	WHILE (.index NEQ .dif$gl_commdesc [dsc$w_length])	! Check for each comment character
+	DO BEGIN						!
+	   IF (currptr = CH$FIND_SUB (.working_len, .charptr,	! Yes, does comment char appear in record?
+		1, .dif$gl_commdesc [dsc$a_pointer] + .index)) NEQ 0
+	      THEN IF NOT .dif$gl_commflgs [.index] 		! Yes, must it appear in the first column?
+		      THEN bestptr = MINU (.currptr, .bestptr)	! No, then we've definitely got a comment
+		      ELSE IF .currptr EQL rdb [rdb$t_text]	! Yes, then check that it does
+			      THEN EXITLOOP bestptr = .currptr;	! It does, so treat it as a comment
+	   index = .index + 1;					! Increment the comment char count
+	   END;							!
+	working_len = .bestptr - .charptr;			! Reset record length
+	END;
+
+!
+! Only enter character loop if FORM_FEED or SPACING is specified.
+! Test each character in record to see if it should be ignored.  Edit ignored 
+! characters out of the record.
+!
+IF .dif$gl_ignore [ign$v_formfeed] OR .dif$gl_ignore [ign$v_spacing]
+THEN BEGIN
+
+     blankseen = false;						! Init state
+     ignore = false;						!
+     moveptr = .charptr;					!
+
+     WHILE (.charptr NEQ (rdb [rdb$t_text] + .working_len))	! Check each character
+     DO BEGIN							!
+	SELECTONE .charptr [0] OF SET				!
+
+	[%X'0C']:						! Form feed?
+		IF .dif$gl_ignore [ign$v_formfeed]		! Are we ignoring them?
+	   	   THEN ignore = true				! Yes, then set ignore flag
+	   	   ELSE blankseen = false;			! Reset blank flag
+
+	[%X'20',%X'09']:					! Blank or tab?
+		IF .dif$gl_ignore [ign$v_spacing]		! Are we evening out spacing
+		   THEN (IF .blankseen				! Yes
+			   THEN ignore = true			! Second blank or tab, so ignore it
+			   ELSE BEGIN				! First blank or tab
+				blankseen = true;		! Set blankseen flag
+				IF .charptr [0] EQL %X'09'	! If char is a tab, we have
+				THEN BEGIN
+				    rdb [rdb$v_edited] = true;	! editted the line
+				    charptr [0] = %X'20';	! Convert tabs to blanks
+				    END;
+				END);				!
+
+	[OTHERWISE]:						! All other characters
+		blankseen = false;				!
+
+	TES;
+
+!
+! If not ignoring last character tested, then copy the character.
+!
+	IF NOT .ignore						! If last char was not ignored
+	   THEN BEGIN						!
+		moveptr [0] = .charptr [0];			! Copy the character
+		moveptr = .moveptr + 1;				! Update result ptr 
+		END;						!
+
+	ignore = false;						! Reset flag
+	charptr = .charptr + 1;					! Incr the charptr
+	END;							! Of while
+
+     working_len = .moveptr - rdb [rdb$t_text];			! Update working length
+     END;
+
+!
+! If ignoring trailing blanks, then edit them out also.
+!
+moveptr = rdb [rdb$t_text] + .working_len - 1;			! Update move ptr
+IF .dif$gl_ignore [ign$v_traiblnk]				! If ignoring trailing blanks
+   THEN BEGIN							!
+	BIND start_of_record = rdb [rdb$t_text] - 1;		!
+	WHILE ( (.moveptr [0] EQL %X'20') OR			! Then while last char is blank
+		(.moveptr [0] EQL %X'09') ) AND			! or tab
+		(.moveptr NEQ start_of_record)			! and not past beginning of string
+	DO moveptr = .moveptr - 1;				! Decrement size of record
+	END;							!
+
+!
+! Calculate length of edited record.  Set edited flag if different from original length
+!
+working_len = .rdb [rdb$w_length];
+rdb [rdb$w_length] = .moveptr - rdb [rdb$t_text] + 1;
+IF .working_len NEQ .rdb [rdb$w_length]
+   THEN rdb [rdb$v_edited] = true;
+
+!
+! If length is now zero, and we are ignoring blank records, then ignore 
+! this record.
+!
+IF .dif$gl_ignore [ign$v_blnklin] AND (.rdb [rdb$w_length] EQL 0) 
+   THEN rdb [rdb$v_ignored] = rdb [rdb$v_edited] = true;
+
+RETURN true;
+END;										! Of process_record
+
+ROUTINE allocate_rdb (rdbaddr, textlen) =
+BEGIN
+
+!++
+! 
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called to allocate a new RDB.
+!
+! INPUTS:
+!
+!	rdbaddr =  The address of a longword to receive the address of the
+!		   newly allocated RDB.
+!
+!	textlen =  The length of the text that will make up the variably
+!		   sized portion of the RDB.
+!
+! OUTPUTS:
+!
+!	The new RDB is allocated and its fields are all zeroed.
+!
+! ROUTINE VALUES:
+!
+!	Always true.
+!
+!--
+
+LOCAL
+    rdb : REF BBLOCK;
+
+IF NOT LIB$GET_VM (%REF (.textlen + rdb$c_size), rdb)		! Allocate RDB
+   THEN RETURN dif$_insvirmem;
+
+CH$FILL (%X'00', rdb$c_size, .rdb);				! Init it
+.rdbaddr = .rdb;						! Return its address
+
+RETURN true;
+END;
+
+ROUTINE purge_rdb (fdb) =
+BEGIN
+
+!++
+! 
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called to purge the RDB's associated
+!	with a particular file.	
+!
+! INPUTS:
+!
+!	fdb =	The address of the FDB for the file whose RDB's are to be
+!		purged.  CURREC specifies the first RDB not to be purged.
+!
+! OUTPUTS:
+!
+!	The purged RDB's are deallocated, and the FIRSTREC field of the
+!	FDB is updated.
+!
+! ROUTINE VALUES:
+!
+!	Always true
+!
+!--
+
+MAP
+    fdb : REF BBLOCK;
+
+LOCAL
+    rdb : REF BBLOCK;
+
+IF (rdb = .fdb [fdb$l_firstrec]) EQL .fdb [fdb$l_currec]
+   THEN RETURN true
+   ELSE BEGIN
+	fdb [fdb$l_firstrec] = .rdb [rdb$l_flink];
+	IF NOT .rdb [rdb$v_permanent]
+	   THEN LIB$FREE_VM ( %REF(.rdb [rdb$w_length] + rdb$c_size), rdb);
+	RETURN purge_rdb (.fdb);
+	END;
+
+END;
+
+ROUTINE set_move_flags =
+BEGIN
+
+!++
+! 
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called to initialize the FDB move flags.
+!	An FDB move flag is set to true if that file will be output
+!	in more than one format or radix.  Both FDB move flags are
+!	false if SLP output has been specified.
+!
+! INPUTS:
+!
+!	None.
+!
+! OUTPUTS:
+!
+!	None.
+!
+! ROUTINE VALUES:
+!
+!	Always true.
+!
+!--
+
+LOCAL
+   multiradix;
+
+IF .dif$gl_flags [dif$v_slp]
+   THEN RETURN true;
+
+IF (.dif$gl_flags [dif$v_ascii] + .dif$gl_flags [dif$v_hex] + 
+    .dif$gl_flags [dif$v_octal]) GTR 1
+   THEN BEGIN
+	multiradix = true;
+	IF .dif$gl_flags [dif$v_merged]
+	   THEN BEGIN
+		dif$gl_masfdb [fdb$v_move] = true;
+		dif$gl_revfdb [fdb$v_move] = true;
+		RETURN true;
+		END;
+	END
+   ELSE multiradix = false;
+
+IF (((.multiradix OR .dif$gl_flags [dif$v_parallel]) +
+	.dif$gl_flags [dif$v_merged] + 
+	.dif$gl_masfdb [fdb$v_separated] + 
+	.dif$gl_masfdb [fdb$v_changebar]) GTR 1) OR
+   (.dif$gl_masfdb [fdb$v_changebar] AND .dif$gl_revfdb [fdb$v_separated])
+   THEN dif$gl_masfdb [fdb$v_move] = true;
+
+IF (((.multiradix OR .dif$gl_flags [dif$v_parallel]) +
+	.dif$gl_flags [dif$v_merged] +
+	.dif$gl_revfdb [fdb$v_separated] +
+	.dif$gl_revfdb [fdb$v_changebar]) GTR 1) OR
+   ((.dif$gl_masfdb [fdb$v_separated] +
+	.dif$gl_revfdb [fdb$v_separated] +
+	.dif$gl_revfdb [fdb$v_changebar]) GTR 1) OR
+   (.dif$gl_masfdb [fdb$v_changebar] AND .dif$gl_revfdb [fdb$v_changebar])
+   THEN dif$gl_revfdb [fdb$v_move] = true;
+
+RETURN true;
+END;
+
+ROUTINE print_and_quit (difreccnt, status) =
+BEGIN
+
+!++
+! 
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called to print whatever records have been
+!	processed when a fatal error occurs.
+!
+! INPUTS:
+!
+!	difreccnt =	Count of last set of difference records.
+!
+!	status =  	Status of error causing diff to quit.
+!
+! OUTPUTS:
+!
+!	None.
+!
+! ROUTINE VALUES:
+!
+!	The input status is returned.
+!
+!--
+LOCAL
+    rdb : REF BBLOCK;
+
+dif$gl_difrec = .dif$gl_difrec + (.difreccnt-1)/2 + 1;	! Update difference count
+
+dif$gl_merged = dif$gl_parallel = 0;			! Minimize no. of matched records to output
+
+rdb = .dif$gl_masfdb [fdb$l_currec];			! Set up master FDB for output
+dif$gl_masfdb [fdb$l_compnrec] = .rdb;
+rdb [rdb$l_flink] = .dif$gl_masfdb [fdb$l_eofrec];
+
+rdb = .dif$gl_revfdb [fdb$l_currec];			! Set up revision FDB for output
+dif$gl_revfdb [fdb$l_compnrec] = .rdb;
+rdb [rdb$l_flink] = .dif$gl_revfdb [fdb$l_eofrec];
+
+write_mismatch ();					! Output differences
+
+RETURN .status;
+END;
+
+END							! Of module
+ELUDOM

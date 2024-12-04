@@ -1,0 +1,692 @@
+	.TITLE	 CSPQUORUM - CSP DISK QUORUM MODULE
+	.IDENT	'V04-000'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+; Facility: CSP
+;
+; Abstract:
+;	This module is a "client" thread of the CSP. It is requested by the
+;	quorum disk code whenever:
+;
+;		- SYSINIT did not find the quorum file,
+;		- an I/O error occurred when reading or writing the quorum file,
+;		- or the quorum file containes corrupt data.
+;
+; Enviornment:
+;	CSP process
+;--
+;
+; Author:
+;	R. Scott Hanna, CREATION DATE: 23-Aug-1983
+;
+; Modified by:
+;
+;	V03-006	ADE0002		Alan D. Eldridge	25-Apr-1984
+;		Use $GETDVIW_S instead of $GETDVI_S with an AST since
+;		when an AST is delivered upon R0 failure indication is
+;		thought to be unpredictable.
+;
+;	V03-005	DWT0211		David W. Thiel		09-Apr-1984
+;		Call CNX$DISK_CHANGE when CLUB$T_QDNAME is filled in.
+;
+;	V03-004	RSH0133		R. Scott Hanna		03-Apr-1984
+;		Modify CLOSE_FILE to only call CSP$$WAIT when the file close
+;		I/O is successfully queued.
+;
+;	V03-003	RSH0126		R. Scott Hanna		21-Feb-1984
+;		Incorporate changes to make this algorithm a "client" of
+;		the CSP. It is now requested by the QUORUM code rather than
+;		periodically running to check for work. In addition this
+;		routine can now create a quorum file if none exists and
+;		repair one that does but contains corrupt data.
+;
+;	V03-002	ADE0001		Alan D. Eldridge	28-Feb-1984
+;		Change name of CSP$QUORUM to CSP$QUORUM_INIT, add new
+;		CSP$QUORUM entry point which is used now only as a place
+;		holder.
+;
+;	V03-001	RSH0079		R. Scott Hanna		10-Nov-1983
+;		Modify algorithm to check every 2 minutes to see if the
+;		"connection" to the quorum disk has been lost. If so it
+;		does the quorum file lookup again.
+;--
+
+		
+.SBTTL	Declarations
+;
+;	Define Symbols
+;
+
+	$ATRDEF					; Attribute control block
+	$CCBDEF					; Channel control block
+	$CLUBDEF				; Cluster block
+	$CLUDCBDEF				; Cluster quorum disk control block
+	$CLUQFDEF				; Cluster quorum file
+	$DSCDEF					; Descriptor definitions
+	$DVIDEF					; $GETDVI item list codes
+	$FIBDEF					; File information block
+	$FIDDEF					; File ID codes
+	$IODEF					; I/O function codes
+	$IPLDEF					; Interrupt priority levels
+	$SBKDEF					; Attributes statistics block
+	$SSDEF					; System service status codes
+
+; Error messages will no longer be reported after ERROR_COUNT reaches
+; ERROR_THRESHOLD.
+
+	ERROR_THRESHOLD = 10
+
+
+.SBTTL	Own storage
+
+THREAD_ACTIVE:	.BYTE	0			; Thread active flag
+
+QD_DESCR:	.WORD	0			; Quorum disk descriptor
+		.BYTE	DSC$K_DTYPE_T
+		.BYTE	DSC$K_CLASS_D
+		.LONG	QD_NAME
+
+QD_NAME:	.BLKB	64			; Quorum disk name
+
+QD_ITMLST:	.WORD	64,DVI$_FULLDEVNAM	; $GETDVI item list
+		.LONG	QD_NAME
+		.LONG	QD_DESCR
+		.LONG	0
+
+QF_DESCR:	.ASCID	/QUORUM.DAT;1/		; Quorum file descriptor
+
+CLUDCB_LBN:	.LONG	0			; Quorum file LBN from the CLUDCB
+
+LOOKUP_LBN:	.LONG	0			; Quorum file LBN from file lookup
+
+CHANNEL:	.LONG	0			; Quorum disk channel number
+
+IOSB:		.QUAD	0			; I/O status block
+
+ERROR_COUNT:	.BYTE	0			; Error reported counter
+
+ERROR_MESSAGE:	.LONG	0			; Descr addr of last error message
+
+FIB_DESCR:	.WORD	FIB$K_LENGTH		; FIB descriptor
+		.BYTE	DSC$K_DTYPE_T
+		.BYTE	DSC$K_CLASS_S
+		.LONG	FIB
+
+FIB:		.BLKB	FIB$K_LENGTH		; File information block
+
+ATTRIB_BLOCK:	.WORD	ATR$S_STATBLK,ATR$C_STATBLK ; Attribute control block
+		.LONG	STATBLK
+		.WORD	ATR$S_UIC,ATR$C_UIC
+		.LONG	UIC
+		.WORD	ATR$S_FPRO,ATR$C_FPRO
+		.LONG	FPRO
+		.LONG	0
+
+STATBLK:	.BLKB	ATR$S_STATBLK		; Statistics block
+
+UIC:		.WORD	4,1			; File owner UIC ([1,4])
+
+FPRO:		.WORD	^XFF00			; File protection (S:RWED,O:RWED)
+
+IDENT_STRING:	.ASCII	/QUORUM  FILE/		; Quorum file ID string
+		ASSUME	CLUQF$S_IDENT EQ .-IDENT_STRING
+
+RESCHEDULE_TIMER: .QUAD	0			; Reschedule interval
+
+QF_BUFFER:	.BLKB	CLUQF$K_BLOCKS*512	; Quorum file buffer
+
+MSSG1:	.ASCID	\%CSP-W-QFNOTFOUND, Previously existing quorum file not found\
+MSSG2:	.ASCID	\%CSP-I-QFCREATED, Quorum file created\
+MSSG3:	.ASCID	\%CSP-W-QFCHANGED, Quorum file location has changed\
+MSSG4:	.ASCID	\%CSP-I-QFINIT, Quorum file initialized\
+MSSG5:	.ASCID	\%CSP-E-QDASSIGN, Quorum disk assign error\
+MSSG6:	.ASCID	\%CSP-E-QFOPEN, Quorum file open/create error\
+MSSG7:	.ASCID	\%CSP-E-QFRATT, Quorum file read attributes error\
+MSSG8:	.ASCID	\%CSP-E-QFREAD, Quorum file read error\
+MSSG9:	.ASCID	\%CSP-E-QFWRITE, Quorum file write error\
+MSSG10:	.ASCID	\%CSP-E-QDGETDVI, Quorum disk $GETDVI failed\
+
+
+.SBTTL	CSP$QUORUM - Disk quorum action routine
+
+;++
+;	This routine is requested when some type of error has occured with the
+;	quorum disk. It acknowledges the request and gets the quorum disk name
+;	and logical block number from the CLUDCB. It then does a access with a
+;	create modifier QIO to the ACP. (i.e. If the quorum file does not exist
+;	it creates one.) If a quorum file exists the data in the file is
+;	validated. If the quorum file contents are invalid or the quorum file
+;	was created, a template quorum block is written back to the file. The
+;	request is completed by updating the logical block number, the request
+;	and acknowledge bits, and the state field in the CLUDCB.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CSP$QUORUM
+;
+; INPUTS:
+;
+;	NONE
+;
+; OUTPUT:
+;
+;	NONE
+;--
+CSP$QUORUM::
+	BBCS	#0,THREAD_ACTIVE,1$		; Br if thread not active
+	BRW	17$				; Thread active, ignore request
+1$:	PUSHR	#^M<R2,R3,R4,R5,R6,R7>		; Save registers
+						;
+	$CMKRNL_S	REQUEST_INIT		; Do the initial work
+	BLBS	R0,2$				; Br if request necessary
+	BRW	16$
+
+2$:	TSTW	QD_DESCR			; Do we have the quorum disk name?
+	BNEQU	3$				; Br if yes
+	JSB	GET_QDNAME			; Get quorum disk name
+	BLBS	R0,3$				; Br if success
+	MOVAL	MSSG10,R1			; Quorum disk assign error
+	BRW	11$
+
+3$:	$ASSIGN_S	DEVNAM	= QD_DESCR,-	; Assign a channel to
+			CHAN	= CHANNEL	; the quorum disk
+	BLBS	R0,4$				; Br if success
+	MOVAL	MSSG5,R1			; Quorum disk assign error
+	BRW	11$
+
+4$:	JSB	OPEN_FILE			; Open the quorum file
+	BLBS	R0,5$				; Br if success
+	MOVAL	MSSG6,R1			; Quorum disk open/create error
+	BRB	11$
+
+5$:	CMPW	R0,#SS$_CREATED			; Did we create the file?
+	BNEQU	8$				; Br if not
+	JSB	GET_LBN				; Get the quorum file LBN
+	BLBS	R0,6$				; Br if error
+	MOVAL	MSSG7,R1			; Quorum disk read attributes error
+	BRB	11$
+
+6$:	TSTL	CLUDCB_LBN			; Did the file exist before?
+	BEQLU	7$				; Br if not
+	PUSHAQ	MSSG1
+	CALLS	#1,CSP$TELL_OPCOM		; Output message via opcom
+
+7$:	PUSHAQ	MSSG2
+	CALLS	#1,CSP$TELL_OPCOM		; Output message via opcom
+	BRB	10$
+
+8$:	TSTL	CLUDCB_LBN			; Did the file exist before?
+	BEQLU	9$				; Br if not
+	CMPL	CLUDCB_LBN,LOOKUP_LBN		; Do the LBN's match?
+	BEQLU	9$				; Br if they do
+	PUSHAQ	MSSG3
+	CALLS	#1,CSP$TELL_OPCOM		; Output message via opcom
+
+9$:	JSB	VALIDATE_FILE			; Validate the file contents
+	BLBS	R0,13$				; Br if quorum file valid
+	TSTL	R0				; I/O error?
+	BEQLU	10$				; Br if not
+	MOVAL	MSSG8,R1			; Quorum file read error
+	BRB	11$
+
+10$:	JSB	WRITE_FILE			; Write a template quorum file
+	BLBS	R0,12$				; Br if success
+	MOVAL	MSSG9,R1			; Quorum file write error
+
+11$:	CMPL	R1,ERROR_MESSAGE		; Same error as last reported?
+	BEQLU	14$				; Br if yes
+	MOVL	R1,ERROR_MESSAGE		; Save address of last error message
+	CMPB	#ERROR_THRESHOLD,ERROR_COUNT	; Should we report this one?
+	BEQLU	14$				; Br if not
+	INCB	ERROR_COUNT			; Increment error count
+	PUSHAL	(R1)				; Push address of message descr
+	CALLS	#1,CSP$TELL_OPCOM		; Output message via opcom
+	BRB	14$
+
+12$:	PUSHAQ	MSSG4
+	CALLS	#1,CSP$TELL_OPCOM		; Output message via opcom
+13$:	CLRB	ERROR_COUNT			; Reset error count and...
+	CLRL	ERROR_MESSAGE			; ...error pointer.
+14$:	JSB	CLOSE_FILE			; Close the quorum file
+	$DASSGN_S	CHAN = CHANNEL		; Deassign the quorum disk channel
+	TSTB	ERROR_COUNT			; Have we completed the request?
+	BEQLU	15$				; Br if yes
+	$SETIMR_S	DAYTIM = RESCHEDULE_TIMER,- ; Delay and try again
+			ASTADR	= CSP$$RESUME,-
+			REQIDT 	= CSP$GL_CURCTX
+	CALLS	#0,CSP$$WAIT			; Wait for completion
+	BRW	2$
+
+15$:	$CMKRNL_S	REQUEST_COMPLETE	; Complete the request
+16$:	CLRB	THREAD_ACTIVE			; Clear thread active flag
+						;
+	POPR	#^M<R2,R3,R4,R5,R6,R7>		; Restore registers
+17$:	MOVL	#SS$_NORMAL,R0			; Return success
+	RSB
+
+
+.SBTTL	REQUEST_INIT - Request initialization
+
+;++
+;
+;	This routine acknowledges the request, gets the quorum disk LBN
+;	and name, and initializes the reschedule timer.
+;
+; CALLING SEQUENCE:
+;
+;	$CMKRNL_S	REQUEST_INIT
+;
+; INPUTS:
+;
+;	NONE
+;
+; OUTPUT:
+;
+;	R0 = Status
+;		SS$_NORMAL - Request is necessary (Quorum disk state is NOT_READY)
+;		         0 - Request not necessary
+;	R1,R3 Destroyed
+;--
+
+REQUEST_INIT:
+	.WORD	0
+	CLRL	R0				; Assume request is not necessary
+	MOVL	G^CLU$GL_CLUB,R3		; Get CLUB address
+	MOVL	CLUB$L_CLUDCB(R3),R3		; Get CLUDCB address
+	CMPW	#CLUDCB$M_QS_NOT_READY,-	; Is state NOT_READY?
+		CLUDCB$W_STATE(R3)
+	BNEQU	1$				; Br if not
+	BISW	#CLUDCB$M_QF_CSPACK,-		; Ack the request
+		CLUDCB$W_FLAGS(R3)
+	MOVL	CLUDCB$L_QFLBN(R3),CLUDCB_LBN	; Get the LBN
+	MOVZWL	G^CLU$GW_QDSKINTERVAL,R1	; Get quorum disk timeout value
+	EMUL	R1,#-10000000,#0,-		; Convert to seconds (Delta form)
+		RESCHEDULE_TIMER
+	MOVL	#SS$_NORMAL,R0			; Request is necessary
+1$:	RET
+
+.SBTTL	GET_QDNAME - Get the quorum disk name
+
+;++
+;	This routine gets the full quorum disk name and makes sure that a
+;	copy is in the CLUB.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	GET_QDNAME
+;
+; INPUTS:
+;
+;	NONE
+;
+; OUTPUT:
+;
+;	R0 = Status
+;	R1-R7 Destroyed
+;--
+
+GET_QDNAME:
+	MOVC3	#CLUDCB$S_DISK_QUORUM,-		; Get copy of quorum disk name
+		G^CLU$GB_QDISK,QD_NAME
+	LOCC	#^A/ /,#CLUDCB$S_DISK_QUORUM,-	; Locate end of name
+		QD_NAME
+	SUBW3	R0,#CLUDCB$S_DISK_QUORUM,QD_DESCR ; Store name length
+	$GETDVIW_S	DEVNAM = QD_DESCR,-	; Get full device name
+			ITMLST = QD_ITMLST,-
+	-;		ASTADR = CSP$$RESUME,-
+	-;		ASTPRM = CSP$GL_CURCTX,-
+			IOSB = IOSB
+	BLBC	R0,1$				; Br if error
+-;	CALLS	#0,CSP$$WAIT			; Wait for completion
+	MOVZWL	IOSB,R0				; Get completion status
+	BLBC	R0,1$				; Br if error
+	$CMKRNL_S	GET_QDNAME1		; Put name in CLUB
+	MOVL	#1,R0				; Return success
+	BRB	2$
+1$:	CLRW	QD_DESCR			; Zero name size
+2$:	RSB
+
+GET_QDNAME1:
+	.WORD	0
+	MOVL	G^CLU$GL_CLUB,R6		; Get CLUB address
+	TSTB	CLUB$T_QDNAME(R6)		; Is name in CLUB already?
+	BNEQU	1$				; Br if yes
+	SUBW3	#2,QD_DESCR,R7			; Get adjusted name size
+	MOVC3	R7,QD_NAME+1,CLUB$T_QDNAME+1(R6) ; Put name in CLUB
+	MOVB	R7,CLUB$T_QDNAME(R6)		; Put name size in CLUB
+	JSB	G^CNX$DISK_CHANGE		; Tell connection manager
+1$:	RET
+
+.SBTTL	OPEN_FILE - Open the quorum file
+
+;++
+;	This routine "opens" the quorum file and obtains its logical block
+;	number. It will first attempt to find any existing quorum file but
+;	if unsuccessful, it will create a new one. Note that the logical
+;	block number is only returned if the file was not created. This is
+;	due to the fact that the statistics block is not returned on a create.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	OPEN_FILE
+;
+; INPUTS:
+;
+;	NONE
+;
+; OUTPUT:
+;
+;	R0 = Status of file open
+;
+;	R1-R6 Destroyed
+;--
+
+OPEN_FILE:
+
+;
+; First we initialize the FIB.
+;
+	MOVAL	FIB,R6				; Get FIB pointer
+	MOVC5	#0,(SP),#0,#FIB$K_LENGTH,(R6)	; Init FIB to all zeros
+	MOVL	#FIB$M_WRITE!FIB$M_NOREAD!FIB$M_NOWRITE!FIB$M_WRITETHRU,-
+		FIB$L_ACCTL(R6)			; Access bits
+	MOVW	#FID$C_MFD,FIB$W_DID_NUM(R6)	; Directory is the MFD
+	MOVW	#FID$C_MFD,FIB$W_DID_SEQ(R6)
+	MOVW	#FIB$M_EXTEND!FIB$M_ALCON!FIB$M_FILCON,- ; Extend control bits
+		FIB$W_EXCTL(R6)
+	MOVL	#CLUQF$K_BLOCKS,FIB$L_EXSZ(R6)	; Allocation size
+;
+; Attempt to lookup/create the quorum file and access for read/write
+;
+	$QIO_S		CHAN	= CHANNEL,-
+			FUNC	= #IO$_ACCESS!IO$M_ACCESS!IO$M_CREATE,-
+			IOSB	= IOSB,-
+			ASTADR	= CSP$$RESUME,-
+			ASTPRM	= CSP$GL_CURCTX,-
+			P1	= FIB_DESCR,-
+			P2	= #QF_DESCR,-
+			P5	= #ATTRIB_BLOCK
+	BLBC	R0,1$				; Br if error
+	CALLS	#0,CSP$$WAIT			; Wait for completion
+	MOVZWL	IOSB,R0				; Get I/O completion status
+	BLBC	R0,1$				; Br if error
+;
+; Get the quorum file LBN.
+;
+	MOVW	STATBLK+SBK$W_STLBNL,LOOKUP_LBN	; Get the Low-order LBN
+	MOVW	STATBLK+SBK$W_STLBNH,LOOKUP_LBN+2 ; Get the High-order LBN
+1$:	RSB
+
+.SBTTL	GET_LBN - Get the quorum file logical block number
+
+;++
+;	This routine reads the quorum file attributes and gets the quorum
+;	file logical block number.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	GET_LBN
+;
+; INPUTS:
+;
+;	NONE
+;
+; OUTPUT:
+;
+;	R0 = Status of file open
+;
+;	R1 Destroyed
+;--
+
+GET_LBN:
+
+	$QIO_S		CHAN	= CHANNEL,-	; Read the file attributes
+			FUNC	= #IO$_ACCESS,-
+			IOSB	= IOSB,-
+			ASTADR	= CSP$$RESUME,-
+			ASTPRM	= CSP$GL_CURCTX,-
+			P1	= FIB_DESCR,-
+			P2	= #QF_DESCR,-
+			P5	= #ATTRIB_BLOCK
+	BLBC	R0,1$				; Br if error
+	CALLS	#0,CSP$$WAIT			; Wait for completion
+	MOVZWL	IOSB,R0				; Get I/O completion status
+	BLBC	R0,1$				; Br if error
+;
+; Get the quorum file LBN.
+;
+	MOVW	STATBLK+SBK$W_STLBNL,LOOKUP_LBN	; Get the Low-order LBN
+	MOVW	STATBLK+SBK$W_STLBNH,LOOKUP_LBN+2 ; Get the High-order LBN
+1$:	RSB
+
+.SBTTL	VALIDATE_FILE - Validate the quorum file
+
+;++
+;	This routine reads the quorum file and validates its contents.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	VALIDATE_FILE
+;
+; INPUTS:
+;
+;	NONE
+;
+; OUTPUT:
+;
+;	R0 = Status of validate
+;
+;		If R0 = SS$_NORMAL the file is valid. If R0 = 0 the file is 
+;		invalid. Otherwise R0 contains an I/O status error.
+;
+;	R1-R3,R6,R7 Destroyed
+;--
+
+VALIDATE_FILE:
+
+;
+; Queue a read request to the quorum file
+;
+	$QIO_S		CHAN	= CHANNEL,-
+			FUNC	= #IO$_READLBLK,-
+			IOSB	= IOSB,-
+			ASTADR	= CSP$$RESUME,-
+			ASTPRM	= CSP$GL_CURCTX,-
+			P1	= QF_BUFFER,-
+			P2	= #CLUQF$K_BLOCKS*512,-
+			P3	= LOOKUP_LBN
+	BLBC	R0,2$				; Br if error
+	CALLS	#0,CSP$$WAIT			; Wait for completion
+	MOVZWL	IOSB,R0				; Get I/O completion status
+	BLBC	R0,2$				; Br if error
+;
+; Validate the data in the quorum file
+;
+	CLRL	-(SP)				; Assume file not valid
+	MOVAL	QF_BUFFER,R6			; Get buffer pointer
+	JSB	CALCULATE_CHECKSUM		; Get the checksum
+	TSTL	R7				; Is checksum valid?
+ 	BNEQU	1$				; Br if not
+	CMPC3	#CLUQF$S_IDENT,-		; Validate ID area
+		CLUQF$T_IDENT(R6),-
+		IDENT_STRING
+	BNEQU	1$				; Br if file invalid
+	CMPW	#CLUQF$K_VERSION,-		; Is version correct?
+		CLUQF$W_VERSION(R6)
+	BNEQU	1$				; Br if not
+	MOVZBL	#SS$_NORMAL,(SP)		; File is valid
+1$:	MOVL	(SP)+,R0			; Return status
+2$:	RSB
+
+.SBTTL	WRITE_FILE - Write the quorum file
+
+;++
+;	This routine builds a template quorum file and writes it to the disk.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	WRITE_FILE
+;
+; INPUTS:
+;
+;	NONE
+;
+; OUTPUT:
+;
+;	R0 = Status of the write
+;
+;	R1-R7 Destroyed
+;--
+
+WRITE_FILE:
+
+;
+; Build a template quorum file
+;
+	MOVAL	QF_BUFFER,R6			; Get buffer pointer
+	MOVC5	#0,(SP),#0,-			; Zero buffer
+		#CLUQF$K_BLOCKS*512,(R6)
+	MOVC3	#CLUQF$S_IDENT,-		; Store ident string
+		IDENT_STRING,-
+		CLUQF$T_IDENT(R6)
+	MOVW	#CLUQF$K_VERSION,(R3)		; Store version number
+	JSB	CALCULATE_CHECKSUM		; Get the checksum
+	MOVL	R7,CLUQF$L_CHECKSUM(R6)		; Store checksum
+	MOVB	#1,CLUQF$B_IGNORE(R6)		; Set ignore flag
+;
+; Write the template quorum file.
+;
+	$QIO_S		CHAN	= CHANNEL,-
+			FUNC	= #IO$_WRITELBLK,-
+			IOSB	= IOSB,-
+			ASTADR	= CSP$$RESUME,-
+			ASTPRM	= CSP$GL_CURCTX,-
+			P1	= QF_BUFFER,-
+			P2	= #CLUQF$K_BLOCKS*512,-
+			P3	= LOOKUP_LBN
+	BLBC	R0,1$				; Br if error
+	CALLS	#0,CSP$$WAIT			; Wait for completion
+	MOVZWL	IOSB,R0				; Get I/O completion status
+1$:	RSB
+
+.SBTTL	CLOSE_FILE - Close the quorum file
+
+;++
+;	This routine "closes" the quorum file by issuing a QIO with the
+;	IO$_DEACCESS function code.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CLOSE_FILE
+;
+; INPUTS:
+;
+;	NONE
+;
+; OUTPUT:
+;
+;	R0,R1 Destroyed
+;--
+
+CLOSE_FILE:
+
+	$QIO_S		CHAN	= CHANNEL,-	; Queue deaccess request
+			FUNC	= #IO$_DEACCESS,-
+			IOSB	= IOSB,-
+			ASTADR	= CSP$$RESUME,-
+			ASTPRM	= CSP$GL_CURCTX
+	BLBC	R0,1$				; Br if error
+	CALLS	#0,CSP$$WAIT			; Wait for completion
+1$:	RSB
+
+.SBTTL	REQUEST_COMPLETE - Request completion
+
+;++
+;	This routine completes the request by updating the CLUDCB fields.
+;
+; CALLING SEQUENCE:
+;
+;	$CMKRNL_S	REQUEST_COMPLETE
+;
+; INPUTS:
+;
+;	NONE
+;
+; OUTPUT:
+;
+;	R0,R1 Destroyed
+;--
+
+REQUEST_COMPLETE:
+
+	.WORD	0
+	MOVL	G^CLU$GL_CLUB,R0		; Get CLUB address
+	MOVL	CLUB$L_CLUDCB(R0),R0		; Get CLUDCB address
+	MOVL	CHANNEL,R1			; Get channel number
+	SUBL3	R1,@#CTL$GL_CCBBASE,R1		; Form CCB address
+	SETIPL	#IPL$_TIMER			; Synchronize access to CLUDCB
+	MOVL	CCB$L_UCB(R1),CLUDCB$L_UCB(R0)	; Store UCB address in CLUDCB
+	MOVL	LOOKUP_LBN,CLUDCB$L_QFLBN(R0)	; Put LBN in CLUDCB
+	BICW	#CLUDCB$M_QF_CSPACK,-		; Clear the in progress bit
+		CLUDCB$W_FLAGS(R0)
+	MOVW	#CLUDCB$M_QS_READY,-		; Set state to ready
+		CLUDCB$W_STATE(R0)
+	SETIPL	#0				; Restore IPL
+	RET
+
+.SBTTL	CALCULATE_CHECKSUM - Calculate the quorum file checksum
+
+;++
+;	This routine calulates the checksum of the quorum block pointed to
+;	by R6. It includes the field CLUQF$L_CHECKSUM in the checksum
+;	calculation.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	CALCULATE_CHECKSUM
+;
+; INPUTS:
+;
+;	R6 = Pointer to the quorum block
+;
+; OUTPUT:
+;
+;	R7 = Quorum block checksum
+;
+;	R2,R3	Destroyed
+;--
+
+CALCULATE_CHECKSUM:
+
+	MOVL	#CLUQF$K_CHECK_LENGTH/4,R2	; R2 = checksum longword count
+	MOVL	R6,R3				; Copy buffer address
+	CLRL	R7				; Form checksum in R7
+1$:	XORL2	(R3)+,R7			; Accumulate checksum
+	SOBGTR	R2,1$				; Br if more
+	RSB
+
+	.END

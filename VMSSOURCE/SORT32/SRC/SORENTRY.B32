@@ -1,0 +1,608 @@
+MODULE SOR$ENTRY(MAIN=SOR$ENTRY,
+		IDENT = 'V04-000'	! File: SORSPEC.B32 Edit: PDG3023
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+!
+! FACILITY:	VAX SORT/MERGE
+!
+! ABSTRACT:
+!
+!	This module contains the main entry to the sort/merge utility.
+!
+! ENVIRONMENT:	VAX/VMS user mode
+!
+! AUTHOR: Peter D Gilbert, CREATION DATE: 07-Jan-1982
+!
+! MODIFIED BY:
+!
+!	T03-015		Original
+!	T03-018	Change stat names to SOR$K_xxx.  PDG 4-Jan-1983
+!	T03-019	Return with the worst severity we've seen.  PDG 14-Jan-1983
+!	T03-020	Change "work file size used" to "work file allocation".
+!		PDG 27-Jan-1983
+!	T03-021	Changed the name of SOR$STAT.  PDG 3-Mar-1983
+!	T03-022	Reformat statistics, removing MBC and MBF.  PDG 8-Jul-1983
+!	T03-023	Remove "-11" from statistics.  PDG 10-Nov-1983
+!--
+
+LIBRARY	'SYS$LIBRARY:STARLET';
+LIBRARY	'SYS$LIBRARY:XPORT';
+
+%IF %DECLARED(%QUOTE $DESCRIPTOR) %THEN UNDECLARE %QUOTE $DESCRIPTOR; %FI
+
+LINKAGE
+	JSB_ONE_STAT =	JSB (REGISTER=1): NOTUSED(2,3,4,5,6,7,8,9,10,11);
+
+FORWARD ROUTINE
+    COND_HAND,			! Handle exception conditions
+    SOR_ERROR,			! Issue an error diagnostic
+    SOR$ENTRY,			! Main entry point
+    INIT_STATS,			! Get initial statistics
+    ONE_STAT:	JSB_ONE_STAT,	! Get one statistic
+    PRINT_STATS;		! Print sort/merge statistics
+
+EXTERNAL ROUTINE
+    SOR$$COMMAND,					! Parse command line
+    SOR$$OUTPUT,					! Output text
+    SOR$SORT_MERGE:	ADDRESSING_MODE(GENERAL),	! Sort the stuff
+    SOR$END_SORT:	ADDRESSING_MODE(GENERAL),	! Terminate sort/merge
+    SOR$STAT:		ADDRESSING_MODE(GENERAL),	! Get a statistic
+    LIB$FIXUP_FLT:	ADDRESSING_MODE(GENERAL),
+    LIB$FIXUP_DEC:	ADDRESSING_MODE(GENERAL),
+    LIB$SIGNAL:		ADDRESSING_MODE(GENERAL);
+
+MACRO
+    BASE_ =	0, 0, 0, 0 %;
+
+EXTERNAL LITERAL
+    SORT$_FACILITY;
+BIND
+    SOR$_SHR_SYSERROR = SHR$_SYSERROR + STS$K_SEVERE + SORT$_FACILITY ^ 16;
+
+! FAO string used to output statistics via SYS$PUTMSG.
+!
+! The following text interacts closely with the code in PRINT_STATS.
+! The text can, however, be changed (translated) independent of the code, if
+! the control string still uses the same FAO parameters, and text expands to
+! no more than 1024 characters (a restriction of the way that the text is
+! output), and lines are separated by carraige-return/line-feed pairs.
+!
+! Note that the use of tab character in the text is avoided, since
+! some terminals may not have tab stops at multiples of eight.
+!
+MACRO
+    STR_STATS = %EXPAND %STRING(
+	%IF %SWITCHES(DEBUG)
+	%THEN '!/!18* VAX Sort/Merge !AC Statistics'
+	%ELSE '!/!18* VAX Sort/Merge !+Statistics' %FI,
+	'!/',
+	'!/Records read:!12UL',		'!10* Input record length:!9UL',
+	'!/Records sorted:!10UL',	'!10* Internal length:!13UL',
+	'!/Records output:!10UL',	'!10* Output record length:!8UL',
+	'!/Working set extent:!6UL',	'!10* Sort tree size:!14UL',
+	'!/Virtual memory:!10UL',	'!10* Number of initial runs:!6UL',
+	'!/Direct I/O:!14UL',		'!10* Maximum merge order:!9UL',
+	'!/Buffered I/O:!12UL',		'!10* Number of merge passes:!6UL',
+	'!/Page faults:!13UL',		'!10* Work file allocation:!8UL',
+	'!/Elapsed time: !14%T',	'!7* Elapsed CPU:!6* !14%T',
+	'') %;
+
+! Besides information that is stored in the context area for statistics,
+! a save area is used to store initial values of some statistics.
+!
+FIELD
+    STAT_FIELDS =
+	SET
+	STAT_BUFIO =	[$INTEGER],	! Buffered I/O count
+	STAT_CPUTIM =	[$INTEGER],	! CPU time
+	STAT_START =	[$SUB_BLOCK(2)],! Start time (quadword)
+	STAT_DIRIO =	[$INTEGER],	! Direct I/O count
+	STAT_PAGEFLTS =	[$INTEGER],	! Page faults
+	STAT_FREP0VA =	[$INTEGER]	! Free page in P0 space
+	TES;
+LITERAL
+    STAT_K_SIZE =	$FIELD_SET_SIZE; ! Size of save area for statistics
+MACRO
+    STAT_BLOCK =	BLOCK[STAT_K_SIZE] FIELD(STAT_FIELDS) %;
+
+OWN
+    CONTEXT:	LONG,			! Context parameter
+    STATS:	STAT_BLOCK,		! Block to save statistics
+    BUFIO,
+    CPUTIM:	VECTOR[2],
+    DIRIO,
+    PAGEFLTS,
+    FREP0VA,
+    WSEXTENT,
+    SOR_SEV,
+    SOR_STS;
+BIND
+    ITMLST = UPLIT(
+	WORD(4,JPI$_BUFIO), BUFIO, 0,
+	WORD(4,JPI$_CPUTIM), CPUTIM, 0,
+	WORD(4,JPI$_DIRIO), DIRIO, 0,
+	WORD(4,JPI$_PAGEFLTS), PAGEFLTS, 0,
+	WORD(4,JPI$_FREP0VA), FREP0VA, 0,
+	WORD(4,JPI$_WSEXTENT), WSEXTENT, 0,
+	0);
+
+ROUTINE COND_HAND
+	(
+	SIGVEC:	REF BLOCK[,BYTE],		! Signal vector
+	MCHVEC:	REF BLOCK[,BYTE]		! Mechanism vector
+	) =
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Condition handler for errors occurring during sort/merge.
+!	The returned R0 is set to the error message.
+!
+! FORMAL PARAMETERS:
+!
+!	SIGVEC.ra.r		The signal vector
+!	MCHVEC.ra.r		The mechanism vector
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	Status code.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+    BEGIN
+
+    ! If we are unwinding, just return
+    !
+    IF .SIGVEC[CHF$L_SIG_NAME] EQL SS$_UNWIND THEN RETURN SS$_RESIGNAL;
+
+
+    ! If SS$_ROPRAND, then try using LIB$FIXUP_FLT/DEC
+    !
+    IF .SIGVEC[CHF$L_SIG_NAME] EQL SS$_ROPRAND
+    THEN
+	BEGIN
+	BUILTIN
+	    AP,
+	    CALLG;
+	LOCAL
+	    SIG_PC:	REF VECTOR[,BYTE],	! PC of bad instruction
+	    STATUS;
+
+	SIG_PC = .VECTOR[SIGVEC[BASE_], .SIGVEC[CHF$L_SIG_ARGS]-1];
+
+	! Repair the operand, based on the opcode
+	!
+	STATUS = (SELECTONE .SIG_PC[0] OF
+	    SET
+	    [OP$_CVTTP, OP$_CVTSP]:		CALLG(.AP, LIB$FIXUP_DEC);
+	    [OP$_CMPF, OP$_CMPD, OP$_ESCD]:	CALLG(.AP, LIB$FIXUP_FLT);
+	    [OTHERWISE]:			0;
+	    TES);
+
+	IF .STATUS EQL SS$_NORMAL
+	THEN
+	    BEGIN
+	    !
+	    ! We managed to repair the problem.
+	    ! However, we should let the user know that an error occured.
+	    !
+	    EXTERNAL LITERAL SOR$_ROPRAND;
+	    LIB$SIGNAL(SOR$_ROPRAND);
+	    RETURN SS$_NORMAL;
+	    END;
+	END;
+
+
+    ! Set the returned R0 value
+    !
+    MCHVEC[CHF$L_MCH_SAVR0] = .SIGVEC[CHF$L_SIG_NAME];
+
+    ! Hang onto the worst error we've seen
+    !
+    BEGIN
+    BIND CVT_SEV = UPLIT BYTE(2,0,3,1,4,5,6,7): VECTOR[,BYTE];
+    LOCAL SEV;
+    SEV = .CVT_SEV[.BLOCK[SIGVEC[CHF$L_SIG_NAME],STS$V_SEVERITY;,BYTE]];
+    IF .SEV GTRU .SOR_SEV
+    THEN
+	BEGIN
+	SOR_SEV = .SEV;
+	SOR_STS = .SIGVEC[CHF$L_SIG_NAME] OR STS$M_INHIB_MSG;
+	END;
+    
+    END;
+
+    ! Resignal the error.  If the severity of the error is Success, Info,
+    ! Warning, or Error, execution will continue.
+    !
+    RETURN SS$_RESIGNAL;
+
+    END;
+
+ROUTINE SOR_ERROR(ERR) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine signals an error diagnostic.
+!
+! FORMAL PARAMETERS:
+!
+!	Parameters passed to LIB$SIGNAL.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	System status (first parameter of signalled status), with the
+!	INHIB_MSG bit set.
+!
+! SIDE EFFECTS:
+!
+!	The image may be exitted due to the error.
+!
+!--
+    BEGIN
+    BUILTIN
+	AP,
+	CALLG;
+    LOCAL
+	STATUS;
+    CALLG(.AP, LIB$SIGNAL);
+    RETURN .ERR OR STS$M_INHIB_MSG;
+    END;
+
+GLOBAL ROUTINE SOR$ENTRY =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This is the main entry point to the SORT/MERGE utilities.
+!	This routine does the following:
+!
+!	Parse the command line.
+!	Process the specification file.
+!	Use the callable sort/merge routines to finish processing.
+!	Print statistics, if requested.
+!	Release allocated resources.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	System status code.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+    BEGIN
+    LOCAL
+	STATISTICS,			! Flag for whether statistics requested
+	SORT_FLAG,			! Flag indicating sort (not merge)
+	STATUS;				! Status
+
+
+
+    ! Initialize the severity and message to success
+    !
+    SOR_SEV = 0;
+    SOR_STS = SS$_NORMAL;
+
+    ! Establish a condition handler
+    !
+    (BUILTIN FP; .FP = COND_HAND);
+
+    ! Clear the context longword
+    !
+    CONTEXT = 0;
+
+    ! Initialize the statistics
+    !
+    STATUS = INIT_STATS();
+    IF NOT .STATUS THEN RETURN .STATUS;
+
+
+    ! Call SOR$$COMMAND to process the command line, call SPEC_FILE,
+    ! call PASS_FILES, and call INIT_SORT or INIT_MERGE.
+    !
+    ! The context parameter is not referenced by SOR$$COMMAND, it is
+    ! just passed to the callable interface routines.
+    !
+    ! SOR$$COMMAND sets or clears SORT_FLAG depending on whether
+    ! we were invoked for a sort or a merge, respectively.
+    !
+    ! SOR$$COMMAND sets or clears STATISTICS depending on whether
+    ! statistics were requested for the sort/merge.
+    !
+    STATUS = SOR$$COMMAND(
+	CONTEXT,
+	SORT_FLAG,
+	STATISTICS,
+	(BUILTIN AP; .AP));
+    IF NOT .STATUS THEN RETURN .STATUS;
+
+
+    IF .SORT_FLAG
+    THEN
+	BEGIN
+	!
+	! Call SORT_MERGE
+	!
+	STATUS = SOR$SORT_MERGE(CONTEXT);
+	IF NOT .STATUS THEN RETURN .STATUS;
+	END;
+
+
+    ! Put out the statistics, if requested.
+    !
+    IF .STATISTICS
+    THEN
+	BEGIN
+	STATUS = PRINT_STATS();
+	IF NOT .STATUS THEN RETURN .STATUS;
+	END;
+
+
+    ! Call END_SORT to clean up after ourselves
+    !
+    STATUS = SOR$END_SORT(CONTEXT);
+    IF NOT .STATUS THEN RETURN .STATUS;
+
+
+    ! Return the worst error we've seen
+    !
+    RETURN .SOR_STS;
+    END;
+
+ROUTINE INIT_STATS =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine initializes sort/merge statistics.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	System status value
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+    BEGIN
+    LOCAL
+	STATUS;
+
+    ! Get the statistics
+    !
+    STATUS = $GETJPI(ITMLST=ITMLST);
+    IF NOT .STATUS THEN RETURN SOR_ERROR(SOR$_SHR_SYSERROR, 0, .STATUS);
+    STATUS = $GETTIM(TIMADR=STATS[STAT_START]);
+    IF NOT .STATUS THEN RETURN SOR_ERROR(SOR$_SHR_SYSERROR, 0, .STATUS);
+
+    STATS[STAT_BUFIO] = .BUFIO;
+    STATS[STAT_CPUTIM] = .CPUTIM;
+    STATS[STAT_DIRIO] = .DIRIO;
+    STATS[STAT_PAGEFLTS] = .PAGEFLTS;
+    STATS[STAT_FREP0VA] = .FREP0VA;
+
+    RETURN SS$_NORMAL;
+    END;
+
+ROUTINE ONE_STAT
+	(
+	CODE
+	): JSB_ONE_STAT =
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine gets one sort/merge statistic.
+!
+! FORMAL PARAMETERS:
+!
+!	CODE.rl.v	Code of statistic to get
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	Value of the statistic
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+    BEGIN
+    LOCAL
+	RESULT,
+	STATUS;
+
+    RESULT = 0;
+    STATUS = SOR$STAT(CODE, RESULT, CONTEXT);
+
+    IF NOT .STATUS THEN SOR_ERROR(.STATUS);
+
+    RETURN .RESULT;
+    END;
+
+GLOBAL ROUTINE PRINT_STATS =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine prints sort/merge statistics.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	System status value
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+    BEGIN
+    %IF NOT %DECLARED(COM_K_BPERPAGE)
+	%THEN LITERAL COM_K_BPERPAGE = 512; %FI
+    BUILTIN
+	EMUL;
+    LOCAL
+	FINIS:	VECTOR[2],
+	CTRSTR:	VECTOR[2],
+	STATUS;
+    MACRO
+	S_(X) =
+	    (EXTERNAL LITERAL %NAME('SOR$K_',X): UNSIGNED(5);
+	    ONE_STAT(%NAME('SOR$K_',X))) %;
+
+    ! Get the statistics
+    !
+    STATUS = $GETJPI(ITMLST=ITMLST);
+    IF NOT .STATUS THEN RETURN .STATUS;
+    STATUS = $GETTIM(TIMADR=FINIS[0]);
+    IF NOT .STATUS THEN RETURN .STATUS;
+
+
+    ! Do a quadword subtract to compute the elapsed time.
+    !
+    BEGIN
+    BIND
+	T = STATS[STAT_START]:	VECTOR[2];
+    IF .FINIS[0] LSSU .T[0] THEN FINIS[1] = .FINIS[1] - 1;
+    FINIS[0] = .FINIS[0] - .T[0];
+    FINIS[1] = .FINIS[1] - .T[1];
+    END;
+
+
+    ! Compute the elapsed CPU time, and convert it from 10-millisecond units to
+    ! 100-nanosecond units (the standard VMS date/time format) by multiplying
+    ! by 100000.
+    !
+    CPUTIM[0] = .CPUTIM[0] - .STATS[STAT_CPUTIM];
+    EMUL(CPUTIM[0], %REF(100000), %REF(0), CPUTIM[0]);
+
+
+    ! Format and output the statistics
+    !
+    CTRSTR[0] = %CHARCOUNT(STR_STATS);
+    CTRSTR[1] = UPLIT BYTE(STR_STATS);
+    STATUS = SOR$$OUTPUT(CTRSTR,
+	S_(IDENT),			! Address of ASCIC ident string
+	S_(REC_INP),			! Records input
+	S_(LRL_INP),			! Record length
+	S_(REC_SOR),			! Records sorted
+	S_(LRL_INT),			! Internal record length
+	S_(REC_OUT),			! Records output
+	S_(LRL_OUT),			! Output record length
+	.WSEXTENT,			! Working-set
+	S_(NODES),			! Nodes in tree
+	(.FREP0VA - .STATS[STAT_FREP0VA])/COM_K_BPERPAGE,	! Memory used
+	S_(INI_RUNS),			! Number of runs
+	.DIRIO - .STATS[STAT_DIRIO],	! Direct I/O
+	S_(MRG_ORDER),			! Merge order
+	.BUFIO - .STATS[STAT_BUFIO],	! Buffered I/O
+	S_(MRG_PASSES),			! Merge passes
+	.PAGEFLTS - .STATS[STAT_PAGEFLTS],	! Page faults
+	S_(WRK_ALQ),			! Work file allocation
+	FINIS[0],			! Wall time
+	CPUTIM[0],			! CPU time
+	0);				! Dummy
+
+    IF NOT .STATUS THEN RETURN SOR_ERROR(SOR$_SHR_SYSERROR, 0, .STATUS);
+    RETURN SS$_NORMAL;
+    END;
+
+END
+ELUDOM

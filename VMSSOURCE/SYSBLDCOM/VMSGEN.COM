@@ -1,0 +1,437 @@
+$ !
+$ !	This is the interactive front end for a VMS build run.
+$ !
+$ !	It asks questions so as to set up the parameters with
+$ !		which to submit VMSNEWBLD as a batch job.
+$ !	
+$ MNT2 = 0
+$ INITIT = "NO"
+$ TARGDEV2 = ""
+$ TARGLABEL2 = ""
+$ OPTIONS = ""
+$ ! Turn off STOP_BUILD if it is set.
+$ IF F$TRNLNM("STOP_BUILD") .NES. "" THEN DEASSIGN/GROUP STOP_BUILD
+$
+$ASK_SOURCE:
+$ INQUIRE SRCDEV "Enter the mounted SOURCE device name [DISK$VMSMASTER:]"
+$ IF SRCDEV .EQS. "" THEN SRCDEV = "DISK$VMSMASTER:"
+$ On Warning Then Goto Ask_Source
+$ TEMP = F$GETDVI(SRCDEV,"ALLDEVNAM")
+$ ON WARNING THEN CONTINUE
+$ IF F$LOC(":",SRCDEV) .EQ. F$LEN(SRCDEV) THEN SRCDEV = SRCDEV + ":"
+$
+$ASK_VOLSET:
+$ INQUIRE VOLSET "Is the TARGET disk a volume set? [NO]"
+$ IF VOLSET .EQS. "" THEN VOLSET= "N"
+$ASK_TARGET:
+$ VOLNUM = ""
+$ IF VOLSET THEN VOLNUM = " (volume 1)"
+$ INQUIRE TARGDEV "Enter the TARGET device name''VOLNUM'"
+$ IF TARGDEV .EQS. "" THEN GOTO ASK_TARGET
+$
+$ On Warning Then Goto Ask_Target
+$ TARGDEV = F$GETDVI(TARGDEV,"ALLDEVNAM")
+$ TARGVOL = F$GETDVI(TARGDEV,"VOLNAM")
+$ ON WARNING THEN CONTINUE
+$ IF F$LOC(":",TARGDEV) .EQ. F$LEN(TARGDEV) THEN TARGDEV = TARGDEV + ":"
+$ TIME = F$TIME()
+$ IF F$EXTRACT(0,1,TIME) .EQS. " " THEN TIME[0,1]:="0"
+$ IF TARGVOL .EQS. "" .and VOLSET THEN -
+	TARGVOL = "RES" + F$EXTRACT(0,2,TIME) + F$EXTRACT(3,3,TIME) + "1"
+$ IF TARGVOL .EQS. "" THEN -
+	TARGVOL = "RES" + F$EXTRACT(0,2,TIME) + F$EXTRACT(3,3,TIME)
+$ TARGDEF = ""
+$
+$ INQUIRE TARGLABEL "Enter its volume label''VOLNUM' [''TARGVOL']"
+$ IF TARGLABEL .eqs. "" .and. TARGVOL .nes. "" Then -
+	TARGLABEL = TARGVOL
+$ IF .not. F$GETDVI(TARGDEV, "MNT") .or. TARGVOL .eqs. TARGLABEL THEN -
+	GOTO DSK1MNT
+$ WRITE SYS$OUTPUT "Volume mounted on ''TARGDEV' is not ''TARGLABEL'
+$ GOTO ASK_VOLSET
+
+$DSK1MNT:
+$ MNT1 = (F$GETDVI(TARGDEV,"VOLNAM").NES."")	! True if pack mounted
+$
+$ ! Get second volume label if needed
+$
+$ASK_TARGET2:
+$ IF .NOT. VOLSET THEN GOTO ONE_DISK
+$ INQUIRE TARGDEV2 "Enter the TARGET device name (volume 2)"
+$ IF TARGDEV2 .EQS. "" THEN GOTO ASK_TARGET2
+$
+$ TARGDEV2 = F$GETDVI(TARGDEV2,"ALLDEVNAM") 
+$ TARGVOL  = F$GETDVI(TARGDEV2,"VOLNAM")
+$ IF TARGVOL .eqs. "" THEN -
+	TARGVOL = F$EXTRACT (0, 'F$LEN(TARGLABEL)-1, TARGLABEL) + "2"
+$ TARGDEF = " [" + TARGVOL + "]"
+$
+$ INQUIRE TARGLABEL2 "Enter its volume label (different from volume 1)''TARGDEF'"
+$ IF TARGLABEL2 .eqs. "" Then TARGLABEL2 = TARGVOL
+$ IF .not. F$GETDVI(TARGDEV2, "MNT") .or. TARGVOL .eqs. TARGLABEL2 THEN -
+	GOTO DSK2MNT
+$ WRITE SYS$OUTPUT "Volume mounted on ''TARGDEV2' is not ''TARGLABEL2'
+$ GOTO ASK_VOLSET
+$
+$DSK2MNT:
+$ MNT2 = (F$GETDVI(TARGDEV2,"VOLNAM").NES."")	! True if pack mounted
+$TWO_DSK:
+$ IF MNT2 .AND. MNT1 THEN GOTO 25
+$ IF .NOT. MNT1 .AND. .NOT. MNT2 THEN GOTO TWO_INIT
+$ WRITE SYS$OUTPUT "ERROR - Only one volume of set mounted"
+$ GOTO ASK_VOLSET
+$TWO_INIT:
+$ INQUIRE INITIT "Do you wish to initialize ''TARGDEV' and ''TARGDEV2'?"
+$ IF .NOT. INITIT THEN GOTO TWO_MNT
+$ INIT /SYSTEM 'TARGDEV' 'TARGLABEL' -
+	/CLUSTER_SIZE=1 -	! to conserve space on RL02 kits
+	/OWNER_UIC=[11,177] -
+	/FILE_PROTECTION=(S:RW,O:RWED,G:R,W) -
+	/PROTECTION=(S:RW,O:RWED,G:RW,W=R) -
+	/NOHIGHWATER
+$ INIT /SYSTEM 'TARGDEV2' 'TARGLABEL2' -
+	/CLUSTER_SIZE=1 -
+	/OWNER_UIC=[11,177] -
+	/FILE_PROTECTION=(S:RW,O:RWED,G:R,W) -
+	/PROTECTION=(S:RW,O:RWED,G:RW,W=R) -
+	/NOHIGHWATER
+$TWO_MNT:
+$ GOTO ASK_VOLNAM
+
+$ASK_VOLNAM:
+$ VOLNAMDEF = F$EXTRACT (0, 'F$LEN(TARGLABEL)-1, TARGLABEL)
+$ INQUIRE VOLNAM "What is the volume set name? [''VOLNAMDEF']"
+$ IF VOLNAM .EQS. "" THEN VOLNAM = VOLNAMDEF
+$ IF VOLNAM .EQS. "" THEN GOTO ASK_VOLNAM
+$ CHKVOLNAM:=DISK$'VOLNAM
+$ IF F$TRNLNM(CHKVOLNAM) .EQS. "" THEN GOTO GOT_VOLNAM
+$ WRITE SYS$OUTPUT "Volume set name already in use"
+$ GOTO ASK_VOLNAM
+$GOT_VOLNAM:
+$ MOUNT/BIND=('VOLNAM') 'TARGDEV','TARGDEV2' 'TARGLABEL','TARGLABEL2' -
+	 /'F$LOGICAL("BUILD$MOUNT_TYPE")' /CACHE=LIMIT=100
+$ IF .NOT. INITIT THEN GOTO 25
+$ GOTO 15
+$ONE_DISK:
+$ VOLNAMDEF = ""
+$ IF MNT1 THEN GOTO 25
+$ INQUIRE INITIT "Do you wish to initialize ''TARGDEV'? [NO]"
+$ IF .NOT.  INITIT THEN GOTO ONE_MNT
+$DO_1_INIT:
+$ INIT /SYSTEM 'TARGDEV' 'TARGLABEL' -
+	/CLUSTER_SIZE=1 -	! to conserve space on RL02 kits
+	/OWNER_UIC=[11,177] -
+	/FILE_PROTECTION=(S:RW,O:RWED,G:R,W:R) -
+	/PROTECTION=(S:RW,O:RWED,G:R,W=R) -
+	/NOHIGHWATER
+$ONE_MNT:
+$ MOUNT 'TARGDEV' 'TARGLABEL' /'F$LOGICAL("BUILD$MOUNT_TYPE")' /CACHE=LIMIT=100
+$ IF .NOT. INITIT THEN GOTO 25
+$15:
+$ !
+$ ! Add the result disk (or disks) to SBSTARTUP.COM
+$ !
+$ MUNG = "$TECO MUNG"
+$ MUNG SYSBLDCOM$:EDITSBST,'TARGDEV' 'TARGLABEL','TARGDEV2' 'TARGLABEL2'
+$ !
+$ ! PUT THE SYSTEM DIRECTORIES ON THE TARGET DISK.
+$ !
+$ WRITE SYS$OUTPUT "Creating system directories for ",TARGDEV,"..."
+$ CREATE/DIRECTORY/PROT=W=RE 'TARGDEV'[SHRLIB]
+$ CREATE/DIRECTORY/PROT=W=RE 'TARGDEV'[SYSOBJ]	
+$ CREATE/DIRECTORY/PROT=W=RE 'TARGDEV'[SYSEXE]	
+$ CREATE/DIRECTORY/PROT=W=RE 'TARGDEV'[SYSLISTS]	
+$ CREATE/DIRECTORY/PROT=W=RE 'TARGDEV'[001001]	! SYSLIB synonym first
+$ SET FILE /ENTER='TARGDEV'[000000]SYSLIB.DIR;1 'TARGDEV'[000000]001001.DIR;1
+$ CREATE/DIRECTORY/PROT=W=RE 'TARGDEV'[SYSTEST]	
+$ CREATE/DIRECTORY/PROT=W=RE 'TARGDEV'[SYSMAINT]	
+$ CREATE/DIRECTORY/PROT=W=RE 'TARGDEV'[001002]	! SYSMSG synonym first
+$ SET FILE /ENTER='TARGDEV'[000000]SYSMSG.DIR;1 'TARGDEV'[000000]001002.DIR;1
+$ CREATE/DIRECTORY/PROT=W=RE 'TARGDEV'[SYSMGR]	
+$ CREATE/DIRECTORY/PROT=W=RE 'TARGDEV'[SYSHLP]	
+$ CREATE/DIRECTORY/PROT=W=RE 'TARGDEV'[SYSHLP.EXAMPLES]
+$ CREATE/DIRECTORY/PROT=W=RE 'TARGDEV'[SYSERR]	
+$ CREATE/DIRECTORY/PROT=W=RE 'TARGDEV'[SYSUPD]	
+$ CREATE/DIRECTORY/PROT=W=RE 'TARGDEV'[SYSCBI]
+$ CREATE/DIRECTORY/PROT=W=RE 'TARGDEV'[SYSBLDCOM]
+$ CREATE/DIRECTORY/PROT=W=RE 'TARGDEV'[CONSOLE.780]
+$ CREATE/DIRECTORY/PROT=W=RE 'TARGDEV'[CONSOLE.750]
+$ CREATE/DIRECTORY/PROT=W=RE 'TARGDEV'[CONSOLE.730]
+$25:
+$ IF F$GETDVI(SRCDEV,"ALLDEVNAM") .EQS. F$GETDVI(TARGDEV,"ALLDEVNAM") THEN GOTO 26
+$ GOTO 28
+$26:
+$ OPTIONS := 'OPTIONS'I
+$28:
+$ INQUIRE BLDFIL "Component list? [''SRCDEV'[SYSBLDCOM]VMSNEWBLD.DAT]"
+$ IF BLDFIL .EQS. "" THEN BLDFIL = "''SRCDEV'[SYSBLDCOM]VMSNEWBLD.DAT"
+$ ON CONTROLY THEN GOTO ABNORMAL_EXIT
+$ OPEN /SHARE /READ F1 'BLDFIL'
+$
+$ INQUIRE REPLY "Do you wish to do all PHASES of a build? [YES]"
+$ IF REPLY .EQS. "" THEN REPLY= "Y"
+$ IF .NOT. REPLY THEN GOTO 30
+$ BEGPHASE = "INIT"
+$ ENDPHASE = "END"
+$ GOTO 37
+$30:
+$ IF .NOT. INITIT THEN GOTO 30A
+$ BEGPHASE = "INIT"
+$ WRITE SYS$OUTPUT "The INIT phase will be run on newly initialized ''TARGDEV'."
+$ GOTO 31
+$30A:
+$ INQUIRE BEGPHASE "Enter initial phase name"
+$ T1 = F$ELEM(0,"_",BEGPHASE)
+$ IF T1 .EQS. "INIT" THEN GOTO 31
+$ IF T1 .EQS. "UPDATE" THEN GOTO 31
+$ IF T1 .EQS. "SRCLIB" THEN GOTO 31
+$ IF T1 .EQS. "ASSEM" THEN GOTO 31
+$ IF T1 .EQS. "OBJLIB" THEN GOTO 31
+$ IF T1 .EQS. "LNKLIB" THEN GOTO 31
+$ IF T1 .EQS. "LINK" THEN GOTO 31
+$ IF T1 .EQS. "RESULT" THEN GOTO 31
+$ IF BEGPHASE .EQS. "END" THEN GOTO 31
+$ GOTO 30A
+$31:
+$ INQUIRE ENDPHASE "Enter final phase name ([END])"
+$ IF ENDPHASE .EQS. "" THEN ENDPHASE = "END"
+$ T1 = F$ELEM(0,"_",ENDPHASE)
+$ IF T1 .EQS. "INIT" THEN GOTO 35
+$ IF T1 .EQS. "UPDATE" THEN GOTO 35
+$ IF T1 .EQS. "SRCLIB" THEN GOTO 35
+$ IF T1 .EQS. "ASSEM" THEN GOTO 35
+$ IF T1 .EQS. "OBJLIB" THEN GOTO 35
+$ IF T1 .EQS. "LNKLIB" THEN GOTO 35
+$ IF T1 .EQS. "LINK" THEN GOTO 35
+$ IF T1 .EQS. "RESULT" THEN GOTO 35
+$ IF T1 .EQS. "END" THEN GOTO 35
+$ GOTO 31
+$35:
+$37:
+$ INQUIRE REPLY "Do you wish to do all components? [YES]"
+$ IF REPLY .EQS. "" THEN REPLY= "Y"
+$ IF .NOT. REPLY THEN GOTO 50
+$ BEGIN = "BEGIN"
+$ END = "END"
+$ IF .NOT. (BEGPHASE .EQS. "INIT" .AND. ENDPHASE .EQS. "END" -
+	.AND. .NOT. INITIT) THEN GOTO 60
+$ WRITE SYS$OUTPUT "% WARNING!  The result disk should be re-initialized on full builds."
+$ WRITE SYS$OUTPUT "% To initialize the result disk, dismount it before invoking this procedure."
+$ INQUIRE REPLY "Do you wish to continue? [NO]"
+$ IF REPLY .EQS. "" THEN REPLY = "N"
+$ IF REPLY THEN GOTO 60
+$ EXIT
+$50:
+$ INQUIRE REPLY "Do you want to build more than one component? [NO]"
+$ IF REPLY .EQS. "" THEN REPLY = "NO"
+$ IF REPLY THEN GOTO GET_MULTI_COMPONENTS
+$ INQUIRE/NOPUNC BEGIN "Enter component name: "
+$ IF BEGIN .EQS. "" THEN GOTO 50
+$ READ /KEY="''BEGIN' " /INDEX=0 /NOLOCK /ERROR=55 F1 LINE
+$ END = BEGIN
+$ GOTO 60
+$55:
+$ WRITE SYS$OUTPUT "% Component ''BEGIN' not found in ''TFILE'"
+$ GOTO 50
+$
+$60:
+$ IF BEGPHASE .EQS. "INIT" THEN GOTO GET_ENH
+$ IF BEGIN .EQS. "BEGIN" .AND. END .EQS. "END" THEN GOTO GET_ENH
+$ ! Ensure that phase record for facility exists.
+$62:
+$ T1 = F$EXT(16,16,LINE)
+$ T2 = F$ELEM(0," ",T1)
+$ IF BEGPHASE .EQS. T2 THEN GOTO GET_ENH
+$ T1 = F$ELEM(0,"_",T2)
+$ IF BEGPHASE .NES. T1 THEN GOTO 64
+$ IF ENDPHASE .EQS. BEGPHASE THEN ENDPHASE = T2
+$ BEGPHASE = T2
+$ WRITE SYS$OUTPUT "% Actual phase ''BEGPHASE' will be run for component ''BEGIN'"
+$ GOTO GET_ENH
+$64:
+$ READ /NOLOCK /ERR=65 /END=65 F1 LINE
+$ IF F$ELEM(0," ",LINE) .NES. BEGIN THEN GOTO 65
+$ GOTO 62
+$65:
+$ WRITE SYS$OUTPUT "% Phase ''BEGPHASE' record not found for component ''BEGIN'"
+$ GOTO ABNORMAL_EXIT
+
+$GET_MULTI_COMPONENTS:
+$ TFILE = "''TARGDEV'[SYSBLDCOM]VMSNEWBLD.DAT"
+$ IF F$LOC("I",OPTIONS) .NE. F$LEN(OPTIONS) THEN TFILE="SYS$LOGIN:VMSNEWBLD.DAT"
+$
+$ create /fdl=sys$input 'tfile'
+FILE
+	BEST_TRY_CONTIGUOUS     no
+	BUCKET_SIZE             7
+	CLUSTER_SIZE            1
+	CONTIGUOUS              no
+	EXTENSION               5
+	GLOBAL_BUFFER_COUNT     0
+	ORGANIZATION            indexed
+
+RECORD
+	BLOCK_SPAN              yes
+	CARRIAGE_CONTROL        carriage_return
+	FORMAT                  variable
+	SIZE                    255
+
+AREA 0
+	ALLOCATION              3
+	BUCKET_SIZE             5
+	EXTENSION               5
+
+AREA 1
+	ALLOCATION              6
+	BUCKET_SIZE             5
+	EXTENSION               5
+
+AREA 2
+	ALLOCATION              0	! Not accumulated for this file.
+	BUCKET_SIZE             7
+	EXTENSION               7
+
+AREA 3
+	ALLOCATION              9
+	BUCKET_SIZE             7
+	EXTENSION               7
+
+KEY 0
+	CHANGES                 no
+	DATA_KEY_COMPRESSION    yes
+	DATA_RECORD_COMPRESSION yes
+	DATA_AREA               0
+	DATA_FILL               100
+	DUPLICATES              yes
+	INDEX_AREA              1
+	INDEX_COMPRESSION       yes
+	INDEX_FILL              100
+	LEVEL1_INDEX_AREA       1
+	NAME                    "Facility_name"
+	NULL_KEY                no
+	PROLOG                  3
+	SEG0_LENGTH             15
+	SEG0_POSITION           0
+	TYPE                    string
+
+KEY 1
+	CHANGES                 yes
+	DATA_KEY_COMPRESSION    yes
+	DATA_AREA               2
+	DATA_FILL               100
+	DUPLICATES              yes
+	INDEX_AREA              3
+	INDEX_COMPRESSION       yes
+	INDEX_FILL              100
+	LEVEL1_INDEX_AREA       3
+	NAME                    "Build_phase"
+	NULL_KEY                no
+	SEG0_LENGTH             15
+	SEG0_POSITION           16
+	TYPE                    string
+$ open /share /read /write f2 'tfile'
+$ write f2 "AAAAAA          AAAAAA          "
+$multi_10:
+$ inquire fac "Component"
+$ if fac .eqs. "" then goto multi_done
+$ read /key="''fac' " /error=multi_nofac f1 record
+$multi_20:
+$ write f2 record
+$ read /error=multi_10 /end=multi_10 f1 record
+$ if f$elem(0," ",record) .eqs. fac then goto multi_20
+$ goto multi_10
+$multi_done:
+$ close f2
+$ BLDFIL = TFILE
+$ BEGIN = "BEGIN"
+$ END = "END"
+$ goto get_enh
+$multi_nofac:
+$ write sys$output "Facility ''fac' not found."
+$ goto multi_10
+
+$GET_ENH:
+$ CLOSE F1
+$ ! If more than 1 facility is to be done, then we need a read/write
+$ ! build database for the build_master to use to keep track of the jobs.
+$ IF BEGIN .EQS. END THEN GOTO 71
+$ TFILE := 'TARGDEV'[SYSBLDCOM]VMSNEWBLD.DAT
+$ IF F$LOC("I",OPTIONS) .NE. F$LEN(OPTIONS) THEN TFILE="SYS$LOGIN:VMSNEWBLD.DAT"
+$ IF TFILE .NES. BLDFIL THEN COPY /LOG 'BLDFIL' 'TFILE'
+$ BLDFIL = TFILE
+$71:
+$ ON CONTROLY THEN EXIT	! Don't need CTRL/Y handler now that file is closed
+$
+$ IF BEGPHASE .NES. "INIT" .OR. -
+	BEGIN .NES. "BEGIN" .OR. END .NES. "END" THEN GOTO 80
+$ WRITE SYS$OUTPUT "Incrementing system version number for build..."
+$ SET NOON
+$ @'SRCDEV'[SYSBLDCOM]NEXTVERS
+$ COPY/LOG WRKD$:[SYS.SRC]VERSION.MAR 'SRCDEV'[SYS.SRC]
+$ COPY/LOG WRKD$:[SYS.SRC]VERSION.MAR 'SRCDEV'[SYS.BUGSRC]
+$ SET ON
+$80:
+$
+$ INQUIRE REPLY "Is this an ENH build? [YES]"
+$ IF REPLY .EQS. "" THEN REPLY = "YES"
+$ IF .NOT. REPLY THEN OPTIONS = OPTIONS + "B"
+$
+$ INQUIRE REPLY "Do you want this build to be restartable? [YES]"
+$ IF REPLY .EQS. "" THEN REPLY = "YES"
+$ IF REPLY THEN OPTIONS = OPTIONS + "R"
+$
+$74:
+$ INQUIRE REPLY "Postfix for process names used in build (0=_T,1=_C) [none]"
+$ IF REPLY .EQS. "" THEN GOTO 75
+$ IF REPLY .EQS. "0" THEN GOTO 75
+$ IF REPLY .EQS. "1" THEN GOTO 75
+$ GOTO 74
+$75:
+$ IF REPLY .NES. "" THEN OPTIONS:='OPTIONS'N'REPLY'
+$
+$ INQUIRE REPLY "What should be the process priority of the build? [4]"
+$ IF REPLY .NES. "" THEN OPTIONS:='OPTIONS'P'REPLY'
+$
+$ SHOW SYMBOL BEGPHASE
+$ SHOW SYMBOL ENDPHASE
+$ SHOW SYMBOL BEGIN
+$ SHOW SYMBOL END
+$ SHOW SYMBOL SRCDEV
+$ SHOW SYMBOL TARGDEV
+$ SHOW SYMBOL OPTIONS
+$ SHOW SYMBOL BLDFIL
+$ INQUIRE REPLY "Are you satisfied to submit this job? [YES]"
+$ IF REPLY .EQS. "" THEN REPLY= "Y"
+$ IF .NOT. REPLY THEN EXIT
+$ !
+$ !	SUBMIT THE SYSTEM BUILD BATCH JOB
+$ !
+$ TIMEARG = ""
+$ INQUIRE REPLY "Submit immediately? [YES]"
+$ IF REPLY .EQS. "" THEN REPLY= "Y"
+$ IF REPLY THEN GOTO SUBMIT
+$ WRITE SYS$OUTPUT "The time is now ''F$TIME()'."
+$ INQUIRE DELAY "Enter the time to start the job"
+$ TIMEARG = "/AFTER=""''DELAY'"""
+$SUBMIT:
+$ JOBNAME = "BUILD_MASTER"
+$ IF BEGIN .EQS. END THEN JOBNAME = BEGIN
+$ IF BEGPHASE .EQS. ENDPHASE THEN JOBNAME := 'BEGPHASE'_'BEGIN'
+$ IF OPTIONS .EQS. "" THEN OPTIONS = "X"	! MUST BE NON NULL
+$ RESTART = ""
+$ NOTIFY = ""
+$ IF BEGIN .EQS. END THEN NOTIFY = "/NOTIFY"
+$ IF F$LOC("R",OPTIONS) .EQ. F$LEN(OPTIONS) THEN GOTO SUBMIT20
+$ RESTART = "/RESTART"
+$SUBMIT20:
+$ SUBMIT 'SRCDEV'[SYSBLDCOM]VMSNEWBLD -
+	/NOPRINT'NOTIFY'/LOG='TARGDEV'[SYSBLDCOM]'JOBNAME' -
+	'RESTART'/QUEUE=SYS$BUILD-
+	'TIMEARG'/NAME='JOBNAME' -
+	/PARAM=('BEGPHASE':'ENDPHASE','BEGIN':'END', -
+		'TARGDEV','SRCDEV','OPTIONS','BLDFIL')
+$ EXIT
+$
+$ABNORMAL_EXIT:
+$ IF F$LOGICAL("F1") .NES. "" THEN CLOSE F1
+$ IF F$LOGICAL("F2") .NES. "" THEN CLOSE F2

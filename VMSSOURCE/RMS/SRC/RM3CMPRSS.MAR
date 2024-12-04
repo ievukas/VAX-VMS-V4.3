@@ -1,0 +1,795 @@
+	$BEGIN	RM3CMPRSS,000,RM$RMS3,<>,<PIC,NOWRT,QUAD>
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+;
+; Facility:	RMS32 Index Sequential File Organization
+;
+; Abstract:
+;
+;	This modules contains the routines to handle compressed buckets
+;	and compressed records.
+;
+; Environment: 		VAX/VMS Operating System
+;
+; Author:  	Todd M. Katz		Creation Date:  13-Aug-1982
+;
+; Modified By:
+;
+;	V03-008	TMK0006		Todd M. Katz		03-Feb-1983
+;		Add support for Recovery Unit Journalling and RU ROLLBACK
+;		Recovery of ISAM files. This involves a change to RM$SRCH_CMPR.
+;		Check both for IRC$V_DELETED and IRC$V_RU_DELETED before setting
+;		the IRB$V_DUPS_SEEN flag. Previously, just IRC$V_DELETED was 
+;		being checked.
+;
+;	V03-007	TMK0005		Todd M. Katz		16-Sep-1982
+;		The field IRB$B_SRCHFLAGS has been changed to a word in size.
+;		Fix all the references to it. 
+;
+;		If a record is encountered with a key that is an exact duplicate
+;		of the search key, then set the bit IRB$V_DUP_KEY regardless
+;		of whether the record is or isn't marked deleted if RMS is 
+;		currently positioning for insertion.
+;
+;		Performance enhancement. RMS does not have to call 
+;		RM$GETNEXT_REC to position to the next record in the bucket.
+;		If this is an index record, then the address of the next record 
+;		is REC_ADDR + current key size + 2 for compression overhead. 
+;		If this is anyother type of record, (primary data or SIDR) then
+;		RMS knows that the record size field makes up the last two bytes
+;		of the record overhead, and can use the quantity there + the
+;		record overhead to position to the next record.
+;
+;		At the present time, RMS positions past deleted records even 
+;		when the search would otherwise be terminated because of the
+;		key value of the current record, the search key value, and the
+;		goal of the search. This is incorrect, and inconsistant with the
+;		manner in which the rest of the searching is performed. It 
+;		creates problems during next record positioning which always
+;		tries to first position to the current record before positioning
+;		to the next record, and thus, could end up positioning past a
+;		stream's internal current record because its marked deleted, and
+;		therefore wrongly assume that the record had been completely
+;		deleted from the file. The solution to this problem is to return
+;		the record that the search terminates at regardless of whether
+;		the record is or isn't marked deleted, and to let the upper 
+;		level routines decide what to do if the record is in fact marked
+;		deleted.
+;
+;		At the present time, RM$SRCH_CMPR always starts its search with
+;		the first record in the current bucket. This is unacceptable 
+;		because of the above made change - ie, searches may now 
+;		terminate with deleted records, and thus, may have to resume 
+;		positioning somewhere within the bucket in order to find a 
+;		non-deleted record. Fortunately, this change is easy to make
+;		provided several assumptions hold:
+;
+;		1. The goal of the search does not change between invocations 
+;		   of RM$SRCH_CMPR.
+;
+;		2. The search key does not change between invocations of 
+;		   RM$SRCH_CMPR.
+;
+;		2. The bucket being searched is kept locked between invocations
+;		   of this routine.
+;
+;		3. The keys are always in ascending order in the bucket, and the
+;		   compression of these keys are always correct.
+;
+;		If these assumptions hold true, then it will always possible to
+;		resume the search in the middle of a bucket, and return whether
+;		the next record has a key value equal to (if the goal of the
+;		search is EQ) or GT (if the goal of the search is GT or EQ) the
+;		search key.
+;
+;	V03-006	KBT0159		Keith B. Thompson	21-Aug-1982
+;		Reorganize psects
+;
+;	V03-005	TMK0004		Todd M. Katz		13-Aug-1982
+;		Completely re-wrote the routine responsible for searching 
+;		compressed buckets, and the routine responsible for determining
+;		the amount of front compression of records.
+;
+;		Added support for prologue 3 SIDRs to both the compressed key 
+;		bucket searching routine and the front compression determining 
+;		routine.
+;
+;--
+
+	.SBTTL	DEFINITIONS
+
+
+;
+; Internal Structure Symbol Definitions
+;
+
+	$BKTDEF
+	$IRBDEF
+	$IFBDEF
+	$IRCDEF
+	$IDXDEF	
+
+	.SBTTL	RM$SRCH_CMPR - Search a Compressed Index, SIDR, or Data Bucket
+;+++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine performs an equal search or a greater-than search on a
+;	primary data, SIDR, or index bucket with compressed key records using 
+;	the search key found in keybuffer 2. The search may start with the first
+;	record in the bucket, or with a record somewhere in the middle of the
+;	bucket. When the search is completed, REC_ADDR is positioned to the 
+;	record to be returned, and R0 contains the status of the search. 
+;
+;	This routine makes some basic assumptions which can not be violated
+;	without expecting totally unpredicatble search results.
+;
+;	1. It is assumed that the keys of the records in the bucket are strictly
+;	   in ascending order, and that they are always as fully compressed
+;	   as they can be for the position they occupy.
+;
+;	2. The two key compression bytes always follow whatever record overhead
+;	   is present in the record (if any), regardless of the bucket type. The
+;	   first key compression byte is always the number of bytes of key 
+;	   present, and the second key compression byte is always the amount of
+;	   front compression of the key. 
+;
+;	3. Record overhead is a fixed quantity for each record type. 
+;	   Furthermore, if a record has record overhead associated with it, the
+;	   record's size minus the record overhead is always stored in the last
+;	   two bytes of record overhead.
+;
+;	4. Whenever RMS is positioning for insertion it performs a greater-than
+;	   search.
+;
+;	5. The decision to terminate a search is based on the goal of the search
+;	   and the outcome of the comparison between the key of the record being
+;	   returned and the search key. It is never based on anything else about
+;	   the record, for example, whether the record is marked deleted or not.
+;
+;	6. If this routine is called to resume a search within a bucket then:
+;
+;	   a. The bucket has been locked between routine invocations.
+;	   b. IRAB[IRB$L_LST_NCMP] still points to the last record with a zero 
+;	      front-compressed key.
+;	   c. The goal of all consecutive routine invocations is identical 
+;	      (either EQ or GT).
+;	   d. The search key has not changed between routine invocations.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	RM$SRCH_CMPR
+;
+; INPUT PARAMETERS:
+;
+;	R1	- if 0, greater-than or equal search
+;	       	  if 1, greater-than search
+;
+; IMPLICIT INPUT:
+;
+;	R5	- BKT_ADDR		- address of bucket
+;		      BKT$W_FREESPACE	- offset to first free byte in bucket
+;		      BKT$B_INDEXNO	- key of reference of bucket
+;		      BKT$B_LEVEL	- level of bucket 
+;
+;	R6	- REC_ADDR		- address of where to begin search
+;
+;	R7	- IDX_DFN		- address of index descriptor
+;
+;	R9	- IRAB			- address of IRAB
+;		      IRB$L_KEYBUF	- address of contigious keybuffers
+;		      IRB$B_KEYSZ	- size of the search key
+;		      IRB$V_LAST_GT	- if set, GT search result ocurred
+;		      IRB$V_POSINSERT	- if set, positioning for insertion
+;		      IRB$W_SRCHFLAGS	- search flags
+;
+;	R10	- IFAB			- address of IFAB
+;		      IFB$W_KBUFSZ	- size of each keybuffer
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUT:
+;
+;	IRB$V_DUP_KEY	- if set, there is at least one data record in the file
+;			  (deleted or otherwise) with a key identical to that of
+;			  the search key
+;	IRB$V_DUPS_SEEN	- if set, there is at least one primary data record with
+;			  a key identical to that of the search key.
+;	IRB$V_LAST_GT	- if set, the result of this search was that the search 
+;			  key was less than the record positioned to,
+;	IRB$L_LST_NCMP	- address of last key with no front compression
+;	IRB$L_LST_REC	- address of last primary data record in duplicate chain
+;	IRB$L_REC_COUNT - number of the record found
+;	REC_ADDR	- address of record found
+;
+; ROUTINE VALUE:
+;
+;	R0:  -1, search key < record found
+;	      0, search key = record found
+;	      1, search key > all records in the bucket
+;
+; SIDE EFFECTS:
+;
+;	If positioning for insertion within a primary data bucket, and a record
+;	with a key value duplicate of the key of the record to be inserted is
+;	encountered, IRB$V_DUP_KEY is set, IRB$V_DUPS_SEEN is set (provided 
+;	the record is not marked deleted), and the address of the record is 
+;	placed in IRB$L_LST_REC. In fact at the conclusion of the search, this 
+;	same field will contain the address of the last such duplicate 
+;	encountered while REC_ADDR points to the record that follows it which 
+;	is where the new record will be inserted. Of course, if the bucket is a
+;	SIDR bucket, then there can only be one instance of a record with a
+;	given key value in a bucket.
+;
+;	Whenever the search key is greater that the key of all the records in 
+;	the bucket, then REC_ADDR is left positioned at the end of the bucket 
+;	when this status is returned. This is independent of bucket type.
+;
+;---
+
+RM$SRCH_CMPR::
+	PUSHR	#^M<R1,R2,R3,R4,R8,R11>	; save the working registers
+
+
+;
+; Register Usage:
+;
+; R0  - Result of the comparison between the search key and the "last" record.
+;
+; R1  - Set to the type of bucket for determining the amount of record overhead.
+;     - Number of bytes of search key and record key to be compared.
+;     - Scratch register.
+;
+; R2  - Offset in the search key to the byte where the comparison between the
+;	search key and the key of the "current" record is to begin.
+;
+; R3  - Working register for CMPC3 and CMPC5.
+;	Working register during next record positioning.
+;
+; R4  - Number of bytes of record overhead, not including key compression bytes.
+;
+; R5  - Address of the beginning of the bucket in memory.
+;
+; R6  - Address in memory of the current record in the bucket.
+;
+; R7  - Address of the index descriptor.
+;
+; R8  - Address in memory of the first free byte in the bucket. Effectively the
+;	address of the end of the bucket.
+;
+; R9  - Address of the IRAB.
+;
+; R10 - Address of the IFAB.
+;
+; R11 - Address of keybuffer 2. Effectively the address of the search key.
+;
+
+	MOVZWL	BKT$W_FREESPACE(R5),R8	; compute the address of the first free
+	ADDL2	R5,R8			; byte in the bucket, and put it in R8
+
+	CMPL	R6,R8			; if the bucket is empty, return a GT
+	BLSSU	1$			; status (primary data or SIDR buckets)
+	BRW	140$			; otherwise continue
+
+1$:	MOVZBL	BKT$B_LEVEL(R5),R1	; if this is an index bucket, then as
+	BEQLU	5$			; index records do not contain any
+	CLRL	R4			; overhead intialize R4 to 0, and skip
+	BRB	15$			; call to determine record overhead
+
+5$:	TSTB	BKT$B_INDEXNO(R5)	; if this is a primary data bucket, 
+	BEQLU	10$			; setup R1 with a 0, else it is a SIDR
+	MNEGL	#1,R1			; bucket and a -1 is placed in R1
+
+10$:	BSBW	RM$REC_OVHD		; determine the amount of overhead in 
+	MOVL	R0,R4			; each record and store it in R4
+
+	ADDL3	#BKT$C_OVERHDSZ,R5,R1	; get address of first record in bucket
+
+	CMPL	R1,R6			; if RMS is to start search with first
+	BEQLU	15$			; record, then go start search
+
+
+;
+; RMS is resuming a search, and not starting with the first record in the 
+; bucket. The rules for resuming a search are as follows:
+;
+; 1. If the goal of the search is GT, then as the previous record must have
+;    been GT the search key, so must the current record. Therefore the search
+;    can immediately terminate with this status. 
+;
+; 2. If the goal of the search is EQ, then if the number of bytes the current
+;    record's key is front compression is equal to or exceeds the size of the 
+;    search key, then the current record and the search key must also be EQ.
+;    Therefore, such a status can be immediately returned.
+;
+; 3. If the goal of the search is EQ, but the number of bytes the current 
+;    record's key is front compressed is less than the size of the search key,
+;    then the current record's key must be greater than the search key, and
+;    such a status maybe immediately returned.
+;
+
+	BBC	#IRB$V_LAST_GT,-	; if the result of the last routine
+		IRB$W_SRCHFLAGS(R9),12$	; invocation was LT, then so is the 
+11$:	BRW	90$			; result of this contigious invocation
+
+12$:	CMPB	1(R6)[R4],-		; determine whether the key of the
+		IRB$B_KEYSZ(R9)		; current record is equal to or
+	BLSSU	11$			; greater than the search key and
+13$:	BRW	110$			; return the appropriate status
+
+;
+; RMS is to start the search with the first record in the bucket. 
+;
+
+15$:	CSB	#IRB$V_LAST_GT,-	; if the search is starting with the
+		IRB$W_SRCHFLAGS(R9)	; first record in the bucket then there 
+					; is no previous context
+	MOVL	R6,IRB$L_LST_NCMP(R9)	; the first non-compressed record
+
+	MOVZWL	IFB$W_KBUFSZ(R10),R11	; compute the address of keybuffer 2
+	ADDL2	IRB$L_KEYBUF(R9),R11	; and place it in R11
+
+	CLRL	IRB$L_REC_COUNT(R9)	; RMS is positioned to the first record
+
+
+;
+; The only time it is ever necessary to compare the key of the current record
+; with the search key is when the number of bytes the key of the current record
+; is compressed is the same as the offset to the character in the search key
+; which terminated key comparison the last time it was done. The comparison is
+; now done to see whether this previous comparison terminating character (and 
+; implicitely the rest that follow it in the search key) is still greater then
+; its opposite in the key of the new current record.
+; 
+; The comparison starts in the search key with the character that had previously
+; terminated such a comparison, and the number of bytes of key to be compared
+; is the minimum of the number of bytes thus remaining in the search key and the
+; number of bytes in the key of the current record.
+;
+; Note that this strategy guarentees that a comparison is always done between 
+; the search key and the key of the first record in the bucket.
+;
+
+	CLRL	R2			; initialize the search key offset to 0
+
+20$:	MOVZBL	IRB$B_KEYSZ(R9),R1	; compute the number of bytes in the
+	SUBB2	R2,R1			; search key remaining to be compared
+
+	CMPB	R1,(R6)[R4]		; use the minimum of the search key 
+	BLEQU	30$			; bytes remaining and the current record
+	MOVZBL	(R6)[R4],R1		; key size as the key comparison size 
+
+30$:	CMPC3	R1,2(R6)[R4],(R11)[R2]	; if the search key is equal to or less
+	BEQLU	100$			; than the current record key process
+	BGTRU	90$			; accordingly, otherwise position to the
+	MOVZBL	#1,R0			; next record in the bucket
+
+;
+; Position to the record which follows the current record in the bucket. Before
+; performing this positioning, save the address of the old current record if it
+; was zero front compressed.
+;
+
+40$:	SUBL3	R11,R3,R2		; compute terminating search key offset
+
+50$:	TSTB	1(R6)[R4]		; if the key of the current record is
+	BNEQU	55$			; 0 front compressed, save its address
+	MOVL	R6,IRB$L_LST_NCMP(R9)	; before positioning to the next record
+
+55$:	TSTB	BKT$B_LEVEL(R5)		; if this is an index bucket then next
+	BEQL	60$			; record position equals the current 
+	MOVZBL	(R6),R3			; record position + current record key 
+	MOVAB	2(R6)[R3],R6		; size + two bytes for the key 
+	BRB	62$			; compression overhead
+
+60$:	ADDL2	R4,R6			; otherwise, next record position equals
+	MOVZWL	-2(R6),R3		; current record position + record 
+	ADDL2	R3,R6			; overhead + record size
+
+62$:	INCL	IRB$L_REC_COUNT(R9)	; increment the record counter
+
+;
+; There are a number of circumstances under which the result of the comparison
+; between the key of the new current record and the search key is known or can
+; be quickly determined without actually performing the comparison.
+;
+; 1. If RMS has positioned to the end of the bucket, or to a RRV record within 
+;    a primary data bucket then the search is terminated with a GT status.
+;
+; 2. If the search key was found to be equal to the key of the last record, but
+;    the front compression of the key of the current record is less than the
+;    size of the search key, then the search key will be less than the key of 
+;    new current record and it is processed as such. 
+;
+; 3. If the search key was found to be equal to the key of the last record, and
+;    the front compression of the key of the new current record is either equal
+;    to or greater-than the size of the search key, then the search key will 
+;    also be equal to the key of the new current record and is processed as 
+;    such. The front compression of the key of the new current record maybe 
+;    greater-than the size of the search key because RMS maybe performing a
+;    generic search with a search key smaller in size than the full size of a
+;    key for this key of reference.
+;
+; 4. If the search key was found to be greater-than the key of the last record,
+;    and the front compression of the key of the new current record is 
+;    greater-than the position in the search key where the last comparison
+;    terminated, then the search key will also be greater-than the key of the
+;    new current record and RMS proceeds to position to the next record.
+;
+; 5. If the search key was found to be greater-than the key of the last record,
+;    but the front compression of the key of the new current record is less-than
+;    the position in the search key where the last comparison terminated, then
+;    the search key will be less-than the key of the new current record and is 
+;    processed as such.
+;
+; In the remaining circumstances a direct comparison between the key of the new
+; current record and the search key is required, and is performed.
+;
+
+	CMPL	R6,R8			; if RMS is at the end of the bucket 
+	BGEQU	65$			; or has positioned ti a RRV record
+	BISB3	BKT$B_INDEXNO(R5),-	; in a primary data bucket then
+		BKT$B_LEVEL(R5),R1	; go return a status of GT (search key
+	BNEQU	70$			; greater than all the records in the 
+	BBC	#IRC$V_RRV,(R6),70$	; bucket)
+65$:	BRW	140$
+
+70$:	TSTL	R0			; if the last comparison's result was GT
+	BGTR	80$			; then go decide between cases 4 or 5 or
+					; whether a key comparison must be made
+
+	CMPB	1(R6)[R4],R2		; if CASE 2 holds true process as 
+	BLSSU	90$			; less-than, but if CASE 3 holds true
+	BRB	115$			; process as equal
+
+80$:	CMPB	1(R6)[R4],R2		; if CASE 4 holds true go position to 
+	BGTRU	50$			; the next record, but if CASE 5 holds
+	BEQLU	20$			; true process as less-than otherwise
+
+;
+; RMS has positioned to a record whose key is greater than that of the search
+; key. Return this status.
+;
+
+90$:	MNEGL	#1,R0			; setup the status in R0 to be LT and
+	SSB	#IRB$V_LAST_GT,-	; save that the result of this search
+		IRB$W_SRCHFLAGS(R9)	; was GT in case the search must resume
+	BRB	150$			; go return this status
+
+;
+; On an actual search key - current record key comparison, the parts of the
+; key that were compared were found to be equivalent. This does not necessairly
+; mean that the two keys are in fact identical. If the size of the search key
+; (including those characters front compressed but not rear-end truncated) is 
+; less than or equal to the size of the key of the current record, then in fact
+; the two keys are identical, and are processed as such. However, if because of
+; rear-end truncation the search key is greater in size then the key of the 
+; current record, then the comparison between the two keys must be continued. 
+; This is done by extending the key of the current record by the last character
+; present, and comparing the remaining bytes in the search key with it alone. If
+; the two keys are still identical they are processed as such; otherwise, they 
+; are processed depending on whether the search key is greater-than or 
+; less-than the key of the current record.
+;
+
+100$:	ADDB3	(R6)[R4],1(R6)[R4],R1	; if the size of the search key is 
+	CMPB	IRB$B_KEYSZ(R9),R1	; less-than or equal to the size of the
+	BLEQU	110$			; current record's key, process as equal
+
+	SUBL3	R11,R3,R2		; determine where in the search key the
+	CLRL	R3			; comparison stopped and how many search
+	SUBB3	R2,IRB$B_KEYSZ(R9),R3	; key bytes remain to be compared
+
+	MOVZBL	(R6)[R4],R1		; compute the offset to the last 
+	MOVAB	1(R4)[R1],R1		; character in the current record's key
+
+	CMPC5	#1,(R6)[R1],(R6)[R1],-	; compare the remaining search key bytes
+		R3,(R11)[R2]		; with the current record key's last
+	BGTRU	90$			; character, and continue processing
+	BEQLU	110$			; depending upon whether they are
+	MOVZBL	#1,R0			; identical, the search key is less-than
+	BRW	40$			; the current record's key or vice versa
+
+
+;
+; The search key has been found to be identical with the key of the current
+; record.
+;
+; If the goal of the search is to find an equal match then RMS is done and
+; should return such a status provided the record is not a primary data record
+; marked deleted. In such an instance, RMS continues the search with the next
+; primary data record in the bucket.
+;
+; If the goal of the search is to find a greater-than match, then RMS will also
+; continue the search with the next record in the bucket. However, before
+; continuing the search, if RMS is positioning for insertion within a data
+; bucket, then as the key of the new record will be identical to the key of the
+; current record, RMS saves the address of the current record as the last record
+; seen in the data bucket with this key value. RMS will also indicate that a 
+; a record with a key duplicate to that of the new record has been seen by 
+; setting a bit in the IRAB, provided the current record is not marked deleted,
+; and it will indicate that some record with this key value has been seen by
+; setting another bit in the IRAB, regardless of the setting of the current 
+; record.
+;
+
+110$:	CLRL	R0			; setup the status in R0 to be equal
+
+	TSTL	(SP)			; if the goal of the search is an equal
+	BEQLU	150$			; match then go an EQ status, otherwise
+	SUBL3	R11,R3,R2		; compute terminating search key offset
+
+115$:	TSTB	BKT$B_LEVEL(R5)		; if rms is not currently positioning
+	BNEQU	130$			; for insertion within a data bucket, 
+	BBC	#IRB$V_POSINSERT,-	; then continue the search for a record 
+		IRB$W_SRCHFLAGS(R9),130$; with a key greater-than the search key
+
+	SSB	#IRB$V_DUP_KEY,-	; otherwise, save the address of the
+		IRB$W_SRCHFLAGS(R9)	; current record, set a bit indicating
+	MOVL	R6,IRB$L_LST_REC(R9)	; that a duplicate key was encountered
+	TSTB	BKT$B_INDEXNO(R5)	; during the search, and indicate that
+	BNEQ	120$			; duplicates have been seen during the 
+	BBS	#IRC$V_DELETED,(R6),130$; search if the current record is a
+	BBS	#IRC$V_RU_DELETE,(R6),-	; SIDR, or if the current record is a
+		130$			; primary data record that is not 
+120$:	BISB2	#IRB$M_DUPS_SEEN,-	; marked either deleted or deleted
+		IRB$B_SPL_BITS(R9)	; within a Recovery Unit
+130$:	BRW	50$
+
+
+;
+; RMS has found that the search key is greater-than the key of every record
+; in the bucket. In this case RMS will immediately terminate the search with
+; a greater-than status.
+;
+
+140$:	MOVZBL	#1,R0			; go terminate the search with a status
+	BRB	160$			; of greater-than
+
+;
+; Return the status of the search to the caller of this routine. If the bucket
+; that was searched was a data level bucket, and RMS was not positioning for
+; insertion, then save the address of the current record as the last zero
+; front compressed record encountered provided it is zero front compressed
+; and there is a record to be returned (ie - the status of the search is not
+; greater-than).
+;
+
+150$:	TSTB	BKT$B_LEVEL(R5)		; immediately return the appropriate
+	BNEQU	160$			; status if this is not a data bucket
+
+	BBS	#IRB$V_POSINSERT,-	; if RMS is positioning for insertion 
+		IRB$W_SRCHFLAGS(R9),160$; then immediately return status
+
+	TSTB	1(R6)[R4]		; if the current record is zero front
+	BNEQU	160$			; compressed then save its address as
+	MOVL	R6,IRB$L_LST_NCMP(R9)	; the last seen zero-compressed record 
+
+160$:	POPR	#^M<R1,R2,R3,R4,R8,R11>	; restore the registers used and
+	RSB				; return
+
+
+	.SBTTL	RM$FRNT_CMPR - Compute a Record's Front Compression Count
+;+++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine's responsibility is to take a proposed point of insertion
+;	of a new record, and determine the amount of front compression the key 
+;	of the new record will have if it is inserted there. The record maybe
+;	a primary data, an index, or a SIDR record. There are two assumptions
+;	which this routine makes:
+;
+;	1. The keys of the records in the bucket are in ascending order and are
+;	   correctly compressed (ie - they are as compressed as they can be for
+;	   their place in the bucket).
+;
+;	2. Each record in the bucket is preceeded by the same number of bytes of
+;	   overhead, a constant for the type of file and type of bucket, and
+;	   key compression overhead always consists of two bytes - the first the
+;	   size of the key that is present, and the second the number of bytes
+;	   of front compression.
+;
+; INPUT PARAMETERS:
+;
+;	R6 	- address where new record is to be inserted
+;	R8 	- address of key of new record 
+;		  (including key compression overhead)
+;
+; IMPLICIT INPUT:
+;
+;	R5 	- BKT_ADDR		- address of primary/index/SIDR bucket
+;		     BKT$B_INDEXNO	- index number of bucket
+;		     BKT$B_LEVEL 	- level of bucket
+;
+;	R7	- IDX_DFN		- address of index descriptor
+;		     IDX$B_KEYSZ	- size of key
+;
+;	R9 	- IRAB			- address of IRAB
+;		     IRB$L_LST_NCMP 	- address of last key not compressed
+;		     IRB$L_REC_COUNT	- number of preceeding records
+;
+;	R10	- IFAB			- address of IFAB
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUT:
+;	NONE
+;
+; ROUTINE VALUE:
+;
+;	R0 	- number of characters which can be front compressed
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;---
+
+RM$FRNT_CMPR::
+	PUSHR	#^M<R1,R2,R3,R4,R11>	; save the working registers
+	PUSHL	IRB$L_REC_COUNT(R9)	; save the record count
+	CLRL	-(SP)			; 0 is current front compression guess 
+
+;
+; If the size of the key is zero bytes, or if the new record is to be inserted
+; at the beginning of the bucket, then go return indicating that the key of the
+; new record will not have to be front compressed.
+;
+
+	TSTB	(R8)			; if the new record's key size is zero
+	BEQLU	50$			; then return 0 bytes front compresion
+
+	ADDL3	#BKT$C_OVERHDSZ,R5,R1	; if the new record is to be inserted as
+	CMPL	R6,R1			; the first record in the bucket then
+	BLEQU	50$			; go return 0 bytes front compression
+
+
+;
+; Before a determination can be made of the front compression that will be 
+; required for the key of the new record there are some necessary preparations.
+;
+;
+; Register Usage:
+;
+; R0  - Size of the key of the current record in the bucket.
+;
+; R1  - Set to the type of bucket for determining the amount of record overhead.
+;	Offset to the last character of the current record's key.
+;
+; R2  - Offset to the character in the key of the new record where the 
+;	comparison is to resume.
+;
+; R3  - Number of bytes of the new record's key remaining to be compared with 
+;	the key of the current record.
+;
+; R4  - Number of bytes of record overhead, not including key compression bytes.
+;
+; R5  - Address of the beginning of the bucket in memory.
+;
+; R6  - Address in memory of the current record in the bucket.
+;
+; R7  - Address of the index descriptor.
+;
+; R8  - Address of the key of the new record to be inserted.
+;
+; R9  - Address of the IRAB.
+;
+; R10 - Address of the IFAB.
+;
+; R11 - Address in memory of the bucket address where the new record is to be
+;	inserted.
+;
+
+	MOVL	R6,R11			; save the point of insertion in R11 and
+	MOVL	IRB$L_LST_NCMP(R9),R6	; initialize REC_ADDR to the address of 
+					; the last zero-compressed record
+
+	MOVZBL	BKT$B_LEVEL(R5),R1	; if this is an index bucket, then as
+	BEQLU	10$			; index records do not contain any
+	CLRL	R4			; overhead initialize R4 to 0, and skip
+	BRB	30$			; call to determine record overhead
+
+10$:	TSTB	BKT$B_INDEXNO(R5)	; if this is a primary data bucket,
+	BEQL	20$			; setup R1 with a 0, else it is a SIDR
+	MNEGL	#1,R1			; bucket and a -1 is placed in R1
+
+20$:	BSBW	RM$REC_OVHD		; determine the amount of overhead in
+	MOVL	R0,R4			; each record and store it in R4
+
+
+;
+; The records in the bucket are assumed to be in ascending order and correctly
+; compressed. Therefore, if RMS's current best guess for the front compression
+; of the key of the new record is less then the front compression count of the
+; key of the current record, then there will be no need to compare the two keys.
+; because the current record's key can not contribute any more to the 
+; compression of the key of the new record then was contributed by the key of 
+; last record the new record's key was compared with. Only if the current front
+; compression estimate and the front compression count of the current record are
+; the same will it be necessary to compare the two keys, because only then can
+; the key of the current record influence the compression of the key of the new
+; record.
+;
+
+30$:	CMPB	(SP),1(R6)[R4]		; if compression counts arn't identical
+	BNEQ	40$			; then go position to the next record
+
+;
+; Compare the key of the new record with the key of the current record. Because 
+; the current record's key is fully compressed, rear-end truncated as well as
+; front compressed, it will be necessary to extend it by its last character as
+; necessary. Furthermore, the comparison starts in the key of the new record, 
+; not with its first character, but with the first character past those RMS has
+; already determined will be front compressed.
+;
+
+	MOVZBL	(R6)[R4],R0		; setup R0 and R1 with the size of and
+	MOVAB	1(R0)[R4],R1		; offset to the last character in the
+					; current record's key respectively
+
+	MOVL	(SP),R2			; setup R2 and R3 with the offset to 
+	MOVZBL	IDX$B_KEYSZ(R7),R3	; the first character to be compared 
+	SUBL2	R2,R3			; and the number of bytes to compare in 
+					; the new record's key respectively
+				
+
+	CMPC5	R0,2(R6)[R4],(R6)[R1],-	; compare the key of the new record
+		R3,2(R8)[R2]		; with the key of the current record
+
+	SUBL3	R8,R3,(SP)		; compute a new best guess for the front
+	SUBL2	#2,(SP)			; compression of the new record's key
+					; correcting for compression overhead
+
+
+;
+; Increment the current record pointer to the next record in the bucket. If the
+; address of the new current record is the same as the address of the point
+; of insertion of the new record, then go return the number of bytes the key of
+; the new record will have to be front compressed. Otherwise, go determine 
+; whether the front compression of the key of the current record is the same
+; as RMS's current guess of the front compression of the key of the new record, 
+; and the two keys will have to be compared, or whether the latter is 
+; greater-than the former and they will not have to be compared.
+;
+
+40$:	BSBW	RM$GETNEXT_REC		; position to next record in the bucket
+
+	CMPL	R6,R11			; if RMS has positioned to the point of 
+	BLSSU	30$			; insertion then return, else continue
+
+;
+; Return the number of bytes the the key of the new record will have to be front
+; compressed if the new record is to go at the indicated place of insertion.
+;
+
+50$:	POPL	R0			; load front compression count into R0
+	POPL	IRB$L_REC_COUNT(R9)	; restore the record count
+	POPR	#^M<R1,R2,R3,R4,R11>	; restore the working registers and
+	RSB				; return
+	.END

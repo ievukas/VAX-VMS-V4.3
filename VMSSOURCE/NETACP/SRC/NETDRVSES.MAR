@@ -1,0 +1,3030 @@
+	.TITLE	NETDRVSES - DECnet Session Control Module for NETDRIVER
+	.IDENT	'V04-000'
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+
+;++
+; FACILITY:	DECNET
+;
+; ABSTRACT:	This module is part of NETDRIVER and is the interface between
+;		the user and the NSP layer.
+;
+; ENVIRONMENT:	KERNEL mode, normal driver environment.
+;
+;--
+
+
+.SBTTL	HISTORY
+
+;
+; AUTHOR:	Alan D. Eldridge,  CREATION DATE: 11-JUN-79
+;
+; MODIFIED BY:
+;
+;	V03-022	LMP0308		L. Mark Pilant,		31-Aug-1984  16:15
+;		Change default state of the ACL queue in the ORB.
+;
+;	V03-021	ADE1042		A. Eldridge		23-Aug-1984
+;		Don't create an XWB if the RCB$W_MCOUNT is zero.  This condition
+;		indicates that NETACP is going away and the test is needed to
+;		avoid a race condition that can crash the system.
+;
+;	V03-020	ADE1041		A. Eldridge		25-Jun-1984
+;		Fix loop problem in cleaning up receives.  Return SS$_CONNECFAIL
+;		when an IO$_ACCESS fct can't locate the XWB (was SS$_NOLINKS).
+;		Send NET$C_DR_ABORT upon IO$_DEACCESS!IO$M_ABORT (was sending
+;		NET$C_DR_NORMAL).
+;
+;	V03-019	LMP0221		L. Mark Pilant,		7-Apr-1984  14:29
+;		Change UCB$L_OWNUIC to ORB$L_OWNER and UCB$W_VPROT to
+;		ORB$W_PROT.
+;
+;	V03-018	ADE1041		A. Eldridge	 7-Mar-1984
+;		Fix resource error count -- registers were screwed up.
+;
+;	V03-017	ADE1040		A.Eldridge	10-Sep-1983
+;		Major rewrite to accomodate changes to allow NSP (NETDRVNSP.MAR)
+;		to use kernel mode AST's to nibble away at the user buffers
+;		rather than accessing them just at FDT or I/O post time.  This
+;		change was needed to allow huge user buffers (for performance)
+;		without requiring a lot of pool.
+;
+;
+
+
+.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+
+	$AQBDEF
+	$ACBDEF
+	$CCBDEF
+	$CRBDEF
+	$CXBDEF
+	$DDBDEF
+	$DRDEF
+	$DYNDEF
+	$FKBDEF
+	$IODEF
+	$IPLDEF
+	$IRPDEF
+	$JIBDEF
+	$MSGDEF
+	$ORBDEF
+	$PCBDEF
+	$PHDDEF
+	$PRDEF
+	$SSDEF
+	$TQEDEF
+	$UCBDEF
+	$VECDEF
+
+	$ICBDEF
+	$IDBDEF
+	$LPDDEF
+	$LTBDEF
+	$LLIDEF
+	$RCBDEF
+
+	$NETSYMDEF
+	$NETUPDDEF
+	$NSPMSGDEF
+
+	$CXBEXTDEF		; NETDRIVER CXB extensions
+	$XWBDEF			; XWB and LSB definitions
+
+
+
+;
+; MACROS:
+;
+
+;
+;  Bit definition macro
+;
+.MACRO	BITDEF	BLK,SYM,BITVAL
+
+	'BLK'$V_'SYM' = BITVAL
+	'BLK'$M_'SYM' = 1@<BITVAL>
+.ENDM
+
+;
+;  Macro to set up mailbox message filtering table
+;
+.MACRO	MBX_FILTER	MESSAGE,BIT
+
+	.LONG	MBX$M_'BIT
+	.WORD	MSG$_'MESSAGE
+
+.ENDM	MBX_FILTER
+
+;
+;  Macro to build a mask of XWB$M_FLG_xxx bits
+;
+.MACRO	BLDMSK	A
+	_$MSK	= _$MSK + XWB$M_FLG_'A'
+.ENDM
+
+;
+;  Macro to fill the 'set' and 'clear' XWB$W_FLG tables
+;
+.MACRO	STATEMASK	STA,SETM,CLRM
+
+	;
+	;  Build and enter the 'set FLG' bit mask
+	;
+	_$MSK = 0
+	.IRP	A,<SETM>
+		BLDMSK	A
+	.ENDR
+	. = NET$AW_FLG_SETM + <2*XWB$C_STA_'STA'>
+	.WORD	_$MSK
+	;
+	;  Build and enter the 'clear FLG' bit mask
+	;
+	_$MSK = 0
+	.IRP	A,<CLRM>
+		BLDMSK	A
+	.ENDR
+	. = NET$AW_FLG_CLRM + <2*XWB$C_STA_'STA'>
+	.WORD	_$MSK
+.ENDM
+
+
+
+;
+;  Macro to initialize NSP state tables
+;
+.MACRO	STTAB				; Init state transition data
+
+	_$EVENT_INDEX	=  0		; Init event index
+	_$ACT_INDEX	=  0		; Init action routine index
+	ACT$_BUG	== 0		; Init the "bug-check" action routine
+					; index
+
+	_$ACT_DFLT = <XWB$C_STA_CLO -	; Default state table entry
+		     @NET$C_ACTBITS> -	;
+		     + ACT$_BUG		;
+
+
+NET$AW_FLG_SETM: 			; Bits to be set upon entering state 
+		.BLKW XWB$C_NUMSTA	; and upon timeout
+NET$AW_FLG_CLRM:.BLKW XWB$C_NUMSTA	; Bits to be cleared upon entering state
+
+NET$AB_STTAB:	.BLKB	0		; Bind the table address
+
+.ENDM
+
+;
+;  Macroes to move the current position within the state table 
+;
+.MACRO	ENDSTTAB				; Move PC to end of table
+	. = NET$AB_STTAB -
+	    + <_$EVENT_INDEX * XWB$C_NUMSTA>
+.ENDM
+
+
+.MACRO	EVENT  EV				; Setup for this event
+
+	EV == _$EVENT_INDEX			; Define event code
+	.=NET$AB_STTAB + <EV * XWB$C_NUMSTA>	; Move PC to proper event
+	.BYTE	<_$ACT_DFLT>[XWB$C_NUMSTA]	; Init the entry
+						;
+	.=NET$AB_STTAB + <EV * XWB$C_NUMSTA>	; Move PC to proper event
+	_$EVENT_INDEX  =  _$EVENT_INDEX + 1	; Get ready for next event
+
+.ENDM
+
+
+;
+;  Macro to fill the build and enter the state transition table element
+;
+.MACRO	STATE	CURSTA,NXTSTA,ACTION,?LL 	; Make table entry
+    LL:
+       .=.+XWB$C_STA_'CURSTA'			; Goto state table entry
+	;
+	;
+	;   If the action routine index is not defined then define the index
+
+	;   Create the state-table entry.
+	;
+	;
+	.IF NDF,ACT$_'ACTION'
+		ACT$_'ACTION'	= _$ACT_INDEX
+		_$ACT_INDEX	= _$ACT_INDEX + 1
+	.ENDC
+	.BYTE	<XWB$C_STA_'NXTSTA' @NET$C_ACTBITS> + ACT$_'ACTION'
+
+    .=LL
+.ENDM
+
+
+
+;
+; EQUATED SYMBOLS:
+;
+
+;
+;  Argument list offsets for QIO 
+;
+P1	= 0				; Buffer address
+P2	= 4				; Buffer length
+P3	= 8				; Miscellaneous
+
+
+ASSUME	FKB$C_LENGTH  LE  ACB$C_LENGTH	
+
+_$tmp		== <XWB$S_XWB+7>&^C<7>	; XWB length, quad word aligned
+XWB$$		== _$tmp+64		; Allow enough room for the route-header
+XWB$L_PTR_RTHD	== _$tmp		; Ptr to route-header
+XWB$B_ADJ_INX	== _$tmp +4		; Adjacency index
+XWB$T_TR3HDR	== XWB$$-8		; Start of standard Phase III header
+					;  (must be quadword aligned)
+
+XWB_C_LEN = XWB$$+ACB$C_LENGTH		; Total XWB length
+
+;
+;  Definitions for mailbox message filtering	
+;					
+$VIELD MBX,0,<-
+	     <NETSTATE,,M>,-		; Network state change
+	     <EVTAVL,,M>,-		; Events available for logging
+	     <EVTRCVCHG,,M>,-		; Event receiver database change
+	     <EVTXMTCHG,,M>,-		; Event xmitter database change
+>
+
+;
+;
+;  Define a mask containing all bits indicating work needs to be done
+;
+;
+XWB$M_FLG_WMSK =	XWB$M_FLG_SCD ! -
+			XWB$M_FLG_SDT ! XWB$M_FLG_SDACK!-
+			XWB$M_FLG_SLI ! XWB$M_FLG_SIACK!-
+			XWB$M_FLG_CLO ! XWB$M_FLG_BREAK
+
+
+
+;
+; DRIVER PROLOGUE TABLE
+;
+ 
+		.PSECT	$$$105_PROLOGUE
+	DPTAB	-				; Define driver prologue table
+		END	= NET$END,-		; End of driver
+		ADAPTER	= NULL,-		; Adapter type
+		UCBSIZE	= UCB$C_LENGTH,-	; UCB size
+		NAME	= NETDRIVER		; Driver name
+
+	DPT_STORE INIT				; CONTROL BLOCK INIT VALUES
+						;
+	DPT_STORE CRB,CRB$L_INTD+VEC$L_ADP,L,0	; No ADP pointer 
+	DPT_STORE UCB,UCB$W_MB_SEED,W,0		; Init. unit value for cloning
+	DPT_STORE UCB,UCB$B_FIPL,B,NET$C_IPL	; Fork IPL
+	DPT_STORE UCB,UCB$B_DIPL,B,NET$C_IPL	; Device IPL
+	DPT_STORE ORB,ORB$B_FLAGS,B,-
+				<ORB$M_PROT_16>	; SOGW protection word
+	DPT_STORE ORB,ORB$W_PROT,W,0		; Default protection
+	DPT_STORE ORB,ORB$L_OWNER,L,<^X010001>	; Owner UIC
+	DPT_STORE UCB,UCB$L_DEVCHAR,L,-		; Device characteristics
+				<DEV$M_NET!-	;   Network device
+				 DEV$M_AVL!-	;   Available
+				 DEV$M_MBX!-	;   Mailbox type (no hardware)
+				 DEV$M_IDV!-	;   Input device
+			 	 DEV$M_ODV- 	;   Output device
+				>		;
+	DPT_STORE UCB,UCB$W_DEVBUFSIZ,W,256	;
+	DPT_STORE UCB,UCB$L_DEVDEPEND,L,-	;
+				 MBX$M_NETSTATE	; Enable NETSHUT by default
+	DPT_STORE UCB,UCB$W_STS,W,-		;
+				<UCB$M_ONLINE!-	; Device online
+				 UCB$M_TEMPLATE-; NET0 is the "template" UCB 
+				>		; used to build other NET UCBs
+						;
+	DPT_STORE REINIT			; CONTROL BLOCK RE-INIT VALUES
+
+	DPT_STORE DDB,DDB$L_DDT,D,NET$DDT 
+	DPT_STORE CRB,CRB$L_INTD+VEC$L_INITIAL,	D,NET$CTLR_INIT
+	DPT_STORE CRB,CRB$L_INTD+VEC$L_UNITINIT,D,NET$UNIT_INIT
+	DPT_STORE CRB,CRB$L_INTD+VEC$L_START,	D,NET$ACP_COMM
+	DPT_STORE CRB,CRB$L_INTD+4,		D,NET$INTERRUPT
+
+	DPT_STORE END				;
+
+
+
+ 
+;
+; DRIVER DISPATCH TABLE
+;
+	.PSECT	$$$115_DRIVER,LONG
+
+	DDTAB	DEVNAM	= NET,-		; DRIVER DISPATCH TABLE
+		FUNCTB	= FUNCTABLE,-	; Function decision table address
+		START	= NET$STARTIO,-	; Start I/O operation
+		ALTSTART= NET$ALTENTRY,-; Alternate I/O request entry point
+		CANCEL	= NET$CANCEL,-	; Cancel I/O entry point
+		UNSOLIC	= NET$UNSOL_INTR; Unsolicited interrupt
+
+
+.SBTTL	FUNCTION DECISION TABLE
+ 
+FUNCTABLE:				; FUNCTION DECISION TABLE
+	FUNCTAB	,-			; Legal Functions
+		<READVBLK,READLBLK,-	; Read 
+		 WRITEVBLK,WRITELBLK,-	; Write
+		 SETMODE,-		; Set mailbox message filters
+		 ACCESS,-		; Logical-link Connect/Reject
+		 ACPCONTROL,-		; ACP Control function
+		 DEACCESS,-		; Logical-link Disconnect
+	>
+	FUNCTAB	,-			; BUFFERED I/O FUNCTIONS
+		<READVBLK,READLBLK,-	; Read 
+		 WRITEVBLK,WRITELBLK,-	; Write
+		 SETMODE,-		; Set mailbox message filters
+		 ACCESS,-		; Logical-link Connect/Reject
+		 ACPCONTROL,-		; ACP Control function
+		 DEACCESS,-		; Logical-link Disconnect
+	>
+	FUNCTAB	NET$FDT_RCV,     <READLBLK>   ; Read
+	FUNCTAB	NET$FDT_XMT,     <WRITELBLK>  ; Write
+	FUNCTAB	NET$FDT_ACCESS,  <ACCESS>     ; Connect Logical-link
+	FUNCTAB	NET$FDT_DEACCESS,<DEACCESS>   ; Disconnect Logical-link
+	FUNCTAB NET$FDT_SETMODE, <SETMODE>    ; Set mailbox message filters
+	FUNCTAB	NET$FDT_CONTROL, <ACPCONTROL> ; ACP Control
+
+.SBTTL	State Table
+
+;
+;  OWN STORAGE:
+; 
+	PATCH_AREA_SIZE = 128		; Size of patch area space
+
+NET$GQ_PATCH::
+	.LONG	PATCH_AREA_SIZE
+	.LONG	.+4			; (not an address - offset from start
+					; of image to base of patch space)
+	.BLKB	PATCH_AREA_SIZE
+
+
+NET$GL_OFF_DPTFLG::  .LONG  DPT$TAB + DPT$B_FLAGS - . ; Offset to DPT$B_FLAGS
+
+	NET$C_ACTBITS	= 5		; Number of action bits per entry
+	NET$C_STABITS	= 3		; Number of state bits per entry
+	NET$M_STAMSK	= <7>@5		; State bit mask
+
+;
+;
+;  The following definitions must be contiguous to the NSPTABLES definition
+;
+;
+STTAB					; Init state transition table
+
+EVENT	   NETEVT$_CI			; CI message received
+    STATE  CIS,	CIS,	BUG		; something wrong in the driver
+    STATE  CAR,	CAR,	LOG		; unexpected event
+    STATE  CIR,	CIR,	RCV_CR		; Assume received retransmitted CI
+    STATE  CCS,	CCS,	RCV_CR		; Assume received retransmitted CI
+    STATE  RUN,	RUN,	LOG		; unexpected event
+    STATE  DIS,	DIS,	LOG		; unexpected event
+    STATE  DIR,	DIR,	LOG		; unexpected event
+    STATE  CLO,	CIR,	RCV_CI		; inbound connect sequence
+
+EVENT	   NETEVT$_CA			; Connect Ack received
+    STATE  CIS,	CAR,	RCV_CA		; measure intial round-trip time
+    STATE  CAR,	CAR,	NOP		; assume retransmission
+    STATE  CIR,	CIR,	LOG		; unexpected event
+    STATE  CCS,	CCS,	LOG		; unexpected event
+    STATE  RUN,	RUN,	NOP		; assume late arrival
+    STATE  DIS,	DIS,	NOP		; assume late arrival
+    STATE  DIR,	DIR,	NOP		; assume late arrival
+    STATE  CLO,	CLO,	NOP		; assume late arrival
+
+EVENT	   NETEVT$_CC			; Connect Confirm received
+    STATE  CIS,	RUN,	RCV_CC		; normal handshaking sequence
+    STATE  CAR,	RUN,	RCV_CC		; normal handshaking sequence
+    STATE  CIR,	CIR,	LOG		; unexpected event
+    STATE  CCS,	CCS,	LOG		; unexpected event
+    STATE  RUN,	RUN,	NOP		; assume retransmission
+    STATE  DIS,	DIS,	NOP		; we enter DIS for many reasons
+    STATE  DIR,	DIR,	NOP		; assume late arrival
+    STATE  CLO,	CLO,	RTS_NLT		; assume late arrival
+
+
+
+EVENT	   NETEVT$_PH2CCS		; Phase II connect confirm xmt-complete
+    STATE  CIS,	CIS,	NOP		; 
+    STATE  CAR,	CAR,	NOP		; 
+    STATE  CIR,	CIR,	NOP		; 
+    STATE  CCS,	RUN,	ENT_RUN		; Normal Phase II handshaking sequence
+    STATE  RUN,	RUN,	NOP		; 
+    STATE  DIS,	DIS,	NOP		; 
+    STATE  DIR,	DIR,	NOP		; 
+    STATE  CLO,	CLO,	NOP		; 
+
+EVENT	   NETEVT$_RTS			; Rcv "return to sender" CI message 
+    STATE  CIS,	CLO,	RCV_RTS		; Process returned message
+    STATE  CAR,	CAR,	NOP		; Assume late arrival on retransmission
+    STATE  CIR,	CIR,	NOP		; Assume late arrival on retransmission
+    STATE  CCS,	CCS,	NOP		; Assume late arrival on retransmission
+    STATE  RUN,	RUN,	NOP		; Assume late arrival on retransmission
+    STATE  DIS,	DIS,	NOP		; Assume late arrival on retransmission
+    STATE  DIR,	DIR,	NOP		; Assume late arrival on retransmission
+    STATE  CLO,	CIR,	NOP		; Assume late arrival on retransmission
+
+EVENT	   NETEVT$_DATA			; Data message received
+    STATE  CIS,	CIS,	LOG		; unexpected event
+    STATE  CAR,	CAR,	LOG		; unexpected event
+    STATE  CIR,	CIR,	LOG		; unexpected event
+    STATE  CCS,	RUN,	ENT_RUN		; a normal handshaking sequence
+    STATE  RUN,	RUN,	RCV_DATA	; this is what NSP is for
+    STATE  DIS,	DIS,	NOP		; unavoidable race in sending DI
+    STATE  DIR,	DIR,	NOP		; assume late arrival
+    STATE  CLO,	CLO,	RTS_NLT		; assume late arrival
+
+EVENT	   NETEVT$_DTACK		; Data Ack received
+    STATE  CIS,	CIS,	LOG		; unexpected event
+    STATE  CAR,	CAR,	LOG		; unexpected event
+    STATE  CIR,	CIR,	LOG		; unexpected event
+    STATE  CCS,	RUN,	ENT_RUN		; a normal handshaking sequence
+    STATE  RUN,	RUN,	RCV_DTACK	; drive the link
+    STATE  DIS,	DIS,	NOP		; assume late arrival or race
+    STATE  DIR,	DIR,	NOP		; assume late arrival or race
+    STATE  CLO,	CLO,	RTS_NLT		; assume late arrival or race
+
+
+
+EVENT	   NETEVT$_LS			; Link Service msg received
+    STATE  CIS,	CIS,	LOG		; unexpected event
+    STATE  CAR,	CAR,	LOG		; unexpected event
+    STATE  CIR,	CIR,	LOG		; unexpected event
+    STATE  CCS,	RUN,	ENT_RUN		; a normal handshaking sequence
+    STATE  RUN,	RUN,	RCV_LI		; drive the link
+    STATE  DIS,	DIS,	NOP		; assume late arrival or race
+    STATE  DIR,	DIR,	NOP		; assume late arrival or race
+    STATE  CLO,	CLO,	RTS_NLT		; assume late arrival or race
+
+EVENT	   NETEVT$_INT			; Interrupt msg received
+    STATE  CIS,	CIS,	LOG		; unexpected event
+    STATE  CAR,	CAR,	LOG		; unexpected event
+    STATE  CIR,	CIR,	LOG		; unexpected event
+    STATE  CCS,	RUN,	ENT_RUN		; a normal handshaking sequence
+    STATE  RUN,	RUN,	RCV_LI		; drive the link
+    STATE  DIS,	DIS,	NOP		; assume late arrival or race
+    STATE  DIR,	DIR,	NOP		; assume late arrival or race
+    STATE  CLO,	CLO,	RTS_NLT		; assume late arrival or race
+
+EVENT	   NETEVT$_LIACK		; INT/LS Ack received
+    STATE  CIS,	CIS,	LOG		; unexpected event
+    STATE  CAR,	CAR,	LOG		; unexpected event
+    STATE  CIR,	CIR,	LOG		; unexpected event
+    STATE  CCS,	RUN,	ENT_RUN		; a normal handshaking sequence
+    STATE  RUN,	RUN,	RCV_LIACK	; drive the link
+    STATE  DIS,	DIS,	NOP		; assume late arrival or race
+    STATE  DIR,	DIR,	NOP		; assume late arrival or race
+    STATE  CLO,	CLO,	RTS_NLT		; assume late arrival or race
+
+EVENT	   NETEVT$_DI			; Disconnect Initiate msg rcv'd
+    STATE  CIS,	DIR,	RCV_Dx		; link rejected
+    STATE  CAR,	DIR,	RCV_Dx		; link rejected
+    STATE  CIR,	DIR,	ABORT		; abort the link, no local owner
+    STATE  CCS,	DIR,	RCV_Dx		; abort the link 
+    STATE  RUN,	DIR,	RCV_Dx		; abort the link
+    STATE  DIS,	DIR,	ABORT		; change state and send DC
+    STATE  DIR,	DIR,	NOP		; send DC
+    STATE  CLO,	CLO,	RTS_NLT		; assume race or late arrival
+
+EVENT	   NETEVT$_DC			; Disconnect Confirm msg rcv'd
+    STATE  CIS,	CLO,	RCV_Dx		; link rejected
+    STATE  CAR,	CLO,	RCV_Dx		; link rejected
+    STATE  CIR,	CLO,	ABORT		; link aborted, no local owner
+    STATE  CCS,	CLO,	RCV_Dx		; link aborted
+    STATE  RUN,	CLO,	RCV_Dx		; link aborted
+    STATE  DIS,	CLO,	NOP		; normal handshaking sequence
+    STATE  DIR,	CLO,	NOP		; assume DC is a 'no link terminate'
+    STATE  CLO,	CLO,	NOP		; assume late arrival
+
+
+
+
+EVENT	   NETEVT$_DSCLNK		; Link failed confidence test
+    STATE  CIS,	CLO,	ABORT		; connect timed out
+    STATE  CAR,	DIS,	ABORT		; connect timed out
+    STATE  CIR,	DIS,	ABORT		; local system is slow
+    STATE  CCS,	DIS,	ABORT		; connect timed out
+    STATE  RUN,	DIS,	ABORT		; problem talking with remote node
+    STATE  DIS,	CLO,	NOP		; abort the link
+    STATE  DIR,	CLO,	NOP		; abort the link
+    STATE  CLO,	CLO,	NOP		; Try to deallocate XWB
+ 
+
+EVENT	   NETEVT$_CANLNK		; Local cancel of link
+    STATE  CIS,	CLO,	CANLNK		; abort from a Connect state
+    STATE  CAR,	CLO,	CANLNK		; abort from a Connect state
+    STATE  CIR,	DIS,	CANLNK		; abort link, no local owner
+    STATE  CCS,	DIS,	CANLNK		; abort from a Connect state
+    STATE  RUN,	DIS,	CANLNK		; orderly shuttdown
+    STATE  DIS,	DIS,	NOP		; link is already disconnecting
+    STATE  DIR,	DIR,	NOP		; link is already disconnecting
+    STATE  CLO,	CLO,	NOP		; link is already disconnecting
+
+EVENT	   NETEVT$_RESDIS		; Resume disconnect
+    STATE  CIS,	CIS,	BUG		; Valid only from RUN state
+    STATE  CAR,	CAR,	BUG		; Valid only from RUN state
+    STATE  CIR,	CIR,	BUG		; Valid only from RUN state
+    STATE  CCS,	CCS,	BUG		; Valid only from RUN state
+    STATE  RUN,	DIS,	RES_DISC	; Disconnect if XWB is idle
+    STATE  DIS,	DIS,	BUG		; Valid only from RUN state
+    STATE  DIR,	DIR,	BUG		; Valid only from RUN state
+    STATE  CLO,	CLO,	BUG		; Valid only from RUN state
+
+
+
+
+EVENT	   NETEVT$_CIA			; Connect Initiate IO$_ACCESS
+    STATE  CIS,	CIS,	BUG		; XWB was just created
+    STATE  CAR,	CAR,	BUG		; XWB was just created 
+    STATE  CIR,	CAR,	BUG		; XWB was just created
+    STATE  CCS,	CCS,	BUG		; XWB was just created
+    STATE  RUN,	RUN,	BUG		; XWB was just created
+    STATE  DIS,	DIS,	BUG		; XWB was just created 
+    STATE  DIR,	DIR,	BUG		; XWB was just created
+    STATE  CLO,	CIS	INITIATE	; Normal connect initiate seq.
+
+EVENT	   NETEVT$_CCA			; Connect Confirm IO$_ACCESS
+    STATE  CIS,	CIS,	SSABORT		; Confirm not possible
+    STATE  CAR,	CAR,	SSABORT		; Confirm not possible
+    STATE  CIR,	CCS,	CONFIRM		; Normal connect confirm seq.
+    STATE  CCS,	CCS,	SSABORT		; Confirm not possible
+    STATE  RUN,	RUN,	SHRLNK		; Second accessor to link
+    STATE  DIS,	DIS,	SSABORT		; Confirm no longer possible
+    STATE  DIR,	DIR,	SSABORT		; Confirm no longer possible
+    STATE  CLO,	CLO,	SSABORT		; Confirm no longer possible
+
+EVENT	   NETEVT$_CRA			; Connect Reject IO$_ACCESS
+    STATE  CIS,	CIS,	SSABORT		; Reject not possible
+    STATE  CAR,	CAR,	SSABORT		; Reject not possible
+    STATE  CIR,	DIS,	CONFIRM		; Normal connect reject seq.
+    STATE  CCS,	CCS,	SSABORT		; Reject not possible
+    STATE  RUN,	RUN,	SSABORT		; Reject not possible
+    STATE  DIS,	DIS,	SSABORT		; Reject not possible
+    STATE  DIR,	DIR,	SSABORT		; Reject not possible
+    STATE  CLO,	CLO,	SSABORT		; Reject not possible
+
+EVENT	   NETEVT$_DEA			; QIO IO$_DEACCESS
+    STATE  CIS,	CIS,	BUG		; Channel should not have window
+    STATE  CAR,	CAR,	BUG		; Channel should not have window
+    STATE  CIR,	CIR,	BUG		; Channel should not have window
+    STATE  CCS,	CCS,	BUG		; Channel should not have window
+    STATE  RUN,	DIS,	DEACCESS	; But change to DIS state only 
+					;  if this is the last accessor
+    STATE  DIS,	DIS,	DEACCESS	; Link was aborted externally
+    STATE  DIR,	DIR,	DEACCESS	; Link was aborted externally
+    STATE  CLO,	CLO,	DEACCESS	; Link was aborted externally 
+
+
+
+EVENT	    NETEVT$_MBXERR		; Fatal error writing to mailbox
+    STATE  CIS,	CLO,	ABORT		; abort from a Connect state
+    STATE  CAR,	CLO,	ABORT		; abort from a Connect state
+    STATE  CIR,	DIS,	ABORT		; abort link, no local owner
+    STATE  CCS,	DIS,	ABORT		; abort from a Connect state
+    STATE  RUN,	DIS,	ABORT		; abort from the RUN state
+    STATE  DIS,	DIS,	NOP		; link is already disconnecting
+    STATE  DIR,	DIR,	NOP		; link is already disconnecting
+    STATE  CLO,	CLO,	NOP		; link is already disconnecting
+
+EVENT	   NETEVT$_PROERR		; Protocol error     (NOP for now)
+    STATE  CIS,	CIS,	NOP		; 
+    STATE  CAR,	CAR,	NOP		;
+    STATE  CIR,	DIS,	NOP		;
+    STATE  CCS,	DIS,	NOP		;
+    STATE  RUN, RUN,	NOP		;
+    STATE  DIS,	DIS,	NOP		;
+    STATE  DIR,	DIR,	NOP		;
+    STATE  CLO,	CLO,	NOP		;
+
+
+
+
+;
+;  Setup tables which specify which XWB$W_FLG bits to set and clear upon
+;  a transition into a new state.
+;
+;	  New
+;	  State  Flags to set	  Flags to clear
+;	  -----  ------------	  --------------
+;
+STATEMASK CIS,	<SCD>		  <WBUF>
+STATEMASK CAR,	<CLO>	 	  <WBUF>
+STATEMASK CIR,	<SCD>		  <WBUF>
+STATEMASK CCS,	<SCD>		  <WBUF>
+STATEMASK RUN,	<SDT,SDFL,WHGL>	  <WBUF,SCD>
+STATEMASK DIR,	<SCD>		  <WBUF,WBP,WHGL,WDAT,SDT,SLI,SDACK,SIACK,-
+						   BREAK,IAVL,TBPR,SIFL,SDFL>
+STATEMASK DIS,	<SCD>		  <WBUF,WBP,WHGL,WDAT,SDT,SLI,SDACK,SIACK,-
+						   BREAK,IAVL,TBPR,SIFL,SDFL>
+STATEMASK CLO,	<CLO>		  <WBUF,WBP,WHGL,WDAT,SDT,SLI,SDACK,SIACK,-
+					       SCD,BREAK,IAVL,TBPR,SIFL,SDFL>
+
+ENDSTTAB
+
+
+;
+; The following mask is used to identify the subset of flags used
+; to signal work to be done
+;
+NET$GL_WORKBITS:: .LONG	XWB$M_FLG_WMSK	; Flags requiring work to be done
+
+
+MBX_TABLE:				    ; Table for mapping mbx msg codes 
+					    ; to filter bits
+	MBX_FILTER	NETSHUT,NETSTATE    ; Network state change
+	MBX_FILTER	EVTAVL,EVTAVL	    ; Events available for logging
+	MBX_FILTER	EVTRCVCHG,EVTRCVCHG ; Event receiver database change
+	MBX_FILTER	EVTXMTCHG,EVTXMTCHG ; Event xmitter database change
+	.LONG	0	  		    ; End of table
+
+
+.SBTTL	NET$AZ_DR_TABLE	- Disconnect Reason Code Mapping
+
+
+;
+;  Macro to set up connect reject reason codes
+;
+REASON_W_DR	== 0		; Reason code
+REASON_W_SS	== 2		; SS$_.. to return in data IRP's
+REASON_W_MBX	== 4		; MBX$_.. message code
+REASON_C_LENGTH == 6
+
+.MACRO	MRC	REASON,SS_CODE,MSG_CODE
+
+	.WORD	NET$C_DR_'REASON
+	.WORD	SS$_'SS_CODE
+	.WORD	MSG$_'MSG_CODE
+
+.ENDM	MRC
+
+
+NET$C_DR_INVALID   == 100		; Fake value meaning "not setup"
+NET$C_DR_DEACC	   == 102		; Fake value for code conversion
+
+NET$AZ_DR_TABLE:			; Table for mapping disconnect reasons
+					; for other than the "connect-initiate"
+					; state
+;
+;
+;    discon  data        mailbox	
+;    reason  status      message	
+;    ------  ---------   --------	
+;
+MRC  NORMAL, LINKDISCON, DISCON		;
+MRC  EXIT,   LINKEXIT,   EXIT		; User exit or timeout
+MRC  NOPATH, PATHLOST,   PATHLOST	; Path lost to partner node
+MRC  SHUT,   SHUT,       NETSHUT	; Node shutting down
+MRC  NOBJ,   PROTOCOL,   ABORT		; No such object
+MRC  ABORT,  LINKABORT,  ABORT		; Disconnect abort
+MRC  THIRD,  THIRDPARTY, THIRDPARTY	; Disconnect by third party
+MRC  ACCESS, PROTOCOL,   ABORT		; Login info invalid
+MRC  RSU,    PROTOCOL,   ABORT		; Resource error
+MRC  BUSY,   PROTOCOL,   ABORT		; Object too busy
+MRC  FMT,    PROTOCOL,   ABORT		; Illegal process name field
+MRC  NONODE, PROTOCOL,   ABORT		; Unrecognized node i.d.
+MRC  IVNODE, PROTOCOL,	 ABORT		; Invalid node-i.d. format
+     ;
+     ;
+     ;  The following are internal codes and are not part of NSP
+     ;
+     ;
+MRC  DEACC,  LINKDISCON, DISCON		; Link is IO$_DEACCESS'ed
+MRC  INVALID,LINKABORT,  ABORT		; Reason field never setup
+
+.LONG -1				; Terminate the table (the last entry
+					; is to be used as a catch-all)
+
+
+
+NET$AZ_DR_CONTAB:			; Table for mapping reject reasons
+					; in one of the "connect" states
+;
+;
+;    discon  connect      mailbox	
+;    reason  status       message	
+;    ------  -----------  --------	
+;
+MRC  NORMAL, REJECT,	  REJECT	; Connect reject
+MRC  EXIT,   LINKEXIT,    EXIT		; User exit or timeout
+MRC  NOPATH, UNREACHABLE, PATHLOST	; Path lost to partner node
+MRC  SHUT,   SHUT,        NETSHUT	; Node shutting down
+MRC  NOBJ,   NOSUCHOBJ,   REJECT	; No such object
+MRC  ABORT,  LINKABORT,   ABORT		; Disconnect abort
+MRC  THIRD,  THIRDPARTY,  THIRDPARTY	; Disconnect by third party
+MRC  ACCESS, INVLOGIN,    REJECT	; Login info invalid
+MRC  RSU,    REMRSRC,     REJECT	; Resource error
+MRC  BUSY,   REMRSRC,     REJECT	; Object too busy
+MRC  FMT,    PROTOCOL,    REJECT	; Illegal process name field
+MRC  NONODE, NOSUCHNODE,  REJECT	; Unrecognized node i.d.
+MRC  IVNODE, NOSUCHNODE,  REJECT	; Invalid node-i.d. format
+     ;
+     ;
+     ;  The following are internal codes and are not part of NSP
+     ;
+     ;
+MRC  DEACC,  ABORT,	  ABORT	 	; Link is IO$_DEACCESS'ed
+MRC  INVALID,CONNECFAIL,  ABORT		; Reason field never setup
+
+.LONG -1				; Terminate the table (the last entry
+					; is to be used as a catch-all)
+
+
+
+NET$MAP_R_REASON::			; Map Reason code in XWB$W_R_REASON
+	MOVAB	W^NET$AZ_DR_TABLE -	; Setup non-connect table address
+		 -REASON_C_LENGTH,R0	; ...biased for scan
+
+	ASSUME	XWB$C_STA_CLO  EQ  0
+	ASSUME	XWB$C_STA_CIS  EQ  1
+	ASSUME	XWB$C_STA_CAR  EQ  2
+
+	CMPB	#2,XWB$B_STA(R5)	; Is 'connect intiate' table needed?
+	BLSS	10$			; If LSS then no
+	MOVAB	W^NET$AZ_DR_CONTAB -	; Setup connect-intiate table address
+		 -REASON_C_LENGTH,R0	; ...biased for scan
+					;
+10$:	ADDL	#REASON_C_LENGTH,R0	; Goto next entry
+	CMPW	XWB$W_R_REASON(R5),-	; Does it match ?
+		REASON_W_DR(R0)		;
+	BEQL	20$			; If EQL then yes
+	TSTL	(R0)			; At end of table?
+	BGEQ	10$			; If GEQU then no
+	SUBL	#REASON_C_LENGTH,R0	; No match found, use the default entry
+20$:	RSB	
+
+
+
+
+
+NET$INTERRUPT:
+NET$CTLR_INIT:
+	RSB
+NET$UNIT_INIT:
+	NOP
+	NOP
+	NOP
+	NOP
+	NOP
+	NOP
+	NOP
+	NOP
+	NOP
+	RSB
+
+
+.SBTTL	NET$FORK	- Fork the XWB to do new work
+;+
+;
+;  If the fork block in the XWB is available, it is forked so that the work
+;  in XWB$W_FLG will be done.  If the fork block is unavailable, no further
+;  action is required since the XWB$W_FLG work will get done when to XWB fork
+;  process is subsequently resumed.
+;
+;
+;  INPUTS:	R5	XWB address
+;		R0	Garbage
+;
+;  OUTPUTS:	R0	#1
+;
+;		All other registers are preserved
+;
+;-
+NET$FORK::					; Fork the XWB
+	BBSS   #XWB$V_STS_SOL,XWB$W_STS(R5),20$	; If BS, fork block in use
+						;
+	PUSHR  #^M<R1,R2,R3,R4,R5>		; Save regs
+	BSBB	30$				; Schedule fork and return
+10$:	POPR   #^M<R1,R2,R3,R4,R5>		;
+						;
+20$:	MOVL   #1,R0				; Always return success
+	RSB					; Done
+	
+30$:	MOVAB	XWB$Q_FORK(R5),R5		; Switch to fork block context
+	JSB	G^EXE$FORK			; Fork
+	MOVAB  -XWB$Q_FORK(R5),R5		; Restore XWB context
+						;
+	BICW   #XWB$M_STS_SOL,XWB$W_STS(R5)	; We're back
+	BICW   #XWB$M_FLG_WBUF,XWB$W_FLG(R5)	; Clear wait flag to allow retry
+	BBC    #XWB$V_STS_DIS,XWB$W_STS(R5),100$; If BC, disconnect not pending
+						;
+	PUSHR	#^M<R6,R7,R8,R9,R10,R11>	; Save Event regs
+	CLRL	R11				; Say "not okay to go to IPL 2"
+	MOVZBL	#NETEVT$_RESDIS,R7		; Event is "resume deaccess"
+	BSBW	NET$EVENT			; Signal the event
+	POPR	#^M<R6,R7,R8,R9,R10,R11>	; Restore regs
+						;
+100$:	BSBW	NET$SCH_MSG			; Schedule message transmission
+	RSB					; Done
+
+
+
+.SBTTL	NET$END_EVENT	- Abort current event without changing state
+.SBTTL	NET$COMPLEX_EV	- Change state and process new event
+.SBTTL	NET$PRE_EMPT	- Process new event without changing state
+;+
+;
+;  These routines are called by the dispatched event action routines in order
+;  to complete current event processing in a non-standard way.  They should be 
+;  considered substitutes to the RSB instruction which is normally used to 
+;  return control -- consequently the stack is checked for the return address 
+;  of the event dispatcher.
+;
+;  CALLING SEQUENCE:   JMP  NET$xxx
+;
+;  INPUTS: R10	  Preserved for call to action routine
+;	   R9	  The value originally stored by the event dispatcher
+;	   R8	  Preserved for call to action routine
+;	   R7	  Code of new event to be processed (scratch if NET$END_EVENT)
+;	   R6	  The value originally stored by the event dispatcher
+;	   R5	  XWB address
+;	   R4-R1  Scratch
+;	   R0	  If NET$END_EVENT the status to be returned to the
+;		     caller of the event dispatcher,
+;		  Else scratch
+;	  (SP)	  The address of CHANGE_STA which is the NET$EVENT return
+;		  address.
+;
+;  OUTPUTS:  N/A
+;
+;-
+NET$END_EVENT::				; End event without changing state
+	BSBB	CHKRETADDR		; Make sure stack is setup properly
+	BSBW	NET$SCH_MSG		; Schedule message transmission
+	RSB
+
+NET$COMPLEX_EV::			; Change state, process new event
+	BSBB	CHKRETADDR		; Validate state of stack
+	EXTZV	#NET$C_ACTBITS,-	;
+		#NET$C_STABITS,R9,R4	; Get next state
+	CMPB	R4,XWB$B_STA(R5)	; New state ?
+	BEQL	10$			; If not, branch
+	BSBB	NEW_STATE		; Enter new state
+10$:	BRB	NET$EVENT		; Process new event
+					;
+NET$PRE_EMPT::				; Pre-empt the current event
+	BSBB	CHKRETADDR		; Validate state of stack
+	BRB	NET$EVENT		; Process new event
+
+CHKRETADDR:				; Checks return address to trap bugs
+	PUSHAB	B^CHANGE_STA		; Prepare for next instruction
+	CMPL	(SP)+,4(SP)		; Is state of stack correct?
+	BNEQ	5$			; If NEQ then no
+	MOVL	(SP)+,(SP)		; Overlay return address
+	RSB				; Return
+
+5$:	BUG_CHECK NETNOSTATE,FATAL
+
+
+.SBTTL	NET$EVENT	- Event dispatcher
+;+
+;
+;  This is the state table event dispatcher used to determine what is to be
+;  done and what state the XWB is to enter next.  An event only has meaning 
+;  within the context of a XWB.
+;
+;
+;  INPUTS:	R10	Preserved for call to action routine
+;		R9	Available for the event dispatcher's exclusive use
+;		R8	Preserved for call to action routine
+;		R7	Code of the event to be processed
+;		R6	If received message event then Tranport's IRP address
+;			If "startio" event then UCB address
+;		R5	Address of XWB
+;		R4	Scratch
+;		R3	If received message event then scratch
+;			If "startio" event then QIO IRP address
+;		R2	If received msg event then message bytes not yet accounted for
+;			If "startio" event then scratch
+;		R1	If received msg event then ptr to first unprocessed byte in msg
+;			If "startio" event then scratch
+;		R0 	Scratch
+;
+;  OUTPUTS:	R0 	Status code from the action routine to be returned to
+;			the caller of the event dispatcher.
+;
+;		  Only R6 and R5 are preserved.
+;
+;-
+
+	ASSUME	XWB$C_NUMSTA EQ 8	; Assume quadword per event
+NET$EVENT::				; Process new event
+	MOVZBL	XWB$B_STA(R5),R9	; Get current state
+	MOVAQ	NET$AB_STTAB[R7],R4	; Get event block address
+	MOVZBL	(R4)[R9],R9		; Get table entry
+	BICL3	#NET$M_STAMSK,R9,R4	; Get action routine index
+	;
+	;
+	;    Dispatch according to the event code.  The action routines 
+	;    can assume the following :
+	;
+	;    Inputs:
+	;
+	;	R10	Parameter from caller to action routine
+	;	R9	State information -- not to be touched
+	;	R8	Parameter from caller to action routine
+	;	R7	Event code
+	;	R6	Varies with event
+	;	R5	XWB address
+	;	R4	Scratch
+	;	R3-R1	Varies with event
+	;	R0	Scratch
+	;      (SP)	Return address
+	;
+	;    Returned values:
+	;
+	;	R8,R7	Garbage
+	;	R6,R5	Preserved
+	;	R4-R1	Garbage
+	;	R0	Status to be returned to caller of dispatcher
+	;
+	;
+	BSBW	ACT_DISPATCH		; Call action routine
+
+CHANGE_STA:				; Change logical-link state
+	EXTZV	#NET$C_ACTBITS,-	;
+		#NET$C_STABITS,R9,R4	; Get next state
+	CMPB	R4,XWB$B_STA(R5)	; New state ?
+	BEQL	NET$SCH_MSG		; If EQL no, schedule message xmission
+	BSBB	NEW_STATE		; Change to new state
+	BRB	NET$SCH_MSG		; Schedule message xmission
+
+
+NEW_STATE:				; Change to new logical-link state
+	;
+	;
+	;    Clear PROGRESS since we are changing states.  The only exceptions
+	;    are if we are coming out of the "closed" state (since PROGRESS has
+	;    been setup to the correct value by the previous action routine) or
+	;    if we are entering the "connect ACK received" state (since we the
+	;    outgoing link timeout period is tied to the receipt of a Connect
+	;    Confirm, not a Connect-ACK).
+	;
+	;
+	CMPB	#XWB$C_STA_CLO,-	; Coming out of the "closed" state?
+		 XWB$B_STA(R5)		;
+	BEQL	10$			; If EQL, PROGRESS was already init'd
+	CMPB	#XWB$C_STA_CAR,R4	; Entering "CAR" state?
+	BEQL	10$			; If EQL yes, do not re-init PROGRESS
+	CLRW	XWB$W_PROGRESS(R5)	; Init progress count
+10$:	MOVB	R4,XWB$B_STA(R5)	; Change state
+	BICW	#XWB$M_STS_TID!-	; Always clear "timer id valid" and
+		 XWB$M_STS_DIS,-	; "disconnect pending" flags
+		 XWB$W_STS(R5)		; 
+						   ;
+	BICW	NET$AW_FLG_CLRM[R4],XWB$W_FLG(R5)  ; Clear indicated flags
+	BISW	NET$AW_FLG_SETM[R4],XWB$W_FLG(R5)  ; Set indicated flags
+	RSB					   ; Done
+
+
+.SBTTL	NET$SCH_MSG	- schedule message transmission
+;+
+;
+;  The following flags are used to cause control messages to be setup when the
+;  control message cell in the XWB becomes available.  As each message is 
+;  entered into this contol message cell, the corresponding bit is cleared.
+;
+;  These flags are listed in the order of their priority.
+;
+;
+;	XWB$V_FLG_TBPR - Set whenever the receive back pressure state needs to
+;			 be toggled.
+;
+;	XWB$V_FLG_IAVL - Set whenever a new xmit interrupt IRP makes it to the
+;			 head of the LSB queue and the partner's flow control 
+;			 on the INT/LS subchannel will let us send the message.
+;
+;	XWB$V_FLG_SIFL - Set whenever an INTERRUPT message has been sent to the
+;			 user's mailbox.  
+;
+;	XWB$V_FLG_SDFL - Set whenever the inactivity timer fires in order to 
+;			 maintain a minimal amount of traffic on the link to 
+;			 see if the remote node is still active.
+;
+;
+;  Whether or not a new Link-service/Interrupt message is setup in the XWB
+;  cell, XWB$W_FLG(R5) is scanned to see if any work needs to be done.  If
+;  so, and if the XWB fork block is not in use, control is passed to
+;  NET$SOLICIT.
+;
+;
+;  INPUTS:	R5	XWB address
+;		R4-R0	Scratch
+;
+;  OUTPUTS:	R4-R0	Garbage
+;
+;		All other registers are preserved.
+;
+;-
+NET$SCH_MSG::					; Schedule message transmission
+
+	ASSUME	XWB$V_FLG_IAVL  EQ  1+XWB$V_FLG_TBPR
+	ASSUME	XWB$V_FLG_SIFL  EQ  1+XWB$V_FLG_IAVL
+	ASSUME	XWB$V_FLG_SDFL  EQ  1+XWB$V_FLG_SIFL
+
+	FFS    #XWB$V_FLG_TBPR,#4,XWB$W_FLG(R5),R0 ; Find message to build
+	BEQL	90$				   ; If EQL then none
+	BBS    #NSP$V_FLW_INUSE,XWB$B_X_FLW(R5),90$; If BS, msg cell is in use
+	MOVB   #NSP$M_FLW_INUSE,XWB$B_X_FLW(R5)	   ; Claim the cell, clear flags
+	CLRB	XWB$B_X_FLWCNT(R5)		   ; Init flow request count
+						   ;
+	MOVAB	XWB$T_LI(R5),R2			   ; Setup LSB pointer
+	INCW	LSB$W_LUX(R2)		           ; Get next sequence number
+	BICW   #^X<F000>,LSB$W_LUX(R2)		   ; Mask off junk bits
+	MOVW	LSB$W_LUX(R2),LSB$W_HXS(R2)	   ; It's sendable now
+	BBCC	R0,XWB$W_FLG(R5),20$		   ; Clear the work bit
+						   ;
+20$:	$DISPATCH  R0,-				   ; Dispatch on work bit
+	<-
+	  <XWB$V_FLG_IAVL,   50$>,-		   ; INTerrupt msg
+	  <XWB$V_FLG_SIFL,   40$>,-		   ; INTerrupt flow control msg
+	  <XWB$V_FLG_SDFL,   80$>,-		   ; DATA flow control msg
+	>					   ; Fall thru if 
+						   ;   R0=XWB$V_FLG_TBPR
+	;
+	;
+	;    Setup for DATA channel control message to toggle the local
+	;    receiver back pressure state
+	;
+	;
+	MOVB   #NSP$M_FLW_XOFF,R0		; Setup for "stop flow" message 
+	BBCS   #XWB$V_STS_RBP,XWB$W_STS(R5),30$	; If BC, not back-pressured off
+	BICW   #XWB$M_STS_RBP,XWB$W_STS(R5)	; Mark receiver as having its
+						; back-pressured relaxed
+	MOVB   #NSP$M_FLW_XON,R0		; Setup for "start flow" msg
+	;
+	;
+	;    Force a NAK on the DATA sub-channel in order to reset its sequence
+	;    numbers.  Ordinarily, NAK's are undesireable in a routing
+	;    environment since they could contribute to congestion problems.
+	;    But that is generally true for NAK's sent due to receiving messages
+	;    out of order (a message received out of order is often due to
+	;    network congestion loss of an earlier packet).
+	;
+	;    The NAK is not absolutely necessary, but failure to send it will 
+	;    mean an inordinate delay since the remote sequence numbers will 
+	;    not be reset when back-pressure is subsequently relaxed (only a
+	;    NAK or timeout resets the sequence numbers).
+	;
+	;	NOTE:	Since XWB$M_FLG_SDACK is less than XMB$M_FLG_SLI, the
+	;		NAK will be sent just before the back-pressure message.
+	;		This is the desired order.
+	;
+	;
+	;
+	BISW   #XWB$M_FLG_SDACK,XWB$W_FLG(R5)	; Force NAK on the DATA channel 
+	BISW   #XWB$M_STS_DTNAK,XWB$W_STS(R5)	;   in order to reset it
+30$:	BISB	R0,XWB$B_X_FLW(R5)		; Set remaining control flags
+	BBCC   #XWB$V_FLG_SIFL,XWB$W_FLG(R5),80$; Piggy-back INT flow control 
+						; message if possible
+40$:	;
+	;
+	;    Setup Interrupt flow-control message.
+	;
+	;
+	BISB   #NSP$M_FLW_LISUB,XWB$B_X_FLW(R5)	; Flow control for LI channel
+	INCB	XWB$B_X_FLWCNT(R5)		; Ask for one more INT message
+	INCB	XWB$T_LI+LSB$B_R_CXBQUO(R5)	; And allow it to be received
+	BRB	80$				; Schedule msg for transmission
+50$:	;
+	;
+	;    Setup for Interrupt message
+	;
+	;
+	BISB   #NSP$M_FLW_INT,XWB$B_X_FLW(R5)	; Not "link service" message
+	MOVL	LSB$L_X_PND(R2),R0		; Get IRP
+	BICW   #IO$M_INTERRUPT,IRP$W_FUNC(R0)	; Indicate state change
+80$:	;
+	;
+	;    Schedule the message for transmission.
+	;
+	;
+	BISW   #XWB$M_FLG_SLI,XWB$W_FLG(R5)	; We've got a message to send
+	BICW   #XWB$M_FLG_SDFL,XWB$W_FLG(R5)	; Whatever has just been built
+						; satisfies the need to send the
+						; backround inactivity message
+90$:	;
+	;
+	;    Unless there are any wait conditions pending, solicit permission
+	;    from the Routing layer to transmit a message.
+	;
+	;
+	FFS    #0,#XWB$V_FLG_CLO+1,-		; Get work bit
+		   XWB$W_FLG(R5),R0		;
+	BBC	R0,NET$GL_WORKBITS,200$		; Br if no work to be done
+	BBSS   #XWB$V_STS_SOL,XWB$W_STS(R5),100$; If BS, fork block in use
+						;
+	PUSHL	R5				; Save XWB address
+	BSBW	NSP$SOLICIT			; Get permission to transmit
+	POPL	R5				; Restore XWB address
+100$:	RSB
+
+200$:	BBC    #XWB$V_STS_DIS,XWB$W_STS(R5),100$; If BC, disconnect not pending
+	BSBW	NET$CHK_X_IDLE			; Is XWB ready for disconnect ?
+	BLBC	R0,100$				; If LBC then no
+	BRW	NET$FORK			; Attempt to resume disconnect
+
+
+
+ACT_DISPATCH:				; Dispatch action routine
+
+	$DISPATCH	TYPE=B,R4,		-; R4 contains the action index
+	<-					
+	  <ACT$_ABORT,       ACT$ABORT>,	-; 
+	  <ACT$_BUG,         ACT$BUG>,		-; 
+	  <ACT$_CANLNK,      ACT$CANLNK>,	-; 
+	  <ACT$_CONFIRM,     ACT$CONFIRM>,	-; 
+	  <ACT$_DEACCESS,    ACT$DEACCESS>,	-; 
+	  <ACT$_ENT_RUN,     ACT$ENT_RUN>,	-; 
+	  <ACT$_INITIATE,    ACT$INITIATE>,	-; 
+	  <ACT$_LOG,         ACT$LOG>,		-; 
+	  <ACT$_NOP,         ACT$NOP>,		-; 
+	  <ACT$_RES_DISC,    ACT$RES_DISC>,	-;
+	  <ACT$_RCV_CA,      ACT$RCV_CA>,	-; 
+	  <ACT$_RCV_CC,      ACT$RCV_CC>,	-; 
+	  <ACT$_RCV_CI,      ACT$RCV_CI>,	-; 
+	  <ACT$_RCV_CR,      ACT$RCV_CR>,	-; 
+	  <ACT$_RCV_DATA,    ACT$RCV_DATA>,	-; 
+	  <ACT$_RCV_DTACK,   ACT$RCV_DTACK>,	-; 
+	  <ACT$_RCV_DX	     ACT$RCV_DX>,	-; 
+	  <ACT$_RCV_LI,      ACT$RCV_LI>,	-; 
+	  <ACT$_RCV_LIACK,   ACT$RCV_LIACK>,	-; 
+	  <ACT$_RCV_RTS,     ACT$RCV_RTS>,	-;
+	  <ACT$_RTS_NLT,     ACT$RTS_NLT>,	-; 
+	  <ACT$_SHRLNK,      ACT$SHRLNK>,	-; 
+	  <ACT$_SSABORT,     ACT$SSABORT>,	-;
+	>
+	BRB	ACT$BUG				; If unknown, bug
+
+
+.SBTTL	ACT$NOP   	- Null action routine
+.SBTTL	ACT$BUG   	- BUG_CHECK action routine
+.SBTTL	ACT$LOG	  	- Log-event action routine
+.SBTTL	ACT$NOLINK	- Report "SS$_FILNOTACC"
+.SBTTL	ACT$SSABORT	- Abort QIO since link was disconnected
+
+ACT$NOP:	RSB
+ACT$BUG:	BUG_CHECK NETNOSTATE,FATAL
+ACT$LOG:	NOP
+		NOP
+
+		NOP
+		NOP
+		NOP
+		RSB
+
+
+ACT$NOLINK:	MOVZWL	#SS$_FILNOTACC,IRP$L_IOST1(R3)
+		RSB
+
+ACT$SHRLNK:	;&nyi
+ACT$SSABORT:	MOVZWL	#SS$_ABORT,IRP$L_IOST1(R3)
+		RSB
+
+
+
+.SBTTL	NET$STARTIO	- Start I/O operation
+;+
+;
+;  This routine is entered when the associated unit is idle and a packet
+;  is available for processing.  The IRP$L_WIND field is used to locate the 
+;  associated XWB.
+;
+;
+;  INPUTS:	R5	UCB address
+;		R4	PCB address
+;		R3	IRP address
+;
+;  OUTPUTS:	 *** TBS ***
+;
+;-
+NET$STARTIO:					; Process next IRP
+	PUSHR	#^M<R5,R6,R7,R8,R9,R10,R11>	; Setup "event" context
+	BSBB	PROC_IO				; Process the I/O function
+	BLBS	R5,20$				; If LBS, no event to process
+	CLRL	R11				; Say "can't go to IPL 2"
+	BSBW	NET$EVENT			; Process event in R7
+20$:	POPR	#^M<R5,R6,R7,R8,R9,R10,R11>	; Return to UCB 'fork' context
+						;
+	MOVL	UCB$L_IRP(R5),R3		; Get IRP
+	BEQL	50$				; If EQL then its been queued
+						; or suspended, start next I/O
+	;
+	;
+	;    Deallocate misc. buffer 
+	;
+	;
+	BBC    #IRP$V_COMPLX,IRP$W_STS(R3),40$	; If BC, IRP$L_DIAGBUF does not
+						; point to a NETDRIVER buffer
+	MOVL	IRP$L_DIAGBUF(R3),R0		; Get buffer
+	BGEQ	40$				; If GEQ then none
+	CLRL	IRP$L_DIAGBUF(R3)		; Detach it
+	BSBW	NET$DEALLOCATE			; Deallocate block in R0
+40$:	;
+	;
+	;    Start next I/O.
+	;
+	;
+	MOVL	IRP$L_IOST1(R3),R0		; First  IOSB longword
+	MOVL	UCB$L_DEVDEPEND(R5),R1		; Second IOSB longword
+	REQCOM					; Complete I/O, start next IRP
+50$:	REMQUE	@UCB$L_IOQFL(R5),R3		; Get next IRP
+	BVS	60$				; If VS then none
+	JMP	G^IOC$INITIATE			; Deliver IRP to driver
+60$:	BICW	#UCB$M_BSY,UCB$W_STS(R5)	; Free up the UCB
+	RSB					; Return to Exec
+
+PROC_IO:;
+	;
+	;    Move the UCB to R6 and the XWB (if any) to R5 and dispatch
+	;    on function code with:
+	;
+	;	R10-R7	Scratch
+	;	R6	UCB address
+	;	R5	XWB address if LBC, else garbage
+	;	R3	IRP address
+	;	R2-R0	Scratch
+	;
+	;
+	MOVL	R5,R6				; Copy UCB to safe register
+	MOVL	IRP$L_WIND(R3),R5		; Get XWB, if any
+	BLSS	10$				; If LSS, XWB is in system space
+	BISL	#1,R5				; Else, invalidate window ptr
+10$:	MOVZWL	#SS$_ILLIOFUNC,IRP$L_IOST1(R3)	; Assume fct not supported
+	BICL3	#^C<IO$M_FCODE>,IRP$W_FUNC(R3),R7 ; Get code without modifiers
+
+	$DISPATCH  R7,TYPE=B,-			; Process I/O 
+	<-
+	  <IO$_ACCESS,	   NET$ACCESS>,- 	; Connect Requests
+	  <IO$_DEACCESS,   NET$DEACCESS>,-	; Disconnect Requests
+	  <IO$_ACPCONTROL, NET$CONTROL>,-	; ACP Control function
+	>				 	; Else, fall thru
+	MOVL	#1,R5				; Set low bit to prevent event
+	RSB					; dispatching and return
+
+
+.SBTTL	NET$FDT_SETMODE	- Process IO$_SETMODE request
+;+
+;
+; *** tbs ***
+;
+;-
+NET$FDT_SETMODE:				; Process IO$_SETMODE function
+	MOVL	P1(AP),R1			; Get characteristics buffer
+	BEQL	10$				; If EQL then none
+	IFNORD	#8,(R1),50$			; Br on access violation
+	MOVL	4(R1),UCB$L_DEVDEPEND(R5)	; Set mailbox mask
+10$:	BICL3	#1,IRP$L_WIND(R3),R0		; Get XWB address
+	BGEQ	40$				; If GEQ then none
+	;
+	;
+	;    This was used for "maintenance" mode.  Now available for
+	;    future functions.  
+	;
+	;
+40$:	MOVL	UCB$L_DEVDEPEND(R5),R1		; Get device dependent info
+	MOVZWL	S^#SS$_NORMAL,R0		; Setup I/O status
+	JMP	G^EXE$FINISHIO			; Return success
+	
+50$:	MOVZWL	#SS$_ACCVIO,R0			; Setup I/O status
+	JMP	G^EXE$ABORTIO			; Abort I/O
+
+
+.SBTTL	NET$FDT_CONTROL	- IO$_ACPCONTROL FDT processing
+.SBTTL	NET$CONTROL	- IO$_ACPCONTROL "startio" processing
+;+
+;
+;  The FDT routine simply routes the IRP through the Exec to the ACP.  The Exec
+;  builds a "complex buffer" describing the control function.  The ACP will 
+;  requeue any IRP to the driver if it does not recognize the control function.
+;  The driver has been designed to handle some of its own control functions 
+;  since many are protocol or control block format specific.
+;
+;
+;  INPUTS:	R5	UCB Address 
+;		R4	PCB Address
+;		R3	IRP Address
+;
+;  OUTPUTS:	R5	Unchanged
+;		R0	I/O status
+;
+;-
+NET$FDT_CONTROL:				  ; FDT phase for IO$_ACPCONTROL
+	CLRL	IRP$L_DIAGBUF(R3)		  ; Zero misc buffer pointer
+	BICL	#1,IRP$L_WIND(R3)		  ; Always clear interlock flag
+	ASSUME	PHD$Q_PRIVMSK  EQ  0		  ;
+	MOVQ	@PCB$L_PHD(R4),IRP$Q_NT_PRVMSK(R3); Store privilege mask
+	JMP	G^ACP$MODIFY			  ; Continue in EXEC
+
+
+;
+;  INPUTS:	*** tbs ***
+;  OUTPUTS:	*** tbs ***
+;
+;
+NET$CONTROL:					; "Startio" for IO$_ACPCONTROL
+	BBC	#IRP$V_COMPLX,IRP$W_STS(R3),10$	; If BC, part of $CANCEL
+	MOVL	@IRP$L_SVAPTE(R3),R0		; Get ptr to window descriptor
+	CLRL	(R0)				; Don't affect window upon
+	BRB	50$				;  I/O completion
+10$:	;
+	;
+	;   The user is getting ready to issue an IO$_DEACCESS QIO to break the
+	;   link.  In order for the IO$_DEACCESS to be sent to the driver, the 
+	;   channel's outstanding I/O count (CCB$W_IOC) must be zero.  Hence the
+	;   receiver must be run-down and any outstanding receive IRP's aborted.
+	;
+	;
+	MOVZWL	#SS$_NORMAL,IRP$L_IOST1(R3)	; Set I/O status
+	BICL	#1,R5				; Clear interlock bit
+	BLSS	70$				; If LSS then valid XWB
+	;
+	;
+	;    Scan LTB to find XWB with an access pending for this channel
+	;
+	;
+	MOVL	UCB$L_VCB(R6),R0		; Get RCB
+	BEQL	50$				; If EQL then none
+	MOVL	RCB$L_PTR_LTB(R0),R0		; Get LTB
+	BEQL	50$				; If EQL then none
+	MOVAB  -XWB$L_LINK+LTB$L_XWB(R0),R5	; Prepare for XWB scan
+20$:	MOVL	XWB$L_LINK(R5),R5		; Get next XWB
+	BNEQ	60$				; If EQL then none left
+50$:	BISB	#1,R5				; Prevent event dispatching
+	RSB					; Done
+
+60$:	MOVL	XWB$L_IRP_ACC(R5),R0		; Get suspended IRP, if any
+	BEQL	20$				; If EQL none, loop
+	CMPL	IRP$L_PID(R0),IRP$L_PID(R3)	; Belong to this process ?
+	BNEQ	20$				; Loop if NEQ
+	CMPW	IRP$W_CHAN(R0),IRP$W_CHAN(R3)	; Same channel ?
+	BNEQ	20$				; If NEQ, loop
+70$:	;
+	;
+	;   The transmitter is not automatically run-down since the user may be 
+	;   preparing a "synchronous" disconnect -- i.e., disconnect after the 
+	;   final data segment has been ACK'd.  The manner in which pipelining 
+	;   has been implemented allows user transmit IRP's to be sent to I/O 
+	;   completion before the corresponding CXB's have been ACK'd  (or even 
+	;   sent).  Therefore, the user might issue a call to $CANCEL mistakenly
+	;   thinking that the final message has be ACK'd.  Hence $CANCEL should
+	;   allow the transmit CXB's to be ACK'd in their normal fashion.
+	;
+	;   Therefore, drain the receiver of all IRP's and CXB's.  If there
+	;   are any transmit IRP's on the queue, then the disconnect is not
+	;   synchronous, and the transmitter queue must be drained as well.
+	;
+	;
+	BBS    #XWB$V_STS_CON,XWB$W_STS(R5),80$	; If BS, IO$_ACCESS pending
+	BSBW	DRAIN_RCV			; Drain the receiver
+	CLRL	R0				; Init R0 for CHK_X_IRP call
+	BSBW	CHK_X_IRP			; Any Xmt IRP's
+	BLBS	R0,50$				; If LBS, no
+80$:	MOVZWL	#NETEVT$_CANLNK,R7		; Force link to break
+	RSB					; Done
+
+
+
+.SBTTL	NET$FDT_ACCESS	- IO$_ACCESS  FDT processing
+.SBTTL	NET$ACCESS	- IO$_ACCESS "startio" processing
+;++
+;
+;  NET$FDT_ACCESS passes the IRP through the EXEC, where the user parameters 
+;  are packaged into a "complex buffer", to the ACP.  The ACP reads the user 
+;  connect info to build an Internal Connect Block (ICB) which it attaches to 
+;  the IRP$L_DIAGBUF field of the IRP and requeues the IRP to the driver.  The
+;  role of the ACP is to lookup default access control (username, password,
+;  account) information in its data base and to translate node and object names
+;  to numbers.
+;
+;  NET$ACCESS reads the ICB and determines the type of connect.  It builds an 
+;  XWB for connect initiate events and locates an already existing XWB for all 
+;  others.  NET$ACCESS stores the appropriate event code in R7 and returns 
+;  expecting the caller to call the event dispatcher.
+;
+;  It should be noted that the size of the XWB is not charged against the user 
+;  byte count or byte limit quotas.  It is assumed that these quotas are at 
+;  least partly used to limit a run away process and that the file quota of a 
+;  process, against which logical-links are charged, is a sufficient mechanism.
+;
+;
+;
+;  INPUTS:      *** tbs ***
+;
+;  OUTPUT:	*** tbs ***
+;
+;
+;-
+NET$FDT_ACCESS:					; IO$_ACCESS  "FDT" processing
+
+	ASSUME	PHD$Q_PRIVMSK EQ 0
+
+	MOVQ	@PCB$L_PHD(R4),IRP$Q_NT_PRVMSK(R3) ; Store priv mask in IRP
+	CLRL	IRP$L_DIAGBUF(R3)		; Indicate no ICB
+	JMP	G^ACP$ACCESSNET			; Continue in EXEC
+
+
+NET$ACCESS:					; IO$_ACCESS "startio" processing
+	BSBW	GET_WNDSC			; Get CCB$L_WIND image descr.
+	CLRL	(R7)				; Init CCB$L_WIND image
+	BISW	#IRP$M_FUNC,IRP$W_STS(R3)	; Mark for write back
+	MOVZWL	#1,IRP$L_BCNT(R3)		; Write back one descriptor
+	MOVL	R6,R5				; Copy UCB addr for subroutines
+	MOVL	R3,R8				; Copy IRP address to safe reg
+	MOVL	IRP$L_DIAGBUF(R8),R4		; Get ICB pointer
+	BGEQ	80$				; If GEQ, its an error code
+10$:	;
+	;
+	;    IO$_ACCESS made it successfully through the ACP
+	;
+	;
+	MOVZWL	ICB$W_LOCLNK(R4),R3		; Get local link address
+	BSBW	XWB_LOCLNK			; Find associated XWB
+	BLBS	R5,60$				; Br if XWB was not found
+	CMPL	XWB$L_PID(R5),IRP$L_PID(R8)	; PIDs match ?
+	BNEQ	55$				; Br if they don't
+	TSTW	XWB$W_REMLNK(R5)		; Does remote link id exit ?
+	BNEQ	30$				; Connect Confirm if NEQ
+	;
+	;
+	;    Connect Initiate
+	;
+	;
+	ADDW3	#1,ICB$W_TIM_OCON(R4),-		; Setup outbound connect timer 
+		XWB$W_TIMER(R5)			; (+1 for possible clock skew)
+	MOVZBL	#NETEVT$_CIA,R7			; Set 'connect initiate access'
+	BRB	50$				; Finish in common
+30$:	;
+	;
+	;    Connect Confirm
+	;
+	;
+40$:	MOVZBL	#NETEVT$_CCA,R7			; Set 'connect confirm access'
+	BBC	#IO$V_ABORT,IRP$W_FUNC(R8),50$	; If BC, not Connect Reject
+	MOVZBL	#NETEVT$_CRA,R7			; Set 'connect reject access'
+50$:	;
+	;
+	;    Because the low bit of R5 is clear, the XWB will considered to
+	;    be valid and the event in R7 will be processed.
+	;
+	;
+	MOVL	R8,R3				; Setup IRP address
+	RSB					; Return with LBC in R5
+
+;
+;  Unsuccessful access
+;
+55$:	MOVZWL	#SS$_DEVALLOC,R4		; Setup error code
+	BRB	80$				; Continue
+60$:	MOVZWL	#SS$_CONNECFAIL,R4		; Setup error code
+80$:	MOVL	R8,R3				; Setup IRP pointer
+	MOVL	R4,IRP$L_IOST1(R3)		; Store error code
+	MOVL	#1,R5				; Tell CLEANUP_ACCESS "no XWB"
+	BSBW	CLEANUP_ACCESS			; Restore quota
+	RSB					; On return goto REQCOM
+
+100$:	BUG_CHECK  NETNOSTATE,FATAL
+
+
+.SBTTL	ACT$INITIATE	- Connect Initiate action routine
+.SBTTL	ACT$CONFRIM	- Connect Confirm action routine
+;+
+;
+;  These action routines resume processing the event setup by NET$ACCESS.
+;  ACT$INITIATE assumes that a Connect Initiate message will be built
+;  and sent.  ACT$CONFIRM is used when a received connect is being either
+;  accepted or rejected and assumes that eihter a Connect Confirm or a
+;  Disconnect Initiate message will be built and sent.  
+;
+;
+;  INPUTS:	R8	Scratch
+;		R7	Event code
+;		R6	UCB address
+;		R5	XWB address
+;		R4	Scratch
+;		R3	IRP address
+;		R2-R0	Scratch
+;
+;  OUTPUTS:	R8,R7	Garbage
+;		R6,R5 	Preserved
+;		R4-R0	Garbage
+;
+;-
+ACT$CONFIRM::					; Connect Confirm or Reject
+	BSBB	SETUP_XWB			; Do common setup
+	;
+	;
+	;    If the remote end of the Logical-link is on the local node then
+	;    use the same "path".  This allows loopbacked lines to be used for
+	;    all logical-link traffic in both directions -- which seems like a 
+	;    sensible thing to do even though this may be a depature from the
+	;    Network Management architecture.
+	;
+	;
+	TSTW	XWB$W_PATH(R5)			; Has a path been chosen ?
+	BNEQ	20$				; If NEQ then yes
+	MOVL	XWB$L_VCB(R5),R2		; Get the RCB
+	CMPW	XWB$W_REMNOD(R5),RCB$W_ADDR(R2)	; Is the remote node us?
+	BNEQ	20$				; If NEQ no
+						;
+	PUSHR	#^M<R3,R4,R5>			; Save regs
+	MOVZWL	XWB$W_REMLNK(R5),R3		; Get remote link i.d.
+	BSBW	NET$XWB_LOCLNK			; Find corresponding XWB
+	MOVL	R5,R2				; Copy XWB address to new reg
+	POPR	#^M<R3,R4,R5>			; Restore regs
+						;
+	BLBS	R2,20$				; If LBS then no XWB was found
+	MOVW	XWB$W_PATH(R2),XWB$W_PATH(R5)	; Use partner's path i.d.
+20$:	BBC	#IO$V_ABORT,IRP$W_FUNC(R3),100$	; If BC then not connect reject
+	ASSUME	NET$C_DR_NORMAL  EQ  0		;
+	CLRW	XWB$W_X_REASON(R5)		; Setup disconnect reason code
+	MOVQ	S^#SS$_NORMAL,R0		; Setup IOSB value
+	BSBW	NET$CMPL_ACC			; Complete the IO$_ACCESS IRP
+100$:	RSB					; Done
+
+ACT$INITIATE::					; Connect Initiate request
+SETUP_XWB:					; Setup common fields
+	INCW	XWB$W_REFCNT(R5)		; Account for accessor
+	MOVL	XWB$L_PID(R5),XWB$$+ACB$L_PID(R5) ; Setup Special Kernal AST PID
+	MOVL	R3,XWB$L_IRP_ACC(R5)		; Store IRP address
+	CLRL	UCB$L_IRP(R6)			; Clear IRP pointer to prevent
+						; immediate I/O completion
+	MOVL	R6,XWB$L_ORGUCB(R5)		; Setup UCB ptr
+	MOVL	IRP$L_DIAGBUF(R3),R4		; Get ICB ptr
+	CLRL	IRP$L_DIAGBUF(R3)		; Dettach it from IRP
+	MOVL	R4,XWB$L_ICB(R5)		; Attach it to XWB
+	BISW	#XWB$M_FLG_SCD,XWB$W_FLG(R5)	; Set send message flag
+30$:	;
+	;
+	;    Setup pre-allocated byte quota to take upon entering the RUN state
+	;
+	;
+;&	CLRW	XWB$W_X_QUO(R5)			; Pre-allocate none for rcv's
+;&	CLRW	XWB$W_R_QUO(R5)			; Pre-allocate none for rcv's
+	;
+	;
+	;    Move remainder of parameters from the ICB
+	;
+	;
+	PUSHR	#^M<R3,R4,R5>				; Save MOVC regs
+							;
+	MOVAB	ICB$B_DATA(R4),R1			; Get source pointer
+	BSBW	NET$MOV_TO_XWB				; Move counted string 
+							; to XWB$B_DATA...
+	ASSUME	ICB$C_RID  LE  XWB$C_RID		;
+	MOVB	ICB$B_RID(R4),XWB$B_RID(R5)		; Move the count field
+							;
+	MOVC5	#ICB$C_RID,ICB$T_RID(R4),#^A' ',-	; Move the remote
+		#XWB$C_RID,XWB$T_RID(R5)		; i.d. text
+							;
+	POPR	#^M<R3,R4,R5>			 	; Restore regs
+	MOVW	ICB$W_RETRAN(R4),R0			; Get rexmt factor
+	BLEQ	50$					; If LEQ keep default
+	MOVW	R0,		    XWB$W_RETRAN(R5)	; Update rexmt factor
+50$:	CLRW			    XWB$W_PROGRESS(R5)	; Init progress count
+	MOVW	ICB$W_PATH(R4),     XWB$W_PATH(R5)  	; Circuit to use
+	MOVW	ICB$W_SEGSIZ(R4),   XWB$W_LOCSIZ(R5)	; Rcv buffer size
+	MOVW	ICB$W_DLY_FACT(R4), XWB$W_DLY_FACT(R5)	; Delay factor
+	MOVW	ICB$W_DLY_WGHT(R4), XWB$W_DLY_WGHT(R5)	; Delay weight
+	MOVW	ICB$W_TIM_INACT(R4),XWB$W_TIM_INACT(R5)	; Inactivity timer
+	;
+	;
+	;    Setup TIMER and DELAY so that the Connect message will be
+	;    retransmitted periodically if necessary.  This is done by choosing
+	;    a DELAY which will allow RETRAN retransmission before the amount
+	;    of time left in TIMER expires.  
+	;
+	;
+	DIVW3	XWB$W_RETRAN(R5),-		; TIMER has number of ticks
+		XWB$W_TIMER(R5),XWB$W_DELAY(R5)	; left before timeout
+	DIVW	XWB$W_DLY_FACT(R5),-		; Adjust for the "delay factor"
+		XWB$W_DELAY(R5)			;
+	BNEQ	70$				; If NEQ then use it
+	INCW	XWB$W_DELAY(R5)			; Else use 1 second
+70$:	BSBW	NET$RESET_TIMER			; Reset XWB$W_TIMER
+	RSB					; Done
+
+
+.SBTTL	NET$CMPL_ACC	- Complete IO$_ACCESS, fill in window
+;++
+;
+;  The access function currently being processed is completed.
+;  If the I/O completion status is not successful then the window of the
+;  channel associated with the IRP is cleared.
+;
+;
+;  INPUTS:  R5	XWB address
+;	    R1	Second IOSB longword value
+;	    R0	First  IOSB longword value
+;
+;  OUTPUTS: R1	Garbage
+;	    R0	SS$_NORMAL
+;
+;	    All other registers are preserved.
+;
+;-
+NET$CMPL_ACC::				; Complete access, fill in window
+	PUSHR  #^M<R2,R3,R4,R5,R7,R8>	; Save regs
+					;
+	CMPW	XWB$W_DELAY(R5),#4	; Make sure initial "delay" estimate
+	BGEQU	30$			; is at least 4 seconds
+	MOVW	#4,XWB$W_DELAY(R5)	;
+30$:	MOVL	XWB$L_IRP_ACC(R5),R3	; Get IO$_ACCESS IRP
+	BEQL	200$			; If EQL then none
+	CLRL	XWB$L_IRP_ACC(R5)	; Remove IRP
+	MOVQ	R0,IRP$L_IOST1(R3)	; Save I/O status
+	;
+	;
+	;    Setup the CCB$L_WIND value and deallocate the ICB.
+	;
+	;    If either the access was unsuccessful or the request was for a
+	;    Connect Reject, then cleanup from the IO$_ACCESS attempt and
+	;    leave the CCB$L_WIND image at zero.
+	;
+	;
+	BBS	#IO$V_ABORT,-		; If BS, Connect Reject
+		IRP$W_FUNC(R3),60$	;
+	CLRB	XWB$B_DATA(R5)		; Init optional data cell to prepare 
+					; for eventual disconnect
+	BLBS	R0,100$			; If LBS then successful IO$_ACCESS
+60$:	BSBW	CLEANUP_ACCESS		; Clean up from access I/O fct
+	BRB	110$			; Complete the I/O
+100$:	BSBW	GET_WNDSC		; Get CCB$L_WIND image descriptor
+	MOVL	R5,(R7)			; Setup CCB$L_WIND value
+	BSBW	DEAL_ICB		; Deallocate the ICB
+110$:	;
+	;
+	;    Complete the I/O
+	;
+	;
+	BSBW	NET$POST_IO		; Post IRP for completion
+					;
+200$:	POPR	#^M<R2,R3,R4,R5,R7,R8>	; Restore regs
+	MOVL	S^#SS$_NORMAL,R0	; Success
+	RSB
+
+
+
+.SBTTL	ACT$ENT_RUN	- Enter RUN state action routine
+;+
+;
+;  This routine is entered to setup the XWB for entering the RUN state.
+;
+;  INPUTS:  R7	Event code  - it will be reprocessed via the complex event
+;			      mechanism.  Note that the state should have
+;			      been updated by then.
+;	    R5	XWB address
+;	    R0	Scratch
+;
+;  OUTPUTS: R0 garbage
+;
+;	    All other registers are preserved.
+;
+;-
+ACT$ENT_RUN::				; Enter RUN state
+	BSBW	NET$SETUP_RUN		; Setup XWB for RUN state
+	BRW	NET$COMPLEX_EV		; Change state and resignal the event
+
+
+.SBTTL	NET$FDT_DEACCESS- IO$_DEACCESS FDT processing
+.SBTTL	NET$DEACCESS	- IO$_DEACCESS "startio" processing
+;++
+;
+;  INPUTS:	AP	Pointer to the QIO P1 parameter
+;		R8	Must be saved/restored if return to Exec for next
+;			FDT routine
+;		R7	I/O function code without modifiers
+;		R6	CCB address
+;		R5	UCB address
+;		R4	PCB address
+;		R3	IRP address
+;		R2-R0	Scratch
+;
+;  OUTPUTS:	R5,R3	Preserved
+;
+;		All other regs may be clobbered.
+;
+;--
+NET$FDT_DEACCESS::				; IO$_DEACCESS FDT routine
+	CLRL	IRP$L_DIAGBUF(R3)		; Zero misc buffer pointer
+	MOVZWL	#SS$_FILNOTACC,R0		; Assume "link not accessed"
+	BICL	#1,IRP$L_WIND(R3)		; Clear interlock bit
+	BGEQ	200$				; If GEQ, link is not accessed
+						;
+	PUSHR	#^M<R3,R4,R5,R6,R8,R9,R10,R11>	; Save regs
+	DSBINT	UCB$B_FIPL(R5)			; Synchronize
+	MOVL	#1,R11				; Say "okay to go to IPL 2"
+						;
+	MOVL	IRP$L_WIND(R3),R5		; Switch to XWB context
+	;
+	;
+	;    Setup disconnect reasons codes as appropriate
+	;
+	;
+	CMPW	#NET$C_DR_INVALID,XWB$W_R_REASON(R5) ; Rcv'd reason code yet ?
+	BNEQ	10$				     ; If NEQ yes
+	MOVZWL	#NET$C_DR_DEACC,  XWB$W_R_REASON(R5) ; Setup local reason
+10$:	CMPW	#NET$C_DR_INVALID,XWB$W_X_REASON(R5) ; Xmt reason code setup ?
+	BGTRU	20$				     ; If GTRU, yes
+	MOVZWL	#NET$C_DR_NORMAL, XWB$W_X_REASON(R5) ; Assume ordinary disconn.
+	BBC	#IO$V_ABORT,	  IRP$W_FUNC(R3),20$ ; If BS, must abort all I/O
+	MOVZWL	#NET$C_DR_ABORT,  XWB$W_X_REASON(R5) ; Else, set "disc. abort"
+20$:	;
+	;
+	;   If IO$V_ABORT is set, then both the transmitter and receiver must
+	;   be run-down.  Otherwise, this is a "synchronous" disconnect and
+	;   the transmitter must be allowed to send all data before breaking
+	;   the link.
+	;
+	;
+	BBS	#XWB$V_STS_CON,   XWB$W_STS(R5),100$ ; If BS, not in RUN format
+	BBC	#IO$V_ABORT,	  IRP$W_FUNC(R3),50$ ; If BS, must abort all I/O
+	BSBW	DRAIN_XMT			     ; Run-down the transmitter
+50$:	BSBW	DRAIN_RCV			     ; Run-down the receiver
+						;
+100$:	ENBINT					; Restore IPL
+	POPR	#^M<R3,R4,R5,R6,R8,R9,R10,R11>	; Restore regs
+						;
+	JMP	G^ACP$DEACCESS			; Goto system FDT routine
+200$:	JMP	G^EXE$ABORTIO			; Abort the I/O
+
+
+NET$DEACCESS::					; User QIO to break link
+	BSBW	GET_WNDSC			; Get CCB$L_WIND image desc
+	CLRL	(R7)				; Clear CCB$L_WIND image 
+	MOVZWL	#SS$_NORMAL,IRP$L_IOST1(R3)	; Setup success status
+	BISW	#IRP$M_FUNC,IRP$W_STS(R3)	; Mark for write back
+	MOVL	#1,IRP$L_BCNT(R3)		; Write back 1 (the window) ABD
+	MOVL	#NETEVT$_DEA,R7			; Setup event code in case R5
+	RSB					; is a valid XWB pointer
+
+
+ACT$DEACCESS::					; User QIO to break link
+	BSBW	CLEANUP_ACCESS			; Clean up from access I/O fct
+	BSBW	GET_P2DSC			; Get optional data descriptor
+	DECL	R8				; Reduce length by count field
+	BLSS	ACT$RES_DISC			; If LSS, then no data
+	MOVZBL	(R7),R1				; Get count value from string 
+	CMPL	R8,R1				; Take minimum of size from 
+	BLSSU	20$				;  descriptor and size from 
+	MOVL	R1,R8				;  string
+20$:	CMPL	R8,#16				; Take minimum of what's there 
+	BLSSU	30$				;  and max allowed by NSP
+	MOVL	#16,R8				;
+30$:	MOVB	R8,(R7)				; Setup count field in string
+	MOVL	R7,R1				; Setup source ptr
+	BSBW	NET$MOV_TO_XWB			; Move counted string to 
+						; XWB$B_DATA
+ACT$RES_DISC::					; Resume Disconnect processing
+	;
+	;
+	;    If the XWB is idle, continue processing this event.  Else, dismiss
+	;    this event for now and resume it when the XWB goes idle.  This is
+	;    the only way to do a "synchronous disconnect" with NSP pipelining
+	;    causing user Transmit IRP's to be completed before the CXB's are
+	;    actually transmitted.
+	;
+	;
+	BSBB	NET$CHK_X_IDLE			; Is the transmitter idle ?
+	BLBC	R0,100$				; If LBS then no
+	BSBW	NET$PURG_RUN			; Cleanup if necessary
+	RSB					; Return to change state
+						;
+100$:	BISW	#XWB$M_STS_DIS,XWB$W_STS(R5)	; Mark disconnect pending
+	BRW	NET$END_EVENT			; Dismiss this event for now
+
+
+
+		.ENABL	LSB
+
+NET$CHK_X_IDLE::				; See if transmitter is idle
+	BBS	#XWB$V_STS_CON,XWB$W_STS(R5),10$; If BS, not in RUN format
+	MOVL	 XWB$T_DT+LSB$L_X_CXB(R5),R0	; Get next DATA CXB
+	BISL	 XWB$T_LI+LSB$L_X_CXB(R5),R0	;  OR in next Interrupt CXB
+CHK_X_IRP:					; Check for Xmt IRP's
+	BISL	 XWB$T_DT+LSB$L_X_PND(R5),R0	;  OR in pending DATA Xmt IRP's
+	BISL	 XWB$T_DT+LSB$L_X_IRP(R5),R0	;  OR in spent DATA Xmt IPR's
+	BISL	 XWB$T_LI+LSB$L_X_PND(R5),R0	;  OR in pending Int. Xmt IRP's
+	BISL	 XWB$T_DT+LSB$L_X_IRP(R5),R0	;  OR in spent Int. Xmt IPR's
+	BNEQ	 20$				; If NEQ then not idle
+10$:	MOVL	#1,R0				; Say "idle"
+	RSB					; Done
+						;
+20$:	CLRL	 R0				; Say "non-idle"
+	RSB					; Done
+
+		.DSABL	LSB
+
+
+		.ENABL	LSB
+GET_WNDSC:				; Get window descriptor
+	CLRL	R8			; Get descriptor offset
+	BRB	10$			; Continue
+GET_P1DSC:				; Get P1 descriptor
+	MOVL	#8,R8			; Get descriptor offset
+	BRB	10$			; Continue
+GET_P2DSC:				; Get P2 descriptor
+	MOVL	#8*2,R8			; Get descriptor offset
+	BRB	10$			; Continue in common
+GET_P3DSC:				; Get P3 descriptor
+	MOVL	#8*3,R8			; Get descriptor offset
+	BRB	10$			; Continue in common
+GET_P4DSC:				; Get P4 descriptor
+	MOVL	#8*4,R8			; Get desciptor offset
+10$:	ADDL	@IRP$L_SVAPTE(R3),R8	; Get descriptor address
+	MOVZWL	(R8)+,R7		; Get offset to data
+	MOVAB	-1(R8)[R7],R7		; Get ptr to data after skipping
+					; over access mode byte
+	MOVZWL	(R8),R8			; Get length of data
+	RSB
+		.DSABL	LSB
+
+
+.SBTTL	CLEANUP_ACCESS	- Cleanup XWB for terminated IO$_ACCESS
+;+
+;
+;  INPUTS:	R5 - XWB address, low bit set if none
+;		R3 - IRP address
+;
+;  OUTPUTS:	All registers are preserved.
+;
+;
+;-
+CLEANUP_ACCESS:
+	PUSHR	#^M<R0,R1,R2>			; Save regs
+						;
+	CLRL	R2				; Assume no byte quota to return
+	BLBS	R5,20$				; If LBS then no XWB
+	BSBB	DEAL_ICB			; Deallocate the ICB
+	BSBW	NET$DRAIN_FREE_CXB		; Drain CXB free queue
+	DECW	XWB$W_REFCNT(R5)		; Account for loss of accessor
+	BNEQ	200$				; Br if last accessor
+10$:	CLRL	XWB$L_ORGUCB(R5)		; XWB is unowned
+	CLRL	XWB$L_PID(R5)			; XWB is unowned
+	BBS    #XWB$V_STS_ASTPND,XWB$W_STS(R5),20$ ; If BS, AST block in use
+	CLRL	XWB$$+ACB$L_PID(R5)		; Prevent false AST delivery
+20$:	;
+	;
+	;    Return BYTCNT and FILCNT quota
+	;
+	;
+	MOVZWL	IRP$L_PID(R3),R0		; Get PID index
+	MOVL	G^SCH$GL_PCBVEC,R1		; Get PCB vector address
+	MOVL	(R1)[R0],R1			; Get PCB address
+	CMPL	PCB$L_PID(R1),IRP$L_PID(R3) 	; Still there ?
+	BNEQ	30$				; If not branch
+	MOVL	PCB$L_JIB(R1),R0		; Get JIB
+	INCW	JIB$W_FILCNT(R0)		; Return quota for IO$_ACCESS
+	ADDL	R2,JIB$L_BYTCNT(R0)		; Return byte quota
+	ADDL	R2,JIB$L_BYTLM(R0)		; Here too
+						;
+30$:	POPR	#^M<R0,R1,R2>			; Restore regs
+	RSB					; Done
+
+200$:	BUG_CHECK NETNOSTATE,FATAL		; Invalid reference count
+
+DEAL_ICB:					; Deallocate the ICB
+	MOVQ	R0,-(SP)			; Save regs
+						;
+	BBC    #XWB$V_STS_CON,XWB$W_STS(R5),40$	; If BC, XWB$L_ICB is invalid
+	MOVL	XWB$L_ICB(R5),R0		; Get buffer for deallocation
+	BGEQ	30$				; If GEQ then none
+	BSBW	NET$DEALLOCATE			; Deallocate block in R0
+30$:	CLRL	XWB$L_ICB(R5)			; Say "no ICB"
+						;
+40$:	MOVQ	(SP)+,R0			; Restore regs
+	RSB					; Done
+
+
+.SBTTL	NET$CANCEL	- Cancel I/O routine
+;+
+;
+;  Most of the work for the Cancel-I/O sequence will occur when the special
+;  IO$_ACPCONTROL QIO is issued by the $CANCEL system service.  
+;
+;  In all cases, the ACP is informed via a mailbox message since special 
+;  cleanup may be needed in the ACP (e.g. declared name cleanup).  Note that
+;  the special Cancel IRP is only sent to the ACP if there is a logical-link 
+;  active.
+;
+;
+;  INPUTS:	R5	UCB address
+;		R4	PCB address
+;		R3	IRP address if UCB is busy
+;		R2	Channel number
+;		R1,R0	Scratch
+;
+;		NET$C_IPL
+;
+;  OUTPUTS:	R3-R0	Garbage
+;
+;		All other registers are preserved
+;
+;-
+NET$CANCEL:					; Cancel I/O entry point
+	MOVL	UCB$L_VCB(R5),R0		; Get VCB address
+	BEQL	50$				; If EQL then none
+	;
+	;
+	;    Tell the ACP
+	;
+	;
+	PUSHR	#^M<R2,R3,R4,R5,R7,R8>		; Save regs
+						;
+	MOVL	R2,R7				; Save channel number
+	MOVL	RCB$L_ACP_UCB(R0),R5		; Get the ACP's UCB
+	MOVZWL	#MSG$_PATHLOST,R8		; Setup mailbox message code
+	MOVL	#6,R2				; No. of bytes to be entered 
+	BSBW	NET$SEND_MBX			; Setup the message
+	BLBC	R0,30$				; Br on error -- ignore it
+	MOVL	PCB$L_PID(R4),(R3)+		; Enter the PID
+	MOVW	R7,(R3)+			; Enter channel
+	JSB	@(SP)+				; Send the message
+						;
+30$:	POPR	#^M<R2,R3,R4,R5,R7,R8>		; Restore regs
+50$:	;
+	;
+	;    If the unit is busy then it must be a bug sinc NET$STARTIO never
+	;    allows an I/O queue to build on the UCB
+	;
+	;
+	BBS	#UCB$V_BSY,UCB$W_STS(R5),100$	; Done if UCB is not busy
+	RSB					; Done
+						;
+100$:	BUG_CHECK NETNOSTATE,FATAL		; Our UCB assumptions are wrong
+
+
+.SBTTL	NET$PURG_RUN	- Cleanup XWB to exit RUN state
+;+
+;
+;  The receiver and transmitter are run-down on both the DATA and INT/LS
+;  LSB's.
+;
+;  It is assumed that this routine is called as a result of a call from one
+;  of the state transition action routines and that there will be a state 
+;  transition out of the RUN state as the event processing is completed.  This
+;  is because certain processing -- such as the setting and clearing of XWB
+;  flags -- is assumed to be done as part of the state transition processing
+;  and is therefore done by this routine.
+;
+;
+;  INPUTS:	R5	XWB address; low bit set if no XWB
+;		R0	Scratch
+;
+;  OUTPUTS:	R0	Garbage
+;
+;		All other registers are preserved
+;
+;-
+NET$PURG_RUN::					; Leave the RUN state
+	PUSHR  #^M<R1,R2,R3,R4,R6,R7,R8>	; Save regs
+						;
+	BBS    #XWB$V_STS_CON,XWB$W_STS(R5),20$	; If BS, not in RUN format
+	BSBB	DRAIN_XMT			; Drain the transmitter
+	BSBW	DRAIN_RCV			; Drain the receiver
+						;
+20$:	POPR   #^M<R1,R2,R3,R4,R6,R7,R8>	; Restore regs
+	RSB
+
+
+DRAIN_XMT:				    ; Drain the xmitter
+	;
+	;    All transmit CXB's are detached and eventually deallocated.
+	;    All transmit IRP's are sent to I/O Post with disconenct status.
+	;    The LSB transmitter state variables are updated to reflect an
+	;    idle transmitter.
+	;
+	;
+	;    Inputs:	R8,R7	Scratch
+	;		R5	XWB address
+	;		R4-R0	Scratch
+	;
+	;    Outputs:	R8,R4-R0  garbage.
+	;
+	;		All other registers are preserved.
+	;
+	;
+	BSBW	NET$MAP_R_REASON	    ; Map disconnect reason to status
+	MOVZWL	REASON_W_SS(R0),R0	    ; Get proper I/O status code
+	CLRL	R1			    ; IOSB second longword
+	MOVAB	XWB$T_LI(R5),R8		    ; Get the LS/INT LSB
+	BSBB	10$			    ; Do it
+	MOVAB	XWB$T_DT(R5),R8		    ; Get the DATA LSB
+	BSBB	10$			    ; Do it
+	;
+	;
+	;    Simulate an ACK on each active CXB thus causing them to be
+	;    deallocated.  This will lead to a false value for LSB$B_X_REQ,
+	;    but this is tolerable since we're about to exit the RUN state.
+	;
+	;	(only the DATA subchannel has CXB's attached to the LSB).
+	;
+	;
+	MOVZBL	LSB$B_X_CXBACT(R8),R4	    ; Number of active Xmt CXB's 
+	BEQL	5$			    ; If EQL then none
+	BSBW	NET$ACK_XMT_SEGS	    ; "ACK" each segment release CXB's
+5$:	RSB				    ; Done
+
+
+10$:	MOVQ	R0,-(SP)		    ; Save IOSB image
+	;
+	;
+	;    Update Xmitter state variables
+	;
+	;
+	MOVW	LSB$W_LUX(R8),LSB$W_LNX(R8) ; Pretend we've sent all packets
+	MOVW	LSB$W_LUX(R8),LSB$W_HAR(R8) ; Pretend all packets were ACK'd
+	MOVW	LSB$W_LUX(R8),LSB$W_HAA(R8) ; No further ACK's expected
+	MOVW	LSB$W_LUX(R8),LSB$W_HXS(R8) ; No further packets to send
+	;
+	;
+	;    Join the Xmitter's IRP lists, setup each IRP with new I/O status
+	;
+	;
+	ASSUME	IRP$L_IOQFL  EQ  0
+
+	MOVAB	LSB$L_X_IRP(R8),R1	    ; Get spent IRP listhead
+	BRB	40$
+20$:	CLRL	LSB$L_X_PND(R8)		    ; Detach pending IRP list
+	MOVL	R0,(R1)			    ; Attach it to end of spent IRP list
+30$:	MOVL	R0,R1			    ; Update last IRP pointer
+	MOVQ	(SP),IRP$L_IOST1(R0)	    ; Overwrite status
+40$:	MOVL	(R1),R0			    ; Get next IRP
+	BNEQ	30$			    ; If NEQ, IRP was found
+	MOVL	LSB$L_X_PND(R8),R0	    ; Get pending IRP list
+	BNEQ	20$			    ; If NEQ, not empty
+	MOVL	LSB$L_X_IRP(R8),R3	    ; Get first IRP
+	BEQL	100$			    ; If EQL, none
+	BSBW	NET$XMT_DONE		    ; Complete all Xmt IRPs
+					    ;
+100$:   MOVQ	(SP)+,R0		    ; Restore stack and R0
+	RSB				    ; Done
+
+
+DRAIN_RCV:				    ; Drain the receiver
+	;
+	;    All receive CXB's are detached and deallocated.
+	;
+	;    All receive IRP's are sent to I/O Post with disconnect status.
+	;    For each LSB, LSB$B_R_CXBQUO is zeroed to prevent further CXB's
+	;    from being received.
+	;
+	;
+	;    Inputs:	R8	Scratch
+	;		R5	XWB address
+	;		R3	Scratch
+	;		R1-R0	Scratch
+	;
+	;    Outputs:	R8,R3,R1,R0  garbage.
+	;
+	;		All other registers are preserved.
+	;
+	;
+	BSBW	NET$MAP_R_REASON	    ; Map disconnect reason to status
+	MOVZWL	REASON_W_SS(R0),R0	    ; Get proper I/O status code
+	CLRL	R1			    ; IOSB second longword
+	MOVAB	XWB$T_LI(R5),R8		    ; Get the LS/INT LSB
+	BSBB	10$			    ; Do it
+	MOVAB	XWB$T_DT(R5),R8		    ; Get the DATA LSB
+10$:	MOVQ	R0,-(SP)		    ; Save IOSB image
+	;
+	;
+	;    Drain Receive CXB list
+	;
+	;
+	CLRB	LSB$B_R_CXBQUO(R8)	    ; Prevent further receives
+	CLRB	LSB$B_R_CXBCNT(R8)	    ; Zero the CXB  in use count
+	MOVL	LSB$L_R_CXB(R8),R0	    ; Get first CXB in list
+	BEQL	40$			    ; If EQL then none
+	CLRL	LSB$L_R_CXB(R8)		    ; Detach entire CXB chain from LSB
+					    ;
+30$:	PUSHL	CXB$L_LINK(R0)		    ; Save ptr to next CXB
+	BSBW	NET$DEALLOCATE		    ; Deallocate block in R0
+	POPL	R0			    ; Get the next CXB
+					    ;
+	BNEQ	30$			    ; If NEQ then loop, else no CXB
+40$:	;
+	;
+	;    Complete all Rcv IRP's with mapped disconnect status code
+	;
+	;
+	MOVL	LSB$L_R_IRP(R8),R3	    ; Get next Rcv IRP
+	BEQL	50$			    ; If EQL then none
+	CLRW	IRP$W_BCNT(R3)		    ; No bytes xferred
+	MOVQ	(SP),IRP$L_IOST1(R3)	    ; Setup I/O status
+	BSBW	NET$RCV_DONE		    ; Complete the receive
+	BRB	40$			    ; Loop
+					    ;
+50$:	MOVQ	(SP)+,R0		    ; Restore regs
+	RSB				    ; Done
+
+
+.SBTTL	NET$ACP_COMM	- Entry for ACP communication
+;++
+;
+;  This routine is called by the ACP for change of status notification 
+;  including process exit, logical-link "ownership" changes, and datalink 
+;  transitions.
+;
+;
+;  CALLING SEQUENCE:
+;
+;	  JSB	@CRB$L_INTD+VEC$L_START  at IPL 0
+;
+;  INPUTS: R5	 NET UCB address.   
+;	   R4-R1 Function specific -- see individual action routine preambles
+;	   R0	 Function code as follows:
+;
+;		  NETUPD$_CONNECT   - Pass NCB to Declared Name mailbox
+;		  NETUPD$_PROCRE    - Process created to received connect
+;		  NETUPD$_ABORT	    - Process couldn't start
+;		  NETUPD$_EXIT	    - Started process is exiting
+;
+;		  NETUPD$_DLL_ON    - Datalink has come online - post a receive
+;		  NETUPD$_DLL_DLE   - Datalink online for service fcts
+;		  NETUPD$_REACT_RCV - Reactivate Datalink receiver
+;		  NETUPD$_SEND_HELLO - Force datalink to send a hello message 
+;
+;		  NETUPD$_CRELNK    - Create a logical-link control structure 
+;		  NETUPD$_DSCLNK    - Graceful disconnect of single link
+;		  NETUPD$_ABOLNK    - Force immediate disconnect of all links
+;
+;		  NETUPD$_BRDCST    - Broadcast mailbox message
+;		  NETUPD$_REPLY     - Reply to associated mailbox
+;
+;  OUTPUTS:  R0	Status
+;
+;	    All other registers are preserved.
+;
+;--
+	R3_OFF = 4*3
+	R4_OFF = 4*4
+	R5_OFF = 4*5
+
+		.ENABL	LSB
+
+NET$ACP_COMM::				; ACP entry point
+	SETIPL	UCB$B_FIPL(R5)		; Raise IPL to synch access to structures
+
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10>	; Save regs
+
+	MOVL	SP,R10			; Save ptr to saved R0
+	BSBB	20$			; Dispatch on fct code
+	MOVL	R0,(SP)			; Overlay return code
+
+	POPR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10>	; Restore regs
+
+	SETIPL	#0			; Restore IPL
+	RSB
+
+20$:	$DISPATCH  R0,TYPE=B,-		; Case on function code
+	<-
+	    <NETUPD$_CONNECT,	DECLARE>,-  ; Pass NCB to Declared Name mailbox
+	    <NETUPD$_PROCRE,	PROCRE>,-   ; Process created to rcv connect
+	    <NETUPD$_ABORT,	ABORT>,-    ; Abort single link for given process
+	    <NETUPD$_EXIT,	EXIT>,-	    ; Started process is exiting
+	    -				    ;
+	    <NETUPD$_CRELNK,    CRE_LNK>,-  ; Create a logical-link
+	    <NETUPD$_DSCLNK,    DISC_ONE>,- ; Disconnect single logical-link
+	    <NETUPD$_ABOLNK,   	ABORT_ALL>,-; Abort all logical-links
+	    -				    ;
+	    <NETUPD$_BRDCST,    BRDCST>,-   ; Broadcast mailbox message
+	    <NETUPD$_REPLY,     REPLY>,-    ; Send general mailbox message
+	    <NETUPD$_DLL_ON,	DLLTRN>,-   ; Datalink made into "on" state
+	    -				    ;
+	>
+	BRW	UNKNOWN			    ; Let lowest level handle this
+
+;+
+;  PROCRE   - Process started due to CI received
+;
+;  INPUTS:  R5	NET UCB address.
+;	    R4	Scratch
+;	    R3	Local link number.
+;	    R2	Scatch
+;	    R1  PID of process
+;
+;-
+PROCRE:	CLRL	R0			; Setup for "no PID" match
+	BSBW	200$			; Get XWB
+	BNEQ	40$			; Done if NEQ
+	MOVL	R1,XWB$L_PID(R5)	; Set PID of process allowed
+					; to complete the connect
+	BRB	40$			; Done
+
+;+
+;  ABORT    - Abort single logical-link for a given process
+;
+;  INPUTS:  R5	NET UCB address.
+;	    R4	Scratch
+;	    R3	Local link number.
+;	    R2	Disconnect reason code 
+;	    R1  PID of process (zero if process not started)
+;
+;-
+ABORT:	MOVL	R1,R0			; Setup PID (could be zero)
+	BSBW	200$			; Get XWB
+	BNEQ	40$			; Done if NEQ
+	BSBW	180$			; Enter DIS state
+40$:	MOVL	S^#SS$_NORMAL,R0	; Report success
+	RSB				; Done
+
+;+
+;  EXIT	    - A formerly started process has exited
+;
+;  INPUTS:  R5	NET UCB address
+;	    R4	Scratch
+;	    R3	Scratch
+;	    R2	Disconnect reason code 
+;	    R1  PID of process
+;
+;-
+EXIT:	MOVL	UCB$L_VCB(R5),R5        ; Get RCB
+	BEQL	80$			; Br if not mounted
+	MOVL	RCB$L_PTR_LTB(R5),R5    ; Get LTB
+	BEQL	80$			; Br if its not there
+	MOVAL	-XWB$L_LINK -		;
+		+LTB$L_XWB(R5),R5	; Setup for scan
+60$:	MOVL	XWB$L_LINK(R5),R5	; Get next XWB
+	BEQL	80$			; If EQL then end of list
+	MOVL	R1,R0			; Copy process PID
+	BSBB	210$			; Check process access to XWB via PID
+	BNEQ	60$			; If NEQ then something wrong
+	BSBB	180$			; Disconnect the link
+	BRB	60$			; Continue
+80$:	MOVL	S^#SS$_NORMAL,R0	; Success
+	RSB				; Done
+
+	
+;+
+;  CRE_LNK  -   Create a single logical-link
+;
+;  INPUTS:  R5	NET UCB address.
+;	    R4	Scratch
+;	    R3  Logical-link's remote node address 
+;	    R2	Scratch
+;	    R1  PID of process allowed to access link
+;
+;  OUTPUTS:  R0	XWB address, high bit clear => failure code
+;-
+CRE_LNK:				; Create single logical-link
+	BSBW	NET$CREATE_XWB		; Create the structure
+	BLBC	R0,10$			; If LBC, failed
+	MOVL	R1,XWB$L_PID(R5)	; Setup PID
+	MOVL	R5,R0			; Setup XWB address
+10$:	RSB				; Done
+
+;+
+;  DISC_ONE -   Disconnect a single logical-link
+;
+;  INPUTS:  R5	NET UCB address.
+;	    R4	Scratch
+;	    R3	Local link number.
+;	    R2	Disconnect reason code
+;	    R1  Logical-link's remote node address 
+;-
+DISC_ONE:				; Disconnect single logical-link
+	BSBW	XWB_LOCLNK		; Find the logical-link XWB
+	MOVZWL	S^#SS$_BADPARAM,R0	; Assume no such link exists
+	BLBS	R5,120$			; If LBS then XWB was not found
+	TSTW	XWB$W_REMNOD(R5)	; Remote node 0?
+	BEQL	100$			; If so, ignore node check
+	CMPW	R1,XWB$W_REMNOD(R5)	; Same remote node ?
+	BNEQ	120$			; If not, return error
+100$:	BSBW	180$			; Disconnect the link
+	MOVL	S^#SS$_NORMAL,R0	; Success
+120$:	RSB
+
+;+
+;  ABORT_ALL -  Abort all logical-links
+;
+;  INPUTS:  R5	NET UCB address
+;	    R4	Scratch
+;	    R3	Scratch
+;	    R2	Scratch
+;	    R1  Ptr to LTB
+;
+;-
+ABORT_ALL:				; Abort all logical-links
+	MOVAL	-XWB$L_LINK -		;
+		+LTB$L_XWB(R1),R5	; Prepare for scan
+140$:	MOVL	XWB$L_LINK(R5),R5	; Get next XWB
+	BEQL	160$			; If NEQ then got one
+	MOVW	#NET$C_DR_THIRD,R2	; Reason is "third party abort"
+	BSBB	180$			; Mark link to be broken
+	BRB	140$			; Loop
+160$:	MOVL	S^#SS$_NORMAL,R0	; Success
+	RSB
+
+
+;
+;  Disconnect the link
+;
+180$:	CMPW	XWB$W_X_REASON(R5),-	; Remote reason been setup yet?
+		#NET$C_DR_INVALID	;
+	BNEQ	190$			; If NEQ then yes
+	MOVW	R2,XWB$W_X_REASON(R5)	; Enter disconnect reason
+190$:	CMPW	XWB$W_R_REASON(R5),-	; Local reason been setup yet?
+		#NET$C_DR_INVALID	;
+	BNEQ	195$			; If NEQ then yes
+	MOVW	R2,XWB$W_R_REASON(R5)	;
+195$:	BSBW	NET$MARK_LINK		; Mark the link to be broken
+	MOVQ	(R10),R0		; Restore R0,R1,R2
+	MOVL	8(R10),R2		;
+	RSB				; Done
+;
+;  Find XWB, verify access rights by PID
+;
+200$:	BSBW	XWB_LOCLNK		; Find XWB via local link number
+	TSTB	#1			; Clear Z-bit, assuming error
+	BLBS	R5,220$			; If LBS then no XWB
+210$:	CMPL	R0,XWB$L_PID(R5)	; Is the process the owner ? 
+	BNEQ	220$			; If NEQ then no
+	CMPB	#XWB$C_STA_CIR,-	;
+		XWB$B_STA(R5) 		; Verify state
+220$:	RSB
+
+
+;+
+;  BRDCST   -   Broadcast a mailbox message
+;
+;  INPUTS:  R5	NET UCB address
+;	    R4	Ptr to mailbox msg text
+;	    R3	Associated mailbox mask (0 if broadcast to all mailboxes)
+;	    R2	Mailbox msg code
+;	    R1  Scratch
+;
+;-
+BRDCST:					; Broadcast mailbox message
+	;
+	; & Code to set up R3 here will move to NETACP, eventually
+	;
+	MOVAB	MBX_TABLE,R8		; Point to filter mapping table
+300$:	MOVL	(R8)+,R3		; Get next mask
+	BEQL	320$			; If EQL at end of table - take the msg
+	CMPW	(R8)+,R2		; Is this the msg being sent?
+	BNEQ	300$			; If NEQ no - loop; else, R3 has bit
+320$:	MOVL	R2,R8			; Transfer msg type code
+	PUSHL	#0			; Assume no message text
+	MOVL	SP,R7			; Point to it
+	TSTL	R4			; Any message text?
+	BEQL	400$			; If EQL no, goto end of loop
+	MOVZBL	(R4),R2			; Get count field value
+	INCL	R2			; Inc to get total string size
+	MOVL	R4,R7			; Setup stable string pointer
+	BRB	400$			; Jump to end of loop
+	
+340$:	TSTL	R3			; Will everyone take this message?
+	BEQL	360$			; If EQL yes
+	BITL	R3,UCB$L_DEVDEPEND(R5)	; Can this UCB take this message?
+	BEQL	400$			; If EQL no - don't even try to send
+360$:	PUSHR	#^M<R2,R3,R5>		; Save regs
+	BSBW	NET$SEND_MBX		; Call co-routine to setup the message
+	BLBC	R0,380$			; If LBC then error
+	MOVL	R7,R1			; Get message pointer
+	BSBW	NET$MOV_CSTR		; Move the string with count field
+	JSB	@(SP)+			; Complete the message
+380$:	POPR	#^M<R2,R3,R5>		; Recover regs
+400$:	MOVL	UCB$L_LINK(R5),R5	; Get next UCB
+	BNEQ	340$			; If NEQ then got one
+	TSTL	(SP)+			; Fix the stack
+	MOVL	S^#SS$_NORMAL,R0	; Exit with success
+	RSB
+
+
+;+
+;  REPLY    -   Send general message to assocaited mailbox
+;
+;  INPUTS:  R5	NET UCB address
+;	    R4	Ptr to mailbox msg text  
+;	    R3	& Associated mailbox mask if NETUPD$_BRDCST (0 if broadcast all)
+;	    R2	Mailbox msg code
+;	    R1  Scratch
+;
+;-
+REPLY:	MOVL	R2,R8			; Get mailbox message code
+	BRB 	500$			; Continue in common
+
+;+
+;  DECLARE  -   Pass NCB to Declared-name mailbox
+;
+;  INPUTS:  R5	NET UCB address
+;	    R4	Ptr to NCB counted string
+;	    R3	Scratch
+;	    R2	Scratch
+;	    R1  Scracth
+;
+;-
+DECLARE:				; Pass NCB to declare-object mailbox
+	BSBW	XWB_LOCLNK		; Find link's XWB
+	BLBS	R5,560$			; Br if no XWB 
+	CMPB	#XWB$C_STA_CIR,-	; Must be in CIR state
+		XWB$B_STA(R5)		;
+	BNEQ	560$			; If not then cannot redirect connect
+	MOVL	R1,XWB$L_PID(R5)	; Set PID of process
+	MOVZWL	#MSG$_CONNECT,R8	; Setup mailbox message type 
+500$:	MOVQ	R4_OFF(R10),R4		; Get mbx message and UCB addresses
+	MOVL	R4,R2			; Copy msg pointer
+	BEQL	520$			; If EQL then no text
+	MOVZBL	(R2),R2			; Set count of bytes to be sent
+520$:	BSBW	NET$SEND_MBX		; Prepare to send mailbox message
+	BLBC	R0,580$			; Br on error
+	MOVL	R4,R1			; Copy NCB pointer
+	BEQL	540$			; Skip if null
+	BSBW	NET$MOV_CSTR		; Move counted string into buffer
+540$:	JSB	@(SP)+			; Complete writing mailbox
+560$:	MOVL	S^#SS$_NORMAL,R0	; Success
+580$:	RSB				; Done
+
+
+;+
+;  DLLTRN   -   Datalink state transition
+;
+;  INPUTS:  R5	NET UCB address
+;	    R4	Scratch
+;	    R3	Scratch
+;	    R2	Scratch
+;	    R1  Ptr to datalink's LPD
+;
+;-
+DLLTRN:	MOVL	UCB$L_VCB(R5),R2	; Get RCB
+	CMPB	#LPD$C_LOC_INX,-	; Is this the local LPD
+		 LPD$B_PTH_INX(R1)	;
+	BNEQ	 UNKNOWN		; If not, branch
+					;
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; Save regs
+	MOVL	R5,R3			; Copy UCB address
+	MOVL	RCB$L_PTR_TQE(R2),R5	; Get TQE
+	BBS	#TQE$V_REPEAT,-		; Br if timer is in use
+		TQE$B_RQTYPE(R5),600$	;
+	MOVB	#TQE$C_SSREPT,-		; Set for system subroutine repeat
+		TQE$B_RQTYPE(R5)	;
+	MOVAB	W^NET$TIMER,-		; Set timer handler address
+		TQE$L_FPC(R5)		;
+	MOVL	R3,TQE$L_FR4(R5)	; Save UCB address
+	MOVQ	#10*1000*1000,-		; 1 tick = 1 sec
+		TQE$Q_DELTA(R5)		;
+	MOVAB	W^NET$GL_OFF_DPTFLG,R0	; Get address of offset to DPT$B_FLAGS
+	ADDL	(R0),R0			; Make it an address
+	BISB	#DPT$M_NOUNLOAD,(R0)	; Prevent reload of driver
+	MOVQ	G^EXE$GQ_SYSTIME,R0	; Set time of first tick
+	DSBINT	#IPL$_TIMER		; Lower IPL to that of timer service
+	JSB 	G^EXE$INSTIMQ		; Insert into queue
+	ENBINT				; Restore IPL
+600$:	POPR    #^M<R0,R1,R2,R3,R4,R5>	;
+					;
+UNKNOWN:				;
+	BSBW	TR$UPDATE		; Fct code is in R0
+	RSB				; Exit with status in R0
+
+		.DSABL	LSB
+
+
+.SBTTL	NET$SEND_CS_MBX	- Send counted string to mailbox
+;+
+;
+;  A mailbox message is built and sent to the mailbox associated with the UCB
+;  associated with the XWB.  The counted string pointed to by R1 is appended to
+;  the end of the mailbox message.  R2 contains the assumed total count of the
+;  string and may be zero.  If there is no mailbox then the routine is assumed
+;  implicitly successful.
+;
+;
+;  INPUTS:  R8	Mailbox message type code
+;	    R5	XWB address
+;	    R2	Assumed total length of string (low byte only)
+;	    R1	Address of count field of string
+;
+;  OUTPUTS: R2	Zero 
+;	    R1	Garbage
+;	    R0	SS$_NORMAL	if mailbox successfully written
+;		SS$_NOMBX!1	if no associated mailbox or no UCB
+;		Zero		if (R1)+1 NEQ R2  or  R2 GTRU 17
+;		Also see 	NET$SEND_MBX for R0 error codes
+;
+;
+;	All other registers are preserved
+;
+;-
+NET$SEND_CS_MBX::
+	PUSHR	#^M<R1,R2,R3,R4,R5>	; Save regs
+					;
+	TSTL	R2			; Any bytes in string ?
+	BNEQ	10$			; If NEQ yes, else can't trust R1
+	MOVAB	B^50$,(SP)		; Setup null string ptr
+	BRB	20$			; Continue
+10$:	CLRL	R0			; Assume string error
+	CMPL	R2,#17			; Is count within range
+	BGTRU	40$			; If not, branch
+	SUBB3	(R1),R2,R3		; Check count field consistency
+	DECB	R3			; Account for count field itself
+	BNEQ	40$			; Inconsistent if NEQ
+20$:	MOVZWL	#SS$_NOMBX!1,R0		; Assume no UCB or mailbox
+	MOVL	XWB$L_ORGUCB(R5),R5	; Get UCB
+	BEQL	40$			; If none, done
+	TSTL	UCB$L_AMB(R5)		; Is there a mailbox ?
+	BEQL	40$			; If not, branch
+	BSBW	NET$SEND_MBX		; Build header (co-routine)
+	BLBC	R0,40$			; Br on error
+	MOVL	4(SP),R1		; Get string address (note stack)
+	BSBW	NET$MOV_CSTR		; Move string with count field
+	JSB	@(SP)+			; Close and send mbx message
+					;
+40$:	POPR	#^M<R1,R2,R3,R4,R5>	; Recover regs
+	CLRL	R2			; String has been consumed
+	RSB
+
+50$:	.BYTE	0			; Phony counted string for mailbox
+
+.SBTTL	NET$SEND_MBX	- Co-routine to send mailbox message
+;+
+;
+;  The first time the routine is entered the associated mailbox is found, a
+;  buffer is allocated for the message, and the mailbox header is built.  When 
+;  the routine is re-entered, after a call-back to the co-routine, the message 
+;  is closed and sent to the mailbox.
+;
+;  The original entry parameters are given below, the re-entry parameters are 
+;  given within the body of the code.
+;
+;
+;  INPUTS:  R8	Mailbox message type code
+;	    R5	UCB address
+;	    R3	Scratch
+;	    R2	Count of bytes co-routine will enter into message
+;	    R1	Scratch
+;	    R0	Scratch
+;
+;  OUTPUTS: R3	Pointer to next byte in mailbox message to be filled
+;	    R2	Address of allocated buffer if R0=SS$_NORMAL
+;	    R1	Garbage
+;	    R0	SS$_NORMAL  if successful
+;		SS$_NOMBX   if there's no associated mailbox
+;
+;		see NET$ALONONPAGED for additional error status
+;
+;	    All other registers are preserved
+;
+;-
+NET$SEND_MBX::
+	;
+	;
+	;    Add 24 to the number of bytes the user will enter.  This will 
+	;    ensure that the allocated block is large enough for COM$DRVDEALMEM
+	;    to deallocate -- also creates space for:
+	;
+	; 	12 bytes for  standard buffer header
+	;  	 2 bytes for mailbox msg type code
+	;	 2 bytes for mailbox  unit number
+	;  	 1 byte  for count field for device name
+	;
+	;
+	ADDL	#24,R2			; Increase buffer size
+	MOVL	UCB$L_DDB(R5),R0	; DDB pointer
+	MOVAB	DDB$T_NAME(R0),R1	; Get device name string ptr
+					;
+	PUSHL	R1			; Save device name string ptr
+	MOVZBL	(R1),R1			; Get string size
+	ADDL	R2,R1			; Add in remaining bytes 
+	BSBW	NET$ALONONPAGED		; Get the buffer
+	POPL	R1			; Restore device name string ptr
+					;
+	BLBS	R0,10$			; If LBS then okay
+	RSB				; Return with error status in R0
+
+10$:	ADDL3	#12,R2,R3		; Get pointer to start of msg
+	MOVW	R8,(R3)+		; Enter message type code
+	MOVW	UCB$W_UNIT(R5),(R3)+	; Enter unit I.D.
+	BSBW	NET$MOV_CSTR		; Move in device name with count field
+	MOVL	S^#SS$_NORMAL,R0	; Indicate success
+	JSB	@(SP)+			; Call co-routine for more bytes
+					; Note that R4 is unmodified
+	;
+	;
+	;    On coroutine return:	R5 = UCB address
+	;				R3 = address of 1st byte past mbx msg
+	;				R2 = buffer address
+	;
+	;    On return to caller:	R0 = EXE$WRITEMBX status
+	; 				R1-R5 are garbage
+	;
+	;
+	ADDL3	#12,R2,R4		; Get start of mbx message
+	SUBL	R4,R3			; Get length of mbx message
+	MOVZWL	#SS$_NOMBX,R0		; Assume no mailbox
+	MOVL	UCB$L_AMB(R5),R5	; Get mailbox
+	BEQL	20$			; If EQL then no mailbox
+	JSB	G^EXE$WRTMAILBOX	; Send message to mailbox
+					;
+20$:	PUSHL	R0			; Save return status
+	SUBL3	#12,R4,R0		; Get buffer address
+	BSBW	NET$DEALLOCATE 		; Deallocate block in R0
+	POPL	R0			; Restore reg
+					;
+	RSB				; Done
+
+
+.SBTTL	NET$CREATE_XWB	- Create XWB for logical-link
+;++
+;
+;  An XWB (the logical-link control structure that will eventually be attached 
+;  to an I/O channel CCB$L_WIND field) is allocated and initialized, provided
+;  that the current maximum logical-link count is not exceeded.  The current
+;  logical-link count in incremented.
+;
+;  No local link address is assigned, and the XWB is not linked into the LTB.
+;
+;
+;  INPUTS:	R5	NET UCB Address 
+;		R3	Remote node address
+;		R0	Scratch
+;
+;  OUTPUTS:	R5	Address of XWB if successful, otherwise LBS
+;		R0	Status
+;
+;		All other registers are preserved
+;
+;--
+NET$CREATE_XWB::				; Get idle XWB
+	PUSHR  #^M<R1,R2,R3,R4>			; Save regs to be used
+	;
+	;
+	;    Make sure we are not over our limit (MCOUNT = current links + 1).
+	;
+	;
+	MOVZWL #SS$_NOLINKS,R0			; Assume failure
+	MOVL	UCB$L_VCB(R5),R2		; Point to RCB
+	BEQL	13$				; If EQL then no RCB
+	MOVZWL	RCB$W_MCOUNT(R2),R1		; Get current Mount Count
+	BEQL	13$				; If EQL, NETACP shutting down
+	CMPW	R1,RCB$W_MAX_LNK(R2)		; Is new link allowed ?
+	BGTRU	12$				; If not, branch 
+	MOVZWL #XWB_C_LEN,R1			; Get size of XWB
+	BSBW	NET$ALONPGD_Z			; Allocate the block and zero it
+						; to initialize most fields
+	MOVL	R2,R1				; Save XWB pointer
+	MOVL	UCB$L_VCB(R5),R2		; Point to RCB 
+	MOVL	R1,R5				; Use standard XWB pointer
+	MOVW	8(SP),R4			; Get dst node address
+	BLBS	R0,15$				; Br if successful
+12$:	BUMP	W,RCB$W_CNT_XRE(R2)		; Account for resource error
+13$:	MOVL	#1,R5				; Invalidate XWB ptr
+	BRB	100$				; Done
+15$:	;
+	;
+	;    Initialize the XWB and bump RCB mount count.  
+	;
+	;					
+	BSBB	INIT_XWB			; Init XWB
+	CMPW	RCB$W_MCOUNT(R2),RCB$W_CNT_MLL(R2) ; New max active links value?
+	BLEQU	30$				; If LEQU then no
+	INCW	RCB$W_CNT_MLL(R2)		; Bump max active link count
+						; (#links = MCOUNT-1)
+30$:	INCW	RCB$W_MCOUNT(R2)		; Account for new link 
+	MOVL	#1,R0				; Success
+100$:	POPR   #^M<R1,R2,R3,R4>			; Restore regs
+	RSB					; Done
+
+INIT_XWB:					     ; Initialize XWB.
+	MOVB   #NET$C_IPL,	 XWB$B_FIPL(R5)	     ; Setup fork IPL
+	MOVB   #DYN$C_NDB,	 XWB$B_TYPE(R5)	     ; Setup structure type
+	MOVB   #XWB$C_STA_CLO,	 XWB$B_STA(R5)	     ; Init logical-link state
+	MOVW   #XWB$M_STS_CON,	 XWB$W_STS(R5)	     ; Init the status word
+	MOVW   #XWB$M_FLG_CLO,	 XWB$W_FLG(R5)	     ; Init FLG bits
+	MOVW   #NET$C_DR_INVALID,XWB$W_R_REASON(R5)  ; Init rcv'd discon reason
+	MOVW   #NET$C_DR_INVALID,XWB$W_X_REASON(R5)  ; Init xmt'd discon reason
+	MOVW	R4,		 XWB$W_REMNOD(R5)    ; Setup remote node i.d.
+	MOVL	R2,		 XWB$L_VCB(R5)	     ; Setup VCB address
+	MOVB   #^X<80>,          XWB$$+ACB$B_RMOD(R5); Setup Special Kernal AST
+	MOVAB	NET$KAST,        XWB$$+ACB$L_KAST(R5);  mode and address
+						     ;
+	MOVAB	XWB$Q_FREE_CXB(R5),R0		     ; Get free queue address
+	MOVL	R0,(R0)				     ; Init queue header
+	MOVAL	(R0)+,(R0)			     ;
+					              ;
+	MOVZBW	RCB$B_ECL_RFA(R2),  XWB$W_RETRAN(R5)  ; Set default rexmit's
+	MOVZBW	RCB$B_ECL_DFA(R2),  XWB$W_DLY_FACT(R5); Set default delay factor
+	MOVZBW	RCB$B_ECL_DWE(R2),  XWB$W_DLY_WGHT(R5); Set default delay weight
+	MOVW	RCB$W_ECLSEGSIZ(R2),XWB$W_REMSIZ(R5)  ; Set temp 'seg' size
+	ADDW3  #1,RCB$W_TIM_CNI(R2),XWB$W_TIMER(R5)   ; Set inbound connect timer
+						      ; (#1 is for clock skew)
+	;
+	;
+	;    Build the route header.
+	;
+	;
+	MOVAB	XWB$T_TR3HDR+6(R5),R1	; Setup route-header pointer
+	CLRB	-(R1)			; Zero the "visits" field
+	MOVW	RCB$W_ADDR(R2),-(R1)	; Enter src node address
+	MOVW	R4,-(R1)		; Enter dst node address
+	MOVB   #TR3$C_MSG_DATA,-(R1)	; Enter message type
+	MOVL	R1,XWB$L_PTR_RTHD(R5)	; Setup route-header pointer
+	MOVL	#6,-(R1)		; Store the route-header size
+	RSB				; Done
+
+
+.SBTTL	XWB_LOCLNK	- Get XWB via local link number
+;+
+;
+;  INPUTS:	R5	Any NET UCB address
+;		R3	Local link number
+;
+;  OUTPUTS:	R5	Address of associated XWB, or low bit set if none
+;
+;		All other registers are preserved.
+;-
+XWB_LOCLNK:				; Get XWB context
+	PUSHR	#^M<R2,R4>		; Save reg
+					;
+	MOVL	UCB$L_VCB(R5),R2	; Get RCB address
+	BNEQ	5$			; If NEQ the RCB exists
+	MOVL	#1,R5			; Invalidate XWB address
+	BRB	10$			; Done
+5$:	BSBB	NET$XWB_LOCLNK		; If NEQ Locate the link
+					;
+10$:	POPR	#^M<R2,R4>		; Restore reg
+	RSB
+
+
+.SBTTL	NET$XWB_LOCLNK	- Get XWB via local link number
+;++
+;
+;  The Link Table is located and the slot associated with the specified link 
+;  number is found.  If this slot contains an XWB then the link sequence number
+;  is checked.  If there is a sequence number mismatch, or if there is no 
+;  active XWB, then the low bit of R5 is set.  Else, the XWB address is stored
+;  in R5.
+;
+;
+;  INPUTS:	R5,R4	Scratch
+;		R3	Local link number - high order word is clear
+;		R2	RCB address  
+;
+;  OUTPUTS:	R5	Address of associated XWB, or low bit set if none
+;		R4	LTB (link table) address
+;
+;		All other registers are preserved.
+;
+;--
+NET$XWB_LOCLNK::			; Locate XWB via local link number
+	MOVL	RCB$L_PTR_LTB(R2),R4	; Get Link Table pointer
+	BEQL	20$			; Return error if not there
+	BICL3	#^C<NET$C_MAXLNK>,R3,R5	; Get link 'index'
+	BEQL	20$			; Index '0' isn't used
+	CMPW	R5,LTB$W_SLT_TOT(R4)	; Index within range ?
+	BGTRU	20$			; If not, branch
+	MOVL	LTB$L_SLOTS(R4)[R5],R5	; Get XWB address
+	BLBS	R5,30$			; If LBS then none
+	CMPW	R3,XWB$W_LOCLNK(R5)	; Sequence number match ?
+	BEQL	30$			; If so, branch
+20$:	BISB	#1,R5			; Flag no associated XWB
+30$:	RSB
+
+.SBTTL	NET$RET_SLOT	- Return logical-link XWB slot if done
+.SBTTL	NET$QUE_XWB	- Queue XWB to NETACP's AQB
+;++
+;
+;  If the XWB is busy then the queue attempt is aborted.  If the XWB is 
+;  not busy then the XWB$V_STS_SOL bit is set to prevent any further XWB use.  
+;
+;
+;
+;  INPUTS:   	R5	XWB pointer
+;
+;  OUTPUTS:  	R0,R1	Zero
+;
+;		All other registers are preserved.
+;
+;
+;--
+NET$RET_SLOT::					; Return logical-link if done
+	CMPB   #XWB$C_STA_CLO,XWB$B_STA(R5)	; In 'closed' state?
+	BEQL	10$				; If so, continue
+	CMPB   #XWB$C_STA_DIR,XWB$B_STA(R5)	; If DIR state then we've sent
+						; the DC msg already
+	BNEQ	40$				; If not, XWB is still active
+10$:	TSTW	XWB$W_REFCNT(R5)		; Any references ?
+	BNEQ	40$				; If NEQ must wait
+;&	BBS    #XWB$V_FLG_LOCK,XWB$W_FLG(R5),40$; Exit if XWB is locked
+	BITW   #XWB$M_STS_ASTPND!-		; AST pending
+		XWB$M_STS_ASTREQ!-		; AST requested
+		XWB$M_STS_SOL,XWB$W_STS(R5)	; Fork block in use
+	BNEQ	40$				; If NEQ, XWB is busy
+	BSBB	NET$DRAIN_FREE_CXB		; Drain CXB free queue
+	BSBB	NET$QUE_XWB			; Queue XWB to NETACP's AQB
+40$:	CLRQ	R0				; Say "nothing to xmit"
+	RSB					; Done
+
+
+NET$QUE_XWB::					; Queue XWB to NETACP's AQB
+	ASSUME	IPL$_SYNCH  EQ  NET$C_IPL
+
+	BBSS	#XWB$V_STS_SOL,XWB$W_STS(R5),50$; If BS, then queue block in use
+	PUSHR	#^M<R2,R3,R4,R5>		; Save regs
+						;
+	MOVL	XWB$L_VCB(R5),R2		; Get RCB
+	INCW	RCB$W_TRANS(R2)			; Account for ACP transaction
+	MOVL	RCB$L_AQB(R2),R4		; Get AQB
+	INSQUE	(R5),@AQB$L_ACPQBL(R4)		; Queue XWB to AQB
+	BNEQ	30$				; If NEQ then not first
+	MOVL	AQB$L_ACPPID(R4),R1		; Get ACP's PID
+	JSB	G^SCH$WAKE			; Wake the ACP
+						;
+30$:	POPR	#^M<R2,R3,R4,R5>		; Restore regs
+50$:	RSB					; done
+
+
+
+.SBTTL	NET$DRAIN_FREE_CXB	- Drain CXB free queue
+
+NET$DRAIN_FREE_CXB::				; Drain CXB free queue
+	;
+	;
+	;   All registers except for R0 must be preserved.
+	;
+	;
+10$:	REMQUE	@XWB$Q_FREE_CXB(R5),R0		; Get next CXB
+	BVS	20$				; If VS, none left
+	BSBW	NET$DEALLOCATE			; Deallocate block in R0
+	BRB	10$				; Loop
+20$:	RSB					; Done
+
+
+
+.SBTTL	NET$ALONPGD_Z	- Allocate and zero from system pool
+.SBTTL	NET$ALONONPAGED	- Allocate from system pool
+;++
+;
+;  A buffer is allocated from non-paged pool and its size field is set to
+;  the size requested.  Its type field is set to DYN$C_CXB.
+;
+;
+;  INPUTS:  R2 = Scratch
+;	    R1 = Size, in bytes, of block to be allocated
+;	    R0 = Scratch
+;
+;  OUTPUTS: R2 = Address of block if successful
+;		 Zero if unsuccessful
+;	    R0 = Standard VMS status code
+;
+;	    All other registers are preserved.
+;
+;--
+		.ENABL	LSB
+NET$ALONPGD_Z::				; Allocate and zero non-paged buffer
+	BSBB	NET$ALONONPAGED		; Allocate the buffer
+	BLBC	R0,20$			; If LBC then error
+					;
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; Save regs
+	MOVC5	#0,(SP),#0,R1,(R2)	; Zero the entire buffer
+	POPR	#^M<R0,R1,R2,R3,R4,R5>	; Restore regs
+					;
+	BRB	10$			; Setup the type and size fields (again)
+
+
+NET$ALONONPAGED::			; Allocate non-paged memory
+					;
+	PUSHR	#^M<R1,R3>		; Save regs
+	JSB	G^EXE$ALONONPAGED	; Allocate memory
+	POPR	#^M<R1,R3>		; Restore regs
+					;
+	BLBS	R0,10$			; If LBS then success
+	CLRL	R2			; Zero the buffer pointer
+	BRB	20$			; Take common exit
+10$:	MOVW	R1,CXB$W_SIZE(R2)	; Set size for deallocation
+	MOVB	#DYN$C_CXB,-		;
+		CXB$B_TYPE(R2)		; Set tentative buffer type
+20$:	RSB				; Return with status in R0
+
+		.DSABL	LSB
+
+
+.SBTTL	NET$DEALLOCATE	- Deallocate non-paged pool
+;+
+;
+;  IPL must be NET$C_IPL or lower.
+;
+;
+;  INPUTS:	R0	Address of block
+;
+;  OUTPUTS:	R0	Zero
+;
+;		All other registers are preserved.
+;
+;-
+	ASSUME	NET$C_IPL  LE  IPL$_SYNCH	; Can't deallocate above SYNCH
+
+NET$DEALLOCATE::			; Deallocate non-paged pool
+	PUSHR	#^M<R1,R2,R3>		; Save regs
+	CLRL	-(SP)			; Value to return in R0
+					;
+	MOVZWL	8(R0),R1		; Get size of block
+	JSB	G^EXE$DEANONPGDSIZ	; Deallocate it
+					;
+	POPR	#^M<R0,R1,R2,R3>	; Restore regs
+	RSB				; Done
+
+
+.SBTTL	NET$MOV_TO_XWB	- Move counted string to XWB$B_DATA
+.SBTTL	NET$MOV_CSTR	- Move counted string with count field
+.SBTTL	NET$MOV_USTR	- Move counted string without count field
+;+
+;
+;  The source string is moved to its destination.  Both the source
+;  and destination pointers are updated.
+;
+;
+;  INPUTS:	R3	Pointer to destination field
+;		R1	Pointer to count field of source string
+;
+;  OUTPUTS:	R3	Pointer to first byte beyond end of destination
+;		R1	Pointer to first byte beyond source string
+;
+;		All other registers are preserved
+;
+;
+;-
+		.ENABL	LSB
+NET$MOV_TO_XWB::			; Move counted string to XWB$B_DATA
+	PUSHL	R3			; Save reg
+	MOVAB	XWB$B_DATA(R5),R3	; Setup destination ptr
+	BSBB	NET$MOV_CSTR		; Move the string
+	POPL	R3			; Restore reg
+	RSB				; Done
+					;
+NET$MOV_CSTR::				; Move counted string with count byte
+	PUSHR	#^M<R0,R2,R4,R5>	; Save regs
+					;
+	MOVZBW	(R1),R0			; Get string length
+	INCW	R0			; Include count itself
+	BRB	10$			; Continue in common
+					;
+NET$MOV_USTR::				; Mov counted str w/o count byte
+	PUSHR	#^M<R0,R2,R4,R5>	; Save regs
+					;
+	MOVZBW	(R1)+,R0		; Get count value, advance ptr
+10$:	MOVC3	R0,(R1),(R3)		; Move the string
+					;
+	POPR	#^M<R0,R2,R4,R5>	; Restore regs
+	RSB
+
+		.DSABL LSB
+
+
+.SBTTL	NET$POST_IO	- Send IRP to COM$POST
+;+
+;
+;  INPUTS:	R3	IRP address
+;		R0	Scratch
+;
+;  OUTPUTS:	R0	SS$_NORMAL
+;
+;		All other registers are preserved
+;-
+NET$POST_IO::				; Send IRP to COM$POST
+	;
+	;
+	;  Complete the I/O
+	;
+	;
+	PUSHL	R5			; Save XWB pointer
+	MOVL	IRP$L_UCB(R3),R5	; Get UCB address
+	JSB	G^COM$POST		; Another packet for the heap
+	MOVL	S^#SS$_NORMAL,R0	; Always return success
+	POPL	R5			; Recover XWB address
+	RSB				; Done
+
+
+
+
+.END
+

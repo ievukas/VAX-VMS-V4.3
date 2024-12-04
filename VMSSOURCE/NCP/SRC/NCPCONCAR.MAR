@@ -1,0 +1,927 @@
+	.TITLE	NCPCONCAR - Console Carrier Requester Ethernet I/O
+	.IDENT	'V04-000'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+; FACILITY: REMOTE CONSOLE CARRIER (NI)
+;
+; ABSTRACT:
+;
+;	THIS PROGRAM RUNS ON A LOCAL NODE TO ALLOW A TERMINAL TO APPEAR TO
+;	BE LOCALLY CONNECTED TO A REMOTE CONSOLE.
+;
+;
+; ENVIRONMENT: VMS - USER MODE
+;		
+;
+; AUTHOR: Scott G. Davis, 17-Mar-1983
+;
+; MODIFIED BY:
+;
+;	V004	PRD0110		Paul R. DeStefano	30-Jul-1984
+;		Store SERVICE PASSWORD in NICE message in image
+;		(HI-n) format.
+;
+;	V003	TMH0003		Tim Halvorsen	28-Jul-1984
+;		Deassign channels to XEDRIVER before issuing request
+;		to down-line load console carrier microcode.  This is
+;		necessary because NDDRIVER can't operate on a XE UCB
+;		which isn't fully owned by NETACP.
+;
+;	V002	SGD0002		Scott G. Davis		07-Mar-1984
+;		Send SERVICE PASSWORD in Reserve Console message.
+;
+;	V001	SGD0001		Scott G. Davis		30-Aug-1983
+;		Correctly store SERVICE PASSWORD in NICE message.
+;
+;**
+;--
+	.PAGE
+	.SBTTL	DECLARATIONS
+;
+; DEFAULT ADDRESSING MODE
+;
+	.DEFAULT DISPLACEMENT WORD
+;
+; INCLUDE FILES:
+;
+	$NMADEF		; Network management definitions
+	$NFBDEF		; Network function block definitions
+;
+; MACROS:
+;
+	.MACRO	ONERROR ACTION,?L
+	BLBS	R0,L
+	ACTION
+	L:
+	.ENDM	ONERROR
+;
+; EQUATED SYMBOLS:
+;
+
+; ***NOTE  References to PDBs assume they are of the form:
+;
+;	.BYTE	presence-flag
+;	.BLKB	n	 - data
+;
+
+DONE_CHAR	=	04		; Character to finish I/O (^D)
+BREAK_CHAR	=	02		; Character to set "break" (^B)
+LF		=	10
+CR		=	13
+RETRY_CNT	=	5		; No. of times to retry connect
+TIMER	=	5			; No. of seconds between retries
+
+NFBSIZ	=	NFB$C_LENGTH+12		; Network function block size
+P2BUFSIZ =	NFB$C_CTX_SIZE+4+18	; P2 minimum + service circuit string
+P4BUFSIZ =	512
+XMTBUFLEN =	512			; Size of transmit buffer
+RCVBUFLEN =	512			; Size of receive buffer
+
+MOP$C_REQID	=	5		; Request ID
+MOP$C_SYSTEMID	=	7		; System ID
+MOP$C_RESERVE	=	13		; Reserve console
+MOP$C_RELEASE	=	15		; Release console
+MOP$C_COMMAND	=	17		; Command and poll
+	MOP$M_MSGNUM = 1		; Message number bit
+	MOP$M_BREAK = 2			; Break indicator bit
+MOP$C_RESPONSE	=	19		; Response and acknowledge
+	MOP$V_CMDLOST = 1		; Message lost bit
+
+MOP$C_INFO_FUNC	=	2		; INFO type code - functions
+	MOP$V_FUNC_CARR	= 5		; Console carrier active
+	MOP$V_FUNC_RSRV	= 7		; Console reserved
+	MOP$C_FUNC_SIZE	= 2		; Size of field
+
+MOP$C_INFO_USER	=	3		; INFO type code - console user
+MOP$C_INFO_TIMR	=	4		; INFO type code - reservation timer
+MOP$C_INFO_CSIZ	=	5		; INFO type code - console command size
+MOP$C_INFO_RSIZ	=	6		; INFO type code - console response size
+	.PAGE
+;
+; OWN STORAGE:
+;
+	.PSECT	CONCAR$PURE,NOWRT,NOEXE
+	.SBTTL	READ ONLY DATA
+
+	ASSUME	BREAK_CHAR LT 32
+	ASSUME	DONE_CHAR LT 32
+
+TERMINATOR_DESC:	.LONG	0	; For trapping terminators
+			.LONG	<1@BREAK_CHAR>!<1@DONE_CHAR>
+
+CON$NFB_DESC::	.LONG	NFBSIZ		; NFB descriptor
+		.ADDRESS	CON$NFB
+
+CON$P2BUF_DESC::	.LONG	P2BUFSIZ ; P2BUF descriptor
+		.ADDRESS	CON$P2BUF
+
+CON$P4BUF_DESC::	.LONG	P4BUFSIZ ; P4BUF descriptor
+		.ADDRESS	CON$P4BUF
+
+SETPARAM_DESC:
+	.LONG		SETPARAMLEN
+	.ADDRESS	SETPARAM
+
+TIMEOUT:  .LONG  -10*1000*1000*TIMER,-1	; Timer for NI responses during setup
+
+;*****
+; Note:
+;	The arrays NICE_PARAM_ADDR/ID have parallel entries.
+;*****
+NICE_PARAM_ADDR:			; Addresses to store param values
+	.ADDRESS	ADDR_HARD	; Target Ethernet hardware address
+	.ADDRESS	PDB$G_CON_SLI	; NI device to use
+	.ADDRESS	PDB$G_CON_SPW	; For RESERVE CONSOLE and LOAD messages
+	.LONG	0			; End of table
+
+NICE_PARAM_ID:				; Table of parameters in charac response
+	.WORD	NMA$C_PCNO_HWA		; Hardware address
+	.WORD	NMA$C_PCNO_SLI		; Service circuit
+	.WORD	NMA$C_PCNO_SPA		; Service password
+
+REQUEST_ID_MSG:				; To poll for presence of console
+	.BYTE	MOP$C_REQID		; Code
+	.BYTE	0			; Reserved byte, for future use
+	.BYTE	0,0			; Receipt number - **What goes here?**
+REQUEST_MSG_LEN = .-REQUEST_ID_MSG
+
+RELEASE_MSG:				; To release console
+	.BYTE	MOP$C_RELEASE		; Code
+RELEASE_MSG_LEN = .-RELEASE_MSG
+
+CONNECTED_MSG:	.LONG	20$-10$		; Prompt
+		.LONG	10$
+10$:	.ASCII	<LF>\Console connected (press CTRL/D when finished)\<CR><LF>
+20$:
+
+FINISH_MSG:	.LONG	20$-10$		; Message when done
+		.ADDRESS 10$
+10$:	.ASCII	<CR><LF>
+20$:
+
+NO_RESP_MSG:	.LONG	20$-10$		; Status message
+		.LONG	10$
+10$:	.ASCII	<LF>/Target does not respond/<CR><LF>
+20$:
+
+NO_HARD_MSG:	.LONG	20$-10$		; Hardware address required message
+		.LONG	10$
+10$:	.ASCII	<LF>/Hardware address required/<CR><LF>
+20$:
+
+IN_USE_MSG:	.LONG	20$-10$		; Status message
+		.LONG	10$
+10$:	.ASCII	<LF>/Console in use/<CR><LF>
+20$:
+
+TTY_DESC:	.ASCID	/SYS$COMMAND/
+
+NETMANVER:	.ASCII	/300/		; Network management version 3.0.0
+
+LOA_FILE:	.ASCIC	/PLUTOCC/	; Name of console carrier file
+LOA_LTH = .-LOA_FILE
+
+SLO_FILE:	.ASCIC	/PLUTOWL/	; Name of secondary loader
+SLO_LTH = .-SLO_FILE
+	.PAGE
+	.SBTTL	READ/WRITE DATA
+	.PSECT	CONCAR$IMPURE,NOEXE,WRT,LONG
+
+TTY_IN_IOSB:	.BLKQ	1		; Terminal input status block
+IOSB:	.BLKQ	1			; I/O status block
+
+LOAD_RESP_DESC:	.BLKQ	1		; Points to NML response to load request
+
+SYSTEM_ID_MSG:	.BLKB	128+4		; Enough room for buffer + CRC
+SYSTEM_INFO	=	SYSTEM_ID_MSG+4	; Start of INFO section of message
+SYSTEM_ID_LTH	= .-SYSTEM_ID_MSG
+SYSTEM_ID_END:	.BLKL	1		; Holds pointer to end of SYSTEMID msg
+
+NI_RCVBUF:	.BLKB	RCVBUFLEN+4	; Enough room for buffer + CRC
+
+NI_XMTBUF:	.BYTE	MOP$C_COMMAND	; This is a COMMAND/POLL message
+MOP_CTRL_FLAGS:	.BLKB	1		; Flags byte:	bit 0 = msg no.
+					;		bit 1 = break flag
+COMMAND_OHD	= .-NI_XMTBUF		; Amount of overhead in message
+TTY_INBUF	= NI_XMTBUF+COMMAND_OHD	; Terminal input comes here
+	.BLKB	XMTBUFLEN		; Start of xmit data
+
+CON$XE_DESCADDR::	.BLKA	1		; Address of NI device descriptor
+
+RETRY_COUNTER:	.BLKL	1		; For making sure of responses
+
+NI_ADDRESSES:	.ADDRESS	ADDR_HARD+2 ; Hardware address
+		.ADDRESS	ADDR_PHYS+1 ; Physical address
+NICHAN_HARD:	.BLKW	1		; NI channel for hardware address
+NICHAN_PHYS:	.BLKW	1		; NI channel for physical address
+; *** NICHAN_HARD/PHYS must be together in this order, for context indexing
+NICHAN:	.BLKW	1			; For I/O operations
+
+TTYCHAN:	.BLKW	1		; Terminal I/O channel
+
+SETPARAM:
+	.WORD	NMA$C_PCLI_BUS		; Buffer size
+	.LONG	RCVBUFLEN
+	.WORD	NMA$C_PCLI_BFN		; Number of buffers
+	.LONG	7
+	.WORD	NMA$C_PCLI_PAD		; Pad short buffers
+	.LONG	NMA$C_STATE_ON
+	.WORD	NMA$C_PCLI_PTY		; Protocol type
+	.LONG	^X0260			; Console carrier protocol type
+	.WORD	NMA$C_PCLI_PRM		; Promiscous mode disabled
+	.LONG	NMA$C_STATE_OFF
+	.WORD	NMA$C_PCLI_DCH		; Data chaining off
+	.LONG	NMA$C_STATE_OFF
+	.WORD	NMA$C_PCLI_CRC		; Generate crc on transmit
+	.LONG	NMA$C_STATE_ON
+	.WORD	NMA$C_PCLI_ACC		; Protocol access mode
+	.LONG	NMA$C_ACC_LIM		; Limited sharing
+	.WORD	NMA$C_PCLI_DES		; Destination addr for limited sharing
+	.WORD	8			; Count for parameter
+	.WORD	NMA$C_LINMC_SET		; Set the address that follows
+DEST_ADDR:	.BLKB	6		; Space for complete NI ADDRESS
+; *** NOTE:
+; 1. DEST_ADDR must be right after DES
+; 2. DEST_ADDR is multiplexed.  It is used initially to specify the destination
+;    address for protocol sharing.  Thereafter, it contains the pointer to
+;    address to be used for Ethernet transmits.
+;***
+SETPARAMLEN=.-SETPARAM			; **line to be deleted later
+
+ADDR_PHYS:	.BYTE	6		; Counted physical Ethernet address
+		.BYTE	^XAA		; Four wired bytes for DNA addresses
+		.BYTE	00
+		.BYTE	04
+		.BYTE	00
+CON$W_ADDR_DNA::	.BLKW	1	; For storing DNA node address, in
+					; reverse byte order
+RESERVE_MSG:				; To reserve console
+	.BYTE	MOP$C_RESERVE		; Code
+	.BLKB	8			; Room for service password
+RESERVE_MSG_LEN = .-RESERVE_MSG
+
+XE_DESC:	.ASCID	/XEA0:/		; Descriptor of service circuit
+					; XEA0: is the default
+NICE_SHOW_DESC:	.BLKL	1		; Length of NICE SHOW message
+		.ADDRESS	NICE_SHOW_MSG
+NICE_SHOW_MSG:	.BYTE	NMA$C_FNC_REA		; Read function
+	.BYTE	NMA$C_OPINF_CHA@4!NMA$C_ENT_NOD ; Get node characteristics
+CON$T_SHOW_NODE::	.BLKB	7	; Leave room for node name
+
+NICE_LOAD_DESC:	.BLKL	1		; Length of load message
+	.ADDRESS	NICE_LOAD_MSG	; Address of load message
+NICE_LOAD_MSG:				; Given to NMLSHR to load console code
+	.BYTE	NMA$C_FNC_SYS		; System-specific
+	.BYTE	NMA$C_SYS_VMS		; for VMS
+	.BYTE	NMA$C_FNC_LOA		; Load function
+LOAD_PARAMS:				; For parameters
+	.BLKB	1			; Option - load by node/circuit
+	.BLKB	2+7			; Space for physical address, maybe
+	.BLKB	2+17			; Space for service circuit - variable
+	.BLKB	2+9			; Space for param ID+password
+	.BLKB	2+LOA_LTH		; Space for param ID+load file
+	.BLKB	2+SLO_LTH		; Space for param ID+sec loader file
+
+ZERO_START:				; Storage to be initialized
+
+CON$NFB::	.BLKB	NFBSIZ		; Network function block
+
+CON$P2BUF::	.BLKB	P2BUFSIZ	; Buffer for describing what I want
+
+CON$P4BUF::	.BLKB	P4BUFSIZ	; Buffer for getting what I want
+
+NICE_MSG_FLAG:	.BLKB	1		; Error flag for processing NICE msg
+
+MOP_MSG_NUM:	.BLKB	1		; Message number -1 for command msgs
+
+ADDR_HARD:	.BLKB	8		; Hardware address of target.  Format:
+					; Byte 1 - existence flag
+					; Byte 2 - "6" (length of string)
+					; Byte 3-8 - Ethernet address
+ZERO_LTH	=	.-ZERO_START
+
+MY_ADDRESS:	.BLKB	14		; Place to hold Ethernet header, starting
+					; with my address
+	.PAGE
+	.PSECT	CONCAR$CODE,NOWRT
+	.SBTTL	ACT$VRB_CONNECT	 INIT REMOTE CONSOLE DIALOGUE
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	Initiate dialogue with remote console:
+; - Attempt to reserve console
+; - Request System ID
+; - Determine whether you have it.
+;	- If so - proceed with exchanging characters
+;	- If not - request downline load of console code, etc.
+;
+; CALLING SEQUENCE:
+;
+;	CALLS	#N,ACT$VRB_CONNECT
+;
+; INPUT PARAMETERS:
+;
+;	NONE
+;
+; IMPLICIT INPUTS:
+;
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+; SIDE EFFECTS:
+;
+;	Console carrier maintenance link set up with remote node
+;
+;--
+
+ACT$VRB_CONNECT::	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	$ASSIGN_S DEVNAM = TTY_DESC, CHAN = TTYCHAN ; Get terminal channel
+	ONERROR	RET			; If error done
+	MOVC5	#0,ZERO_START,#0,#ZERO_LTH,ZERO_START ; Init storage
+;
+; Get parameter values supplied by NCP command
+;
+	PUSHAB	NETMANVER		; Addr of management version string
+	CALLS	#1,G^NML$INITIALIZE	; Initialize NMLSHR
+
+	ASSUME	NMA$C_ENT_NOD	EQ 0
+
+	TSTL	NCP$GL_OPTION		; Is this CONNECT by node?
+	BNEQ	6$			; If NEQ no - don't look anything up
+	PUSHAB	CON$SHOW_MSG		; Address of message processing routine
+	PUSHAB	NICE_SHOW_DESC		; Address of descriptor of my READ
+	MOVAB	CON$T_SHOW_NODE,R3	; Point to storage for node-id
+	MOVAB	NICE_SHOW_MSG,R7	; Point to beginning of message
+	MOVAB	PDB$G_VRB_ENT+1,R6	; Point to node-id
+	MOVZBL	(R6)+,R8		; Was a node address specified?
+	BNEQ	2$			; if NEQ no - use node name
+
+	ASSUME	NMA$C_ENT_NOD	EQ 0
+
+	CLRB	(R3)+			; Set parameter type
+	MOVW	(R6),(R3)+ 		; Store node address
+	BRB	4$			; Continue in common code
+
+2$:	MOVB	R8,(R3)+		; Store length of name
+	MOVC3	R8,(R6),(R3)		; Store node name
+4$:	SUBL3	R7,R3,NICE_SHOW_DESC	; Store length of message
+	CALLS	#2,G^NML$PROCESS_NICE	; Ship the message
+	BLBC	NICE_MSG_FLAG,6$	; If LBC no error
+	BRW	2000$			; Terminate processing
+;
+; Do any necessary parameter conversion
+;
+6$:	MOVAB	XE_DESC,CON$XE_DESCADDR	; Default to XEA0: (UNA-0)
+	TSTB	PDB$G_CON_SLI		; Was service circuit specified?
+	BEQL	10$			; If EQL no
+;
+; Convert SLI to XEq0:
+;
+	BSBW	CON$GET_SLI		; Do ultimate call to NETACP
+
+;
+; Set up channels for request IDs
+;
+10$:	MOVAB	PDB$G_CON_PHA+2,R2	; Point to physical address, maybe
+	TSTB	-2(R2)			; Was a physical address provided?
+	BNEQ	20$			; If NEQ yes - use it alone
+	TSTB	ADDR_HARD		; Is there a hardware address?
+	BNEQ	15$			; If NEQ yes - use it alone
+	MOVL	NO_HARD_MSG+4,R3	; Address of message
+	MOVL	NO_HARD_MSG,R2		; Length of message
+	BSBW	NCP$TTY_WRITE		; Output the message
+	BRW	1500$			; Done
+15$:	MOVAB	ADDR_HARD+2,R2		; Assume I have a hardware address
+	MOVAB	NICHAN_HARD,R6		; Address of channel to physical address
+	BSBW	SETUP_NICHAN		; Set up the Ethernet channel
+	MOVAB	ADDR_PHYS+1,R2		; Point to physical address
+20$:	MOVAB	NICHAN_PHYS,R6		; Address of channel to hardware address
+	BSBW	SETUP_NICHAN		; Set up the Ethernet channel
+;
+; Try to get the console connected
+;
+	MOVL	#RETRY_CNT,RETRY_COUNTER ; Set up number of times to retry
+;*****
+; Need initial checking code:
+;	1.  Request system ID
+;	2.  If no response or console not loaded, done
+;	3.  If console owned by some else, too bad
+;	4.  If console owned by me, bug:  release console
+;*****
+;
+; Transmit RESERVE message, to see if I can get console
+;
+100$:	MOVL	#1,R6			; Set to flipflop channels
+150$:	MOVW	NICHAN_HARD[R6],NICHAN	; Use the proper channel
+	BEQL	410$			; If EQL, channel was never assigned
+	MOVL	NI_ADDRESSES[R6],DEST_ADDR ; Store pointer to address
+200$:	MOVAB	RESERVE_MSG,R3		; Address of message
+	CLRQ	1(R3)			; Assume no service password (8 bytes)
+	TSTB	PDB$G_CON_SPW		; Did I get a service password?
+	BEQL	300$			; If EQL no
+	MOVQ	PDB$G_CON_SPW+1,1(R3)	; String of 8 bytes
+300$:	MOVZBL	#RESERVE_MSG_LEN,R2	; Length of message
+	BSBW	NI_OUTPUT		; Send it
+;
+; Transmit REQUEST ID message, to see if console is mine
+;
+400$:	MOVAB	REQUEST_ID_MSG,R3	; Address of message
+	MOVZBL	#REQUEST_MSG_LEN,R2	; Length of message
+	BSBW	NI_OUTPUT		; Send it
+;
+; Receive the System ID message
+;
+	MOVAB	SYSTEM_ID_MSG,R3	; Address of rcv bfr
+	MOVL	R3,SYSTEM_ID_END	; Init pointer to end
+	MOVZBL	#SYSTEM_ID_LTH,R2	; Length of rcv bfr
+	BSBW	NI_INPUT		; Do the receive
+	BNEQ	450$			; If NEQ I/O completion
+	$CANCEL_S	NICHAN		; Kill the receive
+410$:	SOBGEQ	R6,150$			; Try other channel
+420$:	SOBGTR	RETRY_COUNTER,100$	; Try both again
+425$:	MOVL	NO_RESP_MSG+4,R3	; Address of message
+	MOVL	NO_RESP_MSG,R2		; Length of message
+	BSBW	NCP$TTY_WRITE		; Output the message
+	BRW	1500$			; Done
+;
+; Response received
+;
+450$:	EXTZV	#16,#16,R0,R0		; Get length of message
+	ADDL2	R0,SYSTEM_ID_END	; Point to end of message
+;
+; See if it is valid
+;
+	CMPB	SYSTEM_ID_MSG,-		; Is this a system ID?
+		#MOP$C_SYSTEMID
+	BEQL	460$			; If EQL yes
+	SOBGTR	RETRY_COUNTER,400$	; See if OK to proceed
+	BRB	425$			; Ran out of retries
+;
+; See if I have the console
+;
+460$:	MOVZBL	#MOP$C_INFO_FUNC,R0	; Set to find functions
+	BSBW	SCAN_SYSTEM_ID		; Scan for the field
+	TSTL	R0			; Found?
+	BEQL	410$			; *** If EQL no - try again
+	CMPL	R1,#MOP$C_FUNC_SIZE	; Valid size?
+	BNEQ	410$			; *** If NEQ no
+	BBC	#MOP$V_FUNC_CARR,(R2),470$ ; If BC console is not active
+	BRW	600$			; Check reservation
+
+470$:	DECL	RETRY_COUNTER		; Can I keep going?
+	BLEQ	425$			; If LEQ no
+;
+; Request downline load of carrier code to DEUNA.
+;
+; NOTE: We must deassign all our channels to the Ethernet driver in order
+; to allow MOM/NDDRIVER to be able to issue reads/writes on the protocol
+; type.  XEDRIVER only allows NDDRIVER to be used when NETACP "owns" the
+; protocol-type UCB, so we must "de-own" it for a while.
+;
+	$DASSGN_S CHAN = NICHAN_HARD	; Deassign channel to physical address
+	$DASSGN_S CHAN = NICHAN_PHYS	; Deaasign channel to logical address
+
+	MOVAB	LOAD_PARAMS,R11		; Set to complete LOAD request msg
+
+	ASSUME	NMA$C_ENT_NOD	EQ 0
+
+	MOVB	NCP$GL_OPTION,(R11)+	; Store load option code
+	BNEQ	475$			; If NEQ load VIA circuit
+
+	ASSUME	NMA$C_ENT_ADD	EQ 0
+
+	CLRB	(R11)+			; Address to follow
+	MOVW	CON$W_ADDR_DNA,(R11)+	; Store the node address
+475$:	MOVAB	PDB$G_CON_PHA,R0	; Point to address
+	TSTB	(R0)+			; Was physical address in command?
+	BEQL	480$			; If EQL no - don't pass one to NML
+	MOVW	#NMA$C_PCNO_PHA,(R11)+	; Store PHA indicator
+	BSBW	MOVE_IMAGE		; Move it to message
+480$:	TSTB	PDB$G_CON_SLI		; Was service circuit specified?
+	BEQL	500$			; If EQL no
+	MOVW	#NMA$C_PCNO_SLI,(R11)+	; Mark service circuit
+	MOVAB	PDB$G_CON_SLI+1,R0	; Point to circuit string
+	BSBW	MOVE_IMAGE		; Move it to message
+500$:	TSTB	PDB$G_CON_SPW		; Did I get a service password?
+	BEQL	510$			; If EQL no
+	MOVW	#NMA$C_PCNO_SPA,(R11)+	; Put in the service password.
+	MOVB	#8,(R11)+		; Set length of service password.
+	MOVQ	PDB$G_CON_SPW+1,(R11)+	; Store the service password.
+510$:	MOVW	#NMA$C_PCNO_LOA,(R11)+	; Mark load file
+	MOVAB	LOA_FILE,R0		; Point to string
+	BSBW	MOVE_IMAGE		; Move it
+	MOVW	#NMA$C_PCNO_SLO,(R11)+	; Mark secondary loader file
+	MOVAB	SLO_FILE,R0		; Point to string
+	BSBW	MOVE_IMAGE		; Move it
+	MOVAB	NICE_LOAD_MSG,R0	; Point to beginning of message
+	PUSHAB	CON$LOAD_MSG		; Address of processing routine
+	PUSHAB	NICE_LOAD_DESC		; Address of message descriptor
+	SUBL3	R0,R11,@(SP)		; Store message length
+	CALLS	#2,G^NML$PROCESS_NICE
+	CMPB	@LOAD_RESP_DESC+4,-	; Did the load succeed?
+		#NMA$C_STS_SUC
+	BNEQ	900$			; If NEQ no
+	BRW	10$			; Try to reserve console again
+;
+; See if console is reserved
+;
+600$:
+	BBS	#MOP$V_FUNC_RSRV,(R2),700$ ; If BS console is reserved
+610$:	BRW	420$			; Try reservation again
+;
+; Console code is active and console is reserved - see if I have it
+;
+700$:	MOVZBL	#MOP$C_INFO_USER,R0	; Get user
+	BSBW	SCAN_SYSTEM_ID		; Look at message
+	TSTL	R0			; Field present?
+	BEQL	610$			; If EQL no - try again
+	CMPC3	#6,MY_ADDRESS,(R2)	; Do I have it?
+	BEQL	800$			; If EQL yes
+	MOVL	IN_USE_MSG+4,R3		; Address of message
+	MOVL	IN_USE_MSG,R2		; Length of message
+	BSBW	NCP$TTY_WRITE		; Output the message
+	BRW	1500$			; Finish in common code
+;
+; Now get to the terminal and start processing characters.
+; Also, post a read on the NI channel, for responses
+;
+800$:	MOVL	CONNECTED_MSG+4,R3	; Address of message
+	MOVL	CONNECTED_MSG,R2	; Length of message
+	BSBW	NCP$TTY_WRITE		; Output the message
+;
+; Set up for terminal loop
+;
+	BSBW	TTY_READ		; Start a timed read
+	$HIBER_S			; Twiddle
+;
+; If we get here, user typed "terminate" character
+;
+	MOVL	FINISH_MSG+4,R3		; Address of message
+	MOVL	FINISH_MSG,R2		; Length of message
+	BSBW	NCP$TTY_WRITE		; Output the message
+	BRB	1000$			; Finish in common code
+;
+; Output error message from load
+;
+900$:	MOVQ	LOAD_RESP_DESC,-(SP)	; Set up arguments
+	CALLS	#2,NCP$CONERR		; Call the error routine
+;
+; Clean up
+;
+1000$:
+;
+; Transmit release message
+;
+	MOVAB	RELEASE_MSG,R3		; Address of message
+	MOVZBL	#RELEASE_MSG_LEN,R2	; Length of message
+	BSBW	NI_OUTPUT		; Send it
+;
+; Deassign outstanding channels
+;
+1500$:	$DASSGN_S	NICHAN_PHYS	; Physical address channel
+	$DASSGN_S	NICHAN_HARD	; Hardware address channel
+2000$:	$DASSGN_S	TTYCHAN		; Terminal channel
+	CALLS	#0,G^NML$TERMINATE	; Close off NMLSHR interface
+	MOVL	S^#SS$_NORMAL,R0	; Status for mainline
+	RET				; Done
+	.PAGE
+;++
+;
+; NI_INPUT - This routine receives a message over the Ethernet
+; NI_OUTPUT - This routine transmits a message over the Ethernet
+;
+; Inputs:
+;	R3 - address of message
+;	R2 - length of message
+;
+; Outputs:
+;	R0 - first longword of IOSB
+;	PSL reflects value of R0
+;
+; Side effects - image exits if error
+;
+;--
+
+NI_INPUT:
+	$SETIMR_S	EFN=#2,-	; Start timer on input
+			DAYTIM=TIMEOUT
+	MOVZWL	S^#IO$_READVBLK,R0	; Get function code
+	MOVAB	MY_ADDRESS,R1		; P5, to get my address
+	BRB	NI_IO_COMMON		; Go to common code
+NI_OUTPUT:
+	$CLREF_S	#2		; Make sure timeout flag isn't set
+	MOVZWL	S^#IO$_WRITEVBLK,R0	; Get function code
+	MOVL	DEST_ADDR,R1		; P5, to show destination address
+NI_IO_COMMON:
+	$QIO_S	FUNC=R0,CHAN=NICHAN,EFN=#1-
+		P1=(R3),-
+		P2=R2,-
+		P5=R1,-
+		IOSB=IOSB
+	ONERROR	RET
+	$WFLOR_S	#1,#^B110	; Wait for flags 1 or 2
+	$CANTIM_S			; Cancel the timer
+	MOVL	IOSB,R0			; Get I/O status return
+	BEQL	100$			; If EQL I/O not complete
+	ONERROR	RET
+100$:	RSB				; Done
+
+;++
+;
+; SCAN_SYSTEM_ID - Scan SYSTEM ID msg for a certain info type
+;
+; Message format:
+;
+;	Message code	-	1 byte
+;	Reserved byte	-	1 byte
+;	Receipt number	-	2 bytes
+;	Info fields	-	2 bytes of type, 1 byte of length, n bytes of data
+;
+; Inputs:
+;	R0 - INFO type field to be matched
+;
+; Outputs:
+;	R0 - 0==> field not found
+;	R1 - length of info field
+;	R2 - address of info field
+;--
+
+SCAN_SYSTEM_ID:
+	MOVAB	SYSTEM_INFO,R2		; Point to start of INFO
+10$:	CMPL	R2,SYSTEM_ID_END	; At end of message?
+	BLSSU	15$			; If LSSU no
+	CLRL	R0			; Mark error
+	BRB	100$			; Take common exit
+15$:	CMPW	(R2)+,R0		; INFO type match?
+	BEQL	20$			; If EQL yes
+	MOVZBL	(R2)+,R1		; Get length of this field
+	ADDL2	R1,R2			; Point to next field
+	BRB	10$			; Loop
+20$:	MOVZBL	(R2)+,R1		; Get length of this field
+100$:	RSB				; Done
+	.PAGE
+;++
+;
+; CON$SHOW_MSG	- process nice message returned from NMLSHR
+; This routine extracts the parameters needed for the CONNECT CONSOLE operation
+; from a NICE message returned by NMLSHR.  This routine assumes that there
+; will be 3 messages:  more data, data, done.  The "data" msg is of interest.
+;
+;	CALLS	#1,CON$SHOW_MSG
+;
+; Input:
+;
+;	4(AP) - Address of descriptor of message
+;
+;--
+
+CON$SHOW_MSG:	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	MOVQ	@4(AP),R1		; Get message descriptor
+	CMPB	(R2),#NMA$C_STS_MOR	; Do I want to see this?
+	BEQL	100$			; If EQL no
+	CMPB	(R2),#NMA$C_STS_DON	; Do I want to see this?
+	BEQL	100$			; If EQL no
+	CMPB	(R2),#NMA$C_STS_SUC	; Do I want to see this?
+	BEQL	5$			; If EQL yes
+	INCB	NICE_MSG_FLAG		; Set error flag
+	MOVQ	R1,-(SP)		; Set up for call to error processor
+	CALLS	#2,NCP$CONERR		; Output error
+	BRB	100$			; Return
+;
+; Initialize to scan for missing parameters
+;
+5$:	MOVAB	NICE_PARAM_ID,R10	; Point to data IDs
+	MOVAB	NICE_PARAM_ADDR,R9	; Point to data storage addresses
+;
+; Loop to get parameters not specified in command
+;
+10$:	MOVZWL	(R10)+,R0		; Get param type code
+	MOVL	(R9)+,R11		; Get PDB address
+	BEQL	100$			; If EQL done
+	TSTB	(R11)+			; Was param passed?
+	BNEQ	10$			; If NEQ yes
+	PUSHL	R11			; Address of storage area to stack
+	PUSHL	R0			; Param type code to stack
+	CALLS	#2,CON$PARSE_NICE	; Parse the field, if it's there
+	MOVB	R0,-(R11)		; Return value becomes existence flag
+	BRB	10$			; Loop
+
+100$:	RET				; Done
+	.PAGE
+;++
+;
+; CON$LOAD_MSG	- process response to load message returned from NMLSHR
+;
+;	CALLS	#1,CON$LOAD_MSG
+;
+; Input:
+;
+;	4(AP) - Address of descriptor of message
+;
+;--
+
+CON$LOAD_MSG:	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	MOVQ	@4(AP),LOAD_RESP_DESC	; Get message descriptor
+100$:	RET				; Done
+	.PAGE
+;++
+;
+; SETUP_NICHAN - Set up channel to Ethernet
+;
+; INPUTS:
+;
+;	R2 - Address of Ethernet address for destination on this channel
+;	R6 - Address of channel no.
+;
+; OUTPUTS:
+;
+;	Channel number stored indirectly via R6
+;
+;--
+
+SETUP_NICHAN:
+	MOVC3	#6,(R2),DEST_ADDR	; Stuff the address
+;
+; Get a channel to Ethernet
+;
+	$ASSIGN_S DEVNAM = @CON$XE_DESCADDR, CHAN = (R6)
+	ONERROR	RET			; If error done
+;
+; Set function to establish the protocol type and start device.
+; The initial startup will take about 6 seconds for the DEUNA
+; to run the self-test sequence.
+;
+	$QIOW_S	FUNC = #<IO$_SETMODE!IO$M_CTRL!IO$M_STARTUP>,-
+		CHAN = (R6),-
+		IOSB = IOSB,-
+		P2 = #SETPARAM_DESC
+	ONERROR	RET			; If error done
+	MOVL	IOSB, R0		; Else, get I/O status return
+	ONERROR	RET			; If error done
+	RSB				; Done
+	.PAGE
+;++
+;
+; MOVE_IMAGE - move image string
+;
+; INPUTS:
+;
+;	R0  - address of source string
+;	R11 - address of destination string
+;
+; OUTPUTS:
+;
+;	R0-R5  - clobbered
+;	R11    - updated to point at next storage byte
+;
+;--
+
+MOVE_IMAGE:
+	MOVZBL	(R0)+,R1		; Get length
+	MOVB	R1,(R11)+		; Store it
+	MOVC3	R1,(R0),(R11)		; Store string
+	MOVL	R3,R11			; Update pointer
+	RSB				; Done
+	.PAGE
+;++
+;
+; NCP$TTY_WRITE - This routine writes a message on the terminal
+;
+; INPUTS:
+;
+;	R2 - length of msg
+;	R3 - address of msg
+;
+;--
+
+NCP$TTY_WRITE::
+	$QIOW_S	CHAN = TTYCHAN,-	; Get input from terminal
+		FUNC = #<IO$_WRITEVBLK>,-
+		IOSB = IOSB,-
+		P1   = (R3),-
+		P2   = R2
+
+	ONERROR	RET
+	RSB				; Done
+
+
+;++
+;
+; TTY_READ - Routine to do timed read from terminal.  Also, input
+; terminates on BREAK_CHAR (and "break" indication is sent across channel) or
+; DONE_CHAR, which results in termination of operation.  I/O completes in an
+; AST, where input is processed and another I/O is queued.
+;
+;--
+
+TTY_READ:
+	MOVAB	TERMINATOR_DESC,R0	; Get address of character mask info
+	$QIO_S	CHAN = TTYCHAN,-	; Get input from terminal
+		FUNC = #<IO$_TTYREADALL!IO$M_TIMED!IO$M_NOECHO>,-
+		IOSB = TTY_IN_IOSB,-
+		ASTADR = TTY_AST,-
+		P1   = TTY_INBUF,-
+		P2   = #XMTBUFLEN,-
+		P3   = #1,-		; 1 second timer
+		P4   = R0		; Descriptor of terminator set
+
+	ONERROR	RET
+
+	RSB				; Done
+
+
+;++
+;
+; TTY_AST - Process terminal input ASTs
+;	This routine is called when a timeout on the TTY read occurs or when
+; one of the terminators is encountered.  If a timeout occurs, any characters
+; in the buffer are sent in a COMMAND/POLL message.  If the "break" terminator
+; is encountered, any characters in the terminal buffer are sent, and the
+; "break" indicator is set in the message.  If the "done" terminator is
+; encountered, the process is restarted, so that control will return to mainline.
+; The NI input buffer is also checked for completion at this point;  if there
+; is a message, the text is printed on the terminal and another NI read is
+; queued.
+;
+;--
+
+TTY_AST:	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	BICB	#MOP$M_BREAK,MOP_CTRL_FLAGS ; Assume no break
+	BLBC	TTY_IN_IOSB,100$	; If LBC assume timeout occurred
+	CMPW	TTY_IN_IOSB+4,#DONE_CHAR ; Was that the I/O terminator?
+	BNEQ	50$			; If NEQ no
+10$:	$WAKE_S				; We are all done
+	BRB	200$			; Finish in common code
+
+50$:	CMPW	TTY_IN_IOSB+4,#BREAK_CHAR ; Was that the I/O terminator?
+	BNEQ	100$			; If NEQ no
+
+	BISB	#MOP$M_BREAK,MOP_CTRL_FLAGS ; Set break indicator
+;
+; Set up to transmit to remote console
+;
+100$:	BICB2	#MOP$M_MSGNUM,MOP_CTRL_FLAGS ; Clear msg number
+	MCOMB	MOP_MSG_NUM,MOP_MSG_NUM	; Get next number-1
+	ADDB3	#1,MOP_MSG_NUM,R0	; Get bit to put in message
+	BEQL	110$			; If EQL number is right
+	INCB	MOP_CTRL_FLAGS		; Make the number right
+110$:	MOVAB	NI_XMTBUF,R3		; Get address of output buffer
+	MOVZWL	TTY_IN_IOSB+2,R2	; Get number of characters in
+	ADDL2	#COMMAND_OHD,R2		; Account for rest of message
+	BSBW	NI_OUTPUT		; Ship the message
+	MOVAB	NI_RCVBUF,R3		; Address of rcv bfr
+	MOVZWL	#RCVBUFLEN,R2		; Length of rcv bfr
+	BSBW	NI_INPUT		; Do the receive
+	BNEQ	120$			; If NEQ I/O completion
+	MOVL	NO_RESP_MSG+4,R3	; Address of message
+	MOVL	NO_RESP_MSG,R2		; Length of message
+	BSBW	NCP$TTY_WRITE		; Output the message
+	BRB	10$			; Done
+;
+; Terminal output from console
+;
+120$:	MOVAB	NI_RCVBUF,R3		; Point to message
+	CMPB	(R3)+,#MOP$C_RESPONSE	; Is this a response message
+	BNEQ	190$			; If NEQ no - ignore
+	MOVB	(R3)+,R0		; Get the control flags
+	BBS	#MOP$V_CMDLOST,R0,110$	; If BS need to rexmt
+	MOVZWL	IOSB+2,R2		; Get no. of chars in message
+	SUBL2	#2,R2			; Adjust for MOP overhead
+	BSBW	NCP$TTY_WRITE		; Output to the terminal
+190$:	BSBW	TTY_READ		; Start the next input
+200$:	RET				; Done
+
+	.END

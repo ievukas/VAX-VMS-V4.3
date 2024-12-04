@@ -1,0 +1,19 @@
+$ !
+$ !	ACCLNK.COM - Command file to link the ACC utility
+$ !
+$ DELETE EXE$:ACC.EXE;*,MAP$:ACC.MAP;*
+$ LINK	/EXE=EXE$:ACC -
+	/MAP=MAP$:ACC -
+	/FULL/CROSS/NOTRACE-
+	LIB$:ACC/INCLUDE=(ACC, -
+			  ACCMSG, -
+			  FILES, -
+			  FORMAT, -
+			  SUMMARY, -
+			  UTILITY, -
+			  SYMBOLS, -
+			  SYMBOLMSG), -
+	RESOBJ$:CLIUTL/INCLUDE=CVTTIME, -
+	SYS$INPUT/OPTION
+PSECT=SOR$KEYCODE,NOEXE
+$ EXIT

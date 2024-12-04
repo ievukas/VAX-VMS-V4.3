@@ -1,0 +1,671 @@
+MODULE DISPAT (
+		LANGUAGE (BLISS32),
+		IDENT = 'V04-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 2
+!
+! ABSTRACT:
+!
+!	This module is the main routine of FCP. It dequeues a request,
+!	executes it, and signals completion to the user.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  20-Dec-1976  14:33
+!
+! MODIFIED BY:
+!
+!	V03-020	ACG0438		Andrew C. Goldstein,	26-Jul-1984  14:01
+!		Handle create-if at dispatcher level for improved generality
+!
+!	V03-019	ACG0427		Andrew C. Goldstein,	8-May-1984  20:31
+!		Optimize checksumming of file header in error cases
+!
+!	V03-018	ACG0427		Andrew C. Goldstein,	8-May-1984  11:23
+!		Finish security auditing. Restructure the saved audit
+!		info to save space.
+!
+!	V03-017	CDS0014		Christian D. Saether	10-Apr-1984
+!		Increase number of error retries.
+!
+!	V03-016	RSH0134		R. Scott Hanna		04-APR-1984
+!		Add the PERFORM_AUDIT routine.
+!
+!	V03-015	CDS0013		Christian D. Saether	22-Feb-1984
+!		Call GET_REQD_BFR_CREDITS before starting request.
+!		Call RETURN_CREDITS after running down buffers and locks.
+!
+!	V03-014	CDS0012		Christian D. Saether	29-Dec-1983
+!		Use L_NORM linkage and BIND_COMMON macro.
+!		The DISPATCH module plays games with the disk
+!		i/o channel now.
+!
+!	V03-013	CDS0011		Christian D. Saether	17-Oct-1983
+!		Let MOUNT and ACPCONTROL functions get by
+!		request block checking.
+!
+!	V03-012	CDS0010		Christian D. Saether	16-Oct-1983
+!		Correctly declare BLOCK_CHECK to be a byte.
+!
+!	V03-011	CDS0009		Christian D. Saether	12-Oct-1983
+!		Add calls to START_REQUEST and FINISH_REQUEST
+!		to synchronize with volume activity blocking.
+!
+!	V03-010	CDS0008		Christian D. Saether	14-Sep-1983
+!		Use the allocation_unlock routine to release
+!		the allocation lock.
+!		Use the RELEASE_SERIAL_LOCK routine to run down locks.
+!		Move the request initialization calls into GET_REQUEST
+!		to avoid a useless init after the last request.
+!
+!	V03-009	CDS0007		Christian D. Saether	 2-Sep-1983
+!		Remember the original IO_CHANNEL UCB prior to
+!		the request loop.  V03-008 incorrectly did this
+!		in get_request, and when a second request piled
+!		up in the queue, would "restore" the UCB of the
+!		previous request, rather than that of the orignal
+!		channel assignment.
+!
+!	V03-008	CDS0006		Christian D. Saether	27-Aug-1983
+!		Put back the original IO_CHANNEL UCB rather than
+!		just stuffing the UCB it got when originally assigned.
+!		During process deletion, we may get called after
+!		the channel has been deassigned and assigned to
+!		some other device.
+!
+!	V03-007	CDS0005		Christian D. Saether	23-Jun-1983
+!		Invalidate all buffers after a successful window turn.
+!
+!	V03-006	CDS0004		Christian D. Saether	 3-May-1983
+!		Remove volume level interlock.  Unlock_xqp routine
+!		now releases fid locks instead of volume lock.
+!
+!	V03-005	CDS0003		C Saether		26-Oct-1982
+!		Restore original ucb's to assigned channels before exit.
+!
+!	V03-004	CDS0002		C Saether		 6-Oct-1982
+!		Add volume level interlock of XQP activity.
+!
+!	V03-003	CDS0001		C Saether		30-Jul-1982
+!		Make changes from ACP to XQP.
+!
+!	V03-002	LMP0035		L. Mark Pilant,		28-Jun-1982  14:50
+!		Correct problems that caused information messages.
+!
+!	V03-001	ACG0274		Andrew C. Goldstein,	23-Mar-1982  14:49
+!		Use longword displacement
+!
+!	A0102	ACG0082		Andrew C. Goldstein,	8-Nov-1979  21:42
+!		Make error cleanup iterative for new write error handling
+!
+!	A0101	ACG0044		Andrew C. Goldstein,  15-Jun-1979  11:39
+!	Add disk quota support
+!
+!	A0100	ACG00001	Andrew C. Goldstein,  10-Oct-1978  20:02
+!	Previous revision history moved to F11A.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+!
+! Establish the max and min function codes for the function dispatch.
+!
+
+LITERAL
+	LOW_FUNCTION	= MINU (
+		IO$_ACCESS,
+		IO$_CREATE,
+		IO$_DEACCESS,
+		IO$_DELETE,
+		IO$_MODIFY
+		),
+
+	HIGH_FUNCTION	= MAXU (
+		IO$_CREATE,
+		IO$_DEACCESS,
+		IO$_DELETE,
+		IO$_MODIFY
+		);
+
+FORWARD ROUTINE
+	DISPATCHER	: L_NORM NOVALUE,
+	UNLOCK_XQP	: L_NORM NOVALUE,
+	MAIN_HANDLER	: L_NORM NOVALUE,
+	ZERO_ON_ERROR,
+	PERFORM_AUDIT	: L_NORM NOVALUE,
+	WRITE_AUDIT	: L_NORM NOVALUE;
+
+GLOBAL ROUTINE DISPATCHER : L_NORM NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is the main routine of FCP. It dequeues a request,
+!	executes it, and signals completion to the user.
+!
+! CALLING SEQUENCE:
+!	DISPATCHER ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	FCP functions executed
+!
+!--
+
+BEGIN
+
+LABEL
+	NORMAL_FUNC;			! block of normal function execution
+
+LOCAL
+	FUNCTION,			! function being executed
+	STATUS;				! status return of function routine
+
+BIND_COMMON;
+
+EXTERNAL ROUTINE
+	GET_REQD_BFR_CREDITS : L_NORM,
+	START_REQUEST	: L_JSB,
+	FINISH_REQUEST	: L_JSB,
+	PMS_END		: L_NORM,	! end performance metering
+	GET_REQUEST	: L_NORM,	! get next I/O request
+	READ_WRITEVB	: L_NORM,	! process read/write virtual
+	ACCESS		: L_NORM,	! ACCESS function routine
+	CREATE		: L_NORM,	! CREATE function routine
+	DEACCESS	: L_NORM,	! DEACCESS function routine
+	DELETE		: L_NORM,	! DELETE function routine
+	MODIFY		: L_NORM,	! MODIFY function routine
+	ACPCONTROL	: L_NORM,	! ACPCONTROL function routine
+	MOUNT		: L_NORM,	! MOUNT function routine
+	CHECKSUM	: L_NORM,	! checksum a file header
+	ERR_CLEANUP	: L_NORM,	! error cleanup routine
+	CLEANUP		: L_NORM,	! general cleanup routine
+	IO_DONE;			! I/O completion processing
+
+
+! Get the next request, and process it. If
+! the request fails, call the error cleanup before returning
+! completion.  When the last request is dequeued, return.
+!
+
+!	ENABLE MAIN_HANDLER;
+BEGIN
+BUILTIN FP;
+.FP = MAIN_HANDLER;
+END;
+
+WHILE 1 DO
+
+NORMAL_FUNC:
+    BEGIN
+
+    IF (IO_PACKET = GET_REQUEST()) EQL 0
+    THEN
+
+! No more packets.  Exit.
+!
+
+	RETURN;
+
+    FUNCTION = .IO_PACKET[IRP$V_FCODE];
+
+    STATUS =
+
+	BEGIN
+
+	GET_REQD_BFR_CREDITS ();
+
+	SELECTONEU .FUNCTION OF
+	    SET
+
+	    [IO$_READPBLK, IO$_WRITEPBLK]:
+		IF READ_WRITEVB ()
+		THEN
+		    LEAVE NORMAL_FUNC
+		ELSE 0;
+
+	    [IO$_ACPCONTROL]: ACPCONTROL ();
+	    [IO$_MOUNT]:	MOUNT ();
+
+	    [OTHERWISE]:
+
+	    BEGIN
+
+	    IF .BLOCK_LOCKID EQL 0
+	    THEN
+		BEGIN
+		START_REQUEST ();
+		BLOCK_CHECK = 1;
+		END;
+
+	    CASE .FUNCTION FROM LOW_FUNCTION TO HIGH_FUNCTION OF
+		SET
+		[IO$_ACCESS]:	BEGIN
+				LOCAL STATUS;
+				STATUS = ACCESS ();
+				IF .STATUS EQL SS$_NOSUCHFILE
+				AND .BBLOCK [IO_PACKET[IRP$W_FUNC], IO$V_CREATE]
+				THEN
+				    BEGIN
+				    USER_STATUS = SS$_CREATED;
+				    CREATE ()
+				    END
+				ELSE
+				    .STATUS
+				END;
+		[IO$_CREATE]:	CREATE ();
+		[IO$_DEACCESS]:	DEACCESS ();
+		[IO$_DELETE]:	DELETE ();
+		[IO$_MODIFY]:	MODIFY ();
+		[INRANGE]:	(ERR_STATUS (SS$_ILLIOFUNC); 0);
+		[OUTRANGE]:	(ERR_STATUS (SS$_ILLIOFUNC); 0);
+		TES
+	    END
+	    TES
+	END;
+
+    IF .AUDIT_COUNT NEQU 0
+    THEN
+	BEGIN
+	IF NOT .STATUS
+	AND .FILE_HEADER NEQ 0
+	THEN CHECKSUM (.FILE_HEADER);
+	PERFORM_AUDIT();
+	END;
+
+    DECR J FROM 2000 TO 1
+    DO
+	BEGIN
+	IF .STATUS THEN IF CLEANUP () THEN EXITLOOP;
+	STATUS = ERR_CLEANUP ();
+	END;
+
+    UNLOCK_XQP();
+    PMS_END ();
+    IO_DONE (.IO_PACKET);
+
+    IF .BLOCK_CHECK
+    THEN
+	FINISH_REQUEST ();
+
+    END;				! end of block NORMAL_FUNC
+
+END;					! end of routine DISPATCHER
+
+GLOBAL ROUTINE MAIN_HANDLER (SIGNAL, MECHANISM) : L_NORM NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is the main level condition handler. It stores the
+!	condition value (FCP error code) in the user status block, unwinds
+!	and returns from the function that was executing.
+!
+! CALLING SEQUENCE:
+!	MAIN_HANDLER (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of signal array
+!	ARG2: address of mechanism array
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	USER_STATUS: receives signal code
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	stack unwound to main level to return to dispatcher
+!
+!--
+
+BEGIN
+
+MAP
+	SIGNAL		: REF BBLOCK,	! signal array arg
+	MECHANISM	: REF BBLOCK;	! mechanism array arg
+
+BIND_COMMON;
+
+EXTERNAL ROUTINE
+	SYS$UNWIND	: ADDRESSING_MODE (ABSOLUTE);
+
+
+! Check the signal code. The only permissible ones are SS$_UNWIND, which
+! is ignored, and SS$_CMODUSER. The error status is the 16 bit CHMU code.
+! If the error value is non-zero, store it in the user status (zero
+! means just exit). Set up a return value of 0, unwind to the current
+! depth, and return, causing the invoked function to return with failure
+! to the dispatcher.
+!
+
+IF .SIGNAL[CHF$L_SIG_NAME] EQL SS$_UNWIND THEN RETURN;
+IF .SIGNAL[CHF$L_SIG_NAME] NEQ SS$_CMODUSER
+THEN BUG_CHECK (UNXSIGNAL, FATAL, 'Unexpected signal name in ACP');
+
+IF .SIGNAL[CHF$L_SIG_ARG1] NEQ 0
+AND .USER_STATUS
+THEN USER_STATUS = .SIGNAL[CHF$L_SIG_ARG1];
+
+MECHANISM[CHF$L_MCH_SAVR0] = .USER_STATUS;
+
+SYS$UNWIND (MECHANISM[CHF$L_MCH_DEPTH], 0);
+
+RETURN;
+
+END;					! end of routine MAIN_HANDLER
+
+
+GLOBAL ROUTINE ZERO_ON_ERROR (SIGNAL, MECHANISM) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This condition handler is used in various places to cause a
+!	function to return zero if any error is signalled during its
+!	operation. The actual error is ignored.
+!
+! CALLING SEQUENCE:
+!	ZERO_ON_ERROR (SIGNAL, MECHANISM)
+!
+! INPUT PARAMETERS:
+!	SIGNAL: address of condition signal vector
+!	MECHANISM: address of condition mechanism vector
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	SS$_RESIGNAL
+!
+! SIDE EFFECTS:
+!	Stack unwound to establisher (FLUSH_QUO_CACHE)
+!
+!--
+
+BEGIN
+
+MAP
+	SIGNAL		: REF BBLOCK,	! signal arg list
+	MECHANISM	: REF BBLOCK;	! mechanism arg list
+
+
+! Check for an error signal. All others are resignaled. On an error
+! set the return R0 to 0 and unwind to establisher.
+!
+
+IF .SIGNAL[CHF$L_SIG_NAME] EQL SS$_CMODUSER
+THEN
+    BEGIN
+    MECHANISM[CHF$L_MCH_SAVR0] = 0;
+    $UNWIND (DEPADR = MECHANISM[CHF$L_MCH_DEPTH]);
+    END;
+
+SS$_RESIGNAL
+END;					! End of routine ZERO_ON_ERROR
+
+GLOBAL ROUTINE UNLOCK_XQP : L_NORM NOVALUE =
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine releases the xqp synchonization locks.
+!--
+BEGIN
+
+EXTERNAL ROUTINE
+	RETURN_CREDITS		: L_NORM,
+	ALLOCATION_UNLOCK	: L_NORM,
+	RELEASE_SERIAL_LOCK	: L_NORM;
+
+BIND_COMMON;
+
+LOCAL
+	LOCKID;
+
+INCR I FROM 1 TO (LB_NUM - 1)
+DO
+    IF .LB_LOCKID [.I] NEQ 0
+    THEN
+	RELEASE_SERIAL_LOCK (.I);
+
+ALLOCATION_UNLOCK ();
+
+RETURN_CREDITS ();
+
+END;
+
+GLOBAL ROUTINE PERFORM_AUDIT : L_NORM NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine outputs any pending audit records that may have resulted
+!	from protection checks performed in this file operation. They are
+!	deferred to this point because of the disruption caused by the
+!	call to FID_TO_SPEC.
+!
+! CALLING SEQUENCE:
+!	PERFORM_AUDIT ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN					! Start of routine PERFORM_AUDIT
+
+LOCAL
+	AUDIT_BLOCK	: REF BBLOCK;	! pointer to saved audit block
+
+BIND_COMMON;
+
+EXTERNAL ROUTINE
+	SERIAL_FILE	: L_NORM;	! acquire file synchronization lock
+
+
+! Step through the list of saved audits and write the audit for each block
+! that contains a valid entry.
+!
+
+AUDIT_BLOCK = AUDIT_ARGLIST;
+DECR J FROM MAX_AUDIT_COUNT TO 1
+DO
+    BEGIN
+    IF .AUDIT_BLOCK[AUDIT_TYPE] NEQ 0
+    THEN
+	BEGIN
+	SERIAL_FILE (AUDIT_BLOCK[AUDIT_FID]);
+	WRITE_AUDIT (.AUDIT_BLOCK);
+	END;
+    AUDIT_BLOCK = .AUDIT_BLOCK + AUDIT_LENGTH;
+    END;
+
+END;					! End of routine PERFORM_AUDIT
+
+GLOBAL ROUTINE WRITE_AUDIT (AUDIT_BLOCK) : L_NORM NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine writes a security audit record based on the specified
+!	saved audit block. Most of the information has been collected in
+!	CHECK_PROTECT; All that remains is to construct the actual audit
+!	arg list and call NSA$EVENT_AUDIT.
+!
+! CALLING SEQUENCE:
+!	WRITE_AUDIT (AUDIT_BLOCK)
+!
+! INPUT PARAMETERS:
+!	AUDIT_BLOCK: address fo saved audit info
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN					! Start of routine WRITE_AUDIT
+
+BUILTIN
+	CALLG;
+
+MAP
+	AUDIT_BLOCK	: REF BBLOCK;			! audit info block
+
+LOCAL
+	ARGLIST		: BBLOCK [NSA$K_ARG1_LENGTH],
+					! audit argument list
+	LOC_HEADER;			! Local copy of file header address
+
+LINKAGE
+	ARGLST_IMGNAM	= JSB (REGISTER = 2;) :
+			  NOPRESERVE (0,1)
+			  NOTUSED (3,4,5,6,7,8,9,10,11);
+
+EXTERNAL ROUTINE
+	READ_HEADER	: L_NORM,	! Read file header
+	WRITE_DIRTY	: L_NORM,	! Write dirty buffers on lock
+	FID_TO_SPEC	: NOVALUE L_NORM, ! Convert FID to file name
+	NSA$ARGLST_IMGNAM : ARGLST_IMGNAM ADDRESSING_MODE (GENERAL),
+					! get image name for audit record
+	NSA$EVENT_AUDIT	: ADDRESSING_MODE (GENERAL);
+					! Security auditing routine
+
+BIND_COMMON;
+
+
+! Build the audit argument list from the saved info.
+!
+
+ARGLIST[NSA$B_ARG_FLAG] = .AUDIT_BLOCK[AUDIT_TYPE];
+ARGLIST[NSA$L_ARG1_FACMOD_TM] = NSA$K_ARG_MECH_LONG^16 + NSA$K_PKTTYP_FACMOD;
+ARGLIST[NSA$L_ARG1_FACMOD] = .AUDIT_BLOCK[AUDIT_ACCESS];
+ARGLIST[NSA$L_ARG1_FILNAM_TM] = NSA$K_ARG_MECH_DESCR^16 + NSA$K_PKTTYP_FILNAM;
+
+IF .AUDIT_BLOCK[AUDIT_SUCCESS]
+THEN
+    BEGIN
+    ARGLIST[NSA$L_ARG_COUNT] = 12;
+    ARGLIST[NSA$L_ARG_ID] = NSA$K_RECID_FIL_SUCC;
+    ARGLIST[NSA$B_ARG_PKTNUM] = 4;
+    ARGLIST[NSA$L_ARG1_PRIVUSED_TM] = NSA$K_ARG_MECH_LONG^16 + NSA$K_PKTTYP_PRIVUSED;
+    ARGLIST[NSA$L_ARG1_PRIVUSED] = .AUDIT_BLOCK[AUDIT_PRIVS];
+    END
+ELSE
+    BEGIN
+    ARGLIST[NSA$L_ARG_COUNT] = 10;
+    ARGLIST[NSA$L_ARG_ID] = NSA$K_RECID_FIL_FAIL;
+    ARGLIST[NSA$B_ARG_PKTNUM] = 3;
+    END;
+
+LOC_HEADER = READ_HEADER (AUDIT_BLOCK[AUDIT_FID], 0);
+WRITE_DIRTY (.LB_BASIS[.PRIM_LCKINDX]);
+FID_TO_SPEC (.LOC_HEADER);
+ARGLIST[NSA$L_ARG1_FILNAM_SIZ] = .FILE_SPEC_LEN<0,16,0>;
+ARGLIST[NSA$L_ARG1_FILNAM_PTR] = FULL_FILE_SPEC;
+NSA$ARGLST_IMGNAM (ARGLIST[NSA$L_ARG1_IMGNAM_TM]);
+CALLG (ARGLIST, NSA$EVENT_AUDIT);
+
+! Note this entry processed.
+!
+
+AUDIT_BLOCK[AUDIT_TYPE] = 0;
+AUDIT_COUNT = .AUDIT_COUNT - 1;
+
+END;					! End of routine WRITE_AUDIT
+
+END
+ELUDOM

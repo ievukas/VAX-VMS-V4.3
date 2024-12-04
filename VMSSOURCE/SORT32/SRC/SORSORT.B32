@@ -1,0 +1,1448 @@
+MODULE SOR$SORT (
+		IDENT = 'V04-000'	! File: SORSCRIO.B32 Edit: PDG3025
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+!
+! FACILITY:	VAX-11 SORT/MERGE
+!
+! ABSTRACT:
+!
+!	This module contains routines that control the sorting process,
+!	such as handling the internal sort tree, switching between runs,
+!	and the merge phase.
+!
+! ENVIRONMENT:	VAX/VMS user mode
+!
+! AUTHOR: Peter D Gilbert, CREATION DATE: 07-Jan-1982
+!
+! MODIFIED BY:
+!
+!	T03-015		Original
+!	T03-016	Added clean-up routines.  PDG 4-Jan-1983
+!	T03-017	Fix possible unlimited recursion in READ_INSERT.
+!		Identified the section of code relevant to the merge problems
+!		of sequence checking and record deletion.
+!		PDG 14-Jan-1983
+!	T03-018	Implement merge stuff mentioned in T03-017.  PDG 26-Jan-1983
+!	T03-019	Use COM_MERGE (rather than COM_MRG_ORDER) to indicate a merge.
+!		PDG 31-Jan-1983
+!	T03-020	Changes for hostile environment.  PDG 3-Feb-1983
+!	T03-021	Add missing dot in TREE_OUTPUT.  PDG 8-Mar-1983
+!	T03-022	Fix check for [KEY] being [0,0,0,0].  PDG 10-Mar-1983
+!	T03-023	Remove SOR$$WORK_DELRUN.  Remove extra parameter from
+!		call to WORK_MERGE.  PDG 14-Apr-1983
+!	T03-024	Use CTX_BLOCK_ macro to use additional fields.  PDG 18-Apr-1983
+!	T03-025	Some coding changes to get best generated code.
+!		Compile-time check on the size of TREE_INSERT.
+!--
+
+LIBRARY	'SYS$LIBRARY:STARLET';
+LIBRARY	'SYS$LIBRARY:XPORT';
+REQUIRE	'SRC$:COM';
+
+%IF %DECLARED(%QUOTE $DESCRIPTOR) %THEN UNDECLARE %QUOTE $DESCRIPTOR; %FI
+
+FORWARD ROUTINE
+    SOR$$TREE_INIT:	CAL_CTXREG,		! Initialize the sort tree
+    SOR$$TREE_INSERT:	JSB_INSERT,		! Insert a record into sort tree
+    SOR$$TREE_EXTRACT:	JSB_EXTRACT,		! Extract a record from the sort
+    TREE_OUTPUT:	JSB_OUTPUT,		! Output routine
+    READ_INSERT:	JSB_READINS NOVALUE,	! Read a record, insert on queue
+    MERGE_PASSES:	CAL_CTXREG NOVALUE,	! Perform the merge passes
+    CLEAN_UP:		CAL_CTXREG NOVALUE;
+
+SOR$$END_ROUTINE_(CLEAN_UP);
+
+LINKAGE
+    JSB_SCOPY_R_DX6=	JSB (REGISTER=0,REGISTER=1,REGISTER=2):
+			NOPRESERVE (0,1,2,3,4,5,6)
+			NOTUSED (7,8,9,10,11);
+%IF HOSTILE
+%THEN
+    MACRO
+	LIB$GET_VM = SOR$LIB$GET_VM %;
+%FI
+
+EXTERNAL ROUTINE
+    SOR$$WORK_NEWRUN:	JSB_NEWRUN NOVALUE,		! Indicate start of run
+    SOR$$WORK_MERGE:	CAL_CTXREG,			! Decide runs to merge
+    SOR$$WORK_WRITE:	JSB_OUTPUT,			! Write to work file
+    SOR$$WORK_READ:	JSB_INPUT,			! Read from a run
+    SOR$$ALLOCATE:	CAL_CTXREG,			! Allocate storage
+    SOR$$DEALLOCATE:	CAL_CTXREG NOVALUE,		! Deallocate storage
+    %IF NOT HOSTILE %THEN
+    LIB$SCOPY_R_DX6:	JSB_SCOPY_R_DX6
+			ADDRESSING_MODE(GENERAL),	! Copy string
+    %FI
+    LIB$GET_VM:		ADDRESSING_MODE(GENERAL),
+    SOR$$ERROR;						! Error routine
+
+MACRO							! Swap two variables
+    SWAP_(X,Y) = (LOCAL Z; Z=.X; X=.Y; Y=.Z) %;
+
+
+ASSERT_(TUN_K_CALC_FI LEQU 1)		! Must be 0 or 1, as these values ...
+ASSERT_(TUN_K_CALC_FE LEQU 1)		! ... are used in calculations
+
+
+! Macroes to define fields in the replacement selection tree.
+!
+LITERAL
+    !
+    ! Offset within node of where pointers to this node point.
+    ! Having this the same as the offset to KEY is be worthwhile, so that the
+    ! address of the key portion is the 'pointer' to the node, thus making it
+    ! easier to keep the address of the key in COM_REG_SRC2.
+    ! If so, RN and LOSER are negative offsets from the pointers.
+    !
+    ! This should be either 0, or 4-TUN_K_CALC_FI-TUN_K_CALC_FE, although the
+    ! code will work for any value.
+    !
+    K_ROOT=	4-TUN_K_CALC_FI-TUN_K_CALC_FE;
+FIELD
+    NODE_FIELDS =
+	SET
+	!
+	! Run number of the record pointed to by LOSER
+	!
+	RN=	[0-K_ROOT, L_],
+	!
+	! Pointer to "loser" stored in this int node
+	!
+	LOSER=	[1-K_ROOT, L_],
+	!
+	! Pointer to int node above this int node
+	!
+	%IF NOT TUN_K_CALC_FI %THEN
+	FI=	[2-K_ROOT, L_], %FI
+	!
+	! Pointer to int node above this ext node
+	!
+	%IF NOT TUN_K_CALC_FE %THEN
+	FE=	[3-K_ROOT-TUN_K_CALC_FI, L_], %FI
+	!
+	! Key and record
+	!
+	KEY=	[4-K_ROOT-TUN_K_CALC_FI-TUN_K_CALC_FE, A_]
+	TES;
+MACRO
+	NODE_BLOCK=	BLOCK FIELD(NODE_FIELDS) %;
+
+LITERAL
+    !
+    ! Number of extra bytes in a node
+    !
+    K_NODE=	(4-TUN_K_CALC_FI-TUN_K_CALC_FE)*%UPVAL;
+
+
+! Define fields within COM_TREE_INSERT
+!
+$FIELD
+    S_FIELDS =
+	SET
+	$OVERLAY(COM_TREE_INSERT)
+	S_0=	[$BYTES(0)],
+	S_RQ=	[XLONG],	! Saved value of RQ
+	S_RMAX=	[XLONG],	! Saved value of RMAX
+	S_RC=	[XLONG],	! Saved value of RC
+	S_X=	[XLONG],	! Saved value of X
+	S_Q=	[XLONG],	! Saved value of Q
+	S_DESC=	[XLONG],	! Saved parameter for COM_OUTPUT
+	S_LEN=	[XLONG],	! Saved parameter for COM_OUTPUT
+	S_LAST=	[XLONG],	! Pointer to the LASTKEY area
+	S_QUEUE=[XLONG],	! Pointer to queue of runs
+%IF TUN_K_CALC_FI OR TUN_K_CALC_FE
+%THEN
+	S_BIT=	[XLONG],
+	S_ADJ=	[XLONG],
+%FI
+%IF TUN_K_CALC_FI
+%THEN
+	S_FIK=	[XLONG],
+%FI
+%IF TUN_K_CALC_FE
+%THEN
+	S_FEK=	[XLONG],
+%FI
+	S_1=	[$BYTES(0)]
+	TES;
+
+! Make sure everything fits within the size of our portion
+!
+ASSERT_(%FIELDEXPAND(S_1,0)-%FIELDEXPAND(S_0,0) LEQ COM_K_TREE)
+%IF %FIELDEXPAND(S_1,0)-%FIELDEXPAND(S_0,0) LSS COM_K_TREE
+%THEN %INFORM('COM_K_TREE can be made smaller') %FI
+
+MACRO
+    FE_(X,Y) =		! Y = .X[FE]
+    %IF NOT TUN_K_CALC_FE
+    %THEN
+	Y = .X[FE]
+    %ELSE
+	Y = .X ^ -1;
+	IF .BITVECTOR[Y,.CTX[S_BIT];%BPVAL] THEN Y = .Y + .CTX[S_ADJ];
+	Y = .Y + .CTX[S_FEK]
+    %FI %;
+MACRO
+    FI_(X,Y) =		! Y = .X[FI]
+    %IF NOT TUN_K_CALC_FI
+    %THEN
+	Y = .X[FI]
+    %ELSE
+	Y = .X ^ -1;
+	IF .BITVECTOR[Y,.CTX[S_BIT];%BPVAL] THEN Y = .Y + .CTX[S_ADJ];
+	Y = .Y + .CTX[S_FIK]
+    %FI %;
+!MACRO
+!   CHECK(X,K) =
+!	BEGIN
+!	LOCAL Z;
+!	%NAME(K,'_') (X,Z);
+!	IF .X[%NAME(K)] NEQ .Z THEN BUGCHECK();
+!	END %;
+
+! Macros to define the format of a queue entry
+!
+MACRO
+    QUE_FWD =	0, L_ %,	! Forward pointer
+    QUE_BWD =	1, L_ %,	! Backward pointer
+    QUE_REC =	2, L_ %,	! Address of the internal format record
+    QUE_RUN =	3, L_ %;	! Pointer to the run description block
+LITERAL
+    QUE_K_SIZE=	4;		! Size in longwords
+
+! The queue header for the queue is somewhat special.  Normally, its QUE_REC
+! and QUE_RUN fields are zero.  For sequence-checking (which is allowed only
+! for merges), the QUE_REC field contains the address of an internal format
+! record which has not yet been written, and QUE_PRESENT indicates that this
+! record has not been deleted.  QUE_PRESENT overlays the QUE_RUN field.
+!
+MACRO
+    QUE_PRESENT = %EXPAND QUE_RUN %;
+
+GLOBAL ROUTINE SOR$$TREE_INIT
+	(
+	PAGES,			! Pages available for the sort tree
+	EXP_RECS		! Expected number of input records
+	):	CAL_CTXREG =
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine initializes the internal replacement selection tree.
+!
+! FORMAL PARAMETERS:
+!
+!	PAGES		Number of pages available for the sort tree
+!	EXP_RECS	Expected number of input records
+!	CTX		Longword pointing to work area (passed in COM_REG_CTX)
+!
+! IMPLICIT INPUTS:
+!
+!	The memory for the sort tree has already been allocated.
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	Status code.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+! NOTES:
+!
+!	The following routines are accessed through the context area:
+!
+!	CTX[COM_COMPARE]		! Compare records
+!		(see SOR$$KEY_SUB)
+!	CTX[COM_INPUT]			! Convert and copy routine
+!		(see SOR$$KEY_SUB)
+!	CTX[COM_NEWRUN]			! Indicate a new run
+!		SOR$$WORK_NEWRUN
+!		RSB			! Nothing special if fits in tree
+!	CTX[COM_OUTPUT]			! Output a record to a temp file
+!		SOR$$WORK_WRITE		! Output to a work file
+!		TREE_OUTPUT		! Output to a descriptor
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CTX =	COM_REG_CTX:	REF CTX_BLOCK_(S_FIELDS);
+    LITERAL
+	N_TREE =	2,	! Nodes needed in the tree
+	N_LASTKEY =	0,	! Another node to hold the last key output
+	N_ROUND =	2,	! Truncate number of nodes to a mult of N_ROUND
+	!
+	! Minimum number of nodes needed from GET_VM
+	! This is to guarantee that:
+	!	(k_minp - n_lastkey) and not (n_round-1) >= n_tree
+	!
+	K_MINP =	ROUND_(N_TREE, N_ROUND) + N_LASTKEY;
+
+    LOCAL
+	P,				! Number of nodes in the tree
+	X:	REF BLOCK,		! Pointer to root of the tree
+	INTLEN,				! Length of internal node
+	STATUS;				! Status
+
+
+    ! Calculate the length of an internal node, including the LOSER pointer,
+    ! the run number, et.al.  Round up to align on an addressing boundary.
+    !
+    INTLEN = ROUND_(.CTX[COM_LRL_INT] + K_NODE, 1^TUN_K_ALIGN_NODE);
+
+
+    ! Determine the number of records to have in the tree, based on either:
+    !	the expected number of records to be sorted plus, an extra K_MINP
+    ! or
+    !	the number of pages allowed for the sort tree.
+    !
+    P = MINU( .EXP_RECS + K_MINP,
+	COM_K_BPERPAGE * .PAGES / .INTLEN + TUN_K_MRGCOST );
+
+    IF .P LSS K_MINP THEN P = K_MINP;		! Get at least this many nodes
+
+    WHILE TRUE DO
+	BEGIN
+	CTX[COM_TREE_LEN] = ROUND_(.P*.INTLEN, 1^TUN_K_ALIGN_TREE);
+	STATUS = LIB$GET_VM( CTX[COM_TREE_LEN], CTX[COM_TREE_ADR] );
+	!
+	! If we got the memory, exit the loop, so we don't retry.
+	!
+	IF .STATUS THEN EXITLOOP;
+	!
+	! Complain, and then try asking for less memory.
+	!
+	SOR$$ERROR(SOR$_SHR_SYSERROR AND NOT STS$M_SEVERITY OR STS$K_WARNING,
+	    0, .STATUS);
+	P = .P * 7 / 8;
+	IF .P LSS K_MINP THEN RETURN SOR$$ERROR(SOR$_SHR_INSVIRMEM);
+	END;
+    X = .CTX[COM_TREE_ADR];
+    P = .CTX[COM_TREE_LEN] / .INTLEN;		! Divvy up the space
+
+
+    ! Truncate P to an even number to speed up the initialization loop
+    !
+    P = .P AND NOT (N_ROUND-1);
+
+    ! Initialize variables
+    !
+    CTX[S_RMAX] = 0;
+    CTX[S_RC] = 0;
+    CTX[S_RQ] = 0;
+    CTX[S_LAST] = 0;
+    CTX[S_X] = X[K_ROOT,A_];
+    CTX[S_Q] = X[K_ROOT,A_];
+
+    CTX[COM_STAT_NODES] = .P;
+
+    ! Compute constants for calculating Y[FI] and Y[FE] with FI_ and FE_ macros
+    !
+    %IF TUN_K_CALC_FI OR TUN_K_CALC_FE
+    %THEN
+	BEGIN
+	BUILTIN
+	    FFS;
+	LOCAL
+	    B;
+	FFS(%REF(0), %REF(%BPVAL), INTLEN, CTX[S_BIT]);	! INTLEN must be even!
+	B = .BITVECTOR[ CTX[S_X], .CTX[S_BIT] ];
+	CTX[S_BIT] = .CTX[S_BIT] - 1;		! Since we first divide by 2
+	%IF TUN_K_CALC_FI
+	%THEN
+	    CTX[S_FIK] = .CTX[S_X]/2 - .B*.INTLEN/2;
+	%FI
+	%IF TUN_K_CALC_FE
+	%THEN					! .P must be even!
+	    CTX[S_FEK] = (.P*.INTLEN+.CTX[S_X])/2 - .B*.INTLEN/2;
+	%FI
+	CTX[S_ADJ] = - .INTLEN/2 + .B*.INTLEN;
+	END;
+    %FI
+
+
+    ! NODE[J,LOSER] = NODE[J]
+    ! NODE[J,RN] = 0
+    ! NODE[J,FE] = NODE[(P+J)/2]
+    ! NODE[J,FI] = NODE[(J/2)]
+    !
+    BEGIN
+    LOCAL
+	Y:	REF NODE_BLOCK,
+	J2LEN,
+	P2LEN;
+    Y = .CTX[S_X];
+    P2LEN = (.P/2)*.INTLEN;
+    J2LEN = 0;
+    DECR K FROM .P/2-1 TO 0 DO		! INCR J FROM 0 TO .P-1
+	BEGIN
+	Y[RN] = 0;			! Set run number to zero
+	Y[LOSER] = Y[BASE_];		! Set loser to point to self
+%IF NOT TUN_K_CALC_FI
+%THEN
+	Y[FI] = Y[BASE_] + .J2LEN;
+%FI
+%IF NOT TUN_K_CALC_FE
+%THEN
+	Y[FE] = Y[BASE_] + .J2LEN + .P2LEN;
+%FI
+	Y = Y[BASE_] + .INTLEN;		! Advance to next node
+%IF NOT TUN_K_CALC_FI OR NOT TUN_K_CALC_FE
+%THEN
+	J2LEN = .J2LEN - .INTLEN;
+%FI
+	Y[RN] = 0;			! Set run number to zero
+	Y[LOSER] = Y[BASE_];		! Set loser to point to self
+%IF NOT TUN_K_CALC_FI
+%THEN
+	Y[FI] = Y[BASE_] + .J2LEN;
+%FI
+%IF NOT TUN_K_CALC_FE
+%THEN
+	Y[FE] = Y[BASE_] + .J2LEN + .P2LEN;
+%FI
+	Y = Y[BASE_] + .INTLEN;		! Advance to next node
+	END;
+    END;
+
+    CTX[COM_NEWRUN] = SOR$$WORK_NEWRUN;	! Indicate a new run
+    CTX[COM_OUTPUT] = 0;		! Output a record to a temp file
+					! (access violate if we try to output
+					!  a record before calling NEWRUN).
+    RETURN SS$_NORMAL;
+    END;
+
+MACRO
+    COMPARE_LSS(X,Y,DELX,DELY,EQCOND) =
+	BEGIN
+	!
+	! This macro expands into a key comparison and either a call to
+	! the equal key routine or the output routine, depending on whether
+	! or not the DELX and DELY parameters are present.  If not present,
+	! the second parameter (Y) is the record that is output.
+	!
+	! The value of this macro expansion is (X LSS Y), unless the keys
+	! compare equal.
+	!
+	LOCAL
+	    CMP;
+	REGISTER
+	    _X = COM_REG_SRC1;
+	_X = X;
+	CMP = JSB_COMPARE(.CTX[COM_COMPARE], ._X, Y);
+	IF .CMP LSS 0
+	THEN
+	    TRUE
+	ELIF .CMP EQL 0
+	THEN
+	    BEGIN
+	    !
+	    ! The result of this macro is FALSE.
+	    !
+	    ! If there is an equal key routine, and we are comparing with
+	    ! a node in the tree, call the equal key routine.
+	    !
+	    ! If there is no equal key routine, and we are comparing with
+	    ! the last key output, we can output the record now.
+	    !
+	    IF .CTX[COM_EQUAL] NEQ 0
+	    THEN
+		%IF %NULL(DELX)
+		%THEN
+		    0			! Don't do deletes
+		%ELSE
+		    %IF NOT %NULL(EQCOND) %THEN IF EQCOND THEN %FI
+		    BEGIN
+		    LOCAL SS: BLOCK[1];
+		    SS = JSB_EQUAL(.CTX[COM_EQUAL], ._X, Y);
+		    !
+		    ! Check the returned status and delete
+		    ! records from the sort, as requested.
+		    !
+		    ! Note that if X is deleted, and Y is not deleted,
+		    ! this macro should really have the value "true".
+		    ! The effect of this inaccuracy is that there may be
+		    ! empty nodes in the tree, which could have been put
+		    ! to better use creating longer runs.  If the equal-key
+		    ! routine has a choice, the second record should be
+		    ! deleted, rather than the first.
+		    !
+		    ! Finally, if the user supplied an equal-key routine,
+		    ! a routine is generated to call his routine.
+		    ! If an error is returned from the user routine, it
+		    ! is signalled from the generated routine, and
+		    ! SS$_NORMAL is returned here.  Thus we need only
+		    ! distinguish between the expected returned statuses
+		    ! and SS$_NORMAL.  The following code will cause a
+		    ! problem only if the equal-key routine returns an
+		    ! unexpected successful Sort status.
+		    !
+		    IF .SS[STS$V_FAC_NO] EQL SORT$_FACILITY
+		    THEN
+			BEGIN
+			IF DIST_(.SS, (SOR$_DELETE1, SOR$_DELBOTH),
+				      (SOR$_DELETE2))
+			THEN (DELX);
+			IF DIST_(.SS, (SOR$_DELETE2, SOR$_DELBOTH),
+				      (SOR$_DELETE1))
+			THEN (DELY);
+			END;
+		    END
+		    %IF NOT %NULL(EQCOND) %THEN ELSE 0 %FI
+		%FI
+	    ELSE			! There is no equal-key routine
+		%IF %NULL(DELX)
+		%THEN
+		    BEGIN
+		    !
+		    ! The keys have been found to be equal, and there is
+		    ! no equal-key routine.  This implies that we are
+		    ! comparing the record with the LASTKEY record.
+		    ! Thus, we can safely output the record now, and we
+		    ! need not update the LASTKEY record, since it's
+		    ! equal to the current record.
+		    !
+		    CTX[S_LAST] = JSB_OUTPUT(.CTX[COM_OUTPUT], Y);
+		    !
+		    ! We can safely return at this point, since no updates
+		    ! are made to the tree.  The "keep on chugging" code
+		    ! which flushes the tree has no effect, since having
+		    ! this record implies we aren't at the end, and the
+		    ! comparison with LASTKEY is not in a loop.
+		    !
+		    RETURN SS$_NORMAL;
+		    END
+		%ELSE
+		    0		! Put it in the tree
+		%FI;
+	    FALSE
+	    END
+	ELSE
+	    FALSE
+	END
+    %;
+
+GLOBAL ROUTINE SOR$$TREE_INSERT
+	(
+	INP_DESC:	REF BLOCK[,BYTE] VOLATILE	! Record to insert
+	):	JSB_INSERT =
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine inserts a record into the sort tree.
+!
+! FORMAL PARAMETERS:
+!
+!	INP_DESC.rab.d	Descriptor of the record
+!			Not really volatile, but saying it is prevents Bliss
+!			from materializing (INP_DESC[BASE_] EQL 0).
+!	CTX		Longword pointing to work area (passed in COM_REG_CTX)
+!
+!	INP_DESC is optional, and may be absent if and only if the end of the
+!	input file has been reached.
+!
+! IMPLICIT INPUTS:
+!
+!	The sort tree has been initialized by TREE_INIT.
+!	The address of a record output routine in the context area.
+!
+! IMPLICIT OUTPUTS:
+!
+!	If the tree becomes full, records may be output to a scratch file.
+!
+! ROUTINE VALUE:
+!
+!	False (SS$_ENDOFFILE) if we have completely emptied the tree.
+!	True (SS$_NORMAL) if the tree still contains elements.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+! NOTES:
+!
+!	Replacement selection is used for the dispersion pass.
+!	See Vol 3 of "The Art of Computer Programming", pages 256 & ff, for a
+!	description of the algorithm.  Steps R2 and R3 are moved to the end of
+!	the loop.  A flag is used to obviate testing against infinity.
+!	To avoid comparisons between uninitialized records, we test for RQ
+!	equal to zero before step R6.
+!
+!	Additional code has been added for equal-key comparisons, and to avoid
+!	comparing records in uninitialized nodes, and nodes that have already
+!	been written.
+!
+!	Two special run numbers are used.  These are zero and negative one.
+!	Zero is used to indicate an initially empty record; negative one
+!	indicates a record that was emptied during the final flush of records.
+!	Thus an unsigned comparison can be used for comparisons based on run
+!	numbers, while a signed comparison with zero can be used to avoid
+!	comparisons.
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CTX =	COM_REG_CTX:	REF CTX_BLOCK_(S_FIELDS);
+
+    REGISTER
+	!
+	! Q_KEY is a pointer to the key portion of the node
+	!
+	Q_KEY = COM_REG_SRC2: REF BLOCK;	! Q[KEY] in a register
+
+    %IF %IDENTICAL( [%FIELDEXPAND(KEY)], [0,0,0,0] )
+    %THEN
+	!
+	! The pointer to the node is the same as the KEY portion.
+	! Thus, the same pointer can be used for both the node and the KEY.
+	!
+	BIND
+	    Q = Q_KEY: REF NODE_BLOCK
+    %ELSE
+	!
+	! The pointer to the node is not the same as the KEY portion.
+	! We must allocate another variable to point to the node itself.
+	!
+	%INFORM('This routine is non-optimal')
+	LOCAL
+	    Q:	REF NODE_BLOCK
+    %FI;
+
+    Q = .CTX[S_Q];			! Pointer to the node
+    Q_KEY = Q[KEY];			! Address of key portion of node
+
+    ! Input new record
+    !
+    IF INP_DESC[BASE_] EQL 0		! Check for end-of-file
+    THEN
+	BEGIN
+	CTX[S_RQ] = -1;			! To flush the remaining records
+	END
+    ELSE
+	BEGIN
+	!
+	! Read another record into RECORD(Q)
+	!
+	! Check whether the record should be omitted.
+	!
+	IF NOT JSB_INPUT(.CTX[COM_INPUT], INP_DESC[BASE_],	! Convert, copy
+		Q_KEY[BASE_])
+	THEN
+	    BEGIN
+	    CTX[COM_OMI_RECNUM] = .CTX[COM_OMI_RECNUM] + 1;
+	    RETURN SS$_NORMAL;
+	    END;
+	IF
+	    BEGIN
+	    REGISTER
+		LAST_KEY = COM_REG_SRC1: REF BLOCK;
+	    CTX[S_RQ] = .CTX[S_RC];		! Get current run number
+	    LAST_KEY = .CTX[S_LAST];
+	    IF LAST_KEY[BASE_] EQL 0		! First time here?
+	    THEN TRUE
+	    ELSE NOT COMPARE_LSS(LAST_KEY[BASE_], Q_KEY[BASE_])
+	    END
+	THEN
+	    BEGIN
+	    !
+	    ! This new record does not belong to the current run
+	    !
+	    CTX[S_RQ] = .CTX[S_RQ] + 1;			! Belongs to next run
+	    IF .CTX[S_RMAX] LSS .CTX[S_RQ]
+	    THEN
+		CTX[S_RMAX] = .CTX[S_RQ];			! Maximize RMAX
+	    END;
+	END;
+
+
+    DO
+	BEGIN
+	LABEL
+	    TI;
+TI:	BEGIN
+
+	! Prepare to update
+	!
+	! Now Q points to a new record, whose run number is RQ
+	!
+	REGISTER
+	    T:	REF NODE_BLOCK;
+	FE_(Q,T);					! T = .Q[FE];
+	WHILE TRUE DO
+	    BEGIN
+	    !
+	    ! Determine which of these records is "smaller".
+	    ! First compare the winner run number with the one in the node
+	    !	(if the node is smaller, it's the new winner)
+	    !	(if the node is greater, keep the same winner),
+	    ! Then check whether the run number is 0 or -1
+	    !	(avoid comparing uninitialized or emptied records)
+	    !	(if 0, declare this node the winner, to save time),
+	    ! Then compare the keys themselves.
+	    !
+	    IF  BEGIN
+		IF   .CTX[S_RQ] GTRU .T[RN] THEN TRUE
+		ELIF .CTX[S_RQ] LSSU .T[RN] THEN FALSE
+		ELIF .CTX[S_RQ] LEQ  0
+		THEN
+		    BEGIN
+		    IF .CTX[S_RQ] EQL 0 THEN (LEAVE TI);
+		    FALSE
+		    END
+		ELSE
+		    COMPARE_LSS(BLOCK[.T[LOSER],KEY], Q_KEY[BASE_],
+			T[RN] = 0, CTX[S_RQ] = 0)
+		END
+	    THEN
+		BEGIN
+		SWAP_(T[RN], CTX[S_RQ]);	! RQ <--> T[RN]
+		SWAP_(T[LOSER], Q);		! Q  <--> T[LOSER]
+		Q_KEY = Q[KEY];
+		END;
+	    FI_(T,T);				! Go up (T = .T[FI])
+	    IF .T EQL .CTX[S_X] THEN LEAVE TI;	! Exit loop if we're at the top
+	    END;
+	END;
+
+	! End of run?
+	!
+	IF .CTX[S_RQ] GTRU .CTX[S_RC]
+	THEN
+	    BEGIN
+	    !
+	    ! We've just completed run number RC (which at first means run 0),
+	    ! and must prepare for the next run.
+	    !
+	    ! Any special actions required by a merging pattern for subsequent
+	    ! passes of the sort should be done at this point.
+	    !
+	    ! For what it's worth, at this point .RQ equals .RC + 1.
+	    !
+	    IF .CTX[S_RQ] LSS .CTX[S_RC]	! Equiv to .CTX[S_RQ] EQL -1
+	    THEN
+		BEGIN
+		!
+		! We've completed the initial dispersion.
+		!
+		RETURN SS$_ENDOFFILE;
+		END;
+	    JSB_NEWRUN(.CTX[COM_NEWRUN]);
+	    CTX[S_RC] = .CTX[S_RC] + 1;	! = .CTX[S_RQ]	! Set current run number
+	    END;
+
+	! Output top of tree
+	!
+	! Q points to the "champion", and RQ is its run number.
+	!
+	IF .CTX[S_RQ] GTR 0			! First dummy run, or flushing?
+	THEN
+	    BEGIN
+	    !
+	    ! Output record pointed to by Q
+	    !
+	    CTX[S_LAST] = JSB_OUTPUT(.CTX[COM_OUTPUT], Q_KEY[BASE_]);
+	    !
+	    ! ??? We don't need to exitloop if we are flushing to a work file.
+	    !
+	    EXITLOOP;
+%(
+	    ! Is this correct?
+	    !
+	    ! Unless we are flushing the tree to a work file, exit the loop.
+	    !
+	    IF .CTX[COM_RUNS] EQL 0
+	    THEN
+		BEGIN
+		!
+		! We aren't writing to a work file, so leave now.
+		!
+		EXITLOOP;
+		END;
+)%
+	    END;
+
+
+	! If we are emptying the tree, keep looping until we output a record
+	!
+	IF INP_DESC[BASE_] EQL 0
+	THEN
+	    CTX[S_RQ] = -1		! We are emptying the tree
+	ELSE
+	    EXITLOOP;
+	END
+    UNTIL FALSE;
+
+    CTX[S_Q] = .Q;			! Store value of Q
+
+    RETURN SS$_NORMAL;
+    END;
+
+! Compile-time checks on the size of the SOR$$TREE_INSERT routine
+!
+OWN
+    END__TREE_INSERT: BLOCK[0] PSECT(SOR$RO_CODE) ALIGN(0);
+LITERAL
+    SIZE_TREE_INSERT = END__TREE_INSERT - SOR$$TREE_INSERT,
+    OLD__TREE_INSERT = 261;
+%IF SIZE_TREE_INSERT GTR OLD__TREE_INSERT %THEN
+     %WARN('SIZE_TREE_INSERT has gotten larger') %FI
+%IF SIZE_TREE_INSERT LSS OLD__TREE_INSERT %THEN
+     %INFORM('SIZE_TREE_INSERT has gotten smaller') %FI
+UNDECLARE
+    END__TREE_INSERT,
+    SIZE_TREE_INSERT,
+    OLD__TREE_INSERT;
+
+GLOBAL ROUTINE SOR$$TREE_EXTRACT
+	(
+	OUT_DESC:	REF BLOCK[,BYTE],	! Extracted record
+	LEN:		REF VECTOR[1,WORD]
+	):	JSB_EXTRACT =
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine returns a record from the sort or merge.
+!
+! FORMAL PARAMETERS:
+!
+!	OUT_DESC.rab.d	Descriptor of the record extracted
+!	LEN.waw.r	Address of returned length
+!	CTX		Longword pointing to work area (passed in COM_REG_CTX)
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	Status code
+!	SS$_ENDOFFILE indicates the end of the sorted records.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CTX =	COM_REG_CTX:	REF CTX_BLOCK_(S_FIELDS);
+    LITERAL
+	OPC_RSB   = %X'05';
+
+
+    ! If we haven't written to the work files, we can write directly to the
+    ! user's buffer, via TREE_OUTPUT.  Otherwise, we must first flush the
+    ! tree into the work files, and do the merging.
+    !
+    ! Important!  The output run should be included in the number of runs
+    ! (CTX[COM_RUNS]), even if the output of the merge pass is going to the
+    ! output file.
+    !
+    IF .CTX[COM_RUNS] EQL 0
+    THEN
+	BEGIN
+	CTX[COM_NEWRUN] = UPLIT BYTE(OPC_RSB);	! Nothing special for new runs
+	CTX[COM_OUTPUT] = TREE_OUTPUT;		! Output to the user's buffer
+	CTX[S_DESC] = OUT_DESC[BASE_];		! User's buffer
+	CTX[S_LEN] = LEN[0];			! User's length
+	RETURN SOR$$TREE_INSERT(0);
+	END
+    ELSE
+	BEGIN
+	STACKLOCAL
+	    QUEUE:	REF BLOCKVECTOR[1+TUN_K_MAX_MERGE,QUE_K_SIZE],
+	    Q_FWD:	REF BLOCK;
+
+	IF .CTX[COM_STAT_PASSES] EQL 0		! First time here?
+	THEN
+	    BEGIN
+	    !
+	    ! Call another routine for the merging, to keep this one simple.
+	    !
+	    MERGE_PASSES();
+	    END;
+
+	! Get a pointer to the queue
+	!
+	QUEUE = .CTX[S_QUEUE];
+
+	WHILE TRUE DO
+	    BEGIN
+	    BUILTIN
+		TESTBITSS,
+		TESTBITSC;
+
+	    Q_FWD = .QUEUE[0,QUE_FWD];
+
+	    ! Check for finishing the sort or merge
+	    !
+	    IF .Q_FWD NEQ QUEUE[0,BASE_]
+	    THEN
+		BEGIN
+		IF .CTX[COM_SEQ_CHECK]
+		THEN
+		    BEGIN
+		    LOCAL
+			DEL;
+
+		    ! Check the sequence, if requested.
+		    ! Note that we make the call to the equal-key routine
+		    ! conditional on whether the "extra" record
+		    ! (at QUEUE[0,QUE_REC]) has already been deleted.
+		    !
+		    DEL = FALSE;
+		    IF COMPARE_LSS(.Q_FWD[QUE_REC], .QUEUE[0,QUE_REC],
+			DEL = TRUE,
+			QUEUE[0,QUE_PRESENT] = FALSE,
+			.QUEUE[0,QUE_PRESENT] )
+		    THEN
+			SOR$$ERROR(SOR$_BAD_ORDER);
+		    IF .DEL
+		    THEN
+			READ_INSERT(Q_FWD[BASE_], QUEUE[0,BASE_])
+		    ELSE
+			BEGIN
+			IF .QUEUE[0,QUE_PRESENT]
+			THEN
+			    BEGIN
+			    CTX[S_DESC] = OUT_DESC[BASE_];
+			    CTX[S_LEN] = LEN[0];
+			    TREE_OUTPUT(.QUEUE[0,QUE_REC]);
+			    END;
+			CH$MOVE(.CTX[COM_LRL_INT],
+			    .Q_FWD[QUE_REC],
+			    .QUEUE[0,QUE_REC]);
+			READ_INSERT(Q_FWD[BASE_], QUEUE[0,BASE_]);
+			IF TESTBITSS(QUEUE[0,QUE_PRESENT])
+			THEN
+			    RETURN SS$_NORMAL;
+			QUEUE[0,QUE_PRESENT] = TRUE;
+			END;
+		    END
+		ELSE
+		    BEGIN
+
+		    ! Return the smallest record to the user
+		    ! Read another record, and insert onto the list
+		    !
+		    CTX[S_DESC] = OUT_DESC[BASE_];
+		    CTX[S_LEN] = LEN[0];
+		    TREE_OUTPUT(.Q_FWD[QUE_REC]);
+		    READ_INSERT(Q_FWD[BASE_], QUEUE[0,BASE_]);
+
+		    RETURN SS$_NORMAL;
+		    END;
+		END
+	    ELSE
+		BEGIN
+
+		! Process the extra record that may be hanging around
+		!
+		IF TESTBITSC(QUEUE[0,QUE_PRESENT])
+		THEN
+		    BEGIN
+		    CTX[S_DESC] = OUT_DESC[BASE_];
+		    CTX[S_LEN] = LEN[0];
+		    TREE_OUTPUT(.QUEUE[0,QUE_REC]);
+		    RETURN SS$_NORMAL;
+		    END
+		ELSE
+		    RETURN SS$_ENDOFFILE;		! We're finished
+
+		END;
+	    END;
+	RETURN SS$_NORMAL;
+	END;
+    END;
+
+ROUTINE TREE_OUTPUT
+	(
+	SRC_ADDR:	REF BLOCK	! Address of internal format record
+	): JSB_OUTPUT =
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine returns a record to the user.
+!
+! FORMAL PARAMETERS:
+!
+!	SRC_ADDR.ral.v	Address of internal format record
+!	CTX		Longword pointing to work area (passed in COM_REG_CTX)
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CTX =	COM_REG_CTX:	REF CTX_BLOCK_(S_FIELDS);
+    LOCAL
+	STATUS,
+	LEN,
+	ADR;
+
+    JSB_LENADR(.CTX[COM_LENADR], SRC_ADDR[BASE_]; LEN, ADR);
+    BEGIN
+    LOCAL
+	W: REF VECTOR[1,WORD];
+    IF (W = .CTX[S_LEN]) NEQ 0 THEN W[0] = .LEN;
+    END;
+
+    %IF NOT HOSTILE
+    %THEN
+	STATUS = LIB$SCOPY_R_DX6(.LEN, .ADR, .CTX[S_DESC]);
+	IF NOT .STATUS THEN SOR$$ERROR(SOR$_SHR_SYSERROR, 0, .STATUS);
+    %ELSE
+	BEGIN
+	BIND
+	    D = .CTX[S_DESC]: BLOCK[,BYTE];
+	CH$COPY(.LEN, .ADR, 0, .D[DSC$W_LENGTH], .D[DSC$A_POINTER]);
+	END;
+    %FI
+
+    RETURN 0;
+%(
+    BIND
+	D = CTX[S_DESC]: BLOCK[,BYTE];
+    ASSERT_(DSC$K_CLASS_Z  LSSU 2)
+    ASSERT_(DSC$K_CLASS_S  LSSU 2)
+    IF .D[DSC$B_CLASS] LSSU 2
+    THEN
+	CH$COPY(.LEN, .ADR, %C' ', .D[DSC$W_LENGTH], .D[DSC$A_POINTER])
+    ELIF
+	.D[DSC$B_CLASS] EQL DSC$K_CLASS_D AND .LEN LEQU .D[DSC$W_LENGTH]
+    THEN
+	CH$MOVE(.LEN, .ADR, .D[DSC$A_POINTER])
+    ELSE
+	BEGIN
+	LOCAL
+	    STATUS;
+	STATUS = LIB$SCOPY_R_DX6(.LEN, .ADR, D[BASE_]);
+	IF NOT .STATUS THEN SOR$$ERROR(SOR$_SHR_SYSERROR, 0, .STATUS);
+	END;
+)%
+    END;
+
+ROUTINE READ_INSERT			! Read a record and insert in queue
+	(
+	PENTRY:		REF BLOCK,
+	QUEUE:		REF BLOCK
+	):	JSB_READINS NOVALUE =
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine reads a record, and inserts the entry in the queue.
+!
+! FORMAL PARAMETERS:
+!
+!	PENTRY		Address of entry
+!	QUEUE		Address of queue header
+!	CTX		Longword pointing to work area (passed in COM_REG_CTX)
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CTX =	COM_REG_CTX:	REF CTX_BLOCK;
+
+    LITERAL
+	D_ENTRY =	0,	! Delete ENTRY
+	D_POINT =	1;	! Delete POINT
+
+    BUILTIN
+	TESTBITSC,
+	TESTBITCC;
+
+    MACRO
+	REMQUE_(A) =			! Remove A from a queue
+	    BEGIN
+	    BLOCK[.BLOCK[A,QUE_FWD], QUE_BWD] = .BLOCK[A,QUE_BWD];
+	    BLOCK[.BLOCK[A,QUE_BWD], QUE_FWD] = .BLOCK[A,QUE_FWD];
+	    END %,
+	INSQUE_(A,B) =			! Insert A just before B
+	    BEGIN
+	    BLOCK[A,QUE_FWD] = BLOCK[B,BASE_];
+	    BLOCK[A,QUE_BWD] = .BLOCK[B,QUE_BWD];
+	    BLOCK[.BLOCK[A,QUE_BWD], QUE_FWD] = BLOCK[A,BASE_];
+	    BLOCK[B,QUE_BWD] = BLOCK[A,BASE_];
+	    END %;
+
+    ! Deletion flags D_ENTRY and D_POINT
+    !
+    LOCAL
+	S:	BITVECTOR[%BPVAL] INITIAL(0);
+
+    REGISTER
+	ENTRY:	REF BLOCK;
+
+
+    ! Get a copy of PENTRY in a register
+    !
+    ENTRY = PENTRY[BASE_];
+
+
+    ! Remove ENTRY from its current place in the queue
+    !
+    REMQUE_(ENTRY[BASE_]);
+
+
+    ! Continue until we don't delete ENTRY
+    !
+    ! The deletion flags are always 0 at the start of the following loop, due
+    ! to the use of the INITIAL attribute and TESTBITSC and TESTBITCC builtins.
+    !
+    WHILE TRUE DO
+	BEGIN
+	REGISTER
+	    POINT:	REF BLOCK;
+
+
+	! Read the record
+	!
+	ENTRY[QUE_REC] = SOR$$WORK_READ(.ENTRY[QUE_RUN]);
+
+
+	! At the end of run, don't put ENTRY in the queue.
+	! Thus, we will not read from this run again.
+	!
+	IF .ENTRY[QUE_REC] EQL 0 THEN RETURN;	! Indicates end-of-file
+
+
+	! Determine where the record belongs in the queue
+	!
+	POINT = .QUEUE[QUE_FWD];
+	WHILE POINT[BASE_] NEQ QUEUE[BASE_] DO
+	    BEGIN
+	    IF COMPARE_LSS(.POINT[QUE_REC], .ENTRY[QUE_REC],
+		S[D_POINT] = TRUE, S[D_ENTRY] = TRUE)
+	    THEN
+		POINT = .POINT[QUE_FWD]
+	    ELSE
+		EXITLOOP;
+	    END;
+
+	! If keeping ENTRY, insert it in the queue just before POINT[BASE_]
+	!
+	IF TESTBITCC(S[D_ENTRY])
+	THEN
+	    BEGIN
+
+	    ! Insert ENTRY in the queue just before POINT[BASE_]
+	    !
+	    INSQUE_(ENTRY[BASE_], POINT[BASE_]);
+
+	    ! To delete POINT, make ENTRY look like POINT and continue
+	    ! looping.  This avoids a recursive call.
+	    ! If keeping both, return (hurrah, hurrah!).
+	    !
+	    IF TESTBITSC(S[D_POINT])
+	    THEN
+		BEGIN
+		ENTRY = POINT[BASE_];
+		REMQUE_(ENTRY[BASE_]);
+		S<0,%BPUNIT*%ALLOCATION(S),0> = 0;
+		END
+	    ELSE
+		RETURN;
+	    END
+	ELSE
+	    BEGIN
+
+	    ! To delete POINT, use READ_INSERT to read from its run.
+	    ! This is a recursive invocation of READ_INSERT.
+	    ! Note that the maximum recusion level is TUN_K_MAX_MERGE,
+	    ! because we've deleted a item from the queue, and have not yet
+	    ! inserted anything in the queue.
+	    !
+	    IF TESTBITSC(S[D_POINT])
+	    THEN
+		READ_INSERT(POINT[BASE_], QUEUE[BASE_]);
+
+	    ! Continue looping, since we need to read another ENTRY.
+	    !
+	    0;
+	    END;
+
+	END;	! Continue until we don't delete ENTRY
+
+
+    END;
+
+ROUTINE MERGE_PASSES:	CAL_CTXREG NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine performs the merge passes.
+!
+! FORMAL PARAMETERS:
+!
+!	CTX		Longword pointing to work area (passed in COM_REG_CTX)
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CTX =	COM_REG_CTX:	REF CTX_BLOCK_(S_FIELDS);
+    LOCAL
+	QUEUE:	REF BLOCKVECTOR[1+TUN_K_MAX_MERGE,QUE_K_SIZE],
+	STATUS;				! Status
+
+
+    ! If this routine was called due to a sort (rather than a merge),
+    ! clean up the replacement selection tree.
+    !
+    IF NOT .CTX[COM_MERGE]
+    THEN
+	BEGIN
+	!
+	! Flush the tree
+	!
+	WHILE (STATUS = SOR$$TREE_INSERT(0)) DO 0;
+	IF .STATUS NEQ SS$_ENDOFFILE THEN RETURN SOR$$ERROR(.STATUS);
+
+
+	! Deallocate the replacement selection tree
+	!
+	SOR$$DEALLOCATE(.CTX[COM_TREE_LEN], CTX[COM_TREE_ADR]);
+	END;
+
+
+    ! Save the number of runs in the dispersion, for statistics
+    !
+    CTX[COM_STAT_RUNS] = .CTX[COM_RUNS];	! Number of runs in dispersion
+
+
+    ! Allocate storage to hold the queue.
+    ! One entry per run, and one for the queue header.
+    !
+    QUEUE = CTX[S_QUEUE] = SOR$$ALLOCATE
+		( (1+TUN_K_MAX_MERGE) * QUE_K_SIZE * %UPVAL );
+
+
+    ! While there are more runs than can be handled at once, ...
+    !
+    WHILE TRUE DO
+	BEGIN
+	LOCAL
+	    RUNS:	VECTOR[1+TUN_K_MAX_MERGE];
+
+	! One more merge pass
+	!
+	CTX[COM_STAT_PASSES] = .CTX[COM_STAT_PASSES] + 1;
+
+
+	! Determine which runs to merge.
+	! This routine also initiates reading these runs.
+	!
+	SOR$$WORK_MERGE(
+	    (.CTX[COM_RUNS]-2) MOD (TUN_K_MAX_MERGE-1) + 2,
+	    RUNS[0]);
+
+
+	CTX[COM_STAT_MERGE] = MAXU(.RUNS[0], .CTX[COM_STAT_MERGE]);
+
+
+	! Initialize queue entries for each run
+	!
+	DECR I FROM .RUNS[0] TO 1 DO
+	    BEGIN
+	    LOCAL
+		P: REF BLOCK;
+	    P = QUEUE[.I, BASE_];
+	    P[QUE_FWD] = P[BASE_];		! Point to self
+	    P[QUE_BWD] = P[BASE_];		! Point to self
+	    P[QUE_RUN] = .RUNS[.I];		! Init ptr to run info
+	    END;
+	QUEUE[0,QUE_FWD] = QUEUE[0,BASE_];		! Init queue header
+	QUEUE[0,QUE_BWD] = QUEUE[0,BASE_];		! Init queue header
+
+
+	! Read a record from each run
+	!
+	DECR I FROM .RUNS[0] TO 1 DO
+	    READ_INSERT(QUEUE[.I,BASE_], QUEUE[0,BASE_]);
+
+	! If sequence checking, allocate and read an extra record
+	!
+	IF .CTX[COM_SEQ_CHECK]
+	THEN
+	    BEGIN
+	    LOCAL
+		Q_FWD: REF BLOCK;
+	    QUEUE[0,QUE_REC] = SOR$$ALLOCATE(.CTX[COM_LRL_INT]);
+	    Q_FWD = .QUEUE[0,QUE_FWD];
+	    IF .Q_FWD NEQ QUEUE[0,BASE_]
+	    THEN
+		BEGIN
+		CH$MOVE(.CTX[COM_LRL_INT],
+		    .Q_FWD[QUE_REC],
+		    .QUEUE[0,QUE_REC]);
+		QUEUE[0,QUE_PRESENT] = TRUE;
+		READ_INSERT(Q_FWD[BASE_], QUEUE[0,BASE_]);
+		END;
+	    END;
+
+
+	! If this is the final pass (indicated by comparing the number of
+	! active runs with the number of runs being merged), return now
+	! TREE_EXTRACT will use READ_INSERT to get the records.
+	! Note that for a merge, we will always return here.
+	!
+	IF .CTX[COM_RUNS] - .RUNS[0] LEQ 1	! EQL suffices, LEQ is robust
+	THEN
+	    RETURN;
+
+
+	! Process all the runs
+	!
+	WHILE .QUEUE[0,QUE_FWD] NEQ QUEUE[0,BASE_] DO
+	    BEGIN
+	    !
+	    ! Output the smallest record
+	    ! Read another record, and insert onto the list
+	    !
+	    SOR$$WORK_WRITE(.BLOCK[.QUEUE[0,QUE_FWD], QUE_REC]);
+	    READ_INSERT(.QUEUE[0,QUE_FWD], QUEUE[0,BASE_]);
+	    END;
+
+	END;
+
+    END;
+
+ROUTINE CLEAN_UP: CAL_CTXREG NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Release resources allocated by this module.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE (signals errors)
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+    BEGIN
+    EXTERNAL REGISTER
+	CTX =	COM_REG_CTX:	REF CTX_BLOCK_(S_FIELDS);
+    LOCAL
+	QUEUE:	REF BLOCKVECTOR[1+TUN_K_MAX_MERGE,QUE_K_SIZE];
+
+
+    ! Deallocate the extra storage used for sequence checking
+    !
+    IF (QUEUE = .CTX[S_QUEUE]) NEQ 0
+    THEN
+	SOR$$DEALLOCATE(.CTX[COM_LRL_INT], QUEUE[0,QUE_REC]);
+
+
+    ! Deallocate storage to hold the queue.
+    ! One entry per run, and one for the queue header.
+    !
+    SOR$$DEALLOCATE
+	( (1+TUN_K_MAX_MERGE) * QUE_K_SIZE * %UPVAL, CTX[S_QUEUE] );
+
+
+    ! Deallocate the replacement selection tree
+    !
+    SOR$$DEALLOCATE(.CTX[COM_TREE_LEN], CTX[COM_TREE_ADR]);
+
+
+    END;
+
+END
+ELUDOM

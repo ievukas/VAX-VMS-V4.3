@@ -1,0 +1,455 @@
+MODULE DBGNHELP (IDENT = 'V04-000') =
+
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!
+! MODULE FUNCTION
+!	This module contains the ATN parse and command execution networks to
+!	support the HELP command. The routine DBG$NEXECUTE_HELP consists of
+!	the version 2 debugger routine DBG$GET_HELP with a few modifications
+!	to allow it to perform correctly in version 3. Specifically, error
+!	signals (which unwind the stack) have been replaced with calls to
+!	version 3 error output routines.
+!
+!
+! AUTHOR:	David Plummer, CREATION DATE:	4/9/80
+!
+! MODIFIED BY:
+!
+!		Richard Title	15 Dec 1981	Converted to the new help
+!						librarian LBR$OUTPUT_HELP,
+!						which prompts for output
+!						("Topic? ", "Subtopic? ")
+!		Richard Title	13-Jun 1982	Added support for DBG$HELP
+!						(logical name telling where
+!						the help library is)
+!
+
+REQUIRE 'SRC$:DBGPROLOG.REQ';
+
+LIBRARY 'LIB$:DBGGEN.L32';
+
+FORWARD ROUTINE
+    DBG$NPARSE_HELP,			! Creates the command execution tree for help
+    DBG$NEXECUTE_HELP,			! Executes the parsed HELP command
+    PRINT_HELP_LINE,			! Print a line of HELP text
+    INPUT_HELP_LINE;			! Input HELP topic or subtopic request
+
+EXTERNAL ROUTINE
+    DBG$GET_TEMPMEM,			! Allocates temporary dynamic storage
+    DBG$NEWLINE: NOVALUE,		! Go to a new print line
+    DBG$NMAKE_ARG_VECT,			! Constructs a message argument vector
+    DBG$PRINT: NOVALUE,			! Print some debug output
+    DBG$SCR_OUTPUT_SCREEN: NOVALUE,	! Output the current screen contents
+    DBG$SCR_SCREEN_MODE: NOVALUE,	! Turn screen mode on or off
+    LBR$INI_CONTROL,			! Librarian init control table
+    LBR$OPEN,				! Librarian open library file
+    LBR$CLOSE,				! Librarian close library file
+    LBR$GET_HELP,			! Librarian get help
+    LBR$OUTPUT_HELP,			! Librarian output help
+    LIB$PUT_OUTPUT,			! Library output routine
+    LIB$GET_INPUT,			! Library input routine
+    SMG$READ_COMPOSED_LINE,		! Read a line of input in keypad mode
+    SYS$TRNLOG;				! Translate logical name
+
+EXTERNAL
+    DBG$CHAR_TABLE: VECTOR[,BYTE],	! Character type table
+    DBG$GB_KEYPAD_INPUT: BYTE,		! Flag set if keypad input is active
+    DBG$GL_CISHEAD: REF CIS$LINK,	! Head of Command Input Stream
+    DBG$GL_INPRAB: BLOCK[,BYTE],	! RAB for DEBUG input (DBG$INPUT)
+    DBG$GL_KEYBOARD_ID,			! The keyboard Id used for keypad input
+    DBG$GL_KEY_TABLE_ID,		! The key-table Id used for keypad input
+    DBG$GL_OUTPRAB: BLOCK[,BYTE],	! RAB for DEBUG output (DBG$OUTPUT)
+    DBG$GL_SCREEN_MODE;			! Flag set if screen mode is active
+
+EXTERNAL LITERAL
+    SMG$_EOF;				! Keypad input End-of-File code
+
+GLOBAL ROUTINE DBG$NPARSE_HELP (INPUT_DESC, VERB_NODE, MESSAGE_VECT) =
+!
+! FUNCTION
+!	DBG$NPARSE_HELP constructs the command execution tree for the HELP
+!	command.  Specifically, a Noun Node is allocated and linked to the
+!	Verb Node.  A copy of the present input descriptor (describing the
+!	input line minus the keyword HELP) is made, and the value of the Noun
+!	Node is a pointer to this descriptor.  The actual parsing of the HELP
+!	string is done by DBG$NEXECUTE_HELP.
+!
+! INPUTS
+!	INPUT_DESC - Descriptor of the present input line.
+!
+!	VERB_NODE - Head of the command execution tree.
+!
+!	MESSAGE_VECT - The address of a longword to contain the address 
+!		  of a message argument vector.
+!
+! OUTPUTS
+!	INPUT_DESC - The input line string descriptor is updated to reflect
+!		  the current parse location.  This normally means that the
+!		  input descriptor winds up pointing past the end of the line.
+!
+!	VERB_NODE - The Verb Node is filled in to reflect the parameters
+!		  parsed on the HELP command.
+!
+!	An unsigned integer longword completion code is returned as the
+!		  routine's value.  These are the possible values:
+!
+!		STS$K_SEVERE (4)  - The input could not be parsed.
+!		STS$K_SUCCESS (1) - The input was parsed and an execution
+!				    tree was created.
+!
+
+    BEGIN
+
+    MAP
+	INPUT_DESC: REF DBG$STG_DESC,	! Pointer to input scring descriptor
+	VERB_NODE: REF DBG$VERB_NODE;	! Pointer to the Verb Node
+
+    LOCAL
+  	NOUN_NODE: REF DBG$NOUN_NODE,	! Pointer to Noun node for execution tree
+	COMMAND_DESC: REF DBG$STG_DESC;	! Descriptor of HELP line
+
+
+
+    ! Get storage for the Noun Node and link it to the Verb Node.
+    !
+    NOUN_NODE = DBG$GET_TEMPMEM (DBG$K_NOUN_NODE_SIZE);
+    VERB_NODE [DBG$L_VERB_OBJECT_PTR] = .NOUN_NODE;
+
+
+    ! Get storage for the command descriptor.
+    !
+    COMMAND_DESC = DBG$GET_TEMPMEM (2);
+
+
+    ! Copy the fields of the input descriptor to the command descriptor.
+    !
+    COMMAND_DESC [DSC$W_LENGTH] = .INPUT_DESC [DSC$W_LENGTH];
+    COMMAND_DESC [DSC$A_POINTER] = .INPUT_DESC [DSC$A_POINTER];
+
+
+    ! Set the value of the Noun Node to the address of the command descriptor.
+    !
+    NOUN_NODE [DBG$L_NOUN_VALUE] = .COMMAND_DESC;
+
+
+    ! Eat the rest of the input command and return.
+    !
+    INPUT_DESC [DSC$W_LENGTH] = 0;
+    RETURN STS$K_SUCCESS;
+
+    END;
+
+GLOBAL ROUTINE DBG$NEXECUTE_HELP (VERB_NODE) =
+!
+! FUNCTION
+!	Invoke the VMS librarian to implement the HELP command. 
+!
+! INPUTS
+!	VERB_NODE - A pointer to the Verb Node that forms the head of the
+!		  command execution tree for the HELP command.
+!
+! OUTPUTS
+!	This routine always returns STS$K_SUCCESS as its value.
+!
+
+    BEGIN
+    
+    MAP 
+	VERB_NODE: REF DBG$VERB_NODE;	! Pointer to the input Verb Node
+
+    LOCAL
+    	CHAR,				! Temporary placeholder for a char
+    	COUNT,				! Counter for leading blanks
+    	DBGHELP_STGDESC: BLOCK[8,BYTE],	! String descriptor for DBG$HELP
+    	DBGHELP_STG: VECTOR[8,BYTE],	! String with DBG$HELP
+    	DUMMY: VECTOR [2],		! Output string descriptor for
+    					!      SYS$TRNLOG
+    	DUMMY_BUFFER: VECTOR [256, BYTE],! Output buffer for SYS$TRNLOG
+    	INPUT_PTR,			! Temporary pointer into input
+	LIB_NAME: REF DBG$STG_DESC,	! descriptor for library name
+	NOUN_NODE: REF DBG$NOUN_NODE, 	! noun node of command execution tree
+	PARSE_STG_DESC: REF DBG$STG_DESC,! Descriptor of the help command
+    	SAVED_PARSE_STG_DESC,		! ???
+	SCREEN_MODE_FLAG,		! Saved value of screen mode flag
+	STATUS,				! Librarian routines return status
+    	TRNLOG;				! Return status from $TRNLOG
+
+
+
+    ! Recover pointers to the Noun Node and the command descriptor.
+    !
+    NOUN_NODE = .VERB_NODE [DBG$L_VERB_OBJECT_PTR];
+    PARSE_STG_DESC = .NOUN_NODE [DBG$L_NOUN_VALUE];
+
+
+    ! Initialize the library name. If the logical name DBG$HELP is defined,
+    ! then we use that as the directory in which to find DEBUGHLP.HLB.
+    ! Otherwise, the help librarian looks in SYS$HELP by default.
+    !
+    LIB_NAME = DBG$GET_TEMPMEM (2);
+    DUMMY[0] = %X'010E0000' + 256;
+    DUMMY[1] = DUMMY_BUFFER;
+
+
+    ! Set up string descriptor for DBG$HELP.  Use DBG$HELP as the directory
+    ! name if a logical name translation exists for DBG$HELP.
+    !
+    DBGHELP_STGDESC[DSC$B_CLASS] = DSC$K_CLASS_S;
+    DBGHELP_STGDESC[DSC$B_DTYPE] = DSC$K_DTYPE_T;
+    DBGHELP_STGDESC[DSC$W_LENGTH] = 8;
+    DBGHELP_STGDESC[DSC$A_POINTER] = DBGHELP_STG;
+    CH$MOVE (8, UPLIT BYTE (%ASCII 'DBG$HELP'), DBGHELP_STG);
+    TRNLOG = SYS$TRNLOG (DBGHELP_STGDESC, 0, DUMMY, 0, 0, 0);
+    IF .TRNLOG EQL SS$_NORMAL
+    THEN
+    	BEGIN
+    	LIB_NAME [DSC$W_LENGTH] = 17;
+    	LIB_NAME [DSC$A_POINTER] = UPLIT BYTE (%ASCII 'DBG$HELP:DEBUGHLP');
+    	END
+
+    ELSE
+    	BEGIN
+    	LIB_NAME [DSC$W_LENGTH] = 8;
+    	LIB_NAME [DSC$A_POINTER] = UPLIT BYTE(%ASCII 'DEBUGHLP');
+    	END;
+
+
+    ! Suppress leading blanks and tabs.
+    !
+    INPUT_PTR = CH$PTR(.PARSE_STG_DESC[DSC$A_POINTER]);
+    CHAR = CH$RCHAR(INPUT_PTR);
+    COUNT = 0;
+    WHILE .DBG$CHAR_TABLE[.CHAR] EQL 4 DO
+	BEGIN
+    	CHAR = CH$RCHAR_A(INPUT_PTR);
+    	COUNT = .COUNT + 1;
+    	END;
+
+    
+    ! Update the string descriptor to point to the first non-blank character.
+    !	
+    PARSE_STG_DESC[DSC$W_LENGTH] = .PARSE_STG_DESC[DSC$W_LENGTH] - .COUNT;
+    PARSE_STG_DESC[DSC$A_POINTER] = .INPUT_PTR;
+
+
+    ! Save away PARSE_STG_DESC before we clobber it.
+    !
+    SAVED_PARSE_STG_DESC = .PARSE_STG_DESC;
+
+
+    ! Remove the trailing carriage return from PARSE_STG_DESC.
+    !
+    INPUT_PTR = CH$PTR (.PARSE_STG_DESC[DSC$A_POINTER]);
+    INPUT_PTR = CH$PLUS (.INPUT_PTR, .PARSE_STG_DESC[DSC$W_LENGTH] - 1);
+    IF CH$RCHAR(.INPUT_PTR) EQL DBG$K_CAR_RETURN
+    THEN
+    	PARSE_STG_DESC[DSC$W_LENGTH] = .PARSE_STG_DESC[DSC$W_LENGTH] - 1;
+
+
+    ! Check for all blanks. If so, put zero in PARSE_STG_DESC to tell the
+    ! HELP librarian that no keys were specified.
+    ! 
+    IF .PARSE_STG_DESC[DSC$W_LENGTH] EQL 0
+    THEN
+        PARSE_STG_DESC = 0;    	
+
+
+    ! If screen mode is set, turn off screen mode for the duration of the
+    ! HELP command.  We restore screen mode after the HELP command completes
+    ! if it was set when the HELP command was entered.
+    !
+    SCREEN_MODE_FLAG = .DBG$GL_SCREEN_MODE;
+    IF .DBG$GL_SCREEN_MODE THEN DBG$SCR_SCREEN_MODE(FALSE);
+
+
+    ! Call the library routine to output help text.  Note that we restore
+    ! screen mode if appropriate before we signal any error message.
+    !
+    STATUS = LBR$OUTPUT_HELP (PRINT_HELP_LINE, 0, .PARSE_STG_DESC,
+			.LIB_NAME, UPLIT(HLP$M_PROMPT), INPUT_HELP_LINE);
+    IF .SCREEN_MODE_FLAG THEN DBG$SCR_SCREEN_MODE(TRUE);
+    IF NOT .STATUS THEN SIGNAL(DBG$_NOSUCHELP, 0, .STATUS);
+
+
+    ! The HELP has been displayed.  Now cleanup and return.
+    !
+    PARSE_STG_DESC = .SAVED_PARSE_STG_DESC;
+    PARSE_STG_DESC[DSC$A_POINTER] = CH$PLUS(.PARSE_STG_DESC[DSC$A_POINTER],
+    					    .PARSE_STG_DESC[DSC$W_LENGTH]);
+    PARSE_STG_DESC[DSC$W_LENGTH] = 0;
+    RETURN STS$K_SUCCESS;
+
+    END;
+
+ROUTINE PRINT_HELP_LINE(LINE_DESC) =
+!
+! FUNCTION
+!	Print a line of HELP text to the DEBUG output device.  It is necessary
+!	to pass this routine to LBR$OUTPUT_HELP, instead of using the default
+!	routine LIB$PUT_OUTPUT, because DEBUG may write its output to a log
+!	file, to logical name DBG$OUTPUT, or to a screen display, and not
+!	necessarily to SYS$OUTPUT.
+!
+! INPUTS
+!	LINEDESC - A pointer to a string descriptor for the line to be output.
+!
+! OUTPUTS
+!	This routine always returns SS$_NORMAL as its value.
+!
+
+    BEGIN
+
+    MAP
+	LINE_DESC: REF DBG$STG_DESC;	! Pointer to output line string descr.
+
+
+
+    ! Output the line of HELP text via DBG$PRINT.  Then return.
+    !
+    $ABORT_ON_CONTROL_Y;
+    DBG$PRINT(UPLIT BYTE(%ASCIC '!AD'),
+			.LINE_DESC[DSC$W_LENGTH], .LINE_DESC[DSC$A_POINTER]);
+    DBG$NEWLINE();
+    RETURN SS$_NORMAL;
+
+    END;
+
+ROUTINE INPUT_HELP_LINE (GET_STR, PROMPT_STR) =
+!
+! FUNCTION
+!	Reads a line of HELP input from the DEBUG input stream.  This routine
+!	is used by LBR$OUTPUT_HELP to collect responses to the "Topic? " and
+!	"Subtopic? " prompts.  It is necessary to use this instead of the
+!	default LIB$GET_INPUT, because DEBUG may read its input from DBG$INPUT,
+!	the keypad read routine, or from an indirect command file, and not
+!	necessarily from SYS$INPUT.
+!
+! INPUTS
+!	GET_STR	- The address of a string descriptor pointing to the buffer
+!		  to receive the input line.
+!
+!	PROMPT_STR - A string descriptor specifying the prompt string.
+!
+! OUTPUTS
+!	GET_STR	- The actual length of the read input string is returned to the
+!		  length field of the GET_STR string descriptor.
+!
+!	The status returned by the $GET call is returned as this routine's
+!		  value.  If $GET was not called, SS$_NORMAL or the keypad
+!		  input routine's status is returned.
+!
+
+    BEGIN
+
+    MAP
+    	GET_STR: REF DBG$STG_DESC,	! String descriptor for input buffer
+    	PROMPT_STR: REF DBG$STG_DESC;	! Prompt string string descriptor
+
+    LOCAL
+	CIS_PTR: REF CIS$LINK,		! Pointer to Command Input Stream entry
+	LENGTH,				! The input length on a keypad read
+    	STATUS;				! The RMS status code
+
+
+
+    ! If we are currently reading from a DEBUG command list as on an IF, FOR,
+    ! or WHILE statement, or a screen display DEBUG command list, we simply
+    ! return a null line to the HELP librarian.  This means that HELP commands
+    ! in such command lists do not prompt for topics or subtopics.
+    !
+    CIS_PTR = .DBG$GL_CISHEAD;
+    IF .CIS_PTR[CIS$B_INPUT_TYPE] EQL CIS_INPBUF
+    THEN
+	CIS_PTR = .CIS_PTR[CIS$A_NEXT_LINK];
+
+    IF (.CIS_PTR[CIS$B_INPUT_TYPE] NEQ CIS_DBG$INPUT) AND
+       (.CIS_PTR[CIS$B_INPUT_TYPE] NEQ CIS_RAB)
+    THEN
+	BEGIN
+	GET_STR[DSC$W_LENGTH] = 0;
+	RETURN SS$_NORMAL;
+	END;
+
+
+    ! We are reading from the user's input terminal (SYS$INPUT or DBG$INPUT)
+    ! or we are reading from an indirect command file.  If we are reading from
+    ! the terminal and we are in screen mode, we update the screen at this
+    ! point so that the user sees his current HELP output before being prompted
+    ! for another topic or subtopic.
+    !
+    IF .DBG$GL_SCREEN_MODE AND
+       (.CIS_PTR[CIS$B_INPUT_TYPE] EQL CIS_DBG$INPUT)
+    THEN
+	DBG$SCR_OUTPUT_SCREEN();
+
+
+    ! If keypad input mode is enabled and we are reading from the terminal, we
+    ! read a line of input by calling the keypad input routine.
+    !
+    IF .DBG$GB_KEYPAD_INPUT AND
+       (.CIS_PTR[CIS$B_INPUT_TYPE] EQL CIS_DBG$INPUT)
+    THEN
+	BEGIN
+	STATUS = SMG$READ_COMPOSED_LINE(DBG$GL_KEYBOARD_ID,
+			DBG$GL_KEY_TABLE_ID, 
+    			.GET_STR, 
+    			.PROMPT_STR, 
+
+! *** Note - the fifth parameter (DEFAULT_STATE) is being removed from
+! *** this routine, according to Steve Lionel. If Steve's change doesn't
+! *** make it this build, however, the "0" must be restored here.
+!
+!    			0, 
+
+    			LENGTH);
+	GET_STR[DSC$W_LENGTH] = .LENGTH;
+    	IF .STATUS EQL SMG$_EOF THEN STATUS = RMS$_EOF;
+	RETURN .STATUS;
+	END;
+
+
+    ! We are either reading from the user's terminal in the normal way using
+    ! RMS or we are reading from an indirect command file.  Hence we set up
+    ! the RAB and call RMS to give the prompt and read a line.
+    !
+    DBG$GL_INPRAB[RAB$W_USZ] = .GET_STR[DSC$W_LENGTH];
+    DBG$GL_INPRAB[RAB$L_UBF] = .GET_STR[DSC$A_POINTER];
+    DBG$GL_INPRAB[RAB$B_PSZ] = .PROMPT_STR[DSC$W_LENGTH];
+    DBG$GL_INPRAB[RAB$L_PBF] = .PROMPT_STR[DSC$A_POINTER];
+    STATUS = $GET(RAB = DBG$GL_INPRAB);
+
+
+    ! Put the number of characters read back into the string descriptor.  Then
+    ! return with the status we got back from $GET.
+    !
+    GET_STR[DSC$W_LENGTH] = .DBG$GL_INPRAB[RAB$W_RSZ];
+    RETURN .STATUS;
+
+    END;
+
+END ELUDOM

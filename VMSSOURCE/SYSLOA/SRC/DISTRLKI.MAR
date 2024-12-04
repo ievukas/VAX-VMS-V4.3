@@ -1,0 +1,1157 @@
+	.TITLE	DISTRLKI - Distributed GETLKI Loadable Code
+	.IDENT	'V04-000'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+;
+; FACILITY:	Executive, system services and fork level code
+;
+; ABSTRACT:
+;	This module contains routines used to implement distributed
+;	GETLKI system service functions.
+;
+; ENVIRONMENT:	Kernel mode, fork level, loadable code
+;
+;--
+;
+; AUTHOR: Rod Gamache,		 CREATION DATE:	3-Jun-1983
+;
+; MODIFIED BY:
+;
+;	V03-007	RNG0007		Rod N. Gamache		22-Aug-1984
+;		Fix race condition in check for spurious wake-ups, by
+;		raising IPL.
+;
+;	V03-006	RNG0006		Rod N. Gamache		3-Aug-1984
+;		Map all Lock waiting states to LKI$C_WAITING code.
+;
+;	V03-005	RNG0005		Rod N. Gamache		13-Apr-1984
+;		Fix bug where process was waiting and pre-mature wakes
+;		caused the process to continue.
+;
+;	V03-004	RNG0004		Rod N. Gamache		26-Mar-1984
+;		Return the LOCKID as the REMLKID on Local copy locks.
+;
+;	V03-003	RNG0003		Rod N. Gamache		21-Mar-1984
+;		Add REMLKID and remCSID to returns for list items.
+;		Save/restore R2 on call to list of locks routine.
+;
+;	V03-002	RNG0002		Rod N. Gamache		05-Dec-1983
+;		Change reference to RSB reference count from longword to
+;		word - this reflects changes made to the Lock Manager.
+;
+;	V03-001	RNG0001		Rod N. Gamache		05-Aug-1983
+;		Add support for distributed list items (LOCKS, BLOCKEDBY
+;		and BLOCKING).
+;		Fix problem with standard information processing, must
+;		not hold onto the CDRP message buffer for return data.
+;
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+
+;
+; MACROS:
+;
+
+	$CDRPDEF			; CDRP offsets
+	$CLSMSGDEF			; Cluster message offsets
+	$CLUBDEF			; Cluster block definitions
+	$CSBDEF				; CSB offsets
+	$DYNDEF				; Data structure names
+	$FKBDEF				; Fork block offsets
+	$IPLDEF				; IPL definitions
+	$LCKDEF				; LCK definitions
+	$LKBDEF				; LKB offsets
+	$LKIDEF				; LKI item codes
+	$PCBDEF				; PCB offsets
+	$PDTDEF				; PDT offsets
+	$PRIDEF				; Priority definitions
+	$PSLDEF				; PSL definitions
+	$RSBDEF				; RSB offsets
+	$RSNDEF				; Resource numbers
+	$VADEF				; Define virtual addresses
+
+;
+; EQUATED SYMBOLS:
+;
+
+
+;
+; OWN STORAGE:
+;
+
+	.PSECT	$$$020
+
+;***********************************************************************
+;
+; NOTE:	The following assumption is in effect for this entire module.
+;
+;************************************************************************
+
+	ASSUME	IPL$_SYNCH  EQ  IPL$_SCS
+
+	.SBTTL	LKI$DISPATCH - Dispatch incoming GETLKI message
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine dispatches incoming GETLKI messages to
+;	the appropriate routine.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	LKI$DISPATCH	(called from connection manager received
+;				message routine)
+;	IPL is at IPL$_SYNCH
+;
+; INPUT PARAMETERS:
+;
+;	R2	Address of message
+;	R3	CSID
+;	R4	Address of PDT
+;	R5	Address of CDRP (if this message needs a response)
+;
+; OUTPUT PARAMETERS:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+;	R0 - R5 destroyed
+;--
+
+LKI$DISPATCH::
+
+	DISPATCH	CLSMSG$B_FUNC(R2),TYPE=B,PREFIX=LIMSG$K_,-
+		<-
+		<STDINFO,LKI$RCV_STDINFO>,-	; Standard lock information
+		<BLKING,LKI$RCV_BLKING>,-	; List of locks blocking this lock
+		<BLKBY,LKI$RCV_BLKBY>,-		; List of locks blocked by this lock
+		<LOCKS,LKI$RCV_LOCKS>,-		; List of locks on resource
+		>
+
+	; Unrecognized function code
+
+	BUG_CHECK	LOCKMGRERR,FATAL
+
+	.SBTTL	LKI$SND_STDREQ - Send a standard information request message
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine handles getting standard information requests that must
+;	be forwarded to the master system for this lock.  This system is the
+;	process system.
+;
+; CALLING SEQUENCE:
+;
+;	BSB/JSB		LKI$SND_STDREQ
+;
+;	IPL must be at IPL$_SYNCH
+;
+; INPUT PARAMETERS:
+;
+;	R3	CSID of destination system
+;	R4	Address of PCB
+;	R8	Address of RSB
+;	R9	Address of LKB
+;	R11	Scratch
+;
+; OUTPUT PARAMETERS:
+;
+;	R0	Completion code
+;	R11	Address of REMOTE LKI INFORMATION BLOCK or zero
+;
+; SIDE EFFECTS:
+;
+;	The process will go into MWAIT until the response from the remote
+;	system arrives.
+;
+;	IPL = ASTDEL
+;
+;	R1 - R5 destroyed
+;--
+
+LKI$SND_STDREQ::
+
+	; Send a message and wait for response.
+
+	CLRL	R11			; Zero remote lock block address
+	MOVZWL	#LIMSG$K_STDINFO_LEN,R1	; Get size of return info
+	JSB	G^EXE$ALONONPAGED	; Allocate a buffer
+	BLBC	R0,110$			; Br on error
+	ASSUME	FKB$B_TYPE EQ FKB$W_SIZE+2
+	MOVL	#<DYN$C_BUFIO@16>!LIMSG$K_STDINFO_LEN,-
+		FKB$W_SIZE(R2)		; Store size and type
+	MOVL	R2,R11			; Copy buffer address
+	BSBW	CNX$ALLOC_WARMCDRP	; Alloc. a CDRP with RSPID and cvt CSID
+	BLBC	R0,90$			; No CDRPs or CSID error
+	MOVL	R11,CDRP$L_VAL4(R5)	; Save address of system buffer in CDRP
+	MOVZBL	#SS$_NORMAL,(R11)	; Assume success, zero completion word
+	MOVL	PCB$L_PID(R4),-		; Save PID in CDRP
+		CDRP$L_VAL2(R5)
+	MOVL	R9,CDRP$L_VAL1(R5)	; Copy address of LKB
+	BSBW	SENDSTDREQ		; Send standard request
+
+30$:	BLBS	2(R11),50$		; Continue if transaction completed
+
+	; Put the process into MWAIT until the response arrives.
+
+	MOVL	#RSN$_SCS,R0		; Go into MWAIT for resource RSN$_SCS
+	ASHL	#PSL$V_IPL,-		; Create a PSL on stack with IPL
+		#IPL$_ASTDEL,-(SP)	; set to ASTDEL
+	MOVL	G^SCH$GL_CURPCB,R4	; Get our PCB address
+	JSB	G^SCH$RWAIT		; Wait
+
+	; Upon reawakening, IPL = ASTDEL; we must raise to IPL = SYNCH
+
+	SETIPL	#IPL$_SYNCH		; Raise IPL - to lock out completions
+	BRB	30$			; Make sure we have completed
+
+50$:	; Lower IPL to IPL = ASTDEL
+	;
+	; Inputs:
+	;	R11	Address of return buffer
+
+	SETIPL	#IPL$_ASTDEL		; Lower IPL, in case we raised it
+	MOVZWL	(R11),R0		; Get status
+
+90$:	RSB				; Return to caller
+
+110$:	MOVZWL	#SS$_INSFMEM,R0		; Return error
+	RSB				; Return to caller
+
+
+	.SBTTL	SENDSTDREQ - Send standard information request to remote system
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine takes care of building and sending the standard lock
+;	information request.  It also handles the fork level processing of
+;	the response.  We are the process system; the remote system is the
+;	master system.  SENDSTDREQ is called to send a standard lock inform-
+;	ation request that requires a  response.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	SENDSTDREQ
+;
+;	IPL must be at SCS fork IPL (8)
+;
+;	This routine operates as a fork process so it may return
+;	to its caller before completing.
+;
+; INPUT PARAMETERS:
+;
+;	R3	CSB address of destination system
+;	R5	CDRP address
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+;--
+	.ENABL	LSB
+
+SENDSTDREQ:
+	MOVAB	W^BLD_STDMSGR,-		; Store address of message build
+		CDRP$L_MSGBLD(R5)	; routine
+	BSBW	CNX$SEND_MSG_CSB	; Send the message
+	MOVL	CDRP$L_VAL4(R5),R1	; Get address of return buffer
+	INCW	2(R1)			; Indicate transaction complete
+	BLBC	R0,100$			; Dest. system is no longer in cluster
+
+	; We are resumed here when the response message arrives.
+	; Registers contain:
+	;	R2	Address of message buffer
+	;	R3	CSB address 
+	;	R4	Address of PDT
+	;	R5	Address of CDRP
+
+	; Request for information was successfull, wake process
+
+	DISPATCH	LIMSG$B_STATUS(R2),TYPE=B,PREFIX=LIMSG$K_,-
+		<-
+		<RSPSUCCESS,70$>,- 	; Success
+		<RSPIVLKID,50$>,-	; Invalid lockid
+		>
+
+	BUG_CHECK	LOCKMGRERR,FATAL
+
+
+	; Invalid lock id
+
+50$:	MOVW	#SS$_IVLOCKID,(R1)	; Return error
+	BRB	DEALL_WARMCDRP		; Deallocate resources
+
+	; Success
+
+70$:	PUSHR	#^M<R2,R3,R5>		; Save registers
+	ASSUME	LIMSG$L_MSTLKID GE FKB$W_SIZE+4
+	MOVC3	#LIMSG$K_STDINFO_LEN-LIMSG$L_MSTLKID,-
+		LIMSG$L_MSTLKID(R2),LIMSG$L_MSTLKID(R1) ; Copy the data
+	POPR	#^M<R2,R3,R5>		; Restore registers
+
+DEALL_WARMCDRP:
+	; Deallocate CDRP (R5), message buffer (R2), and RSPID (in CDRP).
+	; CSB address is in R3.
+
+	MOVZWL	CDRP$L_VAL2(R5),R4	; Get process index
+	BSBW	CNX$DEALL_WARMCDRP_CSB	; Deallocate the package
+
+
+WAKE_PROCESS:
+	; R4 contains process index
+
+	MOVL	G^SCH$GL_PCBVEC,R0	; Get address of PCB vector
+	MOVL	(R0)[R4],R4		; Get address of PCB
+
+	; Change process state to executable
+
+	CLRL	R2			; No priority increment
+	RPTEVT	AST,JSB			; Report event (use JSB G^)
+	RSB
+
+	; Destination system left the cluster
+
+100$:	MOVW	R0,(R1)			; Return error
+	MOVL	R5,R0			; Get address of CDRP
+	MOVZWL	CDRP$L_VAL2(R5),R4	; Get process index
+	JSB	G^EXE$DEANONPAGED	; Deallocate the CDRP
+	BRB	WAKE_PROCESS		; And wake process
+
+	.DSABL	LSB
+
+
+;************************************************************************
+;
+;		Build standard information request message action routine
+;
+;************************************************************************
+
+	; Action routine to build the actual request message
+	; Inputs are:
+	;	R2	Address of message buffer
+	;	R5	Address of CDRP
+	; All registers except R0 and R1 must be preserved
+
+BLD_STDMSGR:
+
+	ASSUME	LIMSG$L_PRCLKID  EQ  LIMSG$L_MSTLKID+4
+	ASSUME	CLSMSG$B_FUNC  EQ  CLSMSG$B_FACILITY+1
+
+	MOVW	#LIMSG$K_STDINFO@8-	; Store function and facility codes
+		!CLSMSG$K_FAC_LKI,CLSMSG$B_FACILITY(R2)
+	MOVL	CDRP$L_VAL1(R5),R0	; Get LKB address
+	ADDL3	#LIMSG$L_MSTLKID,R2,R1	; Point into message buffer
+	MOVL	LKB$L_REMLKID(R0),(R1)+	; Store master lockid
+	MOVL	LKB$L_LKID(R0),(R1)+	; Store process lockid
+	RSB
+
+	.SBTTL	LKI$RCV_STDINFO - Receive standard information request
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine receives conversion requests from the remote system.
+;	The remote system is the process system and we are the master 
+;	system for this lock.  The conversion request is performed and
+;	a response message is returned if called at entry point
+;	LKI$RCV_STDREQ.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	LKI$RCV_STDREQ (called from CNX received message routine)
+;
+;	IPL must be at IPL$_SYNCH
+;
+; INPUT PARAMETERS:
+;
+;	R2	Address of message buffer
+;	R3	Address of CSB
+;	R5	Address of CDRP
+;
+; OUTPUT PARAMETERS:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+;	A message is sent back as a response
+;
+;	R0 - R5 destroyed
+;--
+
+	ASSUME	LIMSG$L_PRCLKID  EQ  LIMSG$L_MSTLKID+4
+
+LKI$RCV_STDINFO::
+	PUSHR	#^M<R2,R3,R6,R7,R8>
+	PUSHL	R2			; Save message buffer address
+	BSBW	CNX$INIT_CDRP		; Initialize CDRP
+	POPL	R2			; Restore message buffer address
+	ADDL3	#LIMSG$L_MSTLKID,R2,R7	; Point R7 into message buffer
+	MOVL	(R7)+,R1		; Get master lockid (id on this system)
+	MOVL	(R7)+,R0		; Get process lockid (for verify)
+	MOVB	#LIMSG$K_RSPIVLKID,-	; Assume error on lock id
+		CDRP$L_VAL5(R5)
+	BSBW	VERIFYREMLKID		; Convert to LKB address
+	BLBC	R0,STD_IVLKID		; Invalid lock id
+
+	; Have LKB address in R6, pointer into message in R7.  Set
+	; up other registers as needed.
+
+	MOVL	LKB$L_RSB(R6),R8	; Get RSB address
+
+	; Send response message.  CDRP address is in R5.
+
+	MOVB	#LIMSG$K_RSPSUCCESS,-	; Store status indicator
+		CDRP$L_VAL5(R5)
+STD_IVLKID:
+	MOVL	R6,CDRP$L_VAL1(R5)	; Store LKB address
+	POPR	#^M<R2,R3,R6,R7,R8>
+	MOVAB	B^BLD_STDRSP,-		; Store address of message build
+		CDRP$L_MSGBLD(R5)	; routine
+	MOVL	CSB$L_CSID(R3),R3	; Get CSID out of CSB
+	BSBW	CNX$SEND_MSG_RESP	; Send message response
+
+	; Return here only on errors
+
+	CMPW	R0,#SS$_NOSUCHNODE	; Is status SS$_NOSUCHNODE?
+	BEQL	10$			; Yes, error
+	MOVL	R5,R0			; No, SS$_NODELEAVE is okay
+	JMP	G^EXE$DEANONPAGED	; Deallocate CDRP
+
+10$:	BUG_CHECK	LOCKMGRERR,FATAL; CSID invalid
+
+BLD_STDRSP:
+	; This routine builds a response message for conversion requests
+	; Inputs:
+	;	R2	Address of message buffer
+	;	R5	Address of CDRP
+	; All registers except R0 and R1 must be preserved
+
+	ASSUME	CLSMSG$B_FUNC  EQ  CLSMSG$B_FACILITY+1
+
+	MOVW	#LIMSG$K_STDINFO@8-	; Store function and facility codes
+		!CLSMSG$M_RESPMSG-
+		!CLSMSG$K_FAC_LKI,CLSMSG$B_FACILITY(R2)
+	MOVB	CDRP$L_VAL5(R5),-	; Store response status
+		LIMSG$B_STATUS(R2)
+	DISPATCH	LIMSG$B_STATUS(R2),TYPE=B,PREFIX=LIMSG$K_,-
+		<-
+		<RSPSUCCESS,5$>,-	; Success
+		<RSPIVLKID,40$>,-	; Invalid lockid
+		>
+	BUG_CHECK	LOCKMGRERR,FATAL
+
+5$:	MOVL	CDRP$L_VAL1(R5),R0	; Get address of LKB
+	MOVL	LKB$L_LKID(R0),-	; Store master lockid
+		LIMSG$L_MSTLKID(R2)
+	MOVL	LKB$L_REMLKID(R0),-	; Store process lockid
+		LIMSG$L_PRCLKID(R2)
+
+	ASSUME	LKB$B_GRMODE EQ LKB$B_RQMODE+1
+	ASSUME	LKB$B_STATE EQ LKB$B_GRMODE+1
+
+	MOVL	LKB$B_GRMODE(R0),-	; Get state information
+		LIMSG$L_STATE(R2)
+	TSTB	LKB$B_STATE(R0)		; Is state information okay?
+	BGEQ	7$			; Br if yes, continue
+	MOVB	#LKI$C_WAITING,-	; Else, map all waiting states
+		LIMSG$L_STATE+2(R2)	;   to same code
+7$:
+	MOVL	LKB$L_RSB(R0),R1	; Get RSB address
+	MOVQ	RSB$Q_VALBLK(R1),-	; Get VALBLK information
+		LIMSG$Q_VALBLK(R2)
+	MOVQ	RSB$Q_VALBLK+8(R1),-	; Get rest of VALBLK information
+		LIMSG$Q_VALBLK+8(R2)
+	MOVZWL	RSB$W_REFCNT(R1),-	; Get sub-RSB reference count
+		LIMSG$L_RSBREFCNT(R2)
+
+	; Calculate the LOCK COUNT on the RSB
+
+	CLRL	R0			; Init count
+	PUSHR	#^M<R3,R4>		; Save registers
+	MOVAB	RSB$L_GRQFL(R1),R3	; Get address of granted queue listhead
+	MOVL	R3,R4			; Save listhead address
+10$:	CMPL	(R3),R4			; End of list?
+	BEQL	20$			; Br if yes
+	INCL	R0			; Increment count
+	MOVL	(R3),R3			; Move down list
+	BRB	10$			; Look for more
+20$:	MOVL	R0,LIMSG$L_LCKCOUNT(R2); Return the Lock Count
+	POPR	#^M<R3,R4>		; Restore registers
+40$:	RSB
+
+
+	.SBTTL	LKI$SND_BLKING - Send a request for list of blocking locks
+	.SBTTL	LKI$SND_BLKBY - Send a request for list of blockedby locks
+	.SBTTL	LKI$SND_LOCKS - Send a request for list of all locks
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine handles getting a list of locks blocking/blocked by/
+;	associated with the given lock. The given lock must be valid.
+;
+; CALLING SEQUENCE:
+;
+;	BSB/JSB		LKI$SND_BLKING
+;	BSB/JSB		LKI$SND_BLKBY
+;	BSB/JSB		LKI$SND_LOCKS
+;
+;	IPL must be at IPL$_SYNCH
+;
+; INPUT PARAMETERS:
+;
+;	R3	CSID of destination system
+;	R4	Address of system buffer to receive information
+;	R6	Size of user's return buffer
+;	R9	Address of LKB
+;	R10	Address of length longword for return + scratch longword
+;
+; OUTPUT PARAMETERS:
+;
+;	R0	Completion code
+;
+; SIDE EFFECTS:
+;
+;	The process will go into MWAIT until the response from the remote
+;	system arrives.
+;
+;	IPL = ASTDEL
+;
+;	R1 - R3, R5 destroyed
+;
+;--
+	.ENABL	LSB
+
+LKI$SND_BLKING::
+	MOVAB	W^SENDBLKINGREQ,(R10)	; Store address of action routine
+	BRB	10$			; Join common code
+
+LKI$SND_BLKBY::
+	MOVAB	W^SENDBLKBYREQ,(R10)	; Store address of action routine
+	BRB	10$			; Join common code
+
+LKI$SND_LOCKS::
+	MOVAB	W^SENDLOCKSREQ,(R10)	; Store address of action routine
+
+10$:	PUSHL	R4			; Save system buffer address
+	BSBW	CNX$ALLOC_WARMCDRP	; Alloc. a CDRP with RSPID and cvt CSID
+	BLBC	R0,90$			; No CDRPs or CSID error
+	MOVL	R4,CDRP$L_VAL5(R5)	; Save system buffer address
+	MOVL	G^SCH$GL_CURPCB,R0	; Get our PCB address
+	MOVL	PCB$L_PID(R0),-		; Save PID in CDRP
+		CDRP$L_VAL2(R5)
+	MOVL	R9,CDRP$L_VAL3(R5)	; Copy address of LKB
+	MOVL	R10,CDRP$L_VAL4(R5)	; Save length longword
+	MOVL	(R10),R0		; Copy address of action routine
+	MOVW	S^#SS$_NORMAL,2(R10) 	; Assume success
+	MOVW	R6,(R10)		; Set size of return
+	CLRW	4(R10)			; Indicate transaction not complete yet
+	JSB	(R0)			; Call action routine
+
+30$:	BLBS	4(R10),50$		; Continue if transaction completed
+
+	; Put the process into MWAIT until the response arrives.
+
+	MOVL	#RSN$_SCS,R0		; Go into MWAIT for resource RSN$_SCS
+	ASHL	#PSL$V_IPL,-		; Create a PSL on stack with IPL
+		#IPL$_ASTDEL,-(SP)	;   set to ASTDEL
+	MOVL	G^SCH$GL_CURPCB,R4	; Get our PCB address
+	JSB	G^SCH$RWAIT		; Wait
+
+	; Upon reawakening, IPL = ASTDEL; we must raise to IPL = SYNCH
+
+	SETIPL	#IPL$_SYNCH		; Raise IPL - to lock out completions
+	BRB	30$			; Check that transaction is complete
+
+50$:	; Lower IPL to IPL = ASTDEL
+	;
+	; Inputs:
+	;	R10	Address of length longword
+
+	SETIPL	#IPL$_ASTDEL		; Lower IPL, in case we raised it
+	MOVZWL	2(R10),R0		; Get status return
+
+90$:	POPL	R4			; Restore system buffer address
+	RSB
+
+	.DSABL	LSB
+
+
+	.SBTTL	SENDBLKINGREQ - Send request for blocking locks to remote system
+	.SBTTL	SENDBLKBYREQ - Send request for blocked locks to remote system
+	.SBTTL	SENDLOCKSREQ - Send request for all locks to remote system
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine takes care of building and sending the request for
+;	list of blocking/blocked/all locks.  It also handles the fork level
+;	processing of the response.  We are the process system; the remote
+;	system is the master system.  SENDxxxREQ is called to send an
+;	information request that requires a response.
+;
+; CALLING SEQUENCE:
+;
+;	BSB/JSB		SENDBLKINGREQ
+;	BSB/JSB		SENDBLKBYREQ
+;	BSB/JSB		SENDLOCKSREQ
+;
+;	IPL must be at SCS fork IPL (8)
+;
+;	This routine operates as a fork process so it may return
+;	to its caller before completing.
+;
+; INPUT PARAMETERS:
+;
+;	R3	CSB address of destination system
+;	R5	CDRP address
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+;--
+	.ENABL	LSB
+
+SENDBLKINGREQ:
+	MOVAB	W^BLD_BLKINGMSGR,-	; Store address of message build
+		CDRP$L_MSGBLD(R5)	; routine
+	BRB	10$			; Join common code
+
+SENDBLKBYREQ:
+	MOVAB	W^BLD_BLKBYMSGR,-	; Store address of message build
+		CDRP$L_MSGBLD(R5)	; routine
+	BRB	10$			; Join common code
+
+SENDLOCKSREQ:
+	MOVAB	W^BLD_LOCKSMSGR,-	; Store address of message build
+		CDRP$L_MSGBLD(R5)	; routine
+
+10$:	BICW3	#^C<VA$M_BYTE>,-	; Get byte offset
+		CDRP$L_VAL5(R5),-	;
+		CDRP$W_CNXBOFF(R5)	;  to start of buffer
+	EXTZV	#VA$V_VPN,#VA$S_VPN,-	; Get virtual page number
+		CDRP$L_VAL5(R5),R2	;  of buffer
+	MOVL	G^MMG$GL_SPTBASE,R0	; Get the base address of the SPT
+	MOVAL	(R0)[R2],CDRP$L_CNXSVAPTE(R5) ; Set address of the first PTE
+	MOVZWL	@CDRP$L_VAL4(R5),-	; Set size of system buffer
+		CDRP$L_CNXBCNT(R5)	;
+	CLRB	CDRP$B_CNXRMOD(R5)	; In kernel mode.
+	MOVL	CSB$L_CSID(R3),R3	; Get CSID
+	BSBW	CNX$BLOCK_XFER		; Request block transfer
+	MOVL	CDRP$L_VAL4(R5),R1	; Get return longword
+	INCW	4(R1)			; Indicate that transaction is complete
+	BLBC	R0,90$			; Dest. system is no longer in cluster
+
+	; We are resumed here when the response message arrives.
+	; Registers contain:
+	;	R2	Address of message buffer
+	;	R3	CSB address 
+	;	R4	Address of PDT
+	;	R5	Address of CDRP
+
+	; Request for information was successfull, wake process
+
+	DISPATCH	LIMSG$B_STATUS(R2),TYPE=B,PREFIX=LIMSG$K_,-
+		<-
+		<RSPSUCCESS,70$>,-	; Success
+		<RSPIVLKID,50$>,-	; Invalid lockid
+		>
+
+	BUG_CHECK	LOCKMGRERR,FATAL
+
+
+	; Invalid lock id
+
+50$:	MOVW	#SS$_IVLOCKID,2(R1)	; Return error
+
+	; Success
+
+70$:	MOVW	LIMSG$W_LISTSIZE(R2),(R1) ; Set size of received message
+	BRW	DEALL_WARMCDRP		; Deallocate CDRP etc, wake up process
+
+	; Error - node is leaving the cluster
+
+90$:	MOVW	R0,2(R1)		; Set return status
+	MOVL	R5,R0			; Get address of CDRP
+	MOVZWL	CDRP$L_VAL2(R5),R4	; Get process index
+	JSB	G^EXE$DEANONPAGED	; Deallocate the CDRP
+	BRW	WAKE_PROCESS		; And wake process
+
+	.DSABL	LSB
+
+
+;************************************************************************
+;
+;		Build request message to get list of blocking locks
+;
+;************************************************************************
+
+	; Action routine to build the actual request message
+	; Inputs are:
+	;	R2	Address of message buffer
+	;	R5	Address of CDRP
+	; All registers except R0 and R1 must be preserved
+
+	.ENABL	LSB
+
+	ASSUME	LIMSG$L_PRCLKID  EQ  LIMSG$L_MSTLKID+4
+	ASSUME	CLSMSG$B_FUNC  EQ  CLSMSG$B_FACILITY+1
+
+BLD_BLKINGMSGR:
+	MOVW	#LIMSG$K_BLKING@8-	; Store function and facility codes
+		!CLSMSG$K_FAC_LKI,CLSMSG$B_FACILITY(R2)
+	BRB	10$			; Join common code
+
+BLD_BLKBYMSGR:
+	MOVW	#LIMSG$K_BLKBY@8-	; Store function and facility codes
+		!CLSMSG$K_FAC_LKI,CLSMSG$B_FACILITY(R2)
+	BRB	10$			; Join common code
+
+BLD_LOCKSMSGR:
+	MOVW	#LIMSG$K_LOCKS@8-	; Store function and facility codes
+		!CLSMSG$K_FAC_LKI,CLSMSG$B_FACILITY(R2)
+
+10$:	MOVL	CDRP$L_VAL3(R5),R0	; Get LKB address
+	ADDL3	#LIMSG$L_MSTLKID,R2,R1	; Point into message buffer
+	MOVL	LKB$L_REMLKID(R0),(R1)+	; Store master lockid
+	MOVL	LKB$L_LKID(R0),(R1)+	; Store process lockid
+	MOVW	@CDRP$L_VAL4(R5),-	; Store return buffer size
+		LIMSG$W_LISTSIZE(R2)	;
+	RSB
+
+	.DSABL	LSB
+
+
+	.SBTTL	LKI$RCV_BLKING - Receive a request for list of blocking locks
+	.SBTTL	LKI$RCV_BLKBY - Receive a request for list of blocked locks
+	.SBTTL	LKI$RCV_LOCKS - Receive a request for list of all locks
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine handles receiving a request for list of locks.
+;	The given lock id must be a valid non-zero lock id.
+;
+; CALLING SEQUENCE:
+;
+;	BSB/JSB	LKI$RCV_BLKING (called by the CNX received message routine)
+;	BSB/JSB	LKI$RCV_BLKBY (called by the CNX received message routine)
+;	BSB/JSB	LKI$RCV_LOCKS (called by the CNX received message routine)
+;
+;	IPL must be at IPL$_SYNCH
+;
+; INPUT PARAMETERS:
+;
+;	R2	Address of message buffer
+;	R3	Address of CSB
+;	R5	Address of CDRP
+;
+; OUTPUT PARAMETERS:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+;	R0 - R5 destroyed
+;--
+	.ENABL	LSB
+
+	; Format of allocated buffer return information
+
+	RCV_W_STATUS = 0		; Return status
+	RCV_W_SIZE = 2			; Return size
+	RCV_L_BLDRTN = 4		; Completion build routine
+	RCV_T_DATA = 8			; Return data
+
+LKI$RCV_BLKING::
+	MOVAB	W^RCVBLKINGREQ,-	; Store address of action routine
+		CDRP$L_VAL2(R5)		;   in CDRP
+	MOVAB	W^BLD_BLKINGRSP,-	; Store address of completion routine
+		CDRP$L_VAL3(R5)		;   in CDRP
+	BRB	10$			; Join common code
+
+LKI$RCV_BLKBY::
+	MOVAB	W^RCVBLKBYREQ,-		; Store address of action routine
+		CDRP$L_VAL2(R5)		;   in CDRP
+	MOVAB	W^BLD_BLKBYRSP,-	; Store address of completion routine
+		CDRP$L_VAL3(R5)		;   in CDRP
+	BRB	10$			; Join common code
+
+LKI$RCV_LOCKS::
+	MOVAB	W^RCVLOCKSREQ,-		; Store address of action routine
+		CDRP$L_VAL2(R5)		;   in CDRP
+	MOVAB	W^BLD_LOCKSRSP,-	; Store address of completion routine
+		CDRP$L_VAL3(R5)		;   in CDRP
+
+10$:	MOVZWL	LIMSG$W_LISTSIZE(R2),R1	; Get requested buffer size
+	ADDL	#RCV_T_DATA,R1		; Make room for size field + return status
+	MOVAB	W^RCV_ERROR,R4		; Set address of error processing routine
+	BSBW	CNX$PARTNER_INIT_CSB	; Init partner's CSB
+	PUSHR	#^M<R6,R7,R8,R9,R10>	; Save registers
+	MOVZWL	LIMSG$W_LISTSIZE(R2),R8	; Get requested buffer size
+	ADDL3	#LIMSG$L_MSTLKID,R2,R7	; Point R7 into message buffer
+	MOVB	#LIMSG$K_RSPIVLKID,-	; Assume error on lock id
+		RCV_W_STATUS(R4)
+	MOVAB	RCV_W_SIZE(R4),R10	; Point R10 to length word
+	MOVL	CDRP$L_VAL3(R5),-	; Save completion routine address
+		RCV_L_BLDRTN(R4)
+	CLRW	(R10)			; Assume no data to return
+	MOVAB	RCV_T_DATA(R4),R2	; Point R2 to start of data area
+	MOVL	(R7)+,R1		; Get master lockid (id on this system)
+	MOVL	(R7)+,R0		; Get process lockid (for verify)
+	BSBW	VERIFYREMLKID		; Convert to LKB address
+	BLBC	R0,RCV_IVLKID		; Invalid lock id
+
+	; Have LKB address in R6, return buffer in R2. Setup other registers.
+
+	MOVL	R6,R9			; Copy LKB address
+	MOVL	R8,R6			; Copy size of return data buffer
+	MOVL	LKB$L_RSB(R9),R8	; Get RSB address
+	JSB	@CDRP$L_VAL2(R5)	; Call action routine
+
+	; Send data back to requestor
+
+	BICW3	#^C<VA$M_BYTE>,R2,-	; Get byte offset
+		CDRP$W_CNXBOFF(R5)	;  to start of buffer
+	EXTZV	#VA$V_VPN,#VA$S_VPN,-	; Get virtual page number
+		R2,R1			;  of buffer
+	MOVL	G^MMG$GL_SPTBASE,R0	; Get the base address of the SPT
+	MOVAL	(R0)[R1],CDRP$L_CNXSVAPTE(R5) ; Set address of the first PTE
+	MOVZWL	(R10),CDRP$L_CNXBCNT(R5); Set size of system buffer
+	CLRB	CDRP$B_CNXRMOD(R5)	; In kernel mode.
+	CLRL	CDRP$L_LBOFF(R5)	; Start at beginning of buffer
+	CLRL	CDRP$L_RBOFF(R5)	;  on both sides
+	MOVL	CDRP$L_CNXBCNT(R5),-	; Set size of system buffer
+		CDRP$L_XCT_LEN(R5)
+	POPR	#^M<R6,R7,R8,R9,R10>	; Restore registers, in case of fork
+	BSBW	CNX$BLOCK_WRITE		; Send the data
+	MOVB	#LIMSG$K_RSPSUCCESS,-	; Store success status indicator
+		RCV_W_STATUS(R4)
+
+	; Send response message.  CDRP address is in R5, allocated buffer in R4.
+	
+	BRB	70$			; Continue
+
+RCV_IVLKID:
+	POPR	#^M<R6,R7,R8,R9,R10>	; Restore registers
+70$:	MOVW	RCV_W_SIZE(R4),-	; Save return size
+		CDRP$L_VAL2+2(R5)	;  in CDRP
+	MOVB	RCV_W_STATUS(R4),-	; Save return status
+		CDRP$L_VAL2(R5)		;  in CDRP
+	MOVL	RCV_L_BLDRTN(R4),-	; Store address of response message
+		CDRP$L_MSGBLD(R5)	;  build routine
+	BRW	CNX$PARTNER_FINISH	; Send response and close connection
+
+	.DSABL	LSB
+
+	; Error processing routine
+
+RCV_ERROR:				; Error processing
+	MOVL	R5,R0			; Copy CDRP address
+	JMP	G^EXE$DEANONPAGED	; Deallocate the CDRP
+
+
+;************************************************************************
+;
+;		Action routines to build response messages
+;
+;************************************************************************
+
+	.ENABL	LSB
+
+	; These routines build the response messages for received requests
+	; Inputs:
+	;	R2	Address of message buffer
+	;	R5	Address of CDRP
+	; All registers except R0 and R1 must be preserved
+
+	ASSUME	CLSMSG$B_FUNC  EQ  CLSMSG$B_FACILITY+1
+
+BLD_BLKINGRSP:
+	MOVW	#LIMSG$K_BLKING@8-	; Store function and facility codes
+		!CLSMSG$M_RESPMSG-
+		!CLSMSG$K_FAC_LKI,CLSMSG$B_FACILITY(R2)
+	BRB	10$			; Join common code
+
+BLD_BLKBYRSP:
+	MOVW	#LIMSG$K_BLKBY@8-	; Store function and facility codes
+		!CLSMSG$M_RESPMSG-
+		!CLSMSG$K_FAC_LKI,CLSMSG$B_FACILITY(R2)
+	BRB	10$			; Join common code
+
+BLD_LOCKSRSP:
+	MOVW	#LIMSG$K_LOCKS@8-	; Store function and facility codes
+		!CLSMSG$M_RESPMSG-
+		!CLSMSG$K_FAC_LKI,CLSMSG$B_FACILITY(R2)
+
+10$:	MOVB	CDRP$L_VAL2(R5),-	; Store response status
+		LIMSG$B_STATUS(R2)
+	MOVW	CDRP$L_VAL2+2(R5),-	; Store response length
+		LIMSG$W_LISTSIZE(R2)
+	RSB
+
+
+	.DSABL	LSB
+
+
+;************************************************************************
+;
+;		Build list of blocking locks
+;
+;************************************************************************
+
+	; Action routine to build the data transfer message
+	; Inputs are:
+	;	R2	Address of return buffer
+	;	R6	Size of return buffer
+	;	R8	Address of RSB
+	;	R9	Address of LKB
+	;	R10	Address of size word for return data
+	; R0-R4,R7 may be destroyed
+
+RCVBLKINGREQ:
+	MOVAB	RSB$L_WTQFL(R8),R8	; Point R8 to wait queue listhead
+	JMP	G^LKI$SEARCH_BLOCKING	; Search for all blocking locks,
+					;  and return
+
+
+;************************************************************************
+;
+;		Build list of blocked locks
+;
+;************************************************************************
+
+	; Action routine to build the block transfer message
+	; Inputs are:
+	;	R2	Address of return buffer
+	;	R6	Size of return buffer
+	;	R8	Address of RSB
+	;	R9	Address of LKB
+	;	R10	Address of size word for return data
+	; R0-R4,R7 may be destroyed
+
+RCVBLKBYREQ:
+	MOVAB	RSB$L_GRQFL(R8),R8	; Point R8 to granted queue listhead
+	JMP	G^LKI$SEARCH_BLOCKEDBY	; Search for all blocked locks,
+					;  and return
+
+
+;************************************************************************
+;
+;		Build list of all locks
+;
+;************************************************************************
+
+	; Action routine to build the block transfer message
+	; Inputs are:
+	;	R2	Address of return buffer
+	;	R6	Size of return buffer
+	;	R8	Address of RSB
+	;	R7	Scratch
+	;	R9	Address of LKB
+	;	R10	Address of size word for return data
+	; R0-R4,R7 may be destroyed
+
+RCVLOCKSREQ:
+	PUSHL	R2			; Save address of return buffer
+	MOVAB	RSB$L_GRQFL(R8),R8	; Point R8 to granted queue listhead
+	MOVL	R6,R1			; Get size of buffer
+	ASSUME	RSB$L_CVTQFL EQ RSB$L_GRQFL+8
+	ASSUME	RSB$L_WTQFL EQ RSB$L_CVTQFL+8
+	MOVZBL	#3,R3			; Initialize number of queues to search
+30$:	MOVL	R8,R7			; Copy listhead address, again
+50$:	CMPL	(R7),R8			; Back at listhead again?
+	BEQL	60$			; Br if yes
+	SUBL	#LKI$C_LENGTH,R1	; Any room left in buffer?
+	BLSS	90$			; Br if not
+	MOVL	(R7),R7			; Else, move down list
+	MOVAB	-LKB$L_SQFL(R7),R7	; Point to start of LKB
+	BSBB	LOCK_INFO		; Get the lock information
+	MOVAB	LKB$L_SQFL(R7),R7	; Point back to state queue
+	BRB	50$			; Look for more
+60$:	ASSUME	RSB$L_CVTQFL EQ RSB$L_GRQFL+8
+	ASSUME	RSB$L_WTQFL EQ RSB$L_CVTQFL+8
+	ADDL	#8,R8			; Skip to next queue
+	SOBGTR	R3,30$			; Loop if more queues to search
+90$:	POPL	R2			; Restore address of return buffer
+	RSB				; Return to caller
+
+
+;+
+; Return Lock Information
+;
+;	This routine will return the following lock information:
+;
+;		LKI$_LOCKID	- the lock's lock id
+;		LKI$_PID	- the lock's PID
+;		LKI$_SYSTEM	- the resource's system id (CSID)
+;		LKI$_STATE	- the locks current state
+;		LKI$_REMLKID	- the lock's remote id
+;		LKI$_REMSYSTEM	- the lock's remote system id (CSID)
+;
+; Inputs:
+;	R2 = Output buffer address
+;	R7 = LKB address
+;	R10 = Address of size word for return data
+;
+; Outputs:
+;	None
+;
+; Side Effects:
+;	R0 is destroyed
+;	(R10) is increased by lock return size
+;-
+LOCK_INFO:
+	ADDW	#LKI$C_LENGTH,(R10)	; Tally return size
+	MOVL	LKB$L_LKID(R7),(R2)+	; Return the LOCKID
+	;
+	;  The EPID in the LKB is valid only for a master lock block.
+	;
+	MOVL	LKB$L_EPID(R7),R0	; Get the EPID
+	BBS	#LKB$V_MSTCPY,-		; Br if master copy
+		LKB$W_STATUS(R7),10$	; ...EPID is valid
+	MOVL	LKB$L_PID(R7),R0	; Else, get PID and
+	JSB	G^EXE$IPID_TO_EPID	; Convert to EPID
+10$:	MOVL	R0,(R2)+		; Return the EPID
+	MOVL	LKB$L_RSB(R7),R0	; Get RSB address
+	MOVL	RSB$L_CSID(R0),(R2)+	; Return the SYSTEM ID
+	BNEQ	30$			; Br if non-zero - okay
+	MOVL	G^CLU$GL_CLUB,R0	; Else, get CLUB address
+	BEQL	30$			; Br if no cluster
+	MOVL	CLUB$L_LOCAL_CSID(R0),-4(R2) ; Return real CSID
+30$:	ASSUME	LKB$B_GRMODE EQ LKB$B_RQMODE+1
+	MOVW	LKB$B_RQMODE(R7),(R2)+	; Copy modes
+	MOVZBW	LKB$B_STATE(R7),(R2)+	; Copy current state, zero byte
+	BGEQ	40$			; Br if state is okay
+	MOVB	#LKI$C_WAITING,-2(R2)	; Else, map waiting states to same code
+40$:	;
+	;  The remote CSID and REMLKID are only valid in master
+	;  copy lock blocks.
+	;
+	MOVL	LKB$L_REMLKID(R7),(R2)+	; Copy the REMLKID
+	MOVL	LKB$L_CSID(R7),(R2)+	; Get the remote CSID
+	BBS	#LKB$V_MSTCPY,-		; Br if master copy
+		LKB$W_STATUS(R7),90$	; ...CSID, REMLKID are valid
+	MOVL	LKB$L_LKID(R7),-8(R2)	; Else, return the LOCKID as REMLKID
+	MOVL	G^CLU$GL_CLUB,R0	; Get CLUB address
+	BEQL	70$			; Br if no cluster, zero CSID
+	MOVL	CLUB$L_LOCAL_CSID(R0),R0; Else, get real CSID
+70$:	MOVL	R0,-4(R2)		; Return real CSID
+90$:	RSB
+
+
+	.SBTTL	VERIFYREMLKID - Verify remote lock id
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine verifies a lock id sent by another system
+;	and converts it into a LKB address.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	VERIFYREMLKID
+;	IPL must be at IPL$_SYNCH
+;
+; INPUT PARAMETERS:
+;
+;	R0	Lock id on remote system
+;	R1	Lock id on this system
+;
+; OUTPUT PARAMETERS:
+;
+;	R0	Completion code
+;	R6	Address of LKB
+;
+; COMPLETION CODES:
+;
+;	SS$_NORMAL	Lock id was valid can converted to LKB address
+;	SS$_IVLOCKID	Invalid lock id
+;
+; SIDE EFFECTS:
+;
+;	None.
+;
+; NOTE:
+;
+;	This routine does two consistency checks.  The first is that
+;	it verifies the lock id is valid via the sequence number check.
+;	If the lock id fails this check, then an error is returned to
+;	the caller as this is allowed in some cases and is fatal in others.
+;	However, if the lock id passes this check, then another check
+;	is made that compares the remote lock id as sent by the remote
+;	system with the remote lock id stored here in the LKB.  If this
+;	check fails then it is immediately fatal as the first check should
+;	catch all races that cause lock ids to not match across systems.
+;	Also note that this second check is not perfect in that it should
+;	also check CSB addresses.  This is considered unnecessary as the
+;	additional protection that check offers is small.
+;--
+
+VERIFYREMLKID:
+	PUSHL	R4			; Save R4
+	MOVZWL	R1,R6			; Put lockid index in R6
+	CMPL	R6,G^LCK$GL_MAXID	; Is the lock id too big?
+	BGTRU	40$			; Yes
+	MOVL	G^LCK$GL_IDTBL,R4	; *** May combine with next instr.
+	MOVL	(R4)[R6],R6		; Get LKB address
+	BGEQ	40$			; Unallocated id
+	CMPL	R1,LKB$L_LKID(R6)	; Check sequence number
+	BNEQ	40$			; Not valid
+	CMPL	R0,LKB$L_REMLKID(R6)	; Check remote lock id
+	BNEQ	50$			; Doesn't match
+	MOVZBL	S^#SS$_NORMAL,R0	; Success
+	POPL	R4			; Restore R4
+	RSB
+
+40$:	MOVZWL	#SS$_IVLOCKID,R0	; Invalid lock id
+	POPL	R4			; Restore R4
+	RSB
+
+50$:	BUG_CHECK	INVLOCKID,FATAL; Invalid remote lockid
+
+
+
+	.END
+

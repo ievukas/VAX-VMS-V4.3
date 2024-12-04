@@ -1,0 +1,1275 @@
+MODULE ASYNCHRON(%TITLE	'Asynchronous service management'
+		IDENT = 'V04-002'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:
+!	Job controller.
+!
+! ABSTRACT:
+!	This module contains the routines that manage services that complete
+!	asynchronously to the original request.  Many such instances require
+!	communication with remote job controllers in a cluster.
+!
+! ENVIRONMENT:
+!	VAX/VMS user and kernel mode.
+!--
+!
+! AUTHOR: M. Jack, CREATION DATE: 16-Feb-1982
+!
+! MODIFIED BY:
+!
+!	V04-002	JAK0236		J A Krycka	14-Sep-1984
+!		Collect more diagnostic information.
+!
+!	V04-001	JAK0235		J A Krycka	12-Sep-1984
+!		Detect and repair a corrupted incomplete services list in
+!		SCAN_INCOMPLETE_SERVICES.
+!
+!	V03-011	JAK0224		J A Krycka	24-Aug-1984
+!		In ENTER_REMOTE_REQUEST set a flag if there is no doorbell lock
+!		defined for the remote job controller (indicating that the
+!		remote node is not in the cluster or the remote job controller
+!		does not have the queue file open).
+!
+!	V03-010	KPL0003		P Lieberwirth,  30-Jul-1984
+!		Fix ALL bugs introduced in V03-008.
+!
+!	V03-009	KPL0002		P Lieberwirth,	30-Jul-1984
+!		Sigh, fix bug in V03-008.  When rewriting predecessor,
+!		do not update predecessor pointer to be the deallocated
+!		record.  (That took someone with the brain of a turnip.)
+!
+!	V03-008	KPL0001		P Lieberwirth,	19-Jul-1984
+!		Rewrite predecessor before deallocating SRQ in routine
+!		SCAN_INCOMPLETE_SERVICES.  This avoids corrupting the
+!		incomplete service list at the possible cost of losing
+!		a deallocated record and extra IOs.
+!
+!	V03-007	JAK0213		J A Krycka	18-May-1984
+!		Continuation of V03-006. Use newly created LCK$M_NODLCKBLK
+!		(no deadlock on blocking AST) option on enqueue instead.
+!
+!	V03-006	JAK0208		J A Krycka	08-May-1984
+!		Use LCK$M_NODLCKWT (no deadlock wait) option on enqueue service
+!		for the remote doorbell lock to avoid having the lock manager
+!		declare a deadlock situation.
+!
+!	V03-005	GRR0001		Gregory R. Robert	09-Sep-1983
+!		Supply missing dot in call to delete_files.
+!
+!	V03-004	MLJ0115		Martin L. Jack,	30-Jul-1983
+!		Changes for job controller baselevel.
+!
+!	V03-003	MLJ0114		Martin L. Jack,	23-Jun-1983
+!		Changes for job controller baselevel.
+!
+!	V03-002	MLJ0113		Martin L. Jack,	26-May-1983
+!		Changes for job controller baselevel.
+!
+!	V03-001	MLJ0112		Martin L. Jack,	29-Apr-1983
+!		Changes for job controller baselevel.
+!
+!**
+
+REQUIRE 'SRC$:JOBCTLDEF';
+
+
+FORWARD ROUTINE
+	CREATE_SRQ_RECORD,
+	PROCESS_REMOTE_SERVICES:	L_OUTPUT_1,
+	SCAN_INCOMPLETE_SERVICES:	NOVALUE,
+	REMOTE_BLOCKING_AST:		NOVALUE,
+	REMOTE_COMPLETION_NONAST:	NOVALUE,
+	REMOTE_COMPLETION_AST:		NOVALUE,
+	ENTER_REMOTE_REQUEST:		NOVALUE,
+	ENTER_REMOTE_REQUEST_AST:	NOVALUE,
+	QUEUE_MASTER_AST:		NOVALUE;
+
+
+EXTERNAL ROUTINE
+	ABORT_EXECUTION,
+	AFTER_AST:			NOVALUE,
+	ALLOCATE_MEMORY,
+	ALLOCATE_RECORD:		L_OUTPUT_2,
+	BROADCAST_MESSAGE:		NOVALUE,
+	COMPLETE_JOB:			NOVALUE,
+	CREATE_SRB:			NOVALUE,
+	DEALLOCATE_MEMORY:		NOVALUE,
+	DEALLOCATE_RECORD:		NOVALUE,
+	DELETE_FILES:			NOVALUE,
+	FIND_PENDING_JOBS:		NOVALUE,
+	FLUSH_RECORD:			NOVALUE,
+	LOCK_QUEUE_FILE:		NOVALUE,
+	PAUSE_EXECUTION,
+	READ_RECORD,
+	RELEASE_RECORD:			NOVALUE,
+	RESET_EXECUTOR_QUEUE:		NOVALUE,
+	RESUME_EXECUTION,
+	REWRITE_RECORD:			NOVALUE,
+	SCHEDULE_NONAST:		NOVALUE,
+	SEND_SERVICE_RESPONSE_MESSAGE:	NOVALUE,
+	START_EXECUTION,
+	START_SYMBIONT_STREAM,
+	STOP_SYMBIONT_STREAM,
+	UNLOCK_QUEUE_FILE:		NOVALUE,
+	UPDATE_GETQUI_DATA:		NOVALUE;
+
+
+LITERAL
+	K_COMPLETE=	0,		! Complete request with status
+	K_DEALLOCATE=	1,		! Deallocate request
+	K_RELEASE=	2,		! Leave request in queue
+	K_REWRITE=	3;		! Leave request in queue and rewrite
+
+
+BUILTIN
+	TESTBITSC,
+	TESTBITSS;
+
+GLOBAL ROUTINE CREATE_SRQ_RECORD(FUNC,P1,P2,P3,P4,P5,P6,P7)=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine allocates, initializes, and enqueues an incomplete service
+!	record.
+!
+! INPUT PARAMETERS:
+!	FUNC		- Function code.
+!	P1-P7		- Function-specific parameters.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	Completion status.
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	SQH:		REF BBLOCK,	! Pointer to SQH
+	SRQ_N,				! Record number of SRQ record
+	SRQ:		REF BBLOCK,	! Pointer to SRQ record
+	STATUS;				! Status return
+
+
+! Allocate the queue record, and return if no more.
+!
+STATUS = ALLOCATE_RECORD( ; SRQ_N, SRQ);
+IF NOT .STATUS THEN RETURN .STATUS;
+
+
+! Initialize the incomplete service record.
+!
+SRQ[SYM$B_TYPE] = SYM$K_SRQ;
+SRQ[SRQ$L_FUNCTION_CODE] = .FUNC;
+COPY_SYSID(THIS_SYSID, SRQ[SRQ$T_SENDING_SYSID]);
+
+
+CASE .FUNC FROM SRQ$K_START_JOB TO SRQ$K_START_SYMBIONT OF
+    SET
+
+
+    [INRANGE, OUTRANGE]:
+	0;
+
+
+    [SRQ$K_START_JOB]:
+	BEGIN
+	BIND
+	    SMQ_N	= P1,			! Record number of SMQ
+	    SMQ		= P2:	REF BBLOCK,	! Pointer to SMQ
+	    SJH_N	= P3,			! Record number of SJH
+	    SJH		= P4:	REF BBLOCK;	! Pointer to SJH
+
+	SRQ[SRQ$V_NO_RESPONSE] = TRUE;
+	SJH[SJH$V_STARTING] = TRUE;
+	COPY_SYSID(SMQ[SMQ$T_SYSID], SRQ[SRQ$T_RECEIVING_SYSID]);
+	SRQ[SRQ$L_P1] = .SMQ_N;
+	SRQ[SRQ$L_P2] = .SJH_N;
+	END;
+
+
+    [SRQ$K_ABORT_JOB]:
+	BEGIN
+	BIND
+	    SMQ_N	= P1,			! Record number of SMQ
+	    SMQ		= P2:	REF BBLOCK,	! Pointer to SMQ
+	    SJH_N	= P3,			! Record number of SJH
+	    SJH		= P4:	REF BBLOCK;	! Pointer to SJH
+
+	SJH[SJH$V_ABORTING] = TRUE;
+	COPY_SYSID(SMQ[SMQ$T_SYSID], SRQ[SRQ$T_RECEIVING_SYSID]);
+	SRQ[SRQ$L_P1] = .SMQ_N;
+	SRQ[SRQ$L_P2] = .SJH_N;
+	END;
+
+
+    [SRQ$K_SYNCHRONIZE_JOB]:
+	BEGIN
+	BIND
+	    SJH_N	= P1,			! Record number of SJH
+	    SJH		= P2:	REF BBLOCK;	! Pointer to SJH
+
+	SJH[SJH$V_SYNCHRONIZE] = TRUE;
+	SRQ[SRQ$V_STALLED] = TRUE;
+	COPY_SYSID(THIS_SYSID, SRQ[SRQ$T_RECEIVING_SYSID]);
+	SRQ[SRQ$L_P1] = .SJH_N;
+	END;
+
+
+    [SRQ$K_START_QUEUE]:
+	BEGIN
+	BIND
+	    SMQ_N	= P1,			! Record number of SMQ
+	    SMQ		= P2:	REF BBLOCK;	! Pointer to SMQ
+
+	SMQ[SMQ$V_STARTING] = TRUE;
+	SMQ[SMQ$V_STOPPED] = SMQ[SMQ$V_PAUSED] = FALSE;
+	COPY_SYSID(SMQ[SMQ$T_SYSID], SRQ[SRQ$T_RECEIVING_SYSID]);
+	SRQ[SRQ$L_P1] = .SMQ_N;
+	END;
+
+
+    [SRQ$K_STOP_QUEUE]:
+	BEGIN
+	BIND
+	    SMQ_N	= P1,			! Record number of SMQ
+	    SMQ		= P2:	REF BBLOCK;	! Pointer to SMQ
+
+	SMQ[SMQ$V_STOPPING] = TRUE;
+	COPY_SYSID(SMQ[SMQ$T_SYSID], SRQ[SRQ$T_RECEIVING_SYSID]);
+	SRQ[SRQ$L_P1] = .SMQ_N;
+	END;
+
+
+    [SRQ$K_PAUSE_QUEUE]:
+	BEGIN
+	BIND
+	    SMQ_N	= P1,			! Record number of SMQ
+	    SMQ		= P2:	REF BBLOCK;	! Pointer to SMQ
+
+	SMQ[SMQ$V_PAUSING] = TRUE;
+	COPY_SYSID(SMQ[SMQ$T_SYSID], SRQ[SRQ$T_RECEIVING_SYSID]);
+	SRQ[SRQ$L_P1] = .SMQ_N;
+	END;
+
+
+    [SRQ$K_RESUME_QUEUE]:
+	BEGIN
+	BIND
+	    SMQ_N	= P1,			! Record number of SMQ
+	    SMQ		= P2:	REF BBLOCK,	! Pointer to SMQ
+	    FLAGS	= P3:	BBLOCK,		! Resume control flags
+	    ALIGNMENT	= P4,			! Alignment pages
+	    RELATIVE	= P5,			! Relative page offset
+	    SEARCH_LEN	= P6,			! Search string length
+	    SEARCH_ADDR	= P7;			! Search string address
+
+	SMQ[SMQ$V_RESUMING] = TRUE;
+	COPY_SYSID(SMQ[SMQ$T_SYSID], SRQ[SRQ$T_RECEIVING_SYSID]);
+	SRQ[SRQ$L_P1] = .SMQ_N;
+	SRQ[SRQ$L_P2] = .FLAGS;
+	SRQ[SRQ$L_P3] = .ALIGNMENT;
+	SRQ[SRQ$L_P4] = .RELATIVE;
+	CH$WCHAR(.SEARCH_LEN, SRQ[SRQ$T_P5]);
+	CH$MOVE(.SEARCH_LEN, .SEARCH_ADDR, SRQ[SRQ$T_P5]+1);
+	END;
+
+
+    [SRQ$K_RESET_QUEUE]:
+	BEGIN
+	BIND
+	    SMQ_N	= P1,			! Record number of SMQ
+	    SMQ		= P2:	REF BBLOCK;	! Pointer to SMQ
+
+	SMQ[SMQ$V_RESETTING] = TRUE;
+	COPY_SYSID(SMQ[SMQ$T_SYSID], SRQ[SRQ$T_RECEIVING_SYSID]);
+	SRQ[SRQ$L_P1] = .SMQ_N;
+	END;
+
+
+    [SRQ$K_BROADCAST_MESSAGE]:
+	BEGIN
+	BIND
+	    SYSID	= P1,
+	    USERNAME	= P2:	REF VECTOR[,BYTE],
+	    LENGTH	= P3,
+	    ADDRESS	= P4;
+
+	SRQ[SRQ$V_NO_RESPONSE] = TRUE;
+	COPY_SYSID(.SYSID, SRQ[SRQ$T_RECEIVING_SYSID]);
+	CH$MOVE(SRQ$S_BRDCST_USERNAME, .USERNAME, SRQ[SRQ$T_BRDCST_USERNAME]);
+	SRQ[SRQ$W_BRDCST_LENGTH] = .LENGTH;
+	CH$MOVE(.LENGTH, .ADDRESS, SRQ[SRQ$T_BRDCST_TEXT]);
+	END;
+
+
+    [SRQ$K_DELETE_FILES]:
+	BEGIN
+	BIND
+	    SJH		= P1:	REF BBLOCK,	! Pointer to SJH
+	    SQR_N	= P2;			! Record number of SQR
+
+	SRQ[SRQ$V_NO_RESPONSE] = TRUE;
+	COPY_SYSID(SJH[SJH$T_SYSID], SRQ[SRQ$T_RECEIVING_SYSID]);
+	SRQ[SRQ$L_P1] = .SQR_N;
+	END;
+
+
+    [SRQ$K_START_SYMBIONT]:
+	BEGIN
+	BIND
+	    SMQ_N	= P1,			! Record number of SMQ
+	    SMQ		= P2:	REF BBLOCK;	! Pointer to SMQ
+
+	SRQ[SRQ$V_STALLED] = TRUE;
+	COPY_SYSID(SMQ[SMQ$T_SYSID], SRQ[SRQ$T_RECEIVING_SYSID]);
+	SRQ[SRQ$L_P1] = .SMQ_N;
+	END;
+
+
+    TES;
+
+
+IF NOT .SRQ[SRQ$V_NO_RESPONSE]
+THEN
+    CREATE_SRB(SRQ[SRQ$T_SRB]);
+
+
+! If services of another job controller are required, signal it.
+!
+IF SYSID_NEQ(THIS_SYSID, SRQ[SRQ$T_RECEIVING_SYSID])
+AND NOT .SRQ[SRQ$V_STALLED]
+THEN
+    ENTER_REMOTE_REQUEST(SRQ[SRQ$T_RECEIVING_SYSID]);
+
+
+! Enqueue the record to the incomplete service list.
+!
+SQH = READ_RECORD(SQH$K_RECNO);
+SRQ[SYM$L_LINK] = .SQH[SQH$L_INCOMPLETE_SERVICE_LIST];
+SQH[SQH$L_INCOMPLETE_SERVICE_LIST] = .SRQ_N;
+REWRITE_RECORD(.SRQ_N);
+REWRITE_RECORD(SQH$K_RECNO);
+
+
+! Return 0 to indicate that the service is incomplete.
+!
+0
+END;
+
+ROUTINE PROCESS_REMOTE_SERVICES(SRQ;NEXT_ACTION): L_OUTPUT_1=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine processes a remote service directed to this node.
+!
+! INPUT PARAMETERS:
+!	SRQ		- Pointer to SRQ.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NEXT_ACTION	- Code identifying the next action.
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	Completion status.
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+MAP
+	SRQ:		REF BBLOCK;	! Pointer to SRQ
+LOCAL
+	STATUS;				! Status of the request
+
+
+STATUS = SS$_NORMAL;
+
+
+CASE .SRQ[SRQ$L_FUNCTION_CODE] FROM SRQ$K_START_JOB TO SRQ$K_DELETE_FILES OF
+    SET
+
+
+    [INRANGE, OUTRANGE]:
+	NEXT_ACTION = K_COMPLETE;
+
+
+    [SRQ$K_START_JOB]:
+	BEGIN
+	LOCAL
+	    SMQ_N,			! Record number of SMQ
+	    SMQ:	REF BBLOCK,	! Pointer to SMQ
+	    SJH_NP,			! Record number of predecessor of SJH
+	    SJH_P:	REF BBLOCK,	! Predecessor of SJH
+	    SJH_N,			! Record number of SJH
+	    SJH:	REF BBLOCK;	! Pointer to SJH
+
+
+	SMQ = READ_RECORD(SMQ_N = SJH_NP = .SRQ[SRQ$L_P1]);
+	SJH_N = .SMQ[SMQ$L_CURRENT_LIST];
+	WHILE .SJH_N NEQ 0 DO
+	    BEGIN
+	    SJH = READ_RECORD(.SJH_N);
+	    IF .SJH_N EQL .SRQ[SRQ$L_P2]
+	    THEN
+		BEGIN
+		SJH[SJH$V_STARTING] = FALSE;
+		STATUS = START_EXECUTION(
+		    .SMQ_N, .SMQ,
+		    .SJH_N, .SJH);
+		IF NOT .STATUS
+		THEN
+		    BEGIN
+		    UPDATE_GETQUI_DATA(.SJH_N, .SJH);
+		    SMQ[SMQ$B_CURRENT_JOB_COUNT] = .SMQ[SMQ$B_CURRENT_JOB_COUNT] - 1;
+		    IF .SJH_NP EQL .SMQ_N
+		    THEN
+			BEGIN
+			SMQ[SMQ$L_CURRENT_LIST] = .SJH[SYM$L_LINK];
+			IF .SJH[SYM$L_LINK] EQL 0 THEN SMQ[SMQ$L_CURRENT_LIST_END] = 0;
+			END
+		    ELSE
+			BEGIN
+			SJH_P[SYM$L_LINK] = .SJH[SYM$L_LINK];
+			IF .SJH[SYM$L_LINK] EQL 0 THEN SMQ[SMQ$L_CURRENT_LIST_END] = .SJH_NP;
+			REWRITE_RECORD(.SJH_NP);
+			END;
+		    SJH[SJH$L_CONDITION_1] = .STATUS;
+		    COMPLETE_JOB(.SJH_N, .SJH, .SMQ, 0);
+		    FIND_PENDING_JOBS(.SMQ_N, .SMQ);
+		    END
+		ELSE
+		    REWRITE_RECORD(.SJH_N);
+
+		REWRITE_RECORD(.SMQ_N);
+		EXITLOOP;
+		END;
+	    IF .SJH_NP NEQ .SMQ_N THEN RELEASE_RECORD(.SJH_NP);
+	    SJH_NP = .SJH_N;
+	    SJH_P = .SJH;
+	    SJH_N = .SJH[SYM$L_LINK];
+	    END;
+	NEXT_ACTION = K_DEALLOCATE;
+	END;
+
+
+    [SRQ$K_ABORT_JOB]:
+	BEGIN
+	LOCAL
+	    SMQ_N,			! Record number of SMQ
+	    SMQ:	REF BBLOCK,	! Pointer to SMQ
+	    SJH_N,			! Record number of SJH
+	    SJH_NS,			! Successor of SJH
+	    SJH:	REF BBLOCK;	! Pointer to SJH
+
+
+	SMQ = READ_RECORD(SMQ_N = .SRQ[SRQ$L_P1]);
+	SJH_N = .SMQ[SMQ$L_CURRENT_LIST];
+	WHILE .SJH_N NEQ 0 DO
+	    BEGIN
+	    SJH = READ_RECORD(.SJH_N);
+	    IF .SJH_N EQL .SRQ[SRQ$L_P2]
+	    THEN
+		BEGIN
+		SJH[SJH$V_ABORTING] = FALSE;
+		STATUS = ABORT_EXECUTION(
+		    .SMQ_N, .SMQ,
+		    .SJH_N, .SJH);
+		REWRITE_RECORD(.SJH_N);
+		EXITLOOP;
+		END;
+	    SJH_NS = .SJH[SYM$L_LINK];
+	    RELEASE_RECORD(.SJH_N);
+	    SJH_N = .SJH_NS;
+	    END;
+	NEXT_ACTION = K_COMPLETE;
+	END;
+
+
+    [SRQ$K_START_QUEUE]:
+	BEGIN
+	LOCAL
+	    SMQ_N,				! Record number of SMQ
+	    SMQ:		REF BBLOCK;	! Pointer to SMQ
+
+
+	SMQ = READ_RECORD(SMQ_N = .SRQ[SRQ$L_P1]);
+	STATUS = START_SYMBIONT_STREAM(.SMQ_N, .SMQ);
+	IF NOT .STATUS
+	THEN
+	    BEGIN
+	    SMQ[SMQ$V_STARTING] = FALSE;
+	    SMQ[SMQ$V_STOPPED] = TRUE;
+	    NEXT_ACTION = K_COMPLETE;
+	    END
+	ELSE
+	    BEGIN
+	    SRQ[SRQ$L_FUNCTION_CODE] = SRQ$K_START_SYMBIONT;
+	    SRQ[SRQ$V_STALLED] = TRUE;
+	    NEXT_ACTION = K_REWRITE;
+	    END;
+	REWRITE_RECORD(.SMQ_N);
+	END;
+
+
+    [SRQ$K_STOP_QUEUE]:
+	BEGIN
+	LOCAL
+	    SMQ_N,				! Record number of SMQ
+	    SMQ:		REF BBLOCK;	! Pointer to SMQ
+
+
+	SMQ = READ_RECORD(SMQ_N = .SRQ[SRQ$L_P1]);
+	SMQ[SMQ$V_STOPPING] = FALSE;
+	STOP_SYMBIONT_STREAM(.SMQ_N, .SMQ);
+	REWRITE_RECORD(.SMQ_N);
+	NEXT_ACTION = K_COMPLETE;
+	END;
+
+
+    [SRQ$K_PAUSE_QUEUE]:
+	BEGIN
+	LOCAL
+	    SMQ_N,				! Record number of SMQ
+	    SMQ:		REF BBLOCK;	! Pointer to SMQ
+
+
+	SMQ = READ_RECORD(SMQ_N = .SRQ[SRQ$L_P1]);
+	SMQ[SMQ$V_PAUSING] = FALSE;
+	STATUS = PAUSE_EXECUTION(.SMQ_N, .SMQ);
+	IF NOT .STATUS THEN FIND_PENDING_JOBS(.SMQ_N, .SMQ);
+	REWRITE_RECORD(.SMQ_N);
+	NEXT_ACTION = K_COMPLETE;
+	END;
+
+
+    [SRQ$K_RESUME_QUEUE]:
+	BEGIN
+	LOCAL
+	    SMQ_N,				! Record number of SMQ
+	    SMQ:		REF BBLOCK;	! Pointer to SMQ
+
+
+	SMQ = READ_RECORD(SMQ_N = .SRQ[SRQ$L_P1]);
+	SMQ[SMQ$V_RESUMING] = FALSE;
+	STATUS = RESUME_EXECUTION(
+	    .SMQ_N, .SMQ,
+	    .SRQ[SRQ$L_P2], .SRQ[SRQ$L_P3], .SRQ[SRQ$L_P4],
+	    CH$RCHAR(SRQ[SRQ$T_P5]), SRQ[SRQ$T_P5]+1);
+	FIND_PENDING_JOBS(.SMQ_N, .SMQ);
+	REWRITE_RECORD(.SMQ_N);
+	NEXT_ACTION = K_COMPLETE;
+	END;
+
+
+    [SRQ$K_RESET_QUEUE]:
+	BEGIN
+	LOCAL
+	    SMQ_N,				! Record number of SMQ
+	    SMQ:		REF BBLOCK;	! Pointer to SMQ
+
+
+	SMQ[SMQ$V_RESETTING] = FALSE;
+	SMQ = READ_RECORD(SMQ_N = .SRQ[SRQ$L_P1]);
+	RESET_EXECUTOR_QUEUE(.SMQ_N, .SMQ);
+	REWRITE_RECORD(.SMQ_N);
+	NEXT_ACTION = K_COMPLETE;
+	END;
+
+
+    [SRQ$K_BROADCAST_MESSAGE]:
+	BEGIN
+	BROADCAST_MESSAGE(
+	    THIS_SYSID,
+	    SRQ[SRQ$T_BRDCST_USERNAME],
+	    .SRQ[SRQ$W_BRDCST_LENGTH],
+	    SRQ[SRQ$T_BRDCST_TEXT]);
+	NEXT_ACTION = K_DEALLOCATE;
+	END;
+
+
+    [SRQ$K_RESPONSE]:
+	BEGIN
+	SEND_SERVICE_RESPONSE_MESSAGE(
+	    SRQ[SRQ$T_SRB],
+	    .SRQ[SRQ$L_P1]);
+	NEXT_ACTION = K_DEALLOCATE;
+	END;
+
+
+    [SRQ$K_DELETE_FILES]:
+	BEGIN
+	DELETE_FILES(.SRQ[SRQ$L_P1]);
+	NEXT_ACTION = K_DEALLOCATE;
+	END;
+
+
+    TES;
+
+
+.STATUS
+END;
+
+GLOBAL ROUTINE SCAN_INCOMPLETE_SERVICES(EVENT,P1,P2,P3,P4): NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine scans the incomplete services list when a specified event
+!	that allows an incomplete service to progress has occurred.
+!
+! INPUT PARAMETERS:
+!	EVENT		- Code identifying the event.
+!	P1-P4		- Event-dependent parameters.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	PRED_MODIFIED,			! True if predecessor modified
+	SRQ_NP,				! Record number of predecessor of SRQ
+	SRQ_P:		REF BBLOCK,	! Pointer to predecessor of SRQ
+	SRQ_N;				! Record number of SRQ
+
+
+! Search the incomplete service list for those that are affected by the
+! specified event and process these.
+!
+PRED_MODIFIED = FALSE;
+SRQ_P = READ_RECORD(SRQ_NP = SQH$K_RECNO);
+SRQ_N = .SRQ_P[SQH$L_INCOMPLETE_SERVICE_LIST];
+WHILE .SRQ_N NEQ 0 DO
+    BEGIN
+    LOCAL
+	SRQ:		REF BBLOCK,	! Pointer to SRQ
+	SRQ_NS,				! Record number of successor of SRQ
+	STATUS,				! Request status
+	NEXT_ACTION;			! Code for next action
+
+
+    SRQ = READ_RECORD(.SRQ_N);
+    SRQ_NS = .SRQ[SYM$L_LINK];
+
+
+    ! Check for corrupted incomplete services list. If an incorrect record type
+    ! is found, truncate the list. The remaining records are either already
+    ! linked to another list, or they will be lost until a cold start operation
+    ! is performed. Pruning these unwanted records (most likely free list or
+    ! job header records) from the incomplete services list will prevent
+    ! reading them every time SCAN_INCOMPLETE_SERVICES is called.
+    !
+    IF .SRQ[SYM$B_TYPE] NEQ SYM$K_SRQ
+    THEN
+	BEGIN
+	DIAG_TRACE[12] = .DIAG_TRACE[12] + 1;
+	DIAG_TRACE[13] = .SRQ[SYM$B_TYPE] * 65536 + .SRQ_N;
+	IF .FLAGS[FLAGS_V_LOG_QF_REPAIR]
+	    THEN SIGNAL(JBC$_DIAGNOSTIC OR STS$K_INFO, 1,
+		$DESCRIPTOR('on-line repair of incomplete services list') );
+	IF .SRQ_NP EQL SQH$K_RECNO
+	    THEN SRQ_P[SQH$L_INCOMPLETE_SERVICE_LIST] = 0
+	    ELSE SRQ_P[SYM$L_LINK] = 0;
+	PRED_MODIFIED = TRUE;
+	EXITLOOP;
+	END;
+
+
+    STATUS = SS$_NORMAL;
+    NEXT_ACTION = K_RELEASE;
+
+
+    CASE .EVENT FROM ISRV_K_REMOTE TO ISRV_K_PURGE_SJH OF
+	SET
+
+
+	[ISRV_K_REMOTE]:
+	    BEGIN
+	    IF SYSID_EQL(THIS_SYSID, SRQ[SRQ$T_RECEIVING_SYSID])
+	    AND NOT .SRQ[SRQ$V_STALLED]
+	    THEN
+		STATUS = PROCESS_REMOTE_SERVICES(.SRQ; NEXT_ACTION);
+	    END;
+
+
+	[ISRV_K_SYNCHRONIZE]:
+	    BEGIN
+	    BIND
+		SJH_N		= P1,			! Record number of SJH
+		STS		= P2;			! Completion status
+
+	    IF .SRQ[SRQ$L_FUNCTION_CODE] EQL SRQ$K_SYNCHRONIZE_JOB
+	    AND .SRQ[SRQ$L_P1] EQL .SJH_N
+	    THEN
+		BEGIN
+		NEXT_ACTION = K_COMPLETE;
+		STATUS = .STS;
+		END;
+	    END;
+
+
+	[ISRV_K_SYMBIONT]:
+	    BEGIN
+	    BIND
+		SMQ_N		= P1,			! Record number of SMQ
+		SMQ		= P2,			! Pointer to SMQ
+		FUNC		= P3,			! Function completed
+		STS		= P4;			! Completion status
+
+	    IF .SRQ[SRQ$L_FUNCTION_CODE] EQL SRQ$K_START_SYMBIONT
+	    AND .SRQ[SRQ$L_P1] EQL .SMQ_N
+	    AND (.FUNC EQL 0 OR .FUNC EQL .SRQ[SRQ$L_FUNCTION_CODE])
+	    THEN
+		BEGIN
+		NEXT_ACTION = K_COMPLETE;
+		STATUS = .STS;
+		END;
+	    END;
+
+
+	[ISRV_K_PURGE_SYSID]:
+	    BEGIN
+	    BIND
+		SYSID		= P1;			! Pointer to system ID
+
+	    IF SYSID_EQL(.SYSID, SRQ[SRQ$T_SENDING_SYSID])
+	    THEN
+		NEXT_ACTION = K_DEALLOCATE
+
+	    ELSE IF SYSID_EQL(.SYSID, SRQ[SRQ$T_RECEIVING_SYSID])
+	    THEN
+		BEGIN
+		STATUS = JBC$_SYSFAIL OR STS$K_ERROR;
+		NEXT_ACTION = K_COMPLETE;
+		END;
+	    END;
+
+
+	[ISRV_K_PURGE_SMQ]:
+	    BEGIN
+	    BIND
+		SMQ_N		= P1;			! Record number of SMQ
+
+	    IF
+		ONEOF_(.SRQ[SRQ$L_FUNCTION_CODE], BMSK_(
+		    SRQ$K_START_QUEUE,
+		    SRQ$K_STOP_QUEUE,
+		    SRQ$K_PAUSE_QUEUE,
+		    SRQ$K_RESUME_QUEUE,
+		    SRQ$K_RESET_QUEUE,
+		    SRQ$K_START_SYMBIONT))
+		AND .SRQ[SRQ$L_P1] EQL .SMQ_N
+	    THEN
+		NEXT_ACTION = K_COMPLETE;
+	    END;
+
+
+	[ISRV_K_PURGE_SJH]:
+	    BEGIN
+	    BIND
+		SJH_N		= P1;			! Record number of SJH
+
+	    IF
+		ONEOF_(.SRQ[SRQ$L_FUNCTION_CODE], BMSK_(
+		    SRQ$K_START_JOB,
+		    SRQ$K_ABORT_JOB))
+		AND .SRQ[SRQ$L_P2] EQL .SJH_N
+	    THEN
+		NEXT_ACTION = K_COMPLETE;
+	    END;
+
+
+	TES;
+
+
+    IF .NEXT_ACTION EQL K_COMPLETE
+    THEN
+	BEGIN
+
+	! If no response is required, merely deallocate the SRQ.
+	!
+	IF .SRQ[SRQ$V_NO_RESPONSE]
+	THEN
+	    NEXT_ACTION = K_DEALLOCATE
+
+
+	! If the response can be sent locally, send it and deallocate the SRQ.
+	!
+	ELSE IF SYSID_EQL(THIS_SYSID, SRQ[SRQ$T_SENDING_SYSID])
+	THEN
+	    BEGIN
+	    SEND_SERVICE_RESPONSE_MESSAGE(SRQ[SRQ$T_SRB], .STATUS);
+	    NEXT_ACTION = K_DEALLOCATE;
+	    END
+
+
+	! Otherwise, convert the SRQ to a "response" request and forward it
+	! to the sending job controller.
+	!
+	ELSE
+	    BEGIN
+	    COPY_SYSID(SRQ[SRQ$T_SENDING_SYSID], SRQ[SRQ$T_RECEIVING_SYSID]);
+	    COPY_SYSID(THIS_SYSID, SRQ[SRQ$T_SENDING_SYSID]);
+	    SRQ[SRQ$L_FUNCTION_CODE] = SRQ$K_RESPONSE;
+	    SRQ[SRQ$L_P1] = .STATUS;
+	    SRQ[SRQ$V_STALLED] = FALSE;
+	    ENTER_REMOTE_REQUEST(SRQ[SRQ$T_RECEIVING_SYSID]);
+	    NEXT_ACTION = K_REWRITE;
+	    END;
+	END;
+
+
+    CASE .NEXT_ACTION FROM K_DEALLOCATE TO K_REWRITE OF
+	SET
+
+
+	[K_DEALLOCATE]:
+	    BEGIN
+	    IF .SRQ_NP EQL SQH$K_RECNO
+		THEN SRQ_P[SQH$L_INCOMPLETE_SERVICE_LIST] = .SRQ_NS
+		ELSE SRQ_P[SYM$L_LINK] = .SRQ_NS;
+
+	    ! First, rewrite the predecessor, then deallocate the SRQ.
+	    ! If done in the opposite order, a crash after the deallocate
+	    ! can result in a corrupted INCOMPLETE_SERVICE_LIST, which
+	    ! will then result in a queue format error on warm/cold start.
+	    !
+	    FLUSH_RECORD(.SRQ_NP);
+	    DEALLOCATE_RECORD(.SRQ_N);
+	    END;
+
+
+	[K_RELEASE]:
+	    BEGIN
+	    IF TESTBITSC(PRED_MODIFIED)
+		THEN REWRITE_RECORD(.SRQ_NP)
+		ELSE RELEASE_RECORD(.SRQ_NP);
+	    SRQ_NP = .SRQ_N;
+	    SRQ_P = .SRQ;
+	    END;
+
+
+	[K_REWRITE]:
+	    BEGIN
+	    IF TESTBITSS(PRED_MODIFIED)
+		THEN REWRITE_RECORD(.SRQ_NP)
+		ELSE RELEASE_RECORD(.SRQ_NP);
+	    SRQ_NP = .SRQ_N;
+	    SRQ_P = .SRQ;
+	    END;
+
+
+	TES;
+
+
+    SRQ_N = .SRQ_NS;
+    END;
+
+
+IF .PRED_MODIFIED
+    THEN REWRITE_RECORD(.SRQ_NP)
+    ELSE RELEASE_RECORD(.SRQ_NP);
+END;
+
+GLOBAL ROUTINE REMOTE_BLOCKING_AST: NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine is the blocking AST routine for the job controller remote
+!	request lock.  This routine is entered when another job controller
+!	attempts to obtain this job controller's remote request lock.
+!
+! INPUT PARAMETERS:
+!	Standard AST routine parameters (not used).
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	STATUS_1,			! Status return
+	STATUS_2;			! Status return
+
+
+! Convert the lock to null mode to allow the process that has requested the
+! lock to obtain it.
+!
+STATUS_1 = $ENQW(
+    EFN=JBC$K_SYNC_EFN,
+    LKMODE=LCK$K_NLMODE,
+    LKSB=REMOTE_REQUEST_LKSB,
+    FLAGS=LCK$M_CONVERT);
+IF .STATUS_1 THEN STATUS_1 = .REMOTE_REQUEST_LKSB[0];
+IF NOT .STATUS_1
+THEN
+    SIGNAL(JBC$_COMREMJBC OR STS$K_ERROR, 0, .STATUS_1);
+
+
+! Reconvert the lock to exclusive mode to reenable the blocking AST.
+!
+STATUS_2 = $ENQ(
+    LKMODE=LCK$K_EXMODE,
+    LKSB=REMOTE_REQUEST_LKSB,
+    FLAGS=LCK$M_CONVERT OR LCK$M_NODLCKBLK,
+    ASTADR=REMOTE_COMPLETION_AST,
+    BLKAST=REMOTE_BLOCKING_AST);
+IF NOT .STATUS_2
+THEN
+    SIGNAL(JBC$_COMREMJBC OR STS$K_ERROR, 0, .STATUS_2);
+END;
+
+ROUTINE REMOTE_COMPLETION_NONAST: NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine is scheduled to execute by the completion AST routine for
+!	reconversion of the job controller remote request lock to exclusive
+!	mode, which is entered when another job controller has obtained and
+!	released this job controller's remote request lock.
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+! Get the current time.
+!
+$GETTIM(TIMADR=CUR_TIME);
+
+
+IF .QUEUE_FAB[FAB$W_IFI] NEQ 0
+THEN
+    BEGIN
+
+    ! Lock the queue file.
+    !
+    LOCK_QUEUE_FILE();
+
+
+    ! Search the incomplete services list to perform actions requested by the
+    ! remote job controller.
+    !
+    SCAN_INCOMPLETE_SERVICES(ISRV_K_REMOTE);
+
+
+    ! Unlock the queue file.
+    !
+    UNLOCK_QUEUE_FILE();
+    END;
+END;
+
+ROUTINE REMOTE_COMPLETION_AST: NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine is the completion AST routine for reconversion of the job
+!	controller remote request lock to exclusive mode.  This routine is
+!	entered when another job controller has obtained and released this job
+!	controller's remote request lock.
+!
+! INPUT PARAMETERS:
+!	Standard AST routine parameters (not used).
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+! Check status of the $ENQ.
+!
+IF NOT .REMOTE_REQUEST_LKSB[0]
+THEN
+    SIGNAL(JBC$_COMREMJBC OR STS$K_ERROR, 0, .REMOTE_REQUEST_LKSB[0]);
+
+
+! Schedule the companion routine to execute.
+!
+SCHEDULE_NONAST(REMOTE_COMPLETION_NONAST);
+END;
+
+ROUTINE ENTER_REMOTE_REQUEST(SYSID): NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine requests services of another job controller.
+!
+! INPUT PARAMETERS:
+!	SYSID		- Address of the system ID of the target.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+MAP
+	SYSID:		REF BBLOCK;	! Pointer to system ID
+LOCAL
+	LKSB:		REF BBLOCK,	! Pointer to LKSB from dynamic memory
+	RESNAM_DESC:	VECTOR[2],	! Descriptor for resource name
+	RESNAM:		BBLOCK[10],	! Buffer for resource name
+	STATUS;				! Status return
+
+
+! Allocate and initialize the LKSB.
+!
+LKSB = ALLOCATE_MEMORY();
+
+
+! Initialize the resource name.
+!
+RESNAM[0,0,32,0] = 'JBC$';
+COPY_SYSID(.SYSID, RESNAM[4,0,0,0]);
+RESNAM_DESC[0] = %ALLOCATION(RESNAM);
+RESNAM_DESC[1] = RESNAM;
+
+
+! Enqueue for the doorbell lock of the remote system.
+!
+STATUS = $ENQ(
+    LKMODE=LCK$K_EXMODE,
+    LKSB=.LKSB,
+    RESNAM=RESNAM_DESC,
+    FLAGS=LCK$M_SYNCSTS OR LCK$M_NODLCKWT,
+    ASTADR=ENTER_REMOTE_REQUEST_AST,
+    ASTPRM=.LKSB);
+
+
+! Set flag is there is no doorbell lock defined for the remote job controller.
+! This indicates that either the remote node is not available (or not in the
+! cluster) or the remote job controller does not have the queue file open).
+! In either case the remote job controller may not respond for a long time or
+! possibly never (if an invalid node name were specified, for example).
+!
+! Note that if SS$_SYNCH is set, the AST will not be delivered. Consequently,
+! lock dequeuing and memory deallocation must be performed here when the AST
+! routine is not executed.
+!
+FLAGS[FLAGS_V_NO_REMOTE_DOORBELL] = FALSE;
+IF .STATUS EQL SS$_SYNCH
+THEN
+    BEGIN
+    FLAGS[FLAGS_V_NO_REMOTE_DOORBELL] = TRUE;
+    $DEQ(LKID=.LKSB[4,0,32,0]);
+    DEALLOCATE_MEMORY(.LKSB);
+    END;
+
+
+! Check for service failure.
+!
+IF NOT .STATUS
+THEN
+    SIGNAL(JBC$_COMREMJBC OR STS$K_ERROR, 0, .STATUS);
+END;
+
+ROUTINE ENTER_REMOTE_REQUEST_AST(LKSB): NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine is the completion AST routine for obtaining another job
+!	controller's remote request lock.
+!
+! INPUT PARAMETERS:
+!	LKSB		- Pointer to LKSB allocated from dynamic memory.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+MAP
+	LKSB:		REF BBLOCK;	! Pointer to lock status block
+
+
+! Check status of the $ENQ.
+!
+IF NOT .LKSB[0,0,16,0]
+THEN
+    SIGNAL(JBC$_COMREMJBC OR STS$K_ERROR, 0, .LKSB[0,0,16,0]);
+
+
+! Release the lock to enable the receiving job controller to recover it.
+!
+$DEQ(LKID=.LKSB[4,0,32,0]);
+
+
+! Deallocate the LKSB.
+!
+DEALLOCATE_MEMORY(.LKSB);
+END;
+
+GLOBAL ROUTINE QUEUE_MASTER_AST: NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine is the completion AST routine for the queue master lock.
+!	It is entered when the queue master job controller fails and releases
+!	the lock.
+!
+! INPUT PARAMETERS:
+!	Standard AST routine parameters (not used).
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+! Ensure that at least one job controller holds a timer on the timed job
+! queue.
+!
+AFTER_AST();
+END;
+
+END
+ELUDOM

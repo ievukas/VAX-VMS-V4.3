@@ -1,0 +1,784 @@
+
+	$BEGIN	RM1JOURNL,000,RM$RMS_JOURNAL,<Sequential specific journaling>
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+;
+; FACILITY:	RMS-32
+;
+; ABSTRACT:	This module contains the routines which journal record 
+;		operations performed on sequential files.
+;
+;
+; ENVIRONMENT:	VAX/VMS Operating System
+;
+;
+;--
+;
+; AUTHOR:	Tamar Krichevsky, CREATION DATE: 28-May-1983
+;
+; MODIFIED BY:
+;
+;	V03-005	TSK0004		Tamar Krichevsky		 9-Dec-1983
+;		Add support for BI journaling.
+;
+;		****************************************************************
+;		*
+;		*  THE CODE FOR BI JOURNALING OF TRUNCATE OPERATIONS HAS NOT 
+;		*  BEEN TESTED.  
+;		*
+;		****************************************************************
+;
+;	V03-004	JWT0141		Jim Teague			11-Nov-1983
+;		Change IFB$V_RUM to IFB$V_ONLY_RU
+;
+;	V03-003	TSK0003		Tamar Krichevsky		 5-Oct-1983
+;		Use RM$RETJNLBDB and RM$ALJNLBDB instead of RM$RETBDB and 
+;		RM$ALBDB when allocating a large journal buffer.
+;
+;	V03-002	TSK0002		Tamar Krichevsky		27-Jun-1983
+;		Pass journal BDB to RM$WRTJNL instead of related BDB for 
+;		AI operations.
+;
+;	V03-001	TSK0001		Tamar Krichevsky		22-Jun-1983
+;		Clean up comments for MAKE_AI_JNL.
+;
+;**
+
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+
+;
+; MACROS:
+;
+	$IFBDEF
+	$BDBDEF
+	$IRBDEF
+	$FABDEF
+	$RABDEF
+	$RMSDEF
+	$RJRDEF
+	$CJFDEF
+;
+; EQUATED SYMBOLS:
+;
+
+;
+; OWN STORAGE:
+;
+
+
+	.SBTTL	RM$SEQJNL - Sequential journaling setup
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	RM$SEQJNL is called when a sequential file record operation needs
+;	to be journaled.  It fills in the recover journal record (RJR) with
+;	the appropriate information and the returns to the caller.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	RM$SEQJNL
+;
+; INPUT PARAMETERS:
+;
+;	4(SP)	type of record operation to be performed
+;	R4	BDB address
+;	R5	Data record address
+;	R6	Data record size
+;	R8	RAB
+;	R9	IRAB
+;	R10	IFAB
+;	R11	Impure
+;
+; IMPLICIT INPUTS:
+;
+;	IRB$L_JNLBDB	Address of journal BDB
+;
+; OUTPUT PARAMETERS:
+;
+;	R0	Status
+;	R1 - R3	Destroyed
+;
+; IMPLICIT OUTPUTS:
+;
+;	None
+;
+; COMPLETION CODES:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+;	The journal buffer and BDB may be released and new ones allocated,
+;	if the the existing buffer is not large enough to hold the current 
+;	record.
+;
+;--
+
+
+RM$SEQJNL::
+	PUSHR	#^M<R4, R5>			; Save BDB and record addresses
+	MOVL	IRB$L_JNLBDB(R9), R4		; Get the journal BDB
+
+;+
+;
+; The buffer for the journal entry must be large enough to hold the current
+; record and any overhead necessary to describe the record.  If the buffer is 
+; not large enough, then deallocate it and its BDB.  Then, allocate a new buffer
+; (and buffer descriptor block) which will be large enough.
+;
+; If the operation being journaled is a BI $TRUNCATE or BI $PUT, with the TPT
+; option, then skip this check.  Journaling for these operations is done block
+; mode.  Therefore, a different set of criteria is used to check the size of
+; the journal buffer.
+;
+;-
+
+	BBC	#IFB$V_BI, IFB$B_JNLFLG(R10), 10$ ; If not BI, check jnl buff size
+    	BITB	#<RJR$_TPT!RJR$_TRUNCATE>, 4(SP)  ; BI TPT or TRUNCATE?
+	BNEQ	30$				; Yes, skip size check
+
+10$:	SUBW3	#RJR$C_RECLEN,BDB$W_ALLOC_SIZE(R4),R1 ; Ignore jrnl entry overhead
+	SUBW3	IRB$W_ROVHDSZ(R9), -		; Ignore the overhead for the
+		   IRB$W_RTOTLSZ(R9), R2	;    current record, also
+	ADDW2	IFB$B_FSZ(R10), R2		; Do count fixed header part
+	CMPW	R2, R1				; Will record fit in buffer?
+	BLEQU	30$				; Yes, Make and write jnl entry
+
+	PUSHR	#^M<R2>				; Save the record size
+	JSB	RM$RETJNLBDB			; Release this buffer and BDB
+	POPR	#^M<R5>				; Get record size - It is put in
+						; R5 because of RM$ALDBUF
+	ADDL2	#RJR$C_RECLEN, R5 		; Add in journal entry overhead 
+    	ADDL2	#511, R5			; Round up to a 
+	BICL2	#511, R5			;     page boundary
+	JSB	RM$ALDJNLBUF			; Get new buffer and BDB
+	BLBS	R0, 20$				; Keep going if everything is ok
+    	BRW	EXIT				; Get out on error
+20$:	SSB	#BDB$V_PRM, BDB$B_FLGS(R4)	; Mark BDB as permanent
+	CLRQ	@BDB$L_ADDR(R4)			; Clear the top of the buffer
+	MOVL	R4, IRB$L_JNLBDB(R9)		; Save the BDB's address
+    	MOVL	4(SP), R5			; Restore the record address
+	BRB	40$
+
+;+
+;
+; The journal buffer is all set.  Now, the journal entry is filled in and 
+; written to the journal.  First, fill in the overhead which describes the 
+; record.
+;
+;-
+
+30$:	MOVL	BDB$L_ADDR(R4), R3		; Get the jnl buffer address
+40$:	MOVB	#RJR$C_RECORD, RJR$B_ENTRY_TYPE(R3); A record is being jnl'ed
+    	MOVB	#RJR$C_SEQ, RJR$B_ORG(R3)	; File org. is sequential
+	MOVB	12(SP), RJR$B_OPER(R3)		; Type of record operation
+	MOVL	IRB$L_RP_VBN(R9), RJR$L_RFA0(R3); RFA is needed, get VBN part
+	MOVW	IRB$L_RP_OFF(R9), RJR$W_RFA4(R3);	and offset into block 
+	MOVAB	RJR$T_RIMAGE(R3), R1		; Point to start of record image
+
+;+
+;
+; Do the journal-type specific stuff.
+;
+; AI journaling
+;
+;-
+
+    	BBC	#IFB$V_AI, IFB$B_JNLFLG(R10), 50$; If not AI jnl'ing, keep going
+	BSBB	MAKE_AI_JNL			; Make the AI record image.
+	BLBC	R0, EXIT			; Get out on error
+	PUSHL	R4				; Use jnl BDB as related BDB
+	MOVZBL	#CJF$_AI, -(SP)			; Pass jnl type to RM$WRTJNL
+    	BSBW	RM$WRTJNL			; Write journal entry
+    	ADDL2	#8, SP				; Remove arguments from stack
+	BLBC	R0, EXIT			; Get out on error
+
+;+
+;
+; BI journaling
+;
+;-
+
+50$:	BITB	#<IFB$V_BI!IFB$V_RU>,IFB$B_JNLFLG(R10) 	 ; BI or RU jnling?
+	BEQL	EXIT				         ; No, then continue
+
+    	BITB	#<RJR$_TPT!RJR$_TRUNCATE>, RJR$B_OPER(R3) ; BI TPT or TRUNCATE?
+	BNEQ	EXIT				; Yes, jnl entry was already written
+	BSBW	WRTBIJNL			; Write jnl entry
+
+EXIT:
+    	POPR	#^M<R4, R5>
+	RSB
+
+
+	.SBTTL	MAKE_AI_JNL - Put operation specific info in AI jnl
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	MAKE_AI_JNL moves the operation specific information in the journal
+;	entry for an AI journal.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	MAKE_AI_JNL
+;
+; INPUT PARAMETERS:
+;
+;	R1	Address of record image portion of journal buffer
+;	R3	Journal buffer address
+;	R4	Journal BDB address
+;	R5	Record address
+;	R6	Record length
+;	R8	RAB
+;	R9	IRAB
+;	R10	IFAB
+;
+; IMPLICIT INPUTS:
+;
+;	None
+;
+; OUTPUT PARAMETERS:
+;
+;	R0	Status
+;	R1 - R3	Destroyed 
+;
+; IMPLICIT OUTPUTS:
+;
+;	None
+;
+; COMPLETION CODES:
+;
+;	RHB or RBF
+;
+; SIDE EFFECTS:
+;
+;	None
+;
+;--
+
+
+MAKE_AI_JNL:
+
+;+
+;
+; Fill in AI specific information in the journal entry.  Then if the record
+; being journaled is VFC format, copy the fixed header portion into the
+; the record image.
+;
+;-
+
+	PUSHR	#^M<R4, R5>			; Save jnl bdb and record adr
+    	MOVL	#1, R0				; Assume success
+	MOVB	#RJR$C_RMS_AI, RJR$B_JNL_TYPE(R3); This is an AI journal entry
+    	MOVW	#RJR$C_RECLEN, BDB$W_NUMB(R4) 	; Journal entry contAIns at 
+    						;     least the overhead
+	CMPB	#RJR$_TRUNCATE, RJR$B_OPER(R3)	; Is the operation truncation?
+	BEQL	TRUNC_ENTRY			; No need to copy any data
+
+	MOVW	R6, RJR$W_RSIZE(R3)		; Save the record's size
+    	ADDW2	R6, BDB$W_NUMB(R4)		; Add rec len to jnl entry size
+	CMPB	#FAB$C_VFC, IFB$B_RFMORG(R10)	; Is the record VFC format?
+	BNEQ	40$				; No, copy the record
+
+;+
+;
+; Copy the fixed header portion of the record.
+;
+;-
+
+	MOVZBL	IFB$B_FSZ(R10), R2		; Get length of fixed hdr part
+	ADDW2	R2, BDB$W_NUMB(R4)		; Count FSZ in jnl entry size
+	MOVL	RAB$L_RHB(R8), R0		; Get adr of user's hdr buffer
+	BNEQ	20$				; If buffer adr given, copy hdr
+	MOVC5	#0, (R0), #0, R2, (R1)		; Zero hdr part of record image
+	BRB	30$				; Copy variable portion of rec
+20$:	IFNORD	R2, (R5), ERRRHB, IRB$B_MODE(R9); Quit if hdr can't be read
+	MOVC3	R2, (R5), (R1)			; Copy hdr part to record image
+30$:	MOVL	R3, R1				; Point to next byte in rec image
+	MOVQ	(SP), R4			; Retrieve BDB and rec adr
+	
+;+
+;
+; Copy the record to the journal entry.
+;
+;-
+
+40$:	CMPW	R6, #512			; Is record longer than a page?
+	BLEQU	50$				; Yes, do short read probe
+	JSB	RM$PROBEREAD			; No, do a long probe
+	BLBC	R0, ERRBUF			; Get out on error
+	BRB	60$				; Continue processing
+50$:	IFNORD	R6, (R5), ERRBUF, IRB$B_MODE(R9); Quit if record can't be read
+	MOVC3	R6, (R5), (R1)			; Copy record to jnl entry
+60$:	RMSSUC					; Journal entry is complete
+	BRB	EXIT_AI_RTN
+
+;+
+;
+; All the information necessary for AI recovery of a $TRUNCATE operation is
+; already in the RMS journal record (RJR).  Therefore, no further modification 
+; needs to be done to the journal entry.
+;
+;-
+ 
+TRUNC_ENTRY:
+EXIT_AI_RTN:
+    	POPR	#^M<R4, R5>
+	RSB					; Return to caller
+
+ERRRHB:
+	RMSERR RHB
+	BRB	EXIT_AI_RTN
+
+ERRBUF:
+	RMSERR 	RBF
+	BRB	EXIT_AI_RTN
+
+
+	.SBTTL	MAKE_BI_JNL - Put operation specific info in BI jnl
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	MAKE_BI_JNL moves the operation specific information in the journal
+;	entry for an BI journal.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	MAKE_BI_JNL
+;
+; INPUT PARAMETERS:
+;
+;	R1	Address of record image portion of journal buffer
+;	R3	Journal buffer address
+;	R4	Journal BDB address
+;	R6	Record length
+;	R8	RAB
+;	R9	IRAB
+;	R10	IFAB
+;
+; IMPLICIT INPUTS:
+;
+;	None
+;
+; OUTPUT PARAMETERS:
+;
+;	R0	Status
+;	R1 - R3	Destroyed 
+;
+; IMPLICIT OUTPUTS:
+;
+;	None
+;
+; COMPLETION CODES:
+;
+;	Any completion code returned by RM$NXTBLK1
+;
+; SIDE EFFECTS:
+;
+;	None
+;
+;--
+
+
+MAKE_BI_JNL:
+
+;+
+;
+; Fill in BI/RU specific information in the journal entry.  
+;
+;-
+
+	PUSHR	#^M<R4, R5, R6, R7>		; Save jnl bdb, record adr & len
+    	MOVL	#1, R0				; Assume success
+	MOVW	#RJR$C_RECLEN, BDB$W_NUMB(R4) 	; Journal entry contains at 
+    						;     least the overhead
+	CMPB	#RJR$_PUT, RJR$B_OPER(R3)	; Is the operation $PUT?
+    	BNEQ	20$				; No, move data to jnl entry
+    	BRW	PUT_ENTRY			; Yes, no need to move data
+10$:	CMPB	#RJR$_UPDATE, RJR$B_OPER(R3)	; Is the operation $UPDATE?
+	BEQL	20$				; Yes
+    	BRW	BI_TRUNC_ENTRY			; No, it's truncate on put, or $TRUNCATE
+
+
+;+
+;
+; Adjust journal entry size to compensate for any overhead.  If it is VFC, 
+; include size of fixed header portion.  For UDF, VAR, FIX and VFC do not add in
+; size of control (count) field.  Do include overhead for STM, STMLF and STMCR. 
+; The terminators are counted as overhead, but are also part of the record.  
+;
+;-
+
+20$:	MOVW	R6, RJR$W_RSIZE(R3)		; Save rec size in jnl entry
+
+	ASSUME	FAB$C_VFC   GT FAB$C_UDF
+	ASSUME	FAB$C_VFC   GT FAB$C_VAR
+	ASSUME	FAB$C_VFC   GT FAB$C_FIX
+	ASSUME	FAB$C_STM   GT FAB$C_VFC 
+	ASSUME	FAB$C_STMLF GT FAB$C_VFC 
+	ASSUME	FAB$C_STMCR GT FAB$C_VFC 
+	ASSUME	FAB$C_STMCR EQ FAB$C_MAXRFM
+
+	CMPB	#FAB$C_VFC, IFB$B_RFMORG(R10)	; Is the record VFC format?
+   	BLSSU	30$				; No, ignore overhead (count field)
+	BGTRU	40$				; No, include overhead (terminators)
+	ADDB2   IFB$B_FSZ(R10), R6		; Yes, include header portion
+	BRB	40$
+30$:	BITB	#<IFB$V_BI_RECVR!IFB$V_RU_RECVR>, IFB$B_RECVRFLGS(R10) ; If in recovery,
+    	BNEQ	40$ 				;   terminators are already counted
+	ADDW2	IRB$W_ROVHDSZ(R9), R6		; Stream format, include overhead
+	ADDW2	IRB$W_ROVHDSZ(R9), RJR$W_RSIZE(R3) ; Add overhead to jnl entry size
+40$:	ADDW2	R6, BDB$W_NUMB(R4)		; Increase size of jnl buffer
+
+;+
+;
+; Locate the first byte of the data to be copied to the journal entry. 
+; NOTE -- This assumes 512 byte blocks.
+;
+;-
+
+	MOVL	IRB$L_CURBDB(R9), R0		; Retrieve BDB for buffer
+	MOVZBL	BDB$B_REL_VBN(R0), R5		; Get block containing record
+	MULL2	IFB$L_DEVBUFSIZ(R10), R5	; Convert to byte offset
+	ADDL2	BDB$L_ADDR(R0), R5		; Add offset to buffer address
+	MOVZWL	IRB$W_RP_OFF(R9), R0		; Get offset with in block
+	ADDL2	R0, R5				; Point to first byte of record
+
+;+
+;
+; If there is a count field preceeding the record, skip over it so that we are
+; truely pointing to the first byte of the record.  Since the total record size
+; includes the count field, if that value is different from the one calculated 
+; for the journal entry, then the record has a count field and it should be 
+; skipped.
+;
+;-
+
+	MOVZWL	IRB$W_RTOTLSZ(R9), R0		; Get total record size
+	SUBL2	R6, R0				; Determine count field length
+	ADDL2	R0, R5				; Move pointer over count field
+	
+;+
+;
+; Save the current record pointer, in case the record crosses into the next 
+; buffer causing the rest of the record is read into the buffer.  After the
+; whole record has been copied to the journal entry, the current record pointer 
+; will be needed to restore the current contents of the buffer.
+;
+;-
+
+	ASSUME	IRB$W_RP_OFF EQ <IRB$L_RP_VBN + 4>
+	MOVQ	IRB$L_RP_VBN(R9), -(SP)
+
+;+
+;
+; Copy the record to the journal entry.  The current register contents are:
+;
+;	R1 - address of first byte of RJR record image (destination)
+;	R5 - first byte of record in buffer (source)
+;	R6 - number of bytes to transfer to journal entry
+;	R7 - end of buffer address + 1
+;
+;-
+
+COPY_DATA:
+	SUBL3	R5, R7, R0			; Get # of bytes left in source buffer
+	CMPL	R0, R6				; Is whole record in buffer?
+	BLEQU	10$				; No, transfer size = remaining buff
+	MOVL	R6, R0				; Yes, use rec len as transfer size 
+10$:	SUBL2	R0, R6				; Adjust size of record
+	MOVC3	R0, (R5), (R1)			; Copy the (partial) record
+	TSTL	R6				; Any data left to copy?
+	BNEQ	20$				; Yes, refill buffer, copy rest of rec
+    	BRB	RESTORE_BUFF			; No, copy is complete
+20$:	PUSHR	#^M<R3>				; Save source and destination
+	BSBW	CHANGE_BUFF			; Get next buffer
+    	MOVL	R1, R5				; Save source location
+	POPL	R1				; Restore the destination
+	BLBS	R0, COPY_DATA			; Copy rest of record or fall thru to error
+
+BI_ERROR_EXIT:
+	ASSUME	IRB$W_RP_OFF EQ <IRB$L_RP_VBN + 4>
+	MOVQ	(SP)+, IRB$L_RP_VBN(R9)		; Retrieve record pointer
+    	BRW	EXIT_BI_RTN			; Return with error status
+
+RESTORE_BUFF:
+	ASSUME	IRB$W_NRP_OFF EQ <IRB$L_NRP_VBN + 4>
+	MOVQ	(SP)+, IRB$L_NRP_VBN(R9)	; Retrieve record pointer
+	JSB	RM$GETBLKNRP			; Restore contents of the buffer
+    	BRW	EXIT_BI_RTN			; Return with error status
+
+;+
+; 
+; The current operation involves truncation ($TRUNCATE or $PUT, with TPT set).
+; The rest of the file must be copied to the journal.  This is done one buffer
+; at a time, from the current VBN to the EOF.  The journal entries are formatted
+; as BLOCK I/O entries, not record entries.  Recovery should be done as a series
+; of $WRITEs.
+; 
+;-
+
+;
+;	****************************************************************
+;	*
+;	*  THE CODE FOR BI JOURNALING OF TRUNCATE OPERATIONS HAS NOT 
+;	*  BEEN TESTED.  
+;	*
+;	****************************************************************
+
+BI_TRUNC_ENTRY:
+
+;
+; Write all dirty buffers out to the disk, to be sure that the file is in a
+; consistent state before any data is copied to the journal.
+;
+
+    	JSB	RM$FLUSH			; Write buffers to disk
+	BLBS	R0, 10$				; If that worked, keep going
+	BRW	EXIT_BI_RTN			; Get out on error
+
+;
+; Determine the maximum size for the journal entry.  Check to see if it fits
+; in the current journal buffer.
+;
+
+	MOVZBL	IRB$B_MBC(R9), R5		; at most, MBC # of blks will be copied
+	INCL	R5				; MBC is zero based, not one based
+	MULL2	IFB$L_DEVBUFSIZ(R10), R5	; Convert to bytes
+	ADDL	#RJR$C_BLKLEN, R5		; Include jnl entry overhead in size
+	CMPW	BDB$W_ALLOC_SIZE(R4), R5	; Will it fit in the curr buff?
+	BGEQU	20$				; Yes, continue processing
+
+;
+; Get a new journal buffer is needed; the current one is too small.  Initialize
+; any journal entry fields which are assumed to already have values in them.
+;
+	
+	PUSHL	R5				; Save jnl buff size
+	JSB	RM$RETJNLBDB			; Release this buffer
+	ADDL2	#511, R5			; Round the number of bytes to
+	BICL	#511, R5			;    up to a page boundary
+	POPL	R5				; Restore jnl buffer size
+	JSB	RM$ALDJNLBUF			; Get a new BDB and buffer
+	BLBS	R0, 10$				; Continue if new BDB is okay
+	BRW	EXIT_BI_RTN
+10$:	MOVL	R4, IRB$L_JNLBDB(R9)		; Save the jnl BDB address
+	MOVB	#RJR$C_SEQ, RJR$B_ORG(R3)	; File is sequential organization 
+
+;
+; Initialize the journal BDB and the journal entry. The jnl entry should look 
+; like a BLOCK I/O operation is happening.
+;
+
+20$:	MOVL	IRB$L_RP_VBN(R10), BDB$L_VBN(R4); Start VBN is VBN of curr rec
+	SUBL2	#RJR$C_BLKLEN, R5		; Ovrhd not included in # bytes to jnl
+	MOVW	R5, BDB$W_NUMB(R4)		; Size of tranfer into jnl entry
+	MOVB	#RJR$C_BLOCK, RJR$B_ENTRY_TYPE(R3)   ; Block mode I/O
+	MOVB	#RJR$_WRITE, RJR$B_OPER(R3)	     ; Operation is psuedo-$WRITE
+    	MOVL	BDB$L_VBN(R4), RJR$L_BLOCK_VBN(R3)   ; VBN of 1st blk being jnl'd
+    	MOVZWL  BDB$W_NUMB(R4), RJR$L_BLOCK_SIZE(R3) ; # of bytes being jnl'd
+
+;+
+;
+; Do until beyond EOF: 
+;    If EOF is in current buffer, set the number of bytes to journal so that
+;    only data up to the first free byte is read into the journal buffer.
+;    Read data into the journal entry and write the entry to the journal.
+;    Determine the start VBN for the next buffer.
+;
+;-
+
+	MOVZBL	IRB$B_MBC(R9), R1		; EOF is in buffer if:
+	INCL	R1				;  (MBC + 1) + start VBN
+	ADDL3	IRB$L_RP_VBN(R9), R1, R2	;  is greater than EBK
+MAKE_TRUNC_ENTRY:
+	CMPL	R2, IFB$L_EBK(R10)		; Is EOF in the current buffer?
+	BLSSU	10$				; No, journal whole buffer
+	SUBW3	IFB$W_FFB(R10), IFB$L_DEVBUFSIZ(R10), R0 ; How many bytes are unused?
+	SUBW2	R0, BDB$W_NUMB(R4)		; Decrement # of bytes to jnl
+	MOVZWL	BDB$W_NUMB(R4), RJR$L_BLOCK_SIZE(R3) ; Same for jnl entry size
+
+;
+; Read VBNs into jnl buffer from the disk.
+;
+
+	ASSUME	RJR$C_BLKLEN EQ RJR$T_BLOCK
+10$:	ADDL2	#RJR$C_BLKLEN, BDB$L_ADDR(R4)	; Use RJR$T_BLOCK as dest for read
+	PUSHR	#^M<R1, R2, R3>			; Save pointers and counters
+	JSB	RM$RDBUFWT			; Read in data and wait for completion
+	SUBL2	#RJR$C_BLKLEN, BDB$L_ADDR(R4)	; Return to real start of jnl buffer
+	BLBS	R0, 20$				; If read worked, continue
+	POPR	#^M<R1, R2, R3>			; Otherwise, restore regs
+	BRW	EXIT_BI_RTN			; Get our on error
+
+;
+; Write journal entry out to journal.
+;
+
+20$:	ADDW2	#RJR$C_BLKLEN, BDB$W_NUMB(R4)	; Ovrhd included in jnl entry size
+	BSBB	WRTBIJNL			; Write jnl entry
+	POPR	#^M<R1, R2, R3>			; Restore pointers and counters
+	BLBC	R0, EXIT_BI_RTN			; Get out on error
+	SUBW2	#RJR$C_BLKLEN, BDB$W_NUMB(R4)	; Remove ovrhd from jnl entry size
+
+;
+; Determine start and end VBN of next buffer.
+;
+
+	MOVL	R2, BDB$L_VBN(R4)		; Start VBN was already calculated
+    	MOVL	BDB$L_VBN(R4), RJR$L_BLOCK_VBN(R3) ; Save start VBN in jnl entry
+	ADDL2	R1, R2				; Get 1st VBN past next buffer
+	CMPW	R2, IFB$L_EBK(R10)		; Is EOF in next buffer?
+	BGTRU	EXIT_BI_RTN			; No, do not jnl past EOF (it has been seen)
+	BRW	MAKE_TRUNC_ENTRY		; Journal next set of blocks
+
+
+PUT_ENTRY:
+EXIT_BI_RTN:
+    	POPR	#^M<R4, R5, R6, R7>
+	RSB					; Return to caller
+
+
+	.SBTTL	CHANGE_BUFF - get next buffer
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	CHANGE_BUFF calls RM$NXTBLK1 for MAKE_BI_JNL.
+;
+; CALLING SEQUENCE:
+;
+;	BSBB	CHANGE_BUFF
+;
+; INPUT PARAMETERS:
+;
+;	R8	RAB
+;	R9	IRAB
+;	R10	IFAB
+;
+; IMPLICIT INPUTS:
+;
+;	None
+;
+; OUTPUT PARAMETERS:
+;
+;	R0	Status
+;	R1 - R3	Destroyed 
+;
+; IMPLICIT OUTPUTS:
+;
+;	R1 	address of current block in buffer
+;	R7	address of end of buffer + 1
+;
+; COMPLETION CODES:
+;
+;	Any completion code returned by RM$NXTBLK1
+;
+; SIDE EFFECTS:
+;
+;	None
+;
+;--
+
+CHANGE_BUFF:
+	CLRL	R3				; Indicate read required 
+	JSB	RM$NXTBLK1			; Get new buffer contents
+	RSB
+
+
+	.SBTTL	WRTBIJNL - writes BI/RU journal entry
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	WRTBIJNL writes a BI/RU jnl entry
+;
+; CALLING SEQUENCE:
+;
+;	BSBB	WRTBIJNL
+;
+; INPUT PARAMETERS:
+;
+;	R4	Journal BDB
+;	R8	RAB
+;	R9	IRAB
+;	R10	IFAB
+;
+; IMPLICIT INPUTS:
+;
+;	None
+;
+; OUTPUT PARAMETERS:
+;
+;	R0	Status
+;	R1 	Destroyed 
+;
+; IMPLICIT OUTPUTS:
+;
+;	None
+;
+; COMPLETION CODES:
+;
+;	Any completion code returned by RM$WRTJNL
+;
+; SIDE EFFECTS:
+;
+;	None
+;
+;--
+
+WRTBIJNL:
+    	BBC	#IFB$V_BI, IFB$B_JNLFLG(R10), 10$ ; If BI/RU jnl'ing, write a BI/RU entry
+	MOVB	#RJR$C_RMS_BI, RJR$B_JNL_TYPE(R3) ; This is a BI journal entry
+	PUSHL	R4				; Use jnl BDB as relate BDB
+    	MOVZBL	#CJF$_BI, -(SP)			; Pass jnl type to WRTBIJNL
+	BSBW	RM$WRTJNL			; Write jnl entry
+	ADDL2	#8, SP				; Remove args from stack
+	BLBC	R0, 20$ 			; Get out on error
+
+10$:	BBC	#IFB$V_RU, IFB$B_JNLFLG(R10), 20$ ; If RU jnl'ing, write a RU entry
+	MOVB	#RJR$C_RMS_RU, RJR$B_JNL_TYPE(R3) ; This is an RU journal entry
+	PUSHL	R4				; Use jnl BDB as relate BDB
+    	MOVZBL	#CJF$_RU, -(SP)			; Pass jnl type to WRTBIJNL
+	BSBW	RM$WRTJNL			; Write jnl entry
+	ADDL2	#8, SP				; Remove args from stack
+
+20$:	RSB
+
+    	.END

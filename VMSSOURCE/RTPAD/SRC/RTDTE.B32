@@ -1,0 +1,1379 @@
+MODULE RTDTE ( IDENT = 'V04-000',
+		ADDRESSING_MODE(EXTERNAL=GENERAL)
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:
+!
+!	SET HOST/LINE=ttcn:
+!
+! ABSTRACT:
+!
+!	Provides data terminal equipment (DTE) or terminal emulation 
+!	routines in SET HOST.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS user mode.
+!
+!--
+!
+! AUTHOR: Jake VanNoy, CREATION DATE: 9-Jan-1984
+!
+! MODIFIED BY:
+!
+!	V03-001	JLV0365		Jake VanNoy		11-JUL-1984
+!		Bug fixes and better messages.
+!
+!**
+
+
+!
+! Include files
+!
+LIBRARY 'SYS$LIBRARY:STARLET';			! VAX/VMS system definitions
+
+REQUIRE 'OBJ$:RTDEF';				! rtpad stuff
+
+REQUIRE 'SYS$LIBRARY:UTILDEF';			! Private VAX/VMS macros
+!
+! Table of contents
+!
+FORWARD ROUTINE
+    TERM$EMULATE,				! Main routine
+    INITIALIZE,					! initialize
+    DIAL_NUMBER,				! autodial number
+    TRANSMIT,					! do transfers
+    READ_COMMAND_KB:		NOVALUE,	! read command keyboard
+    READ_KB_AST:		NOVALUE,	! read command keyboard AST
+    READ_PORT_MBX:		NOVALUE,	! read port mailbox
+    READ_MBX_AST:		NOVALUE,	! read port mailbox AST
+    READ_SYSINPUT,				! read from SYS$INPUT
+    READ_PORT_TIMED:		NOVALUE,	! read from port with timed read
+    READ_PORT_AST:		NOVALUE,	! ast from port with timed read
+    READ_DELAY_AST:		NOVALUE,	! set timer ast routine
+    SET_PASSTHRU_MODE,				! set terminal mode
+    WRITE_COMMAND:		NOVALUE,	! start write to command channel
+    WRITE_COMMAND_AST:		NOVALUE,	! ast for write to Command channel
+    ALLOCATE_BUF,				! allocate buffer
+    DEALLOCATE_BUF:		NOVALUE,	! deallocate buffer
+    SENSE_MODE,					! sense characteristics
+    dump_stats:			NOVALUE,	! %%
+    EXIT_ROUTINE;				! exit handler
+
+!
+! Literals
+!
+LITERAL
+    w_riosb_status 	= 0,
+    w_riosb_datasize	= 1,
+    b_riosb_termchar	= 4,
+    b_riosb_termsize	= 6,
+    char$c_cr 		= 13,
+    char$c_lf		= 10,
+    log_bufsiz = 512,
+    rte$c_portread_max	= 2;
+!
+! Macros
+!
+
+MACRO
+    quit_if_error(command) =
+	BEGIN
+	LOCAL
+	    status;
+
+	status = command;
+	IF NOT .status
+	THEN
+	    BEGIN
+	    WAKEFLAG = 1;
+	    $WAKE ();
+	    RETSTATUS = .status;
+	    RETURN .status;
+	    END;
+	END%;
+
+MACRO
+    quit (status) =
+	BEGIN
+	WAKEFLAG = 1;
+	$WAKE ();
+	RETSTATUS = status;
+	RETURN status;
+	END%;
+
+MACRO
+	PRINT (string) =	! print debug data
+	BEGIN
+	LOCAL status;
+	
+	outdesc [0] = 132;
+	status = SYS$FAO (string, outdesc, outdesc, %remaining);
+
+	IF NOT .status THEN signal (.status);
+	LIB$PUT_OUTPUT (outdesc);
+	END%;
+
+!
+! External Routines
+!
+EXTERNAL ROUTINE
+    LIB$FIND_IMAGE_SYMBOL,
+    STR$CONCAT,
+    LIB$PUT_OUTPUT,	! %% for stats
+    SYS$FAO,		! %% for stats
+    debug_ast,		! ***
+    CLI$PRESENT,	! cli routine
+    CLI$GET_VALUE,	! cli routine
+    SYS$SETIMR,
+    RTLOG$WRITE_STRING,
+    LIB$GET_VM,
+    LIB$FREE_VM,
+    LIB$SIGNAL,
+    LIB$ASN_WTH_MBX;			! assign channel with assoc. mailbox
+!
+! External Storage
+!
+EXTERNAL
+    RTLOG_FLAGS,
+    CTERM_FLAG,
+    INDFLAG,
+    WAKEFLAG,
+    RETSTATUS;
+    
+!
+! External Literals
+!
+EXTERNAL LITERAL
+    REM$_TOEXIT,
+    CLI$_ABSENT;
+!
+! Builtin Functions
+!
+BUILTIN
+    REMQUE,
+    INSQUE;
+!
+! Own Storage
+!
+OWN
+
+    !
+    ! Counters
+    !
+    max_port_count:	INITIAL(0),	! max port cnt
+    cnt_rp_timed:	INITIAL(0),	! calls to READ_PORT_TIMED
+    cnt_rp_char:	INITIAL(0),	! total number of chars read
+    cnt_rp_zero:	INITIAL(0),	! total of read_port_timed with no char
+    cnt_rp_timer:	INITIAL (0),	! 
+    cnt_rp_uns:		INITIAL (0),	! 
+    cnt_rp_ast:		INITIAL (0),	! 
+    cnt_wr_ast:		INITIAL (0),	! 
+    !
+    ! for real work
+    !
+
+    log_buffer:		VECTOR [log_bufsiz,BYTE],
+    log_count:		INITIAL (0),
+    command_chan:	WORD,
+    port_chan:		WORD,
+    port_mbx_chan:	WORD,
+    port_count:		INITIAL (0),
+    write_active_count:	INITIAL (0),			! counter
+    timer_pending:	INITIAL (false),		! boolean
+    read_pending:	INITIAL (false),		! boolean
+    msgsiz:		INITIAL (RTE$C_BUFLEN),
+    delay_time:		VECTOR [2],			! quadword delta time
+    write_command_q:	VECTOR [2],
+    command_char:	VECTOR [3],
+    port_char:		VECTOR [3],
+    exit_status,
+    exit_block:		VECTOR [4]
+			INITIAL(0,exit_routine,
+				1,exit_status);
+
+
+GLOBAL ROUTINE TERM$EMULATE (port_name: REF VECTOR, cmd_chan: WORD) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	main routine
+!
+!
+! CALLING SEQUENCE:
+!
+! INPUT PARAMETERS:
+!	port_name:	descriptor of port name (from /LINE= qualfier)
+!	command_chan:	channel to SYS$COMMAND terminal
+!
+! IMPLICIT INPUTS:
+!	
+!	INDFLAG		- set to 1 if SYS$INPUT is a file
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+command_chan = .cmd_chan;				! save command channel
+
+Return_if_error (initialize(.port_name));		! assign channels, etc.
+
+Return_if_error (dial_number());			! dial phone number
+
+! 
+! tell user how to exit
+!
+Lib$signal (REM$_TOEXIT, 1, %ASCID '^\' );
+
+Return_if_error (transmit ());				! do real work
+
+RETURN (1);
+
+END;					! End of routine
+
+
+ROUTINE INITIALIZE (port_name: REF VECTOR) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Assign a channel to the port terminal.
+!
+! CALLING SEQUENCE:
+!
+!	INITIALIZE();
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	port_chan	- port channel
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+LOCAL
+    rte;
+
+
+write_command_q [0] = write_command_q [0];
+write_command_q [1] = write_command_q [0];
+
+!
+! Assign a channel to the port
+!
+Return_if_error ( LIB$ASN_WTH_MBX (.port_name, msgsiz, msgsiz, 
+    				port_chan, port_mbx_chan) );
+!
+! save away initial characteristics of the command terminal
+!
+Return_if_error (sense_mode (.command_chan, command_char));
+Return_if_error (sense_mode (.port_chan, port_char));
+!
+! set delay delta
+!
+!delay_time [0] = -5000000;	! 5 million is 1/2 second
+delay_time [0]  = -500000;	! *** small time 
+delay_time [1] = -1;
+!
+! declare an exit handler here to reset command terminal characteristics
+!
+$DCLEXH (DESBLK = exit_block);
+!
+! Set both the port line and the command line into passthru mode,
+! this will enable everything except XON and XOFF.
+!
+Return_if_error ( set_passthru_mode (.port_chan, port_char, true));
+Return_if_error ( set_passthru_mode (.command_chan, command_char, false));
+
+rte = allocate_buf (rte$c_length);		! allocate
+read_port_mbx (.rte);
+
+RETURN (ss$_normal);
+
+END;					! End of routine INITIALIZE
+
+
+ROUTINE DIAL_NUMBER =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Look for DCL qualifier /DIAL=xyz-abcd and dial that number
+! 	appropriately.
+!
+!
+! CALLING SEQUENCE:
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+LOCAL
+    image_desc:		BBLOCK [dsc$c_s_bln],
+    number_desc:	BBLOCK [dsc$c_s_bln],
+    modem_desc:		BBLOCK [dsc$c_s_bln],
+    file_desc:		BBLOCK [dsc$c_s_bln],
+    dial_addr,
+    status;
+
+status = CLI$PRESENT ($DESCRIPTOR('DIAL'));	! check for /DIAL=
+IF NOT .status THEN RETURN (SS$_NORMAL);	! return if no /DIAL
+
+CH$FILL (0, dsc$c_s_bln, number_desc);		! zero desc.
+number_desc [dsc$b_class] = dsc$k_class_d;	! set to dynamic allocation
+CH$MOVE (dsc$c_s_bln, number_desc, modem_desc);	! copy to other desc.
+CH$MOVE (dsc$c_s_bln, number_desc, image_desc);	! copy to other desc.
+!
+! get NUMBER =
+!
+return_if_error (CLI$GET_VALUE ($DESCRIPTOR ('NUMBER'), number_desc));
+!**lib$put_output (number_desc);
+!
+! get MODEM_TYPE =
+!
+status = CLI$GET_VALUE ($DESCRIPTOR ('MODEM_TYPE'), modem_desc);
+IF .status EQL CLI$_ABSENT THEN
+    BEGIN
+    !
+    ! CLI parse can't return default if MODEM_TYPE not specified,
+    ! defaulting is done by hand.
+    !
+    modem_desc [dsc$w_length]  = %CHARCOUNT ('DF03');
+    modem_desc [dsc$a_pointer] = UPLIT BYTE ('DF03');
+    END;
+!**lib$put_output (modem_desc);
+
+return_if_error (
+    STR$CONCAT (image_desc, $DESCRIPTOR ('DTE_'), modem_desc));
+
+return_if_error (
+    LIB$FIND_IMAGE_SYMBOL (image_desc, $DESCRIPTOR ('DIAL_ROUTINE'),dial_addr));
+!
+! Call the newly activated image...
+!
+status = (.dial_addr)(number_desc, .port_chan, .command_chan);
+
+RETURN (.status)
+END;					! End of routine
+
+
+
+ROUTINE TRANSMIT =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Set up read's and AST and return.  Entire program is AST driven
+!	after the return from this routine.
+!
+! CALLING SEQUENCE:
+!
+!	TRANSMIT();
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL	
+    buffer_cr:	BYTE INITIAL (13),
+    rte:	REF $BBLOCK;			! rte data block
+
+IF .INDFLAG THEN
+    !
+    ! Set up for initial RMS reads.
+    !
+    Return_if_error (Read_sysinput ())
+ELSE
+    BEGIN
+    !
+    ! Set up dual reads on command channel
+    !
+    rte = allocate_buf (rte$c_length);		! allocate
+    Read_command_kb (.rte);	
+    rte = allocate_buf (rte$c_length);		! allocate
+    Read_command_kb (.rte);	
+    END;
+!
+! Do a read timeout on the port to set up reading
+!
+Read_port_timed (1);
+
+!
+! Kick the whole thing off by sending a CR down the line.  If it's a 
+! VAX down there, LOGIN should start up.
+!
+quit_if_error (
+    $QIO (CHAN 	= .port_chan,
+	FUNC 	= io$_writevblk,
+	P1	= buffer_cr,
+	P2	= 1,
+	P4 	= 0)			! 0 forces no carriage control
+	);
+
+RETURN (ss$_normal);
+
+
+END;					! End of routine
+
+
+ROUTINE Read_command_kb (rte: REF $BBLOCK) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Read from the command keyboard a character at a time.
+!
+! CALLING SEQUENCE:
+!
+!	Read_command_kb ();
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	
+!	COMMAND_CHAN
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	
+!	status
+!
+! SIDE EFFECTS:
+!	
+!	A QIO to SYS$COMMAND is done.
+!
+!--
+
+BEGIN
+
+!
+! Queue a request for a single character
+!
+Quit_if_error (
+    $QIO (CHAN 	= .command_chan,
+	FUNC 	= io$_readvblk OR io$m_noecho,
+	ASTADR  = Read_kb_ast,
+	ASTPRM	= .rte,
+	IOSB	= rte [rte$q_iosb],
+	P1	= rte [rte$t_buf],
+	P2	= 1)				
+	);
+
+END;					! End of routine Read_command_kb
+
+ROUTINE read_kb_ast (rte: REF $BBLOCK) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!
+!
+! CALLING SEQUENCE:
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+BIND 
+    IOSB_WORD = rte [rte$q_iosb] : VECTOR [,WORD],
+    IOSB_BYTE = rte [rte$q_iosb] : VECTOR [,BYTE],
+    char = rte [rte$t_buf] : BYTE; 
+
+LOCAL
+    outdesc:	VECTOR [2],
+    outbuf:	VECTOR [132,BYTE];
+!
+! %% report stats
+!
+outdesc [1] = outbuf;
+
+IF .char EQL 28 THEN ! *** look for ^\
+    BEGIN
+    ! PRINT (%ASCID 'write_active_count:!_!UL', .write_active_count);
+    ! PRINT (%ASCID 'port_count:!_!UL',		.port_count);
+    ! PRINT (%ASCID 'read_pending:!_!UL',	.read_pending);
+    ! dump_stats ();
+    !debug_ast ();	
+
+    quit (ss$_normal);
+    END;
+
+iosb_word [w_riosb_datasize] = .iosb_word [w_riosb_datasize] +
+				.iosb_byte [b_riosb_termsize];
+!
+! adjust for TTDRIVER bug
+!
+IF .iosb_byte [b_riosb_termchar] EQL 0 THEN 
+iosb_word [w_riosb_datasize] = .iosb_word [w_riosb_datasize] -
+				.iosb_byte [b_riosb_termsize];
+
+IF .IOSB_WORD [w_riosb_datasize] NEQ 0 THEN	! if there is data in the buffer
+    quit_if_error (
+	$QIO (CHAN 	= .port_chan,
+		FUNC 	= io$_writevblk,
+		ASTADR  = read_command_kb,
+		ASTPRM	= .rte,
+		IOSB	= rte [rte$q_iosb],
+		P1	= rte [rte$t_buf],
+		P2	= .iosb_word [w_riosb_datasize],
+		P4 	= 0)			! 0 forces no carriage control
+		);
+
+END;					! End of routine read_kb_ast
+
+ROUTINE Read_port_timed (nodelay) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Start reading from port by doing a read with a generous buffer
+!	and a 0 second timeout.  The effect of this is to read typeahead
+!	and return (to AST) immediately.
+!
+! CALLING SEQUENCE:
+!
+!	Read_port_timed ();
+!
+! INPUT PARAMETERS:
+!
+!	nodelay	- 0 if no hurry
+!		  1 if urgent request
+!
+! IMPLICIT INPUTS:
+!
+!	PORT_CHAN
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	Status
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+LOCAL	
+    rte:	REF $BBLOCK;		! rte data block
+
+IF .nodelay THEN
+    BEGIN
+    cnt_rp_timed = .cnt_rp_timed + 1;		! %% counter
+    rte = allocate_buf (rte$c_length);		! allocate
+    port_count = .port_count + 1;			! increment outstanding read
+    IF .port_count GTR .max_port_count THEN max_port_count = .port_count; !%%
+    read_pending = false;				! clear read pending
+    !
+    ! Read with a zero second time out from the port channel. The effect of this
+    ! is to read the buffer and return immediately, with or without a terminator.
+    !
+    quit_if_error (
+	$QIO (CHAN = .port_chan,
+	    FUNC   = io$_readvblk OR io$m_timed OR io$m_noecho,
+	    ASTADR = Read_port_ast,
+	    ASTPRM = .rte,
+	    IOSB   = rte [rte$q_iosb],
+	    P1     = rte [rte$t_buf],
+	    P2	   = rte$c_buflen)
+	);
+    END
+ELSE
+    BEGIN
+    IF .port_count GEQ rte$c_portread_max THEN RETURN;
+    IF NOT .timer_pending THEN
+	BEGIN
+	timer_pending = true;
+	quit_if_error (
+	    $SETIMR (DAYTIM = delay_time,
+		 ASTADR = read_delay_ast)
+		  );
+	END;
+    END;
+END;					! End of routine Read_port_timed
+
+ROUTINE Read_port_ast (rte: REF $BBLOCK) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Handle AST delivered from reading port line to host system.
+!	This data must be displayed on command port with all due
+!	dispatch.
+!
+!	If QIO did not finish with status of SS$_TIMEOUT, then there is
+!	still more data in the buffer, another timed read must be done.
+!
+! CALLING SEQUENCE:
+!
+!	AST routine
+!
+! INPUT PARAMETERS:
+!
+!	rte - buffer with QIO status and data
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+!
+! Set up references to IOSB
+!
+BIND 
+    IOSB_WORD = rte [rte$q_iosb] : VECTOR [,WORD],
+    IOSB_BYTE = rte [rte$q_iosb] : VECTOR [,BYTE];
+
+IF  (.iosb_word [w_riosb_status] NEQ ss$_timeout) THEN
+    BEGIN
+    read_port_timed (0);
+    cnt_rp_ast = .cnt_rp_ast + 1;
+    END;
+
+IF (NOT .iosb_word [w_riosb_status]) AND (.iosb_word [w_riosb_status] NEQ ss$_timeout) THEN
+    quit (.iosb_word [w_riosb_status]);
+
+iosb_word [w_riosb_datasize] = .iosb_word [w_riosb_datasize] +
+				.iosb_byte [b_riosb_termsize];
+!
+! adjust for TTDRIVER bug
+!
+IF .iosb_byte [b_riosb_termchar] EQL 0 THEN 
+iosb_word [w_riosb_datasize] = .iosb_word [w_riosb_datasize] -
+				.iosb_byte [b_riosb_termsize];
+
+port_count = .port_count - 1;
+IF .iosb_word [w_riosb_datasize] EQL 0 THEN 
+    BEGIN
+    ! 
+    ! don't bother with this guy
+    !
+    cnt_rp_zero = .cnt_rp_zero + 1;	! %% counter
+    deallocate_buf (.rte);
+!***    port_count = .port_count - 1;
+    RETURN;
+    END;
+
+cnt_rp_char = .cnt_rp_char + .iosb_word [w_riosb_datasize];  ! %% counter
+
+INSQUE (.rte, .write_command_q [1]);	! insert at end of queue
+
+write_command ();			! check for start write
+
+END;					! End of routine Read_port_ast
+
+ROUTINE write_command : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!
+!
+! CALLING SEQUENCE:
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+LOCAL
+    rte:	VOLATILE REF $BBLOCK;
+
+!
+! Check for multiple writes active.
+!
+IF .write_active_count GEQ 3 THEN RETURN;
+
+!
+! Check for empty queue
+! 
+IF .write_command_q [0] EQL write_command_q [0] THEN 
+   BEGIN
+   RETURN;
+   END;
+
+write_active_count = .write_active_count + 1;
+REMQUE (.write_command_q [0], rte);
+
+BEGIN
+BIND 
+    IOSB_WORD = rte [rte$q_iosb] : VECTOR [,WORD],
+    IOSB_BYTE = rte [rte$q_iosb] : VECTOR [,BYTE];
+
+    quit_if_error (
+	$QIO (CHAN 	= .command_chan,
+		FUNC 	= io$_writevblk,
+		ASTADR  = Write_command_ast,
+		ASTPRM	= .rte,
+		IOSB	= rte [rte$q_iosb],
+		P1	= rte [rte$t_buf],
+		P2	= .iosb_word [w_riosb_datasize],
+		P4 	= 0)			! 0 forces no carriage control
+		);
+END; ! BIND
+
+END;				! End of routine write_command
+
+
+
+ROUTINE Write_command_ast (rte: REF $BBLOCK) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Write to command terminal has completed, delete rte buffer.
+!
+! CALLING SEQUENCE:
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+BIND 
+    CHAR_ARRAY = rte [rte$t_buf] : VECTOR [,byte],
+    IOSB_WORD = rte [rte$q_iosb] : VECTOR [,word],
+    IOSB_BYTE = rte [rte$q_iosb] : VECTOR [,byte];
+LOCAL
+    qio_size;
+!
+! write to screen is complete, decrement count and call routine to 
+! check for more pending writes.
+!
+write_active_count = .write_active_count - 1;
+write_command ();
+
+IF (.cterm_flag AND flg$m_logging) NEQ 0 THEN	! if logging
+    BEGIN
+    qio_size = .iosb_word [1];	!***
+    INCR i FROM 0 TO .qio_Size - 1 DO
+	BEGIN
+	IF NOT (.char_array [.i] EQL char$c_lf) THEN
+	    IF (.char_array [.i] EQL char$c_cr) OR (.log_count GEQ 512) THEN
+		BEGIN
+		IF (.log_count GTR 0) THEN
+		    rtlog$write_string (log_buffer, .log_count);
+		log_count = 0;
+		END
+	   ELSE
+		BEGIN
+		log_buffer [.log_count] = .char_array [.i];
+		log_count = .log_count + 1;
+		END;
+	END;
+    END;
+
+deallocate_buf (.rte);
+!***port_count = .port_count - 1;
+
+
+!IF .read_pending THEN 
+cnt_wr_ast = .cnt_wr_ast + 1;
+!read_port_timed (0);
+
+END;					! End of routine Write_command_ast
+
+
+ROUTINE Read_sysinput =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+! 	Read from SYS$INPUT so as to fake reading from SYS$COMMAND.
+!	This allows SET HOST from a command file to read commands
+!	directly from that file.
+!
+! CALLING SEQUENCE:
+!
+!	Read_sysinput
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	
+!	File opened by RTPAD module.
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+RETURN (ss$_normal);
+
+END;					! End of routine
+
+
+ROUTINE read_port_mbx (rte: REF $BBLOCK) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+! Read from mailbox assocaiated with port channel.  This mailbox will provide
+! unsolicited data notification
+!
+! CALLING SEQUENCE:
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+Quit_if_error (
+    $QIO (CHAN 	= .port_mbx_chan,
+	FUNC 	= io$_readvblk,
+	ASTADR  = Read_mbx_ast,
+	ASTPRM	= .rte,
+	IOSB	= rte [rte$q_iosb],
+	P1	= rte [rte$t_buf],
+	P2	= rte$c_buflen)
+	);
+
+END;					! End of routine read_port_mbx
+
+
+ROUTINE read_mbx_ast (rte: REF $BBLOCK) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+! Receives AST from port mailbox.
+!
+! CALLING SEQUENCE:
+!
+!	called as an AST routine.
+!
+! INPUT PARAMETERS:
+!
+!	RTE - address of I/O block
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+BIND 
+    msgcode = rte [rte$t_buf] : WORD; 
+
+read_pending = true;				! assume read won't happen
+
+IF (.msgcode EQL msg$_trmunsolic) THEN
+    BEGIN
+    cnt_rp_uns = .cnt_rp_uns + 1;
+    read_port_timed (1);
+    END;
+
+read_port_mbx (.rte);
+
+END;					! End of routine read_mbx_ast
+
+
+
+ROUTINE allocate_buf (size) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!
+!
+! CALLING SEQUENCE:
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+LOCAL 
+    buf : REF $BBLOCK,
+    status;
+
+quit_if_error (LIB$GET_VM (size, buf));
+
+buf [rte$w_size] = .size;
+
+RETURN (.buf);
+
+END;					! End of routine
+
+
+ROUTINE deallocate_buf (buf: REF $BBLOCK) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!
+!
+! CALLING SEQUENCE:
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+Quit_if_error (LIB$FREE_VM (buf [rte$w_size], buf));
+
+END;					! End of routine
+
+ROUTINE sense_mode (chan, block) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!
+!
+! CALLING SEQUENCE:
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL status;
+
+status = 
+    $QIOW (CHAN = .chan,
+	FUNC 	= io$_sensemode,
+	P1	= .block,
+	P2	= 12);
+
+RETURN (.status);
+
+END;					! End of routine sense_mode
+
+
+
+ROUTINE SET_PASSTHRU_MODE (chan, char: REF VECTOR, nobrdcst) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Sets PASSTHRU, TTSYNC, HOSTSYNC, and (optionally) NOBRDCST.
+!
+! CALLING SEQUENCE:
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+LOCAL
+    status,
+    new_char:	VECTOR [3];
+
+new_char [0] = .char [0];
+new_char [1] = .char [1] OR TT$M_TTSYNC OR TT$M_HOSTSYNC;
+new_char [2] = .char [2] OR TT2$M_PASTHRU;
+
+IF .nobrdcst THEN
+    new_char [1] = .new_char [1] OR TT$M_NOBRDCST;
+
+status = $QIOW ( CHAN = .chan,
+	FUNC 	= io$_setmode,
+	P1	= new_char,
+	P2	= 12);
+
+RETURN (.status);
+
+END;					! End of routine SET_PASSTHRU_MODE
+
+ROUTINE read_delay_ast : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	AST that fires and requests read from port.
+!
+! CALLING SEQUENCE:
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+timer_pending = false;
+cnt_rp_timer = .cnt_rp_timer + 1;
+read_port_timed (1);
+
+END;		! of routine read_delay_ast
+
+ROUTINE exit_routine =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!
+!
+! CALLING SEQUENCE:
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+$CANCEL (chan = .command_chan);
+
+$QIOW ( CHAN = .command_chan,
+	FUNC 	= io$_setmode,
+	P1	= command_char,
+	P2	= 12);
+
+dump_stats();
+
+RETURN (.retstatus);
+
+END;					! End of routine Exit_routine
+
+ROUTINE dump_stats : NOVALUE =
+BEGIN
+LOCAL
+    outdesc:	VECTOR [2],
+    outbuf:	VECTOR [132,BYTE];
+
+IF (.rtlog_flags AND rtlog$m_banner) EQL 0 
+THEN	! if logging
+    RETURN;
+
+!
+! %% report stats
+!
+outdesc [1] = outbuf;
+    PRINT (%ASCID '%REM-I-STATS, runtime statistics:',0);
+    PRINT (%ASCID '!8<!UL!>  calls to read_port_timed', 	.cnt_rp_timed);
+    PRINT (%ASCID '!8<!UL!>  characters output to screen', 	.cnt_rp_char);
+    PRINT (%ASCID '!8<!UL!>  reads for zero characters', 	.cnt_rp_zero);
+    PRINT (%ASCID '!8<!UL!>  calls to $SETIMR ',		.cnt_rp_timer);
+    PRINT (%ASCID '!8<!UL!>  unsol data hits',			.cnt_rp_uns);
+    PRINT (%ASCID '!8<!UL!>  calls to RPT from rp_ast',		.cnt_rp_ast);
+    PRINT (%ASCID '!8<!UL!>  calls to write screen',		.cnt_wr_ast);
+    PRINT (%ASCID '!8<!UL!>  max outstanding port reads',	.max_port_count);
+END;
+
+END
+ELUDOM

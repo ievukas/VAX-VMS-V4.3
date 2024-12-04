@@ -1,0 +1,68 @@
+$ !
+$ !	SETDEFBOO.COM - Command file to set default boot command file.
+$ !
+$ !		P1 - Type of CPU (optional parameter)
+$ !		     (This feature is used by the V3.0 upgrade procedure.)
+$ !			1 - 11/780
+$ !			2 - 11/750
+$ !			3 - 11/730
+$ !
+$ ON ERROR THEN GOTO ERR_EXIT
+$DO_OVER:
+$ WRITE SYS$OUTPUT ""
+$ WRITE SYS$OUTPUT "	Command file to set default boot command file."
+$ WRITE SYS$OUTPUT ""
+$ CONSOLE_DEVICE := CSA1:
+$ IF (P1 .EQS. "") THEN P1 = 0
+$ CPUTYPE = 'P1
+$ IF (CPUTYPE .NE. 0) THEN GOTO UPGRADE_V24
+$ CPUTYPE = F$GETSYI("CPU")
+$UPGRADE_V24:
+$ IF (CPUTYPE .EQ. 3) THEN CONSOLE_DEVICE := CSA2:
+$ RUN SYS$SYSTEM:SYSGEN
+CONNECT CONSOLE
+$ ON ERROR THEN CONTINUE
+$ DISMOUNT 'CONSOLE_DEVICE'
+$ ON ERROR THEN GOTO ERR_EXIT
+$ WRITE SYS$OUTPUT ""
+$ WRITE SYS$OUTPUT "Please place the system console medium in the console drive."
+$ WRITE SYS$OUTPUT ""
+$ AGAIN1:
+$ INQUIRE READY "Is the console medium ready to be mounted? (Y/N)"
+$ IF (READY .EQS. "") THEN GOTO AGAIN1
+$ IF (.NOT. READY) THEN GOTO AGAIN1
+$ WRITE SYS$OUTPUT ""
+$ MOUNT/SYSTEM/FOR/DATA=WRITE 'CONSOLE_DEVICE' "VAX console"
+$
+$ MOUNTED:
+$ WRITE SYS$OUTPUT ""
+$ INQUIRE NAME "Enter name of default boot command file"
+$ WRITE SYS$OUTPUT ""
+$ OPEN /WRITE COMFILE SYS$SCRATCH:SETDEFBOO_TEMP.COM
+$ SET NOON
+$ WRITE COMFILE "$ EXCHANGE"
+$ WRITE COMFILE "  RENAME /NOPROTECT /SYSTEM ''CONSOLE_DEVICE'*.* ''CONSOLE_DEVICE'"
+$ WRITE COMFILE "  COPY /LOG ''CONSOLE_DEVICE'''NAME' ''CONSOLE_DEVICE'DEFBOO.CMD"
+$ CLOSE COMFILE
+$ @SYS$SCRATCH:SETDEFBOO_TEMP.COM
+$ DELETE /NOLOG SYS$SCRATCH:SETDEFBOO_TEMP.COM;*
+$ SET ON
+$ WRITE SYS$OUTPUT ""
+$ WRITE SYS$OUTPUT "Default boot command file now replaced with ''NAME'."
+$AGAIN:
+$ WRITE SYS$OUTPUT ""
+$ INQUIRE OK -
+"Are you satisfied with this file as the default boot command file? (Y/N)"
+$ IF OK .EQS. "" THEN GOTO AGAIN
+$ IF .NOT. OK THEN GOTO DO_OVER
+$ WRITE SYS$OUTPUT ""
+$ GOTO COMMON_EXIT
+$ERR_EXIT:
+$ WRITE SYS$OUTPUT ""
+$ INQUIRE OK "Error.  Do you want to try again? (Y/N)"
+$ IF (OK .EQS. "") THEN GOTO ERR_EXIT
+$ IF OK THEN GOTO DO_OVER
+$COMMON_EXIT:
+$ DISMOUNT 'CONSOLE_DEVICE'
+$ MOUNT/SYSTEM/FOR/NOWRITE 'CONSOLE_DEVICE' "VAX console"
+$ EXIT

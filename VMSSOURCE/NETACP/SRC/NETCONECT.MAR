@@ -1,0 +1,1316 @@
+	.TITLE	NETCONECT - Process user connect requests
+	.IDENT	'V04-000'
+	.DEFAULT DISPLACEMENT,LONG
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+; FACILITY:	NETWORK ACP
+;
+; ABSTRACT:
+;
+; This module performs processing for logical-link connect requests including
+; connect initialize, connect confirm, and connect reject.
+;
+; The Network Connect Block (NCB) is parsed and an Internal Connect Block (ICB)
+; containing the parse, is built and hung onto the IRP.  The IRP is requeued 
+; to the  NETDRIVER.
+;
+; NCBs have the same form as the translation of the logical name  "SYS$NET" 
+; and is shown below.
+;
+;     node"access control info"::"object=taskname/linknumber+userdata"
+;
+;	'node'	    may be specified either by name or number.
+;	'object'    may be specified either by name or number.
+;	'taskname'  is required if the object number is zero and is only
+;		    allowed if the object number is zero.
+;
+;
+; ENVIRONMENT:
+;
+;	MODE = KERNEL
+;
+; AUTHOR:	A.Eldridge,   CREATION DATE: 10-JUN-79
+;
+; MODIFIED BY:
+;
+;	V03-035	PRB0344		Paul Beck	27-Jul-1984  13:21
+;		Fix truncation error.
+;
+;	V03-034	ADE0035		Alan D. Eldridge	25-Jun-1984
+;		Don't override XWB creation/insertion error code with
+;		"SS$_NOLINKS".
+;
+;	V03-033	PRB0316		Paul Beck	8-Mar-1984  17:13
+;		Resequence local symbols in PRS_NODE. 
+;		Allow endnode to offer larger buffer size if the buffer 
+;		associated with the line is larger than the executor buffer
+;		size. This requires that the link be nonadaptive, but offers
+;		performance wins.
+;
+;	V03-032	ADE0034		Alan D. Eldirdge	15-Feb-1984
+;		Modify it use LLI database and insert XWB's into the LTB
+;		vector. Send the External PID format in format type 2
+;		connect requests.
+;
+;	V03-031	PRB0309		Paul Beck	23-Jan-1984  14:30
+;		Do not make link nonadaptive if line buffer size equals 
+;		the executor buffer size. Undoes part of TMH0030.
+;
+;	V030	TMH0030		Tim Halvorsen	10-Jul-1983
+;		Fix detection of "1 hop away" for purposes of using
+;		line buffer size.  The previous check never worked
+;		and always used the line buffer size if specified.
+;		Allow normal NDI entries to specify an explicit output
+;		circuit, overriding the decision algorithm.  This is
+;		similar to loop nodes, but applies to nodes with real
+;		remote addresses.
+;		Remove check which ignored LINE BUFFER SIZE if it was
+;		lower than the executor buffer size, so that as long
+;		as the line buffer size parameter was explicitly specified,
+;		is is used.
+;
+;	V029	TMH0029		Tim Halvorsen	31-May-1983
+;		Fix problem with NODE ACCESS checking if the user
+;		specified a node address without an area number.
+;
+;	V028	RNG0028		Rod Gamache	20-Apr-1983
+;		Fix branch destination out of range.
+;
+;	V027	TMH0027		Tim Halvorsen	05-Mar-1983
+;		Remove obsolete DLE code (replaced by completely
+;		rewritten DLE module).
+;
+;	V026	TMH0026		Tim Halvorsen	14-Feb-1983
+;		Remove node proxy access parameter.
+;		Add support for "line buffer size" which can be used by a
+;		system manager to override the executor buffer size on
+;		a per-line basis.  This parameter has special meaning,
+;		in that when used to increase the line's buffer size
+;		higher than the executor buffer size, then all logical
+;		links to adjacent nodes over this line become "non-adaptive",
+;		and use the larger buffer size for optimized performance.
+;		Add support for EPIDs.
+;
+;	V025	TMH0025		Tim Halvorsen	28-Dec-1982
+;		Send username rather than PID with outgoing connects
+;		if default access control is supplied to the remote node
+;		(except the nonprivileged local node case).
+;		Fix local outgoing connect case so that nonprivileged
+;		access is supplied on the inbound side, not the outbound
+;		side.  This fixes a problem with proxy that prevented
+;		proxy from working on local connects unless the local NDI
+;		proxy was set.
+;		Fix long-standing bug which prevented outgoing default
+;		access control from being applied because some junk in
+;		the upper word of the NDI search key wasn't being zeroed.
+;		This fixes both outgoing default access control for remote
+;		nodes, and it fixes the privileged access control mechanism.
+;		It also fixes loop nodes, which were failing to associate
+;		the link with the proper circuit, and were using the local
+;		LPD instead.
+;		Fix loop node connect, so that if the circuit exists, but
+;		has no LPD (the state is off), then an error is returned.
+;
+;	V024	TMH0024		Tim Halvorsen	29-Oct-1982
+;		Add area routing support.
+;		Fix DLE so that it matches by user channel as well
+;		as PID, so that a cancel on another NET channel doesn't
+;		blow away DLE channels.
+;
+;	V023	TMH0023		Tim Halvorsen	29-Sep-1982
+;		Avoid check which ensures that a node is reachable
+;		at connect time if we are an endnode.
+;
+;	V022	TMH0022		Tim Halvorsen	02-Sep-1982
+;		Remove check of XWB state in DLE cancel routine.
+;
+;	V021	TMH0021		Tim Halvorsen	22-Jul-1982
+;		Modify call to TEST_REACH, to use adjacency symbols
+;		to determine the type of partner node.
+;
+;	V020	TMH0020		Tim Halvorsen	29-Jun-1982
+;		Add $DYNDEF definition.
+;
+;	V019	TMH0019		Tim Halvorsen	09-Apr-1982
+;		Fix proxy access checking for inbound connect requests
+;		of zero-numbered objects with the name in the NCB.
+;		It didn't correctly look up the proxy access parameter
+;		in the named OBI entry, but used the number proxy access
+;		value instead.
+;		Pick up address of utility buffer, rather than referencing
+;		a statically defined location.
+;
+;	V018	TMH0018		Tim Halvorsen	05-Mar-1982
+;		Mark ACP in "dismount" state when the mount count goes
+;		to zero, to avoid a race between the final DLE XWB coming
+;		back from NETDRIVER and a new ACCESS function coming in
+;		from a user.  The "dismount" state will signal the EXEC
+;		to reject the QIO request.
+;
+;	X02-17	ADE0033		A.Eldridge	25-Jan-1982
+;		Disallow default outbound access control if connect uses
+;		proxy login.
+;
+;	X02-16	ADE0032		A.Eldridge	18-Jan-1982
+;		Require OPER priv on IO$_ACCESS for circuit "direct-access".
+;
+;	X02-15	ADE0031		A.Eldridge	18-Dec-1981
+;		Enter remote object name as the RID field (remote i.d.)
+;		when initiating outbound connects.
+;
+;	X02-14	ADE0030		A.Eldridge	30-Nov-1981
+;		Added proxy login support.
+;
+;	X02-13	ADE0029		A.Eldridge	11-Nov-1981
+;		Identify local process by username rather than PID in order
+;		to allow the implementation of proxy logins at the remote 
+;		side of the link.
+;
+;	X02-12
+;	-X02-10	ADE0028		A.Eldridge	 1-Nov-1981
+;		Fix bugs in "direct-link access" code.
+;
+;	X02-09			A.Eldridge	 1-Oct-1981
+;		Put in "direct-link access" interface.
+;
+;	X02-08			A.Eldridge	 1-Oct-1981
+;		Permanent modification to optionally restrict logical link
+;		access based upon the "access state" of the remote node and
+;		the privilege of the local user.
+;
+;	X02-07			A.Eldridge	 1-APR-1981
+;		Tempory modification to optionally restrict outbound access
+;		to selected nodes by nonprivileged users.  This is for DECUS
+;		and NCC demos.
+;
+;	V02-04			A.Eldridge	11-NOV-1979
+;		Modify for new node, object, and task data base
+;
+;	V02-03			S.G.D.	11-JUN-1979
+;		Modify for routing.
+;	V02-02	SGD00007	S.G.D.	22-NOV-1978	13:10
+;		Allow multiple spaces and tabs in access control info.
+;
+;&
+;& need to fix bug which disallows a null destination name on connect confirm
+
+.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+	$ABDDEF
+	$DRDEF
+	$DYNDEF
+	$IRPDEF
+	$PRVDEF
+	$JPIDEF
+
+	$CNRDEF
+	$CNFDEF
+
+	$NETSYMDEF
+	$NETUPDDEF
+	$NSPMSGDEF	; DNA architecture definitions & message formats
+
+	$ICBDEF
+	$LTBDEF
+	$NMADEF
+	$NFBDEF
+	$RCBDEF
+	$ADJDEF
+	$LPDDEF
+	$XWBDEF
+
+;
+; MACROS:
+;
+.MACRO FILL_INC  NUMCHARS,STARTCHAR,STARTPOS	; Fill range with 
+						; increasing values
+	.=.-256+STARTPOS			; Reposition PC
+
+		C=STARTCHAR
+	.REPT 	NUMCHARS			; Loop for each char.
+	.BYTE	C				; Store character
+		C=C+1				; Bump character
+	.ENDR
+
+	.=.-NUMCHARS-STARTPOS+256		; Restore PC
+.ENDM
+
+
+;
+; EQUATED SYMBOLS:
+;
+TAB	= ^X<09>		; ASCII for tab 
+SPACE	= ^X<20>		; ASCII for space 
+
+;
+; OWN STORAGE:
+;
+	.PSECT	NET_PURE,NOWRT,NOEXE,LONG
+
+
+PRV_TAB:				; Field i.d.'s for privilege access
+
+	.CNFFLD	ndi,s,pus		; Privileged user field i.d.
+	.CNFFLD	ndi,s,ppw		; Privileged password field i.d.
+	.CNFFLD	ndi,s,pac		; Privileged accoutn field i.d.
+	.LONG	0
+
+NONPRV_TAB:				; Field i.d.'s for nonprivileged access
+
+	.CNFFLD	ndi,s,nus		; Nonpriv user field i.d.
+	.CNFFLD	ndi,s,npw		; Nonpriv password field i.d.
+	.CNFFLD	ndi,s,nac		; Nonpriv account field i.d.
+	.LONG	0
+
+BIN_HEXASC:	.ASCII	/0123456789ABCDEF/ ; For binary to Hex Ascii conversion
+
+NET$AB_UPASCNUM::			; Translation table for upper
+					; case ASCII and numerics
+		.BYTE	0[256]		; Fill initially with terminator
+    FILL_INC 10,<^A"0">,<^A"0">		; All numerics trans to themselves
+    FILL_INC 26,<^A"A">,<^A"A">		; All upper case "   "     "
+    FILL_INC 26,<^A"A">,<^A"a">		; All lower case "   " uppercase
+	
+NET$AB_OBJTRAN:				; Translation table for object names
+	.REPT	256
+	.BYTE	.-NET$AB_OBJTRAN	; Fill up translation tabel with .=.
+	.ENDR
+    FILL_INC  1,<0>,<^A/"/>		; Make /"/ a delimiter	
+    FILL_INC  1,<0>,<^A"/">		; Make "/" a delimiter	
+    FILL_INC 26,<^A"A">,<^A"a">		; All lower case "   " uppercase
+	
+NET$AB_ACC_TAB:	.BLKB	256		; Translation table for access control
+
+    FILL_INC 256,0,0			; Init so that each character translates
+					; to itself
+    FILL_INC 1,0,SPACE			; Space is a terminator
+    FILL_INC 1,0,TAB			; Tab	is a terminator
+    FILL_INC 1,0,<^A/"/>		; Quote is a terminator
+
+
+	.PSECT	NET_IMPURE,WRT,NOEXE,LONG
+
+ACC_TAB:	.LONG	0		; Points to current access table
+NDI_PTR:	.LONG	0		; Points to NDI describing the node
+OBI_PTR:	.LONG	0		; Points to destination OBI
+
+OBJ_Q_DESC:	.QUAD	0		; Object specifier from NCB
+TSK_Q_DESC:	.QUAD	0		; Task   specifier from NCB
+
+NDI_B_ACC:	.BYTE	0		; NDI access state
+OBI_B_PRX:	.BYTE	0		; OBI proxy access state
+INT_B_PRX:	.BYTE	0		; Internal proxy access state
+		.BLKB	1		; (spare for alignment)
+
+JPI_Q_IOSB:	.QUAD	0		; IOSB for GET_JPI
+JPI_B_UNAME:	.LONG	0		; Returns resultant user name length
+JPI_T_UNAME:	.BLKB	12		; Returns user name
+
+JPI_ITEM_LIST:				; $GETJPI item list for logical links
+		.WORD	12		; Size of username buffer
+		.WORD	JPI$_USERNAME	; I.d. of username parameter
+		.LONG	JPI_T_UNAME	; Address of username buffer
+		.LONG	JPI_B_UNAME	; Address of buffer to return length
+		.LONG	0		; Terminate the list
+
+	.PSECT	NET_CODE,NOWRT,EXE
+
+
+.SBTTL	NET$CONNECT	- IO$_ACCESS $QIO Procesing
+;++
+;
+; This routine processes user connect inits or confirms.  Parameters and 
+; connect block (NCB) are validated.  Information in the NCB is passed to 
+; NETDRIVER in an ICB (Internal Connect Block).
+;
+; Connect Initiates and Confirms are distinguished by the value of the
+; word following the remote process identifier:
+;
+;	Connect Initiates use a 0
+;	Connect Confirms  use the supplied value (i.e, the local link number)
+;
+;
+; INPUTS:	R5 	Logical-link UCB address
+;		R3 	IRP address
+;--
+NET$CONNECT::				; Parse NCB
+	.WORD	0			; Entry
+
+	CLRL	NDI_PTR			; No NDI pointer yet
+	CLRL	OBI_PTR			; No OBI pointer yet
+	CLRL	R6			; No ICB yet
+	;
+	;   Get the Network Connect Block (NCB) descriptor 
+	;
+	MOVL	@IRP$L_SVAPTE(R3),R4			     ; ABD ptr
+	MOVZWL	<ABD$C_LENGTH*ABD$C_NAME>+ABD$W_COUNT(R4),R5 ; NCB lth
+	MOVAB	<ABD$C_LENGTH*ABD$C_NAME>+ABD$W_TEXT(R4),R0  ; Offset
+							     ; to text
+	MOVAB	(R0)+,R4		; Copy the address and add 1
+					; for access mode field
+	MOVZWL	(R4),R1			; Get offset to text
+	ADDL3	R1,R0,R4		; Point to device name string
+	MOVL	R4,R8			; Copy name address
+	MOVL	R5,R7			; Copy name size
+	ADDL	R4,R5			; Point R5 past last NCB byte
+	;
+	;   Allocate an Internal Connect Block (ICB) to hold the parse 
+	;   of the NCB.
+	;
+	MOVZBL	#ICB$C_LENGTH,R1	; Set block length
+	JSB	NET$ALONPGD_Z		; Allocate/zero from non-paged pool
+	BLBS	R0,5$			; If error detected,
+	BRW	ACCESS_DONE		; then exit with error status in R0
+5$:	MOVL	R2,R6			; Copy ICB pointer
+	;
+	;   Init ICB values obtained from LNI data base
+	;
+	ASSUME	CNR$L_FLINK  EQ  0
+	MOVL	NET$GL_PTR_VCB,R0			; Point at the RCB
+	MOVW	RCB$W_TIM_CNO(R0),ICB$W_TIM_OCON(R6)	; Outbound connect timer
+	MOVW	RCB$W_TIM_IAT(R0),ICB$W_TIM_INACT(R6)	; Inactivity timer
+	MOVZBW	RCB$B_ECL_RFA(R0),ICB$W_RETRAN(R6)	; Max rexmission count
+	MOVZBW	RCB$B_ECL_DFA(R0),ICB$W_DLY_FACT(R6)	; Rexmt delay factor
+	MOVZBW	RCB$B_ECL_DWE(R0),ICB$W_DLY_WGHT(R6)	; Rexmt delay weight
+	MOVW	RCB$W_ECLSEGSIZ(R0),ICB$W_SEGSIZ(R6)	; Segment size
+	;
+	;
+	;   Enter the local process name using NSP format type 1 and the PID
+	;   converted to ascii as the counted string.  This is the default
+	;   which may be overridded below, and is compatible with earlier
+	;   releases.
+	;
+	MOVL	NET$GL_PTR_VCB,R0	; Point to RCB
+	MOVB	RCB$B_ECL_DAC(R0),-	;
+		NDI_B_ACC		; Setup default NDI access
+	MOVB	RCB$B_ECL_DPX(R0),-	;
+		OBI_B_PRX		; Setup default OBI proxy access
+	MOVB	#NMA$C_ACES_BOTH,-	; Setup default internal proxy access
+		INT_B_PRX		;
+	MOVL	NET$GL_SAVE_IRP,R2	; Get current IRP
+	MOVL	R6,IRP$L_DIAGBUF(R2)	; Save ICB for NETDRIVER
+	MOVL	IRP$L_PID(R2),R0	; Get users PID
+	MOVL	#8,R8			; Convert it to 8 ascii chars
+	MOVAB	ICB$B_LPRNAM(R6),R7	; Get output pointer
+	MOVB	#11,(R7)+		; Total size including counted
+					; ascii PID, object and format type
+	MOVW	#1,(R7)+		; Format type 1, object type 0
+	MOVB	#8,(R7)+		; Setup count field for PID
+	ADDL	#8,R7			; Point R7 past end of dst field
+	CLRL	R1			; Clear high order dividend
+10$:	EDIV	#16,R0,R0,R2		; Divide by 16, get remainder
+	MOVB	BIN_HEXASC(R2),-(R7)	; Convert to ASCII and store
+	SOBGTR	R8,10$			; Loop for 8 characters
+	;
+	;
+	;   Parse the NCB
+	;
+	BSBW	PRS_NCB			; Parse the NCB
+	BLBC	R0,20$			; If LBC then error
+	BSBW	CHECK_ACCESS		; See if connect is allowed to node
+	BLBS	R0,30$			; If LBS then yes
+20$:	BRW	ACCESS_DONE		; Exit
+30$:	;
+	;
+	;  If outbound proxy logins are allowed then identify the local
+	;  process via format type 2 with the binary PID in the 'UIC' field
+	;  and the username as the 12 byte counted string.
+	;
+	$DISPATCH  TYPE=B,OBI_B_PRX -	; Goto ACCESS_DONE if proxy disallowed
+	<-
+	  <NMA$C_ACES_INCO, ACCESS_DONE>-
+	  <NMA$C_ACES_NONE, ACCESS_DONE>-
+	>
+	$DISPATCH  TYPE=B,INT_B_PRX -	; Goto ACCESS_DONE if proxy disallowed
+	<-
+	  <NMA$C_ACES_INCO, ACCESS_DONE>-
+	  <NMA$C_ACES_NONE, ACCESS_DONE>-
+	>
+	MOVL	NET$GL_SAVE_IRP,R2	; Get current IRP
+	MOVL	IRP$L_PID(R2),R0	; Get internal PID for process
+	JSB	G^EXE$IPID_TO_EPID	; Convert to EPID format
+	MOVL	R0,R3			; Save EPID in R3
+	PUSHL	R0			; Push EPID on stack
+	MOVL	SP,R0			; Get address of EPID
+	$GETJPI_S -			;
+	    PIDADR = (R0),-		; EPID of process of interest
+	    EFN    = #NET$C_EFN_WAIT,-	; Event flag
+	    IOSB   = JPI_Q_IOSB,-	; IOSB
+	    ITMLST = JPI_ITEM_LIST	; Item list for return
+	ADDL	#4,SP			; Pop EPID off stack
+	BLBC	R0,ACCESS_DONE		; Br on error
+	$WAITFR_S  EFN = #NET$C_EFN_WAIT; Wait for $GETJPI to finish
+	BLBC	JPI_Q_IOSB,ACCESS_DONE	; Br on error
+	MOVZBL	JPI_B_UNAME,R0		; Get string size
+	BEQL	40$			; If EQL then skip this
+	CMPB	R0,#12			; Maximum name in NSP is 16
+	BGTRU	40$			; If GTRU then out of range
+	MOVAB	ICB$B_LPRNAM(R6),R7	; Get output pointer
+	ADDB3	#7,R0,(R7)+		; Total size including username, PID,
+					; object type, and format type
+	MOVW	#2,(R7)+		; Format type 2, object type 0
+	MOVL	R3,(R7)+		; Enter binary EPID in "UIC" field
+	MOVB	R0,(R7)+		; Setup count field for username
+	MOVQ	R4,-(SP)		; Save NCB descriptor
+	MOVC3	R0,JPI_T_UNAME,(R7)	; Move the username
+	MOVQ	(SP)+,R4		; Restore NCB descriptor
+40$:	MOVL	S^#SS$_NORMAL,R0	; Setup status
+					;
+ACCESS_DONE:
+	MOVL	NET$GL_SAVE_IRP,R3	; Recover IRP address
+	BLBS	R0,10$			; Br if successful
+	MOVZWL	R0,IRP$L_DIAGBUF(R3)	; Save error code for NETDRIVER
+	MOVL	R6,R0			; Copy block address for deallocate
+	BEQL	10$			; Br if none
+	JSB	NET$DEALLOCATE		; Deallocate the block
+	BRB	100$			; Take common exit
+10$:	TSTW	ICB$W_LOCLNK(R6)	; Connect Initiate or Confirm ?
+	BNEQ	100$			; If NEQ, Confirm (or Reject)
+	;
+	;
+	;    A zero LOCLNK means that this is a Connect Initiate.  Allocate
+	;    an XWB and LLI and insert them in their respective databases.
+	;
+	;
+	MOVL	IRP$L_UCB(R3),R5	; Get UCB address
+	MOVL	IRP$L_PID(R3),R1	; Get PID
+	MOVZWL	ICB$W_REMNOD(R6),R3	; Get remote node address
+	MOVL	#NETUPD$_CRELNK,R0	; Function code
+	JSB	CALL_NETDRIVER		; Tell Netdriver
+	MOVL	R0,R3			; Get allocated XWB address
+	BGEQ	40$			; If GEQ, failed
+					;
+	PUSHR	#^M<R3,R6>		; Save XWB,ICB
+	JSB	NET$PROC_XWB		; Insert XWB, create LLI, etc.
+	POPR	#^M<R3,R6>		; Recover XWB,ICB
+	BLBC	R0,40$			; If LBC, XWB was deallocated
+	MOVW	XWB$W_LOCLNK(R3),-	; Setup local link number
+		ICB$W_LOCLNK(R6)	;
+	BRB	100$			; Tack common exit
+					;
+	MOVL	#SS$_NOLINKS,R0		; Setup error code
+					;& NO LONGER USED
+40$:	BRB	ACCESS_DONE		; Deal with the error
+					;
+100$:	MOVL	NET$GL_SAVE_IRP,R3	; Recover IRP address
+	BISW	#NET$M_RQIRP,-		;
+		     NET$GL_FLAGS	; Give the IRP back to NETDRIVER
+	RET
+
+
+.SBTTL	PRS_NCB	- Parse Network Connect Block
+;+
+;
+; INPUTS:	R6	Ptr to the ICB
+;		R5	Ptr to first byte beyond the NDB
+;		R4	Ptr to first byte in the NDB
+;
+;		All other registers are scratch
+;
+; OUTPUTS:	R6	Preserved
+;		R0	Status code
+;
+;-
+PRS_NCB:
+	BSBW	NET$GETUTLBUF		; Obtain use of the utility buf
+	CMPB	(R4),#^A"_"		; Is there a prefixed underscore?
+	BNEQ	20$			; If NEQ no
+	INCL	R4			; Pass over it
+20$:	BSBB	PRS_NODE		; Parse nodename, get NDI block
+	BLBC	R0,100$			; Br if error
+	MNEGB	#1,ICB$B_ACCESS(R6)	; Flag 'no access control yet'
+	BSBW	PRS_ACCESS		; Parse access control field
+	BLBC	R0,100$			; Br if error
+	CMPW	#^A"::",(R4)+		; Correct delimiter
+	BNEQ	200$			; Br if not
+	BSBW	PRS_OBJECT		; Parse the target object name
+	BLBC	R0,100$			; Br if error
+	BSBW	PRS_END			; Parse remainder of the NCB
+	BLBC	R0,100$			; Br if error
+	CMPB	#-1,ICB$B_ACCESS(R6)	; Any access control yet ?
+	BNEQ	50$			; If NEQ then yes
+	BSBW	DFLT_ACCESS		; Use the default
+	BLBC	R0,100$			; Br if error
+50$:	TSTW	ICB$W_REMNOD(R6)	; Address = 0 ?
+	BNEQ	100$			; If not, branch
+					; Else use the local address
+	MOVL	NET$GL_PTR_VCB,R1	; Get RCB
+	MOVW	RCB$W_ADDR(R1),-	;
+		ICB$W_REMNOD(R6)	; Store local address
+100$:	RSB
+
+200$:	MOVZWL	#SS$_IVDEVNAM,R0	; Setup error code
+	RSB				; Return error
+
+.SBTTL	PRS_NODE	- Parse NCB nodename
+;+
+;
+; Parse the node identifier and find the appropriate NDI block.  If all
+; numerics then convert from decimal to binary and use the NDI with the
+; same address and null assoc. line (if not found then use null NDI).
+;
+; If the number is zero or the nodename is unspecified then treat as if 
+; the local nodename were used.  The local node number is always stored
+; as a zero in all NDI blocks -- the actual local node number is found
+; in the LNI block.
+;
+; The parse does not include the terminator which may be " or ::
+;
+; INPUTS:	R6	Ptr to the ICB
+;		R5	Ptr to first byte beyond the NDB
+;		R4	Ptr to first byte in the NDB
+;
+;		All other are scratch
+;
+; OUTPUTS:	R6	Preserved
+;		R5	Preserved
+;		R4	Advance by bytes parsed
+;		R0	Status code
+;
+;		ICB$W_REMNOD	Remote Node address -- 0 if its the local node
+;		ICB$W_PATH	Path index of line to use to get to node.
+;		NDI_PTR		Address of NDI CNF or 0 if none
+;
+PRS_NODE:				; Parse NCB nodename
+	CLRW	ICB$W_PATH(R6)		; Assume path zero
+	MOVZBL	S^#NET$C_MAXNODNAM,R9	; Indicate max size of nodename
+	MOVL	NET$GL_UTLBUF,R8	; Point to output buffer
+	BSBW	GET_STR_NUM		; Returns:
+					; R8  name pointer
+					; R7  name string size 
+					; R4  advanced by chars parsed
+					; R3  garbage
+					; R2  numeric value if LBS in R1
+					;     zero if null string
+					; R1  LBC if ascii string
+					;     LBS if numeric or null
+					; R0  garbage
+
+	MOVL	NET$GL_CNR_NDI,R11	; Setup root of NDI list
+	CLRL	R10			; Indicate no current NDI
+	BLBC	R1,40$			; Br if Ascii nodename
+	CMPB	(R4),#^A"."		; Is it of the form "area.node"?
+	BNEQ	20$			; If not, use the number as the node
+	INCL	R4			; Skip the delimiter
+	PUSHL	R2			; Save area number
+	BSBW	GET_STR_NUM		; Get the node number within area
+	POPL	R3			; Restore area number
+	BLBS	R1,10$			; If numeric, then it's ok
+	MOVZWL	#SS$_IVDEVNAM,R0	; Setup error code
+	BRW	160$			; Report the error
+10$:	INSV	R3,#TR4$V_ADDR_AREA,-	; Combine area and node number
+		#TR4$S_ADDR_AREA,R2
+20$:	MOVL	NET$GL_PTR_VCB,R9	; Get RCB
+	CMPW	R2,RCB$W_ADDR(R9)	; Is this the local node?
+	BNEQ	30$			; Br if address not local
+	CLRL	R2			; 0 is used to indicate the local node
+	;
+	;   The node has been specified by address in the NCB.  Attempt to find
+	;   the associated NCB and continue.
+	;
+30$:	MOVL	R2,R8			; Use as search value
+	BSBW	NET$NDI_BY_ADD		; Find the NDI with matching address
+	BRB	60$			; R10 = NDI address, 0 if no match
+	;
+	;   The node has been specified by name in the NCB.   Find the NDI.  If
+	;   its not there return an error since we cannot determine the node
+	;   address.
+	;
+40$:	MOVZWL	#SS$_NOSUCHNODE,R0	; Establish error code
+	$SEARCH	eql,ndi,s,nna		; Find the NDI block
+	BLBS	R0,50$			; If LBS then found
+	BRW	160$			; ...else return error
+50$:	$GETFLD	ndi,l,add		; Get node address - its always there
+					; and its value is 0 for the local node
+60$:	;
+	;   At this point  R8  = node address (zero if local) 
+	;		   R10 = NDI block address (zero if none)
+	;
+	;   NOTE:  At this point, R8 may not be a "normalized" address,
+	;   which means that if the area number was not specified, the
+	;   homearea has not yet been defaulted!
+	;   
+	MOVW	R8,ICB$W_REMNOD(R6)	; Store the address
+	MOVL	R10,NDI_PTR		; Save the NDI CNF pointer
+	BEQL	70$			; If EQL then none
+	$GETFLD	ndi,l,acc		; Get access state
+	BLBC	R0,70$			; If LBC then not set
+	MOVB	R8,NDI_B_ACC		; Else override default
+70$:	;
+	;   See if node is reachable
+	;
+	MOVL	NET$GL_PTR_VCB,R1	; Get RCB address
+	MOVZWL	ICB$W_REMNOD(R6),R2	; Get node address
+	BEQL	100$			; If zero, then skip this
+	EXTZV	#TR4$V_ADDR_AREA,-	; Get the remote area number
+		#TR4$S_ADDR_AREA,R2,R0
+	BNEQ	80$			; If area = 0, then use our area
+	INSV	RCB$B_HOMEAREA(R1),-	; Always enforce our area set in
+		#TR4$V_ADDR_AREA,-	; node addr, so that returning NSP
+		#TR4$S_ADDR_AREA,ICB$W_REMNOD(R6) ; msgs match on node addr
+	BRB	90$			; Check node reachability
+80$:	CMPB	R0,RCB$B_HOMEAREA(R1)	; Our area?
+	BNEQ	100$			; If not, skip reachability check
+90$:	CMPB	RCB$B_ETY(R1),#ADJ$C_PTY_PH4N ; Are we an endnode?
+	BNEQ	95$			; If not, do reachability check
+	;
+	;   If the remote node is an endnode, there is only one adjacency
+	;   available. If that circuit has a buffer size larger than the
+	;   executor buffer size, we can gain some throughput by making the
+	;   link nonadaptive and offering to use the larger buffer size.
+	;   However, we can only do this if we are certain that the target
+	;   is one hop away. The only way to do this is to ask NETDRIVER to
+	;   find it in the cache. If it's not in the cache, we don't know
+	;   that it's one hop away, and we don't offer a big buffer.
+	;
+	PUSHR	#^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Save registers
+	MOVL	NET$GL_SAVE_IRP,R3	; Recover IRP address
+	MOVL	IRP$L_UCB(R3),R5	; Get network UCB address
+	MOVL	R2,R4			; Get node address of target
+	MOVL	R1,R2			; Copy RCB address
+	MOVL	#NETUPD$_TEST_ADJ,R0	; Function code
+	JSB	CALL_NETDRIVER		; Tell Netdriver
+	BLBC	R0,115$			; If LBC, target not in cache
+	;
+	; We have ascertained that the target node is one hop away.
+	; Join common code to decide whether to offer a larger buffer.
+	;
+	MOVZWL	RCB$W_DRT(R2),R8	; Get ADJ index for designated router
+	BEQL	115$			; If EQL, none: don't bother
+	BRB	125$			; Join common code
+	;
+	;   Node is a router. Test reachability of target.
+	;
+95$:	BSBW	NET$TEST_REACH		; Is node reachable ?
+	BLBC	R0,110$			; If LBC then no
+	;
+	;   If the remote node is an adjacent Phase II node, then
+	;   "tie" the logical link to the circuit for the life of
+	;   the logical link, thus making it "non-adaptive".
+	;
+	CMPZV	#16,#16,R1,#ADJ$C_PTY_PH2 ; Is the remote a Phase II node?
+	BNEQ	120$			; If NEQ no
+	MOVW	R1,ICB$W_PATH(R6)	; Else stuff the path ID
+100$:	BRW	140$			; Branch forward
+
+110$:	BRW	160$			; Take common exit
+
+115$:	POPR	#^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Restore registers
+	BRB	100$			; Branch "forward"
+	;
+	;   If the remote node is adjacent (hops=1), and the line buffer
+	;   size parameter is set higher than the executor buffer size,
+	;   then "tie" all logical links to the circuit for the life
+	;   of the logical link, thus making it "non-adaptive".  This
+	;   is so that the logical link can use a larger buffer size
+	;   for more optimal performance over the circuit.
+	;
+120$:	CMPV	#16,#16,R1,#ADJ$C_PTY_UNK ; Is the node 1 hop away?
+	BEQL	100$			; If not, skip it
+	PUSHR	#^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Save registers
+	MOVZWL	R1,R8			; Get ADJ index
+125$:	BSBW	NET$FIND_ADJ		; Lookup ADJ & LPD addresses
+	BLBC	R0,130$			; Skip if not found for some reason
+	MOVL	R6,R5			; Save LPD address
+	MOVZBL	LPD$B_PLVEC(R5),R8	; Get PLVEC index
+	MOVL	NET$GL_CNR_PLI,R11	; Point to line database
+	CLRL	R10			; Starting at beginning
+	$SEARCH	eql,pli,l,plvec		; Search for corresponding line
+	BLBC	R0,130$			; Skip if none found
+	$GETFLD	pli,l,bfs		; Get line buffer size, if any
+	BLBC	R0,130$			; Skip if not set
+	SUBL	#TR$C_MAXHDR+NSP$C_MAXHDR,R8 ; Compute possible maximum
+					; segment size
+	MOVL	NET$GL_PTR_VCB,R1	; get address of RCB
+	CMPW	R8,RCB$W_ECLSEGSIZ(R1)	; check for segment size (R8) same 
+					; ... as executor buffer size
+	BEQL	130$			; if equal, don't force fixed path
+	;
+	;  If an end node, DON'T lock the path (don't want to use DR).
+	;
+	CMPB	RCB$B_ETY(R1),#ADJ$C_PTY_PH4N ; Is this node an end node?
+	BEQL	130$			; If EQL, yes - don't force fixed path
+	MOVL	4*4(SP),R6		; Restore ICB address
+	MOVW	LPD$W_PTH(R5),ICB$W_PATH(R6)	; Stuff the path ID
+	MOVW	R8,ICB$W_SEGSIZ(R6)	; Set larger segment buffer size
+	MOVW	#30,ICB$W_TIM_INACT(R6)	; Lower inactivity timer (&& need symbol)
+130$:	POPR	#^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Restore registers
+	;
+	;  If the node entry specifies an explicit output circuit, then
+	;  force all I/O to use that circuit, overriding automatic routing.
+	;
+140$:	TSTL	NDI_PTR			; Is there an NDI block ?
+	BEQL	150$			; If EQL no, we're done
+	$GETFLD	ndi,s,nli		; Get name of node's designated line
+	BLBC	R0,150$			; If none specified use path 0
+	MOVL	NET$GL_CNR_CRI,R11	; Get root of DLI list
+	CLRL	R10			; Indicate no current CNF
+	$SEARCH	eql,cri,s,nam		; Find the CRI block
+	BLBC	R0,170$			; If LBC then not found
+	MOVW	CNF$W_ID(R10),ICB$W_PATH(R6) ; Establish the LPD i.d.
+	BEQL	170$			; If no LPD for this circuit, error
+150$:	MOVL	S^#SS$_NORMAL,R0	; Indicate success
+160$:	RSB
+
+170$:	MOVZWL	#SS$_DEVOFFLINE,R0	; Loop circuit cannot be found
+	BRB	160$
+
+.SBTTL	PRS_ACCESS	- Parse NCB access control fields
+;+
+;
+; Parse the optional access control fields including the begining and
+; ending delimiter (" only)
+;
+; INPUTS:	R6	ICB pointer
+;		R5	Pointer to 1st byte past NCB
+;		R4	Pointer to next byte to be parsed
+;
+;		All other regs are scratch
+;
+; OUTPUTS:	R6,R5	Preserved
+;		R4	Updated by number of bytes parsed
+;		R0	Routine status code
+;
+;		All other regs are garbage
+;
+;		ICB$B_ACCESS,ICB$T_ACCESS are setup if the optional
+;		fields are present
+;-
+PRS_ACCESS:				; Parse NCB access control fields
+	CMPB	#^A'"',(R4)		; Access control specified ?
+	BNEQ	20$			; If not, branch
+	MOVB	#NMA$C_ACES_NONE,-	; Disable proxy access
+		INT_B_PRX		;
+	TSTB	(R4)+			; Skip over delimiter (")
+	MOVAB	ICB$T_ACCESS+1(R6),R8	; Setup destination field - leave
+					; room for count of first subfield
+	MOVL   #ICB$C_ACCESS-1,R9	; Setup size of dest field
+					; C_ACCESS includes B_ACCESS
+	MOVAB	NET$AB_ACC_TAB,R3	; Setup translation table
+	;
+	;   Note that here ICB$B_ACCESS is cleared -- there was a -1 in it to
+	;   signal "no access control yet".   If the user explicitly specifies
+	;   null access control, e.g., node""::taskspecifier, then ICB$B_ACCESS
+	;   will remain zero.  A -1 at the end of the parse would signal a need
+	;   to supply the default access control.  It is important that null
+	;   access control strings can be explicitly requested by the user
+	;   so that the node receiving the connect can supply default inbound
+	;   access info.
+	;
+	CLRB	ICB$B_ACCESS(R6)	; Init access string size
+	MOVZBL	#3,R11			; Setup loop counter
+10$:	BSBW	GET_TOKEN		; Get user id
+	MOVB	R7,-1(R8)		; Enter count of subfield
+	INCB	R7			; Account for count field
+	ADDB	R7,ICB$B_ACCESS(R6)	; Bump total bytes in strings
+	ADDL	R7,R8			; Advance output pointer - note that
+					; R7 pts to first block after count
+					; for next subfield
+	SUBL	R7,R9			; Adjust bytes left in buffer
+	MOVZWL	#SS$_INVLOGIN,R0	; Assume access fields too long
+	CMPW	S^#NET$C_MAXACCFLD,R7	; Access subfield within range?
+	BLSSU	30$			; If GTRU then too large
+	SOBGTR	R11,10$			; Get next string
+	BSBW	SCAN_BLANKS		; Scan blanks and tabs
+	MOVZWL	#SS$_IVDEVNAM,R0	; Assume NCB format error
+	CMPB	#^A'"',(R4)+		; Is next character a quote ?
+	BNEQ	30$			; Illegal NCB if NEQ
+20$:	MOVL	S^#SS$_NORMAL,R0	; Indicate success
+30$:	RSB
+
+.SBTTL	PRS_OBJECT	- Parse NCB target task identifier
+;+
+;
+; The taskname specifier is parsed, the OBI block located, and the
+; ICB destination task fields setup.  The legal taskname formats are:
+;
+;	"objectname=
+;	"objectnumber=
+;	"TASK=taskname
+;	"0=taskname
+;
+; The parse includes the parse of the leading " but does not include
+; the terminating delimiter since it may vary.
+;
+; INPUTS:	R6	ICB pointer
+;		R5	Points past NCB
+;		R4	Points to next unparsed byte in NCB
+;
+;		All other registers are scratch
+;
+; OUTPUTS:	R6,R5	Preserved
+;		R4	Updated to point to next unparsed byte
+;		R0	Routine status
+;		All other registers are garbage
+;
+;		ICB destination task fields are setup
+;
+;		OBI_PTR	points the OBI CNF
+;			0 if taskname specified by number and the
+;			  corresponding OBI entry is not found
+;-
+PRS_OBJECT:				; Parse NCB target taskname
+	CLRQ	OBJ_Q_DESC		; Init the object descriptor
+	CLRQ	TSK_Q_DESC		; Init the task descriptor
+	MOVL	NET$GL_CNR_OBI,R11	; Setup root of OBI list
+	;
+	;
+	;   Locate begining of object specifier
+	;
+	BSBW	SCAN_BLANKS		; Skip blanks and tabs
+	CMPB	#^A'"',(R4)+		; Correct delimiter
+	BNEQ	17$			; If NEQ no, may be some other field
+	;
+	;
+	;   Locate object name or number -- that part before the "=" delimiter
+	;
+	MOVZBL	S^#NET$C_MAXOBJNAM,R9	; Set max field size
+	MOVL	NET$GL_UTLBUF,R8	; Setup output buffer address
+	MOVL	R4,OBJ_Q_DESC+4		; Point to begining of object specifier
+	BSBW	GET_STR_NUM		; Get ascii string or binary value
+	SUBL3	OBJ_Q_DESC+4,R4,-	; Complete descriptor by calculating
+		OBJ_Q_DESC		; the string size
+	CLRL	R10			; Indicate no current CNF
+	CLRL	R0			; Preset return error flag
+	BLBC	R1,10$			; Br unless specified by number
+	CMPL	R2,#NET$C_MAX_OBJ	; Object # within range ?
+	BGTRU	15$			; If GTRU then out of range
+	;
+	;
+	;   Locate OBI block.  This block is not required if the object number
+	;   was specified and it was non-zero.  Else it is needed to continue.
+	;
+	MOVL	R2,R8			; Setup search key value
+	$SEARCH	eql,obi,l,num		; Find the matching OBI block
+	BLBS	R0,20$			; If LBS then it was found
+	CLRL	R10			; Else nullify OBI CNF pointer
+	BRB	20$			; Continue in common
+10$:	$SEARCH	eql,obi,s,nam		; Find the macthing OBI CNF
+	BLBC	R0,15$			; If LBC then not found
+	$GETFLD	obi,l,num		; Get the number
+	BLBS	R0,20$			; Okay if LBS
+15$:	BRW	200$			; Else, exit with "no such object"
+17$:	BRW	300$			; Exit with "invalid device (NCB) name"
+20$:	MOVL	R10,OBI_PTR		; Setup CNF pointer
+	;
+	;
+	;   Make sure an "=" sign follows the object specifier
+	;
+	BSBW	SCAN_BLANKS		; Skip over blanks and tabs
+	CMPB	#^A'=',(R4)+		; Is correct delimiter there ?
+	BNEQ	17$			; If NEQ then incorrect
+	;
+	;
+	;   Setup the ICB remote task desciption
+	;
+	CLRB	ICB$B_DSTFMT(R6)	; Assume format type zero
+	CLRB	ICB$T_DSTDSC(R6)	; Nullify ascii object string
+	MOVB	#2,ICB$B_RPRNAM(R6)	; Account for format,object type
+	MOVB	R8,ICB$B_DSTOBJ(R6)	; Enter object type
+	BNEQ	40$			; If NEQ then type is not TASK
+	MOVB	#1,ICB$B_DSTFMT(R6)	; Format type 1
+	MOVAB	NET$AB_OBJTRAN,R3	; Setup translation table
+	MOVAB	ICB$T_DSTDSC+1(R6),R8	; Setup dest. string pointer
+	MOVL	#ICB$C_RPRNAM-4,R9	; Setup size of dest. field 
+					; (-3 for DSTFMT,DSTOBJ, taskname
+					;  count and ICB$_RPRNAM fields)
+	BSBW	GET_TOKEN		; Scan blanks and move string
+	MOVQ	R7,TSK_Q_DESC		; Setup taskname descriptor
+	MOVB	R7,ICB$T_DSTDSC(R6)	; Store taskname length in ICB
+	BNEQ	30$			; If not null then good task i.d.
+	BRW	200$			; Else, illegal task i.d.
+30$:	ADDB3	#3,R7,ICB$B_RPRNAM(R6)	; Set total RPRNAM length
+	;
+	;
+	;   The connect is to object number 0.
+	;
+	;   Since there may be many OBI entries for object number 0 (TASK),
+	;   see if there is one which matches the qualifying taskname.  If so,
+	;   use it instead of the generic TASK OBI.
+	;
+	PUSHL	R10			; Save the TASK OBI
+	CLRL	R10			; Nullify OBI CNF pointer
+	$SEARCH	eql,obi,s,nam		; See if there's an OBI with this name
+	BLBC	R0,35$			; If LBC then no
+	MOVL	R10,(SP)		; Overly the OBI pointer on the stack
+35$:	POPL	OBI_PTR			; Update the official OBI pointer
+40$:	;
+	;
+	;   Setup the proxy login state for this OBI
+	;
+	MOVL	OBI_PTR,R10		; Get the OBI
+	BEQL	60$			; If EQL then none
+	$GETFLD	obi,l,prx		; Get proxy login state
+	BLBC	R0,60$			; If LBC then none
+	MOVB	R8,OBI_B_PRX		; Else override the default
+60$:	;
+	;
+	;   Setup the remote user i.d. (RID) for display purposes.  If the
+	;   target number is zero then use the taskname from the NCB.  Else,
+	;   use the object name from the OBI -- if no OBI use the object 
+	;   name/number from the NCB.
+	;
+	PUSHR	#^M<R1,R2,R3,R4,R5>	; Save regs
+	MOVQ	TSK_Q_DESC,R7		; Setup taskname descriptor assuming
+					; object type 0
+	MOVB	ICB$B_DSTOBJ(R6),R0	; Get object number
+	BEQL	80$			; If EQL then use taskname
+	MOVQ	OBJ_Q_DESC,R7		; Get object name/number descriptor
+	MOVL	OBI_PTR,R10		; Get OBI pointer
+	BEQL	80$			; If EQL none, use object name/number
+					; from NCB
+	$GETFLD	obi,s,nam		; Else use object name from NCB
+80$:	MOVB	R7,ICB$B_RID(R6)	; Setup text field length
+	MOVC5	R7,(R8),#^A" ",-	; Move the text
+		#ICB$C_RID,ICB$T_RID(R6);	
+	POPR	#^M<R1,R2,R3,R4,R5>	; Restore regs
+	;
+	;
+	;   Done, return to caller
+	;
+	MOVL	S^#SS$_NORMAL,R0	; Indicate success
+100$:	RSB				; Done
+					;
+200$:	MOVZWL	#SS$_NOSUCHOBJ,R0	; Indicate error
+	RSB				; Done
+					;
+300$:	MOVZWL	#SS$_IVDEVNAM,R0	; Assume NCB format error
+	RSB				; Done
+
+.SBTTL	PRS_END	- Parse the remainder of the NCB
+;+
+;
+; Find the link i.d. and optional data.  If none specified then this is
+; a "connect initiate".
+;
+; *** tbs ****  (R4 -> next input char,  R5 -> past end of NCB)
+;-
+PRS_END:				; Parse remainder of the NCB
+	CLRB	ICB$B_DATA(R6)		; Assume no optional data
+	CLRW	ICB$W_LOCLNK(R6)	; Assume connect initiate
+	BSBW	SCAN_BLANKS		; Scan past tabs,blanks
+	CMPB	#^A"/",(R4)		; Is the 'tail' of the NCB here
+	BEQL	5$			; If EQL yes, parse it
+	CMPB	#^A'"',(R4)		; Is NCB delimiter next?
+	BEQL	10$			; If EQL yes, check for end of NCB
+	BRW	20$			; Else NCB is malformed
+5$:	TSTB	(R4)+			; Skip over "/"
+	MOVW	(R4)+,ICB$W_LOCLNK(R6)	; Enter local link id
+	CMPB	#^A'"',(R4)		; Is NCB delimiter next ?
+	BEQL	10$			; If EQL yes, chk for legal NCB 
+	MOVZWL	#SS$_TOOMUCHDATA,R0	; Assume error
+	MOVZBL	(R4),R1			; Get optional data count field
+	CMPB	R1,#16			; Check length of optional data
+	BGTRU	20$			; Br if too long
+	INCL	R1			; Include the count field
+	PUSHR	#^M<R4,R5>		; Save critical regs
+	MOVC	R1,(R4),ICB$B_DATA(R6)	; Move optional data
+	MOVL	R1,R4			; Get next character in NCB
+	POPR	#^M<R4,R5>		; Restore regs
+	;
+	;   Check to see if the NCB is terminated correctly.  This means that 
+	;   we must be at the last character in the NCB and it must be a double
+	;   quote.  However, if the user is doing a "transparent" $ASSIGN to
+	;   SYS$NET, then there is some garbage containing local the task
+	;   specification after the optional data -- ignore it.
+	;
+	;   The actual test used to verify a correct NCB is to check that there
+	;   is a '"' character somewhere between the current pointer and the 
+	;   end of the NCB.  This is simple and more forgiving of user error.
+	;
+10$:	CMPL	R4,R5			; Are we beyond the end ?
+	BGEQU	20$			; If so, NCB format error
+	CMPB	#^A'"',(R4)+		; Is NCB delimiter there ?
+	BNEQ	10$			; If not, continue search
+	MOVL	S^#SS$_NORMAL,R0	; Indicate success
+	RSB
+
+20$:	MOVZWL	#SS$_IVDEVNAM,R0	; Signal illegal NCB
+	RSB
+
+CHECK_ACCESS:				; See if access is allowed to node
+	MOVL	NET$GL_SAVE_IRP,R3	; Get the IRP address
+	BBS	#PRV$V_OPER,-		; If user has OPER then the connect is
+		IRP$Q_NT_PRVMSK(R3),100$; always allowed -- bypass all checks
+	;
+	;
+	;   Check to see if the connect is allowed based on the state of the
+	;   local node.  
+	;
+	;	state	   Allow connect if
+	;	--------   ----------------
+	;	ON	   always
+	;	RESTRICT   if this is a connect initiate, or
+	;		   if the partner node is the local node
+	;	SHUT	   never
+	;	OFF	   never
+	;
+	;
+	MOVL	NET$GL_PTR_VCB,R0	; Get the RCB address
+	MOVZBL	RCB$B_STI(R0),R0	; Get the local node state
+	CMPB	S^#ACP$C_STA_N,R0	; Is state "ON"?
+	BEQL	10$			; If EQL yes - no local restrictions
+	CMPB	S^#ACP$C_STA_R,R0	; Is state "RESTRICTED"?
+	BNEQ	200$			; If NEQ no, connect not allowed
+	TSTW	ICB$W_REMNOD(R6)	; Is it for the local node?
+	BEQL	100$			; If EQL yes - connect OK
+	TSTW	ICB$W_LOCLNK(R6)	; Connect initiate?
+	BNEQ	200$			; If NEQ no - connect not allowed
+10$:	;
+	;
+	;   Check to see if the connect is allowed based on the local access
+	;   restrictions set for the remote node.  
+	;
+	$DISPATCH  TYPE=B,NDI_B_ACC -	;
+	<-
+	    <NMA$C_ACES_NONE, 200$> -	; No access allowed
+	    <NMA$C_ACES_INCO,  60$> -	; Inbound access allowed
+	    <NMA$C_ACES_OUTG,  50$> -	; Outbound access allowed
+	    <NMA$C_ACES_BOTH, 100$> -	; All access allowed
+	>
+	BRB	100$			; Code is not recognized, ignore it
+50$:	TSTW	ICB$W_LOCLNK(R6)	; No inbound access. Connect confirm ?
+	BNEQ	200$			; If NEQ then yes, access not allowed
+	BRB	100$			; Else report success
+60$:	TSTW	ICB$W_LOCLNK(R6)	; No outbound access. Connect initiate?
+	BEQL	200$			; If EQL then yes, access not allowed
+100$:	MOVL	S^#SS$_NORMAL,R0	; Indicate success
+	RSB
+
+200$:	;
+	;   The connection is not allowed.  Tell NETDRIVER to terminate the
+	;   link.  Return an error message to our caller.
+	;
+	MOVZWL	ICB$W_LOCLNK(R6),R3	; Setup local link number
+	MOVZWL	#NET$C_DR_SHUT,R2	; Setup disconnect reason
+	MOVL	NET$GL_SAVE_IRP,R1	; Get user's IRP
+	MOVL	IRP$L_PID(R1),R1	; Setup user's PID
+	JSB	NET$CONNECT_FAIL	; Report connect failure to NETDRIVER
+	MOVZWL	#SS$_SHUT,R0		; Signal connects not allowed
+	RSB
+
+.SBTTL	DFLT_ACCESS - Get default access control
+;+
+;
+; Use the default information from the NDI block.
+;
+;-
+DFLT_ACCESS:				; Get default access control
+	CLRB	ICB$B_ACCESS(R6)	; Init access string length
+	MOVAB	NONPRV_TAB,ACC_TAB	; Assume no privileges needed
+	MOVL	OBI_PTR,R10		; Get OBI CNF pointer
+	BNEQ	10$			; If NEQ then OBI exists
+	BRW	100$			;
+10$:	$GETFLD	obi,l,lpr		; Get the high order priv mask field
+	MOVL	R8,@NET$GL_UTLBUF	; Save the low order priority mask
+	$GETFLD	obi,l,hpr		; Get the low order priv mask field
+	MOVL	NET$GL_UTLBUF,R10	; Point to the utility buffer
+	MOVL	R8,4(R10)		; Save the high order priority mask
+
+	ASSUME	PRV$V_NETMBX	LT 32
+	ASSUME	PRV$V_TMPMBX	LT 32
+
+	BBCC	#PRV$V_TMPMBX,(R10),20$	; Zero non-priv bits
+20$:	BBCC	#PRV$V_NETMBX,(R10),30$	;
+30$:	MOVQ	(R10),R0		; Get required privilege mask
+	BEQL	40$			; If EQL then none needed
+	MOVL	NET$GL_SAVE_IRP,R3	; Get current IRP pointer
+	BICL	IRP$Q_NT_PRVMSK(R3),R0	; Test for required privileges
+	BNEQ	35$			; Br if user lacks privilege
+	BICL	IRP$Q_NT_PRVMSK+4(R3),R1; Test high order part of mask
+	BNEQ	35$			; Br if user lacks privilege
+	MOVAB	PRV_TAB,ACC_TAB		; Setup for priv access
+	BRB	40$			; Continue
+35$:	BRW	100$			; No default access control
+	;
+	;
+	;   Get NDI to use for default access control.  If no NDI is
+	;   currently specified then there's no default.
+	;
+40$:	MOVL	NET$GL_CNR_NDI,R11	; Get NDI root pointer
+	MOVL	NDI_PTR,R10		; Get NDI CNF pointer
+	BEQL	35$			; Br if no NDI block
+	;
+	;   If the NDI is a
+	;   loopnode NDI and its access control is null, use the access control
+	;   of the NDI with the matching address and which is not a loopnode
+	;   (currently this can only be the local NDI).  If there is no such
+	;   NDI then there is no default access control.
+	;
+	$GETFLD	ndi,v,loo		; Loopnode ?
+	BLBC	R8,60$			; If loopnode,
+	MOVL	@ACC_TAB,R9		; Setup first field (user) id
+	JSB	CNF$GET_FIELD		; Get the USER_ID field
+	BLBS	R0,60$			; If LBS then non-null, use it
+50$:	MOVZWL	ICB$W_REMNOD(R6),R8	; Get node address
+	CLRL	R10			; Indicate no current CNF
+	$SEARCH	 eql,ndi,l,add		; Find CNF with matching address
+	BLBC	R0,100$			; No default access if no NDI
+	$GETFLD	ndi,v,loo		; Loopnode ?
+	BLBS	R8,100$			; If LBS its a loopnode - can't use it
+					; Loop nodes are stored in the list 
+					; last and so there's no use searching
+					; any further
+60$:	;
+	;   If this connect is for the local node, and we have determined
+	;   that the non-privileged account is to be used, then don't provide
+	;   any default outbound access control, but instead, rely on the
+	;   access control being defaulted on the incoming side.  This is
+	;   to avoid conflict with the proxy mechanism for executor connects.
+	;
+	TSTW	CNF$W_ID(R10)		; Is this the local node?
+	BNEQ	70$			; Skip if not
+	MOVAB	NONPRV_TAB,R0		; Get address of non-priv param table
+	CMPL	ACC_TAB,R0		; Is connect non-priv or privileged?
+	BEQL	100$			; If local non-priv connect, no default
+70$:	;
+	;
+	;   Move access control strings
+	;
+	PUSHR	#^M<R4,R5>		; Save critical regs
+	MOVAB	ICB$T_ACCESS(R6),R3	; Get output pointer
+80$:	MOVL	@ACC_TAB,R9		; Get field i.d.
+	BEQL	90$			; Done if EQL
+	ADDL	#4,ACC_TAB		; Bump the pointer
+	JSB	CNF$GET_FIELD		; Get the string descriptor
+	ADDB	R7,ICB$B_ACCESS(R6)	; Update total size
+	INCB	ICB$B_ACCESS(R6)	; Account for count byte
+	CMPB	#ICB$C_ACCESS,-		; Can it fit ?
+		ICB$B_ACCESS(R6)	;
+	BLSS	200$			; If LSS no, must be bug
+	MOVB	R7,(R3)+		; Enter count field
+	BEQL	80$			; If EQL then get next string
+	MOVC3	R7,(R8),(R3)		; Enter string
+	BRB	80$			; Loop
+90$:	POPR	#^M<R4,R5>		; Restore regs
+					;
+100$:	MOVL	S^#SS$_NORMAL,R0	; Always successful
+	RSB
+
+200$:	BUG_CHECK NETNOSTATE,FATAL	; Bugcheck
+
+.SBTTL	GET_STR_NUM - Get next numeric token
+;+
+;
+; The next string is scanned until the first non-numeric, non-alphabetic
+; ascii character.  All lower case alphabetics are converted to upper
+; case.  Leading blanks and tabs are skipped.  If the string contains
+; all ascii numeric characters, it is converted from its ascii-decimal
+; form to binary.
+;
+; INPUTS:	R9  Maximum allowed output length
+;		R8  Pointer to input buffer
+;
+;		R7,R3-R0 Scratch
+;
+; OUTPUTS:	R7  Number of characters in output buffer
+;		R4  Pointer to next unparsed byte in input stream
+;		R3  Garbage
+;		R2  Converted ascii value if R1 has low bit set,
+;		    zero if R7=0
+;		R1  Low bit set if string was all numeric or null
+;		R0  Garbage
+;
+;		All other registers are preserved.
+;-
+GET_STR_NUM:				; Get string or number
+	MOVAB	NET$AB_UPASCNUM,R3	; Setup translation table
+	BSBB	GET_TOKEN		; Get the translated string
+	CLRL	R2			; Zero string converted value
+	MOVL	R7,R1			; Any characters in moved ?
+	BEQL	15$			; Br if none moved
+	MOVL	R8,R3			; Get ptr to first character 
+10$:	SUBB3	#^A"0",(R3)+,R0		; Get binary of character
+	BLSS	20$			; Br if non-numeric
+	CMPB	R0,#9			; Test upper bound
+	BGTR	20$			; Br if non-numeric
+	MOVZBL	R0,R0			; Zero garbage bytes
+	MULL	#10,R2			; Multiply old value by ten
+	ADDL	R0,R2			; and add new increment
+	SOBGTR	R1,10$			; Loop for each character
+15$:	INCL	R1			; Flag 'all numeric string'
+	RSB
+20$:	CLRL	R1			; Flag 'non-numeric'
+	RSB
+
+.SBTTL	GET_TOKEN - Get next token
+;+
+;
+; The input stream is scanned until a delimiter is found.  A delimiter
+; is defined as any character which the translation table translates
+; to a zero.  The input pointer is advanced up to, but not past, the
+; delimiter.  All leading blanks and tabs are skipped over.
+;
+; INPUTS:  R9	  Max size of input string
+;	   R8	  Address of buffer to receive output
+;	   R7	  Scratch
+;	   R6	  ICB pointer
+;	   R5	  Points past NCB
+;	   R4	  Next character in input string
+;	   R3	  Translation table address
+;	   R2-R0  Scratch
+;
+; OUTPUTS: R7	  Number of characters in output buffer
+;	   R4	  Points to first unmoved character
+;	   R2-R0  Garbage
+;
+;	   All other registers are preserved.
+;-
+GET_TOKEN:				; Move input up to delimiter
+	BSBB	SCAN_BLANKS		; Skip blanks and tabs
+	PUSHL	R5			; Protect regs form MOVTUC
+	SUBL3	R4,R5,R0		; Get bytes left in input stream
+	MOVTUC	R0,(R4),#0,(R3),R9,(R8)	; Translate/move the string
+	MOVL	R1,R4			; Get input stream pointer
+	SUBL3	R8,R5,R7		; Get # of bytes moved
+	POPL	R5			; Recover regs
+	RSB
+;+
+; SCAN_BLANKS - Skip over blank and tab characters
+;
+; The input stream is advanced to the first non blank/tab character.
+;
+; INPUTS:  R5	Points to first character beyond input stream
+;	   R4	Points to next character in input stream
+; OUTPUTS: R4	Points to next non blank/tab character in input stream
+;-
+			.ENABL	LSB
+10$:	CMPL	R4,R5			; At the end of input stream ?
+	BGEQU	20$			; If so, branch
+	INCL	R4			; Advance input pointer
+
+SCAN_BLANKS:				; Skip over blanks and tabs
+	TSTB	(R4)			; Is character null?
+	BEQL	10$			; If so, skip it
+	CMPB	#SPACE,(R4)		; Is character a space ?
+	BEQL	10$			; If so then loop
+	CMPB	#TAB,(R4)		; Is it a tab ?
+	BEQL	10$			; If so then loop
+20$:	RSB
+			.DSABL	LSB
+
+.END

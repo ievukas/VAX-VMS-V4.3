@@ -1,0 +1,675 @@
+MODULE object		(IDENT='V04-000',
+			ADDRESSING_MODE(EXTERNAL=GENERAL))
+= BEGIN
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! Facility:	Command Definition Utility, Object File Module
+!
+! Abstract:	This module contains the routines necessary to create a
+!		object file from a set of CLDs.  Once the CLDs are compiled,
+!		the resulting tables are transformed into an object records
+!		and placed in a file.
+!
+! Environment:	Standard CDU environment.
+!
+! Author:	Paul C. Anagnostopoulos
+! Creation:	24 January 1983
+!
+! Modifications:
+!
+!	V04-001	KPL0001		Peter Lieberwirth	28-Jun-1984
+!		Record Attributes of object module should be NULL, not
+!		CR, for consistency with all other object modules.
+!
+!--
+
+
+library 'sys$library:lib';
+require 'clitabdef';
+require 'cdureq';
+
+!	T A B L E   O F   C O N T E N T S
+!	---------   ---   ---------------
+
+forward routine
+	cdu$prepare_object_file: novalue,
+	cdu$write_object_file: novalue,
+	write_header_records: novalue,
+	write_global_symbol_record: novalue,
+	write_psect_record: novalue,
+	write_table_records: novalue,
+	write_user_routine_records: novalue,
+	write_eom_record: novalue;
+
+
+!	E X T E R N A L   R E F E R E N C E S
+!	---------------   -------------------
+
+external routine
+	cdu$collect_table_blocks,
+	cdu$lookup_child,
+	cdu$report_rms_error,
+	cli$get_value,
+	lib$free_vm,
+	lib$get_vm;
+
+external
+	cdu$facility_string: descriptor,
+	cdu$gl_root_node: ref node,
+	cdu$gl_table: pointer;
+
+$shr_msgdef(cdu,17,local,
+	(openout,severe),
+	(writeerr,severe)
+	);
+
+!	O B J E C T   F I L E   C O N T R O L   B L O C K S
+!	-----------   -------   -------------   -----------
+
+! The following items define the RMS control blocks needed to create and 
+! write the object file.
+
+own
+	object_related_rsa: block[nam$c_maxrss,byte],
+	object_related_nam: $nam(),
+
+	object_esa: block[nam$c_maxrss,byte],
+	object_rsa: block[nam$c_maxrss,byte],
+	object_nam: $nam(
+			esa=object_esa,
+			ess=%allocation(object_esa),
+			rlf=object_related_nam,
+			rsa=object_rsa,
+			rss=%allocation(object_rsa)
+			),
+
+	dbuffer(object_spec,nam$c_maxrss),
+	object_fab: $fab(
+			dnm='.OBJ',
+			fna=object_spec+8,
+			fns=%allocation(object_spec)-8,
+			fac=put,
+			fop=<sqo,nam,ofp>,
+			nam=object_nam,
+			org=seq,
+			rfm=var
+			),
+
+	object_rab: $rab(
+			fab=object_fab,
+			rac=seq,
+			rop=wbh
+			);
+
+!++
+! Description:	This routine is called to prepare the object file for
+!		writing of the object records.  All we do is save enough
+!		information so that we can create it after the CLDs are
+!		compiled.
+!
+! Parameters:	cld_fab		By reference, the FAB used to read the first
+!				CLD file.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$prepare_object_file(cld_fab: pointer)	: novalue
+= BEGIN
+
+bind
+	cld_nam = .cld_fab[fab$l_nam]: block[,byte];
+
+
+! We don't want to create the object file now, because the CLDs may have
+! errors and we'll end up with a null file.  However, we do want to save
+! the NAM block and resultant strings from the CLDs so we can used them as
+! the related name when we create the object file.
+
+ch$move(.cld_nam[nam$b_bln],cld_nam, object_related_nam);
+ch$move(.cld_nam[nam$b_rss],.cld_nam[nam$l_rsa], object_related_rsa);
+
+return;
+
+END;
+
+!++
+! Description:	This routine is called after all the CLD files have been
+!		compiled.  It is responsible for creating and writing the
+!		object file containing all of the generated table blocks,
+!		along with related descriptive information.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$write_object_file	: novalue
+= BEGIN
+
+local
+	status: long,
+	final_area: pointer;
+
+
+! Begin by creating the object file.  Get any value specified on the /OBJECT
+! qualifier to use as the spec for the object file.
+
+cli$get_value(dtext('OBJECT'),object_spec);
+
+! Create and connect to the object file.  Any errors are fatal.
+
+status = $create(fab=object_fab);
+if not .status then
+	cdu$report_rms_error(msg(cdu$_openout),object_fab);
+status = $connect(rab=object_rab);
+if not .status then
+	cdu$report_rms_error(msg(cdu$_openout),object_rab);
+
+! Write the header records.
+
+write_header_records();
+
+! Write the global symbol definition record.
+
+write_global_symbol_record();
+
+! Allocate a large area to contain the final CLI table.  Collect all of the
+! table blocks into that area.
+
+status = lib$get_vm(cdu$gl_table[vec_l_table_size], final_area);
+check(.status, .status);
+cdu$collect_table_blocks(.final_area);
+
+! Write the PSECT definition record.
+
+write_psect_record();
+
+! Write the table blocks themselves.
+
+write_table_records();
+
+! Write the records needed to define and store user routine addresses.
+
+write_user_routine_records();
+
+! Write the end-of-module record.
+
+write_eom_record();
+
+return;
+
+END;
+
+!++
+! Description:	This routine is responsible for writing the header records
+!		in the object file.  We write the mandatory module record,
+!		along with a language name record.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+ROUTINE write_header_records	: novalue
+= BEGIN
+
+local
+	status: long,
+	hdr: block[256,byte],
+	variable_ptr: pointer,
+	child: ref node,
+	work_dsc: descriptor;
+
+
+! Set up the fixed portion of a module header record.
+
+hdr[obj$b_rectyp] = obj$c_hdr;
+hdr[mhd$b_hdrtyp] = mhd$c_mhd;
+hdr[mhd$b_strlvl] = obj$c_strlvl;
+hdr[mhd$w_recsiz] = obj$c_maxrecsiz;
+
+! Now we want to include the module name.  If there is a MODULE statement
+! in the CLD, use it.  Otherwise use the name of the object file.  While
+! we're at it, set up a pointer to the next available byte in the header.
+
+child = cdu$lookup_child(.cdu$gl_root_node,node_k_module);
+if .child neqa 0 then (
+	ch$move(1+.child[node_b_text_length],child[node_b_text_length], hdr[mhd$b_namlng]);
+	variable_ptr = hdr[mhd$t_name] + .child[node_b_text_length];
+) else (
+	hdr[mhd$b_namlng] = .object_nam[nam$b_name];
+	ch$move(.object_nam[nam$b_name],.object_nam[nam$l_name], hdr[mhd$t_name]);
+	variable_ptr = hdr[mhd$t_name] + .object_nam[nam$b_name];
+);
+
+! Now we want to include the module ident string.  If there is an IDENT
+! statement, then use it.  Otherwise use a string of "0-0".
+
+child = cdu$lookup_child(.cdu$gl_root_node,node_k_ident);
+if .child neqa 0 then (
+	ch$move(1+.child[node_b_text_length],child[node_b_text_length], .variable_ptr);
+	variable_ptr = .variable_ptr + 1+.child[node_b_text_length];
+) else (
+	ch$move(4,ctext('0-0'), .variable_ptr);
+	variable_ptr = .variable_ptr + 4;
+);
+
+! Finally, we want to include the current date and time.
+
+build_descriptor(work_dsc,17,.variable_ptr);
+status = $asctim(timbuf=work_dsc);
+check(.status, .status);
+variable_ptr = .variable_ptr + 17;
+
+! Write the module header into the object file.  Any error is fatal.
+
+object_rab[rab$l_rbf] = hdr;
+object_rab[rab$w_rsz] = .variable_ptr - hdr;
+status = $put(rab=object_rab);
+if not .status then
+	cdu$report_rms_error(msg(cdu$_writeerr),object_rab);
+
+! Set up the fixed portion of a language name record.
+
+hdr[obj$b_rectyp] = obj$c_hdr;
+hdr[mhd$b_hdrtyp] = mhd$c_lnm;
+
+! Move in our language name.
+
+ch$move(.cdu$facility_string[len],.cdu$facility_string[ptr], hdr + 2);
+
+! Write the language name record in the object file.
+
+object_rab[rab$w_rsz] = 2 + .cdu$facility_string[len];
+status = $put(rab=object_rab);
+if not .status then
+	cdu$report_rms_error(msg(cdu$_writeerr),object_rab);
+
+return;
+
+END;
+
+!++
+! Description:	This routine is responsible for writing a global symbol
+!		directory record to define the global symbol naming the
+!		table.  This name is used in CLI calls to reference
+!		this table after it is linked with an image.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+ROUTINE write_global_symbol_record		: novalue
+= BEGIN
+
+local
+	status: long,
+	gsd: block[256,byte],
+	child: ref node;
+
+bind
+	gsd_sym = gsd + 1: block[,byte];
+
+
+! Set up the fixed portion of the record.
+
+gsd[obj$b_rectyp] = obj$c_gsd;
+gsd_sym[sdf$b_gsdtyp] = gsd$c_sym;
+gsd_sym[sdf$b_datyp] = 0;
+gsd_sym[sdf$w_flags] = gsy$m_def + gsy$m_rel;
+gsd_sym[sdf$b_psindx] = 0;
+gsd_sym[sdf$l_value] = 0;
+
+! Now we want the module name as the symbol.  If there is a MODULE statement
+! in the CLD, use it.  Otherwise use the name of the object file.
+
+child = cdu$lookup_child(.cdu$gl_root_node,node_k_module);
+if .child neqa 0 then
+	ch$move(1+.child[node_b_text_length],child[node_b_text_length],
+		gsd_sym[sdf$b_namlng])
+else (
+	gsd_sym[sdf$b_namlng] = .object_nam[nam$b_name];
+	ch$move(.object_nam[nam$b_name],.object_nam[nam$l_name],
+		gsd_sym[sdf$t_name]);
+);
+
+! Write the record into the object file.  Any error is fatal.
+
+object_rab[rab$l_rbf] = gsd;
+object_rab[rab$w_rsz] = 1 + 9 + 1+.gsd_sym[sdf$b_namlng];
+status = $put(rab=object_rab);
+if not .status then
+	cdu$report_rms_error(msg(cdu$_writeerr),object_rab);
+
+return;
+
+END;
+
+!++
+! Description:	This routine is responsible for writing the psect definition
+!		record, which defines the psect in which all the blocks reside.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+ROUTINE write_psect_record		: novalue
+= BEGIN
+
+local
+	status: long,
+	gsd: block[256,byte];
+
+bind
+	gsd_psc = gsd + 1: block[,byte];
+
+
+! Set up the fixed portion of the psect record.  We get the psect size out
+! of the primary vector block.
+
+gsd[obj$b_rectyp] = obj$c_gsd;
+gsd_psc[gps$b_gsdtyp] = gsd$c_psc;
+gsd_psc[gps$b_align] = 2;
+gsd_psc[gps$w_flags] = gps$m_pic + gps$m_rel + gps$m_rd;
+gsd_psc[gps$l_alloc] = .cdu$gl_table[vec_l_table_size];
+
+! Now we want the psect name.
+
+begin
+bind
+	name = ctext('CLI$TABLES'): vector[,byte];
+
+ch$move(1+.name[0],name[0], gsd_psc[gps$b_namlng]);
+end;
+
+! Write the psect definition record into the object file.  Errors are fatal.
+
+object_rab[rab$l_rbf] = gsd;
+object_rab[rab$w_rsz] = 1 + 8 + 1+.gsd_psc[gps$b_namlng];
+status = $put(rab=object_rab);
+if not .status then
+	cdu$report_rms_error(msg(cdu$_writeerr),object_rab);
+
+return;
+
+END;
+
+!++
+! Description:	This routine is called to write a sequence of TIR records
+!		containing the table blocks.  The blocks are packed
+!		together, resulting in a minimum number of records.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:	We assume the table blocks have been collected into a final,
+!		contiguous area.
+!--
+
+ROUTINE write_table_records	: novalue
+= BEGIN
+
+local
+	status: long,
+	tir: block[obj$c_maxrecsiz,byte],
+	table_offset: long,
+	command: pointer,
+	command_length: long;	
+
+
+! Initialize the type byte of the TIR record.
+
+tir[obj$b_rectyp] = obj$c_tir;
+
+! Write out the following sequence of TIR commands, which will set the
+! location counter to the beginning of the psect.
+!
+!	stack address of beginning of psect
+!	set location counter
+!
+! Any error is fatal.
+
+tir[1,0,8,0] = tir$c_sta_pb;
+tir[2,0,8,0] = 0;
+tir[3,0,8,0] = 0;
+tir[4,0,8,0] = tir$c_ctl_setrb;
+object_rab[rab$l_rbf] = tir;
+object_rab[rab$w_rsz] = 1 + 3 + 1;
+status = $put(rab=object_rab);
+if not .status then
+	cdu$report_rms_error(msg(cdu$_writeerr),object_rab);
+
+! Sit in a loop, going through once for each TIR record.  The table offset
+! pointer will advance along the CLI table as we write it out.
+
+table_offset = 0;
+do (
+
+	! Initialize the command pointer, which will advance along the TIR
+	! record, to point past the type byte.
+
+	command = tir + 1;
+
+	! Each TIR record contains a sequence of Store Immediate commands.
+	! Loop once for each command.
+
+	incru i from 1 to obj$c_maxrecsiz / 129 do (
+
+		! The Store Immediate command is the negative of the length
+		! of the bytes being stored.  That's 128 bytes unless we are
+		! at the end of the table.
+
+		command_length = minu(128, .cdu$gl_table[vec_l_table_size]-.table_offset);
+		command[0,0,8,1] = -.command_length;
+
+		! Copy the table bytes following the Store Immediate
+		! command.
+
+		ch$move(.command_length,.cdu$gl_table+.table_offset, command[1,0,0,0]);
+
+		! Advance the table offset and the command pointer.
+
+		table_offset = .table_offset + .command_length;
+		command = .command + 1+.command_length;
+
+		! If we've finished copying the table, then get out of this
+		! loop.
+
+		if .table_offset eqlu .cdu$gl_table[vec_l_table_size] then exitloop;
+	);
+
+	! Write the TIR record.  Any error is fatal.
+
+	object_rab[rab$w_rsz] = .command - tir;
+	status = $put(rab=object_rab);
+	if not .status then
+		cdu$report_rms_error(msg(cdu$_writeerr),object_rab);
+
+	! Loop until we have written the entire table.
+
+) until .table_offset eqlu .cdu$gl_table[vec_l_table_size];
+
+return;
+
+END;
+
+!++
+! Description:	This routine is called to write out the records needed to
+!		declare and store the references to user routines which
+!		handle verbs.  These routines are specified by ROUTINE
+!		clauses in the CLD and must be resolved by the Linker.
+!
+!		The task is accomplished by traversing all of the table
+!		blocks looking for command blocks which specify user
+!		routines.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+ROUTINE write_user_routine_records		: novalue
+= BEGIN
+
+local
+	status: long,
+	a_block: pointer,
+	obj: block[256,byte];
+bind
+	gsd_sym = obj + 1: block[,byte];
+
+
+! Loop through each of the table blocks, one at at a time.  When a command
+! block with a user routine handler is encoutered, then we have to do some
+! work.
+
+a_block = .cdu$gl_table;
+while .a_block lssa .cdu$gl_table + .cdu$gl_table[vec_l_table_size] do (
+
+	if .a_block[vec_b_type] eqlu block_k_command then if
+	   .a_block[cmd_b_handler] eqlu cmd_k_user	 then (
+
+		bind
+			symbol = .a_block + .a_block[cmd_w_image]+4: vector[,byte];
+
+		! First we must generate a GSD record to declare the user
+		! routine address.  The symbol for this address is stored in
+		! the command block at the offset specified by the image BRO
+		! (plus four for the reference longword).
+
+		! Set up the fixed portion of the record.
+
+		obj[obj$b_rectyp] = obj$c_gsd;
+		gsd_sym[srf$b_gsdtyp] = gsd$c_sym;
+		gsd_sym[srf$b_datyp] = 0;
+		gsd_sym[srf$w_flags] = 0;
+
+		! Move the symbol into the record.
+
+		ch$move(1+.symbol[0],symbol[0], gsd_sym[srf$b_namlng]);
+
+		! Write the record into the object file.  Any error is fatal.
+
+		object_rab[rab$l_rbf] = obj;
+		object_rab[rab$w_rsz] = 1 + 4 + 1+.symbol[0];
+		status = $put(rab=object_rab);
+		if not .status then
+			cdu$report_rms_error(msg(cdu$_writeerr),object_rab);
+
+		! Now we have to write a TIR record with the following sequence
+		! of commands to store the user routine address in the command
+		! block.
+		!
+		!	stack address of user routine reference longword
+		!	set location counter
+		!	stack address of user routine
+		!	store PIC data reference
+
+		! Build the fixed portion of the commands.
+
+		obj[obj$b_rectyp] = obj$c_tir;
+		obj[1,0,8,0] = tir$c_sta_pl;
+		obj[2,0,8,0] = 0;
+		obj[3,0,32,0] = .a_block - .cdu$gl_table + .a_block[cmd_w_image];
+		obj[7,0,8,0] = tir$c_ctl_setrb;
+		obj[8,0,8,0] = tir$c_sta_gbl;
+
+		! Move the symbol in as the operand of the stack global.
+
+		ch$move(1+.symbol[0],symbol[0], obj[9,0,0,0]);
+
+		! Finish the command sequence.
+
+		obj[9 + 1+.symbol[0],0,8,0] = tir$c_sto_pidr;
+
+		! Write the record into the object file.  Any error is fatal.
+
+		object_rab[rab$w_rsz] = 1 + 6 + 1 + 1+1+.symbol[0] + 1;
+		status = $put(rab=object_rab);
+		if not .status then
+			cdu$report_rms_error(msg(cdu$_writeerr),object_rab);
+	);
+
+	! Move on to the next table block.
+
+	a_block = .a_block + .a_block[vec_w_size];
+);
+
+return;
+
+END;
+
+!++
+! Description:	This routine is responsible for writing the end-of-module
+!		record at the end of the object file.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+ROUTINE write_eom_record	: novalue
+= BEGIN
+
+local
+	status: long,
+	eom: block[256,byte];
+
+! Format the end-of-module record.
+
+eom[obj$b_rectyp] = obj$c_eom;
+eom[eom$b_comcod] = 0;
+
+! Write the record.  All errors are fatal.
+
+object_rab[rab$l_rbf] = eom;
+object_rab[rab$w_rsz] = 2;
+status = $put(rab=object_rab);
+if not .status then
+	cdu$report_rms_error(msg(cdu$_writeerr),object_rab);
+
+return;
+
+END;
+END
+ELUDOM

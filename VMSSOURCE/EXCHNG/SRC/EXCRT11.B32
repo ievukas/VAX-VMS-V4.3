@@ -1,0 +1,2326 @@
+MODULE	exch$rt11				%TITLE 'RT11 file and directory routines'
+		(
+		IDENT = 'V04-000',
+		ADDRESSING_MODE (EXTERNAL=LONG_RELATIVE, NONEXTERNAL=WORD_RELATIVE)
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:	EXCHANGE - Foreign volume interchange facility
+!
+! ABSTRACT:	RT-11 volume specific routines
+!
+! ENVIRONMENT:	VAX/VMS User mode
+!
+! AUTHOR:	CW Hobbs		CREATION DATE: 26-Aug-1982
+!
+! MODIFIED BY:
+!
+!	V03-004	CWH3004		CW Hobbs		25-Jul-1984
+!		Move logic check 175 to after a test for global caching,
+!		since globally cached write-locked volumes were hitting
+!		the trap.
+!
+!	V03-003	CWH3003		CW Hobbs		12-Apr-1984
+!		Disable message about recovering devices, and force
+!		/TRANSFER=BLOCK to be global
+!
+!	V03-002	CWH9001		CW Hobbs		30-Apr-1983
+!		Remove debugging call accidentally checked in.
+!
+!--
+
+! Include files:
+!
+MACRO $module_name_string = 'exch$rt11' %;	! The require file needs to know our module name
+REQUIRE 'SRC$:EXCREQ'				! Facility-wide require file
+    ;
+
+%SBTTL 'Module table of contents'
+
+! Module table of contents:
+!
+FORWARD ROUTINE
+    exch$rt11_bad_file	: NOVALUE,		! Create a bad file over a bad spot on the volume
+    exch$rt11_close_file,			! RT-11 specific file close routine
+    exch$rt11_create_file,			! RT-11 volume file create
+    exch$rt11_delete_file,			! RT-11 specific file delete routine
+    exch$rt11_dircache_exit_handler : NOVALUE,	! Routine to flush the cache
+    exch$rt11_dircache_start	: NOVALUE,	! Engage write-back caching on the directory
+    exch$rt11_dircache_stop	: NOVALUE,	! Disengage caching and flush the directory
+    exch$rt11_dirseg_flush,			! Write out directory segments
+    exch$rt11_dirseg_get,			! Return pointer to specific directory segment
+    exch$rt11_dirseg_get_nochk	: jsb_r1r2,	! Return pointer to directory segment without checking
+    exch$rt11_dirseg_put,			! Write a specific directory segment
+    exch$rt11_expand_filename,			! Convert directory entry to ASCII filename
+    exch$rt11_format_current_date : NOVALUE jsb_r1,	! Put the current date into a directory entry
+    exch$rt11_mount,				! RT-11 specific volume mount routine
+    exch$rt11_open_file,			! RT-11 specific file open routine
+    exch$rt11_write_cleanup	: NOVALUE,	! Finish writing to the volume
+    exch$rt11_write_prepare	: NOVALUE,	! Prepare to write to the volume
+    exch$rt11_zero_marks	: NOVALUE	! Clear marks on volume
+    ;
+
+! EXCHANGE facility routines
+!
+EXTERNAL ROUTINE
+    exch$cmd_fetch_recfmt_implied : NOVALUE,	! Get or assume the value for /RECORD_FORMAT
+    exch$cmd_match_filename,			! Compare expanded file names for match
+    exch$cmd_related_file_parse,		! Build an output file name
+    exch$io_rt11_read,				! Read blocks from a random access device
+    exch$io_rt11_write,				! Write blocks to a random access device
+    exch$pdp_filter_filename,			! Remove invalid characters from a filename
+    exch$pdp_flush_write_buffer,		! Flush any records waiting in the write buffer
+    exch$pdp_get,				! Get functions for small PDP record structure
+    exch$pdp_put,				! Put functions for small PDP record structure
+    exch$rtacp_check_position : NOVALUE,	! Find directory entry if it has moved
+    exch$rtacp_clean_directory,			! Shuffle and/or split directories as needed
+    exch$rtacp_find_empty_area,			! Compress directory structure and find free space
+    exch$rtacp_find_file,			! RT-11 directory search routine
+    exch$rtacp_verify_directory,		! Verify directory structure and compute volume size
+    exch$util_fao_buffer,			! Do an FAO conversion
+    exch$util_file_error,			! Signal an RMS error
+    exch$util_radix50_from_ascii,		! Convert characters to Radix-50 from Ascii
+    exch$util_radix50_to_ascii,			! Convert characters from Radix-50 to Ascii
+    exch$util_rt11ctx_allocate,			! Get an RT-11 context block
+    exch$util_rt11ctx_release	: NOVALUE,	! Give it back
+    exch$util_vm_allocate,			! Get some virtual memory
+    exch$util_vm_allocate_zeroed,		! Get some virtual memory, initialized to zero
+    exch$util_vm_release			! Return some virtual memory
+    ;
+
+! Equated symbols:
+!
+!LITERAL
+!    ;
+
+! Bound declarations:
+!
+!BIND
+!    ;
+
+GLOBAL ROUTINE exch$rt11_bad_file (filb : $ref_bblock) : NOVALUE =	%SBTTL 'exch$rt11_bad_file (filb)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Perform RT-11 bad block handling by placing a FILE.BAD file over the bad block.  This routine will be 
+!	called when a bad block is detected on the output file during a copy operation.  We assume that there is
+!	a zero-block empty file entry following the current entry.
+!
+!	One of the following actions will be taken:
+!
+!	   The bad block is the first block in the output file:
+!			The output file is renamed to a 1 block FILE.BAD and made permanent.  Remaining blocks are
+!			moved to the empty file.  (Single block files are treated as this case)
+!
+!	   The bad block is in the middle of the output file:
+!			The output file will be left as a tentative file.  If there is room for another entry in
+!			the current directory segment, then a 1 block FILE.BAD is created and the remaining free
+!			blocks are moved to a newly created empty file.  If there is no room to add an entry, the
+!			FILE.BAD will contain all the free blocks in addition to the one known to be bad.
+!
+!	   The bad block is at the end of the file:
+!			The output file will be left as a tentative file, and a 1 block FILE.BAD will be created.
+!
+! INPUT/OUTPUT:
+!
+!	filb - pointer to block describing the file
+!
+! IMPLICIT INPUTS:
+!
+!	things hanging from the filb, notably the bad block number is in RAB$L_BKT in the volb rab.
+!
+! OUTPUTS:
+!
+!	filb - receive info pertaining to the file to be closed
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('exch$rt11_bad_file> ');
+
+LOCAL
+    bad_pbn,					! pbn of the bad block
+    blks_before,				! blocks before the bad block
+    blks_after,					! blocks after the bad one
+    ent_len,					! length of a directory entry
+    emp : $ref_bblock,				! pointer to the empty entry after this one
+    eos : $ref_bblock,				! pointer to the end of segment marker
+    status
+    ;
+
+BIND
+    copy = exch$a_gbl [excg$a_copy_work]: $ref_bblock,
+    ctx  = filb [filb$a_context]	: $ref_bblock,
+    namb = filb [filb$a_assoc_namb]	: $ref_bblock,
+    volb = filb [filb$a_assoc_volb]	: $ref_bblock,
+    rab  = volb [volb$a_rab]		: $ref_bblock,
+    seg  = ctx [rt11ctx$a_seg_address]	: $ref_bblock,	! pointer to the directory segment
+    ent  = ctx [rt11ctx$a_ent_address]	: $ref_bblock	! and the directory entry for this file
+    ;
+
+$debug_print_lit ('entry');
+
+$block_check (2, .filb, filb, 565);			!?? definitely over-zealous checking
+$block_check (2, .namb, namb, 566);
+$block_check (2, .volb, volb, 567);
+$block_check (2, .ctx, rt11ctx, 568);
+$logic_check (2, (.ctx [rt11ctx$a_assoc_filb] EQL .filb), 217);
+$logic_check (2, (.ctx [rt11ctx$a_assoc_volb] EQL .volb), 218);
+$logic_check (2, (.ctx [rt11ctx$v_output_file]), 219);
+$logic_check (3, (exch$rtacp_verify_directory (.volb)), 220);
+
+! The bad block number is sitting in the rab
+!
+bad_pbn = .rab [rab$l_bkt];
+IF .volb [volb$v_virtual]			! Undo pbn -> vbn mapping
+THEN
+    bad_pbn = .bad_pbn - 1;
+$logic_check (2, ((.bad_pbn GEQU .ctx [rt11ctx$l_start_block]) AND (.bad_pbn LEQU .ctx [rt11ctx$l_eof_block])), 221);
+$trace_print_fao ('bad_pbn !UL', .bad_pbn);
+
+! Let the outer routines know that we have erased this file
+!
+filb [filb$v_file_erased] = true;
+
+! Get the pointer to the empty entry after this one
+!
+ent_len = rt11ent$k_length + .seg [rt11hdr$w_extra_bytes];
+emp = .ent + .ent_len;
+$logic_check (3, ((.emp [rt11ent$b_type_byte] EQL rt11ent$m_typ_empty) AND (.emp [rt11ent$w_blocks] EQL 0)), 222);
+$logic_check (3, ((.ent [rt11ent$v_type] EQL rt11ent$m_typ_tentative) AND (.ent [rt11ent$w_blocks] NEQ 0)), 223);
+
+! A structured GOTO follows.  EXITLOOPs will be used to rejoin common code at the end of the routine
+!
+WHILE 1
+DO
+    BEGIN
+
+    ! How many blocks were written before the bad block
+    !
+    blks_before = .bad_pbn - .ctx [rt11ctx$l_start_block];
+
+    ! If blocks before is zero, we can tie this off right now
+    !
+    IF .blks_before EQL 0
+    THEN
+	BEGIN
+
+	! Move any remaining blocks to the empty entry
+	!
+	emp [rt11ent$w_blocks] = .ent [rt11ent$w_blocks] - 1;
+
+	! Create a one block permanent FILE.BAD in the entry
+	!
+	ent [rt11ent$w_blocks] = 1;
+
+	$exch_signal (exch$_rt11_badfile, 1, .bad_pbn);		! Tell the guy that we made a .BAD file
+
+	EXITLOOP;				! Done here, jump to the end to fill in the rest of the bad file
+	END;
+
+    ! How many blocks are after the bad one
+    !
+    blks_after = .ctx [rt11ctx$l_eof_block] - .bad_pbn;
+
+    ! If blocks after is zero, we can also do the work and exit
+    !
+    IF .blks_before EQL 0
+    THEN
+	BEGIN
+
+	! Remove one block from the tentative file
+	!
+	ent [rt11ent$w_blocks] = .ent [rt11ent$w_blocks] - 1;
+
+	! Move the empty pointer to the ent pointer, where the common code expects to find the bad entry
+	!
+	ent = .emp;
+
+	! Create a one block permanent FILE.BAD in the empty entry
+	!
+	ent [rt11ent$w_blocks] = 1;
+
+	$exch_signal (exch$_rt11_badfile, 1, .bad_pbn);		! Tell the guy
+
+	EXITLOOP;
+	END;
+
+    ! OK, the bad block is in the middle of the tentative file.  We have two choices now, depending on whether we
+    ! have room in the segment to add another file entry.  First, find the end of segment marker.
+    !
+    eos = .emp;					! Point to the empty entry
+    WHILE 1
+    DO
+	BEGIN
+	eos = .eos + .ent_len;			! Advance to the next entry
+	$logic_check (2, (.eos LSSU (.seg + rt11$k_dirseglen)), 224);
+	IF .eos [rt11ent$v_type] EQL rt11ent$m_typ_end_segment
+	THEN
+	    EXITLOOP
+	END;
+
+    ! Make sure that there is room to add one more entry to this segment.  If not, we will have to add a big bad file
+    !
+    IF ((.eos+2 + .ent_len) GEQU (.seg + rt11$k_dirseglen))
+    THEN
+	BEGIN
+
+	! Make the tentative file include all the blocks before the bad one
+	!
+	ent [rt11ent$w_blocks] = .blks_before;
+
+	! Move the empty pointer to the ent pointer, where the common code expects to find the bad entry
+	!
+	ent = .emp;
+
+	! Put the rest in a permanent FILE.BAD in the empty entry
+	!
+	ent [rt11ent$w_blocks] = .blks_after + 1;
+
+	$exch_signal (exch$_rt11_badfile, 1, .bad_pbn, exch$_rt11_bigbadfile);	! Tell the guy the bad news
+
+	EXITLOOP;
+	END
+
+    ! Room for another entry, make it <TENT> <BAD> <EMPTY>
+    !
+    ELSE
+	BEGIN
+	LOCAL
+	    sl;
+
+	! Slide the rest of the segment up one entry to make room for the new entry
+	!
+	sl = .eos+2 - .emp;				! Length of segment between empty and end
+	CH$MOVE (.sl, .emp, .emp + .ent_len);	! Slide rest of segment up
+
+	! Finish up the tentative entry
+	!
+	ent [rt11ent$w_blocks] = .blks_before;
+
+	! Point "ent" at the bad entry and "emp" at the new empty
+	!
+	ent = .emp;
+	emp = .emp + .ent_len;
+
+	! Finish up the new empty entry.  Since we slid the old empty up, all we need to do is set the length
+	!
+	emp [rt11ent$w_blocks] = .blks_after;
+	$logic_check (3, (.emp [rt11ent$b_type_byte] EQL rt11ent$m_typ_empty), 225);
+
+	! Create a one block permanent FILE.BAD in the middle entry.  
+	!
+	ent [rt11ent$w_blocks] = 1;
+
+	$exch_signal (exch$_rt11_badfile, 1, .bad_pbn);		! Tell the guy
+
+	EXITLOOP;
+	END;
+    $logic_check (0, (false), 216);		! We should have hit an exitloop before here
+    END;
+
+! "ent" points to the bad entry, fill in the info common to all three cases
+!
+ent [rt11ent$b_type_byte] = rt11ent$m_typ_permanent;
+ent [rt11ent$l_filename]  = r50_file;				! "FILE  " in radix 50
+ent [rt11ent$w_filetype]  = r50_bad;				! "BAD"    in radix 50
+exch$rt11_format_current_date (.ent);
+
+exch$rt11_dirseg_put (.volb, .ctx [rt11ctx$l_seg_number]);	! Flush the modified segment
+
+! Force a directory update on disk if caching is active
+!
+IF .volb [volb$v_dircache_active]
+THEN
+    BEGIN
+    exch$rt11_dircache_stop (.volb);		! Do the I/O
+    exch$rt11_dircache_start (.volb);		! Renable caching
+    END;
+
+! Set a flag so that the copy command will attempt to retry the current file
+!
+copy [copy$v_reopen_input] = true;
+
+RETURN;
+
+END;
+
+GLOBAL ROUTINE exch$rt11_close_file (filb : $ref_bblock) =	%SBTTL 'exch$rt11_close_file (filb)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Perform RT-11 volume specific close processing
+!
+! INPUT/OUTPUT:
+!
+!	filb - pointer to block describing the file
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	filb - receive info pertaining to the file to be closed
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true if able to close the file, false otherwise
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('exch$rt11_close_file> ');
+
+LOCAL
+    status
+    ;
+
+BIND
+    ctx  = filb [filb$a_context]	: $ref_bblock,
+    namb = filb [filb$a_assoc_namb]	: $ref_bblock,
+    volb = filb [filb$a_assoc_volb]	: $ref_bblock
+    ;
+
+$debug_print_lit ('entry');
+
+$block_check (2, .filb, filb, 447);			!?? definitely over-zealous checking
+$block_check (2, .namb, namb, 448);
+$block_check (2, .volb, volb, 449);
+$block_check (2, .ctx, rt11ctx, 451);
+$logic_check (2, (.ctx [rt11ctx$a_assoc_filb] EQL .filb), 122);
+$logic_check (2, (.ctx [rt11ctx$a_assoc_volb] EQL .volb), 123);
+$logic_check (5, (exch$rtacp_verify_directory (.volb)), 186);
+
+! Output files need some directory tweaks and a buffer flush
+!
+IF .ctx [rt11ctx$v_output_file]
+THEN
+    BEGIN
+    LOCAL
+	blks_used,
+	emp : $ref_bblock;			! pointer to the empty entry after this one
+    BIND
+	seg = ctx [rt11ctx$a_seg_address] : $ref_bblock,	! pointer to a directory segment
+	ent = ctx [rt11ctx$a_ent_address] : $ref_bblock;	! and the directory entry for this file
+
+    ! Flush any blocks that are sitting in the output buffer
+    !
+    IF NOT (status = exch$pdp_flush_write_buffer (.ctx))
+    THEN
+	RETURN .status;
+
+    ! How many blocks were actually used in the file
+    !
+    blks_used = 1 + .ctx [rt11ctx$l_high_block_written] - .ctx [rt11ctx$l_start_block];
+
+    ! If an allocation was requested, and the allocation was more than was used, then increase the size to the
+    ! allocation request.  The extra blocks will be filled with nulls.
+    !
+    IF   ((.filb [filb$l_q_allocation] NEQ 0)
+	AND
+	  (.filb [filb$l_q_allocation] GTRU .blks_used))
+    THEN
+	BEGIN
+	LOCAL
+	    blk_cnt,
+	    blks_to_clear,
+	    cur_blk;
+
+	! Figure out how many blocks to clear and the pbn of the first block to clear
+	!
+	blks_to_clear = .filb [filb$l_q_allocation] - .blks_used;		! Number of null blocks to write
+	cur_blk = .ctx [rt11ctx$l_high_block_written] + 1;			! Block at which to write nulls
+	$logic_check (3, (.ctx [rt11ctx$a_buffer] NEQ 0), 195);
+	CH$FILL (0, ctx$k_buffer_length, .ctx [rt11ctx$a_buffer]);		! Fill the buffer with nulls
+
+	! Write the null blocks
+	!
+	blk_cnt = .blks_to_clear;
+	WHILE .blk_cnt GTR 0			! Note the signed compare
+	DO
+	    BEGIN
+	    IF NOT (status = exch$io_rt11_write (.volb,				! All the rms stuff hangs from here
+				.cur_blk,					! First block to write
+				MINU (.blk_cnt, ctx$k_buffer_blocks),		! Number of blocks
+				.ctx [rt11ctx$a_buffer]))			! Address of the I/O buffer
+	    THEN
+		BEGIN
+		exch$rt11_bad_file (.filb);
+		RETURN .status;
+		END;
+
+	    ! Point at the next chunk to write
+	    !
+	    blk_cnt = .blk_cnt - ctx$k_buffer_blocks;		! Number of blocks
+	    cur_blk = .cur_blk + ctx$k_buffer_blocks;		! Number of blocks
+	    END;
+
+	! Update the pointers to the new highest block written
+	!
+	ctx [rt11ctx$l_high_block_written] = .ctx [rt11ctx$l_high_block_written] + .blks_to_clear;
+	blks_used = .blks_used + .blks_to_clear;
+
+	END;
+
+    ! Truncate the file by moving any unused blocks to the empty directory entry which immediately follows this
+    ! entry.
+    !
+    emp = .ent + rt11ent$k_length + .seg [rt11hdr$w_extra_bytes];		! Pointer to the empty entry
+    $logic_check (3, ((.emp [rt11ent$b_type_byte] EQL rt11ent$m_typ_empty) AND (.emp [rt11ent$w_blocks] EQL 0)), 202);
+    emp [rt11ent$w_blocks] = .ctx [rt11ctx$l_eof_block] -			! Count of leftovers (0 is ok)
+				.ctx [rt11ctx$l_high_block_written];
+    ent [rt11ent$w_blocks] = .blks_used;
+    $debug_print_fao ('used !UL,  left !UL,  eof !UL,  high !UL', .ent [rt11ent$w_blocks], .emp [rt11ent$w_blocks],
+		.ctx [rt11ctx$l_eof_block], .ctx [rt11ctx$l_high_block_written]);
+
+    ! If there is another file with the same name around, we need to delete it now
+    !
+    IF .filb [filb$v_delete_previous]
+    THEN
+	BEGIN
+	LOCAL
+	    ctx2 : $ref_bblock;
+
+	ctx2 = exch$util_rt11ctx_allocate (.volb, 0);	! Get an RT11 context block
+
+	IF exch$rtacp_find_file (.ctx2, ctx [rt11ctx$t_exp_fullname], .ctx [rt11ctx$l_exp_fullname_len])
+	THEN
+	    BEGIN
+	    BIND
+		copy = exch$a_gbl [excg$a_copy_work] : $ref_bblock,
+		ent2 = ctx2 [rt11ctx$a_ent_address] : $ref_bblock;
+	    $debug_print_fao ('deleting previous copy of "!AF"', 
+						.filb [filb$l_result_name_len], filb [filb$t_result_name]);
+	    $logic_check (2, (NOT .ctx2 [rt11ctx$v_typ_protected]), 172);	! Must be able to delete
+	    ent2 [rt11ent$b_type_byte] = rt11ent$m_typ_empty;		! It is gone
+	    exch$rt11_dirseg_put (.volb, .ctx2 [rt11ctx$l_seg_number]);
+	    IF .copy [copy$v_q_log]
+	    THEN
+		$exch_signal (exch$_deleteprev, 2, .filb [filb$l_result_name_len], filb [filb$t_result_name]);
+	    END
+	ELSE
+	    $logic_check (3, (false), 171);
+
+	! Return the context block
+	!
+	exch$util_rt11ctx_release (.ctx2);
+
+	END;
+
+    ! And finally, mark our new file as permanent and current, and write the directory segment
+    !
+    ent [rt11ent$v_type] = rt11ent$m_typ_permanent;	! Mark only type field, protected bit might be set
+    ent [rt11ent$b_job] = 1;				! Mark the entry as current
+    exch$rt11_dirseg_put (.volb, .ctx [rt11ctx$l_seg_number]);
+
+    $logic_check (4, (exch$rtacp_verify_directory (.volb)), 187);
+    END;
+
+! Clear the stream active bit and all other context flags
+!
+ctx [rt11ctx$l_flags] = 0;
+
+RETURN true;					
+END;
+
+GLOBAL ROUTINE exch$rt11_create_file =	%SBTTL 'exch$rt11_create_file'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Perform RT-11 volume specific create processing
+!
+! INPUT:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	copy [copy$a_out_filb] - pointer to the filb for the output file
+!	copy [copy$a_inp_filb] - pointer to the filb for the input file
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	copy [copy$a_out_filb] - block receives info pertaining to the created file
+
+!
+! ROUTINE VALUE:
+!
+!	true if able to create a file, false otherwise
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('rt11_create_file> ');
+
+LOCAL
+    rfp : $bblock [nam$c_bln+nam$c_maxrss],	! output file parse - an RMS NAM block plus expanded string buffer
+    nam_len,					! temporary to hold length of name
+    typ_len,					! temporary to hold length of type
+    tot_len,					! temporary to hold length of name + type
+    ent	: $ref_bblock,				! a pointer to the entry we are adding
+    start_block,				! the pbn where this file will start
+    blocks,
+    physical,
+    status
+    ;
+
+BIND
+    copy     = exch$a_gbl [excg$a_copy_work]	: $ref_bblock,
+    out_name = copy [copy$q_output_filename]	: $desc_block,
+    inp_filb = copy [copy$a_inp_filb]		: $ref_bblock,
+    inp_namb = inp_filb [filb$a_assoc_namb]	: $ref_bblock,
+    inp_ctx  = inp_filb [filb$a_context]	: $ref_bblock,
+    out_filb = copy [copy$a_out_filb]		: $ref_bblock,
+    out_namb = out_filb [filb$a_assoc_namb]	: $ref_bblock,
+    out_ctx  = out_filb [filb$a_context]	: $ref_bblock,
+    volb     = out_filb [filb$a_assoc_volb]	: $ref_bblock
+    ;
+
+$debug_print_lit ('entry');
+
+$block_check (1, .out_filb, filb, 426);
+$block_check (1, .inp_filb, filb, 536);
+$block_check (2, .out_namb, namb, 491);
+$block_check (2, .inp_namb, namb, 492);
+$block_check (2, .volb, volb, 531);
+$logic_check (4, (exch$rtacp_verify_directory (.volb)), 188);
+
+! Make certain that write access is permitted, this should be checked long before we get here
+!
+$logic_check (1, (.volb [volb$v_write]), 166);
+
+! If the context pointer is null, then allocate and initialize it.
+!
+IF .out_ctx EQL 0
+THEN
+    out_ctx = exch$util_rt11ctx_allocate (.volb, .out_filb)	! Get an RT11 context block
+
+ELSE
+    $block_check (2, .out_ctx, rt11ctx, 534);			! Make sure that it is what we think it is
+
+! Make sure that we haven't crossed signals someplace
+!
+$logic_check (4, (.out_ctx [rt11ctx$a_assoc_filb] EQL .out_filb), 162);
+$logic_check (4, (.out_ctx [rt11ctx$a_assoc_volb] EQL .volb), 163);
+
+! Set the rest of the block to nulls, nothing carries over from one output file to the next
+!
+CH$FILL (0, rt11ctx$k_end_zero - rt11ctx$k_start_zero,	! Set rest of block to nulls
+		.out_ctx + rt11ctx$k_start_zero);
+
+! Perform an RMS output file parse on the related name (the result name for the input file) and the
+! requested output name from the command line.
+!
+IF NOT (status = exch$cmd_related_file_parse (
+		.out_name [dsc$w_length], .out_name [dsc$a_pointer],			! Command line out parameter
+		.inp_filb [filb$l_result_name_len], inp_filb [filb$t_result_name],	! Related name
+		rfp))									! Gets new name
+THEN
+    BEGIN
+
+    ! Move the raw name to where it is accessible for the outer signal
+    !
+    CH$MOVE (.out_name [dsc$w_length], .out_name [dsc$a_pointer], out_filb [filb$t_result_name]);
+    RETURN .status;
+
+    END;
+
+! Create the result file name in the filb
+!
+out_filb [filb$v_name_change] = false;		! Assume no name change
+tot_len = .rfp [nam$b_name];			! Remember starting length
+rfp [nam$b_name] = exch$pdp_filter_filename (.rfp [nam$b_name], .rfp [nam$l_name]);	! Remove invalid characters
+nam_len = MINU (.rfp [nam$b_name], 6);		! Maximum name is six letters
+IF .tot_len NEQ .nam_len			! If final length not same as initial, then it has changed
+THEN
+    out_filb [filb$v_name_change] = true;
+
+tot_len = .rfp [nam$b_type];			! Remember starting length of type field
+rfp [nam$b_type] = 1 + exch$pdp_filter_filename (.rfp [nam$b_type] - 1, .rfp [nam$l_type] + 1);
+typ_len = MINU (.rfp [nam$b_type], 4);		! Maximum type is three (plus the separating dot)
+IF .tot_len NEQ .typ_len
+THEN
+    out_filb [filb$v_name_change] = true;
+
+tot_len = .nam_len + .typ_len;			! Final length of both
+out_filb [filb$l_result_name_len] = .volb [volb$l_vol_ident_len] + .tot_len;	! Length of volume ident
+$logic_check (2, (.out_filb [filb$l_result_name_len] LEQU filb$s_result_name), 164);
+CH$COPY (.volb [volb$l_vol_ident_len], volb [volb$t_vol_ident],			! Volume name
+		.nam_len, .rfp [nam$l_name], .typ_len, .rfp [nam$l_type],
+		0, filb$s_result_name, out_filb [filb$t_result_name]);
+
+! Do not create a .BAD file unless this is an explicit copy
+!
+IF CH$EQL (4, UPLIT BYTE ('.BAD'), .typ_len, .rfp [nam$l_type])
+THEN
+    BEGIN
+    IF  .inp_namb [namb$v_wild_name] OR .inp_namb [namb$v_wild_type]	! Wild in input?
+      OR
+	.out_namb [namb$v_wild_name] OR .out_namb [namb$v_wild_type]	! Wild in output?
+    THEN
+	RETURN exch$_nocopbad;
+    END;
+
+$debug_print_fao ('Looking for "!AF"', .out_filb [filb$l_result_name_len], out_filb [filb$t_result_name]);
+
+! See if we will have to delete a same-named file later on
+!
+out_filb [filb$v_delete_previous] = false;	! Assume we won't have to delete
+IF exch$rtacp_find_file (.out_ctx, out_filb [filb$t_result_name] + .volb [volb$l_vol_ident_len], .tot_len)
+THEN
+    BEGIN
+    LOCAL
+	retstat,				! Help BLISS figure out the two signals are the same
+	sigstat;
+
+    $debug_print_fao ('file "!AF" exists', .out_filb [filb$l_result_name_len], out_filb [filb$t_result_name]);
+    $logic_check (2, (.inp_ctx NEQ 0), 209);
+
+    ! If the input and output files are identical during a wildcard copy, this is illegal
+    !
+    IF .inp_ctx [rt11ctx$b_type] EQL exchblk$k_rt11ctx		! Input must also be RT-11
+    THEN
+
+	! If the directory entry addresses are the same, this is in fact the same file.  Note that we are
+	! assuming that nothing has happened which might have restructured the directory.
+	!
+	IF .inp_ctx [rt11ctx$a_ent_address] EQL .out_ctx [rt11ctx$a_ent_address]
+	THEN
+	    IF  .inp_namb [namb$v_wild_name] OR .inp_namb [namb$v_wild_type]	! Wild in input?
+	      OR
+		.copy [copy$v_q_replace]
+	    THEN
+		RETURN exch$_nocopsamdev;
+
+    ! Verify that it is ok to delete the existing file
+    !
+    IF .out_ctx [rt11ctx$b_job] NEQ 0		! Can't delete protected files
+    THEN
+	RETURN exch$_nocopdup;
+
+    IF .out_ctx [rt11ctx$v_typ_protected]	! Can't delete protected files
+    THEN
+	RETURN exch$_nocopprot;
+
+    IF NOT .copy [copy$v_q_delete]		! /NODELETE has been requested, don't do it
+    THEN
+	RETURN exch$_nocopnodel;
+
+    IF .out_ctx [rt11ctx$w_filetype] EQL r50_bad	! Cannot delete a file with .BAD extension during a copy
+    THEN
+	RETURN exch$_nocopbaddel;
+
+    IF	.out_ctx [rt11ctx$w_filetype] EQL r50_sys	! Cannot delete a file with .SYS extension during a copy
+      AND						!  unless
+	NOT .copy [copy$v_q_system]			!  /SYSTEM has been specified
+    THEN
+	RETURN exch$_nocopsysdel;
+
+    ! If a delete-before-write operation is requested, delete this file now
+    !
+    IF .copy [copy$v_q_replace]
+    THEN
+	BEGIN
+	BIND
+	    ent = out_ctx [rt11ctx$a_ent_address] : $ref_bblock;
+	$debug_print_fao ('deleting previous copy of "!AF"', 
+					    .out_filb [filb$l_result_name_len], out_filb [filb$t_result_name]);
+	$logic_check (2, (NOT .out_ctx [rt11ctx$v_typ_protected]), 179);	! Must be able to delete
+	ent [rt11ent$b_type_byte] = rt11ent$m_typ_empty;		! It is gone
+	exch$rt11_dirseg_put (.volb, .out_ctx [rt11ctx$l_seg_number]);	! Write the directory segment
+	IF .copy [copy$v_q_log]
+	THEN
+	    $exch_signal (exch$_deleteprev, 2, .out_filb [filb$l_result_name_len], out_filb [filb$t_result_name]);
+	END
+
+    ! otherwise remember that we have some extra work to do when we close the file
+    !
+    ELSE
+	out_filb [filb$v_delete_previous] = true;
+
+    END;
+
+! Reset the rest of the block to nulls, nothing carries over from before
+!
+CH$FILL (0, rt11ctx$k_end_zero - rt11ctx$k_start_zero,	! Set rest of block to nulls
+		.out_ctx + rt11ctx$k_start_zero);
+
+! If a /ALLOCATION qualifier has been seen, use that value.  If BLOCKS ends up with the value 0, then
+! we will get the largest area on the volume.
+!
+blocks = (IF .inp_filb [filb$l_q_allocation] NEQ 0	! If specified on the input
+	THEN						!  then
+	       .inp_filb [filb$l_q_allocation]		!   use that quantity
+	ELSE						!  otherwise
+	       .copy [copy$l_q_allocation]);		!   use the quantity from the output
+
+out_filb [filb$l_q_allocation] = .blocks;	! Save the value so that we can look at it during the close
+
+! Make sure that the record format in the filb is correct
+!
+exch$cmd_fetch_recfmt_implied (.out_filb, .rfp [nam$l_type]+1);	! Pass it the type from the parse
+
+! Save the addresses of our routines for this volume and record format.
+!
+out_filb [filb$a_close_routine] = exch$rt11_close_file;
+out_filb [filb$a_delete_routine] = exch$rt11_delete_file;
+out_filb [filb$a_get_routine] = 0;
+out_filb [filb$a_put_routine] = exch$pdp_put;
+
+! Carriage control doesn't mean anything for RT-11 output, tell him we are ignoring
+!
+IF .inp_filb [filb$v_cctl_explicit]
+ OR
+   .out_filb [filb$v_cctl_explicit]
+THEN
+    $exch_signal (exch$_nocarriage);
+
+physical = false;				! Assume not using physical transfers
+
+! For RT-11 we can treat block transfer mode as fixed 512, physical
+!
+IF .out_filb [filb$b_transfer_mode] EQL filb$k_xfrm_block
+  OR
+   .inp_filb [filb$b_transfer_mode] EQL filb$k_xfrm_block
+THEN
+    BEGIN
+    physical = true;
+    out_filb [filb$b_rec_format]  = filb$k_rfmt_fixed;
+    out_filb [filb$l_fixed_len]   = 512;
+    END;
+
+! If an explicit record format was given on the input but none on the output, carry the input to the output
+!
+IF .inp_filb [filb$v_rfmt_explicit] 		! The input file has explicit format
+   AND (NOT .out_filb [filb$v_rfmt_explicit])	!  but the output has implied record format
+THEN
+    BEGIN
+    out_filb [filb$b_rec_format]  = .inp_filb [filb$b_rec_format];
+    out_filb [filb$l_fixed_len]   = .inp_filb [filb$l_fixed_len];
+    END;
+
+! In some circumstances we can do block mode I/O rather than record mode
+!
+IF  (.inp_filb [filb$b_transfer_mode] EQL filb$k_xfrm_automatic	! Both input and output must be automatic transfer
+     AND .out_filb [filb$b_transfer_mode] EQL filb$k_xfrm_automatic)
+  AND
+    ( NOT (.inp_filb [filb$v_rfmt_explicit] 			! Both the input and output files must have 
+	OR .out_filb [filb$v_rfmt_explicit]))			!  implied record formats
+  AND
+    (.inp_namb [namb$b_vol_format] EQL volb$k_vfmt_rt11		! The input must be RT-11
+      OR .inp_namb [namb$b_vol_format] EQL volb$k_vfmt_dos11)	!  or DOS-11
+THEN
+    BEGIN
+    inp_filb [filb$b_rec_format]  = filb$k_rfmt_fixed;
+    inp_filb [filb$l_fixed_len]   = 512;
+    out_filb [filb$b_rec_format]  = filb$k_rfmt_fixed;
+    out_filb [filb$l_fixed_len]   = 512;
+    END;
+
+! A block request of zero means grab the largest space on the volume.  Let's see if we can determine the exact
+! block count we will need.
+!
+IF .blocks EQL 0
+THEN
+    IF  .physical								! Physical works fine
+      OR
+	(
+	    (.inp_filb [filb$b_rec_format]  EQL filb$k_rfmt_fixed)		! If both input and output are
+	 AND
+	    (.out_filb [filb$b_rec_format]  EQL filb$k_rfmt_fixed)		!  fixed-record files and the
+	 AND
+	    (.inp_filb [filb$l_fixed_len] EQL .out_filb [filb$l_fixed_len])	!  record lengths are identical
+        )
+    THEN
+	blocks = .inp_filb [filb$l_block_count];
+
+! Get some empty area on the volume  
+!
+IF NOT (status = exch$rtacp_find_empty_area (.out_ctx, .blocks, .copy [copy$l_q_start_block]))
+THEN
+    RETURN .status;
+
+! Set the entry up as a tentative file
+!
+ent = .out_ctx [rt11ctx$a_ent_address];			! Get the entry pointer into a place where we can use it
+ent [rt11ent$b_type_byte] = rt11ent$m_typ_tentative;	! Tentative entry
+
+! Set the protection attribute of the file.  If specified, use that value.  Otherwise, if input file is RT-11
+! use the attribute of the input.
+!
+IF .copy [copy$v_q_protect_explicit]		! If /PROTECT or /NOPROTECT was explicitly specified
+THEN
+    ent [rt11ent$v_typ_protected] = .copy [copy$v_q_protect]
+ELSE
+    BEGIN
+    IF .inp_ctx NEQ 0
+    THEN
+	IF .inp_ctx [rt11ctx$b_type] EQL exchblk$k_rt11ctx		! Input must also be RT-11
+	THEN
+	    ent [rt11ent$v_typ_protected] = .inp_ctx [rt11ctx$v_typ_protected];
+    END;
+
+! Get the date into RT11 format
+!
+exch$rt11_format_current_date (.ent);
+
+! Convert the file name to radix 50 and store in the entry
+!
+exch$util_radix50_from_ascii (.nam_len, .rfp [nam$l_name], 
+						rt11ctx$s_exp_name, ent [rt11ent$l_filename]);
+exch$util_radix50_from_ascii (.typ_len-1, .rfp [nam$l_type]+1, 
+						rt11ctx$s_exp_type, ent [rt11ent$w_filetype]);
+
+! Now force the modified entry to disk
+!
+exch$rt11_dirseg_put (.volb, .out_ctx [rt11ctx$l_seg_number]);
+CH$MOVE (rt11ent$k_length, .ent, out_ctx [rt11ctx$t_entry]);	! Put a fresh copy into the context block
+
+! Define a record stream for this file
+!
+out_ctx [rt11ctx$l_cur_byte]	= 0;				! Context is the first byte in
+out_ctx [rt11ctx$l_cur_block]	= .out_ctx [rt11ctx$l_start_block];	!  the first block of the file
+out_ctx [rt11ctx$l_eof_block]	= .out_ctx [rt11ctx$l_start_block] + .out_ctx [rt11ctx$w_blocks] - 1;
+out_filb [filb$a_record]	= 0;				! No valid record or length
+out_filb [filb$l_record_len]	= 0;
+
+! Expand the radix-50 filename into the standard ascii text fields
+!
+exch$rt11_expand_filename (.out_ctx);
+
+! Clear all the flags except the ones we want by writing the masks into the longword
+!
+out_ctx [rt11ctx$l_flags] =    rt11ctx$m_stream_active	! A record stream is currently active
+			    OR rt11ctx$m_output_file;	!  and it is an output file
+
+! Set up the i/o and record buffer
+!
+IF .out_ctx [rt11ctx$a_buffer] EQL 0
+THEN
+    out_ctx [rt11ctx$a_buffer] = exch$util_vm_allocate (ctx$k_buffer_length);
+
+! Set the block pointers to the chunk we are ready to write (i.e. nothing, 'cuz we've done no puts)
+!
+blocks = MINU (.out_ctx [rt11ctx$w_blocks], ctx$k_buffer_blocks);
+out_ctx [rt11ctx$l_buf_base_block] = .out_ctx [rt11ctx$l_start_block];
+out_ctx [rt11ctx$l_buf_high_block] = .out_ctx [rt11ctx$l_start_block] + .blocks - 1;
+out_ctx [rt11ctx$l_high_block_written] = .out_ctx [rt11ctx$l_start_block] - 1;
+
+$logic_check (3, (exch$rtacp_verify_directory (.volb)), 189);
+
+RETURN true;
+END;
+
+GLOBAL ROUTINE exch$rt11_delete_file (filb : $ref_bblock) =	%SBTTL 'exch$rt11_delete_file (filb)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Perform RT-11 volume specific delete processing.  This is only used to delete output files which we
+!	have created, but decide to delete.  For example, if the input file were totally unreadable we might
+!	delete the output file.
+!
+! INPUT/OUTPUT:
+!
+!	filb - pointer to block describing the file
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	filb - receive info pertaining to the file to be deleted
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true if able to delete the file, false otherwise
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('exch$rt11_delete_file> ');
+
+LOCAL
+    status
+    ;
+
+BIND
+    ctx  = filb [filb$a_context]	: $ref_bblock,
+    namb = filb [filb$a_assoc_namb]	: $ref_bblock,
+    volb = filb [filb$a_assoc_volb]	: $ref_bblock
+    ;
+
+$debug_print_lit ('entry');
+
+$block_check (2, .filb, filb, 560);
+$block_check (2, .ctx, rt11ctx, 561);
+$logic_check (3, (.ctx [rt11ctx$v_output_file]), 149);
+
+! Not much to do, simply leave the file marked as tentative
+!
+ctx [rt11ctx$l_flags] = 0;
+
+RETURN true;					
+END;
+
+GLOBAL ROUTINE exch$rt11_dircache_exit_handler (status,	%SBTTL 'exch$rt11_dircache_exit_handler (status, volb)'
+					volb : $ref_bblock) : NOVALUE = 
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Flush the write cache on the directory.
+!
+! INPUTS:
+!
+!	status - pointer to status code
+!	volb - pointer to volb which has been connected to the RT-11 device
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	any modified directory segments will be written
+!--
+
+$dbgtrc_prefix ('rt11_dircache_exit_handler> ');
+
+BIND
+    fab = volb [volb$a_fab] : $ref_bblock,
+    rab = volb [volb$a_rab] : $ref_bblock
+    ;
+
+$trace_print_fao ('entry - volb !XL, dircache !XL', .volb, .volb [volb$l_dircache]);
+
+! If there are any modified segments signal and flush
+!
+IF .volb [volb$l_dircache] NEQ volb$m_dircache_active
+THEN
+    BEGIN
+
+    ! Tell we are flushing the directory of a slow device, it might be a while before it finishes
+    !
+    IF .volb [volb$l_devtype] EQL dt$_tu58	! If it is any kind of TU58
+    THEN
+	BEGIN
+	LOCAL
+	    msgvec : VECTOR [5, LONG],
+	    status;
+
+	! We use the $putmsg service to print this message.  If we signalled it, we could exit the image if
+	! another signal was active in the catch-all condition handler.  This is extremely likely to happen
+	! if the control/Y was hit during a command with a /LOG in effect, since the catch-all handler ends
+	! up printing EXCHANGE log messages.
+	!
+	msgvec [0] = 4;
+	msgvec [1] = exch$_writecache;
+	msgvec [2] = 2;
+	msgvec [3] = .volb [volb$l_vol_ident_len];
+	msgvec [4] = volb [volb$t_vol_ident];
+	IF NOT (status = $putmsg (msgvec=msgvec))
+	THEN
+	    $exch_signal_stop (.status);
+	END;
+
+    ! It is possible that I/O is active (likely if the device is a TU58), so wait for it to complete
+    !
+    IF NOT (status = $wait (rab = .rab))
+    THEN
+	exch$util_file_error (exch$_waiterr, .status, .fab, .rab [rab$l_stv]);
+
+    ! Call the normal cache stop routine
+    !
+    exch$rt11_dircache_stop (.volb);
+
+    END;
+
+RETURN;
+END;
+
+GLOBAL ROUTINE exch$rt11_dircache_start (volb : $ref_bblock) : NOVALUE =	%SBTTL 'exch$rt11_dircache_start (volb)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Set up the write cache on the directory.
+!
+! INPUTS:
+!
+!	volb - pointer to volb which has been connected to the RT-11 device
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('rt11_dircache_start> ');
+
+LOCAL
+    status
+    ;
+
+$block_check (2, .volb, volb, 461);
+$logic_check (2, (.volb [volb$v_write]), 203);	! We shouldn't get this far if we aren't supposed to write to it
+
+! If global caching is in effect, ignore this call
+!
+IF .exch$a_gbl [excg$v_q_cache]
+THEN
+    RETURN;
+
+! Check some conditions before we proceed
+!
+$trace_print_fao ('entry - volb !XL', .volb);
+$logic_check (4, (exch$rtacp_verify_directory (.volb)), 204);
+$logic_check (2, (NOT .volb [volb$v_dircache_active]), 131);	! If it is already on we are confused
+$logic_check (4, (volb$m_dircache_active EQL 1), 132);
+
+! Engage directory write caching.  Clear all 31 segment flags and activate caching by putting a 1 in the 
+! caching longword
+!
+volb [volb$l_dircache] = volb$m_dircache_active;
+
+! Declare an exit handler, so that we can flush the cache if the image is run down
+!
+$logic_check (1, (.exch$a_gbl [excg$a_exh_routine] EQL 0), 313);		! There had better not be one now
+exch$a_gbl [excg$a_exh_routine]		= exch$rt11_dircache_exit_handler;	! Routine to flush the cache
+exch$a_gbl [excg$l_exh_arg_count]	= 2;					! Status and volb
+exch$a_gbl [excg$a_exh_status]		= exch$a_gbl [excg$l_exh_condvalu];	! Address to store status
+exch$a_gbl [excg$a_exh_volb]		= .volb;				! Pass address of volb
+
+IF NOT (status = $dclexh (desblk=exch$a_gbl [excg$r_exit_block]))
+THEN
+    $exch_signal_stop (.status);
+
+RETURN;
+END;
+
+GLOBAL ROUTINE exch$rt11_dircache_stop (volb : $ref_bblock) : NOVALUE =	%SBTTL 'exch$rt11_dircache_stop (volb)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Clear and flush caches.
+!
+! INPUTS:
+!
+!	volb - pointer to volb which has been connected to the RT-11 device
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('rt11_dircache_stop> ');
+
+$block_check (2, .volb, volb, 457);
+
+! If global caching is in effect, ignore this call
+!
+IF .exch$a_gbl [excg$v_q_cache]
+THEN
+    RETURN;
+
+$trace_print_fao ('entry - volb !XL, dircache !XL', .volb, .volb [volb$l_dircache]);
+$logic_check (2, (.volb [volb$v_write]), 175);	! We shouldn't get this far if we aren't supposed to write to it
+
+! Verify that the directory is valid before we allow it to be written.  Since a corrupted directory would have
+! been write-locked when we mounted, this means that EXCHANGE has corrupted the directory
+!
+$logic_check (0, (exch$rtacp_verify_directory (.volb)), 178);
+
+! Clear the cache bit so that we will really write, then flush the directory
+!
+volb [volb$v_dircache_active] = false;
+exch$rt11_dirseg_flush (.volb, .volb [volb$l_dircache]);
+
+! Cancel the exit handler which was declared to flush this cache
+!
+$canexh (desblk=exch$a_gbl [excg$r_exit_block]);
+exch$a_gbl [excg$a_exh_routine]	= 0;		! Mark that no exit handler is active
+
+RETURN;
+END;
+
+GLOBAL ROUTINE exch$rt11_dirseg_flush (volb : $ref_bblock, 	%SBTTL 'exch$rt11_dirseg_flush (volb, mod)'
+						  segment_modified : BITVECTOR [32]) =
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Write any directory segments which have been modified.  Whether any actual I/O will occur depends on the
+!	volb [volb$v_dircache_active] bit.  If this bit is set, actual I/O will be postponed until flush is called
+!	with the bit clear.
+!
+! INPUTS:
+!
+!	volb   - pointer to volb which has been connected to the RT-11 device
+!	modified_segments - bitvector, set means to write the segment, clear means don't write it
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true if success, false if failed
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('rt11_dirseg_flush> ');
+
+LOCAL
+    seg : $ref_bblock,
+    status
+    ;
+
+BIND
+    modified_segments = segment_modified	! map a longword onto the bitvector
+    ;
+
+$trace_print_fao ('entry - volb !XL, dircache !XL', .volb, .modified_segments);
+
+$block_check (2, .volb, volb, 532);
+
+! Assume that all will go well
+!
+status = true;
+
+! A quick exit in case nothing has changed
+!
+IF .modified_segments EQL 0			! No directory segments have been modified, nothing to do
+THEN
+    RETURN .status;
+
+! Find the high segment
+!
+seg = exch$rt11_dirseg_get (.volb, 1);
+$logic_check (2, (.seg NEQ 0), 210);
+$trace_print_fao ('high segment !UL', .seg [rt11hdr$w_high_seg]);
+
+! Look at each of the bits, writing those that are set
+!
+INCRU seg_num FROM 1 TO .seg [rt11hdr$w_high_seg]
+DO
+    BEGIN
+    $trace_print_fao ('seg num !UL, modified !UL', .seg_num, .segment_modified [.seg_num]);
+    IF .segment_modified [.seg_num]
+    THEN
+	BEGIN
+	LOCAL					! We will continue if error, but we want to remember the worst
+	    temp;
+
+	temp = exch$rt11_dirseg_put (.volb, .seg_num);
+	IF NOT .temp
+	THEN
+	    status = .temp;
+	END;
+    END;
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE exch$rt11_dirseg_get (volb : $ref_bblock, number) =	%SBTTL 'exch$rt11_dirseg_get (volb)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Return a pointer to the requested directory segment
+!
+! INPUTS:
+!
+!	volb - pointer to volb which has been connected to the RT-11 device
+!	number - directory segment number in the range 1-31
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	address of segment, or 0 if any error
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('rt11_dirseg_get> ');
+
+LOCAL
+    rtv : $ref_bblock,				! a pointer to the rt11 volb extension
+    rot : $ref_bblock,				! a pointer to the root directory segment
+    seg : $ref_bblock				! a pointer to the desired segment
+    ;
+
+$block_check (2, .volb, volb, 453);
+$trace_print_fao ('  entry - volb !XL, seg !2UL, dircache !XL', .volb, .number, .volb [volb$l_dircache]);
+
+! Get the pointer to our volb extension and to the root segment
+!
+rtv = .volb [volb$a_vfmt_specific];
+$block_check (2, .rtv, rt11, 454);
+rot = rtv [rt11$t_block_0] + (512 * rt11$k_root_block);
+
+! We assume that the directory (thru high_seg not num_segs) is present in memory
+!
+$logic_check (2, .rtv [rt11$v_dir_present], 124);
+
+! Check the consistency of the root segment.  The following tests are order-dependent.  The BLISS optimizer will
+! fold them all together into a single signal and return, but if we had all the tests inside a single IF statement
+! the optimizer might have executed them in any order it felt like.
+!
+IF   (.rot [rt11hdr$w_num_segs] EQL 0)
+  OR
+     (.rot [rt11hdr$w_num_segs] GTRU 31)
+THEN
+    BEGIN
+    $exch_signal (exch$_rt11_baddirect, 2, .volb [volb$l_vol_ident_len], volb [volb$t_vol_ident]);
+    RETURN 0;
+    END;
+IF   (.rot [rt11hdr$w_high_seg] EQL 0)
+  OR
+     (.rot [rt11hdr$w_high_seg] GTRU .rot [rt11hdr$w_num_segs])
+THEN
+    BEGIN
+    $exch_signal (exch$_rt11_baddirect, 2, .volb [volb$l_vol_ident_len], volb [volb$t_vol_ident]);
+    RETURN 0;
+    END;
+IF   (.rot [rt11hdr$w_next_seg] GTRU .rot [rt11hdr$w_high_seg])
+THEN
+    BEGIN
+    $exch_signal (exch$_rt11_baddirect, 2, .volb [volb$l_vol_ident_len], volb [volb$t_vol_ident]);
+    RETURN 0;
+    END;
+
+! The RT-11 Version 4 DUP objects if more than 119 extra words are specified in an initialize (/Z:120. fails).
+! Since strange things can happen (like directories which can hold < 1 file) if this number is large, we are
+! going to complain if it exceeds this number too.
+!
+IF (.rot [rt11hdr$w_extra_bytes] GTRU 238)
+THEN
+    BEGIN
+    $exch_signal (exch$_rt11_baddirect, 2, .volb [volb$l_vol_ident_len], volb [volb$t_vol_ident]);
+    RETURN 0;
+    END;
+IF ((.rot [rt11hdr$w_extra_bytes] AND 1) NEQ 0)	! It can't be odd either
+THEN
+    BEGIN
+    $exch_signal (exch$_rt11_baddirect, 2, .volb [volb$l_vol_ident_len], volb [volb$t_vol_ident]);
+    RETURN 0;
+    END;
+
+! Do a bounds check on the requested segment
+!
+IF   (.number EQL 0)
+  OR
+     (.number GTRU .rot [rt11hdr$w_high_seg])
+THEN
+    BEGIN
+    $exch_signal (exch$_rt11_baddirect, 2, .volb [volb$l_vol_ident_len], volb [volb$t_vol_ident]);
+    RETURN 0;
+    END;
+
+! Looks good, now compute the desired segment as an offset from the root
+!
+seg = .rot + ((.number-1) * rt11$k_dirseglen);
+
+! Now perform some consistency checks on the segment header
+!
+IF   (.seg [rt11hdr$w_num_segs] NEQ .rot [rt11hdr$w_num_segs])
+  OR
+     (.seg [rt11hdr$w_next_seg] GTRU .rot [rt11hdr$w_high_seg])
+  OR
+     (.seg [rt11hdr$w_extra_bytes] NEQ .rot [rt11hdr$w_extra_bytes])
+THEN
+    BEGIN
+    $exch_signal (exch$_rt11_baddirect, 2, .volb [volb$l_vol_ident_len], volb [volb$t_vol_ident]);
+    RETURN 0;
+    END;
+
+RETURN .seg;
+END;
+
+GLOBAL ROUTINE exch$rt11_dirseg_get_nochk (volb : $ref_bblock, number) : jsb_r1r2 =	%SBTTL 'exch$rt11_dirseg_get_nochk'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Return a pointer to the requested directory segment without any checking
+!
+! INPUTS:
+!
+!	volb - pointer to volb which has been connected to the RT-11 device
+!	number - directory segment number in the range 1-31
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	address of segment, or 0 if any error
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('rt11_dirseg_get_nochk> ');
+
+BIND
+    rtv = volb [volb$a_vfmt_specific] : $ref_bblock		! a pointer to the rt11 volb extension
+    ;
+
+$debug_print_lit ('entry');
+
+! Get the pointer to our volb extension and to the root segment, then compute the
+!
+RETURN rtv [rt11$t_block_0] + (512 * rt11$k_root_block) + ((.number-1) * rt11$k_dirseglen);
+END;
+
+GLOBAL ROUTINE exch$rt11_dirseg_put (volb : $ref_bblock, number) =	%SBTTL 'exch$rt11_dirseg_put (volb, number)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Write a directory segment back to disk
+!
+! INPUTS:
+!
+!	volb - pointer to volb which has been connected to the RT-11 device
+!	number - directory segment number in the range 1-31
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true if success, error code if problem arose
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('rt11_dirseg_put> ');
+
+LOCAL
+    blk,					! pbn of block to write
+    rtv : $ref_bblock,				! a pointer to the rt11 volb extension
+    rot : $ref_bblock,				! a pointer to the root directory segment
+    seg : $ref_bblock,				! a pointer to the desired segment
+    status
+    ;
+
+$block_check (2, .volb, volb, 529);
+$trace_print_fao ('* entry - volb !XL, seg !2UL, dircache !XL', .volb, .number, .volb [volb$l_dircache]);
+$logic_check (2, (.volb [volb$v_write]), 146);	! We shouldn't get this far if we aren't supposed to write to it
+
+! Get the pointer to our volb extension and to the root segment
+!
+rtv = .volb [volb$a_vfmt_specific];
+$block_check (2, .rtv, rt11, 528);
+rot = rtv [rt11$t_block_0] + (512 * rt11$k_root_block);
+
+! We assume that the directory (thru high_seg not num_segs) is present in memory
+!
+$logic_check (2, .rtv [rt11$v_dir_present], 142);
+
+! Do a bounds check on the requested segment
+!
+IF   (.number EQL 0)
+  OR
+     (.number GTRU .rot [rt11hdr$w_high_seg])
+THEN
+    $exch_signal_return (exch$_rt11_baddirect, 2, .volb [volb$l_vol_ident_len], volb [volb$t_vol_ident]);
+
+! Segment number is valid, if caching is on we just set a bit in the cache bitvector	!?? interim cache strategy
+!
+IF .volb [volb$v_dircache_active]
+THEN
+    BEGIN
+    BIND
+	segbit = volb [volb$l_dircache] : BITVECTOR [32];
+    segbit [.number] = true;
+    status = true;
+    END
+
+! Caching not active, write the segment immediately
+!
+ELSE
+    BEGIN
+
+    ! Looks good, now find the address of the desired segment, and the block number
+    !
+    seg = .rot + ((.number-1) * rt11$k_dirseglen);
+    blk = 2*(.number-1) + rt11$k_root_block;
+
+    ! Now perform some consistency checks on the segment header
+    !
+    IF   (.seg [rt11hdr$w_num_segs] NEQ .rot [rt11hdr$w_num_segs])
+      OR
+	 (.seg [rt11hdr$w_next_seg] GTRU .rot [rt11hdr$w_high_seg])
+    THEN
+	$exch_signal_return (exch$_rt11_baddirect, 2, .volb [volb$l_vol_ident_len], volb [volb$t_vol_ident]);
+
+    ! Write the directory segment back to the disk
+    !
+    status = exch$io_rt11_write (.volb, .blk, 2, .seg);
+
+    ! If there was an error, we should give them extra warning that quick action can save the file
+    !
+    IF  (NOT .status)
+    THEN
+	$exch_signal (exch$_dire_error);
+
+! Following expression would print additional information to direct the user as to recovery
+! procedures, so that he could save all the information in the volume by using the correct
+! copy of the directory which is still in memory.
+!
+!^	IF .exch$a_gbl [excg$v_foreign_command]	! If single command, no hope of recovery, sigh...
+!^	THEN
+!^	    $exch_signal (exch$_dire_error)
+!^	ELSE
+!^	    $exch_signal (exch$_dire_error, 0, exch$_recover);
+
+    END;
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE exch$rt11_expand_filename (ctx : $ref_bblock) =	%SBTTL 'exch$rt11_expand_filename (ctx)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Convert the information in a directory entry to ascii text.  This involves changing the RADIX-50
+!	filename to ASCII and converting the date to ASCII.
+!
+! INPUTS:
+!
+!	ctx - pointer to an rt11ctx structure which contains a copy of the directory entry
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	ctx - receives ASCII filename info
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	success or failure if the entry is invalid
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('rt11_expand_filename> ');
+
+OWN						! Read-only own
+    months : VECTOR [13, LONG] INITIAL
+		('Jan-','Feb-','Mar-','Apr-','May-','Jun-','Jul-','Aug-','Sep-','Oct-','Nov-','Dec-','***-')
+    ;
+
+LOCAL
+    year,
+    mon,
+    day,
+    date_desc : VECTOR [2, LONG],
+    status,
+    ch
+    ;
+
+$block_check (2, .ctx, rt11ctx, 452);
+
+! Convert the file name from 2 Radix-50 words to 'rt11ctx$s_exp_name' ASCII characters, type from 1 R50 word to
+! 'RT11ctx$s_exp_type' chars
+!
+exch$util_radix50_to_ascii (rt11ctx$s_exp_name, ctx [rt11ctx$l_filename], ctx [rt11ctx$t_exp_name]);
+ch = CH$FIND_CH (rt11ctx$s_exp_name, ctx [rt11ctx$t_exp_name], ' ');
+ctx [rt11ctx$l_exp_name_len] = (IF .ch EQL 0 THEN rt11ctx$s_exp_name ELSE .ch - ctx [rt11ctx$t_exp_name]);
+
+exch$util_radix50_to_ascii (rt11ctx$s_exp_type, ctx [rt11ctx$w_filetype], ctx [rt11ctx$t_exp_type]);
+ch = CH$FIND_CH (rt11ctx$s_exp_type, ctx [rt11ctx$t_exp_type], ' ');
+ctx [rt11ctx$l_exp_type_len] = (IF .ch EQL 0 THEN rt11ctx$s_exp_type ELSE .ch - ctx [rt11ctx$t_exp_type]);
+
+! If file is protected, set the P
+!
+IF .ctx [rt11ctx$v_typ_protected]
+THEN
+    CH$MOVE (2, UPLIT BYTE ('p-'), ctx [rt11ctx$t_exp_protected])
+ELSE
+    CH$MOVE (2, UPLIT BYTE ('  '), ctx [rt11ctx$t_exp_protected]);
+
+! Create a filename in the standard, non-embedded blank format by concatenating the name, a "." and the type.
+!
+ctx [rt11ctx$l_exp_fullname_len] = .ctx [rt11ctx$l_exp_name_len] + 1 + .ctx [rt11ctx$l_exp_type_len];
+CH$COPY (.ctx [rt11ctx$l_exp_name_len], ctx [rt11ctx$t_exp_name],	! the file name
+	 1, UPLIT BYTE ('.'),						! the "." separator
+	 .ctx [rt11ctx$l_exp_type_len], ctx [rt11ctx$t_exp_type],	! the file type
+	%C ' ', rt11ctx$s_exp_fullname, ctx [rt11ctx$t_exp_fullname]);	! the blank-padded result
+
+! Create an ASCII representation of the date
+!
+IF .ctx [rt11ctx$w_date] EQL 0
+THEN
+    CH$MOVE (rt11ctx$s_exp_date, UPLIT BYTE (' < nodate >'), ctx [rt11ctx$t_exp_date])
+ELSE
+    BEGIN
+    year = 1972 + .ctx [rt11ctx$v_year];		! 1972 is stored as zero
+    day  = .ctx [rt11ctx$v_day];			! day is stored 1-31
+    mon  = .ctx [rt11ctx$v_month] - 1;			! month is 1-12, adjust for vector index
+    IF .mon GTRU 12 THEN mon = 12;			! point bad months at '***-'
+    date_desc [0] = rt11ctx$s_exp_date;			! set up a descriptor for FAO
+    date_desc [1] = ctx [rt11ctx$t_exp_date];
+    IF NOT (status = $fao (%ASCID '!2UL-!AF!4UL', 0, date_desc, .day, 4, months [.mon], .year))
+    THEN
+	$exch_signal_stop (.status);
+    END;
+
+%IF switch_debug
+%THEN
+	BEGIN
+	LOCAL
+	    ent_typ;
+	BIND
+	    a = ctx [rt11ctx$t_entry] : VECTOR [, WORD];
+	! Show the entry type
+	!
+	ent_typ = (CASE .ctx [rt11ctx$v_type] FROM 0 TO rt11ctx$m_typ_end_segment OF
+		SET
+			[rt11ent$m_typ_tentative] :	%ASCID 'tent';
+			[rt11ent$m_typ_empty] :		%ASCID 'empty';
+			[rt11ent$m_typ_permanent] :	%ASCID 'perm';
+			[rt11ent$m_typ_end_segment] :	%ASCID 'end';
+			[INRANGE, OUTRANGE] :		%ASCID 'unknown';
+		TES);
+
+	! Show what we are returning
+	!
+	$debug_print_fao ('!7AS !10<!AF.!AF!> !6UL !AF   !XW !XW !XW !XW !XW !XW !XW',
+		.ent_typ,
+		.ctx [rt11ctx$l_exp_name_len], ctx [rt11ctx$t_exp_name],
+		.ctx [rt11ctx$l_exp_type_len], ctx [rt11ctx$t_exp_type],
+		.ctx [rt11ctx$w_blocks],
+		rt11ctx$s_exp_date, ctx [rt11ctx$t_exp_date],
+		.a[0], .a[1], .a[2], .a[3], .a[4], .a[5], .a[6]);
+	END;
+%FI
+
+RETURN true;
+END;
+
+GLOBAL ROUTINE exch$rt11_format_current_date (ent : $ref_bblock) : NOVALUE jsb_r1 =	%SBTTL 'exch$rt11_format_current_date (ent)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Format the current date, placing it into the date field of an RT-11 directory entry
+!
+! INPUT:
+!
+!	ent - pointer to the directory entry
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('rt11_format_current_date> ');
+
+LOCAL
+    timbuf : VECTOR [7, WORD]
+    ;
+
+BIND
+    year = timbuf [0] : WORD, month = timbuf [1] : WORD, day = timbuf [2] : WORD;
+
+$numtim (timbuf=timbuf);
+
+ent [rt11ent$v_year]  = .year - 1972;
+ent [rt11ent$v_month] = .month;
+ent [rt11ent$v_day]   = .day;
+
+RETURN;
+END;
+
+GLOBAL ROUTINE exch$rt11_mount (volb : $ref_bblock) =	%SBTTL 'exch$rt11_mount (volb)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Perform RT-11 volume specific mount processing
+!
+! INPUTS:
+!
+!	volb - pointer to volb which has been connected to the RT-11 device
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('rt11_mount> ');
+
+LOCAL
+    rtv : $ref_bblock,				! a pointer to the rt11 volb extension
+    seg : $ref_bblock,				! a pointer to the current directory segment
+    blocks,
+    status
+    ;
+
+$debug_print_lit ('entry');
+
+$block_check (1, .volb, volb, 462);
+
+! Allocate and initialize our volb extension
+!
+$logic_check (2, (.volb [volb$a_vfmt_specific] EQL 0), 127);
+rtv = exch$util_vm_allocate (exchblk$s_rt11);
+CH$FILL (0, rt11$k_end_zero - rt11$k_start_zero, .rtv + rt11$k_start_zero);	! Set part of block to nulls
+volb [volb$a_vfmt_specific] = .rtv;
+$block_init (.rtv, rt11);
+
+! Read the first part of the volume, the home block on pbn 1
+!
+IF NOT (status = exch$io_rt11_read (.volb, 1, 1, rtv [rt11$t_block_1]))
+THEN
+    RETURN .status;
+
+! Read the the first directory segment, found on blocks 6 and 7.
+!
+IF NOT (status = exch$io_rt11_read (.volb, rt11$k_root_block, 2,
+					rtv [rt11$t_block_0] + (512 * rt11$k_root_block)))
+THEN
+    RETURN .status;
+
+! Use the segment get routine to verify this first segment.  We temporarily set the present flag because the
+! get routine expects to see it.
+!
+rtv [rt11$v_dir_present] = true;
+seg = exch$rt11_dirseg_get (.volb, 1);		! Get a pointer to the root segment
+rtv [rt11$v_dir_present] = false;
+IF .seg EQL 0					! DIRSEG_GET will have signalled any problems
+THEN
+    RETURN exch$_rt11_baddirect;
+
+! Read in the rest of the directory if it is a multi-segment directory
+!
+IF .seg [rt11hdr$w_high_seg] GTRU 1
+THEN
+    BEGIN
+    LOCAL
+	blk_cnt, addr;
+    blk_cnt = 2 * (.seg [rt11hdr$w_high_seg] - 1);	! Segs are 2 blocks, but one is already in memory
+    addr = rt11$k_dirseglen + .seg;			! Get a pointer to space after the root segment
+    IF NOT (status = exch$io_rt11_read (.volb, rt11$k_root_block+2, .blk_cnt, .addr))
+    THEN
+	RETURN .status;
+    END;
+
+! Now we are ok, set the flag that it is present
+!
+rtv [rt11$v_dir_present] = true;		! This means present through HIGH_SEG, not NUM_SEGS
+
+! Verify the directory
+!
+status = exch$rtacp_verify_directory (.volb);
+
+! Set the volume type string
+!
+CH$MOVE (5, UPLIT BYTE ('RT-11'), volb [volb$t_vol_type]);
+volb [volb$l_vol_type_len] = 5;
+
+! Initialize the directory cache to the state of the global /CACHE qualifier
+!
+volb [volb$l_dircache] = .exch$a_gbl [excg$v_q_cache];
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE exch$rt11_open_file =	%SBTTL 'exch$rt11_open_file'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Perform RT-11 volume specific open processing
+!
+! INPUT:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	copy work area
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	filb - receive info pertaining to the open file
+!
+! ROUTINE VALUE:
+!
+!	true if able to open a file, false otherwise
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('rt11_open_file> ');
+
+LOCAL
+    out_filb					: $ref_bblock,
+    status
+    ;
+
+BIND
+    copy     = exch$a_gbl [excg$a_copy_work]	: $ref_bblock,
+    inp_filb = copy [copy$a_inp_filb]		: $ref_bblock,
+    ctx      = inp_filb [filb$a_context]	: $ref_bblock,
+    namb     = inp_filb [filb$a_assoc_namb]	: $ref_bblock,
+    nam_nam  = namb [namb$q_name]		: $desc_block,		! Get name and type components from
+    nam_typ  = namb [namb$q_type]		: $desc_block,		!  the namb
+    volb     = inp_filb [filb$a_assoc_volb]	: $ref_bblock,
+    inp_namb = copy [copy$a_inp_namb]		: $ref_bblock
+    ;
+
+$debug_print_lit ('entry');
+
+$block_check (2, .inp_filb, filb, 463);
+$block_check (2, .namb, namb, 464);
+$block_check (2, .volb, volb, 465);
+
+! Make sure that the output filb points to a valid filb
+!
+IF (out_filb = .copy [copy$a_out_filb]) EQL 0
+THEN
+    out_filb = .inp_filb;
+$block_check (2, .out_filb, filb, 472);
+
+! If the context pointer is null, then allocate and initialize it.
+!
+IF .ctx EQL 0
+THEN
+    ctx = exch$util_rt11ctx_allocate (.volb, .inp_filb)	! Create an RT11 context block
+
+! If non-null, we are doing a subsequent lookup in a wildcard search
+!
+ELSE
+    BEGIN
+
+    ! If not wildcard, then we must be done
+    !
+    IF NOT (.namb [namb$v_wild_name] OR .namb [namb$v_wild_type])
+    THEN
+	RETURN false;
+
+    $block_check (2, .ctx, rt11ctx, 446);
+
+    END;
+
+! Make sure that we haven't crossed signals someplace
+!
+$logic_check (4, (.ctx [rt11ctx$a_assoc_filb] EQL .inp_filb), 128);
+$logic_check (4, (.ctx [rt11ctx$a_assoc_volb] EQL .volb), 129);
+
+! We assume that the file name and type fields in the namb are adjacent.  If they aren't, the next call to
+! exch$rtacp_find_file will choke.
+!
+$logic_check (3, (.nam_typ [dsc$a_pointer] EQL (.nam_nam [dsc$w_length] + .nam_nam [dsc$a_pointer])), 154);
+
+IF (
+    IF .copy [copy$v_reopen_input]		! If we are retrying, then reuse the context block
+    THEN
+	1
+    ELSE					! Otherwise skip to the next file
+	exch$rtacp_find_file (.ctx, .nam_nam [dsc$a_pointer], .nam_nam [dsc$w_length] + .nam_typ [dsc$w_length])
+   )
+THEN
+    BEGIN
+
+    ! Do not find a .BAD file unless it is explicitly specified
+    !
+    IF .ctx [rt11ctx$w_filetype] EQL r50_bad
+    THEN
+	IF  .inp_namb [namb$v_wild_name]		! If the found file was not explicitly named
+	   OR						!  then skip to the next file by calling
+	    .inp_namb [namb$v_wild_type]		!  ourselves again
+	THEN
+	    RETURN exch$rt11_open_file ();
+
+    ! Create the result name string in the filb
+    !
+    inp_filb [filb$l_result_name_len] = .volb [volb$l_vol_ident_len]	! Length of volume ident
+				+ .ctx [rt11ctx$l_exp_fullname_len];	!  plus rt fullname
+    $logic_check (3, (.inp_filb [filb$l_result_name_len] LEQU filb$s_result_name), 130);
+    CH$COPY (.volb [volb$l_vol_ident_len], volb [volb$t_vol_ident],	! Volume name
+		.ctx [rt11ctx$l_exp_fullname_len], ctx [rt11ctx$t_exp_fullname],
+		0, filb$s_result_name, inp_filb [filb$t_result_name]);
+
+    $debug_print_fao ('Found "!AF"', .inp_filb [filb$l_result_name_len], inp_filb [filb$t_result_name]);
+
+    ! Define a record stream for this file
+    !
+    ctx [rt11ctx$l_cur_byte]	= 0;				! Context is the first byte in
+    ctx [rt11ctx$l_cur_block]	= .ctx [rt11ctx$l_start_block];	!  the first block of the file
+    ctx [rt11ctx$l_eof_block]	= .ctx [rt11ctx$l_start_block] + .ctx [rt11ctx$w_blocks] - 1;
+    inp_filb [filb$l_block_count]	= .ctx [rt11ctx$w_blocks];	! Put the size in the filb
+    inp_filb [filb$a_record]	= 0;				! No valid record or length
+    inp_filb [filb$l_record_len]	= 0;
+
+    ! Make sure that the record format in the filb is correct
+    !
+    exch$cmd_fetch_recfmt_implied (.inp_filb, ctx [rt11ctx$t_exp_type]);
+
+    ! For RT-11 we can treat block transfer mode as fixed 512
+    !
+    IF .out_filb [filb$b_transfer_mode] EQL filb$k_xfrm_block
+      OR
+       .inp_filb [filb$b_transfer_mode] EQL filb$k_xfrm_block
+    THEN
+	BEGIN
+	inp_filb [filb$b_rec_format]  = filb$k_rfmt_fixed;
+	inp_filb [filb$l_fixed_len]   = 512;
+	END;
+
+    ! Clear all the flags except the ones we want by writing the masks into the longword
+    !
+    ctx [rt11ctx$l_flags] = rt11ctx$m_stream_active;	! A record stream is currently active
+    inp_filb [filb$v_files_found] = true;			! One or more files have been opened
+
+    ! Set up the i/o and record buffer (for when we can't use locate mode)
+    !
+    IF .ctx [rt11ctx$a_buffer] EQL 0		! If doing wildcards buffer might be there
+    THEN
+	ctx [rt11ctx$a_buffer] = exch$util_vm_allocate (ctx$k_buffer_length);
+
+    ! Set the block pointers so that we will advance the buffer on the first get
+    !
+    ctx [rt11ctx$l_buf_base_block] = .ctx [rt11ctx$l_start_block];
+    ctx [rt11ctx$l_buf_high_block] = .ctx [rt11ctx$l_start_block] - 1;
+
+    ! Save the addresses of our routines for this volume and record format.
+    !
+    inp_filb [filb$a_close_routine] = exch$rt11_close_file;
+    inp_filb [filb$a_put_routine] = 0;
+    inp_filb [filb$a_get_routine] = exch$pdp_get;
+
+    RETURN true;				! True means its open
+    END;
+
+! If no files were found, then scream and shout
+!
+IF NOT .inp_filb [filb$v_files_found]
+THEN
+    BEGIN
+    REGISTER
+	fao_desc = 0 : $ref_bblock;
+
+    ! Concatenate the volume name to the file name and type fields
+    !
+    fao_desc = exch$util_fao_buffer (%ASCID '!AF!AF', .volb [volb$l_vol_ident_len], volb [volb$t_vol_ident],
+			.nam_nam [dsc$w_length] + .nam_typ [dsc$w_length], .nam_nam [dsc$a_pointer]);
+    $exch_signal (exch$_filenotfound, 1, .fao_desc);
+    RETURN rms$_fnf;
+
+    END;
+
+! Normal exit, return a 0
+!
+RETURN 0;
+END;
+
+GLOBAL ROUTINE exch$rt11_write_cleanup (volb : $ref_bblock) : NOVALUE =	%SBTTL 'exch$rt11_write_cleanup (volb)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Finish writing to the volume.  Clear file marks and flush caches.
+!
+! INPUTS:
+!
+!	volb - pointer to volb which has been connected to the RT-11 device
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('rt11_write_cleanup> ');
+
+$trace_print_fao ('entry - volb !XL', .volb);
+
+exch$rt11_zero_marks (.volb);			! Clear all the file marks
+
+exch$rt11_dircache_stop (.volb);		! Clear caching and flush the directory
+
+RETURN;
+END;
+
+GLOBAL ROUTINE exch$rt11_write_prepare (volb : $ref_bblock) : NOVALUE =	%SBTTL 'exch$rt11_write_prepare (volb)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Prepare to write to the volume.  Set up caches and clear file marks.
+!
+! INPUTS:
+!
+!	volb - pointer to volb which has been connected to the RT-11 device
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('rt11_write_prepare> ');
+
+$trace_print_fao ('entry - volb !XL', .volb);
+
+exch$rt11_dircache_start (.volb);		! Start caching on the directory
+
+exch$rt11_zero_marks (.volb);			! Clear all the file marks
+
+RETURN;
+END;
+
+GLOBAL ROUTINE exch$rt11_zero_marks (volb : $ref_bblock) : NOVALUE =	%SBTTL 'exch$rt11_zero_marks (volb)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Clear the file marks in every entry in the directory.  EXCHANGE flags the JOB byte (rt11ent$b_job) of the
+!	directory entry while it is entering files.  The flags are cleared before and after each COPY command,
+!	therebye giving us the means to recognize that we might have to delete a file which we just created.
+!
+! INPUTS:
+!
+!	volb - pointer to volb which has been connected to the RT-11 device
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('exch$rt11_zero_marks> ');
+
+LOCAL
+    seg : $ref_bblock,				! a pointer to the current directory segment
+    cur : $ref_bblock,				! a pointer to the current directory entry
+    seg_num,					! current segment number
+    ent_len					! length of a directory entry
+    ;
+
+$trace_print_fao ('entry - volb !XL', .volb);
+
+$block_check (2, .volb, volb, 459);
+$logic_check (2, (.volb [volb$v_write]), 199);	! We shouldn't get this far if we aren't supposed to write to it
+
+! Loop through all the directory entries to clear the mark flag.  
+!
+seg_num = 1;					! Start with the first directory segment
+WHILE .seg_num NEQ 0
+DO
+    BEGIN
+
+    ! Get a pointer to the current segment, return if error
+    !
+    seg = exch$rt11_dirseg_get (.volb, .seg_num);
+    $logic_check (2, (.seg NEQ 0), 197);
+    ent_len = rt11ent$k_length + .seg [rt11hdr$w_extra_bytes];	! Actually the same for all segments
+
+    ! Get a pointer to the first directory entry
+    !
+    cur = .seg + rt11hdr$k_length;
+
+    ! Look through the segment
+    !
+    WHILE (.cur LSSU (.seg + rt11$k_dirseglen))
+    DO
+	BEGIN
+
+	CASE .cur [rt11ent$v_type] FROM 0 TO rt11ent$m_typ_end_segment OF
+	SET
+	[rt11ent$m_typ_tentative, rt11ent$m_typ_permanent, rt11ent$m_typ_empty] :
+		BEGIN
+
+		! If the marker isn't clear, clear it and remember that the segment has been changed
+		!
+		IF .cur [rt11ent$b_job] NEQ 0
+		THEN
+		    BEGIN
+		    cur [rt11ent$b_job] = 0;
+		    exch$rt11_dirseg_put (.volb, .seg_num);	! Caching is on, this won't give us an I/O now
+		    END;
+		END;
+
+	[rt11ent$m_typ_end_segment] :
+		EXITLOOP;
+
+	[INRANGE, OUTRANGE] :
+		;
+
+	TES;
+
+	cur = .cur + .ent_len;			! Skip to the next entry
+
+	END;
+
+    seg_num = .seg [rt11hdr$w_next_seg];	! Skip to the next segment
+
+    END;
+
+RETURN;
+END;
+
+END
+ELUDOM

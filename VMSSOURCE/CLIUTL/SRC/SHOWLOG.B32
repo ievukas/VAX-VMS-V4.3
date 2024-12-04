@@ -1,0 +1,2048 @@
+module showlog (ident = 'V04-000',	! File: SHOWLOG.B32 Edit: RAS0319
+	addressing_mode (external = general))=
+begin
+!
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!
+!++
+!
+! FACILITY:  Show logical names
+!
+! ABSTRACT:
+!	This module implements the "SHOW LOGICAL" DCL command.
+!
+! ENVIRONMENT:
+!	VAX native, user and kernel mode
+!
+! AUTHOR:  Peter D Gilbert	 CREATION DATE:  20-Dec-1983
+!
+! MODIFIED BY:
+!
+!	V03-004	RAS0328		Ron Schaefer			25-Jul-1984
+!		Make SHOW LOGICAL more friendly in terms of space allocated;
+!		instead of asking for PAGEDYN, ask for the minimum of
+!		PAGEDYN and process free-space as determined by $GETJPI.
+!		Fix possible kernel-mode accvio on error path.
+!
+!	V03-003	RAS0319		Ron Schaefer			 2-Jul-1984
+!		Add additional data structure cell to the RT structure.
+!		Since RT and NT are actually used in 2 facilities, they
+!		should really be globally defined.
+!
+!	V03-002	PDG0002		Peter D Gilbert			08-Apr-1984
+!
+!		Add LOG_V_EQUAL, which is set in CMP_LOG, and indicates there
+!		are two or more identical logical names in the same table.
+!		This flag indicates that, even if no other attributes are
+!		displayed, the access mode should be displayed to distinguish
+!		between these logical names.
+!	
+!		Change DUMP_LOG so a depth of 0 is shown as " ", instead of "0".
+!
+!		For recursive translations, avoid writing a blank line until we
+!		know it's needed to separate logical names (when NO names were
+!		found, the extra blank line looked very tacky).
+!
+!	V03-001	TMK0001		Todd M. Katz			04-Apr-1984
+!		Make the following changes:
+!
+!		1. I have changed this module to use the symbol LNM$C_MAXDEPTH 
+!		   to define the maximum logical name recursion depth instead 
+!		   of the local symbol RT_C_MAXDEP. 
+!
+!		2. The name of the offset in the table header that contains the
+!		   address of the protection structure associated with shareable
+!		   logical name tables has been changed from LNMTH$L_CHP to 
+!		   LNMTH$L_ORB to reflect the replacement of shareable logical 
+!		   name tables' CHIP protection templates by Object Rights 
+!		   Blocks.
+!
+!		3. Change the routine recursively_translate, so that it 
+!		   immediately exits whenever it is called with a depth equal
+!		   to LNM$C_MAXDEPTH. Previously, this routine was exiting only
+!		   when it was called with a depth greater-than LNM$C_MAXDEPTH.
+!		   However, since recursion depths are numbered from 0 to 9 and 
+!		   not from 1 to 10, this was resulting in names being 
+!		   recursively translated to a depth of eleven instead of to a 
+!		   depth of ten. 
+!
+!--
+
+library 'sys$library:lib';		! VAX/VMS system definitions
+library	'sys$library:xport';
+%if %declared(%quote $descriptor) %then undeclare %quote $descriptor; %fi
+require 'src$:showdef';			! SHOW common definitions
+
+
+!			B L I S S   E X T E N S I O N S
+!
+macro
+    $check_(x) = (local s: initial(x); if not .s then signal_stop(.s)) %,
+    !
+    ! Macros for offset, position, size, and extension.
+    !
+    base_ = 0,0,0,0 %,
+    b0_ = 0,8,0 %,
+    b1_ = 8,8,0 %,
+    l_ = 0,32,0 %,
+    !
+    ! This macro is similar to the Bliss %fieldexpand lexical function.
+    ! However, it works with either field names, or o,p,s,e macros.
+    !
+    %fieldexpand_(a,b,c,d,e) =
+	%if %length eql 1 %then %fieldexpand(a) %else
+	%if %length eql 2 %then %fieldexpand(a,b) %else
+	%if %length eql 4 %then a,b,c,d %else
+	%if %length eql 5 %then
+	    %if e eql 0 %then a %else
+	    %if e eql 1 %then b %else
+	    %if e eql 2 %then c %else
+	    %if e eql 3 %then d %else
+	    %error('Invalid parameter to %fieldexpand_')
+	    %fi %fi %fi %fi %else
+	%error('Wrong number of arguments to %fieldexpand_')
+	%fi %fi %fi %fi %;
+
+!
+! BLOCK TO CONTROL RECURSIVE TABLE NAME TRANSLATION
+!
+!	 31           25 24           16 	     9 8 7             0
+!	+---------------+---------------+---------------+---------------+
+! R5 -> | TRIES		| DEPTH		|	     T C| ACCESS MODE	|
+!	+---------------+---------------+---------------+---------------+
+!	|		CACHE TABLE ADDRESS OR 0			|
+!	+---------------+---------------+---------------+---------------+
+!	|								|
+!	|	LNM$C_MAXDEPTH LONGWORDS TO SERVE AS STACK		|
+!	|								|
+!	|								|
+!	+---------------+---------------+---------------+---------------+
+!
+!	T IS SET TO INHIBIT FURTHER RECURSION
+!
+literal
+    rt_c_maxtries=	255;		! Max number of tries
+$unit_field rt_fields =
+    set
+    rt_w_r5=		[$bits(16)],	! Access mode and flags
+    $overlay(rt_w_r5)
+    rt_b_acmode=	[$bits(8)],	! Access mode
+    rt_b_flags=		[$bits(8)],	! Flags
+    $continue
+    $overlay(rt_b_flags)
+    rt_v_case=		[$bit],		! Caseless flag
+    rt_v_term=		[$bit],		! Inhibit recursion flag
+    $continue
+    rt_b_depth=		[$bits(8)],	! Recursion depth
+    rt_b_tries=		[$bits(8)],	! Recursion tries
+    rt_l_cacheptr=	[$address],	! Address of cache entry
+    rt_a_stack=		[$bits(0)]	! Start of recursion stack
+    tes;
+literal	rt_k_size	= $field_set_units + lnm$c_maxdepth * %upval;
+macro	rt_block	= $unit_block(rt_k_size) field(rt_fields) %;
+
+
+!
+! BLOCK TO CONTROL NAME TRANSLATION
+!
+!	 31           25 24           16 15            8 7             0
+!	+---------------+---------------+---------------+---------------+
+! R3 -> | HASH FUNCTION VALUE OR 0	| 	       C| ACCESS MODE	|
+!	+---------------+---------------+---------------+---------------+
+!	| 			LENGTH OF NAME				|
+!	+---------------+---------------+---------------+---------------+
+!	|			ADDRESS OF NAME				|
+!	+---------------+---------------+---------------+---------------+
+!	|		TABLE HEADER ADDRESS OR 0			|
+!	+---------------+---------------+---------------+---------------+
+!	|		NAME BLOCK ADDRESS OR 0				|
+!	+---------------+---------------+---------------+---------------+
+!
+!	F IS SET TO INHIBIT FURTHER RECURSION
+!
+$unit_field nt_fields =
+    set
+    nt_w_r5=		[$bits(16)],	! Access mode and flags
+    $overlay(nt_w_r5)
+    nt_b_acmode=	[$bits(8)],	! Access mode
+    nt_b_flags=		[$bits(8)],	! Flags
+    $continue
+    $overlay(nt_b_flags)
+    nt_v_case=		[$bit],		! Caseless flag
+    $continue
+    nt_w_hash=		[$bits(16)],	! Hash function or 0
+    nt_l_namlen=	[$integer],	! Length of name
+    nt_l_namadr=	[$address],	! Address of name
+    nt_l_tabid=		[$address],	! Table header address or 0
+    nt_l_thread=	[$address]	! Lnmb pointer
+    tes;
+literal	nt_k_size	= $field_set_units;
+macro	nt_block	= $unit_block(nt_k_size) field(nt_fields) %;
+
+! Define linkages for the routines to lock and unlock the logical name
+! table mutex, as well as the match routine and the protection checking
+! routine.
+!
+linkage
+    lnk_presearch = jsb (	! R0 = RETURN STATUS
+	register=1,	! R1 = HASH TABLE ADDRESS (IF TABLE HEADER ADDRESS IS MISSING)
+	register=3;	! R3 = ADDRESS OF NAME TRANSLATION (NT) BLOCK
+	register=1	! R1 = ADDRESS OF LOGICAL NAME BLOCK THAT CONTAINS MATCH.
+	): nopreserve(0,1,2) preserve(3,4,5) notused(6,7,8,9,10,11);
+linkage
+    lnk_contsearch = jsb (	! R0 = RETURN STATUS
+	register=3;	! R3 = ADDRESS OF NAME TRANSLATION (NT) BLOCK
+	register=1	! R1 = ADDRESS OF LOGICAL NAME BLOCK THAT CONTAINS MATCH.
+	): nopreserve(0,1,2) preserve(3,4,5) notused(6,7,8,9,10,11);
+linkage
+    lnk_check_prot = jsb (	! R0 = RETURN STATUS
+	register=1,	! R1 = ADDRESS OF LOGICAL NAME TABLE HEADER.
+	register=2,	! R2 = ACCESS MASK TO USE FOR THE CHECK.
+	register=4,	! R4 = CURRENT PCB ADDR
+	register=5	! R5 = ACCESS MODE OF ACCESSOR
+	): nopreserve(2) preserve(1,3,4,11) notused(6,7,8,9,10);
+linkage
+    lnk_hash = jsb (	! R0 = RETURNED HASH VALUE
+	register=0,	! R0 = LENGTH OF LOGICAL NAME STRING
+	register=1	! R1 = ADDRESS OF LOGICAL NAME STRING
+	): nopreserve(2,3) preserve(4,5) notused(6,7,8,9,10,11);
+linkage
+    lnk_setup = jsb (
+	register=2,	! R2 = LENGTH OF TABLE NAME STRING
+	register=3,	! R3 = ADDRESS OF TABLE NAME STRING
+	register=5;	! R5 = ADDRESS OF RECURSION TABLE SEARCH CONTROL BLOCK
+	register=1	! R1 = ADDRESS OF LOGICAL NAME TABLE HEADER
+	): nopreserve(2,3) preserve(4,5) notused(6,7,8,9,10,11);
+linkage
+    lnk_table = jsb (
+	register=5;	! R5 = ADDRESS OF RECURSION TABLE SEARCH CONTROL BLOCK
+	register=1	! R1 = ADDRESS OF LOGICAL NAME TABLE HEADER
+	): nopreserve(2,3) preserve(4,5) notused(6,7,8,9,10,11);
+linkage
+    lnk_lock = jsb (
+	register=4	! R4 = CURRENT PCB ADDR
+	): nopreserve(1,2,3) notused(5,6,7,8,9,10,11);
+linkage
+    lnk_match_name = jsb (
+	register=2,	! R2 = LENGTH OF STRING TO TRY MATCHING
+	register=3,	! R3 = ADDRESS OF STRING TO TRY MATCHING
+	register=4,	! R4 = LENGTH OF WILDCARD STRING
+	register=5	! R5 = ADDRESS OF WILDCARD STRING
+	): nopreserve(1,2,3,4,5) notused(6,7,8,9,10,11);
+linkage
+    lnk_compare = jsb (
+	register=0,
+	register=1
+	): nopreserve(0,1,2,3) preserve(4,5) notused(6,7,8,9,10,11);
+
+! Some linkages that we don't use
+!
+!linkage
+!    lnk_searchlog = jsb (	! R0 = RETURN STATUS
+!	register=0,	! R0 = LENGTH OF LOGICAL NAME STRING
+!	register=1,	! R1 = ADDRESS OF LOGICAL NAME STRING
+!	register=2,	! R2 = LENGTH OF TABLE NAME STRING
+!	register=3,	! R3 = ADDRESS OF TABLE NAME STRING
+!	register=5;	! R5 = SEARCH ACCESS MODE IN LOW BYTE, CASELESS FLAG IN BIT 8.
+!	register=1	! R1 = ADDRESS OF LOGICAL NAME BLOCK THAT CONTAINS MATCH.
+!	): preserve(2,3,4,5) notused(6,7,8,9,10,11);
+!linkage
+!    lnk_firsttab = jsb (	! R0 = RETURN STATUS
+!	register=1,	! R1 = SEARCH ACCESS MODE IN LOW BYTE, CASELESS FLAG IN BIT 8.
+!	register=2,	! R2 = LENGTH OF TABLE NAME STRING
+!	register=3;	! R3 = ADDRESS OF TABLE NAME STRING
+!	register=1	! R1 = ADDRESS OF LOGICAL NAME TABLE HEADER
+!	): nopreserve(2,3) preserve(4,5) notused(6,7,8,9,10,11);
+!linkage
+!    lnk_lookup = jsb (
+!	register=0,	! R0 = HASH CODE TABLE NAME STRING (OR 0 IF NOT KNOWN)
+!	register=2,	! R2 = LENGTH OF TABLE NAME STRING
+!	register=3,	! R3 = ADDRESS OF TABLE NAME STRING
+!	register=5;	! R5 = ADDRESS OF RECURSION TABLE SEARCH CONTROL BLOCK
+!	register=1	! R1 = ADDRESS OF LOGICAL NAME BLOCK
+!	): nopreserve(2,3) preserve(5) notused(4,6,7,8,9,10,11);
+
+! External declarations
+!
+external routine
+    cli$present,
+    cli$get_value,
+    lib$get_vm,
+    lib$free_vm,
+    lib$scopy_dxdx,
+    str$free1_dx,
+    lnm$check_prot:	lnk_check_prot,
+    lnm$contsearch:	lnk_contsearch,	! ???
+    lnm$presearch:	lnk_presearch,	! ???
+    lnm$setup:		lnk_setup,	! ???
+    lnm$table:		lnk_table,	! ???
+    lnm$lockr:		lnk_lock,
+    lnm$unlock:		lnk_lock,
+!   lnm$searchlog:	lnk_searchlog,
+!   lnm$firsttab:	lnk_firsttab,
+!   lnm$hash:		lnk_hash,
+!   lnm$lookup:		lnk_lookup,	! ???
+    show$write_line,
+    fmg$match_name:	lnk_match_name;
+
+external literal
+    show$_notran;
+
+external
+    sgn$gl_pagedyn,
+    lnm$al_hashtbl:	vector[2],	! Addrs of sys & proc hash tables
+    lnm$al_dirtbl:	vector[2],	! Addrs of sys & proc directory lnmbs
+!   ctl$gl_lnmhash,
+!   lnm$gl_htblsizp,
+!   lnm$gl_htblsizs,
+!   lnm$system_directory,
+    ctl$gl_pcb:		ref $bblock;
+
+!	FLAG_BLOCK
+!
+!	This defines various flags that are used.
+!	Most of the flags are gotten directly from CLI calls.
+!
+$unit_field flag_fields =
+    set
+    flag_v_system	= [$bit],	! True if /SYSTEM  specified
+    flag_v_group	= [$bit],	! True if /GROUP   specified
+    flag_v_job		= [$bit],	! True if /JOB     specified
+    flag_v_proc		= [$bit],	! True if /PROCESS specified
+    flag_v_normal	= [$bit],	! This means not /STRUCTURE
+    flag_v_descend	= [$bit],	! True if descendants needed
+    flag_v_full		= [$bit],	! True if /FULL specified
+    flag_v_recurse	= [$bit],	! True to show recursive translations
+    flag_v_found	= [$bit]	! True if any translations found
+    tes;
+literal	flag_k_size	= $field_set_units;
+macro	flag_block	= $unit_block(flag_k_size) field(flag_fields) %;
+
+
+
+!	CMDTBL_BLOCK
+!
+!	This is used to store a table or a logical name from the command line
+!	(the roots of these linked lists are cmdtbl_list and cmdnam_list).
+!	For table names, the cmdtbl_l_table field points to a list of
+!	table_blocks that are relevant/correspond to the particular table name.
+!	For logical names, the cmdtbl_l_table field is unused.
+!
+$unit_field cmdtbl_fields =
+    set
+    cmdtbl_l_next	= [$address],
+    cmdtbl_l_table	= [$address],
+    cmdtbl_q_name	= [$bytes(dsc$k_d_bln)]
+    tes;
+literal	cmdtbl_k_size	= $field_set_units;
+macro	cmdtbl_block	= $unit_block(cmdtbl_k_size) field(cmdtbl_fields) %;
+
+
+!	TABLE_BLOCK
+!
+!	This stores the information we will display about a table.
+!	It also provides a tree structure for the tables (via the table_l_next
+!	and table_l_child fields).
+!	The table_l_log field points to a linked list of log_blocks.
+!
+$unit_field table_fields =
+    set
+    table_l_next	= [$address],
+    table_l_child	= [$address],
+    table_l_byteslm	= [$integer],	! Same as lnmth$l_byteslm
+    table_l_bytes	= [$integer],	! Same as lnmth$l_bytes
+    table_l_log		= [$address],	! Pointer to log_block
+    table_b_acmode	= [$byte],	! Same as lnmb$b_acmode
+    table_b_flags	= [$byte],	! Same as lnmth$b_flags
+    table_t_name	= [$byte]	! Ascic name of the table
+    tes;
+literal	table_k_size	= $field_set_units;
+macro	table_block	= $unit_block(table_k_size) field(table_fields) %;
+
+
+!	LOG_BLOCK
+!
+!	This holds the information for one logical name.
+!	These blocks are actually variable length --
+!	from log_t_name through the end of the log_block, the contents are the
+!	same as lnmb$t_name through the end of a lnmb block.
+!
+$unit_field log_fields =
+    set
+    log_l_next		= [$address],
+    log_l_table		= [$address],	! Pointer to table_block
+    log_b_flags		= [$byte],	! Same as lnmb$b_flags
+    $overlay(log_b_flags)
+    log_v_dummy		= [$bits(7)],
+    log_v_equal		= [$bit],	! An identical logical is in this table
+    $continue
+    log_b_acmode	= [$byte],	! Same as lnmb$b_acmode
+    log_t_name		= [$byte]	! Same as lnmb$t_name
+    tes;
+literal	log_k_size	= $field_set_units;
+macro	log_block	= $unit_block(log_k_size) field(log_fields) %;
+
+
+!	KNOWN_BLOCK
+!
+!	This block is used to store which logical name tables are currently
+!	known (to avoid displaying the table and contained names more than
+!	once -- consider /TABLE=(LNM$DCL_LOGICAL,LNM$PROCESS) ).
+!
+!	A lookup on this structure uses known_l_lnmth as a key, and gives
+!	known_l_table as the result.
+!
+$unit_field known_fields =
+    set
+    known_l_next	= [$address],
+    known_l_lnmth	= [$address],	! Address of the lnmth block
+    known_l_table	= [$address]	! Pointer to the table_block
+    tes;
+literal	known_k_size	= $field_set_units;
+macro	known_block	= $unit_block(known_k_size) field(known_fields) %;
+
+
+!	OWN STORAGE
+!
+own
+    vm_size,					! Remaining size of VM
+    vm_addr,					! Starting address of VM
+    saved_fp,					! Saved FP from kernel mode
+    known_list:		ref known_block,	! List of "known" tables
+    cmdtbl_list:	ref cmdtbl_block,	! Tables from CLI
+    cmdnam_list:	ref cmdtbl_block,	! Logical names from CLI
+    flags:		flag_block,		! Various flags
+    acmode:		byte;			! Intergrity mode
+
+
+! Macro for a routine to re-call itself in kernel mode
+! (if it's not already running in kernel mode).
+!
+! The sole rationale for this is to make the code more readable.
+!
+! This macro also saves the FP of the kernel mode code.
+! The idea is to provide an easy way to return out of kernel mode.
+! And while we're at it, lock the logical name tables for read access.
+!
+macro
+    runs_in_kernel_(rtn) =
+	begin
+	builtin ap, movpsl, fp;
+	local psl: $bblock[%upval];
+	movpsl(psl);
+	if .psl[psl$v_curmod] eql psl$c_kernel
+	then
+	    saved_fp = .fp
+	else
+	    begin
+	    local status;
+	    status = $cmkrnl(routin = rtn, arglst = .ap);
+	    saved_fp = 0;
+	    return .status;
+	    end;
+	lnm$lockr(.ctl$gl_pcb);
+	end %;
+
+! Macro to write a blank line
+!
+bind
+    blank_line = %ascid'';
+macro
+    write_blank_line(z) =
+	util_output(blank_line)
+	%;
+
+routine util_output(ctrstr, p1) =
+    begin
+    return show$write_line(.ctrstr, p1);
+    end;
+
+! Routine to allocate some memory.
+! A large chunk of memory has already been allocated (by lib$get_vm).
+! This routine simply grabs a little piece of that large chunk.
+!
+! Because the amount of memory we allocated is based on sgn$gl_pagedyn, and we
+! are pretty good about not storing information twice, we should never run out
+! of this memory.  However, if we do, we're ready for it (see below).
+!
+routine util_allocate(size) =
+    begin
+
+    if (vm_size = .vm_size - .size) geq 0
+    then
+	return .vm_addr + .vm_size
+    else if
+	.saved_fp eql 0
+    then
+	begin
+	!
+	! We aren't in kernel mode.  Signal insufficient memory.
+	!
+	signal(show$_insvirmem);
+	return 0;
+	end
+    else
+	begin
+	!
+	! We are in kernel mode.  Return a status to the caller, by
+	! setting FP to that of our first kernel mode frame and returning.
+	!
+	builtin
+	    fp;
+	lnm$unlock(.ctl$gl_pcb);
+	set_ipl(0);
+	fp = .saved_fp;
+	return show$_insvirmem;
+	end;
+    end;
+
+
+! Routine to re-allocate some memory.
+! The reallocation is like removing stuff from a stack.
+! The parameter is the address of where we want to back up to.
+!
+routine util_reallocate(addr): novalue =
+    begin
+    vm_size = .addr - .vm_addr;
+    end;
+
+
+! Routine to manipulate pointers.
+! All the parameters are by reference, except the last which is by value.
+! Slide the rightmost parameter to the left, and so on.  Return the value
+! of the leftmost parameter.
+!
+routine util_slide =
+    begin
+    builtin
+	actualcount,
+	actualparameter;
+    macro
+	swap_(x,y) = (local t; t = .x; x = .y; y = .t) %;
+    local
+	x;
+    x = actualparameter(actualcount());
+    decr i from actualcount()-1 to 1 do
+	swap_(actualparameter(.i), x);
+    return .x;
+    end;
+
+
+! Routine to add another cmdtbl_block to a linked list.
+!
+routine add_to_cmd_list(
+	p_root,			! Address of the root of the linked list
+	name:	ref $bblock	! String to be added to the list
+	): novalue =
+    begin
+    bind
+	root = .p_root: ref cmdtbl_block;
+    local
+	ptr:	ref cmdtbl_block;
+    ptr = util_allocate(cmdtbl_k_size);
+    ch$move(dsc$k_d_bln, name[base_], ptr[cmdtbl_q_name]);
+    ptr = util_slide(ptr[cmdtbl_l_next], root, ptr[base_]);
+    end;
+
+
+! This clever little routine reverses a linked list.
+! This simplifies building the list, and traversing the list.
+!
+routine reverse_list(
+	p_root,		! Address of the root of the linked list
+	next		! Byte offset of the 'next' field in a node
+	): novalue =
+    begin
+    bind
+	root = .p_root: ref $bblock;
+    local
+	ptr:	ref $bblock initial(0);
+    while .root neq 0 do
+	ptr = util_slide(root, root[.next,l_], ptr[base_]);
+    root = ptr[base_];
+    end;	
+
+routine sort_list(	! list[cmdtbl_l_table], %fieldexpand_(table_l_next,0));
+	p_root,		! Address of the root of the linked list
+	next,		! Byte offset of the 'next' field in a node
+	compare		! Address of a routine to compare nodes
+	): novalue =
+    begin
+    !
+    ! Alphabetize the list pointed to by p_root
+    !
+    bind
+	root = .p_root: ref $bblock;
+    bind routine
+	compare_rtn = .compare: lnk_compare;
+    local
+	sort:	ref $bblock initial(0);
+    while root[base_] neq 0 do
+	begin
+	!
+	! Grab one item from root list, and insert in it sort list
+	!
+	local
+	    r:	ref $bblock,
+	    p:	ref vector[1];
+	r = sort - .next;
+	while (p = r[.next,l_]; r = .p[0]) neq 0 do
+	    begin
+	    if compare_rtn( r[base_], root[base_] ) geq 0
+	    then
+		exitloop;
+	    end;
+	r = util_slide(root, root[.next,l_], 0);
+	r = util_slide(r[.next,l_], p[0], r[base_]);
+	end;
+    root = sort[base_];
+    end;
+
+
+! This recursive routine does a preorder tree traversal
+! (visit node, visit left subtree, visit right subtree).
+!
+! To reduce the amount of stack space required, the traversal
+! is done partly by recursion, partly by iteration.
+!
+routine visit_tree(
+	root:	ref $bblock,	! Root of the tree
+	loffset,		! Byte offset of the 'left' field in a node
+	roffset,		! Byte offset of the 'right' field in a node
+	action,			! Address of an action routine
+	depth			! Current depth of the traversal
+	): novalue =
+    begin
+    local
+	ptr:	ref $bblock;
+    ptr = root - .roffset;
+    while (ptr = .ptr[.roffset,l_]) neq 0 do
+	begin
+	(.action)(ptr[base_], .depth);
+	visit_tree(.ptr[.loffset,l_], .loffset, .roffset, .action, .depth+1);
+	end;
+    end;
+
+! This routine calls the CLI and builds a list of cmdtbl_blocks to hold
+! the table names specified by the user.
+!
+routine get_tables =
+    begin
+    local
+	desc:	$bblock[dsc$c_d_bln],
+	root:	ref cmdtbl_block initial(0);
+    macro
+	add_(x) = add_to_cmd_list( root, x ) %;
+
+    if not .flags[flag_v_normal]
+    then
+	begin
+	!
+	! For /STRUCTURE, just specify the directories,
+	! and ask for descendants.
+	!
+	! Note that the /STRUCTURE qualifier should not be used with
+	! any of the /TABLE, /PROCESS, /JOB, /GROUP or /SYSTEM qualifiers.
+	!
+	add_( %ascid'LNM$PROCESS_DIRECTORY' );
+	add_( %ascid'LNM$SYSTEM_DIRECTORY' );
+	flags[flag_v_descend] = true;
+	end
+    else
+	begin
+	!
+	! Get all the relevant table names, in the following order:
+	!	names from the /TABLE qualifier
+	!	names from the /PROCESS, /JOB, /GROUP and /SYSTEM qualifiers
+	!	if still no names, use LNM$DCL_LOGICAL
+	!
+	while
+	    begin
+	    $init_dyndesc(desc);
+	    cli$get_value(%ascid'table', desc[base_])
+	    end
+	do
+	    add_(desc[base_]);
+	if .flags[flag_v_proc]	then add_( %ascid 'LNM$PROCESS' );
+	if .flags[flag_v_job]	then add_( %ascid 'LNM$JOB' );
+	if .flags[flag_v_group]	then add_( %ascid 'LNM$GROUP' );
+	if .flags[flag_v_system]then add_( %ascid 'LNM$SYSTEM' );
+	if .root eql 0		then add_( %ascid 'LNM$DCL_LOGICAL' );
+	end;
+
+    reverse_list( root, %fieldexpand_(cmdtbl_l_next,0) );
+
+    return .root;
+    end;
+
+
+! This routine calls the CLI and builds a list of cmdtbl_blocks to hold
+! the logical names specified by the user.
+!
+routine get_lognam =
+    begin
+    local
+	desc:	$bblock[dsc$c_d_bln],
+	root:	ref cmdtbl_block initial(0);
+
+    macro
+	add_(x) = add_to_cmd_list( root, x ) %;
+    while
+	begin
+	$init_dyndesc(desc);
+	cli$get_value(%ascid'logname', desc[base_])
+	end
+    do
+	begin
+	!
+	! If the last character is a colon, remove it.
+	!
+	if ch$rchar(.desc[dsc$w_length]+.desc[dsc$a_pointer]) eql ':'
+	then
+	    begin
+	    local
+		tmp:	vector[2];
+	    tmp[0] = .desc[dsc$w_length] - 1;
+	    tmp[1] = .desc[dsc$a_pointer];
+	    lib$scopy_dxdx(tmp[0], desc[base_]);
+	    end;
+	add_(desc[base_]);
+	end;
+    if .root eql 0		then add_( %ascid '*' );
+    reverse_list( root, %fieldexpand_(cmdtbl_l_next,0) );
+
+    return .root;
+    end;
+
+! Little routine to check the protection on a lnmth block
+!
+routine check_prot(x: ref $bblock) =
+    begin
+    literal
+	pro_mask = arm$m_read;			! Protection mask
+    if not .x[lnmth$v_shareable] then return true
+    else if .x[lnmth$v_directory] then return true	! ???
+    else if .x[lnmth$l_orb] eql 0 then return true
+    else return lnm$check_prot(x[base_], pro_mask, .ctl$gl_pcb, 0);
+    end;
+
+
+routine recheck_tables: novalue =
+    begin
+    !
+    ! When the code reenters kernel mode, there is always the possibility
+    ! that some logical name table found by get_relevant_tables got deleted,
+    ! or is no longer accessible (which is okay per se, since we really don't
+    ! need to find the lnmth block again).
+    !
+    ! However, it is possible that one of the lnmth blocks got deleted and
+    ! reused as another lnmth block.  This means that we may be displaying
+    ! logical names that the user has no business seeing!
+    !
+    ! This routine prevents the above security hole, by the following method:
+    ! For each table in known_list, we find the table again (by name or by
+    ! calling for_each_lnmth and checking the known_l_lnmth value), and verify
+    ! that the user has read access to the table (this prevents the security
+    ! hole; we should also check that the tables have the same name and
+    ! attributes).  If it doesn't check out, the known_l_lnmth value is zeroed;
+    ! since lnmb$l_table is never zero, we'll not find any more logical names
+    ! for this table.
+    !
+    ! This is a pain.
+    !
+    local
+	known:		ref known_block,
+	an_rt_block:	rt_block,
+	status;
+    register
+	rt = 5:	ref rt_block initial(an_rt_block[base_]);
+
+    ! Initialize the rt_block for the table name
+    !
+    rt[rt_b_acmode] = psl$c_user;	! Acceptable integrity mode
+    rt[rt_b_flags] = 0;			! Initialize flags
+    rt[rt_v_case] = true;		! Case-insensitive
+
+    known = known_list - %fieldexpand_(known_l_next,0);
+    while (known = .known[known_l_next]) neq 0 do
+	if .known[known_l_lnmth] neq 0 then	! Have we already trashed this?
+	begin
+	local
+	    table:	ref table_block,
+	    lnmth:	ref $bblock;
+
+	table = .known[known_l_table];
+	status = lnm$setup(.table[table_t_name], 1+table[table_t_name],
+	    rt[base_]; lnmth);
+	while true do
+	    begin
+	    if not .status
+	    then
+		begin
+		if .status eql ss$_toomanylnam
+		then
+		    rt[rt_b_depth] = .rt[rt_b_depth] - 1	! Backup depth
+		else
+		    begin
+		    known[known_l_lnmth] = 0;
+		    exitloop		! Presumably no more names
+		    end;
+		end
+	    else if
+		lnmth[base_] eql .known[known_l_lnmth]
+	    then
+		begin
+		!
+		! We found what may be this table (it has the same address).
+		! Check the protection.
+		! We should also check for the same name and attributes, but
+		! this prevents any security violations, even though we may
+		! display incorrect information.
+		!
+		if not check_prot(lnmth[base_]) then known[known_l_lnmth] = 0;
+		exitloop;
+		end;
+
+	    rt[rt_b_tries] = rt_c_maxtries;	! Reinitialize number of tries
+	    status = lnm$table(rt[base_]; lnmth);
+	    end;
+	end;
+    end;
+
+! This routine does a lookup on the known_list.
+! It looks up the address of a lnmth block:
+!	if found, it returns the address of the table_block,
+!	if not found, it returns zero.
+!
+routine lookup_table(lnmth_address) =
+    begin
+    local
+	known:	ref known_block;
+    known = known_list - %fieldexpand_(known_l_next,0);
+    while (known = .known[known_l_next]) neq 0 do
+	if .known[known_l_lnmth] eql .lnmth_address
+	then
+	    return .known[known_l_table];
+    return 0;
+    end;
+
+
+! This routine adds a lnmth block to the list of known tables.
+!
+routine add_to_known(
+	lnmth:	ref $bblock
+	) =
+    begin
+    !
+    ! Find whether we already know about this lnmth entry
+    ! If we already know about it (or don't want the user to know about it,
+    ! because of protection) then return 0,
+    ! Otherwise, return a pointer to the table_block
+    !
+    local
+	known:	ref known_block;
+
+
+    ! Check protection on the table
+    !
+    if not check_prot(lnmth[base_]) then return 0;
+
+
+    ! See if it's already on the known list
+    ! If so, return a zero.
+    !
+    if lookup_table(lnmth[base_]) neq 0 then return 0;
+
+
+    begin
+    bind lnmb = .lnmth[lnmth$l_name]: $bblock;
+    local table: ref table_block;
+    !
+    ! Check the access mode on the table
+    !
+    if .lnmb[lnmb$b_acmode] gtru .acmode then return 0;
+    !
+    ! Create and initialize a table_block
+    !
+    table = util_allocate(table_k_size + .lnmb[lnmb$t_name]);
+    ch$move(1+.lnmb[lnmb$t_name], lnmb[lnmb$t_name], table[table_t_name]);
+    table[table_b_acmode] = .lnmb[lnmb$b_acmode];
+    table[table_b_flags] = .lnmth[lnmth$b_flags];
+    table[table_l_bytes] = .lnmth[lnmth$l_bytes];
+    table[table_l_byteslm] = .lnmth[lnmth$l_byteslm];
+    !
+    ! Create and initialize a known_block
+    ! Add the known_block to the list of known tables
+    !
+    known = util_allocate(known_k_size);
+    known[known_l_lnmth] = lnmth[base_];
+    known[known_l_table] = table[base_];
+    util_slide(known[known_l_next], known_list, known[base_]);
+    return table[base_];
+    end;
+
+    end;
+
+
+! This little routine determines whether a lnmth table name
+! matches any of the table names specified by the user.
+! It is called via the routine for_each_lnmth.
+!
+routine match_lnmth( lnmth: ref $bblock, list: ref cmdtbl_block ): novalue =
+    begin
+    bind name = list[cmdtbl_q_name]: $bblock[dsc$c_d_bln];
+    bind lnmb = .lnmth[lnmth$l_name]: $bblock;
+    local table: ref table_block;
+    if fmg$match_name(.lnmb[lnmb$t_name], 1+lnmb[lnmb$t_name],
+	.name[dsc$w_length], .name[dsc$a_pointer]) then
+    if (table = add_to_known(lnmth[base_])) neq 0
+    then
+	util_slide(table[table_l_next], list[cmdtbl_l_table], table[base_]);
+    end;
+
+
+! This comparison routine is used for sorting table_blocks.
+! It is called via the routine sort_list.
+!
+routine cmp_table( t1: ref table_block, t2: ref table_block ): lnk_compare =
+    begin
+    return ch$compare(
+ 	.t1[table_t_name], 1+t1[table_t_name],
+	.t2[table_t_name], 1+t2[table_t_name]);
+    end;
+
+! This comparison routine is used for sorting log_blocks.
+! It is called via the routine sort_list.
+!
+routine cmp_log( t1: ref log_block, t2: ref log_block ): lnk_compare =
+    begin
+    local
+	s;
+    s = ch$compare(
+ 	.t1[log_t_name], 1+t1[log_t_name],
+	.t2[log_t_name], 1+t2[log_t_name]);
+    if .s eql 0
+    then
+	begin
+	t1[log_v_equal] = true;
+	t2[log_v_equal] = true;
+	end;
+    return .s;
+    end;
+
+
+! This routine creates a log_block to hold the information about a logical name
+! and links it to a table_block.
+!
+routine new_lnmb(lnmb: ref $bblock, table: ref table_block) =
+    begin
+    local
+	size,
+	log:	ref log_block,
+	lnmx:	ref $bblock,
+	funny:	initial(true);
+
+    ! Do we really want this logical name?
+    !
+    if .lnmb[lnmb$b_acmode] gtru .acmode then return 0;
+
+    ! Find the end of the relevant information
+    ! Also, make sure we find at least one logical name with a positive index.
+    !
+    lnmx = .lnmb[lnmb$t_name] + 1+lnmb[lnmb$t_name];
+    while not .lnmx[lnmx$v_xend] do
+	begin
+	if .lnmx[lnmx$b_index] geq 0 then funny = false;
+	lnmx = .lnmx[lnmx$t_xlation] + 1+lnmx[lnmx$t_xlation];
+	end;
+    if .funny and not .lnmb[lnmb$v_table] then return 0;
+
+
+    ! Now that we know the beginning and end of the relevant information,
+    ! allocate a log_block to hold it.
+    !
+    size = lnmx[base_] - lnmb[lnmb$t_name] + 1+%fieldexpand_(lnmx$v_xend,0);
+    log = util_allocate(log_k_size + .size);
+    ch$move(.size, lnmb[lnmb$t_name], log[log_t_name]);
+    util_slide(log[log_l_next], table[table_l_log], log[base_]);
+    log[log_l_table] = table[base_];
+    log[log_b_flags] = .lnmb[lnmb$b_flags];
+    log[log_b_acmode] = .lnmb[lnmb$b_acmode];
+    log[log_v_equal] = false;
+    return log[base_];
+    end;
+
+
+! This routine determines whether a lnmb block is relevant, and (if so) creates
+! a log_block to hold the information, and links it to a table_block.
+! It is called via the routine for_each_lnmb.
+!
+routine match_lnmb( lnmb: ref $bblock, dummy ): novalue =
+    begin
+    local
+	table:	ref table_block;
+
+    ! Verify that this is one of the desired logical names
+    !	It must be in an acceptable integrity mode
+    !	It must be in one of the specified tables
+    !	It must match one of the logical names from the command line
+    !
+    begin
+    local
+	list:	ref cmdtbl_block;
+
+    if .lnmb[lnmb$b_acmode] gtru .acmode then return;
+    if (table = lookup_table(.lnmb[lnmb$l_table])) eql 0 then return;
+
+    list = cmdnam_list - %fieldexpand_(cmdtbl_l_next,0);
+    if ( while (list = .list[cmdtbl_l_next]) neq 0 do
+	begin
+	bind name = list[cmdtbl_q_name]: $bblock[dsc$c_d_bln];
+	if fmg$match_name(.lnmb[lnmb$t_name], 1+lnmb[lnmb$t_name],
+	    .name[dsc$w_length], .name[dsc$a_pointer])
+	then
+	    exitloop false;
+	end )
+    then
+	return;
+    end;
+
+    ! Link the new lnmb block to the table
+    !
+    new_lnmb( lnmb[base_], table[base_] );
+
+    end;
+
+
+
+! Get the descendants of the lnmth block, and add them to the table block
+!
+routine get_descend(
+	table:	ref table_block,
+	lnmth:	ref $bblock
+	): novalue =
+    begin
+    local
+	sublnmth:	ref $bblock;
+    sublnmth = lnmth[lnmth$l_child] - %fieldexpand_(lnmth$l_sibling,0);
+    while (sublnmth = .sublnmth[lnmth$l_sibling]) neq 0 do
+	begin
+	local
+	    subtable:	ref table_block;
+	if (subtable = add_to_known(sublnmth[base_])) neq 0
+	then
+	    begin
+	    util_slide(subtable[table_l_next],
+		table[table_l_child], subtable[base_]);
+	    get_descend(subtable[base_], sublnmth[base_]);
+	    end
+	else
+	    begin
+	    !
+	    ! Note that we keep looking for descendant tables,
+	    ! even if we've run across one that we've either seen before,
+	    ! or have no privilege to read.
+	    ! Note: these get linked to the table, rather than the subtable.
+	    !
+	    get_descend(table[base_], sublnmth[base_]);
+	    end;
+	end;
+    sort_list( table[table_l_child], %fieldexpand_(table_l_next,0),
+	cmp_table );
+    end;
+
+
+! Indices for getting to the process and directory tables via lnm$al_dirtbl.
+!
+literal
+    k_process_directory = 1,
+    k_system_directory  = 0;
+
+! A little routine used by for_each_lnmth, below.
+!
+routine fe_lnmth(lnmth: ref $bblock, rtn, prm): novalue =
+    begin
+    local
+	p:	ref $bblock;
+    p = lnmth - %fieldexpand_(lnmth$l_sibling,0);
+    while (p = .p[lnmth$l_sibling]) neq 0 do
+	begin
+	(.rtn)(p[base_], .prm);
+	fe_lnmth(.p[lnmth$l_child], .rtn, .prm);
+	end;
+    end;
+
+! This routine loops over all lnmth blocks,
+! and calls a supplied routine for each.
+!
+routine for_each_lnmth(rtn,prm): novalue =
+    begin
+    decr i from k_process_directory to k_system_directory do
+	begin
+	local
+	    lnmth:	ref $bblock,
+	    lnmx:	ref $bblock,
+	    lnmb:	ref $bblock;
+	lnmb = ..lnm$al_dirtbl[.i];
+	lnmx = .lnmb[lnmb$t_name] + 1+lnmb[lnmb$t_name];
+	lnmth = 1+lnmx[lnmx$t_xlation];
+	fe_lnmth(lnmth[base_], .rtn, .prm);
+	end;
+    end;
+
+
+! This routine loops over all lnmb blocks,
+! and calls a supplied routine for each.
+!
+routine for_each_lnmb(rtn,prm): novalue =
+    begin
+
+    runs_in_kernel_(for_each_lnmb);
+    recheck_tables();
+
+    decr i from k_process_directory to k_system_directory do
+	begin
+	local
+	    bucket:	ref vector,
+	    lnmhsh:	ref $bblock;
+
+	lnmhsh = ..lnm$al_hashtbl[.i];
+	bucket = lnmhsh[base_] + lnmhsh$k_bucket;
+	decr i from not .lnmhsh[lnmhsh$l_mask] to 0 do
+	    begin
+	    local
+		lnmb:	ref $bblock;
+	    lnmb = bucket[.i] - %fieldexpand_(lnmb$l_flink,0);
+	    while (lnmb = .lnmb[lnmb$l_flink]) neq 0 do
+		begin
+		(.rtn)(lnmb[base_], .prm);
+		end;
+	    end;
+	end;
+
+    lnm$unlock(.ctl$gl_pcb);
+    set_ipl(0);
+
+    end;
+
+! Routines to dump the information about tables and logical names.
+!
+! Because of the multiplicity of formats, the following technique is used
+! to produce an fao string and its parameters:
+!	Two buffers are used, the fao control string is built in one,
+!	and (in parallel) the fao parameters are built in the other.
+!
+! The following macros are used to append stuff to these buffers.
+!
+macro
+    ac_(x) = uplit byte(%ascic x) %,
+    appstr_(y) = append_str(args[0], ac_(y)) %,
+    apparg_(y) = append_arg(args[0], y) %;
+
+routine append_str(args: ref vector, ascic: ref vector[,byte]): novalue =
+    begin
+    bind desc = .args[1]: vector[2];
+    ch$move(.ascic[0], ascic[1], .desc[0]+.desc[1]);
+    desc[0] = .desc[0] + .ascic[0];
+    end;
+
+routine append_arg(args: ref vector, y): novalue =
+    begin
+    args[0] = .args[0] + 1;
+    args[.args[0]] = .y;
+    end;
+
+! Dump the quota for a logical name table
+!
+routine dump_table_quot(table: ref table_block, args: ref vector): novalue =
+    begin
+    !
+    ! Don't dump the quota if this is a directory table,
+    ! or if there is no limit on the quota.
+    ! 
+    if  (.table[table_b_flags] and lnmth$m_directory) eql 0 and
+	.table[table_l_byteslm] neq 0
+    then
+	begin
+	appstr_('  [Quota=(!UL,!UL)]');
+	apparg_(.table[table_l_bytes]);
+	apparg_(.table[table_l_byteslm]);
+	end;
+    end;
+
+! Dump logical name table attributes
+!
+routine dump_table_attr(table: ref table_block, args: ref vector): novalue =
+    begin
+    macro
+	f_(x) = (.table[table_b_flags] and %name('lnmth$m_',x)) neq 0 %;
+    local
+	cnt;
+
+    ! Save the current number of arguments
+    !
+    cnt = .args[0];
+
+    ! Append ascic strings for the various attributes
+    !
+    ! The following order was chosen, so that they form readable phrases.
+    !
+    if f_('shareable')	then apparg_(ac_('shareable'));
+    if f_('group')	then apparg_(ac_('group'));
+    if f_('system')	then apparg_(ac_('system'));
+    if f_('directory')	then apparg_(ac_('directory'));
+
+    ! Determine how many attributes we'll be showing (if any), and
+    ! append sufficient fao control strings for all of them.
+    !
+    if (cnt = .args[0] - .cnt) neq 0
+    then
+	begin
+	appstr_('  [!AC');
+	decr i from .cnt-1 to 1 do appstr_(',!AC');
+	appstr_(']');
+	end;
+    end;
+
+
+! Return an ascic string for an access/integrity mode
+!
+routine ac_acmode(mode) =
+    begin
+    own
+	mode_str: vector[4] psect($plit$) preset(
+		[psl$c_kernel]=	ac_('kernel'),
+		[psl$c_exec]=	ac_('exec'),
+		[psl$c_super]=	ac_('super'),
+		[psl$c_user]=	ac_('user'));
+    if .mode lssu 4
+    then
+	return .mode_str[.mode]
+    else
+	return ac_('?');
+    end;
+
+! Dump the access mode for a logical name table
+!
+routine dump_table_mode(table: ref table_block, args: ref vector): novalue =
+    begin
+!   if .table[table_b_acmode] eql psl$c_super then return;
+    appstr_('!_[!AC]');
+    apparg_(ac_acmode(.table[table_b_acmode]));
+    end;
+
+! Dump the attributes for a logical name
+!
+routine dump_log_attr(log: ref log_block, args: ref vector): novalue =
+    begin
+    macro
+	f_(x) = (.log[log_b_flags] and %name('lnmb$m_',x)) neq 0 %;
+    local
+	cnt;
+
+    cnt = .args[0];
+
+!    if .log[log_acmode] neq psl$c_super
+!    then
+	begin
+	apparg_(ac_acmode(.log[log_b_acmode]));
+	end;
+
+    ! The following are in alphabetical order, for lack of anything better.
+    !
+    if f_('confine')	then apparg_(ac_('confine'));
+    if f_('crelog')	then apparg_(ac_('crelog'));
+    if f_('no_alias')	then apparg_(ac_('no_alias'));
+    if f_('nodelete')	then apparg_(ac_('nodelete'));
+    if f_('table')	then apparg_(ac_('table'));
+
+    if (cnt = .args[0] - .cnt) neq 0
+    then
+	begin
+	appstr_(' [!AC');
+	decr i from .cnt-1 to 1 do appstr_(',!AC');
+	appstr_(']');
+	end;
+    end;
+
+
+! Dump translation attributes
+!
+routine dump_lnmx_attr(lnmx: ref $bblock, args: ref vector): novalue =
+    begin
+    macro
+	f_(x) = .lnmx[%name('lnmx$v_',x)] %;
+    local
+	cnt;
+    cnt = .args[0];
+
+    ! The following are in alphabetical order, for lack of anything better.
+    !
+    if f_('concealed')	then apparg_(ac_('concealed'));
+    if f_('terminal')	then apparg_(ac_('terminal'));
+    if (cnt = .args[0] - .cnt) neq 0
+    then
+	begin
+	appstr_(' [!AC');
+	decr i from .cnt-1 to 1 do appstr_(',!AC');
+	appstr_(']');
+	end;
+    end;
+
+
+! Dump translation strings and their attributes
+!
+routine dump_log_lnmx(log: ref log_block, args: ref vector): novalue =
+    begin
+    local
+	first:	initial(true),
+	lnmx:	ref $bblock;
+    builtin
+	ap,
+	callg;
+    lnmx = .log[log_t_name] + 1+log[log_t_name];
+    while not .lnmx[lnmx$v_xend] do
+	begin
+	!
+	! Don't dump logical names that have "funny" indices.
+	!
+	if .lnmx[lnmx$b_index] geq 0 or .lnmx[lnmx$b_index] eql lnmx$c_table
+	then
+	    begin
+	    local len,adr;
+	    if .first
+		then appstr_(' = "!AF"')
+		else appstr_('!_= "!AF"');
+	    len = .lnmx[lnmx$t_xlation];
+	    adr = 1+lnmx[lnmx$t_xlation];
+	    if .lnmx[lnmx$b_index] eql lnmx$c_table
+	    then
+		len = 0;
+	    if .len gequ 4 then if .(.adr)<0,16,0> eql %x'001b'
+	    then
+		(len = .len - 4; adr = .adr + 4);
+	    apparg_(.len);
+	    apparg_(.adr);
+	    if .flags[flag_v_full]
+	    then
+		dump_lnmx_attr(lnmx[base_], args[0]);
+	    if .first and .flags[flag_v_recurse]
+	    then
+		begin
+		bind
+		    table = .log[log_l_table]: table_block;
+		appstr_(' (!AC)');
+		apparg_(table[table_t_name]);
+		end;
+	    callg(args[0], util_output);
+
+	    ! Reinitialize the argument list
+	    !
+	    begin
+	    bind desc = .args[1]: vector[2];
+	    args[0] = 0;
+	    apparg_(desc[0]);
+	    desc[0] = 0;
+	    end;
+
+	    first = false;	! No longer the first time here
+	    end;
+	lnmx = .lnmx[lnmx$t_xlation] + 1+lnmx[lnmx$t_xlation];
+	end;
+    if not .first then flags[flag_v_found] = true;
+    end;
+
+! Dump a logical name and its attributes, and translations and their attributes
+!
+routine dump_log(
+	log:	ref log_block,
+	depth
+	): novalue =
+    begin
+    local
+	buf:	vector[80,byte],
+	desc:	vector[2],
+	args:	vector[20];
+    macro
+	f_(x) = (.log[log_b_flags] and %name('lnmb$m_',x)) neq 0 %;
+    builtin
+	actualcount,
+	testbitsc,
+	callg;
+    args[0] = 0;
+    apparg_(desc[0]);
+    desc[0] = 0;
+    desc[1] = buf[0];
+    if actualcount() gequ 2
+    then
+	begin
+	apparg_(.depth);
+	if .depth gtr 0
+	    then appstr_('!UL  "!AC"')
+	    else appstr_('!+   "!AC"');
+	end
+    else
+	appstr_('  "!AC"' );
+    apparg_(log[log_t_name]);
+    if .flags[flag_v_full]
+    then
+	begin
+	!
+	! Dump all of the attributes
+	!
+	dump_log_attr(log[base_], args[0]);
+	end
+    else if f_('table')
+    then
+	begin
+	!
+	! Let the user know that this is a table
+	!
+	appstr_(' [table]');
+	end
+    else if .log[log_v_equal]
+    then
+	begin
+	!
+	! Display the access mode, so the logicals are distinguishable
+	!
+	apparg_(ac_acmode(.log[log_b_acmode]));
+	appstr_(' [!AC]');
+	end;
+    dump_log_lnmx(log[base_], args[0]);
+    end;
+
+! Dump a logical name table and its attributes, and the contained logical names
+!
+routine dump_table(
+	table:	ref table_block,
+	depth
+	): novalue =
+    begin
+    local
+	buf:	vector[80,byte],
+	desc:	vector[2],
+	args:	vector[20];
+    builtin
+	callg;
+
+    ! Note that we write the name of the table before checking whether there
+    ! are actually any logical names to be displayed in that table.
+    ! The idea for this is that it provides useful feedback about which tables
+    ! were searched.
+    ! This can be changed by including:
+    !
+!!!!if .flags[flag_v_normal] and .table[table_l_log] eql 0 then return;
+
+    ! Display the table name and attributes
+    !
+    if .flags[flag_v_normal] then write_blank_line();
+    args[0] = 0;
+    apparg_(desc[0]);
+    desc[0] = 0;
+    desc[1] = buf[0];
+    if not .flags[flag_v_normal] then appstr_('!#* ');
+    appstr_('(!AC)' );
+    if not .flags[flag_v_normal] then apparg_(4*min(.depth,10));
+    apparg_(table[table_t_name]);
+
+    ! Dump attributes, if needed
+    !
+    if .flags[flag_v_full]
+    then
+	begin
+	dump_table_mode(table[base_], args[0]);
+	dump_table_attr(table[base_], args[0]);
+	dump_table_quot(table[base_], args[0]);
+	end;
+    callg(args[0], util_output);
+
+    ! If there are logical names in this table, display them.
+    !
+    if .table[table_l_log] neq 0
+    then
+	begin
+	local
+	    log:	ref log_block;
+	write_blank_line();
+	sort_list( table[table_l_log], %fieldexpand_(log_l_next,0), cmp_log );
+	log = table[table_l_log] - %fieldexpand_(log_l_next,0);
+	while (log = .log[log_l_next]) neq 0 do
+	    dump_log(log[base_]);
+	end;
+    end;
+
+! Find all the relevant logical name tables specified by the user.
+! This routine uses cmdtbl_list, and calls add_to_known to create table_blocks.
+!
+routine get_relevant_tables =
+    begin
+    local
+	list:	ref cmdtbl_block;
+
+    runs_in_kernel_(get_relevant_tables);
+
+    ! Traverse the list, and process each name as either:
+    !	A wildcard string (find all table names that match)
+    !	A table name (process that table)
+    !	A search list (process all relevant tables)
+    !	
+    list = cmdtbl_list - %fieldexpand_(cmdtbl_l_next,0);
+    while (list = .list[cmdtbl_l_next]) neq 0 do
+	begin
+	bind name = list[cmdtbl_q_name]: $bblock[dsc$c_d_bln];
+	if not ch$fail(ch$find_ch(.name[dsc$w_length],.name[dsc$a_pointer],'*'))
+	or not ch$fail(ch$find_ch(.name[dsc$w_length],.name[dsc$a_pointer],'%'))
+	then
+	    begin
+	    !
+	    ! A wildcard string (find all table names that match)
+	    !
+	    for_each_lnmth( match_lnmth, list[base_] );
+	    sort_list( list[cmdtbl_l_table], %fieldexpand_(table_l_next,0),
+		cmp_table );
+	    end
+	else
+	    begin
+	    !
+	    ! A table name (process that table)
+	    ! A search list (process all relevant tables)
+	    !
+	    ! In either case, we simply use lnm$setup and lnm$table.
+	    !
+	    ! ??? Note that there is a slight problem with the access mode.
+	    ! If we set it to .acmode, then SHOW LOGICAL /EXEC causes no tables
+	    ! to be found, since LNM$DCL_LOGICAL is a supervisor mode name.
+	    ! Instead, we set it to psl$c_user, and let add_to_known check the
+	    ! access mode of the resulting table.
+	    !
+	    local
+		an_rt_block:	rt_block,
+		lnmth:		ref $bblock,
+		status;
+	    register
+		rt = 5:	ref rt_block initial(an_rt_block[base_]);
+	    rt[rt_b_acmode] = psl$c_user;	! Acceptable integrity mode
+	    rt[rt_b_flags] = 0;			! Initialize flags
+	    rt[rt_v_case] = true;		! Case-insensitive
+	    status = lnm$setup(.name[dsc$w_length],.name[dsc$a_pointer],
+		rt[base_]; lnmth);
+	    while true do
+		begin
+		if not .status
+		then
+		    begin
+		    if .status eql ss$_toomanylnam
+		    then
+			rt[rt_b_depth] = .rt[rt_b_depth] - 1	! Backup depth
+		    else
+			exitloop		! Presumably no more names
+		    end
+		else
+		    begin
+		    local table: ref table_block;
+		    if (table = add_to_known(lnmth[base_])) neq 0
+		    then
+			util_slide(table[table_l_next],
+			    list[cmdtbl_l_table], table[base_]);
+		    end;
+		rt[rt_b_tries] = rt_c_maxtries;	! Reinitialize number of tries
+		status = lnm$table(rt[base_]; lnmth);
+		end;
+	    reverse_list(list[cmdtbl_l_table], %fieldexpand_(table_l_next,0));
+	    end;
+	end;
+
+    ! Reverse the order of known_list, so that traversing the list will
+    ! visit the tables in the same order as they were found.
+    !
+    reverse_list(known_list, %fieldexpand_(known_l_next,0));
+
+    ! Now get the descendants, if requested.
+    !
+    ! Note that this is done after finding all the tables specified on the
+    ! command line.  Thus, the user's requested order is honored as much as
+    ! possible.  It also avoids anomolous behaviour for "/table=*/descendants".
+    !
+    ! ??? However, it gives odd behaviour for the command
+    ! "/table=lnm$*_directory/descendants/process/group/job/system"
+    ! as compared with saying "/table=*dire*/descendants".
+    !
+    if .flags[flag_v_descend]
+    then
+	begin
+	!
+	! We traverse the known list in the order in which things were found
+	!
+	local
+	    known:	ref known_block;
+	known = known_list - %fieldexpand_(known_l_next,0);
+	while (known = .known[known_l_next]) neq 0 do
+	    begin
+	    local
+		new:	ref known_block;
+	    get_descend(.known[known_l_table], .known[known_l_lnmth]);
+	    new = known_list - %fieldexpand_(known_l_next,0);
+	    while .new[known_l_next] neq known[base_] do
+		new = .new[known_l_next];
+	    if known_list[base_] neq known[base_]	! Any new tables?
+	    then
+		begin
+		known_list = util_slide(new[known_l_next], known[known_l_next],
+		    known_list[base_]);
+		known = new[base_];
+		end;
+	    end;
+	end;
+
+    lnm$unlock(.ctl$gl_pcb);
+    set_ipl(0);
+
+    return ss$_normal;
+    end;
+
+routine translate(
+	name_len,
+	name_adr,
+	p_known		! Address of pointer to a known_block
+	) =
+    begin
+    !
+    ! This routine translates a logical name in a particular table, and returns
+    ! a pointer to a log_block (or 0).
+    !
+    local
+	proc_nt:	nt_block,
+	syst_nt:	nt_block,
+	known:		ref known_block,
+	log:		ref log_block,
+	status;
+    local
+	nt:	ref nt_block;					! Usually R3
+    label
+	main;
+
+    runs_in_kernel_(translate);
+    recheck_tables();
+
+main:
+    begin
+    !
+    ! Initialize the values we will return to zero
+    !
+    known = 0;
+    log = 0;
+
+    ! Initialize the nt_block for the logical name
+    !
+    decr i from k_process_directory to k_system_directory do
+	begin
+	local
+	   lnmb:	ref $bblock;
+
+	if .i eql k_system_directory
+	    then nt = syst_nt[base_]
+	    else nt = proc_nt[base_];
+
+	! ??? Note that we set the access mode to .acmode.
+	! This should be okay, since lnm$presearch and lnm$contsearch only
+	! check the access mode of the logical name, not the logical name
+	! table.
+	!
+	nt[nt_b_acmode] = .acmode;	! Acceptable integrity mode
+	nt[nt_b_flags] = 0;		! Initialize flags
+	nt[nt_v_case] = true;		! Case-insensitive
+	nt[nt_w_hash] = 0;		! Hash function or 0
+	nt[nt_l_namlen] = .name_len;	! Length of name
+	nt[nt_l_namadr] = .name_adr;	! Address of name
+	nt[nt_l_tabid] = 0;		! Table header address or 0
+	nt[nt_l_thread] = 0;		! Lnmb pointer
+
+	! Do a presearch on the logical name
+	!
+	status = lnm$presearch(..lnm$al_hashtbl[.i], nt[base_]; lnmb);
+	if not .status then nt[nt_l_thread] = 0;
+	end;
+
+    if .proc_nt[nt_l_thread] eql 0 and .syst_nt[nt_l_thread] eql 0
+    then
+	leave main;
+
+    ! Loop through, trying to find a known table that holds this logical name
+    !
+    known = .p_known - %fieldexpand_(known_l_next,0);
+    while (known = .known[known_l_next]) neq 0 do
+	begin
+	!
+	! We simply put the address of the lnmth block into the nt_l_tabid
+	! field and call lnm$contsearch.  This is okay, because recheck_tables
+	! has verified that all the tables are still good (or has cleared the
+	! known_l_lnmth field for those that aren't).
+	!
+	label
+	    lookup;
+lookup:	begin
+	!
+	! See if the name is in that table.
+	!
+	local
+	    table:	ref table_block,
+	    lnmth:	ref $bblock,
+	    lnmb:	ref $bblock,
+	    save_thread;
+	table = .known[known_l_table];
+	lnmth = .known[known_l_lnmth];
+	if lnmth[base_] eql 0 then leave lookup;	! Ignore this table?
+	if .lnmth[lnmth$v_shareable]			! Should we look in
+	    then nt = syst_nt[base_]			!  system hash table, or
+	    else nt = proc_nt[base_];			!  process hash table?
+	nt[nt_l_tabid] = lnmth[base_];			! Stuff it here
+	if .nt[nt_l_thread] eql 0 then leave lookup;	! Any possibilities?
+	!
+	! Now go look for it
+	!
+	save_thread = .nt[nt_l_thread];
+	status = lnm$contsearch(nt[base_]; lnmb);
+	nt[nt_l_thread] = .save_thread;
+	if not .status then leave lookup;		! Check status
+	log = new_lnmb(lnmb[base_], table[base_]);	! Save the lnmb block
+	if log[base_] eql 0 then leave lookup;		! Verify it's acceptable
+	leave main;					! We found one!
+	end;	! of lookup
+
+	! Now go try another table
+	!
+	0;
+	end;
+
+    end;	! of main
+
+    lnm$unlock(.ctl$gl_pcb);
+    set_ipl(0);
+
+    ! Return the address of the log_block,
+    ! and the known_block of the table.
+    !
+    .p_known = known[base_];
+    return log[base_];
+    end;
+
+! Routine to recursively translate a logical name.
+!
+! Note that while we are in this routine, we use the virtual memory as a stack
+! (via util_allocate and util_reallocate).
+!
+routine recursively_translate(
+	name_len,
+	name_adr,
+	depth
+	): novalue =
+    begin
+    local
+	known:	ref known_block,
+	log:	ref log_block,
+	lnmx:	ref $bblock;
+    own
+	transx:	vector[lnm$c_maxdepth];
+
+
+    if .depth gequ lnm$c_maxdepth then return;
+
+    ! Set up for the first known table
+    ! 
+    known = known_list - %fieldexpand_(known_l_next,0);
+    while (known = .known[known_l_next]) neq 0 do
+	begin
+
+	! Look for the next translation, in a table starting with known.
+	! If a found, known is set to the known_block in which it was found.
+	!
+	log = translate(.name_len, .name_adr, known);
+	if log[base_] eql 0 then return;
+
+	! Avoid redisplaying recursive translations (in the current path)
+	!
+	transx[.depth] = log[base_];
+	decr i from .depth-1 to 0 do
+	    if .transx[.i] eql log[base_] then return;
+
+	! Display this translation
+	!
+	dump_log(log[base_], .depth);
+
+	! Unlink the log_block from the table.
+	! This isn't really needed.  It's just good practice, since the pointer
+	! to the log_block is invalidated by the call to util_reallocate.
+	!
+	begin
+	local table: ref table_block;
+	table = .log[log_l_table];
+	table[table_l_log] = 0;
+	end;
+
+	! Now loop through, doing recursive translations
+	!
+	lnmx = .log[log_t_name] + 1+log[log_t_name];
+	while not .lnmx[lnmx$v_xend] do
+	    begin
+	    if .lnmx[lnmx$b_index] geq 0 and not .lnmx[lnmx$v_terminal]
+	    then
+		begin
+		local len,adr;
+		len = .lnmx[lnmx$t_xlation];
+		adr = 1+lnmx[lnmx$t_xlation];
+		if .len gequ 4 then if .(.adr)<0,16,0> eql %x'001b'
+		then
+		    (len = .len - 4; adr = .adr + 4);
+
+		! If we have a trailing colon, remove it
+		! (unless there are actually two trailing colons).
+		!
+		if .len gequ 2 then if
+		    ch$rchar(.adr+.len-2) neq ':' and
+		    ch$rchar(.adr+.len-1) eql ':'
+		then
+		    len = .len - 1;
+
+		recursively_translate(.len, .adr, .depth+1);
+		end;
+	    lnmx = .lnmx[lnmx$t_xlation] + 1+lnmx[lnmx$t_xlation];
+	    end;
+
+	! Back up our memory allocator.
+	!
+	util_reallocate(log[base_]);
+	end;
+    end;
+
+! This is the main routine
+!
+global routine show$logical =
+    begin
+    local
+	list:	ref cmdtbl_block;
+    local
+	free_pages,
+	iosb: vector[2],
+	jpi_list: vector[4] initial(jpi$_freptecnt^16+4,free_pages,0,0);
+	
+    macro
+	dsc_lenadr_(x) = .x[dsc$w_length], .x[dsc$a_pointer] %;
+
+    ! Initialize all the flags to off
+    !
+    ch$fill(0, %allocation(flags), flags[base_]);
+    saved_fp = 0;
+
+    ! Allocate virtual memory
+    !
+    $check_($getjpiw(efn=0,iosb=iosb,itmlst=jpi_list));
+    vm_size = minu((.sgn$gl_pagedyn + 1023),((.free_pages-32)*512));
+    $check_(lib$get_vm(vm_size, vm_addr));
+
+!+
+! Collect the qualifiers and logical names to be translated
+!-
+
+    ! Determine which standard logical name tables to search
+    !	Tables specified by the /TABLE qualifier are searched before
+    !	the tables that correspond to these qualifiers.
+    !	If none of these are specified, all four tables are searched.
+    !
+    flags[flag_v_system] =	cli$present(%ascid 'system');
+    flags[flag_v_group] =	cli$present(%ascid 'group');
+    flags[flag_v_job] =		cli$present(%ascid 'job');
+    flags[flag_v_proc] =	cli$present(%ascid 'process');
+
+    ! Indicate that the heirarchical structure of the tables should be shown
+    !
+    flags[flag_v_normal]=	not cli$present(%ascid 'structure');
+
+    ! Indicates descendants of the specified tables should also be searched
+    !
+    flags[flag_v_descend] =	cli$present(%ascid 'descendants');
+
+    ! Indicates that lots of information should be displayed
+    !
+    flags[flag_v_full] =	cli$present(%ascid 'full');
+
+    ! Determine the qualifying integrity mode
+    !	Only logical names equal or inner to the qualifying mode are shown.
+    !	The integrity mode is also used to qualify which tables are searched,
+    !	and which tables are shown by the /STRUCTURE qualifier.
+    ! Also, turn on inner integrity mode flags
+    ! If none of the mode qualifiers were specified, assume user mode or inner.
+    !
+    begin
+    own
+	mode_str: vector[4] psect($plit$) preset(
+		[psl$c_kernel]=	%ascid 'KERNEL_MODE',
+		[psl$c_exec]=	%ascid 'EXECUTIVE_MODE',
+		[psl$c_super]=	%ascid 'SUPERVISOR_MODE',
+		[psl$c_user]=	%ascid 'USER_MODE');
+    bind
+	dsc_access_mode = %ascid'access_mode';
+
+    acmode = psl$c_user;
+    if cli$present(dsc_access_mode)
+    then
+	begin
+	local
+	    desc:	$bblock[dsc$c_d_bln];
+	$init_dyndesc(desc);
+	cli$get_value(dsc_access_mode, desc[base_]);
+	decr mode from psl$c_user to psl$c_kernel do
+	    begin
+	    bind
+		name = .mode_str[.mode]: $bblock[dsc$c_s_bln];
+	    if .desc[dsc$w_length] lequ .name[dsc$w_length] then
+	    if ch$eql(	.desc[dsc$w_length], .desc[dsc$a_pointer],
+			.desc[dsc$w_length], .name[dsc$a_pointer] )
+	    then
+		begin
+		acmode = .mode;
+		exitloop;
+		end;
+	    end;
+	str$free1_dx(desc[base_]);
+	end;
+    end;
+
+!+
+! Get the table names specified from the command line (cmdtbl_list)
+! Get the logical names specified from the command line (cmdnam_list)
+!-
+    cmdtbl_list = get_tables();
+    cmdnam_list = get_lognam();
+
+    ! Determine whether recursive translations are desired.
+    !	We will show recursive translations if NONE of the logical names
+    !	contain wildcard characters.
+    !
+    begin
+    local list: ref cmdtbl_block;
+    list = cmdnam_list - %fieldexpand_(cmdtbl_l_next,0);
+    flags[flag_v_recurse] = true;
+    while (list = .list[cmdtbl_l_next]) neq 0 do
+	begin
+	bind name = list[cmdtbl_q_name]: $bblock[dsc$c_d_bln];
+	macro contains_(x,y) = not ch$fail(ch$find_ch(dsc_lenadr_(x), y)) %;
+	if contains_(name, '*') or contains_(name, '%')
+	then
+	    begin
+	    flags[flag_v_recurse] = false;
+	    exitloop;
+	    end;
+	end;
+    end;
+
+
+    ! Find the relevant tables
+    !
+    $check_(get_relevant_tables());
+    if known_list[base_] eql 0
+    then
+	begin
+	!
+	! Complain if we found no logical name tables
+	!
+	signal(ss$_ivlogtab and not sts$m_severity or sts$k_warning);
+	end;
+
+    ! Check for recursive translations
+    !
+    if .flags[flag_v_recurse]
+    then
+	begin
+	local
+	    list:	ref cmdtbl_block;
+	list = cmdnam_list - %fieldexpand_(cmdtbl_l_next,0);
+	while (list = .list[cmdtbl_l_next]) neq 0 do
+	    begin
+	    bind name = list[cmdtbl_q_name]: $bblock[dsc$c_d_bln];
+	    if .flags[flag_v_found] then write_blank_line();
+	    flags[flag_v_found] = false;
+	    recursively_translate(dsc_lenadr_(name), 0);
+	    if not .flags[flag_v_found]
+	    then
+		signal(show$_notran,1,list[cmdtbl_q_name]);
+	    end;
+	end
+    else
+	begin
+
+	if .flags[flag_v_normal]
+	then
+	    for_each_lnmb( match_lnmb, 0 );
+
+	! Now display the tables, and the logical names in the tables
+	!
+	list = cmdtbl_list - %fieldexpand_(cmdtbl_l_next,0);
+	while (list = .list[cmdtbl_l_next]) neq 0 do
+	    begin
+	    visit_tree(.list[cmdtbl_l_table],
+		%fieldexpand_(table_l_child,0),
+		%fieldexpand_(table_l_next,0),
+		dump_table,
+		0);
+	    end;
+
+	! If none of the logical names translated, complain about it.
+	!
+	if .flags[flag_v_normal] and not .flags[flag_v_found]
+	then
+	    signal(show$_notran,1,cmdnam_list[cmdtbl_q_name]);
+
+	end;
+
+
+    ! Free the dynamic strings that have been holding table and logical names.
+    !
+    decr i from 1 to 0 do
+	begin
+	if .i
+	then list = cmdtbl_list - %fieldexpand_(cmdtbl_l_next,0)
+	else list = cmdnam_list - %fieldexpand_(cmdtbl_l_next,0);
+	while (list = .list[cmdtbl_l_next]) neq 0 do
+	    begin
+	    bind name = list[cmdtbl_q_name]: $bblock[dsc$c_d_bln];
+	    if .name[dsc$b_class] eql dsc$k_class_d
+	    then
+		str$free1_dx(name[base_]);
+	    end;
+	end;
+
+
+    ! Deallocate virtual memory
+    !
+    vm_size = minu((.sgn$gl_pagedyn + 1023),((.free_pages-32)*512));
+    lib$free_vm(vm_size, vm_addr);
+
+    return ss$_normal;
+    end;
+
+end
+eludom

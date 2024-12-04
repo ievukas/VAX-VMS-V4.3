@@ -1,0 +1,551 @@
+MODULE dcx_compress (			! Data compression routines
+		LANGUAGE (BLISS32),
+		IDENT = 'V04-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+!   FACILITY:
+!
+!	DCX -- Data Compression / Expansion Facility
+!
+!   ABSTRACT:
+!
+!	The Data Compression / Expansion procedures provide a general
+!	method for reducing the storage requirement for a arbitrary data.
+!
+! ENVIRONMENT:
+!
+!	VAX native, user mode.
+!
+!--
+!
+!
+! AUTHOR:  David Thiel
+!
+! CREATION DATE: July, 1981
+!
+! MODIFIED BY:
+!
+!--
+
+%SBTTL  'Declarations';
+
+LIBRARY
+	'sys$library:starlet';	! System macros
+REQUIRE
+	'prefix';		! DCX macros
+REQUIRE
+	'dcxdef';		! DCX public structure definitions
+REQUIRE
+	'dcxprvdef';		! DCX private structure definitions
+
+EXTERNAL ROUTINE
+    dcx$ctx_check : lkg_ctx_check,	! Check context block
+    dcx$map_check : lkg_map_check,	! Check map
+    dcx$get_vm,			! Allocate memory
+    dcx$free_vm,		! Deallocate memory
+    dcx$long_move : lkg_long_move NOVALUE,	! Copy arbitrary length data
+    lib$scopy_r_dx :		! General string copy
+	ADDRESSING_MODE (GENERAL);
+
+EXTERNAL LITERAL
+    dcx$_normal,
+    dcx$_trunc,			! Resultant data truncated
+    dcx$_invdata,		! Invalid character for bounded compression
+    lib$_strtru;
+
+FORWARD ROUTINE
+    fill_cmpseg,		! fill in cmpseg structure
+    dcx$compress_init,		! initialize for data compression
+    dcx$compress_data,		! compress data record
+    dcx$do_compression_0 :	! internal compress routine -- type 0
+	lkg_do NOVALUE,
+    dcx$compress_done;		! delete compression context
+
+%SBTTL	'fill_cmpseg - Fill in cmpseg structure'
+
+ROUTINE fill_cmpseg (cmpseg : REF BBLOCK, offset, pos, bits : REF BITVECTOR, ptrs : REF VECTOR [, LONG]) =
+BEGIN
+!++
+!
+! Fill in cmpseg structure from map.
+!
+! Inputs:
+!
+!	cmpseg			Address of structure to fill in
+!	offset			Current offset in map substructures
+!	pos			Number of bits decoded so far
+!	bits			Address of bitvector holding encoding
+!	ptrs			dcxsbm offset to cmpseg map
+!
+! Outputs:
+!
+!	cmpseg			Encoding strings allocated and pointers
+!				stored
+!
+! Return value:
+!
+!	dcx$_normal		All is well
+!	lib$_insvirmem		Error allocating memory
+!--
+
+BIND
+    dcxsbm = cmpseg [cmpseg$l_dcxsbm] : REF BBLOCK,
+    flags = .dcxsbm + .dcxsbm [dcxsbm$w_flags] : BITVECTOR,
+    nodes = .dcxsbm + .dcxsbm [dcxsbm$w_nodes] : VECTOR [, BYTE];
+
+IF .flags [.offset]
+THEN
+    BEGIN
+
+    BIND
+	code = cmpseg [cmpseg$l_code] : VECTOR [, LONG],
+	cmpseg_next = cmpseg [cmpseg$l_next] : VECTOR [, LONG];
+
+    LOCAL
+	bitv : REF VECTOR [, LONG],
+	char;
+
+    char = .nodes [.offset];
+    IF .dcxsbm [dcxsbm$w_next] NEQ 0
+    THEN
+	BEGIN
+
+	BIND
+	    dcxsbm_next = .dcxsbm + .dcxsbm [dcxsbm$w_next] : VECTOR [, WORD];
+
+	cmpseg_next [.char] = .ptrs [.dcxsbm_next [.char - .dcxsbm [dcxsbm$b_min_char]]]
+	END
+    ELSE
+	cmpseg_next [.char] = .ptrs [0];
+    perform (dcx$get_vm (4 + (.pos+7)/8, code [.char]));
+    bitv = .code [.char];
+    bitv [0] = .pos;
+    CH$MOVE ((.pos+7)/8, .bits, bitv [1]);
+    END
+ELSE IF .nodes [.offset] EQL 0
+THEN
+    BEGIN
+
+    BIND
+	code = cmpseg [cmpseg$l_code] : VECTOR [, LONG];
+
+    LOCAL
+	bitv : REF VECTOR [, LONG];
+
+    perform (dcx$get_vm (4 + (.pos+7)/8, code [dcx$c_eor]));
+    bitv = .code [dcx$c_eor];
+    bitv [0] = .pos;
+    CH$MOVE ((.pos+7)/8, .bits, bitv [1]);
+    END
+ELSE
+    BEGIN
+    bits [.pos] = 1;
+    perform (fill_cmpseg (.cmpseg, 2*.nodes [.offset] + 1, .pos+1, .bits, .ptrs));
+    bits [.pos] = 0;
+    perform (fill_cmpseg (.cmpseg, 2*.nodes [.offset] + 0, .pos+1, .bits, .ptrs));
+    END;
+RETURN dcx$_normal;
+
+END;			! of fill_cmpseg
+
+%SBTTL  'dcx$compress_init - Initialization for data compression'
+
+GLOBAL ROUTINE dcx$compress_init (context_addr, map_addr) =
+BEGIN
+!++
+!
+! Initialization for data compression.
+! Allocate and initialize context area.
+!
+! Inputs:
+!
+!	context_addr.mz.r	Address of context longword
+!	map_addr.ra.r		Address of map
+!
+! Outputs:
+!
+!	context_addr.mz.r	Address of context block is stored
+!
+! Return value:
+!
+!	status.wlc.v
+!
+!		dcx$_normal	All is well
+!		dcx$_invmap	Invalid map structure
+!		lib$_insvirmem	Error allocating memory
+!--
+
+BIND
+    ctx = .context_addr : REF BBLOCK,	! address of context block
+    dcxmap = .map_addr : REF BBLOCK;	! address of map
+
+LOCAL
+    ptrs : REF VECTOR [, LONG],
+    cmp : REF BBLOCK,
+    cmpseg : REF BBLOCK,
+    dcxsbm : REF BBLOCK,
+    status : LONG;			! return status
+
+ctx = 0;				! assume failure
+perform (dcx$map_check (.dcxmap));	! validate map
+perform (dcx$get_vm (ctx$k_fixed_len + cmp$k_length, ctx));
+ctx [ctx$l_size] = ctx$k_fixed_len + cmp$k_length;
+ctx [ctx$b_type] = ctx$c_cmprs;
+ctx [ctx$w_version] = ctx$c_version;
+ctx [ctx$l_sanity] = ctx$c_sanity;
+ctx [ctx$l_map] = .dcxmap;
+cmp = ctx [ctx$l_specific];
+cmp [cmp$l_flink] = cmp [cmp$l_blink] = cmp [cmp$q_queue];
+perform (dcx$get_vm (4*.dcxmap [dcxmap$w_nsubs], ptrs));
+dcxsbm = .dcxmap + .dcxmap [dcxmap$w_sub0];
+INCR i FROM 0 TO .dcxmap [dcxmap$w_nsubs]-1 DO
+    BEGIN
+    perform (dcx$get_vm (cmpseg$k_length, ptrs [.i]));
+    cmpseg = .ptrs [.i];
+    insque (.cmpseg, .cmp [cmp$l_blink]);
+    cmpseg [cmpseg$l_size] = cmpseg$k_length;
+    cmpseg [cmpseg$l_dcxsbm] = .dcxsbm;
+    dcxsbm = .dcxsbm + .dcxsbm [dcxsbm$w_size];
+    END;
+cmpseg = .cmp [cmp$l_flink];
+WHILE .cmpseg NEQA cmp [cmp$q_queue] DO
+    BEGIN
+
+    LOCAL
+	bits : VECTOR [(dcx$c_chars-1+7)/8, BYTE];
+
+    CH$FILL (0, %ALLOCATION (bits), bits);
+    bits [0] = 1;
+    perform (fill_cmpseg (.cmpseg, 1, 1, bits, .ptrs));
+    bits [0] = 0;
+    perform (fill_cmpseg (.cmpseg, 0, 1, bits, .ptrs));
+    cmpseg = .cmpseg [cmpseg$l_flink];
+    END;
+perform (dcx$free_vm (4*.dcxmap [dcxmap$w_nsubs], .ptrs));
+
+RETURN dcx$_normal;
+
+END;					! of dcx$compress_init
+
+%SBTTL  'dcx$compress_data - Compress data record'
+
+GLOBAL ROUTINE dcx$compress_data (context_addr, in_rec : REF BBLOCK, out_rec : REF BBLOCK, out_len) =
+BEGIN
+!++
+!
+! Compress data record
+!
+! Inputs:
+!
+!	context_addr.mz.r	Address of context longword
+!	in_rec.rt.dx		Descriptor for input (text) data record
+!	out_rec.wt.dx		Descriptor for output (text) data buffer
+!
+! Outputs:
+!
+!	context_addr.mz.r	Context block accumulates data
+!	out_rec.wt.dx		Buffer is filled with output record
+!	out_len.wwu.r		Word in which to store length of
+!				output record (optional)
+!
+! Return value:
+!
+!	status.wlc.v
+!
+!		dcx$_normal	All is well
+!		dcx$_invctx	Invalid context block
+!		dcx$_invmap	Invalid map
+!--
+
+BIND
+    ctx = .context_addr : REF BBLOCK,	! context block
+    dcxmap = ctx [ctx$l_map] : REF BBLOCK,	! map address
+    res_len = .out_len : WORD;		! result length
+
+LOCAL
+    in_len,				! input length (bytes)
+    in_addr,				! input data address
+    status2,
+    status;				! return status
+
+BUILTIN
+    NULLPARAMETER;
+
+perform (dcx$ctx_check (.ctx, ctx$c_cmprs));
+perform (dcx$map_check (.dcxmap));
+perform (lib$analyze_sdesc_r2 (.in_rec; status2, in_len, in_addr); .status2);
+
+CASE .out_rec [dsc$b_class]
+    FROM MIN (dsc$k_class_z, dsc$k_class_s)
+    TO MAX (dsc$k_class_z, dsc$k_class_s)
+    OF
+SET
+[dsc$k_class_z, dsc$k_class_s]:
+    BEGIN
+
+    LOCAL
+	result : LONG;
+
+    dcx$do_compression_0 (
+	.ctx, .in_addr, .in_len, .out_rec [dsc$a_pointer], .out_rec [dsc$w_length]
+	; status, result);
+    CH$FILL (%C' ', .out_rec [dsc$w_length] - .result, .out_rec [dsc$a_pointer]+.result);
+    IF NOT NULLPARAMETER (4)
+    THEN
+	res_len = .result;
+    END;
+[inrange, outrange]:
+    BEGIN
+
+    LOCAL
+	result : LONG,
+	status1 : LONG,
+	res_buf : VECTOR [65535, BYTE];	! result buffer
+
+    dcx$do_compression_0 (
+	.ctx, .in_addr, .in_len, res_buf, %ALLOCATION (res_buf)
+	; status, result);
+    status1 = lib$scopy_r_dx (result, res_buf, .out_rec);
+    IF .status1 EQL lib$_strtru
+    THEN
+	BEGIN
+	IF NOT NULLPARAMETER (4)
+	THEN
+	    lib$analyze_sdesc_r2 (.out_rec; status, res_len);
+	status1 = dcx$_trunc;
+	END
+    ELSE IF NOT NULLPARAMETER (4)
+    THEN
+	res_len = .result;
+    IF NOT .status1 AND .status
+    THEN
+	status = .status1;
+    END;
+TES;
+RETURN .status;
+
+END;					! Of dcx$compress_data
+
+%SBTTL  'dcx$do_compression_0 - Type 0 compression'
+
+ROUTINE dcx$do_compression_0 (
+	ctx : REF BBLOCK, in_addr : REF VECTOR [, BYTE], in_bytes, out_addr, out_bytes
+	; status, res_len) : lkg_do NOVALUE =
+BEGIN
+!++
+!
+! Compress data record using type 0 compression.
+!
+! Inputs:
+!
+!	ctx			Address of context block
+!	in_addr			Address of input record
+!	in_bytes		Length of input record
+!	out_addr		Address of output buffer
+!	out_bytes		Length of output buffer
+!
+! Outputs:
+!
+!	ctx			Context block accumulates data
+!	status			Status of operation
+!	res_len			Result length
+!
+! Status value:
+!
+!	dcx$_normal		All is well
+!	dcx$_trunc		Result buffer too small - output truncated
+!--
+
+BIND
+    dcxmap = ctx [ctx$l_map] : REF BBLOCK,	! map address
+    cmp = ctx [ctx$l_specific] : BBLOCK;
+
+IF .dcxmap [dcxmap$w_nsubs] EQL 0
+THEN
+    BEGIN
+    dcx$long_move ((res_len = MINU (.in_bytes, .out_bytes)), .in_addr, .out_addr);
+    IF .in_bytes GTRU .out_bytes
+    THEN
+	RETURN status = dcx$_trunc
+    ELSE
+	RETURN status = dcx$_normal;
+    END
+ELSE
+    BEGIN
+
+    LOCAL
+	cmpseg : REF BBLOCK,
+	outbits : LONG,
+	outptr : LONG;
+
+    outbits = .out_bytes * 8;
+    outptr = 0;
+    cmpseg = .cmp [cmp$l_flink];
+    DECR i FROM .in_bytes-1 TO 0 DO
+	BEGIN
+
+	BIND
+	    next = cmpseg [cmpseg$l_next] : VECTOR [, LONG],
+	    code = cmpseg [cmpseg$l_code] : VECTOR [, LONG],
+	    code_ptr = code [CH$RCHAR (.in_addr)] : REF VECTOR [, LONG];
+
+	LOCAL
+	    bit_src : REF VECTOR [, LONG],
+	    bit_count;
+
+	IF .code_ptr EQLA 0
+	THEN
+	    BEGIN
+	    res_len = 0;
+	    RETURN status = dcx$_invdata;
+	    END;
+	bit_count = .code_ptr [0];
+	bit_src = code_ptr [1];
+	IF (outbits = .outbits - .bit_count) LSS 0
+	THEN
+	    BEGIN
+	    res_len = (.outbits+7)/8;
+	    RETURN status = dcx$_trunc;
+	    END;
+	WHILE .bit_count GTRU 32 DO
+	    BEGIN
+	    (.out_addr) <.outptr, 32, 0> = .bit_src [0];
+	    bit_src = .bit_src + 4;
+	    outptr = .outptr + 32;
+	    bit_count = .bit_count - 32;
+	    END;
+	(.out_addr) <.outptr, .bit_count, 0> = .bit_src [0];
+	outptr = .outptr + .bit_count;
+	cmpseg = .next [CH$RCHAR_A (in_addr)];
+	IF .cmpseg EQLA 0
+	THEN
+	    BEGIN
+	    res_len = 0;
+	    RETURN status = dcx$_invdata;
+	    END;
+	END;
+    IF true
+    THEN
+	BEGIN
+
+	BIND
+	    code = cmpseg [cmpseg$l_code] : VECTOR [, LONG],
+	    code_ptr = code [dcx$c_eor] : REF VECTOR [, LONG];
+
+	LOCAL
+	    bit_src : REF VECTOR [, LONG],
+	    bit_count;
+
+	bit_count = .code_ptr [0];
+	bit_src = code_ptr [1];
+	IF (outbits = .outbits - .bit_count) LSS 0
+	THEN
+	    BEGIN
+	    res_len = (.outbits+7)/8;
+	    RETURN status = dcx$_trunc;
+	    END;
+	WHILE .bit_count GTRU 32 DO
+	    BEGIN
+	    (.out_addr) <.outptr, 32, 0> = .bit_src [0];
+	    bit_src = .bit_src + 4;
+	    outptr = .outptr + 32;
+	    bit_count = .bit_count - 32;
+	    END;
+	(.out_addr) <.outptr, .bit_count, 0> = .bit_src [0];
+	outptr = .outptr + .bit_count;
+	END;
+    res_len = (.outptr + 7)/8;
+    RETURN status = dcx$_normal;
+    END;
+
+END;					! Of dcx$do_compression_0
+
+%SBTTL  'dcx$compress_done -- Release data compression context'
+
+GLOBAL ROUTINE dcx$compress_done (context_addr) =
+BEGIN
+!++
+!
+! Release data compression context data record
+!
+! Inputs:
+!
+!	context_addr.mz.r	Address of context longword
+!
+! Outputs:
+!
+!	context_addr.mz.r	Context block accumulates data
+!
+! Return value:
+!
+!	status.wlc.v
+!
+!		dcx$_normal	All is well
+!		dcx$_invctx	Invalid context block
+!		dcx$_invmap	Invalid map structure
+!--
+
+BIND
+    ctx = .context_addr : REF BBLOCK,	! address of context block
+    cmp = ctx [ctx$l_specific] : BBLOCK;
+
+LOCAL
+    cmpseg : REF BBLOCK;
+
+perform (dcx$ctx_check (.ctx, ctx$c_cmprs));
+WHILE NOT remque (.cmp [cmp$l_flink], cmpseg) DO
+    BEGIN
+
+    BIND
+	code = cmpseg [cmpseg$l_code] : VECTOR [, LONG];
+
+    DECR i FROM cmpseg$c_code-1 TO 0 DO
+	BEGIN
+
+	BIND
+	    bits = code [.i] : REF VECTOR [, LONG];
+
+	IF .bits NEQA 0
+	THEN
+	    BEGIN
+	    perform (dcx$free_vm (4 + (.bits [0]+7)/8, bits [0]));
+	    bits = 0;
+	    END;
+	END;
+    perform (dcx$free_vm (.cmpseg [cmpseg$l_size], .cmpseg));
+    END;
+perform (dcx$free_vm (.ctx [ctx$l_size], .ctx));
+ctx = 0;				! mark context as gone
+RETURN dcx$_normal;
+
+END;					! Of dcx$compress_done
+
+END					! Of module compress
+ELUDOM

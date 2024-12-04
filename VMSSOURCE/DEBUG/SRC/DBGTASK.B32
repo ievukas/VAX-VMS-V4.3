@@ -1,0 +1,1287 @@
+MODULE DBGTASK (IDENT = 'V04-000') =
+
+BEGIN
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+! WRITTEN BY
+!	Edward Freedman 	December, 1983
+!
+! MODULE FUNCTION
+!	This module contains all routines that parse and execute all commands
+!	related to DEBUG's multi-tasking support for ADA.
+!
+
+
+REQUIRE 'SRC$:DBGPROLOG.REQ';
+REQUIRE 'SRC$:DBGEXT.REQ';		! %((REQUIRE OR LIB IN DBGPROLOG? -tbs))%
+
+LIBRARY 'LIB$:DBGGEN.L32';		! %((NEEDED FOR FAULT_EXC AND TRAP_EXC -tbs))%
+
+
+FORWARD ROUTINE
+    DBG$CONV_TASK_NUM_VALUE : NOVALUE,	! Converts an ADA task number to the corresponding task value.
+    DBG$CONV_TASK_VALUE_NUM : NOVALUE,	! Converts an ADA task value to the corresponding task number.
+    DBG$NEXECUTE_SET_TASK : NOVALUE,	! Execute the SET TASK command
+    DBG$NEXECUTE_SHOW_TASK : NOVALUE,	! Execute the SHOW TASK command
+    DBG$NPARSE_SET_TASK : NOVALUE,	! Parse the SET TASK command
+    DBG$NPARSE_SHOW_TASK : NOVALUE,	! Parse the SHOW TASK command
+    DBGEXT$PRINT_ROUTINE : NOVALUE,	! %((-tbs))%
+    LOCAL_ROUT_NAME;			!<<-------------------------------------
+
+
+EXTERNAL ROUTINE
+    DBG$GET_TEMPMEM,			! Allocates and lists dynamic storage
+    DBG$NMATCH,				! Counted string matching routine
+    DBG$NPARSE_EXPRESSION,		! Interface to Address Expression Interpreter
+    DBG$NSAVE_DECIMAL_INTEGER,		! Converts ASCII input to integer
+    DBG$SYNTAX_ERROR : NOVALUE,		! Signal a syntax error in command
+    DBG$TRACEBACK : NOVALUE;		! Shows current runframe nesting
+
+
+EXTERNAL ROUTINE ADA$DBGEXT : WEAK ADDRESSING_MODE (GENERAL);	%((WHERE WILL THESE BE DECLARED? -tbs))%
+%IF NOT %DECLARED (ADA$_FACILITY)	! To be declared in STARLET.REQ
+%THEN
+LITERAL ADA$_FACILITY = 49 ;		! %((-tbs))%
+%FI
+
+
+EXTERNAL
+    DBG$GB_LANGUAGE : BYTE,		! Code for language setting
+    DBG$GB_RADIX : VECTOR[3, BYTE],	! Radix settings
+    DBG$RUNFRAME: BLOCK [,BYTE];	! User runframe
+
+
+LITERAL
+    !+
+    !   These literals are used both to identify the ADVERB node type and to
+    !   index into a bitvector to indicate the presence of particular ADVERB 
+    !   or NOUN nodes. 
+    !-
+    TASK_TASK_LIST		= 0,	! NOUN literal
+    TASK_ACTIVE			= 1,	! ADVERB (qualifier) literals
+    TASK_ALL			= 2,	!
+    TASK_CALLS			= 3,	!
+    TASK_DEADLOCK		= 4,	!
+    TASK_FULL			= 5,	!
+    TASK_HOLD			= 6,	!
+    TASK_NOHOLD			= 8,	! (synonym for "RELEASE")
+    TASK_PRIORITY		= 7,	!
+    TASK_RELEASE		= 8,	!
+    TASK_RESTORE		= 9,	!
+    TASK_STATE			= 10,	!
+    TASK_STATISTICS		= 11,	!
+    TASK_TERMINATE		= 12,	!
+    TASK_VISIBLE		= 13,	!
+    TASK_MAX_QUAL		= 13;	! Max value.
+
+
+MACRO
+    !+
+    !   These two macros are used to test for conflicting qualifiers and
+    !   parameters in a given command.  The test is on bits in a flag word
+    !   which are set as the syntax tree is built.  The macros depend on
+    !   the bit position being given by literals of the form TASK_xxx.
+    !-
+    CONFLICT (flags) [] =
+	(0 + _conflict( flags, %REMOVE(%REMAINING) ) GTR 1) %,
+
+    _conflict (flags) [list] =
+	( .flags < %name('TASK_',list), 1, 0> ) %;
+
+
+BIND
+    DBG$CS_ACTIVE		= UPLIT BYTE (%ASCIC 'ACTIVE'),		! Qualifier names
+    DBG$CS_ALL			= UPLIT BYTE (%ASCIC 'ALL'),		!
+    DBG$CS_CALLS		= UPLIT BYTE (%ASCIC 'CALLS'),		!
+    DBG$CS_DEADLOCK		= UPLIT BYTE (%ASCIC 'DEADLOCK'),	!
+    DBG$CS_FULL			= UPLIT BYTE (%ASCIC 'FULL'),		!
+    DBG$CS_HOLD			= UPLIT BYTE (%ASCIC 'HOLD'),		!
+    DBG$CS_NOHOLD		= UPLIT BYTE (%ASCIC 'NOHOLD'),		!
+    DBG$CS_PRIORITY		= UPLIT BYTE (%ASCIC 'PRIORITY'),	!
+    DBG$CS_RELEASE		= UPLIT BYTE (%ASCIC 'RELEASE'),	!
+    DBG$CS_RESTORE		= UPLIT BYTE (%ASCIC 'RESTORE'),	!
+    DBG$CS_STATE		= UPLIT BYTE (%ASCIC 'STATE'),		!
+    DBG$CS_STATISTICS		= UPLIT BYTE (%ASCIC 'STATISTICS'),	!
+    DBG$CS_TERMINATE		= UPLIT BYTE (%ASCIC 'TERMINATE'),	!
+    DBG$CS_VISIBLE		= UPLIT BYTE (%ASCIC 'VISIBLE'),	!
+
+    DBG$CS_READY		= UPLIT BYTE (%ASCIC 'READY'),		! STATE names
+    DBG$CS_RUNNING		= UPLIT BYTE (%ASCIC 'RUNNING'),	!
+    DBG$CS_SUSPENDED		= UPLIT BYTE (%ASCIC 'SUSPENDED'),	!
+    DBG$CS_TERMINATED		= UPLIT BYTE (%ASCIC 'TERMINATED'),	!
+
+    dbg$cs_left_paren		= UPLIT BYTE (1, dbg$k_left_parenthesis),	! Punctuation
+    dbg$cs_right_paren		= UPLIT BYTE (1, dbg$k_right_parenthesis),	!
+    DBG$CS_COLON		= UPLIT BYTE (%ASCIC ':'),			!
+    dbg$cs_comma		= UPLIT BYTE (1, dbg$k_comma),			!
+    dbg$cs_cr			= UPLIT BYTE (1, dbg$k_car_return),		!
+    dbg$cs_equal		= UPLIT BYTE (1, dbg$k_equal),			!
+    dbg$cs_slash		= UPLIT BYTE (1, dbg$k_slash);			!
+
+
+
+%SBTTL 'DBG$CONV_TASK_NUM_VALUE'
+GLOBAL ROUTINE DBG$CONV_TASK_NUM_VALUE ( TASK_NUMBER, TASK_VALUE ) : NOVALUE =
+!
+! FUNCTION
+!	This routine converts an ADA task number to the corresponding task 
+!	value.  It calls the ADA run time system to perform the actual 
+!	conversion.
+!
+! INPUT
+!	TASK_NUMBER - Address of a longword containing the task number to be 
+!		converted.
+!
+! OUTPUT
+!	TASK_VALUE - Address of a longword to contain the resulting task value.
+!
+!
+
+    BEGIN
+
+
+.TASK_VALUE = %x'0DEC0ADA';	%((TO BE REPLACED WITH SOME REAL CODE -tbs))%
+
+
+    RETURN 0;
+
+    END;			! end of DBG$CONV_TASK_NUM_VALUE
+
+%SBTTL 'DBG$CONV_TASK_VALUE_NUM'
+GLOBAL ROUTINE DBG$CONV_TASK_VALUE_NUM ( TASK_VALUE, TASK_NUMBER ) : NOVALUE =
+!
+! FUNCTION
+!	This routine converts an ADA task value to the corresponding task 
+!	number.  It calls the ADA run time system to perform the actual 
+!	conversion.
+!
+! INPUT
+!	TASK_VALUE - Address of a longword containing the task value to be 
+!		converted.
+!
+! OUTPUT
+!	TASK_NUMBER - Address of a longword to contain the resulting task 
+!		number.
+!
+!
+
+    BEGIN
+
+
+.TASK_NUMBER = 42;	%((TO BE REPLACED WITH SOME REAL CODE -tbs))%
+
+    RETURN 0;
+
+    END;			! end of DBG$CONV_TASK_VALUE_NUM
+
+%SBTTL 'DBG$NEXECUTE_SET_TASK'
+GLOBAL ROUTINE DBG$NEXECUTE_SET_TASK ( VERB_NODE : REF DBG$VERB_NODE ) :
+    NOVALUE =
+!
+! FUNCTION
+!	This routine executes the SET TASK command.  It accepts the address
+!	of a Verb Node as input and executes the corresponding command.
+!
+! INPUTS
+!	VERB_NODE - A pointer to the Verb Node for the SET TASK command
+!		  to be executed.  The Verb Node and its attached Adverb
+!		  and Noun Nodes contain all information picked up during
+!		  the parsing of the command.
+!
+! OUTPUTS
+!	NONE
+!
+
+    BEGIN
+
+    LOCAL
+	XXXXXXX;			!<<--------- Local declarations --------
+
+
+    !+
+    !   Check for conflicting qualifiers and parameters.  %((REQUIRED? -tbs))%
+    !-
+!    IF CONFLICT (QUALIFIERS, (ALL, TASK_LIST) )
+!	OR CONFLICT (QUALIFIERS, (ALL, ACTIVE) )
+!	OR CONFLICT (QUALIFIERS, (ALL, VISIBLE) )	%((NEED OTHER CONFLICTS? -tbs))%
+!    THEN
+!	SIGNAL (DBG$_CONFLICT);
+
+
+    RETURN 0;
+
+    END;			! end of DBG$NEXECUTE_SET_TASK
+
+%SBTTL 'DBG$NEXECUTE_SHOW_TASK'
+GLOBAL ROUTINE DBG$NEXECUTE_SHOW_TASK ( VERB_NODE : REF DBG$VERB_NODE ) :
+    NOVALUE =
+!
+! FUNCTION
+!	This routine executes the SHOW TASK command.  It accepts the address
+!	of a Verb Node as input and executes the corresponding command.
+!
+! INPUTS
+!	VERB_NODE - A pointer to the Verb Node for the SHOW TASK command
+!		  to be executed.  The Verb Node and its attached Adverb
+!		  and Noun Nodes contain all information picked up during
+!		  the parsing of the command.
+!
+! OUTPUTS
+!	NONE
+!
+
+!+
+!   Semantics of the various qualifiers and parameters for a simple SHOW TASK
+!   command or a SHOW TASK /CALLS (i.e. not /DEADLOCK or /STATISTICS).  In this
+!   chart, 1 and 0 indicate presence or absence of the qualifiers and parameters
+!   in the command:
+!   	SHOW TASK [ /CALL ] [ /PRI ] [ /STATE ] [ /HOLD ] [ /ALL ]  [ TASK_LIST,,, ]
+!   TASK SET is the set of tasks the command is applied to where
+!	%VISIBLE =	visible task
+!	T_LIST =	tasks in the task_list
+!	ALL =		all existing tasks %((terminated as well? -tbs))%
+!	PSH =		all existing tasks matching ( /PRI and /STATE and /HOLD )
+!	T_LIST PSH =	tasks in the task_list matching ( /PRI and /STATE and /HOLD )
+!   ALGORITHM indicates the logic to implement the command, where 
+!	S =	SHOW_TASK [ GET_REGISTER, DBG$TRACEBACK ]
+!	NS =	NEXT_TASK SHOW_TASK [ GET_REGISTER, DBG$TRACEBACK ]
+!	GS =	GET_PRIORITY GET_STATE SHOW_TASK [ GET_REGISTER, DBG$TRACEBACK ]
+!	... =	repetition of the sequence
+!   The [ GET_REGISTER, DBG$TRACEBACK ] is done when /CALLS is specified.
+!   
+!   /PRI or
+!   /STATE or
+!   /HOLD	/ALL	TASK_LIST	TASK SET	ALGORITHM	FAILURES
+!   
+!   	0	0	0		%VISIBLE	S		%((-tbs))%
+!   	0	0	1		T_LIST		S...
+!   	0	1	0		ALL		NS...
+!   	0	1	1		T_LIST		S...
+!   	1	0	0		PSH		NS...
+!   	1	0	1		T_LIST PSH	GS...
+!   	1	1	0		PSH		NS...
+!   	1	1	1		T_LIST PSH	GS...
+!   
+!   This results in four different sequences as follows:	`
+!   P := /PRI or /STATE or /HOLD    A := /ALL    T := TASK_LIST
+!   
+!   (P + ~PA)~T		==> NS...
+!   PT			==> GS...
+!   ~PT			==> S..
+!   ~P~A~T = ~(P+A+T) 	==> S
+!   
+!-
+
+    BEGIN
+
+MACRO
+    !+
+    !   $DBG_VALFLD_INI  --  Dynamically initializes a block field with a value.
+    !-
+    $DBG_VALFLD_INI (block_name, field_name, value) [] =
+    block_name [field_name] = value %;
+
+
+KEYWORDMACRO
+
+    !+
+    !   DBGEXT_INIT  --  Initializes the DBGEXT CONTROL BLOCK.  It BINDs the 
+    !   name of the block for later use by the other DBGEXT function macros,
+    !   zero fills the block, sets the facility and print routine fields with
+    !   predetermined values, and optionally sets other fields with the values
+    !   given by the keyword parameters.
+    !-
+    DBGEXT_INIT (dbgext, function, value, number, priority, state, hold) =
+
+	%IF %NULL (dbgext) %THEN %WARN ('DBGEXT must be specified') %FI
+
+	BIND DBGEXT$$CONTROL_BLOCK = dbgext : DBGEXT$CONTROL_BLOCK;
+
+	CH$FILL (0, DBGEXT$K_ADA_SIZE1 * %UPVAL, CH$PTR (dbgext) );
+
+	DBGEXT$$CONTROL_BLOCK [DBGEXT$V_FACILITY_ID] = ADA$_FACILITY;
+	DBGEXT$$CONTROL_BLOCK [DBGEXT$L_PRINT_ROUTINE] = DBGEXT$PRINT_ROUTINE;
+
+	$DBG_VALFLD_INI (DBGEXT$$CONTROL_BLOCK, DBGEXT$W_FUNCTION_CODE, function);
+	$DBG_VALFLD_INI (DBGEXT$$CONTROL_BLOCK, DBGEXT$L_TASK_VALUE, value);
+	$DBG_VALFLD_INI (DBGEXT$$CONTROL_BLOCK, DBGEXT$L_TASK_NUMBER, number);
+
+	! MAY INITIALIZE SOME FLAG BITS %((-tbs))%
+	!	DBGEXT$V_ALL		= 
+	!	DBGEXT$V_FULL		= 
+	!	DBGEXT$V_NO_HEADER	= NOT %NULL (no_header)
+
+	DBGEXT$$CONTROL_BLOCK [DBGEXT$V_PRIORITY_SPECIFIED] = NOT %NULL (priority);
+	$DBG_VALFLD_INI (DBGEXT$$CONTROL_BLOCK, DBGEXT$L_PRIORITY, priority);
+
+	DBGEXT$$CONTROL_BLOCK [DBGEXT$V_STATE_SPECIFIED] = NOT %NULL (state);
+	$DBG_VALFLD_INI (DBGEXT$$CONTROL_BLOCK, DBGEXT$V_STATE, state);
+
+	DBGEXT$$CONTROL_BLOCK [DBGEXT$V_HOLD_SPECIFIED] = NOT %NULL (hold);
+	$DBG_VALFLD_INI (DBGEXT$$CONTROL_BLOCK, DBGEXT$V_HOLD, hold);
+	% ,
+
+    !+
+    !   CALL_ADA --  Calls the ADA run time system via the DEBUG External 
+    !   Interface.  It assumes that a DBGEXT_INIT has been performed to bind
+    !   name DBGEXT$$CONTROL_BLOCK to a real control block.
+    !   It optionally sets other fields with the values
+    !   given by the keyword parameters.
+    !-
+    CALL_ADA (function, value, number, priority, state, hold) =
+	BEGIN
+	$DBG_VALFLD_INI (DBGEXT$$CONTROL_BLOCK, DBGEXT$W_FUNCTION_CODE, function);
+	$DBG_VALFLD_INI (DBGEXT$$CONTROL_BLOCK, DBGEXT$L_TASK_VALUE, value);
+	$DBG_VALFLD_INI (DBGEXT$$CONTROL_BLOCK, DBGEXT$L_TASK_NUMBER, number);
+
+	! MAY INITIALIZE SOME FLAG BITS %((-tbs))%
+	!	DBGEXT$V_ALL		= 
+	!	DBGEXT$V_FULL		= 
+	!	DBGEXT$V_NO_HEADER	= NOT %NULL (no_header)
+
+	DBGEXT$$CONTROL_BLOCK [DBGEXT$V_PRIORITY_SPECIFIED] = NOT %NULL (priority);
+	$DBG_VALFLD_INI (DBGEXT$$CONTROL_BLOCK, DBGEXT$L_PRIORITY, priority);
+
+	DBGEXT$$CONTROL_BLOCK [DBGEXT$V_STATE_SPECIFIED] = NOT %NULL (state);
+	$DBG_VALFLD_INI (DBGEXT$$CONTROL_BLOCK, DBGEXT$V_STATE, state);
+
+	DBGEXT$$CONTROL_BLOCK [DBGEXT$V_HOLD_SPECIFIED] = NOT %NULL (hold);
+	$DBG_VALFLD_INI (DBGEXT$$CONTROL_BLOCK, DBGEXT$V_HOLD, hold);
+
+	IF NOT ADA$DBGEXT (DBGEXT$$CONTROL_BLOCK)			! Call ADA
+	THEN
+	    SIGNAL (%((INTERNAL ERROR -tbs))%);
+	IF NOT .DBGEXT$$CONTROL_BLOCK [DBGEXT$L_STATUS]			! and check status.
+	THEN
+	    SIGNAL (%((SOME ERROR -tbs))%);
+	END;
+	% ;
+
+MACRO
+
+    !+
+    !   DO_NEXT_TASK  --  Calls the NEXT_TASK function without changing any 
+    !   fields of the control block other than FUNCTION_CODE, STATUS, and 
+    !   optionally TASK_VALUE.  It assumes that a DBGEXT_INIT has
+    !   been performed to bind the name DBGEXT$$CONTROL_BLOCK to a real control 
+    !   block.  It returns the new TASK_VALUE.
+    !-
+    DO_NEXT_TASK (task) =
+	BEGIN
+	DBGEXT$$CONTROL_BLOCK [DBGEXT$W_FUNCTION_CODE] = DBGEXT$K_NEXT_TASK;	! set function
+	DBGEXT$$CONTROL_BLOCK [DBGEXT$L_STATUS] = 0;				! and clear status
+	%IF NOT %NULL (TASK)							! optionally use a
+	    %THEN DBGEXT$$CONTROL_BLOCK [DBGEXT$L_TASK_VALUE] = TASK;		!  task value
+	%FI
+	IF NOT ADA$DBGEXT (DBGEXT$$CONTROL_BLOCK) 				! call ada
+	THEN
+	    SIGNAL (%((INTERNAL ERROR -tbs))%);
+	IF NOT .DBGEXT$$CONTROL_BLOCK [DBGEXT$L_STATUS]				! and check status
+	THEN
+	    SIGNAL (%((SOME ERROR -tbs))%);
+	.DBGEXT$$CONTROL_BLOCK [DBGEXT$L_TASK_VALUE]				! return the new task value
+	END % ,
+
+    !+
+    !   DO_SHOW_TASK  --  Calls the SHOW_TASK function without changing any 
+    !   fields of the control block other than FUNCTION_CODE, STATUS, and 
+    !   optionally TASK_VALUE.  It assumes that a DBGEXT_INIT has
+    !   been performed to bind the name DBGEXT$$CONTROL_BLOCK to a real control 
+    !   block.
+    !-
+    DO_SHOW_TASK (task) =
+	BEGIN
+	DBGEXT$$CONTROL_BLOCK [DBGEXT$W_FUNCTION_CODE] = DBGEXT$K_SHOW_TASK;	! set function
+	DBGEXT$$CONTROL_BLOCK [DBGEXT$L_STATUS] = 0;				! and clear status
+	%IF NOT %NULL (TASK)							! optionally use a
+	    %THEN DBGEXT$$CONTROL_BLOCK [DBGEXT$L_TASK_VALUE] = TASK;		!  task value
+	%FI
+	IF NOT ADA$DBGEXT (DBGEXT$$CONTROL_BLOCK) 				! call ada
+	THEN
+	    SIGNAL (%((INTERNAL ERROR -tbs))%);
+	IF NOT .DBGEXT$$CONTROL_BLOCK [DBGEXT$L_STATUS]				! and check status
+	THEN
+	    SIGNAL (%((SOME ERROR -tbs))%);
+	END % ,
+
+    !+
+    !   DO_SHOW_CALLS  --  Implements part of SHOW TASK /CALLS by calling the 
+    !   GET_REGISTER function and passing the PC and FP to the DEBUG traceback
+    !   facility, without changing any fields of the control block other than 
+    !   FUNCTION_CODE, STATUS, and optionally TASK_VALUE.  It assumes that a 
+    !   DBGEXT_INIT has been performed 
+    !   to bind the name DBGEXT$$CONTROL_BLOCK to a real control block.
+    !-
+    DO_SHOW_CALLS (call_level) = 		! (task) = %((DONT THINK TASK IS NEEDED HERE -tbs))%
+	BEGIN
+	DBGEXT$$CONTROL_BLOCK [DBGEXT$W_FUNCTION_CODE] = DBGEXT$K_GET_REGISTERS;! set function
+	DBGEXT$$CONTROL_BLOCK [DBGEXT$L_STATUS] = 0;				! and clear status
+!	%IF NOT %NULL (TASK)							! optionally use a
+!	    %THEN DBGEXT$$CONTROL_BLOCK [DBGEXT$L_TASK_VALUE] = TASK;		!  task value
+!	%FI
+	IF NOT ADA$DBGEXT (DBGEXT$$CONTROL_BLOCK) 				! call ada
+	THEN
+	    SIGNAL (%((INTERNAL ERROR -tbs))%);
+
+	IF NOT ( .DBGEXT$$CONTROL_BLOCK [DBGEXT$L_STATUS]			! and check status
+	    OR .DBGEXT$$CONTROL_BLOCK [DBGEXT$L_STATUS] EQL DBGEXT$K_TASK_IS_ACTIVE )
+	THEN
+	    SIGNAL (%((SOME ERROR -tbs))%);
+
+	! Check for active task and pass registers to traceback.
+	!
+	IF .DBGEXT$$CONTROL_BLOCK [DBGEXT$L_STATUS] EQL DBGEXT$K_TASK_IS_ACTIVE
+	THEN							! DEBUG has the register set
+	    BEGIN
+	    LOCAL
+		EXC_TYPE;		! Exception type (trap=1, fault=2)
+
+	    ! exception type is based on whether the last exception
+	    ! was a fault, break or step-end
+	    !
+	    IF	.dbg$runframe [dbg$v_at_fault] OR
+		    .dbg$runframe [dbg$v_at_break] OR
+		    .dbg$runframe [dbg$v_at_step_end]
+	    THEN	exc_type = fault_exc			! %(( NEED TO LIB DBGGEN -tbs))%
+	    ELSE	exc_type = trap_exc;
+
+	    dbg$traceback (.dbg$runframe [dbg$l_user_pc],
+			   .dbg$runframe [dbg$l_user_fp],
+			   .EXC_TYPE, call_level );
+	    END
+
+	ELSE								! ADA has the register set
+	    DBG$TRACEBACK (.DBGEXT$$CONTROL_BLOCK [DBGEXT$L_PC],
+			   .DBGEXT$$CONTROL_BLOCK [DBGEXT$L_FP],
+			   trap_EXC, call_level );			! %((FAULT or TRAP? -tbs))%
+	END % ;
+
+
+    LOCAL
+    	ADA_CONTROL : REF DBGEXT$CONTROL_BLOCK,
+    	ADVERB_NODE : REF DBG$ADVERB_NODE,
+    	NOUN_NODE : REF DBG$NOUN_NODE,
+	LINK,						! Link field to next adverb or noun node.
+	CALLS_VALUE : INITIAL (0),
+	PRIORITY_VALUE : INITIAL (0),
+	STATE_VALUE : INITIAL (0),
+	QUALIFIERS : BITVECTOR [TASK_MAX_QUAL + 1]	! Qualifier state vector.
+		     INITIAL (BYTE (REP TASK_MAX_QUAL / %BPUNIT + 1 OF (0)));
+
+    !+
+    !   Walk the tree and set bits in the qualifier state vector.  Also pick up the values of the adverb 
+    !   nodes representing the parameters supplied to the /CALLS, /PRIORITY, and /STATE qualifiers.  This 
+    !   algorithm will cause the last value to superceed earlier values, when multiple values are given.
+    !-
+    IF .VERB_NODE [DBG$L_VERB_OBJECT_PTR] NEQ 0		! Check for an explicit task list.
+    THEN
+	QUALIFIERS [TASK_TASK_LIST] = TRUE;
+    LINK = VERB_NODE [DBG$L_VERB_ADVERB_PTR];		! Get link to the adverb nodes.
+    WHILE ..LINK NEQ 0  DO				! Chain down the adverb nodes.
+	BEGIN
+	ADVERB_NODE = ..LINK;
+	QUALIFIERS [ .ADVERB_NODE [DBG$B_ADVERB_LITERAL] ] = TRUE;
+	SELECTONE .ADVERB_NODE [DBG$B_ADVERB_LITERAL] OF
+	    SET
+	    [ TASK_CALLS ] :
+		CALLS_VALUE = .ADVERB_NODE [DBG$L_ADVERB_VALUE];
+	    [ TASK_PRIORITY ] :
+		PRIORITY_VALUE = .ADVERB_NODE [DBG$L_ADVERB_VALUE];
+	    [ TASK_STATE ] :
+		STATE_VALUE = .ADVERB_NODE [DBG$L_ADVERB_VALUE];
+	    TES;
+	LINK = ADVERB_NODE [DBG$L_ADVERB_LINK];		! Link to next node.
+	END;
+
+    !+
+    !   Check for conflicting qualifiers and parameters.  %((what about /FULL ? -tbs))%
+    !-
+    IF CONFLICT (QUALIFIERS, (CALLS, DEADLOCK, STATISTICS) )	! Only one action allowed.
+    THEN
+	SIGNAL (DBG$_CONFLICT);
+
+    !+
+    !   Get a control block.
+    !-
+    IF .QUALIFIERS [TASK_CALLS]
+    THEN
+	ADA_CONTROL = DBG$GET_TEMPMEM (DBGEXT$K_ADA_SIZE2)	! Need long block.
+    ELSE
+	ADA_CONTROL = DBG$GET_TEMPMEM (DBGEXT$K_ADA_SIZE1);	! Need short block.
+
+    !+
+    !   Fill out the control block and perform the required action.
+    !-
+    SELECTONE TRUE OF
+	SET
+
+	!+
+	!   SHOW TASK /DEADLOCK
+	!-
+	[ .QUALIFIERS [TASK_DEADLOCK] ] :
+	    BEGIN
+	    DBGEXT_INIT (DBGEXT = .ADA_CONTROL,			! Initialize block 
+		FUNCTION = DBGEXT$K_SHOW_DEADLOCK);		!  and set function.
+	    IF NOT ADA$DBGEXT (.ADA_CONTROL) 			! Call ADA
+	    THEN
+		SIGNAL (%((INTERNAL ERROR -tbs))%);
+	    IF NOT .DBGEXT$$CONTROL_BLOCK [DBGEXT$L_STATUS]	! and check status.
+	    THEN
+		SIGNAL (%((SOME ERROR -tbs))%);
+	    END;
+
+	!+
+	!   SHOW TASK /STATISTICS
+	!-
+	[ .QUALIFIERS [TASK_STATISTICS] ] :
+	    BEGIN
+	    DBGEXT_INIT (DBGEXT = .ADA_CONTROL,			! Initialize block 
+!%((-tbs))%		FUNCTION = DBGEXT$K_SHOW_STATISTICS);		!  and set function.
+		FUNCTION = DBGEXT$K_SHOW_STAT);		!  and set function.
+	    IF NOT ADA$DBGEXT (.ADA_CONTROL) 			! Call ADA
+	    THEN
+		SIGNAL (%((INTERNAL ERROR -tbs))%);
+	    IF NOT .DBGEXT$$CONTROL_BLOCK [DBGEXT$L_STATUS]	! and check status.
+	    THEN
+		SIGNAL (%((SOME ERROR -tbs))%);
+	    END;
+
+	!+
+	!   SHOW TASK or SHOW TASK /CALLS
+	!-
+	[ OTHERWISE ] :
+	    BEGIN
+	    BIND
+		ALL = .QUALIFIERS [TASK_ALL],
+		LIST = .QUALIFIERS [TASK_TASK_LIST],
+		PSH = .QUALIFIERS [TASK_PRIORITY] OR .QUALIFIERS [TASK_STATE] OR .QUALIFIERS [TASK_HOLD];
+
+	    SELECTONE TRUE OF
+		SET
+
+		!   (P + ~PA)~T		==> NS...
+		[ (PSH OR (NOT PSH AND ALL)) AND NOT LIST ] :
+
+		    BEGIN
+		    LOCAL
+			FIRST_TASK;
+		    DBGEXT_INIT (DBGEXT = .ADA_CONTROL,
+				PRIORITY = .PRIORITY_VALUE,
+				STATE = .STATE_VALUE,
+				HOLD = .QUALIFIERS [TASK_HOLD] ); 
+		    FIRST_TASK = DO_NEXT_TASK (0);
+		    IF FIRST_TASK EQLU 0		! null task ==> EXIT
+		    THEN
+			SIGNAL (%((NO TASKS MATCH RESTRICTION -tbs))%);
+		    DO
+			BEGIN
+			DO_SHOW_TASK ();		%((HEADER CONTROL NEEDED -tbs))%	!`
+			IF .QUALIFIERS [TASK_CALLS]
+			THEN
+			    DO_SHOW_CALLS (.CALLS_VALUE);
+			END
+		    UNTIL .FIRST_TASK EQLU DO_NEXT_TASK ();	! cycled through all tasks
+		    END;
+
+		!   PT			==> GS...
+		[ PSH AND LIST ] :
+		    BEGIN
+		    DBGEXT_INIT (DBGEXT = .ADA_CONTROL);
+		    !+
+		    !   Walk down the chain of noun nodes.  Pick up the pointer to %((THE PRIMARY DESC -tbs))% 
+		    !   and the value of the task.  Then do the SHOW_TASK.
+		    !-
+		    LINK = VERB_NODE [DBG$L_VERB_OBJECT_PTR];		! Get link to the noun nodes.
+		    WHILE ..LINK NEQ 0  DO				! Chain down the noun nodes.
+			BEGIN
+			LABEL
+			    CHECK_PSH;
+			NOUN_NODE = ..LINK;
+!			<task_value> =  (.NOUN_NODE [DBG$L_NOUN_VALUE]) [<task_value_field>] ;	%((need structure -tbs))%
+
+			!+
+			!   Check PRIORITY, STATE, and HOLD
+			!-
+			CHECK_PSH:
+			    BEGIN
+			    SELECT TRUE OF
+				SET
+
+				[ .QUALIFIERS [TASK_PRIORITY] ] :
+				    BEGIN
+				    CALL_ADA (FUNCTION = DBGEXT$K_GET_PRIORITY);
+				    IF .ADA_CONTROL [DBGEXT$L_PRIORITY] AND .PRIORITY_VALUE EQL 0
+				    THEN
+					LEAVE CHECK_PSH;
+				    END;
+
+				[ .QUALIFIERS [TASK_STATE] ] :
+				    BEGIN
+				    CALL_ADA (FUNCTION = DBGEXT$K_GET_STATE);
+				    IF .ADA_CONTROL [DBGEXT$V_STATE] AND .STATE_VALUE EQL 0
+				    THEN
+					LEAVE CHECK_PSH;
+				    END;
+
+				[ .QUALIFIERS [TASK_HOLD] ] :
+				    BEGIN
+				    CALL_ADA (FUNCTION = DBGEXT$K_GET_STATE);
+				    IF NOT .ADA_CONTROL [DBGEXT$V_HOLD]
+				    THEN
+					LEAVE CHECK_PSH;
+				    END;
+
+				TES;
+
+			    DO_SHOW_TASK ();		! <task_value> %((-tbs))%
+			    IF .QUALIFIERS [TASK_CALLS]
+			    THEN
+				DO_SHOW_CALLS (.CALLS_VALUE);
+			    END;
+
+			LINK = NOUN_NODE [DBG$L_NOUN_LINK];		! Link to next node.
+			END;
+		    END;
+
+		!   ~PT			==> S..
+		[ NOT PSH AND LIST ] :
+		    BEGIN
+		    DBGEXT_INIT (DBGEXT = .ADA_CONTROL);
+		    !+
+		    !   Walk down the chain of noun nodes.  Pick up the pointer to %((THE PRIMARY DESC -tbs))% 
+		    !   and the value of the task.  Then do the SHOW_TASK.
+		    !-
+		    LINK = VERB_NODE [DBG$L_VERB_OBJECT_PTR];		! Get link to the noun nodes.
+		    WHILE ..LINK NEQ 0  DO				! Chain down the noun nodes.
+			BEGIN
+			NOUN_NODE = ..LINK;
+!			<task_value> =  (.NOUN_NODE [DBG$L_NOUN_VALUE]) [<task_value_field>] ;	%((need structure -tbs))%
+
+			DO_SHOW_TASK ();		! <task_value> %((-tbs))%
+			IF .QUALIFIERS [TASK_CALLS]
+			THEN
+			    DO_SHOW_CALLS (.CALLS_VALUE);
+			LINK = NOUN_NODE [DBG$L_NOUN_LINK];		! Link to next node.
+			END;
+		    END;
+
+		!   ~P~A~T = ~(P+A+T) 	==> S
+ 		[ NOT (PSH AND ALL AND LIST) ] :
+		    BEGIN
+		    DBGEXT_INIT (DBGEXT = .ADA_CONTROL);
+		    DO_SHOW_TASK ();			! %((NEED GLOBAL SYMBOL FOR %VISIBLE -tbs))%
+		    IF .QUALIFIERS [TASK_CALLS]
+		    THEN
+			DO_SHOW_CALLS (.CALLS_VALUE);
+		    END;
+
+		TES
+
+	    END;
+
+	TES;
+
+
+    RETURN 0;			! %((0?-tbs))%
+
+    END;			! end of DBG$NEXECUTE_SHOW_TASK
+
+
+%SBTTL 'DBG$NPARSE_SET_TASK'
+GLOBAL ROUTINE DBG$NPARSE_SET_TASK ( INPUT_DESC : REF BLOCK [ , BYTE ],
+    VERB_NODE : REF DBG$VERB_NODE ) : NOVALUE =
+!
+! FUNCTION
+!	This routine parses the SET TASK command.  It accepts a command line
+!	string descriptor as input and produces a Verb Node for the parsed
+!	string as output.  The Verb Node and its attached Adverb Nodes and
+!	Noun Nodes, as built by this routine, later serve as input to the
+!	DBG$NEXECUTE_SET_TASK routine which actually executes the command.
+!
+! INPUTS
+!	INPUT_DESC - A string descriptor pointing to the input line being
+!		  parsed.  The descriptor is assumed to be pointing to the
+!		  first character after the SET TASK keywords.
+!
+!	VERB_NODE - A pointer to the Verb Node to be built up for the command
+!		  being parsed.
+!
+! OUTPUTS
+!	INPUT_DESC - The input string descriptor is updated to point to the
+!		  first character after the end of the command.  This normally
+!		  means that the input string is exhausted.
+!
+!	VERB_NODE - The passed-in Verb Node is filled in so that it and its
+!		  attached Adverb and Noun Nodes contain all information picked
+!		  up during the parse of the SET TASK command.
+!
+
+    BEGIN
+
+    LOCAL
+    	ADVERB_NODE : REF DBG$ADVERB_NODE,
+    	NOUN_NODE : REF DBG$NOUN_NODE,
+	LINK,					! Link field to next adverb or noun node.
+	PRIORITY;				! Temporary for storing priority.
+
+
+    ! The field VERB_NODE [DBG$B_VERB_COMPOSITE] has already been set = SET_TASK
+    ! to indicate that the command was SET TASK in routine DBG$NPARSE_SET.
+
+    link = verb_node [dbg$l_verb_adverb_ptr];
+
+    !
+    ! Scan for command qualifiers.  If found, construct adverb nodes.
+    !
+    WHILE dbg$nmatch (.input_desc, dbg$cs_slash, 1) DO
+	BEGIN
+	!
+    	! Case on the qualifier.
+	!
+    	SELECTONE TRUE OF
+	    SET
+	    !
+	    ! SET TASK /ACTIVE.  Construct an Adverb Node and link it in.
+	    !
+	    [ DBG$NMATCH( .INPUT_DESC, DBG$CS_ACTIVE, 2 ) ]:
+		BEGIN
+		ADVERB_NODE = DBG$GET_TEMPMEM (DBG$K_ADVERB_NODE_SIZE);
+		.LINK = .ADVERB_NODE;
+		LINK = ADVERB_NODE [DBG$L_ADVERB_LINK];
+		ADVERB_NODE [DBG$B_ADVERB_LITERAL] = TASK_ACTIVE;
+		END;
+
+	    !
+	    ! SET TASK /ALL.  Construct an Adverb Node and link it in.
+	    !
+	    [ DBG$NMATCH( .INPUT_DESC, DBG$CS_ALL, 2 ) ]:
+		BEGIN
+		ADVERB_NODE = DBG$GET_TEMPMEM (DBG$K_ADVERB_NODE_SIZE);
+		.LINK = .ADVERB_NODE;
+		LINK = ADVERB_NODE [DBG$L_ADVERB_LINK];
+		ADVERB_NODE [DBG$B_ADVERB_LITERAL] = TASK_ALL;
+		END;
+
+	    !
+	    ! SET TASK /VISIBLE.  Construct an Adverb Node and link it in.
+	    !
+	    [ DBG$NMATCH( .INPUT_DESC, DBG$CS_VISIBLE, 1 ) ]:
+		BEGIN
+		ADVERB_NODE = DBG$GET_TEMPMEM (DBG$K_ADVERB_NODE_SIZE);
+		.LINK = .ADVERB_NODE;
+		LINK = ADVERB_NODE [DBG$L_ADVERB_LINK];
+		ADVERB_NODE [DBG$B_ADVERB_LITERAL] = TASK_VISIBLE;
+		END;
+
+	    !
+	    ! SET TASK /PRIORITY=(n).  Construct an Adverb Node and link it in.
+	    !
+	    [ DBG$NMATCH( .INPUT_DESC, DBG$CS_PRIORITY, 1 ) ]:
+		BEGIN
+		ADVERB_NODE = DBG$GET_TEMPMEM (DBG$K_ADVERB_NODE_SIZE);
+		.LINK = .ADVERB_NODE;
+		LINK = ADVERB_NODE [DBG$L_ADVERB_LINK];
+		ADVERB_NODE [DBG$B_ADVERB_LITERAL] = TASK_PRIORITY;
+
+		IF DBG$NMATCH( .INPUT_DESC, DBG$CS_COLON, 1 )
+		    OR DBG$NMATCH( .INPUT_DESC, DBG$CS_EQUAL, 1 )
+		THEN
+		    IF DBG$NMATCH( .INPUT_DESC, dbg$cs_left_paren, 1 )
+		    THEN
+			BEGIN						%((FIX THIS CAN'T HAVE MULTIPLE PRIORITIES! -tbs))%
+			DO
+			    BEGIN
+			    DBG$NSAVE_DECIMAL_INTEGER(
+				.INPUT_DESC,				! read input value
+				PRIORITY);
+			    IF .PRIORITY GTRU 31			! %((need priority limit -tbs))%
+			    THEN
+				SIGNAL (DBG$_BITRANGE );		! %((NEED A BETTER MESSAGE -tbs))%
+			    (ADVERB_NODE [DBG$L_ADVERB_VALUE]) <.PRIORITY, 1, 0> = 1;	! set corresponding bit
+			    END
+			WHILE DBG$NMATCH( .INPUT_DESC, dbg$cs_comma, 1 );
+			IF NOT DBG$NMATCH( .INPUT_DESC, dbg$cs_right_paren, 1 )
+			THEN
+			    SIGNAL (dbg$_UNMTCHPARN);	! Unmatched left parenthesis found.
+			END
+		    ELSE
+			BEGIN
+			DBG$NSAVE_DECIMAL_INTEGER(
+				.INPUT_DESC,				! read input value
+				PRIORITY);
+			IF .PRIORITY GTRU 31			! %((need a limit -tbs))%
+			THEN
+			    SIGNAL (DBG$_BITRANGE );		! %((NEED A BETTER MESSAGE -tbs))%
+			(ADVERB_NODE [DBG$L_ADVERB_VALUE]) <.PRIORITY, 1, 0> = 1;	! set corresponding bit
+			END
+		ELSE		
+		    SIGNAL (DBG$_NEEDMORE);
+
+		END;
+
+	    !
+	    ! SET TASK /RESTORE.  Construct an Adverb Node and link it in.
+	    !
+	    [ DBG$NMATCH( .INPUT_DESC, DBG$CS_RESTORE, 3 ) ]:
+		BEGIN
+		ADVERB_NODE = DBG$GET_TEMPMEM (DBG$K_ADVERB_NODE_SIZE);
+		.LINK = .ADVERB_NODE;
+		LINK = ADVERB_NODE [DBG$L_ADVERB_LINK];
+		ADVERB_NODE [DBG$B_ADVERB_LITERAL] = TASK_RESTORE;
+		END;
+
+	    !
+	    ! SET TASK /RELEASE  or  SET TASK /NOHOLD.  Construct an Adverb Node and link it in.
+	    !
+	    [ DBG$NMATCH( .INPUT_DESC, DBG$CS_RELEASE, 3 ) ,
+	      DBG$NMATCH( .INPUT_DESC, DBG$CS_NOHOLD, 3 ) ]:
+		BEGIN
+		ADVERB_NODE = DBG$GET_TEMPMEM (DBG$K_ADVERB_NODE_SIZE);
+		.LINK = .ADVERB_NODE;
+		LINK = ADVERB_NODE [DBG$L_ADVERB_LINK];
+		ADVERB_NODE [DBG$B_ADVERB_LITERAL] = TASK_RELEASE;
+		END;
+
+	    !
+	    ! SET TASK /HOLD.  Construct an Adverb Node and link it in.
+	    !
+	    [ DBG$NMATCH( .INPUT_DESC, DBG$CS_HOLD, 1 ) ]:
+		BEGIN
+		ADVERB_NODE = DBG$GET_TEMPMEM (DBG$K_ADVERB_NODE_SIZE);
+		.LINK = .ADVERB_NODE;
+		LINK = ADVERB_NODE [DBG$L_ADVERB_LINK];
+		ADVERB_NODE [DBG$B_ADVERB_LITERAL] = TASK_HOLD;
+		END;
+
+	    !
+	    ! SET TASK /TERMINATE.  Construct an Adverb Node and link it in.
+	    !
+	    [ DBG$NMATCH( .INPUT_DESC, DBG$CS_TERMINATE, 1 ) ]:
+		BEGIN
+		ADVERB_NODE = DBG$GET_TEMPMEM (DBG$K_ADVERB_NODE_SIZE);
+		.LINK = .ADVERB_NODE;
+		LINK = ADVERB_NODE [DBG$L_ADVERB_LINK];
+		ADVERB_NODE [DBG$B_ADVERB_LITERAL] = TASK_TERMINATE;
+		END;
+
+	    !
+	    ! Any other condition is an error.
+	    !
+	    [ OTHERWISE ]:
+		DBG$SYNTAX_ERROR(.INPUT_DESC);
+
+	    TES;
+
+	END;		! of WHILE /qualifier
+
+    .LINK = 0;		! End of adverb node chain.
+    
+    IF NOT DBG$NMATCH( .INPUT_DESC, DBG$CS_CR, 1 )	! If more input exists then
+    THEN						! try to parse a task list.
+	BEGIN
+	LINK = VERB_NODE [DBG$L_VERB_OBJECT_PTR];
+	DO
+	    !+
+	    !   Parse tasks in a task list and build noun nodes and value
+	    !   descriptors until end of list or an error is encountered.
+	    !-
+	    BEGIN
+	    NOUN_NODE = DBG$GET_TEMPMEM (DBG$K_NOUN_NODE_SIZE);	! %((NEED LONG NOUN ?-tbs))%
+	    .LINK = .NOUN_NODE;
+	    LINK = NOUN_NODE [DBG$L_NOUN_LINK];
+
+	    DBG$NPARSE_EXPRESSION (
+		.INPUT_DESC,				! rest of command
+		.DBG$GB_RADIX[DBG$B_RADIX_INPUT], 	! default input radix
+		NOUN_NODE [DBG$L_NOUN_VALUE],		! where to store ptr to value desc
+		TOKEN$K_TERM_COMMA );			! task terminator token
+
+	    !	.MESSAGE_VECT);				%((REMOVE MESSAGE VEC FROM ROUTINE -tbs))%
+
+	    END
+	WHILE DBG$NMATCH( .INPUT_DESC, DBG$CS_COMMA, 1 );
+
+	IF NOT DBG$NMATCH( .INPUT_DESC, DBG$CS_CR, 1 )	! If more input exists then
+	THEN						! we have an error.
+	    DBG$SYNTAX_ERROR(.INPUT_DESC);		! Signal the error.
+	END;
+
+
+    RETURN 0;			! %((0?-tbs))%
+
+    END;			! end of DBG$NPARSE_SET_TASK
+
+
+%SBTTL 'DBG$NPARSE_SHOW_TASK'
+GLOBAL ROUTINE DBG$NPARSE_SHOW_TASK ( INPUT_DESC : REF BLOCK [ , BYTE ], 
+    VERB_NODE : REF DBG$VERB_NODE ) : NOVALUE =
+!
+! FUNCTION
+!	This routine parses the SHOW TASK command.  It accepts a command line
+!	string descriptor as input and produces a Verb Node for the parsed
+!	string as output.  The Verb Node and its attached Adverb Nodes and
+!	Noun Nodes, as built by this routine, later serve as input to the
+!	DBG$NEXECUTE_SHOW_TASK routine which actually executes the command.
+!
+! INPUTS
+!	INPUT_DESC - A string descriptor pointing to the input line being
+!		  parsed.  The descriptor is assumed to be pointing to the
+!		  first character after the SHOW TASK keywords.
+!
+!	VERB_NODE - A pointer to the Verb Node to be built up for the command
+!		  being parsed.
+!
+! OUTPUTS
+!	INPUT_DESC - The input string descriptor is updated to point to the
+!		  first character after the end of the command.  This normally
+!		  means that the input string is exhausted.
+!
+!	VERB_NODE - The passed-in Verb Node is filled in so that it and its
+!		  attached Adverb and Noun Nodes contain all information picked
+!		  up during the parse of the SHOW TASK command.
+!
+
+    BEGIN
+
+    LOCAL
+    	ADVERB_NODE : REF DBG$ADVERB_NODE,
+    	NOUN_NODE : REF DBG$NOUN_NODE,
+	LINK,					! Link field to next adverb or noun node.
+	PRIORITY;				! Temporary for storing priority.
+
+
+    ! The field VERB_NODE [DBG$B_VERB_COMPOSITE] has already been set = SHOW_TASK
+    ! to indicate that the command was SHOW TASK in routine DBG$NPARSE_SHOW.
+
+    link = verb_node [dbg$l_verb_adverb_ptr];
+
+    !
+    ! Scan for command qualifiers.  If found, construct adverb nodes.
+    !
+    WHILE dbg$nmatch (.input_desc, dbg$cs_slash, 1) DO
+	BEGIN
+	!
+    	! Case on the qualifier.
+	!
+    	SELECTONE TRUE OF
+	    SET
+	    !
+	    ! SHOW TASK /ALL.  Construct an Adverb Node and link it in.
+	    !
+	    [ DBG$NMATCH( .INPUT_DESC, DBG$CS_ALL, 1 ) ]:
+		BEGIN
+		ADVERB_NODE = DBG$GET_TEMPMEM (DBG$K_ADVERB_NODE_SIZE);
+		.LINK = .ADVERB_NODE;
+		LINK = ADVERB_NODE [DBG$L_ADVERB_LINK];
+		ADVERB_NODE [DBG$B_ADVERB_LITERAL] = TASK_ALL;
+		END;
+
+	    !
+	    ! SHOW TASK /CALLS [ = n ].  Construct an Adverb Node and link it in.  Pickup the 
+	    ! call depth to display.  Assume -1 (very large number) if not given explicitly.
+	    !
+	    [ DBG$NMATCH( .INPUT_DESC, DBG$CS_CALLS, 1 ) ]:
+		BEGIN
+		ADVERB_NODE = DBG$GET_TEMPMEM (DBG$K_ADVERB_NODE_SIZE);
+		.LINK = .ADVERB_NODE;
+		LINK = ADVERB_NODE [DBG$L_ADVERB_LINK];
+		ADVERB_NODE [DBG$B_ADVERB_LITERAL] = TASK_CALLS;
+
+		IF DBG$NMATCH( .INPUT_DESC, DBG$CS_COLON, 1 )	! did user give a call depth?
+		    OR DBG$NMATCH( .INPUT_DESC, DBG$CS_EQUAL, 1 )
+		THEN
+		    DBG$NSAVE_DECIMAL_INTEGER(			! this routine checks for errors
+			.INPUT_DESC,				! read input value
+			ADVERB_NODE [DBG$L_ADVERB_VALUE])	! store in adverb node
+		ELSE
+		    ADVERB_NODE [DBG$L_ADVERB_VALUE] = -1;	! use default value
+		END;
+
+	    !
+	    ! SHOW TASK /DEADLOCK.  Construct an Adverb Node and link it in.
+	    !
+	    [ DBG$NMATCH( .INPUT_DESC, DBG$CS_DEADLOCK, 1 ) ]:
+		BEGIN
+		ADVERB_NODE = DBG$GET_TEMPMEM (DBG$K_ADVERB_NODE_SIZE);
+		.LINK = .ADVERB_NODE;
+		LINK = ADVERB_NODE [DBG$L_ADVERB_LINK];
+		ADVERB_NODE [DBG$B_ADVERB_LITERAL] = TASK_DEADLOCK;
+		END;
+
+	    !
+	    ! SHOW TASK /FULL.  Construct an Adverb Node and link it in.
+	    !
+	    [ DBG$NMATCH( .INPUT_DESC, DBG$CS_FULL, 1 ) ]:
+		BEGIN
+		ADVERB_NODE = DBG$GET_TEMPMEM (DBG$K_ADVERB_NODE_SIZE);
+		.LINK = .ADVERB_NODE;
+		LINK = ADVERB_NODE [DBG$L_ADVERB_LINK];
+		ADVERB_NODE [DBG$B_ADVERB_LITERAL] = TASK_FULL;
+		END;
+
+	    !
+	    ! SHOW TASK /HOLD.  Construct an Adverb Node and link it in.
+	    !
+	    [ DBG$NMATCH( .INPUT_DESC, DBG$CS_HOLD, 1 ) ]:
+		BEGIN
+		ADVERB_NODE = DBG$GET_TEMPMEM (DBG$K_ADVERB_NODE_SIZE);
+		.LINK = .ADVERB_NODE;
+		LINK = ADVERB_NODE [DBG$L_ADVERB_LINK];
+		ADVERB_NODE [DBG$B_ADVERB_LITERAL] = TASK_HOLD;
+		END;
+
+	    !
+	    ! SHOW TASK /PRIORITY=(n).  Construct an Adverb Node and link it in.
+	    !
+	    [ DBG$NMATCH( .INPUT_DESC, DBG$CS_PRIORITY, 1 ) ]:
+		BEGIN
+		ADVERB_NODE = DBG$GET_TEMPMEM (DBG$K_ADVERB_NODE_SIZE);
+		.LINK = .ADVERB_NODE;
+		LINK = ADVERB_NODE [DBG$L_ADVERB_LINK];
+		ADVERB_NODE [DBG$B_ADVERB_LITERAL] = TASK_PRIORITY;
+
+		IF DBG$NMATCH( .INPUT_DESC, DBG$CS_COLON, 1 )
+		    OR DBG$NMATCH( .INPUT_DESC, DBG$CS_EQUAL, 1 )
+		THEN
+		    IF DBG$NMATCH( .INPUT_DESC, dbg$cs_left_paren, 1 )
+		    THEN
+			BEGIN
+			DO
+			    BEGIN
+			    DBG$NSAVE_DECIMAL_INTEGER(
+				.INPUT_DESC,				! read input value
+				PRIORITY);
+			    IF .PRIORITY GTRU 31			! %((need priority limit -tbs))%
+			    THEN
+				SIGNAL (DBG$_BITRANGE );		! %((NEED A BETTER MESSAGE -tbs))%
+			    (ADVERB_NODE [DBG$L_ADVERB_VALUE]) <.PRIORITY, 1, 0> = 1;	! set corresponding bit
+			    END
+			WHILE DBG$NMATCH( .INPUT_DESC, dbg$cs_comma, 1 );
+			IF NOT DBG$NMATCH( .INPUT_DESC, dbg$cs_right_paren, 1 )
+			THEN
+			    SIGNAL (dbg$_UNMTCHPARN);	! Unmatched left parenthesis found.
+			END
+		    ELSE
+			BEGIN
+			DBG$NSAVE_DECIMAL_INTEGER(
+				.INPUT_DESC,				! read input value
+				PRIORITY);
+			IF .PRIORITY GTRU 31			! %((need a limit -tbs))%
+			THEN
+			    SIGNAL (DBG$_BITRANGE );		! %((NEED A BETTER MESSAGE -tbs))%
+			(ADVERB_NODE [DBG$L_ADVERB_VALUE]) <.PRIORITY, 1, 0> = 1;	! set corresponding bit
+			END
+		ELSE		
+		    SIGNAL (DBG$_NEEDMORE);
+
+		END;
+
+	    !
+	    ! SHOW TASK /STATE=(x).  Construct an Adverb Node and link it in.
+	    !
+	    [ DBG$NMATCH( .INPUT_DESC, DBG$CS_STATE, 5 ) ]:
+		BEGIN
+		ADVERB_NODE = DBG$GET_TEMPMEM (DBG$K_ADVERB_NODE_SIZE);
+		.LINK = .ADVERB_NODE;
+		LINK = ADVERB_NODE [DBG$L_ADVERB_LINK];
+		ADVERB_NODE [DBG$B_ADVERB_LITERAL] = TASK_STATE;
+
+		IF DBG$NMATCH( .INPUT_DESC, DBG$CS_COLON, 1 )
+		    OR DBG$NMATCH( .INPUT_DESC, DBG$CS_EQUAL, 1 )
+		THEN
+		    IF DBG$NMATCH( .INPUT_DESC, dbg$cs_left_paren, 1 )
+		    THEN
+			BEGIN
+			DO
+			    BEGIN
+			    SELECTONE TRUE OF
+				SET
+%((THIS WILL OVERWRITE ADVERB VALUE WITH THE MOST RECENT STATE OF THE LIST -- MUST BE FIXED -tbs))%
+				[ DBG$NMATCH( .INPUT_DESC, DBG$CS_RUNNING, 1 ) ]:
+				    ADVERB_NODE [DBG$L_ADVERB_VALUE] = DBGEXT$K_STATE_RUNNING;
+
+				[ DBG$NMATCH( .INPUT_DESC, DBG$CS_READY, 1 ) ]:
+				    ADVERB_NODE [DBG$L_ADVERB_VALUE] = DBGEXT$K_STATE_READY;
+
+				[ DBG$NMATCH( .INPUT_DESC, DBG$CS_SUSPENDED, 1 ) ]:
+				    ADVERB_NODE [DBG$L_ADVERB_VALUE] = DBGEXT$K_STATE_SUSPENDED;
+
+				[ DBG$NMATCH( .INPUT_DESC, DBG$CS_TERMINATED, 1 ) ]:
+				    ADVERB_NODE [DBG$L_ADVERB_VALUE] = DBGEXT$K_STATE_TERMINATED;
+				!
+				! Any other condition is an error.
+				!
+				[ OTHERWISE ]:
+				    DBG$SYNTAX_ERROR(.INPUT_DESC);
+
+				TES
+			    END
+			WHILE DBG$NMATCH( .INPUT_DESC, dbg$cs_comma, 1 );
+			IF NOT DBG$NMATCH( .INPUT_DESC, dbg$cs_right_paren, 1 )
+			THEN
+			    SIGNAL (dbg$_UNMTCHPARN);	! Unmatched left parenthesis found.
+			END
+		    ELSE
+			SELECTONE TRUE OF
+			    SET
+
+			    [ DBG$NMATCH( .INPUT_DESC, DBG$CS_RUNNING, 1 ) ]:
+				ADVERB_NODE [DBG$L_ADVERB_VALUE] = DBGEXT$K_STATE_RUNNING;
+
+			    [ DBG$NMATCH( .INPUT_DESC, DBG$CS_READY, 1 ) ]:
+				ADVERB_NODE [DBG$L_ADVERB_VALUE] = DBGEXT$K_STATE_READY;
+
+			    [ DBG$NMATCH( .INPUT_DESC, DBG$CS_SUSPENDED, 1 ) ]:
+				ADVERB_NODE [DBG$L_ADVERB_VALUE] = DBGEXT$K_STATE_SUSPENDED;
+
+			    [ DBG$NMATCH( .INPUT_DESC, DBG$CS_TERMINATED, 1 ) ]:
+				ADVERB_NODE [DBG$L_ADVERB_VALUE] = DBGEXT$K_STATE_TERMINATED;
+			    !
+			    ! Any other condition is an error.
+			    !
+			    [ OTHERWISE ]:
+				DBG$SYNTAX_ERROR(.INPUT_DESC);
+
+			    TES
+		ELSE
+		    SIGNAL (DBG$_NEEDMORE);
+
+		END;
+
+	    !
+	    ! SHOW TASK /STATISTICS.  Construct an Adverb Node and link it in.
+	    !
+	    [ DBG$NMATCH( .INPUT_DESC, DBG$CS_STATISTICS, 5 ) ]:
+		BEGIN
+		ADVERB_NODE = DBG$GET_TEMPMEM (DBG$K_ADVERB_NODE_SIZE);
+		.LINK = .ADVERB_NODE;
+		LINK = ADVERB_NODE [DBG$L_ADVERB_LINK];
+		ADVERB_NODE [DBG$B_ADVERB_LITERAL] = TASK_STATISTICS;
+		END;
+
+	    !
+	    ! Any other condition is an error.
+	    !
+	    [ OTHERWISE ]:
+		DBG$SYNTAX_ERROR(.INPUT_DESC);
+
+	    TES;
+
+	END;		! of WHILE /qualifier
+
+    .LINK = 0;		! End of adverb node chain.
+    
+
+    IF NOT DBG$NMATCH( .INPUT_DESC, DBG$CS_CR, 1 )	! If more input exists then
+    THEN						! try to parse a task list.
+	BEGIN
+	LINK = VERB_NODE [DBG$L_VERB_OBJECT_PTR];
+	DO
+	    !+
+	    !   Parse tasks in a task list and build noun nodes and value
+	    !   descriptors until end of list or an error is encountered.
+	    !-
+	    BEGIN
+	    NOUN_NODE = DBG$GET_TEMPMEM (DBG$K_NOUN_NODE_SIZE);	! %((NEED LONG NOUN ?-tbs))%
+	    .LINK = .NOUN_NODE;
+	    LINK = NOUN_NODE [DBG$L_NOUN_LINK];
+
+	    DBG$NPARSE_EXPRESSION (
+		.INPUT_DESC,				! rest of command
+		.DBG$GB_RADIX[DBG$B_RADIX_INPUT], 	! default input radix
+		NOUN_NODE [DBG$L_NOUN_VALUE],		! where to store ptr to value desc
+		TOKEN$K_TERM_COMMA );			! task terminator token
+
+	    !	.MESSAGE_VECT);				%((REMOVE MESSAGE VEC FROM ROUTINE -tbs))%
+
+	    END
+	WHILE DBG$NMATCH( .INPUT_DESC, DBG$CS_COMMA, 1 );
+
+	IF NOT DBG$NMATCH( .INPUT_DESC, DBG$CS_CR, 1 )	! If more input exists then
+	THEN						! we have an error.
+	    DBG$SYNTAX_ERROR(.INPUT_DESC);		! Signal the error.
+	END;
+
+
+    RETURN 0;			! %((0?-tbs))%
+
+    END;			! end of DBG$NPARSE_SHOW_TASK
+
+
+ROUTINE DBGEXT$PRINT_ROUTINE (FLAG, FUNCTION, STRING, FAO_ARG) : NOVALUE = 	! %((-tbs))%
+!
+! FUNCTION
+!	Function of this routine goes here.
+!
+! INPUTS
+!	List of inputs goes here, both explicit and implicit,
+!	complete with descriptions.
+!
+! OUTPUTS
+!	List of outputs goes here, together with known side effects.
+!
+
+    BEGIN
+
+    LOCAL
+	XXXXXXX;			!<<--------- Local declarations --------
+
+
+
+    ! The text of the routine starts here.
+    !
+    !<<-------------------------- FIRST LINE OF CODE ---------------------------
+    RETURN 0;
+
+    END;
+
+ROUTINE LOCAL_ROUT_NAME =
+!
+! FUNCTION
+!	Function of this routine goes here.
+!
+! INPUTS
+!	List of inputs goes here, both explicit and implicit,
+!	complete with descriptions.
+!
+! OUTPUTS
+!	List of outputs goes here, together with known side effects.
+!
+
+    BEGIN
+
+    LOCAL
+	XXXXXXX;			!<<--------- Local declarations --------
+
+
+
+    ! The text of the routine starts here.
+    !
+    !<<-------------------------- FIRST LINE OF CODE ---------------------------
+    RETURN 0;
+
+    END;
+
+END ELUDOM

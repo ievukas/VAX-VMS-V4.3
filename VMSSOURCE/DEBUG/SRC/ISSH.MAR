@@ -1,0 +1,405 @@
+	.TITLE	ISSH -- Intercept System Service Handler
+	.IDENT	'V04-000'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; Facility: VAX/VMS System Service Monitor
+;
+; Abstract:
+;
+;	Intercept system service handler.  This code intercepts the system
+;	service, makes the call to user supplied routine under the right 
+;	privilege first, after returning from user supplied routine, 
+;	continues system service.  
+;	Note: this code is copied into P0 space and executed there.
+;	If we encounter SYS$RUNDWN, copy the original system vector back, 
+;	and let it go, this is done by re-enterring back to the entry
+;	point of DBGSSISHR.EXE.
+;
+; Environment:	VAX/VMS
+;
+;--
+;
+; Author: D.W. Thiel,	 Creation Date: 30-Dec-1981
+;
+; Modified By:
+;
+;	  P. Sager,      20-Sep-1983
+;
+;**
+;
+
+
+	.SBTTL	DECLARATIONS
+
+	.ENABLE	SUPPRESSION
+
+
+;
+; External routines
+;
+
+;
+; INCLUDE FILES:
+;
+
+;
+; MACROS:
+;
+
+;
+; EQUATED SYMBOLS:
+;
+
+	$IPLDEF		; define IPL symbols
+	$PSLDEF		; define PSL layout symbols
+    	$SGNDEF		; define system generation parameters
+
+;
+; OWN STORAGE: Data area
+;
+
+	.PSECT	$ISSH_CODE$	RD, NOWRT, NOEXE, PIC, CON, GBL, PAGE
+
+ISSH_VEC_BASE::
+TV_CPY:	.BLKB	SGN$C_SYSVECPGS*512	; copy of transfer vector
+
+ISSH_DATA_BEG::
+DATA:	.BLKB	512			; local/global data area
+ISSH_DATA_END::
+
+    	.ALIGN	PAGE
+
+    					; We have 64 longwords available
+    					;   without making changes to SSI.B32
+;*******************************************************************************
+; This area has potential problems to run over allocated spaces.  Not likely to
+; happen. (now the checks are placed in for overflow condition).
+;
+ISSH_STACK==ISSH_DATA_END - 68		; Local stack (keep track of the 
+    					;   current active routine)
+    					; Never intercept again, if system
+    					;   service is originated from the same 
+    					;   level)
+ISSH_STKPTR==ISSH_DATA_END - 64		; Local stack pointer
+    					; 5 long each for the next two entries,
+    					;   (one byte each per count):
+ISSH_BIT_15_CNT_4==ISSH_DATA_END - 44   ; Bit 15 in PSW count in prio 4. 
+ISSH_BIT_15_CNT_3==ISSH_DATA_END - 24	; Bit 15 in PSW count in prio 3.
+    					; It has the following structure:
+    					;    1st byte: total system service
+    					;      count.
+    					;    2nd byte, 3rd byte, ...:
+    					;      number of priorities it went 
+    					;      through for each service.
+; These two data structures are used by Debug, and Super Debug to
+; catch the RET from system service.
+; Some services are nested, for example, SYS$PUTMSG calls SYS$GETMSG etc.
+; So the 1st byte is used to indicate we are still in SYS$PUTMSG when
+; SYS$GETMSG is in.  When this case happens, debug simply lets SYS$GETMSG
+; go by.  When SYS$PUTMSG happens, depending on where it is called from
+; (User? DBG? or SDBG?), higher priority one always see the lower one, and
+; the same level never sees the same level, so we need to know, how many
+; levels see SYS$PUTMSG, this info. is recorded in 2nd byte, SYS$GETMSG
+; is recorded in 3rd byte, etc.  This really is used by DEBUGGER as a
+; means to communicate, in fact, in DEBUGGER, we are really paying attention
+; to SYS$PUTMSG only.
+;*******************************************************************************
+ISSH_BIT_15_CNT_12==ISSH_DATA_END - 20  ; This one has the same flavor as
+    					;  the above, except is not used,
+    					;  it's only purpose is to fit in
+    					;  the code path.
+ISSH_CTRL_INDEX==ISSH_DATA_END - 16	; Total entries been made for prio.
+ISSH_CTRL_PRIO_INDEX==ISSH_DATA_END - 12; Entries been made in each prio.
+ISSH_RUNNING_FLAG==ISSH_DATA_END - 8	; Flag to indicate if this system
+    					;   service itself is running, if
+    					;   so, don't intercept any system 
+    					;   service called from this routine
+ISSH_PRIO_MASK==ISSH_DATA_END - 4       ; Routine Enable/Disable flags for
+    					;   all priorities
+ISSH_USER_ADDR==ISSH_DATA_BEG		; User routine name Table, the name is
+    					;   filled in by the mode and 
+    					;   priority, declared by the user,
+    					;   and is called by the mode
+    					;   in current PSL and mask.
+    					;
+ISSH_USER_DATA_BEG==ISSH_DATA_BEG+256   ; Ending of the data area (note:
+    					;   data area starting at bigger address)
+
+	.SBTTL	INTERCEPT_SS_HANDLER -- System Service Call Intercept Handler
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;  Receives control whenever a system service is intercepted.
+;
+; CALLING SEQUENCE:
+;
+;  	JSB with stack frame already established
+;
+; INPUT PARAMETERS:
+;
+;	(SP) :	contains the address of the system service entry mask plus 6
+;
+; IMPLICIT INPUTS:
+;
+;	none
+;
+; OUTPUT PARAMETERS:
+;
+;	none
+;
+; IMPLICIT OUTPUTS:
+;
+;	none
+;
+; COMPLETION CODES:
+;
+;	none
+;
+; SIDE EFFECTS:
+;
+;	none
+;
+;--
+
+
+    	.ALIGN	QUAD
+
+ISSH_ENTRY::				; This code is re-entrant many times
+    					;   so all the local variables used in
+    					;   here should have its own local
+    					;   stack, and stack pointers to be
+    					;   managed
+    	SUBL3	#6, (SP), R0		; get system sevice vector address,
+    					;   place it in R0
+    	CMPL	#SYS$RUNDWN, R0		; run down?
+    	BNEQ	10$			; No
+    					; Yes, time to get out
+
+; Run Down
+;
+    	MOVL	#SYS$QIOW+<SGN$C_SYSVECPGS*512-12>,R1
+    					; get the user defined system service 
+    					;   address from saved area
+    	PUSHL	R0			; USER_ADDR=SYS$RUNDWN
+    	CALLS	#1, @(R1)		; Re-enter privileged shareable image
+    					;   DBGSSISHR.EXE to clean up
+    	SUBL2	#4, (SP)		; Pop off return address on
+    					;   the stack
+	RSB				; return to retry point, contiune
+    					;   the real run-down
+
+
+; Get the address of the system service in P0
+;
+10$:	MOVAB	TV_CPY,R1		; get the P0 base address 
+    	SUBL3	#SYS$QIOW, R0, R0	; get the offset 
+	ADDL3	R0, R1, R1		; insert offset into R1, this
+    					;   brings into P0 area
+
+; Get the current mode
+;
+	MOVPSL	-(SP)			; get PSL
+	ASSUME	<PSL$V_CURMOD+PSL$S_CURMOD>,EQ,PSL$V_IS
+	EXTZV	#PSL$V_CURMOD, -	; get current mode + int stk bit
+		#1+PSL$S_CURMOD, -
+		(SP), -
+		R0			; Mode in R0
+    	ADDL	#4,SP			; Pop off PSL
+    	CMPL	R0,#PSL$C_USER		; Strictly allow interception only in
+    					;  in user mode
+    	BEQL	15$
+
+    	ADDL	#4,SP			; Pop off the RET on stack
+    	JMP	2(R1)			; Continue system service
+
+
+; Check to see if this system service is running. If it is, don't intercept
+; its own system service calls.
+;
+15$:	PUSHAB	ISSH_RUNNING_FLAG	; Get the address of the running
+    	MOVL	@(SP),R0		;   flag (global variable, no 
+    					;   need to stack it.)
+    	TSTL	(R0)			; Test to see if it is set
+    	BEQL	20$			; No
+    	ADDL	#8,SP			; Yes, pop off the stack
+    	JMP	2(R1)			; Continue with the system service
+
+
+; Check to see if there is an index ID, if there is no ID, don't intercept
+;
+20$:
+    	PUSHAB	ISSH_CTRL_INDEX		; Get the address of the Index
+    	MOVL	@(SP),R0		;   (global variable)
+    	TSTL	R0			; Test to see if it is zero
+    	BNEQ	25$			; There is user routine declared
+    	ADDL	#12,SP			; Pop Return address and stack locals
+    	JMP	2(R1)			; Continue system service
+
+
+; We may be able to call the user routine at this point.
+;
+25$:
+    	ADDL	#8,SP			; Pop off RUNNING_FLAG & CTRL_INDEX
+
+
+34$:
+    	PUSHR	#^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>; Save registers
+    	MOVL	#PSL$C_USER,R7		; R7 has the user mode only
+    	MOVL	R1,R5			; R5 points to P0 saved copy
+    	SUBL3	#6,40(SP),R10		; R10 has the system service index
+    	MOVL	ISSH_CTRL_INDEX,R6	; R6 points to the last entry
+    					;   in the routine table
+
+    	MOVAB	ISSH_STACK+1,R2		; Get local stack address in R2
+    	SUBL3	ISSH_STKPTR,R2,R3	; Get local stack pointer in R3
+    	MOVZBL	(R3),R3    		; Get Old ptr value, this tells us
+    					;   where was last intercepted
+    	INCL	ISSH_STKPTR		; Increment local stack pointer
+    	SUBL2	ISSH_STKPTR,R2		; R2 points to the current priority
+    					;   level
+    	MOVAB	ISSH_USER_DATA_BEG,R0   ; Test to see if we overflow the stack
+    	CMPL	R2,R0			;   if we are, don't intercept anymore
+    	BGTR    70$			; We are Ok
+    	DECL	ISSH_STKPTR		; Take off what we had done
+    	BRW	54$			; Continue System service
+
+70$:	CLRB	(R2)			; Clear 
+
+    	MOVL	ISSH_PRIO_MASK,R8	; R8 has routine enable mask reflecting
+    					;   all priorities
+
+    					; This is used by Prio. 3 and 4 only
+    	CMPL	R3,#0			; R3 could have 0, 1, 2, 3 or 4 value
+    					;   0 means we are starting a new cycle
+    	BEQL    36$			; Yes, new cycle
+    	CMPL    R3,#3			; No, Did we come from 3 (DBG?)
+    	BEQL    36$			; Yes, some more checking to do
+35$:	MOVAB   ISSH_BIT_15_CNT_12,R4   ; No, so, we must come from 1, 2, or 4
+    					;   don't need to do anything except
+    					;   to make the code path works.
+    	INCB	(R4)			; Plunk in address in R4, increment the
+    	ADDL3	R4,#1,R11		; count, set pointer to next byte in R11
+    	BRB     39$			; Ready to start
+36$:	CMPL	R3,#3			; We either start a new cycle or came
+    					;   from 3
+    	BEQL	37$			; Yes, we were at 3
+	MOVAB	ISSH_BIT_15_CNT_3,R4	; No, we are starting a new cycle, so,
+    					;   DBG prio. 3 sees this service first,
+    					;   passes in the communication variable
+    	BBS	#2,R8,38$		; Is prio. 3 there?  No, more checking!
+37$:	BBC	#3,R8,35$		; We were at 3, or 3 is not here, Is
+    					;   prio. 4 there?  No, plung in dummy
+	MOVAB   ISSH_BIT_15_CNT_4,R4    ; Yes, we really need to use prio. 4
+    					;   communication path
+38$:	INCB	(R4)			; Mark the fact that we have one system
+    					;   service, note, if this count is
+    					;   greater than 1 that means we are
+    					;   in nested services
+    	CMPL	(R4),#1			; If we just start a new system service
+    	BGTR	72$			; No, we are in nested one
+    	ADDL3	R4,#1,R11		; Set pointer in R11 to point to
+    					;   FP RET count for each system
+    					;   service in priority 3 or 4.
+    					; We need this to set bit 15 to cause
+    					;   reserve operand fault in right FP,
+    					;   in right priority, and turn on/off
+    					;   bit 15 at the right level.
+    	BRB	39$
+72$:
+    	ADDL3	R4,#2,R11		; Mark the fact that we don't cause
+    					;   reserve operand fault in FP for
+    					;   nested ones
+39$:	CLRL	R9			; Clear
+    	CLRL	R1			; Clear
+
+; Loop till R6 reach to zero.
+;
+40$:
+    	CMPL	R6,R9			; Have we gone through all the
+    					;  priorities in this mode?
+    	BEQL	50$			; Yes, all done
+    	INCB	(R2)			; No, rememeber which priority we
+    					;  are in
+    	CMPB	R3,R9			; We never intercept system service
+    					;  that came from the same priroity
+    	BGTR	45$			; Yes, from same, next
+    	BBC	R9,R8,45$		; Test to see if the given priority
+    					;   is enabled in the mask, if it
+    					;   is not, loop to next
+    	MULL3	#4,R9,R0		; Index * 4 modes
+    	ADDL	R7,R0			; positioned to current mode
+    	MOVAL	ISSH_DATA_BEG[R0],R1    ; address of the routine
+    	TSTL	(R1)			; Is any routine name there?
+    	BEQL	45$			; No, go on next
+    	PUSHR	#^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+    					; Get ready to call user routine
+    	PUSHL	R8			; Current mask
+    	PUSHL	R4			; Total SV count originated from
+    					;   a service
+    	PUSHL	R11			; FP RET count for the same service
+    	PUSHL	FP			; FP for this system service
+    	PUSHL	AP			; SS argument list
+    	PUSHL	R10			; System Service index
+    	CALLS	#6,@(R1)		; Call the user routine
+    	MOVL	#^XFFFFFFFF,R1		; Indicate the fact that we went
+    					;   through this loop
+    	POPR	#^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+45$:	INCL	R9			; Next higher priority
+    	BRW	40$			; Next
+
+50$:
+    	DECL	ISSH_STKPTR		; Pop the local stack
+    	MOVAB   ISSH_BIT_15_CNT_12,R0   ; Get the address
+    	CMPL	R0,R4			; If we have this dummy address set
+    					;   in R4, decrement its value,
+    					;   for we have increment it, and
+    					;   there is no where else to balance
+    					;   the count, so do it here.
+    	BNEQ	52$			; No, next check
+    	DECB	(R4)			; Yes, decrement, and continue
+    	BRB     54$			;
+52$:	CMPL	#^XFFFFFFFF,R1		; If we have gone through the loop,
+    	BEQL	54$			;   (DEBUG interception routine takes
+    					;    care of the count)
+    	DECB	(R4)			; Else, we got to pop off the count
+54$:    MOVL	R5,R1			; Restore the address, continue
+    	POPR	#^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+100$:	ADDL	#4,SP			; Pop of return
+    	JMP	2(R1)			; System service continues
+
+
+
+	.ALIGN	PAGE
+
+ISSH_CODE_LENGTH==	.-ISSH_VEC_BASE
+ISSH_VEC_LENGTH==	.-ISSH_VEC_BASE
+
+	.END
+

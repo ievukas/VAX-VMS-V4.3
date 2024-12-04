@@ -1,0 +1,2002 @@
+	.NOSHOW	CONDITIONALS
+	.IF	NOT_DEFINED	BOOT_SWITCH
+	.TITLE	VAX$EMULATE - VAX-11 Instruction Emulator
+	.IF_FALSE
+	.TITLE	BOO$EMULATE - Subset VAX-11 Instruction Emulator for VMB
+	.ENDC
+	.IDENT	/V04-000/
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; Facility: 
+;
+;	VAX-11 Instruction Emulator
+;
+; Abstract:
+;
+;	This is the main body of the instruction emulator that supports
+;	the instructions that are not a part of the microVAX architecture.
+;	The current design calls for support of the string instructions
+;	(including CRC), the decimal instructions, and EDITPC.
+;
+;	This routine performs the following steps.
+;
+;	o Moves operands from the exception stack to registers in an
+;	  instruction-specific manner
+;
+;	o Calls an instruction-specific subroutine to do the actual work
+;
+;	If errors occur along the way, those errors are reflected to the
+;	user as exceptions.
+;
+; Environment: 
+;
+;	These routines run at any access mode, at any IPL, and are AST 
+;	reentrant. The routine starts execution in the access mode and
+;	at the IPL at which the instruction executed.
+;
+; Author: 
+;
+;	Lawrence J. Kenah	
+;
+; Creation Date
+;
+;	17 August 1982
+;
+; Modified by:
+;
+;	V01-011	LJK0041		Lawrence J. Kenah	16-Jul-1984
+;		Clear FPD in saved PSL at VAX$EMULATE_FPD entry so that
+;		next instruction can execute correctly.
+;
+;	V01-010	LJK0031		Lawrence J. Kenah	5-Jul-1984
+;		Set R2 and R4 unconditionally to zero in EDITPC routine
+;		to allow the storage of FPD flags and similar data.
+;
+;	V01-009	LJK0026		Lawrence J. Kenah	19-Mar-1984
+;		Perform final cleanup pass. Eliminate xxx_UNPACK routine
+;		references. Add C-bit optimization to MOVP.
+;
+;	V01-008	LJK0010		Lawrence J. Kenah	8-Nov-1983
+;		Eliminate code in EXIT_EMULATOR path that unconditionally
+;		clears the T-bit and conditionally sets the TP-bit. The
+;		TP-bit is handled by the base hardware.
+;
+;	V01-007	KDM0088		Kathleen D. Morse	20-Oct-1983
+;		Make branches to VAX$REFLECT_TO_VMS into jumps, so that
+;		the bootstrap emulator will link without truncation errors
+;		until that routine is finished.
+;
+;	V01-006	KDM0003		Kathleen D. Morse	18-Apr-1983
+;		Generate abbreviated VAX$EMULATE_FPD for the bootstrap
+;		emulator.
+;
+;	V01-005	LJK0006		Lawrence J. Kenah	16-Mar-1983
+;		Generate case tables with macros. Allow subset emulator
+;		for bootstrap instruction emulation.
+;
+;	V01-004	KDM0002		Kathleen D. Morse	16-Mar-1983
+;		Fix fourth and fifth operand fetches for SUBP6, ADDP6,
+;		MULP and DIVP.
+;
+;	V01-003	KDM0001		Kathleen D. Morse	04-Mar-1983
+;		Longword align the exception handler entry points.
+;
+;	V01-002	LJK0005		Lawrence J. Kenah	15-Nov-1982
+;		Use hardware aids provided by microVAX architecture revision.
+;		Exception is now reported in caller's mode. Operands are parsed
+;		and placed on the exception stack as exception parameters.
+;
+;	V01-001	LJK0002		Lawrence J. Kenah	17-Aug-1982
+;		Original version using kernel mode exception through OPCDEC
+;		exception vector.
+;--
+
+	.SUBTITLE	DECLARATIONS
+
+; Include files:
+
+	$OPDEF				; Values for instruction opcodes
+	$PSLDEF				; Define bit fields in PSL
+
+	.NOCROSS			; No cross reference for these
+	.ENABLE		SUPPRESSION	; No symbol table entries either
+
+	PACK_DEF			; Stack usage when restarting instructions
+	STACK_DEF			; Stack usage for original exception
+
+	.DISABLE	SUPPRESSION	; Turn on symbol table again
+	.CROSS				; Cross reference is OK now
+
+; Macro definitions
+
+	.MACRO	INIT_CASE_TABLE		SIZE,BASE,ERROR_EXIT
+BASE:
+	.REPT	SIZE
+	.WORD	ERROR_EXIT-BASE
+	.ENDR
+	.ENDM	INIT_CASE_TABLE
+
+	.MACRO	CASE_TABLE_ENTRY	OPCODE,-
+					ROUTINE,-
+					FPD_ROUTINE,-
+					BOOT_FLAG
+		SIGN_EXTEND	OP$_'OPCODE , ...OPCODE
+		...OFFSET = ...OPCODE - OPCODE_BASE
+		.IF	NOT_DEFINED	BOOT_SWITCH
+			INCLUDE_'OPCODE = 0
+			.EXTERNAL	VAX$'OPCODE
+			.EXTERNAL	FPD_ROUTINE
+			. = CASE_TABLE_BASE + <2 * ...OFFSET>
+			.WORD	ROUTINE - CASE_TABLE_BASE
+			. = FPD_CASE_TABLE_BASE + <2 * ...OFFSET>
+			.WORD	FPD_ROUTINE - FPD_CASE_TABLE_BASE
+		.IF_FALSE
+			.IF	IDENTICAL	<BOOT_FLAG>,BOOT
+			INCLUDE_'OPCODE = 0
+			.EXTERNAL	VAX$'OPCODE
+			. = CASE_TABLE_BASE + <2 * ...OFFSET>
+			.WORD	ROUTINE - CASE_TABLE_BASE
+			.ENDC
+		.ENDC
+		.ENDM	CASE_TABLE_ENTRY
+
+; External declarations for exception handling
+
+	.DISABLE	GLOBAL
+
+	.IF	NOT_DEFINED	BOOT_SWITCH
+	.EXTERNAL	VAX$AL_DELTA_PC_TABLE
+	.EXTERNAL	VAX$REFLECT_TO_VMS
+	.ENDC
+
+	.EXTERNAL	VAX$_OPCDEC, -
+			VAX$_OPCDEC_FPD
+
+; PSECT Declarations:
+
+	.DEFAULT	DISPLACEMENT , WORD
+
+	.PSECT _VAX$CODE PIC, USR, CON, REL, LCL, SHR, EXE, RD, NOWRT, QUAD
+
+	.NOSHOW		CONDITIONALS
+
+	.SUBTITLE	VAX$EMULATE - Entry Path into Emulator
+;+
+; Functional Description:
+;
+;	There are two different entries into this module. When a reserved
+;	instruction is first encountered, its operands are parsed by the
+;	hardware (or microcode, if you will) and placed on the stack as
+;	exception parameters. The code at address VAX$EMULATE is then entered
+;	through the ^XC8(SCB) exception vector. That routine dispatches to an
+;	instruction-specific routine called VAX$xxxxxx (xxxxxx represents the
+;	name of the reserved instruction) after placing the operands into
+;	registers as required by VAX$xxxxxx. 
+;
+;	If an exception occurred during instruction emulation such that a
+;	reserved instruction executed again, this time with FPD set, then a
+;	different exception path is taken. The stack has a different (smaller)
+;	set of parameters for the FPD exception. A different
+;	instruction-specific routine executes to unpack saved intermediate
+;	state before resuming instruction emulation. 
+;
+;	The access mode and IPL are preserved across either exception. 
+;
+; Input Parameters:
+;
+;	00(SP) - Opcode of reserved instruction
+;	04(SP) - PC of reserved instruction (old PC)
+;	08(SP) - First operand specifier
+;	12(SP) - Second operand specifier
+;	16(SP) - Third operand specifier
+;	20(SP) - Fourth operand specifier
+;	24(SP) - Fifth operand specifier
+;	28(SP) - Sixth operand specifier
+;	32(SP) - Seventh operand specifier (currently unused)
+;	36(SP) - Eight operand specifier (currently unused)
+;	40(SP) - PC of instruction following reserved instruction (new PC)
+;	44(SP) - PSL at time of exception
+;
+; Notes on input parameters:
+;
+;   1.	The information that appears on the stack for each operand depends
+;	on the nature of the operand.
+;
+;	.rx - Operand value
+;	.ax - Operand address
+;	.wx - Operand address (Register destination is stored in one's
+;	      complement form. See VAX$CVTPL for details.)
+;
+;   2.	The old PC value is not used unless an exception such as an access
+;	violation occurs and the instruction has to be backed up.
+;
+;   3.	The seventh and eighth operands are not used for any existing VAX-11
+;	instructions. Those slots in the exception stach frame are reserved
+;	for future expansion. 
+;
+;   4.	The two PC parameters and the PSL are the only data that needs to
+;	be preserved once the instruction-specific routine is entered.
+;
+; Output Parameters:
+;
+;	The operands are moved from the stack to general registers in a way
+;	that varies from instruction to instruction. Control is transferred
+;	to a specific routine for each opcode.
+;
+; Notes:
+;
+;	There are several tables in the emulator that use the opcode as an 
+;	index. We choose to interpret the opcode as a signed quantity because 
+;	this reduces the amount of wasted space in the tables. In either case, 
+;	there are 27 useful entries.
+;
+;	Unsigned opcode
+;
+;		OPCODE_BASE = CVTPS (value of 8)
+;		OPCODE_MAX = CVTLP (value of F9)
+;
+;		TABLE_SIZE = 241 decimal bytes
+;
+;	Signed opcode
+;
+;		OPCODE_BASE = ASHP (value of F8 or -8)
+;		OPCODE_MAX = SKPC (value of 3B)
+;
+;		TABLE_SIZE = 67 decimal bytes
+;
+;	The savings of more than 170 entries in each table justifies all
+;	of the machinations that we go through to treat opcodes as signed
+;	quantities.
+;-
+
+; Because the assembler does not understand sign extension of byte and
+; word quantities, we must accomplish this sign extension with macros. The
+; assignment statements that appear as comments illustrate the sense of the
+; macro invocations that immediately follow.
+
+;	OPCODE_MAX = OP$_SKPC		; Largest opcode in this emulator
+
+	SIGN_EXTEND	OP$_SKPC , OPCODE_MAX
+
+; We further restrict the table size and supported operations when we are 
+; building the bootstrap subset of the emulator. We only allow certain string
+; instructions to contribute to the emulator.
+
+	.IF	DEFINED		BOOT_SWITCH
+;	OPCODE_BASE = OP$_CMPC3		; Smallest (in signed sense) opcode
+
+	SIGN_EXTEND	OP$_CMPC3 , OPCODE_BASE
+	.IF_FALSE
+;	OPCODE_BASE = OP$_ASHP		; Smallest (in signed sense) opcode
+
+	SIGN_EXTEND	OP$_ASHP , OPCODE_BASE
+	.ENDC
+
+CASE_TABLE_SIZE = <OPCODE_MAX - OPCODE_BASE> + 1	; Define table size
+
+	.ALIGN	LONG			; Alignment for exception vector
+
+VAX$EMULATE::
+
+	CASEB	OPCODE(SP),#OPCODE_BASE,#<OPCODE_MAX-OPCODE_BASE>
+
+	INIT_CASE_TABLE	CASE_TABLE_SIZE,CASE_TABLE_BASE,10$
+
+; If we drop through the case dispatcher, then the fault was not caused
+; by executing one of the instructions supported by this emulator. Such
+; exceptions will simply be passed through to VMS. (In the bootstrap emulator,
+; there is no operating system to reflect the exception. We simply HALT.)
+
+10$:	PUSHL	#VAX$_OPCDEC		; Store signal name
+	PUSHL	#13			; Total of 13 longwords in signal array
+
+	.IF	DEFINED		BOOT_SWITCH
+	HALT				; Nothing else we can do
+	.IF_FALSE
+	BRW	VAX$REFLECT_TO_VMS	; Use common exit to VMS
+	.ENDC
+
+	.SUBTITLE	VAX$EMULATE_FPD - Alternate Entry Path into Emulator
+;+
+; Functional Description:
+;
+;	This routine is entered through the ^XCC(SCB) exception vector when an
+;	instruction that is not a part of the microVAX architecture executes
+;	and the FPD bit is set in the PSL. The software state that was
+;	preserved by each instruction must be restored and instruction
+;	execution resumed. Access mode and IPL are preserved across the
+;	exception occurrence. 
+;
+;	Before the various VAX$xxxxxx (or VAX$xxxxxx_RESTART) routines regain
+;	control, this dispatcher must retrieve the delta PC from wherever
+;	it was stored and place the stack in the same state that it is in
+;	when the normal (FPD bit not set) instruction dispatcher passes
+;	control to the various VAX$xxxxxx routines. The pictures below explain
+;	this. 
+;
+; Input Parameters:
+;
+;	00(SP) - PC of reserved instruction 
+;	04(SP) - PSL at time of exception
+;
+; Output Parameters:
+;
+;	The following picture shows the state of the stack after the dispatcher
+;	has executed its preliminary code but before control is passed back to
+;	instruction-specific  execution. Note that this routine makes the 
+;	stack look like it does when a reserved instruction executes and FPD
+;	is not yet set. This is done to make the exception exit code independent
+;	of whether a different exception exception occurred while the emulator
+;	was running.
+;
+;	00(SP) - Return PC (Address of EXIT routine in this module)
+;	04(SP) - Unused placeholder (OPCODE)
+;	08(SP) - PC of reserved instruction (old PC)
+;	12(SP) - Unused placeholder (OPERAND_1)
+;	16(SP) - Unused placeholder (OPERAND_2)
+;	20(SP) - Unused placeholder (OPERAND_3)
+;	24(SP) - Unused placeholder (OPERAND_4)
+;	28(SP) - Unused placeholder (OPERAND_5)
+;	32(SP) - Unused placeholder (OPERAND_6)
+;	36(SP) - Unused placeholder (OPERAND_7)
+;	40(SP) - Unused placeholder (OPERAND_8)
+;	44(SP) - PC of instruction following reserved instruction (new PC)
+;	48(SP) - PSL at time of exception
+;
+;	Before this routine dispatches to opcode-specific code, it calculates
+;	the PC of the next instruction based on the PC of the reserved
+;	instruction and the delta-PC quantity that was stored as part of the
+;	instruction's intermediate state. Note that the delta PC quantity
+;
+;		delta PC = new PC - old PC
+;
+;	is stored in the upper bytes of one of the general registers, usually
+;	bits <31:24> of R0 or R2. The registers R0 through R3 are stored on
+;	the stack (in the space used for the first four operands when the
+;	reserved instruction is first encountered) so that the same offsets
+;	that were used to store the delta-PC can be used to retrieve it.
+;-
+
+	.ALIGN	LONG			; Alignment for exception vector
+
+VAX$EMULATE_FPD::
+
+	.IF	NOT_DEFINED	BOOT_SWITCH
+
+	BBCC	#PSL$V_FPD,4(SP),5$	; Clear FPD in exception PSL
+5$:	SUBL2	#NEW_PC,SP		; Create extra stack space
+	MOVL	NEW_PC(SP),OLD_PC(SP)	; Make second copy of old PC
+	MOVQ	R0,OPERAND_1(SP) 	; Save R0 and R1 in some extra space
+	MOVQ	R2,OPERAND_3(SP) 	; Do the same for R2 and R3
+	CVTBL	@OLD_PC(SP),R0		; Get opcode from instruction stream
+	MOVZBL	VAX$AL_DELTA_PC_TABLE[R0],R1 ; Get offset to byte with delta-PC
+	MOVZBL	OPERAND_1(SP)[R1],R1 	; Get delta-PC
+	ADDL	R1,NEW_PC(SP)		; Convert old PC to new PC
+	MOVL	R0,OPCODE(SP)		; Store opcode in other than a register
+	MOVQ	OPERAND_1(SP),R0 	; Restore R0 and R1 
+					; (R2 and R3 were not changed)
+	PUSHAB	VAX$EXIT_EMULATOR	; Create return PC to make CASE like BSB
+
+	CASEB	<OPCODE+4>(SP),#OPCODE_BASE,#<OPCODE_MAX-OPCODE_BASE>
+
+	INIT_CASE_TABLE	CASE_TABLE_SIZE,FPD_CASE_TABLE_BASE,10$
+
+; If we drop through the case dispatcher, then the fault was not caused
+; by executing one of the instructions supported by this emulator. The 
+; exception will be passed to VMS with the following stack.
+;
+;	00(SP) - Signal array size (always 4)
+;	04(SP) - Signal name (VAX$_OPCDEC_FPD)
+;	08(SP) - Opcode that is not supported
+;	12(SP) - PC of that opcode
+;	16(SP) - PSL of exception
+;
+; (In the bootstrap emulator, we simply halt with the stack containing
+; these data.)
+
+10$:	ADDL	#4,SP			; Discard return PC
+	MOVL	OLD_PC(SP),NEW_PC(SP)	; Use PC of opcode and not new PC
+	MOVL	OPCODE(SP),OPERAND_8(SP) ; Include opcode in signal array
+	MOVAL	OPERAND_8(SP),SP	; Discard rest of stack
+
+	.ENDC
+
+	PUSHL	#VAX$_OPCDEC_FPD	; This is the signal name
+	PUSHL	#4			; Signal array has four longwords
+
+	.IF	DEFINED		BOOT_SWITCH
+	HALT				; Nothing else we can do
+	.IF_FALSE
+	BRW	VAX$REFLECT_TO_VMS	; Use common exit to VMS
+	.ENDC
+
+	.SUBTITLE	Dispatch Tables
+;+
+; Functional Description:
+;
+;	The case tables for the two CASEB instructions are built with the
+;	macros that are invoked here. Macros are used to guarantee that both
+;	tables contain correct entries for a selected opcode at the same
+;	offset.
+;
+; Assumptions:
+;
+;	The CASE_TABLE_ENTRY macro assumes that the names of the respective
+;	case tables are CASE_TABLE_BASE and FPD_CASE_TABLE_BASE.
+;
+; Notes:
+;
+;	In the following lists, those FPD routines that do not have _FPD in
+;	their names use the same JSB entry point for initial entry and after
+;	restarting the instruction. In most of these cases, the register state
+;	is the same for both starting and restarting. For the remaining cases,
+;	there is not enough difference between the two cases to justify an
+;	additional entry point. (See VAX$MOVTC for an example of this latter
+;	situation.) 
+;
+;	The FPD routines that include _RESTART in their names have to do a
+;	certain amount of work to restore the intermediate state from the
+;	canonical registers before they can resume instruction execution. 
+;-
+
+	.SAVE				; Remember current location counter
+
+; First generate table entries for the string instructions
+
+	CASE_TABLE_ENTRY	OPCODE=MOVTC,-
+				ROUTINE=MOVTC,-
+				FPD_ROUTINE=VAX$MOVTC
+
+	CASE_TABLE_ENTRY	OPCODE=MOVTUC,-
+				ROUTINE=MOVTUC,-
+				FPD_ROUTINE=VAX$MOVTUC
+
+	CASE_TABLE_ENTRY	OPCODE=CMPC3,-
+				ROUTINE=CMPC3,-
+				FPD_ROUTINE=VAX$CMPC3,-
+				BOOT_FLAG=BOOT
+
+	CASE_TABLE_ENTRY	OPCODE=CMPC5,-
+				ROUTINE=CMPC5,-
+				FPD_ROUTINE=VAX$CMPC5,-
+				BOOT_FLAG=BOOT
+
+	CASE_TABLE_ENTRY	OPCODE=LOCC,-
+				ROUTINE=LOCC,-
+				FPD_ROUTINE=VAX$LOCC,-
+				BOOT_FLAG=BOOT
+
+	CASE_TABLE_ENTRY	OPCODE=SKPC,-
+				ROUTINE=SKPC,-
+				FPD_ROUTINE=VAX$SKPC
+
+	CASE_TABLE_ENTRY	OPCODE=SCANC,-
+				ROUTINE=SCANC,-
+				FPD_ROUTINE=VAX$SCANC
+
+	CASE_TABLE_ENTRY	OPCODE=SPANC,-
+				ROUTINE=SPANC,-
+				FPD_ROUTINE=VAX$SPANC
+
+	CASE_TABLE_ENTRY	OPCODE=MATCHC,-
+				ROUTINE=MATCHC,-
+				FPD_ROUTINE=VAX$MATCHC
+
+	CASE_TABLE_ENTRY	OPCODE=CRC,-
+				ROUTINE=CRC,-
+				FPD_ROUTINE=VAX$CRC
+
+; Now generate table entries for the decimal instructions
+
+	CASE_TABLE_ENTRY	OPCODE=ADDP4,-
+				ROUTINE=ADDP4,-
+				FPD_ROUTINE=VAX$ADDP4
+
+	CASE_TABLE_ENTRY	OPCODE=ADDP6,-
+				ROUTINE=ADDP6,-
+				FPD_ROUTINE=VAX$ADDP6
+
+	CASE_TABLE_ENTRY	OPCODE=ASHP,-
+				ROUTINE=ASHP,-
+				FPD_ROUTINE=VAX$ASHP
+
+	CASE_TABLE_ENTRY	OPCODE=CMPP3,-
+				ROUTINE=CMPP3,-
+				FPD_ROUTINE=VAX$CMPP3
+
+	CASE_TABLE_ENTRY	OPCODE=CMPP4,-
+				ROUTINE=CMPP4,-
+				FPD_ROUTINE=VAX$CMPP4
+
+	CASE_TABLE_ENTRY	OPCODE=CVTLP,-
+				ROUTINE=CVTLP,-
+				FPD_ROUTINE=VAX$CVTLP_RESTART
+
+	CASE_TABLE_ENTRY	OPCODE=CVTPL,-
+				ROUTINE=CVTPL,-
+				FPD_ROUTINE=VAX$CVTPL_RESTART
+
+	CASE_TABLE_ENTRY	OPCODE=CVTPS,-
+				ROUTINE=CVTPS,-
+				FPD_ROUTINE=VAX$CVTPS
+
+	CASE_TABLE_ENTRY	OPCODE=CVTPT,-
+				ROUTINE=CVTPT,-
+				FPD_ROUTINE=VAX$CVTPT_RESTART
+
+	CASE_TABLE_ENTRY	OPCODE=CVTSP,-
+				ROUTINE=CVTSP,-
+				FPD_ROUTINE=VAX$CVTSP
+
+	CASE_TABLE_ENTRY	OPCODE=CVTTP,-
+				ROUTINE=CVTTP,-
+				FPD_ROUTINE=VAX$CVTTP_RESTART
+
+	CASE_TABLE_ENTRY	OPCODE=DIVP,-
+				ROUTINE=DIVP,-
+				FPD_ROUTINE=VAX$DIVP
+
+	CASE_TABLE_ENTRY	OPCODE=MOVP,-
+				ROUTINE=MOVP,-
+				FPD_ROUTINE=VAX$MOVP
+
+	CASE_TABLE_ENTRY	OPCODE=MULP,-
+				ROUTINE=MULP,-
+				FPD_ROUTINE=VAX$MULP
+
+	CASE_TABLE_ENTRY	OPCODE=SUBP4,-
+				ROUTINE=SUBP4,-
+				FPD_ROUTINE=VAX$SUBP4
+
+	CASE_TABLE_ENTRY	OPCODE=SUBP6,-
+				ROUTINE=SUBP6,-
+				FPD_ROUTINE=VAX$SUBP6
+
+; EDITPC always seems to find itself in last place
+
+	CASE_TABLE_ENTRY	OPCODE=EDITPC,-
+				ROUTINE=EDITPC,-
+				FPD_ROUTINE=VAX$EDITPC_RESTART
+
+	.RESTORE			; Reset current location counter
+
+	.SUBTITLE	Description of instruction-specific routines
+
+;++
+; The instruction-specific routines do similar things. Rather than clutter up 
+; each routine with the same comments, we will describe the steps that each 
+; routine takes in this section.
+; 
+; The input parameters to each routine are identical.
+; 
+; 		 Contents of exception stack
+;		 ---------------------------
+;
+;	OPCODE(SP)    - Opcode of reserved instruction
+;	OLD_PC(SP)    - PC of reserved instruction 
+;	OPERAND_1(SP) - First operand specifier
+;	OPERAND_2(SP) - Second operand specifier
+;	OPERAND_3(SP) - Third operand specifier
+;	OPERAND_4(SP) - Fourth operand specifier
+;	OPERAND_5(SP) - Fifth operand specifier
+;	OPERAND_6(SP) - Sixth operand specifier
+;	OPERAND_7(SP) - Seventh operand specifier (currently unused)
+;	OPERAND_8(SP) - Eight operand specifier (currently unused)
+;	NEW_PC(SP)    - PC of instruction following reserved instruction
+;	EXCEPTION_PSL(SP) - PSL at time of exception
+; 
+;	The routine headers for the instruction-specific routines in this
+;	module will list the input and output parameters in symbolic form
+;	only. The VAX$xxxxxx routines in other modules in the emulator contain
+;	the exact meanings of the various operands (parameters) to the
+;	routines.
+;
+; Outline of execution:
+;
+;	The operands are loaded into registers as required by the instruction
+;	specific routines. Routine headers for each routine contain detailed
+;	descriptions. 
+;
+;	A routine of the form VAX$xxxxxx (where xxxxxx is the instruction
+;	name) is called to perform the actual work indicated by each
+;	instruction. 
+;
+;	Common exit code executes to allow the condition codes returned by the
+;	VAX$xxxxxx routines to be passed back to the code that generated the
+;	original exception. 
+;
+; Notes:
+;
+;	The following routines are constructed to be reasonably fast. In 
+;	particular, each instruction has its own separate routine, even though
+;	several instructions differ only in the instruction-specific routine
+;	to which final control is passed. Rather than share this common code
+;	at the expense of another dispatch on opcode, we shoose to duplicate
+;	the common code.
+;--
+
+	.IF	DEFINED		INCLUDE_MOVTC
+
+	.SUBTITLE	MOVTC - Exception handler for MOVTC instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - srclen.rw
+;	OPERAND_2(SP) - srcaddr.ab
+;	OPERAND_3(SP) - fill.rb
+;	OPERAND_4(SP) - tbladdr.ab
+;	OPERAND_5(SP) - dstlen.rw
+;	OPERAND_6(SP) - dstaddr.ab
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0> - srclen.rw
+;	R1       - srcaddr.ab
+;	R2<7:0>  - fill.rb
+;	R3       - tbladdr.ab
+;	R4<15:0> - dstlen.rw
+;	R5       - dstaddr.ab
+;
+; Implicit Output:
+;
+;	R0<31:16> - 0
+;	R2<31:8>  - 0
+;	R4<31:16> - 0
+;-
+
+MOVTC:
+
+	MOVZWL	OPERAND_1(SP),R0	; R0<15:0> <- srclen.rw 
+	MOVL	OPERAND_2(SP),R1	; R1       <- srcaddr.ab 
+	MOVZBL	OPERAND_3(SP),R2	; R2<7:0>  <- fill.rb
+	MOVL	OPERAND_4(SP),R3	; R3       <- tbladdr.ab 
+	MOVZWL	OPERAND_5(SP),R4	; R4<15:0> <- dstlen.rw 
+	MOVL	OPERAND_6(SP),R5	; R5       <- dstaddr.ab 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$MOVTC		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_MOVTUC
+
+	.SUBTITLE	MOVTUC - Exception handler for MOVTUC instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - srclen.rw
+;	OPERAND_2(SP) - srcaddr.ab
+;	OPERAND_3(SP) - esc.rb
+;	OPERAND_4(SP) - tbladdr.ab
+;	OPERAND_5(SP) - dstlen.rw
+;	OPERAND_6(SP) - dstaddr.ab
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0> - srclen.rw
+;	R1       - srcaddr.ab
+;	R2<7:0>  - esc.rb
+;	R3       - tbladdr.ab
+;	R4<15:0> - dstlen.rw
+;	R5       - dstaddr.ab
+;
+; Implicit Output:
+;
+;	R0<31:16> - 0
+;	R2<31:8>  - 0
+;	R4<31:16> - 0
+;-
+
+MOVTUC:
+
+	MOVZWL	OPERAND_1(SP),R0	; R0<15:0> <- srclen.rw 
+	MOVL	OPERAND_2(SP),R1	; R1       <- srcaddr.ab 
+	MOVZBL	OPERAND_3(SP),R2	; R2<7:0>  <- esc.rb
+	MOVL	OPERAND_4(SP),R3	; R3       <- tbladdr.ab 
+	MOVZWL	OPERAND_5(SP),R4	; R4<15:0> <- dstlen.rw 
+	MOVL	OPERAND_6(SP),R5	; R5       <- dstaddr.ab 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$MOVTUC		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_CMPC3
+
+	.SUBTITLE	CMPC3 - Exception handler for CMPC3 instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - len.rw
+;	OPERAND_2(SP) - src1addr.ab
+;	OPERAND_3(SP) - src2addr.ab
+;	OPERAND_4(SP)
+;	OPERAND_5(SP)
+;	OPERAND_6(SP)
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0> - len.rw
+;	R1       - src1addr.ab
+;	R3       - src2addr.ab
+;
+; Implicit Output:
+;
+;	R0<31:16> - 0
+;	R2        - UNPREDICTABLE
+;-
+
+CMPC3:
+
+	MOVZWL	OPERAND_1(SP),R0	; R0<15:0> <- srclen.rw 
+	MOVL	OPERAND_2(SP),R1	; R1       <- src1addr.ab 
+	MOVL	OPERAND_3(SP),R3	; R3       <- src2addr.ab 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$CMPC3		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_CMPC5
+
+	.SUBTITLE	CMPC5 - Exception handler for CMPC5 instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - src1len.rw
+;	OPERAND_2(SP) - src1addr.ab
+;	OPERAND_3(SP) - fill.rb
+;	OPERAND_4(SP) - src2len.rw
+;	OPERAND_5(SP) - src2addr.ab
+;	OPERAND_6(SP)
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0>   - srclen.rw
+;	R0<23:16>  - fill.rb
+;	R1         - srcaddr.ab
+;	R2<15:0>   - src2len.rw
+;	R3         - src2addr.ab
+;
+; Implicit Output:
+;
+;	R0<31:24> - UNPREDICTABLE
+;	R2<31:16> - 0
+;-
+
+CMPC5:
+
+	ROTL	#16,OPERAND_3(SP),R0	; R0<23:16> <- fill.rb
+	MOVW	OPERAND_1(SP),R0	; R0<15:0>  <- src1len.rw 
+	MOVL	OPERAND_2(SP),R1	; R1        <- src1addr.ab 
+	MOVZWL	OPERAND_4(SP),R2	; R2<15:0>  <- src2len.rw 
+	MOVL	OPERAND_5(SP),R3	; R3        <sca- src2addr.ab 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$CMPC5		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_SCANC
+
+	.SUBTITLE	SCANC - Exception handler for SCANC instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - len.rw
+;	OPERAND_2(SP) - addr.ab
+;	OPERAND_3(SP) - tbladdr.ab
+;	OPERAND_4(SP) - mask.ab
+;	OPERAND_5(SP)
+;	OPERAND_6(SP)
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0> - len.rw
+;	R1       - addr.ab
+;	R2<7:0>  - mask.rb
+;	R3       - tbladdr.ab
+;
+; Implicit Output:
+;
+;	R0<31:16> - 0
+;	R2<31:8>  - 0
+;-
+
+SCANC:
+
+	MOVZWL	OPERAND_1(SP),R0	; R0<15:0> <- len.rw 
+	MOVL	OPERAND_2(SP),R1	; R1       <- addr.ab 
+	MOVL	OPERAND_3(SP),R3	; R3       <- tbladdr.ab 
+	MOVZBL	OPERAND_4(SP),R2	; R2<7:0>  <- mask.ab
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$SCANC		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_SPANC
+
+	.SUBTITLE	SPANC - Exception handler for SPANC instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - len.rw
+;	OPERAND_2(SP) - addr.ab
+;	OPERAND_3(SP) - tbladdr.ab
+;	OPERAND_4(SP) - mask.ab
+;	OPERAND_5(SP)
+;	OPERAND_6(SP)
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0> - len.rw
+;	R1       - addr.ab
+;	R2<7:0>  - mask.rb
+;	R3       - tbladdr.ab
+;
+; Implicit Output:
+;
+;	R0<31:16> - 0
+;	R2<31:8>  - 0
+;-
+
+SPANC:
+
+	MOVZWL	OPERAND_1(SP),R0	; R0<15:0> <- len.rw 
+	MOVL	OPERAND_2(SP),R1	; R1       <- addr.ab 
+	MOVL	OPERAND_3(SP),R3	; R3       <- tbladdr.ab 
+	MOVZBL	OPERAND_4(SP),R2	; R2<7:0>  <- mask.ab
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$SPANC		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_LOCC
+
+	.SUBTITLE	LOCC - Exception handler for LOCC instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - char.rb
+;	OPERAND_2(SP) - len.rw
+;	OPERAND_3(SP) - addr.ab
+;	OPERAND_4(SP)
+;	OPERAND_5(SP)
+;	OPERAND_6(SP)
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0>  - len.rw
+;	R0<23:16> - char.rb
+;	R1        - addr.ab
+;
+; Implicit Output:
+;
+;	R0<31:24> - UNPREDICTABLE
+;-
+
+LOCC:
+
+	ROTL	#16,OPERAND_1(SP),R0	; R0<23:16> <- char.ab
+	MOVW	OPERAND_2(SP),R0	; R0<15:0>  <- len.rw 
+	MOVL	OPERAND_3(SP),R1	; R1        <- addr.ab 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$LOCC		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_SKPC
+
+	.SUBTITLE	SKPC - Exception handler for SKPC instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - char.rb
+;	OPERAND_2(SP) - len.rw
+;	OPERAND_3(SP) - addr.ab
+;	OPERAND_4(SP)
+;	OPERAND_5(SP)
+;	OPERAND_6(SP)
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0>  - len.rw
+;	R0<23:16> - char.rb
+;	R1        - addr.ab
+;
+; Implicit Output:
+;
+;	R0<31:24> - UNPREDICTABLE
+;-
+
+SKPC:
+
+	ROTL	#16,OPERAND_1(SP),R0	; R0<23:16> <- char.ab
+	MOVW	OPERAND_2(SP),R0	; R0<15:0>  <- len.rw 
+	MOVL	OPERAND_3(SP),R1	; R1        <- addr.ab 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$SKPC		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_MATCHC
+
+	.SUBTITLE	MATCHC - Exception handler for MATCHC instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - objlen.rw
+;	OPERAND_2(SP) - objaddr.ab
+;	OPERAND_3(SP) - srclen.rw
+;	OPERAND_4(SP) - srcaddr.ab
+;	OPERAND_5(SP)
+;	OPERAND_6(SP)
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0>  - objlen.rw
+;	R1        - objaddr.ab
+;	R2<15:0>  - srclen.rw
+;	R3        - srcaddr.ab
+;
+; Implicit Output:
+;
+;	R0<31:16> - 0
+;	R2<31:16> - 0
+;-
+
+MATCHC:
+
+	MOVZWL	OPERAND_1(SP),R0	; R0<15:0>  <- objlen.rw 
+	MOVL	OPERAND_2(SP),R1	; R1        <- objaddr.ab 
+	MOVZWL	OPERAND_3(SP),R2	; R2<15:0>  <- srclen.rw 
+	MOVL	OPERAND_4(SP),R3	; R3        <- srcaddr.ab 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$MATCHC		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_CRC
+
+	.SUBTITLE	CRC - Exception handler for CRC instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - tbl.ab
+;	OPERAND_2(SP) - inicrc.rl
+;	OPERAND_3(SP) - strlen.rw
+;	OPERAND_4(SP) - stream.ab
+;	OPERAND_5(SP)
+;	OPERAND_6(SP)
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0        - inicrc.rl
+;	R1        - tbl.ab
+;	R2<15:0>  - strlen.rw
+;	R3        - stream.ab
+;
+; Implicit Output:
+;
+;	R2<31:16> - 0
+;-
+
+CRC:
+
+	MOVL	OPERAND_1(SP),R1	; R1        <- tbl.ab 
+	MOVL	OPERAND_2(SP),R0	; R0        <- inicrc.rl
+	MOVZWL	OPERAND_3(SP),R2	; R2<15:0>  <- strlen.rw 
+	MOVL	OPERAND_4(SP),R3	; R3        <- stream.ab 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$CRC			; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_ADDP4
+
+	.SUBTITLE	ADDP4 - Exception handler for ADDP4 instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - addlen.rw
+;	OPERAND_2(SP) - addaddr.ab
+;	OPERAND_3(SP) - sumlen.rw
+;	OPERAND_4(SP) - sumaddr.ab
+;	OPERAND_5(SP)
+;	OPERAND_6(SP)
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0> - addlen.rw
+;	R1       - addaddr.ab
+;	R2<15:0> - sumlen.rw
+;	R3       - sumaddr.ab
+;
+; Implicit Output:
+;
+;	R0<31:16> - 0
+;	R2<31:16> - 0
+;-
+
+ADDP4:
+
+	MOVZWL	OPERAND_1(SP),R0	; R0<15:0> <- addlen.rw 
+	MOVL	OPERAND_2(SP),R1	; R1       <- addaddr.ab 
+	MOVZWL	OPERAND_3(SP),R2	; R2<15:0> <- sumlen.rw 
+	MOVL	OPERAND_4(SP),R3	; R3       <- sumaddr.ab 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$ADDP4		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_ADDP6
+
+	.SUBTITLE	ADDP6 - Exception handler for ADDP6 instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - add1len.rw
+;	OPERAND_2(SP) - add1addr.ab
+;	OPERAND_3(SP) - add2len.rw
+;	OPERAND_4(SP) - add2addr.ab
+;	OPERAND_5(SP) - sumlen.rw
+;	OPERAND_6(SP) - sumaddr.ab
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0> - add1len.rw
+;	R1       - add1addr.ab
+;	R2<15:0> - add2len.rw
+;	R3       - add2addr.ab
+;	R4<15:0> - sumlen.rw
+;	R5       - sumaddr.ab
+;
+; Implicit Output:
+;
+;	R0<31:16> - 0
+;	R2<31:16> - 0
+;	R4<31:16> - 0
+;-
+
+ADDP6:
+
+	MOVZWL	OPERAND_1(SP),R0	; R0<15:0> <- add1len.rw 
+	MOVL	OPERAND_2(SP),R1	; R1       <- add1addr.ab 
+	MOVZWL	OPERAND_3(SP),R2	; R2<15:0> <- add2len.rw 
+	MOVL	OPERAND_4(SP),R3	; R3       <- add2addr.ab 
+	MOVZWL	OPERAND_5(SP),R4	; R4<15:0> <- sumlen.rw 
+	MOVL	OPERAND_6(SP),R5	; R5       <- sumaddr.ab 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$ADDP6		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_ASHP
+
+	.SUBTITLE	ASHP - Exception handler for ASHP instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - cnt.rb
+;	OPERAND_2(SP) - srclen.rw
+;	OPERAND_3(SP) - srcaddr.ab
+;	OPERAND_4(SP) - round.rb
+;	OPERAND_5(SP) - dstlen.rw
+;	OPERAND_6(SP) - dstaddr.ab
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0>  - srclen.rw
+;	R0<31:16> - count.rb
+;	R1        - srcaddr.ab
+;	R2<15:0>  - dstlen.rw
+;	R2<31:16> - round.rb
+;	R3        - dstaddr.ab
+;
+; Implicit Output:
+;
+;	R0<31:24> - UNPREDICTABLE
+;	R2<31:24> - UNPREDICTABLE
+;-
+
+ASHP:
+
+	ROTL	#16,OPERAND_1(SP),R0	; R0<31:16> <- count.rb
+	MOVW	OPERAND_2(SP),R0	; R0<15:0>  <- srclen.rw 
+	MOVL	OPERAND_3(SP),R1	; R1        <- srcaddr.ab 
+	ROTL	#16,OPERAND_4(SP),R2	; R2<31:16> <- round.rb
+	MOVW	OPERAND_5(SP),R2	; R2<15:0>  <- dstlen.rw 
+	MOVL	OPERAND_6(SP),R3	; R3        <- dstaddr.ab 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$ASHP		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_CMPP3
+
+	.SUBTITLE	CMPP3 - Exception handler for CMPP3 instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - len.rw
+;	OPERAND_2(SP) - src1addr.ab
+;	OPERAND_3(SP) - src2addr.ab
+;	OPERAND_4(SP)
+;	OPERAND_5(SP)
+;	OPERAND_6(SP)
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0> - len.rw
+;	R1       - src1addr.ab
+;	R3       - src2addr.ab
+;
+; Implicit Output:
+;
+;	R0<31:16> - 0
+;	R2        - UNPREDICTABLE
+;-
+
+CMPP3:
+
+	MOVZWL	OPERAND_1(SP),R0	; R0<15:0> <- len.rw 
+	MOVL	OPERAND_2(SP),R1	; R1       <- src1addr.ab 
+	MOVL	OPERAND_3(SP),R3	; R3       <- src2addr.ab 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$CMPP3		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_CMPP4
+
+	.SUBTITLE	CMPP4 - Exception handler for CMPP4 instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - src1len.rw
+;	OPERAND_2(SP) - src1addr.ab
+;	OPERAND_3(SP) - src2len.rw
+;	OPERAND_4(SP) - src2addr.ab
+;	OPERAND_5(SP)
+;	OPERAND_6(SP)
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0> - src1len.rw
+;	R1       - src1addr.ab
+;	R2<15:0> - src2len.rw
+;	R3       - src2addr.ab
+;
+; Implicit Output:
+;
+;	R0<31:16> - 0
+;	R2<31:16> - 0
+;-
+
+CMPP4:
+
+	MOVZWL	OPERAND_1(SP),R0	; R0<15:0> <- src1len.rw 
+	MOVL	OPERAND_2(SP),R1	; R1       <- src1addr.ab 
+	MOVZWL	OPERAND_3(SP),R2	; R2<15:0> <- src2len.rw 
+	MOVL	OPERAND_4(SP),R3	; R3       <- src2addr.ab 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$CMPP4		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_CVTLP
+
+	.SUBTITLE	CVTLP - Exception handler for CVTLP instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - src.rl
+;	OPERAND_2(SP) - dstlen.rw
+;	OPERAND_3(SP) - dstaddr.ab
+;	OPERAND_4(SP)
+;	OPERAND_5(SP)
+;	OPERAND_6(SP)
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0       - src.rl
+;	R2<15:0> - dstlen.rw
+;	R3       - dstaddr.ab
+;
+; Implicit Output:
+;
+;	R1        - explicitly set to zero
+;	R2<31:16> - 0
+;-
+
+CVTLP:
+
+	MOVL	OPERAND_1(SP),R0	; R0       <- src.rl 
+	CLRL	R1			; R1       <- 0
+	MOVZWL	OPERAND_2(SP),R2	; R2<15:0> <- dstlen.rw 
+	MOVL	OPERAND_3(SP),R3	; R3       <- dstaddr.ab 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$CVTLP		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_CVTPL
+
+	.SUBTITLE	CVTPL - Exception handler for CVTPL instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - srclen.rw
+;	OPERAND_2(SP) - srcaddr.ab
+;	OPERAND_3(SP) - dst.wl
+;	OPERAND_4(SP)
+;	OPERAND_5(SP)
+;	OPERAND_6(SP)
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0> - srclen.rw
+;	R1       - srcaddr.ab
+;	R3       - dst.wl
+;
+; Notes:
+;
+;	The routine header for VAX$CVTPL describes how the destination is
+;	encoded in a register. Basically, OPERAND_3 contains the effective
+;	address of the operand. If the destination is a general register, then
+;	OPERAND_3 contains the ones complement of the register number. 
+;
+; Implicit Output:
+;
+;	R0<31:16> - 0
+;	R2        - explicitly set to zero
+;-
+
+CVTPL:
+
+	MOVZWL	OPERAND_1(SP),R0	; R0<15:0> <- srclen.rw 
+	MOVL	OPERAND_2(SP),R1	; R1       <- srcaddr.ab 
+	CLRL	R2			; R2       <- 0
+	MOVL	OPERAND_3(SP),R3	; R3       <- dst.wl 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$CVTPL		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_CVTPS
+
+	.SUBTITLE	CVTPS - Exception handler for CVTPS instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - srclen.rw
+;	OPERAND_2(SP) - srcaddr.ab
+;	OPERAND_3(SP) - dstlen.rw
+;	OPERAND_4(SP) - dstaddr.ab
+;	OPERAND_5(SP)
+;	OPERAND_6(SP)
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0> - srclen.rw
+;	R1       - srcaddr.ab
+;	R2<15:0> - dstlen.rw
+;	R3       - dstaddr.ab
+;
+; Implicit Output:
+;
+;	R0<31:16> - 0
+;	R2<31:16> - 0
+;-
+
+CVTPS:
+
+	MOVZWL	OPERAND_1(SP),R0	; R0<15:0> <- srclen.rw 
+	MOVL	OPERAND_2(SP),R1	; R1       <- srcaddr.ab 
+	MOVZWL	OPERAND_3(SP),R2	; R2<15:0> <- dstlen.rw 
+	MOVL	OPERAND_4(SP),R3	; R3       <- dstaddr.ab 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$CVTPS		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_CVTPT
+
+	.SUBTITLE	CVTPT - Exception handler for CVTPT instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - srclen.rw
+;	OPERAND_2(SP) - srcaddr.ab
+;	OPERAND_3(SP) - tbladdr.ab
+;	OPERAND_4(SP) - dstlen.rw
+;	OPERAND_5(SP) - dstaddr.ab
+;	OPERAND_6(SP)
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0>  - srclen.rw
+;	R0<31:16> - dstlen.rw
+;	R1        - srcaddr.ab
+;	R2        - tbladdr.ab
+;	R3        - dstaddr.ab
+;-
+
+CVTPT:
+
+	ROTL	#16,OPERAND_4(SP),R0	; R0<31:16> <- dstlen.rw 
+	MOVW	OPERAND_1(SP),R0	; R0<15:0>  <- srclen.rw 
+	MOVL	OPERAND_2(SP),R1	; R1        <- srcaddr.ab 
+	MOVL	OPERAND_3(SP),R2	; R2        <- tbladdr.ab 
+	MOVL	OPERAND_5(SP),R3	; R3        <- dstaddr.ab 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$CVTPT		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_CVTSP
+
+	.SUBTITLE	CVTSP - Exception handler for CVTSP instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - srclen.rw
+;	OPERAND_2(SP) - srcaddr.ab
+;	OPERAND_3(SP) - dstlen.rw
+;	OPERAND_4(SP) - dstaddr.ab
+;	OPERAND_5(SP)
+;	OPERAND_6(SP)
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0> - srclen.rw
+;	R1       - srcaddr.ab
+;	R2<15:0> - dstlen.rw
+;	R3       - dstaddr.ab
+;
+; Implicit Output:
+;
+;	R0<31:16> - 0
+;	R2<31:16> - 0
+;-
+
+CVTSP:
+
+	MOVZWL	OPERAND_1(SP),R0	; R0<15:0> <- srclen.rw 
+	MOVL	OPERAND_2(SP),R1	; R1       <- srcaddr.ab 
+	MOVZWL	OPERAND_3(SP),R2	; R2<15:0> <- dstlen.rw 
+	MOVL	OPERAND_4(SP),R3	; R3       <- dstaddr.ab 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$CVTSP		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_CVTTP
+
+	.SUBTITLE	CVTTP - Exception handler for CVTTP instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - srclen.rw
+;	OPERAND_2(SP) - srcaddr.ab
+;	OPERAND_3(SP) - tbladdr.ab
+;	OPERAND_4(SP) - dstlen.rw
+;	OPERAND_5(SP) - dstaddr.ab
+;	OPERAND_6(SP)
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0>  - srclen.rw
+;	R0<31:16> - dstlen.rw
+;	R1        - srcaddr.ab
+;	R2        - tbladdr.ab
+;	R3        - dstaddr.ab
+;-
+
+CVTTP:
+
+	ROTL	#16,OPERAND_4(SP),R0	; R0<31:16> <- dstlen.rw 
+	MOVW	OPERAND_1(SP),R0	; R0<15:0>  <- srclen.rw 
+	MOVL	OPERAND_2(SP),R1	; R1        <- srcaddr.ab 
+	MOVL	OPERAND_3(SP),R2	; R2        <- tbladdr.ab 
+	MOVL	OPERAND_5(SP),R3	; R3        <- dstaddr.ab 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$CVTTP		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_DIVP
+
+	.SUBTITLE	DIVP - Exception handler for DIVP instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - divrlen.rw
+;	OPERAND_2(SP) - divraddr.ab
+;	OPERAND_3(SP) - divdlen.rw
+;	OPERAND_4(SP) - divdaddr.ab
+;	OPERAND_5(SP) - quolen.rw
+;	OPERAND_6(SP) - quoaddr.ab
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0> - divrlen.rw
+;	R1       - divraddr.ab
+;	R2<15:0> - divdlen.rw
+;	R3       - divdaddr.ab
+;	R4<15:0> - quolen.rw
+;	R5       - quoaddr.ab
+;
+; Implicit Output:
+;
+;	R0<31:16> - 0
+;	R2<31:16> - 0
+;	R4<31:16> - 0
+;-
+
+DIVP:
+
+	MOVZWL	OPERAND_1(SP),R0	; R0<15:0> <- divrlen.rw 
+	MOVL	OPERAND_2(SP),R1	; R1       <- divraddr.ab 
+	MOVZWL	OPERAND_3(SP),R2	; R2<15:0> <- divdlen.rw 
+	MOVL	OPERAND_4(SP),R3	; R3       <- divdaddr.ab 
+	MOVZWL	OPERAND_5(SP),R4	; R4<15:0> <- quolen.rw 
+	MOVL	OPERAND_6(SP),R5	; R5       <- quoaddr.ab 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$DIVP		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_MOVP
+
+	.SUBTITLE	MOVP - Exception handler for MOVP instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - len.rw
+;	OPERAND_2(SP) - srcaddr.ab
+;	OPERAND_3(SP) - dstaddr.ab
+;	OPERAND_4(SP)
+;	OPERAND_5(SP)
+;	OPERAND_6(SP)
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0> - len.rw
+;	R1       - srcaddr.ab
+;	R3       - dstaddr.ab
+;
+; Implicit Output:
+;
+;	R0<31:16> - 0
+;	R2        - UNPREDICTABLE
+;-
+
+MOVP:
+
+	MOVZWL	OPERAND_1(SP),R0	; R0<15:0> <- len.rw 
+	MOVL	OPERAND_2(SP),R1	; R1       <- srcaddr.ab 
+	MOVL	OPERAND_3(SP),R3	; R3       <- dstaddr.ab 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+; The MOVP instruction is the only instruction in this entire set that
+; preserves the setting of the C-bit. The C-bit setting in the saved PSL
+; is propogated into the current PSL because the current PSL forms the
+; initial setting for the final settings of the condition codes.
+
+	BICPSW	#PSL$M_C		; Assume C bit is clear
+
+	ASSUME PSL$V_C EQ 0		; Make sure that BLBC is OK
+
+	BLBC	EXCEPTION_PSL(SP),10$	; Skip next if saved C-bit is clear
+	BISPSW	#PSL$M_C		; Otherwise, set the C-bit
+
+; Note that it is crucial that no instructions that alter the C-bit can
+; execute until the PSL is saved in VAX$MOVP. PUSHAB preserves the C-bit.
+
+10$:	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$MOVP		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_MULP
+
+	.SUBTITLE	MULP - Exception handler for MULP instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - mulrlen.rw
+;	OPERAND_2(SP) - mulraddr.ab
+;	OPERAND_3(SP) - muldlen.rw
+;	OPERAND_4(SP) - muldaddr.ab
+;	OPERAND_5(SP) - prodlen.rw
+;	OPERAND_6(SP) - prodaddr.ab
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0> - mulrlen.rw
+;	R1       - mulraddr.ab
+;	R2<15:0> - muldlen.rw
+;	R3       - muldaddr.ab
+;	R4<15:0> - prodlen.rw
+;	R5       - prodaddr.ab
+;
+; Implicit Output:
+;
+;	R0<31:16> - 0
+;	R2<31:16> - 0
+;	R4<31:16> - 0
+;-
+
+MULP:
+
+	MOVZWL	OPERAND_1(SP),R0	; R0<15:0> <- mulrlen.rw 
+	MOVL	OPERAND_2(SP),R1	; R1       <- mulraddr.ab 
+	MOVZWL	OPERAND_3(SP),R2	; R2<15:0> <- muldlen.rw 
+	MOVL	OPERAND_4(SP),R3	; R3       <- muldaddr.ab 
+	MOVZWL	OPERAND_5(SP),R4	; R4<15:0> <- prodlen.rw 
+	MOVL	OPERAND_6(SP),R5	; R5       <- prodaddr.ab 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$MULP		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_SUBP4
+
+	.SUBTITLE	SUBP4 - Exception handler for SUBP4 instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - sublen.rw
+;	OPERAND_2(SP) - subaddr.ab
+;	OPERAND_3(SP) - diflen.rw
+;	OPERAND_4(SP) - difaddr.ab
+;	OPERAND_5(SP)
+;	OPERAND_6(SP)
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0> - sublen.rw
+;	R1       - subaddr.ab
+;	R2<15:0> - diflen.rw
+;	R3       - difaddr.ab
+;
+; Implicit Output:
+;
+;	R0<31:16> - 0
+;	R2<31:16> - 0
+;-
+
+SUBP4:
+
+	MOVZWL	OPERAND_1(SP),R0	; R0<15:0> <- sublen.rw 
+	MOVL	OPERAND_2(SP),R1	; R1       <- subaddr.ab 
+	MOVZWL	OPERAND_3(SP),R2	; R2<15:0> <- diflen.rw 
+	MOVL	OPERAND_4(SP),R3	; R3       <- difaddr.ab 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$SUBP4		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_SUBP6
+
+	.SUBTITLE	SUBP6 - Exception handler for SUBP6 instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - sublen.rw
+;	OPERAND_2(SP) - subaddr.ab
+;	OPERAND_3(SP) - minlen.rw
+;	OPERAND_4(SP) - minaddr.ab
+;	OPERAND_5(SP) - diflen.rw
+;	OPERAND_6(SP) - difaddr.ab
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0> - sublen.rw
+;	R1       - subaddr.ab
+;	R2<15:0> - minlen.rw
+;	R3       - minaddr.ab
+;	R4<15:0> - diflen.rw
+;	R5       - difaddr.ab
+;
+; Implicit Output:
+;
+;	R0<31:16> - 0
+;	R2<31:16> - 0
+;	R4<31:16> - 0
+;-
+
+SUBP6:
+
+	MOVZWL	OPERAND_1(SP),R0	; R0<15:0> <- sublen.rw 
+	MOVL	OPERAND_2(SP),R1	; R1       <- subaddr.ab 
+	MOVZWL	OPERAND_3(SP),R2	; R2<15:0> <- minlen.rw 
+	MOVL	OPERAND_4(SP),R3	; R3       <- minaddr.ab 
+	MOVZWL	OPERAND_5(SP),R4	; R4<15:0> <- diflen.rw 
+	MOVL	OPERAND_6(SP),R5	; R5       <- difaddr.ab 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$SUBP6		; Do the actual work
+	.ENDC
+	.IF	DEFINED		INCLUDE_EDITPC
+
+	.SUBTITLE	EDITPC - Exception handler for EDITPC instruction
+;+
+; Input Parameters:
+;
+;	OPCODE(SP)
+;	OLD_PC(SP)
+;	OPERAND_1(SP) - srclen.rw
+;	OPERAND_2(SP) - srcaddr.ab
+;	OPERAND_3(SP) - pattern.ab
+;	OPERAND_4(SP) - dstaddr.ab
+;	OPERAND_5(SP)
+;	OPERAND_6(SP)
+;	OPERAND_7(SP)
+;	OPERAND_8(SP)
+;	NEW_PC(SP)
+;	EXCEPTION_PSL(SP)
+;
+; Output Parameters:
+;
+;	R0<15:0> - srclen.rw
+;	R1       - srcaddr.ab
+;	R3       - pattern.ab
+;	R5       - dstaddr.ab
+;
+; Implicit Output:
+;
+;	R0<31:16> - 0
+;	R2        - explicitly set to zero
+;	R4        - explicitly set to zero
+;-
+
+EDITPC:
+
+	MOVZWL	OPERAND_1(SP),R0	; R0<15:0> <- srclen.rw 
+	MOVL	OPERAND_2(SP),R1	; R1       <- srcaddr.ab 
+	CLRL	R2			; R2       <- 0
+	MOVL	OPERAND_3(SP),R3	; R3       <- pattern.ab 
+	CLRL	R4			; R4       <- 0
+	MOVL	OPERAND_4(SP),R5	; R5       <- dstaddr.ab 
+
+; Now that the operands have been loaded, the only exception parameter
+; other than the PC/PSL pair that needs to be saved is the old PC. However,
+; there is no reason why the state of the stack needs to be altered and we
+; save two instructions if we leave the stack alone.
+
+	PUSHAB	VAX$EXIT_EMULATOR	; Store the return PC
+	BRW	VAX$EDITPC		; Do the actual work
+	.ENDC
+
+	.SUBTITLE	Common Exit Path for VAX$xxxxxx Routines
+;+
+; Functional Description:
+;
+;	This is the common exit path for all instruction-specific routines.
+;	The condition codes returned by the VAX$xxxxxx routine are stored in
+;	the exception PSL and control is passed back to the instruction stream
+;	that executed the reserved instruction. 
+;
+; Input Parameters:
+;
+;	PSL contains condition code settings from VAX$xxxxxx routine.
+;
+;	OPCODE(SP)    - Opcode of reserved instruction
+;	OLD_PC(SP)    - PC of reserved instruction 
+;	OPERAND_1(SP) - First operand specifier
+;	OPERAND_2(SP) - Second operand specifier
+;	OPERAND_3(SP) - Third operand specifier
+;	OPERAND_4(SP) - Fourth operand specifier
+;	OPERAND_5(SP) - Fifth operand specifier
+;	OPERAND_6(SP) - Sixth operand specifier
+;	OPERAND_7(SP) - Seventh operand specifier (currently unused)
+;	OPERAND_8(SP) - Eight operand specifier (currently unused)
+;	NEW_PC(SP)    - PC of instruction following reserved instruction
+;	EXCEPTION_PSL(SP) - PSL at time of exception
+;
+; Implicit Input:
+;
+;	General registers contain architecturally specified values according
+;	to specific instruction that was emulated.
+;
+; Implicit Output:
+;
+;	Control is passed to the location designated by "new PC" with the
+;	condition codes as determined by VAX$xxxxxx. The EXIT routine also
+;	preserves general registers.
+;-
+
+VAX$EXIT_EMULATOR::
+	MOVPSL	-(SP)			; Save the new PSL on the stack
+
+; Note that the next instruction makes no assumptions about the condition 
+; codes in the saved PSL. 
+
+	INSV	(SP)+,#0,#4,-
+		 EXCEPTION_PSL(SP)	; Replace saved condition codes
+	ADDL	#NEW_PC,SP		; Adjust stack pointer (discard old PC)
+	REI				; Return
+
+	.END

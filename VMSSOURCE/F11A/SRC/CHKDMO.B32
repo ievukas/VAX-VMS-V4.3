@@ -1,0 +1,298 @@
+MODULE CHKDMO (
+		LANGUAGE (BLISS32),
+		IDENT = 'V04-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 1
+!
+! ABSTRACT:
+!
+!	This routine dismounts the volume in use if it should be.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  29-Apr-1977  17:19
+!
+! MODIFIED BY:
+!
+!
+!	V03-005	HH0049		Hai Huang		16-Aug-1984
+!		Call IOC$DALLOC_DMT to handle deallocation on dismount.
+!
+!	V03-004	HH0047		Hai Huang		13-Aug-1984
+!		Correct IOC$DALLOC_DEV linkage (UCB address in R5).
+!
+!	V03-003	ACG0441		Andrew C. Goldstein,	10-Aug-1984  17:02
+!		Rework dismount interlocking to eliminate races and
+!		uninterlocked operation; clear the device lock; perform
+!		deallocation here instead of at last deassign.
+!
+!	V03-002	LMP0221		L. Mark Pilant,		27-Mar-1984  12:59
+!		Change UCB$L_OWNUIC to ORB$L_OWNER and UCB$W_VPROT to
+!		ORB$W_PROT.
+!
+!	V03-001	PRD0037		Paul R. DeStefano	13-Sep-1983
+!		Modified to no longer clear volume valid when dismounting
+!		the volume.
+!
+!	V02-001	ACG0226		Andrew C. Goldstein,	24-Nov-1981  22:28
+!		Issue IO$_AVAILABLE on DISMOUNT/NOUNLOAD
+!
+!	V02-000	ACG0167		Andrew C. Goldstein,	7-May-1980  18:47
+!		Previous revision history moved to F11A.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+
+!
+! Part of this routine runs at IPL$_SYNCH, so it must be locked into the
+! working set.
+!
+
+LOCK_CODE;
+
+GLOBAL ROUTINE CHECK_DISMOUNT : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine checks if the volume in use is marked for dismount and
+!	idle. If so, it completes the dismount.
+!
+! CALLING SEQUENCE:
+!	CHECK_DISMOUNT ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	CURRENT_UCB: UCB of unit in use
+!	CURRENT_VCB: VCB of volume in use
+!	ACP$AQB0: queue header for ACP
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	Volume dismounted if appropriate
+!
+!--
+
+BEGIN
+
+LINKAGE
+	DALLOC_DEV	= JSB (REGISTER = 4, REGISTER = 5)
+			: NOPRESERVE (3)
+			  PRESERVE (2, 4, 5)
+			  NOTUSED (6, 7, 8, 9, 10, 11);
+LOCAL
+	UCB		: REF BBLOCK,	! local address of UCB
+	VCB		: REF BBLOCK,	! local address of VCB
+	ORB		: REF BBLOCK,	! local address of ORB
+	FCB		: REF BBLOCK,	! local address of FCB
+	STS,				! general status value
+	LKSTS		: VECTOR [6],	! lock status block
+	WCB		: REF BBLOCK;	! local address of WCB
+
+EXTERNAL
+	IO_CHANNEL,			! channel number for all I/O
+	CURRENT_UCB	: REF BBLOCK,	! UCB of unit in process
+	CURRENT_VCB	: REF BBLOCK,	! VCB of volume in process
+	QUEUE_HEAD	: REF BBLOCK,	! address of ACP queue header
+	CTL$GL_PCB	: ADDRESSING_MODE(GENERAL);	! PCB address
+
+EXTERNAL ROUTINE
+	LOCK_IODB,			! lock I/O data base mutex
+	UNLOCK_IODB,			! unlock I/O data base mutex
+	DEALLOCATE,			! deallocate dynamic memory
+	FLUSH_FID,			! flush blocks from the buffer pool
+	SEND_ERRLOG,			! send message to error logger
+	IOC$DALLOC_DMT	: DALLOC_DEV ADDRESSING_MODE (GENERAL);
+					! deallocate device
+
+
+! First check the mark for dismount bit.
+!
+
+UCB = .CURRENT_UCB;
+ORB = .UCB[UCB$L_ORB];
+IF NOT .BBLOCK [UCB[UCB$L_DEVCHAR], DEV$V_DMT]
+THEN RETURN;
+
+! The volume is marked for dismount. The remainder of the tests and the
+! dismount bit twiddling must be done interlocked.
+!
+
+LOCK_IODB ();
+SET_IPL (IPL$_SYNCH);
+
+VCB = .CURRENT_VCB;
+IF .VCB[VCB$W_TRANS] EQL 1
+THEN
+    BEGIN
+
+! The volume is marked for dismount and idle. Set the dismount in progress
+! bit to stop all further activity.
+!
+
+    UCB[UCB$V_DISMOUNT] = 1;
+    UNLOCK_IODB ();
+
+! Make an error log entry to record the dismount.
+!
+
+    SEND_ERRLOG (0, .UCB);
+
+! Flush the buffer pool of any blocks of this volume.
+!
+
+    FLUSH_FID (0);
+
+! Issue an unload function if unload was requested.
+!
+
+    $QIOW (
+	   CHAN = .IO_CHANNEL,
+	   EFN  = EFN,
+	   FUNC = (IF TESTBITSC (UCB[UCB$V_UNLOAD])
+		   THEN IO$_UNLOAD
+		   ELSE IO$_AVAILABLE)
+	   );
+
+! If this is a shared mount, raise the device lock to PW to get the
+! value block, and prepare for writing it back. If the device is not
+! shared, the lock is already at EX. If the device is not cluster
+! accessible, there is no lock.
+!
+
+    IF (LKSTS [1] = .UCB [UCB$L_LOCKID]) NEQ 0
+	AND .UCB [UCB$L_PID] EQL 0
+    THEN
+	BEGIN
+	STS = $ENQW (LKMODE = LCK$K_PWMODE,
+		     LKSB   = LKSTS,
+		     EFN    = EFN,
+		     FLAGS  = LCK$M_CONVERT + LCK$M_SYNCSTS
+			      + LCK$M_NOQUOTA);
+	IF NOT .STS
+	OR NOT .LKSTS
+	THEN BUG_CHECK (XQPERR, FATAL, 'Unexpected lock manager error');
+	END;
+
+! Mark the volume dismounted and disconnect the VCB from the UCB.
+!
+
+    LOCK_IODB ();
+    BBLOCK [UCB[UCB$L_DEVCHAR], DEV$V_MNT] = 0;
+    BBLOCK [UCB[UCB$L_DEVCHAR], DEV$V_DMT] = 0;
+    BBLOCK [UCB[UCB$L_DEVCHAR], DEV$V_SWL] = 0;
+    UCB[UCB$L_VCB] = 0;
+    UCB[UCB$W_REFC] = .UCB[UCB$W_REFC] - 1;
+    UCB[UCB$V_DISMOUNT] = 0;
+    ORB[ORB$L_SYS_PROT] = 0;
+    ORB[ORB$L_OWN_PROT] = 0;
+    ORB[ORB$L_GRP_PROT] = 0;
+    ORB[ORB$L_WOR_PROT] = 0;
+    ORB[ORB$L_OWNER] = 0;
+    UCB[UCB$W_DIRSEQ] = .UCB[UCB$W_DIRSEQ] + 1;
+
+! If the device lock exists, now demote it as appropriate (to CR if
+! the device is not allocated, to EX otherwise). Clear the value
+! block if this is the final dismount.
+!
+
+    IF .LKSTS [1] NEQ 0
+    THEN
+	BEGIN
+	LKSTS [2] = 0;
+	LKSTS [3] = 0;
+	LKSTS [4] = 0;
+	LKSTS [5] = 0;
+
+	STS = $ENQ (LKMODE = IF .UCB [UCB$L_PID] NEQ 0
+			     THEN LCK$K_EXMODE
+			     ELSE LCK$K_CRMODE,
+		    LKSB   = LKSTS,
+		    EFN    = EFN,
+		    FLAGS  = LCK$M_CONVERT + LCK$M_CVTSYS
+			   + LCK$M_SYNCSTS + LCK$M_NOQUOTA + LCK$M_VALBLK
+		    );
+	IF NOT .STS
+	OR NOT .LKSTS
+	THEN BUG_CHECK (XQPERR, FATAL, 'Unexpected lock manager error');
+	END;
+
+! Call IOC$DALLOC_DMT routine to deallocate the device when appropriate.
+!
+
+    IOC$DALLOC_DMT (.CTL$GL_PCB, .UCB);
+
+! We can now release the locks while we proceed to clean up the mounted
+! volume data base.
+!
+
+    UNLOCK_IODB ();
+
+    UNTIL REMQUE (.VCB[VCB$L_FCBFL], FCB)
+    DO
+	BEGIN
+	UNTIL REMQUE (.FCB[FCB$L_WLFL], WCB) ! Release all window segments
+	DO DEALLOCATE (.WCB);
+	DEALLOCATE (.FCB);		! release all FCB's
+	END;
+
+    DEALLOCATE (.VCB);			! release the VCB
+
+    QUEUE_HEAD[AQB$B_MNTCNT] = .QUEUE_HEAD[AQB$B_MNTCNT] - 1;
+    END				! end of dismount processing
+
+ELSE
+    UNLOCK_IODB ();
+
+END;					! end of routine CHECK_DISMOUNT
+
+END
+ELUDOM

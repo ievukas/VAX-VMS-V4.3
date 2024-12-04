@@ -1,0 +1,1312 @@
+%TITLE 'Network Management Maintenance Operations Service routines'
+MODULE MOMSERVICE (
+		LANGUAGE (BLISS32),
+		ADDRESSING_MODE (NONEXTERNAL=LONG_RELATIVE),
+		ADDRESSING_MODE (EXTERNAL=LONG_RELATIVE),
+		IDENT = 'V04-000'
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:  DECnet-VAX V2.0 Maintenance Operations Module
+!
+! ABSTRACT:
+!	This module contains routines to handle maintenance operations
+!	such as trigger, dump, and line and circuit loop.
+!
+! ENVIRONMENT:  VAX/VMS Operating System
+!
+! AUTHOR:  Kathy Perko
+!
+! CREATION DATE:  5-Jan-1983
+!
+! MODIFIED BY:
+!	V03-004	MKP0004		Kathy Perko		12-June-1984
+!		Add the Ethernet address to logging events.
+!
+!	V03-003	MKP0003		Kathy Perko		28-April-1984
+!		Transmit a "dump complete" message at the end of an upline
+!		dump.  Also, for triggers, if the target does not respond
+!		to a system ID message, send the trigger message to both
+!		the hardware NI address and the DECnet NI address.
+!
+!	V03-002	MKP0002		Kathy Perko		11-Feb-1984
+!		Use Remote console protocol on Ethernet for boot messages
+!		instead of load/dump protocol.  Also, fix parsing of
+!		autoservice initial MOP message to check for loop assistance
+!		requests.
+!
+!	V03-001	MKP0001		Kathy Perko		8-May-1983
+!		Add node id to event logged for Aborted Service Request.
+!		Fix the trigger at the beginning of LOAD to try both
+!		the HIORD and the hardware address of the target.
+!
+!--
+
+
+%SBTTL 'Declarations'
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+    mom$operservice	: NOVALUE,
+    mom$autoservice	: NOVALUE,
+    mom_get_initial_mop_msg: NOVALUE,
+    mom_volunteer_assistance: NOVALUE,
+    mom$dump		: NOVALUE,
+    mom$trigger,
+    mom$servicehandler,
+    mom$autohandler,
+    mom$log_event	: NOVALUE,
+    mom$chk_mop_error	: NOVALUE;
+
+!
+! INCLUDE FILES:
+!
+
+LIBRARY 'LIB$:MOMLIB.L32';
+LIBRARY 'SHRLIB$:NMALIBRY.L32';
+LIBRARY 'SHRLIB$:EVCDEF.L32';
+LIBRARY 'SHRLIB$:NET.L32';
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+
+!
+! EXTERNAL REFERENCES:
+!
+
+$mom_externals;				! Macro to define common externals
+
+EXTERNAL LITERAL
+    mom$_unsmopdev,
+    mom$_alpbfovf,
+    mdt$gk_mopdevcnt;
+
+EXTERNAL
+    mom$ab_mopdevices : BBLOCKVECTOR [0,mdt$k_entrylen],
+    mom$npa_init,
+    mom$npa_load,
+    mom$npa_mopinit,
+    mom$npa_mopdump,
+    mom$npa_trigger;
+ 
+EXTERNAL ROUTINE
+    nma$nparse,
+    mom$parse_nice_entity,
+    mom$test,
+    mom$load,
+    mom$bld_reply,
+    mom$bldmopboot,
+    mom$bldmoprds,
+    mom$bldmopplt,
+    mom$debug_msg,
+    mom$debug_txt,
+    mom$error,
+    mom$getsrvdata,
+    mom$getsrvtimer,
+    mom$loophandler,
+    mom$init_CIB,
+    mom$mopsetsubstate,
+    mom$mopopen,
+    mom$mopsend,
+    mom$mop_receive_qiow,
+    mom$mopsndrcv,
+    mom$passiveloop,
+    mom$netacp_qio,
+    mom$send,
+    mom$set_NI_addr,
+    mom$srvopen,
+    mom$srvwrite,
+    mom$srvrewind,
+    mom$srvclose;
+
+
+
+%SBTTL 'mom$operservice      Parse the maintenance request (NICE) message'
+GLOBAL ROUTINE mom$operservice : NOVALUE =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine parses the NICE service request message and
+!	builds the permanent data base record to hold the data.
+!
+! IMPLICIT OUTPUTS:
+!
+!	MOM$GQ_SRVDATDSC describes the service parameter information from the
+!	    volatile data base and from the NICE message.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Signal errors.
+!
+! SIDE EFFECTS:
+!
+!	The service circuit is open for MOP operations.
+!
+!--
+ 
+BEGIN
+
+LOCAL
+    mom_a_npatbl,			! Pointer to NPARSE table
+    mom_a_routine,			! Address of service routine
+    mom_l_msgsize,			! Size of response message
+    mom_l_status;			! General purpose status
+
+!
+! Enable condition handler for cleanup.
+!
+ENABLE mom$servicehandler;
+!
+! Parse the NICE command message up the parameters.  This parsing includes
+! the function code, the option byte, and the target entity ID.
+!
+mom$parse_nice_entity ();
+!
+! Select parse table according to function code.
+!
+SELECTONEU .mom$gb_function OF
+    SET
+    [nma$c_fnc_loa]:		! Load
+	BEGIN
+	mom_a_routine = mom$load;
+	mom_a_npatbl = mom$npa_load;
+	END;
+
+    [nma$c_fnc_tri]:		! Trigger
+	BEGIN
+	mom_a_routine = mom$trigger;
+	mom_a_npatbl = mom$npa_trigger;
+	END;
+
+    [nma$c_fnc_tes]:		! Loop circuit, node, or line
+	BEGIN
+	mom$test ();
+	RETURN;
+	END;
+
+    [OTHERWISE]:			! Invalid function
+	BEGIN
+	mom$error (nma$c_sts_fun);
+	END;
+
+    TES;
+!
+! Get the node's service parameters from the volatile data base and
+! put them into the Service Data Table.  Then get the parameters
+! (if any) from the NICE command message and overwrite the appropriate
+! Service Data Table.  This is done because the NICE message parameters
+! take precedence over the ones in the volatile database.
+!
+nma$nparse (mom$ab_nparse_blk, .mom_a_npatbl);
+!
+! Set up the event in case of an aborted service request.
+!
+mom$gw_evt_code = evc$c_nma_abs;	! Event code (aborted service request)
+mom$gb_evt_prsn = evc$c_nma_prsn_loe;	! Circuit open error
+
+mom$getsrvdata ();! Build data base from volatile
+!
+! Get the service line timer (used to time all interactions with the
+! target node).
+!
+mom$getsrvtimer ();
+!
+! Dispatch the function to the service routine.
+! (The service routine will signal the status and cleanup will
+! be performed by the condition handler.)
+!
+(.mom_a_routine) (mom$ab_cib);
+
+END;				! End of MOM$OPERSERVICE
+
+%SBTTL 'mom$autoservice  Automatic maintenance operations request'
+GLOBAL ROUTINE mom$autoservice : NOVALUE =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine performs initialization and dispatching for all
+!	automatic service requests.
+!
+! IMPLICIT OUTPUTS:
+!	MOM$GL_SERVICE_FLAGS [MOM$V_AUTOSERVICE] has a value of TRUE.
+!	The Service Data (SVD) table contains the service parameter
+!	    information from the volatile data base and from the MOP message.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!	Signal errors.
+!
+!--
+ 
+BEGIN
+
+LOCAL
+    ptr,
+    rcv_mop_msg_dsc: VECTOR [2],
+    status;
+
+!
+! Enable condition handler for cleanup.
+!
+enable mom$autohandler;
+mom$ab_cib [cib$l_chan] = 0;
+!
+! Set up the event in case of an aborted service request.
+!
+mom$gw_evt_code = evc$c_nma_abs;	! Event code (aborted service request)
+mom$gb_evt_prsn = evc$c_nma_prsn_loe;	! Circuit open error
+!
+! Get the service data base.
+!
+mom$gb_entity_code = mom$c_circuit;
+!
+! Get the service line timer (used to time all interactions with the
+! target node).
+!
+mom$getsrvtimer ();
+!
+! Open a MOP channel on the circuit specified in SYS$NET (translated
+! into MOM$GQ_ENTITY_BUF_DSC).
+!
+mom$mopopen (mom$ab_cib [cib$l_chan]);
+!
+! MOM is started up for autoservice when this node receives a MOP
+! message from some other node which requests a maintenance operation.
+! Get this MOP message and parse it.
+!
+mom_get_initial_mop_msg (rcv_mop_msg_dsc);
+!
+! Get the service data and timer from the volatile data base entry for
+! this device.  For NI circuits, this uses the NI address obtained by
+! MOM_GET_INITIAL_MOP_MSG.
+!
+mom$getsrvdata ();
+!
+! Set up Channel Information Block for channel.  For NI circuits, this
+! sets up the NI protocol for the circuit, and associate it with a specific
+! NI destination.
+!
+mom$init_CIB (mom$ab_cib,		! Channel Information Block addr
+		.mom$gb_function,	! Function = load, dump, test
+		svd$gk_pcno_pha,	! NI Phycial Address
+		svd$gk_pcno_add,	! Node address
+		svd$gk_pcno_hwa);	! NI hardware address
+!
+! For load and dump:
+! If the MOP message sent by the target an NI circuit multicast and
+! it's not a request for the secondary loader then volunteer assistance.
+! The target will perform the load or dump sequence with the first host
+! to respond to the multicast.
+!
+IF .mom$gl_service_flags [mom$v_ni_volunteering] AND
+   NOT ((.mom$gb_function EQL nma$c_fnc_loa) AND
+        (.mom$ab_service_data [svd$gk_pcno_sty, svd$l_param] EQL
+						nma$c_soft_secl)) THEN
+    mom_volunteer_assistance (rcv_mop_msg_dsc);
+
+!
+! Dispatch the autoservice function to the correct routine to handle it.
+! (The service routine will signal status and the condition handler will
+! take care of cleanup.)
+!
+
+SELECTONEU .mom$gb_function OF
+    SET
+    [nma$c_fnc_tes]: mom$passiveloop (rcv_mop_msg_dsc);
+
+    [nma$c_fnc_loa]: mom$load (mom$ab_cib);
+
+    [nma$c_fnc_dum]: mom$dump ();
+
+    [OTHERWISE]:     mom$error (nma$c_sts_fun);
+
+    TES;
+END;				! End of MOM$AUTOSERVICE
+
+%SBTTL 'mom_get_initial_mop_msg    Get autoservice initial MOP message'
+ROUTINE mom_get_initial_mop_msg (rcv_mop_msg_dsc) : NOVALUE =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!	MOM is started up for autoservice when this node receives a MOP
+!	message from some other node which requests a maintenance operation.
+!	This routine is called by MOM$AUTOSERVICE to get the MOP message
+!	from the device driver and to parse it.
+!
+! INPUTS:
+!	RCV_MOP_MSG_DSC - Address at which to put a descriptor of the
+!		initial MOP message.
+!
+! IMPLICIT OUTPUTS:
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!--
+ 
+BEGIN
+
+MAP
+    rcv_mop_msg_dsc: REF VECTOR;
+
+LOCAL
+    status,
+    iosb: $iosb,
+    msgsize,
+    send_mop_msg_dsc  : VECTOR [2],
+    ni_header : BBLOCK [nih$k_ni_header_len];
+
+!
+! Initialize the MOP message descriptor.
+!
+rcv_mop_msg_dsc [0] = .mom$gq_mop_rcv_buf_dsc [0];
+rcv_mop_msg_dsc [1] = .mom$gq_mop_rcv_buf_dsc [1];
+!
+! If the driver is holding a MOP message, issue a read to get it.
+!
+status = mom$mop_receive_qiow (.mom$ab_cib [cib$l_chan],
+				.rcv_mop_msg_dsc,
+				ni_header);
+IF .status THEN
+    BEGIN
+    !
+    ! Check the NI header to see if the target sent the MOP message to the
+    ! NI multicast address (meaning that any NI node enabled for multicast
+    ! can respond to the message.)  If so, MOM must respond by volunteering
+    ! to perform the operation requested.
+    !
+    IF .mom$gl_service_flags [mom$v_ni_circ] THEN
+	BEGIN
+	!
+	! Dump out the NI header to debug logging.
+	!
+	mom$debug_msg (dbg$c_mopio,
+	       ni_header,
+	       nih$k_ni_header_len,
+	       $ASCID ('Header on NI message initiating autoservice'));
+	IF .ni_header [nih$b_multicast] THEN
+	    BEGIN
+	    mom$gl_service_flags [mom$v_ni_volunteering] = true;
+	    mom$gl_service_flags [mom$v_ni_multicast] = true;
+	    END;
+	!
+	! Save the source and destination addresses of the MOP message
+	! which initiated autoservice.
+	!
+	CH$MOVE (6, ni_header [nih$t_source_ni_addr],
+		mom$ab_service_data [svd$gk_pcno_pha, svd$t_string]);
+	mom$ab_service_data [svd$gk_pcno_pha, svd$b_string_len] = 6;
+	mom$ab_service_data [svd$gk_pcno_pha, svd$v_msg_param] = true;
+	CH$MOVE (6, ni_header [nih$t_dest_ni_addr],
+		mom$ab_service_data [svd$gk_pcno_$da, svd$t_string]);
+	mom$ab_service_data [svd$gk_pcno_$da, svd$b_string_len] = 6;
+	mom$ab_service_data [svd$gk_pcno_$da, svd$v_msg_param] = true;
+	END;
+    !
+    ! Parse the MOP message that was received.
+    !
+    mom$ab_nparse_blk [npa$l_msgcnt] = .rcv_mop_msg_dsc [0];
+    mom$ab_nparse_blk [npa$l_msgptr] = .rcv_mop_msg_dsc [1];
+    status = nma$nparse (mom$ab_nparse_blk, mom$npa_mopinit);
+    END
+ELSE
+!
+! If no MOP message was returned by the driver, send a bad MOP message to
+! get the target to retransmit the MOP message which caused me to be
+! started up.  This code will go away when all the drivers have been
+! changed to save that MOP message and return it to MOM$MOPOPEN.
+! Note that this code path is taken for point-to-point and multipoint
+! lines.
+!
+    BEGIN
+    !
+    ! Initialize the MOP message descriptor.
+    !
+    rcv_mop_msg_dsc [0] = .mom$gq_mop_rcv_buf_dsc [0];
+    rcv_mop_msg_dsc [1] = .mom$gq_mop_rcv_buf_dsc [1];
+    !
+    ! Build the bad message (old MOP mode running, new Request dump
+    ! service) to send.
+    !
+    mom$bldmoprds (send_mop_msg_dsc);
+    mom$gb_evt_prsn = evc$c_nma_prsn_err; ! Receive error reason
+    !
+    ! Send the bad MOP mode running message (used to get the target to
+    ! retransmit the last thing it sent - this is done for device drivers
+    ! that lose the MOP message that causes MOM to get started up.)
+    !
+    mom$ab_cib [cib$l_retry_cnt] = 5;
+    DECR i FROM 5 TO 0 DO
+	BEGIN
+	status = mom$mopsndrcv (mom$ab_cib, send_mop_msg_dsc,
+				mom$ab_cib, .rcv_mop_msg_dsc,
+				rcv_mop_msg_dsc [0],
+				0);	! Don't skip program load requests
+	mom$chk_mop_error (.status);
+	!
+	! Parse the MOP message that was received.
+	!
+	mom$ab_nparse_blk [npa$l_msgcnt] = .rcv_mop_msg_dsc [0];
+	mom$ab_nparse_blk [npa$l_msgptr] = .rcv_mop_msg_dsc [1];
+	status = nma$nparse (mom$ab_nparse_blk, mom$npa_mopinit);
+	IF .status THEN
+	    EXITLOOP;
+	END;
+    END;
+!
+! If a bad MOP message came from the target, give up.
+!
+IF NOT .status THEN
+    BEGIN
+    mom$bld_reply (mom$ab_msgblock, msgsize);
+    $signal_msg (mom$ab_nice_xmit_buf, .msgsize);
+    END;
+
+END;			!  of mom_get_initial_mop_msg
+
+%SBTTL 'mom_volunteer_assistance   Volunteer Assistance'
+ROUTINE mom_volunteer_assistance (rcv_mop_msg_dsc) : NOVALUE =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!	If there is a node on the NI whose host is down and it needs a
+!	down line load or an up line dump, it will broadcast a request
+!	for to the NI multicast address for the dump or load.  If the
+!	request is not for a secondary loader (in which case MOM responds
+!	with a secondary loader), MOM sends a volunteer assistance to the
+!	target node.  The target will chose the first host to volunteer to
+!	continue the load or dump sequence with.  If a response is
+!	received to the volunteer assistance sent here, then this node
+!	was chosen by the target.  Parse the message and return to
+!	perform the operation.
+!
+! INPUTS:
+!	None
+!
+! IMPLICIT OUTPUTS:
+!	Writes an event indicating that assistance was volunteered.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!--
+ 
+BEGIN
+
+MAP
+    rcv_mop_msg_dsc :	REF VECTOR;
+
+LOCAL
+    status,
+    msgsize;
+
+!
+! Initialize the MOP message descriptor.
+!
+rcv_mop_msg_dsc [0] = .mom$gq_mop_rcv_buf_dsc [0];
+rcv_mop_msg_dsc [1] = .mom$gq_mop_rcv_buf_dsc [1];
+!
+! Sent assistance volunteer to node requesting assistance.  Send it once if
+! the correct destination NI address is available.  Otherwise, try once to the
+! target's HIORD address and once to its hardware address.
+!
+IF (NOT .mom$ab_cib [cib$v_target_addr_fixed]) THEN
+    mom$ab_cib [cib$l_retry_cnt] = 2
+ELSE
+    mom$ab_cib [cib$l_retry_cnt] = 1;
+status = mom$mopsndrcv (mom$ab_cib, UPLIT LONG (1,
+						UPLIT BYTE (mop$_fct_asv)),
+			mom$ab_cib, .rcv_mop_msg_dsc,
+			rcv_mop_msg_dsc [0],
+			mom$k_skip_multicasts);	! Ignore received multicasts.
+
+mom$chk_mop_error (.status);
+!
+! In case a response to the volunteer was received, restore the retry count
+! for normal operations.
+!
+mom$ab_cib [cib$l_retry_cnt] = 5;
+!
+! Parse the MOP message that was received.
+!
+mom$ab_nparse_blk [npa$l_msgcnt] = .rcv_mop_msg_dsc [0];
+mom$ab_nparse_blk [npa$l_msgptr] = .rcv_mop_msg_dsc [1];
+status = nma$nparse (mom$ab_nparse_blk, mom$npa_mopinit);
+!
+! If a bad MOP message came from the target, give up.
+!
+IF NOT .status THEN
+    BEGIN
+    mom$bld_reply (mom$ab_msgblock, msgsize);
+    $signal_msg (mom$ab_nice_xmit_buf, .msgsize);
+    END;
+mom$gl_service_flags [mom$v_ni_volunteering] = false;
+!
+! Don't log any events for a volunteer assistance that gets no response.
+! This is because every node on the NI that's enabled for multicast would
+! log this event for every multicast request.  That's generating mucho
+! not very interesting data.
+!
+RETURN .status;
+END;			!  of mom_volunteer_assistance
+
+%SBTTL 'mom$dump  Upline dump'
+GLOBAL ROUTINE mom$dump : NOVALUE =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine performs the upline system dump operation.
+!
+! IMPLICIT INPUTS:
+!	MOM$AB_CIB = QIO channel information block for MOP messages.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Signal errors.
+!
+!--
+ 
+BEGIN
+
+MACRO
+    						! MOP Request Memory Dump msg
+    rmd_b_fct     	= 0,0,8,0%,		!  Function code
+    rmd_l_memaddr 	= 1,0,32,0%,		!  Memory address
+    rmd_w_numlocs 	= 5,0,16,0%,		!  Number of locations
+    						! MOP Memory Dump Data message
+    mdd_b_fct	= 0,0,8,0%,			!  Function code
+    mdd_l_memaddr 	= 1,0,32,0%,		!  Memory address
+    mdd_t_data	= 5,0,0,0%;			!  Data
+
+LITERAL
+    mdd_c_datsiz 	= 256,			! MOP Memory Dump data size
+    mdd_c_hdrsiz 	= 5,			! MOP Memory Dump header size
+    recsiz 		= 512;			! Record buffer size
+
+LOCAL
+    len,adr,					! Temp length and address
+    retries,					! Retries remaining count
+    memsiz,					! Memory size
+    memadr,					! Memory address
+    curmemadr,					! Current memory address
+    fildsc : VECTOR [2],			! File name descriptor
+    rmdbuf : BBLOCK [7],			! Request Memory Dump message
+    rmddsc : VECTOR [2],			! Request Memory Dump desc
+    mddlen,					! Memory Dump data length
+    mddbuf : BBLOCK [mdd_c_hdrsiz 		! Memory Dump Data message
+			+ mdd_c_datsiz],
+    mdddsc : VECTOR [2],			! Memory Dump Data descriptor
+    recidx,					! Record buffer index
+    recbuf : VECTOR [recsiz,BYTE],		! Record buffer
+    recdsc : VECTOR [2],			! Record buffer descriptor
+
+    snddsc : VECTOR [2],
+    msgdsc : VECTOR [2],
+    skip_msg_dsc_addr,				! Address of descriptor of
+						! MOP message to skip over.
+    msgsize,
+    status;
+!
+! Set the circuit substate and log the automatic service event for
+! upline dump.
+!
+mom$gw_evt_code = evc$c_nma_als;
+mom$gb_evt_pser = evc$c_nma_pser_dum;
+mom$log_event (0, 0);
+
+mom$mopsetsubstate (nma$c_linss_adu,
+			 .mom$ab_cib [cib$l_chan]);! -AUTODUMPING
+!
+! Get the output file name from the data base.
+!
+fildsc [1] = 0;
+IF .mom$ab_service_data [svd$gk_pcno_dum, svd$b_string_len] LEQ 0 THEN
+    BEGIN
+    mom$error (nma$c_sts_pms, nma$c_pcno_dum);
+    RETURN;
+    END
+ELSE
+    BEGIN
+    fildsc [0] = .mom$ab_service_data [svd$gk_pcno_dum, svd$b_string_len];
+    fildsc [1] = mom$ab_service_data [svd$gk_pcno_dum, svd$t_string];
+    END;
+!
+! Get the memory size of the system being dumped
+!
+memsiz = .mom$ab_service_data [svd$gk_pcno_dct, svd$l_param];
+IF .memsiz LEQ -1 THEN
+    BEGIN
+    mom$error (nma$c_sts_pms, nma$c_pcno_dct);
+    RETURN;
+    END;
+
+!
+! Get the starting memory address of the system being dumped
+!
+memadr = .mom$ab_service_data [svd$gk_pcno_dad, svd$l_param];
+IF .memadr LEQ -1 THEN
+    memadr = 0;
+
+!
+! Open the output file.
+!
+status = mom$srvopen (fildsc, nma$c_opn_ac_rw);
+
+IF NOT .status THEN
+    BEGIN
+    mom$ab_msgblock [msb$w_detail] = nma$c_fopdtl_dfl;
+    mom$bld_reply (mom$ab_msgblock, msgsize);
+    $signal_msg (mom$ab_nice_xmit_buf, .msgsize);
+    RETURN;
+    END;
+!
+! Output the trace message.
+!
+mom$debug_txt (dbg$c_srvtrc, $ASCID ('Dumping'));
+
+rmdbuf [rmd_b_fct] = mop$_fct_rmd;
+rmdbuf [rmd_w_numlocs] = mdd_c_datsiz;
+rmddsc [0] = %ALLOCATION(rmdbuf);
+rmddsc [1] = rmdbuf;
+
+mdddsc [0] = %ALLOCATION(mddbuf);
+mdddsc [1] = mddbuf;
+!
+! Dump the remote system's memory and retry if it fails.
+!
+skip_msg_dsc_addr = mom$gq_mop_msg_dsc;
+curmemadr = .memadr;
+recidx = 0;
+retries = 2;
+
+WHILE .curmemadr LSSU .memsiz
+    AND .retries GTRU 0
+    DO
+    BEGIN
+    !
+    ! Send 'Request Memory Dump' message and receive a response message.
+    ! Skip over retransmitted Request Memory Dump messages from the target
+    ! the first time through.
+    !
+    rmdbuf [rmd_l_memaddr] = .curmemadr;
+    STATUS = mom$mopsndrcv (mom$ab_cib, rmddsc,
+			    mom$ab_cib, mdddsc,
+			    mddlen,
+			    .skip_msg_dsc_addr); ! Skip duplicate dump requests.
+    skip_msg_dsc_addr = 0;
+    !
+    ! If the response message is a 'Memory Dump Data' and the memory
+    ! address is the one requested, copy the data to the record buffer.
+    !
+    IF .status
+       AND (.mddlen GEQU mdd_c_hdrsiz)
+       AND (.mddbuf [mdd_b_fct] EQL mop$_fct_mdd)
+       AND (.mddbuf [mdd_l_memaddr] EQL .curmemadr) THEN
+	BEGIN
+	CH$MOVE (.mddlen - mdd_c_hdrsiz, mddbuf [mdd_t_data],
+		 recbuf [.recidx]);
+	recidx = (.recidx + mdd_c_datsiz) MOD recsiz;
+
+	!
+	! If the record buffer was just filled, write it to the file.
+	!
+	IF .recidx EQL 0 THEN
+	    mom$srvwrite (recbuf, recsiz);
+
+	curmemadr = .curmemadr + mdd_c_datsiz;
+	END
+    ELSE
+	BEGIN
+	!
+	! The response message isn't correct, so tell the dumper to 
+	! start dump again by sending a bad (opcode only) 'Request Dump
+	! Service' MOP message.
+	!
+	mom$bldmoprds (snddsc);
+	msgdsc [1] = .mom$gq_mop_rcv_buf_dsc [1];
+
+	status = mom$mopsndrcv (mom$ab_cib, snddsc,
+			    	mom$ab_cib, mom$gq_mop_rcv_buf_dsc,
+			    	msgdsc [0],
+				0);		! Don't skip program load requests
+	mom$chk_mop_error (.status);
+	mom$ab_nparse_blk [npa$l_msgcnt] = .msgdsc [0];
+	mom$ab_nparse_blk [npa$l_msgptr] = .msgdsc [1];
+	IF NOT nma$nparse (mom$ab_nparse_blk, mom$npa_mopinit) THEN
+	    BEGIN
+	    mom$error (nma$c_sts_lpr);
+	    RETURN;
+	    END;
+	!
+	! Rewind the output file and reset the memory address for
+	! retrying
+	!
+	mom$srvrewind ();
+	recidx = 0;
+	curmemadr = .memadr;
+	retries = .retries - 1;
+	END;
+    END;
+!
+! Send a Dump Complete MOP message.
+!
+status = mom$mopsend (mom$ab_cib,
+		      1,
+		      UPLIT BYTE (mop$_fct_dcm));
+!
+! Close the dump file.
+!
+mom$srvclose ();
+!
+! If auto-dumping, tell the remote system to re-load itself by sending an
+! 'Enter MOP Mode' message.
+!
+IF .mom$gl_service_flags [mom$v_autoservice] THEN
+    mom$trigger ();
+!
+! Return status.
+!
+mom$ab_msgblock [msb$l_flags] = 0;
+IF .retries NEQ 0 THEN
+    mom$ab_msgblock [msb$b_code]  = nma$c_sts_suc
+ELSE
+    mom$ab_msgblock [msb$b_code]  = nma$c_sts_lpr;
+mom$bld_reply (mom$ab_msgblock, msgsize);
+$signal_msg (mom$ab_nice_xmit_buf, .msgsize);
+END;				! End of mom$dump
+
+%SBTTL 'mom$trigger Trigger the target bootstrap'
+GLOBAL ROUTINE mom$trigger =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine performs the trigger bootstrap function.  It is called
+!	during trigger, and dump operations.
+!
+! INPUTS:
+!	None
+!
+! IMPLICIT INPUTS:
+!	MOM$AB_CIB = Channel Information for QIO channel for MOP messages.
+!	MOM$GB_FUNCTION = maintenance function currently being performed.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Signal errors.
+!
+!--
+ 
+BEGIN
+
+LOCAL
+    snddsc :	VECTOR [2],
+    status;
+
+!
+! Open an I/O channel for the circuit service operation.
+!
+mom$mopopen (mom$ab_trigger_cib [cib$l_chan]);
+!
+! Set up the Channel Information Block for the channel.  For NI circuits, this
+! sets up the NI protocol for the circuit, and determines the NI destination
+! address that the target DEUNA is currently responding to.
+!
+mom$init_CIB (mom$ab_trigger_cib,
+		nma$c_fnc_tri,
+		svd$gk_pcno_pha,
+		svd$gk_pcno_add,
+		svd$gk_pcno_hwa);
+IF .mom$gb_function EQL nma$c_fnc_tri THEN
+    BEGIN
+    !
+    ! Set the circuit substate to -TRIGGERING.
+    !
+    mom$mopsetsubstate (nma$c_linss_tri,
+			 .mom$ab_trigger_cib [cib$l_chan]);
+    END;
+!
+! Build the trigger (old 'enter MOP mode', new 'boot') message.
+!
+mom$bldmopboot (snddsc);
+mom$debug_txt (dbg$c_srvtrc,
+	       $ASCID ('Triggering remote bootstrap'));
+!
+! Send the trigger message for a trigger or dump operation, and don't
+! wait for a response message from the target.  
+!
+status = mom$mopsend (mom$ab_trigger_cib,
+			  .snddsc [1],
+			  .snddsc [0]);
+!
+! If the target's correct physical address is not available, send the
+! trigger to the target's hardware address as well.
+!
+IF NOT .mom$ab_trigger_cib [cib$v_target_addr_fixed] THEN
+    BEGIN
+    mom$set_ni_addr (mom$ab_trigger_cib);
+    status = mom$mopsend (mom$ab_trigger_cib,
+			.snddsc [1],
+			.snddsc [0]);
+    END;
+mom$chk_mop_error (.status);
+!
+! If it's a trigger operation, return a NICE response to NCP (trigger is
+! never an autoservice operation), and quit.
+!
+IF .mom$gb_function EQL nma$c_fnc_tri THEN
+    mom$error (nma$c_sts_suc);
+RETURN .status;
+END;				! End of mom$trigger
+
+%SBTTL 'mom$servicehandler  Condition handler'
+GLOBAL ROUTINE mom$servicehandler (signal_vec, mechanism)	=
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is a condition handler that performs cleanup
+!	at the end of maintenance operations.  The MOP I/O channel is
+!	deassigned.  T
+!
+! FORMAL PARAMETERS:
+!
+!	SIGNAL_VEC	Pointer to the signal vector.
+!	MECHANISM	Pointer to the mechanism array.
+!
+!--
+BEGIN
+
+MAP
+    signal_vec : REF BBLOCK,		! Signal vector argument
+    mechanism  : REF BBLOCK;		! Mechanism vector array pointer
+
+LOCAL
+    buf_adr,				! Temporary buffer address
+    buf_len,				! Temporary buffer length
+    sts_code : BBLOCK [4];		! Status code
+ 
+!
+! Deassign the MOP channels.
+!
+IF .mom$ab_cib [cib$l_chan] NEQ 0 THEN
+    $DASSGN (CHAN = .mom$ab_cib [cib$l_chan]);
+IF .mom$ab_trigger_cib [cib$l_chan] NEQ 0 THEN
+    $DASSGN (CHAN = .mom$ab_trigger_cib [cib$l_chan]);
+
+sts_code = .signal_vec [chf$l_sig_name]; ! Get signal status code
+!
+! If the facility code matches the one for MOM, then MOM signalled the
+! error with it's own signalling arguments.  Use these arguments to
+! send the response message back to NML.
+! 
+IF .sts_code [sts$v_fac_no] EQLU mom$k_fac_code THEN
+    BEGIN
+    !
+    ! Two arguments are required for MOM conditions.
+    !
+    IF .signal_vec [chf$l_sig_args] NEQU 2+3 THEN
+	RETURN ss$_resignal
+    ELSE
+	BEGIN
+
+	buf_adr = .signal_vec [chf$l_sig_arg1];
+	buf_len = .(signal_vec [chf$l_sig_arg1]+4);
+	!
+	! For load operations, log the final status event.
+	!
+	IF .mom$gb_function EQL nma$c_fnc_loa THEN
+	    mom$log_event (.buf_len, .buf_adr);
+	!
+	! If a message is specified (length not equal 0) then send it.
+	!
+	IF .buf_len NEQU 0 THEN
+	    mom$send (.buf_adr, .buf_len); ! Send status message
+ 
+	!
+	! Unwind back to the caller of the routine that set up the
+	! condition hanlder and continue from there.  This gets rid of
+	! the MOM specific arguments on the stack.
+	! 
+	$UNWIND ();
+	RETURN ss$_continue
+
+	END;
+    END
+ELSE
+    !
+    ! This condition was not signalled by MOM so let it go by.
+    !
+    RETURN ss$_resignal
+  
+END;				! End of MOM$SERVICEHANDLER
+
+%SBTTL 'mom$autohandler  Condition handler for autoservice operations'
+GLOBAL ROUTINE mom$autohandler (SIGNAL_VEC, MECHANISM)	=
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is a condition handler that performs cleanup
+!	at the end of maintenance operations initiated by the target
+!	(autoservice).  The final status is logged and the direct I/O
+!	channel is deassigned.
+!
+! FORMAL PARAMETERS:
+!
+!	SIGNAL_VEC	Pointer to the signal vector.
+!	MECHANISM	Pointer to the mechanism array.
+!
+!--
+BEGIN
+
+MAP
+    signal_vec : REF BBLOCK, 	! Signal vector argument
+    mechanism  : REF BBLOCK;	! Mechanism vector array pointer
+
+LOCAL
+    msgadr,
+    msgsize,
+    sts_code : BBLOCK [4];		! Status code
+ 
+sts_code = .signal_vec [chf$l_sig_name];
+ 
+!
+! If the error was generated by MOM (as opposed to being an SS$_ error)
+! log an event.
+!
+IF .sts_code [sts$v_fac_no] EQLU mom$k_fac_code THEN
+    BEGIN
+
+    msgadr = .signal_vec [chf$l_sig_arg1];
+    msgsize = .(signal_vec [chf$l_sig_arg1]+4);
+    !
+    ! Log the event.
+    !
+    mom$log_event (.msgsize, .msgadr);
+    !
+    ! Unwind back to the caller of the routine that set up the
+    ! condition hanlder and continue from there.  This gets rid of
+    ! the MOM specific arguments on the stack.
+    ! 
+    $UNWIND ();
+    RETURN ss$_continue
+    END;
+!
+! Deassign the MOP channel.
+!
+IF .mom$ab_cib [cib$l_chan] NEQ 0 THEN
+    $DASSGN (CHAN = .mom$ab_cib [cib$l_chan]);
+
+RETURN ss$_resignal;		! Always resignal error
+  
+END;				! End of MOM$AUTOHANDLER
+
+%SBTTL 'mom$log_event  Log the network management layer event'
+GLOBAL ROUTINE mom$log_event (msgsize, msgadr) : NOVALUE =
+ 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Log the network management event.
+!
+! FORMAL PARAMETERS:
+!
+!	MSGSIZE		Size of response message (if necessary).
+!	MSGADR		Address of response message (if necessary).
+!
+! IMPLICIT INPUTS:
+!
+!	MOM$GW_EVT_CODE
+!	MOM$GB_EVT_PSER
+!	MOM$GB_EVT_POPR
+!	MOM$GB_EVT_PRSN
+!
+!--
+BEGIN
+
+LOCAL
+    status,
+    evtbuf : BBLOCK [mom$k_qio_buf_len],
+    evtdsc : VECTOR [2],
+    nfb    : BBLOCK [nfb$k_length],
+    nfbdsc : VECTOR [2],
+    svd_index,
+    ptr,
+    node_cmu;		! Coded multiple field count for target node ID
+
+!
+! Initialize the event buffer pointer leaving room for the byte count word.
+!
+ptr = evtbuf + 2;
+!
+! Get the current system time and put it in the buffer.
+!
+$GETTIM (timadr = .ptr);
+ptr = .ptr + 8;
+!
+! Put the event code in the buffer.
+!
+(.ptr)<0,16> = .mom$gw_evt_code;
+ptr = .ptr + 2;
+!
+! Add the source circuit id.
+!
+CH$WCHAR_A (evc$c_src_cir, ptr);	! Add source type code (Always CIRCUIT)
+CH$WCHAR_A (.mom$ab_service_data [svd$gk_pcno_sli, svd$b_string_len], ptr);
+ptr = CH$COPY (.mom$ab_service_data [svd$gk_pcno_sli, svd$b_string_len],
+	       mom$ab_service_data [svd$gk_pcno_sli, svd$t_string],
+	       0,
+	       16,
+	       .ptr);
+!
+! Add the event-specific information.
+!
+SELECTU .mom$gw_evt_code OF
+    SET
+    !
+    ! Add service code.
+    !
+    [evc$c_nma_als]:
+	BEGIN
+	(.ptr)<0,16> = evc$c_nma_pser;
+	ptr = .ptr + 2;
+	CH$WCHAR_A (nma$m_pty_cod or 1, ptr);
+	CH$WCHAR_A (.mom$gb_evt_pser, ptr);
+	END;
+    !
+    ! Add operation code.
+    !
+    [evc$c_nma_psl]:
+	BEGIN
+	(.ptr)<0,16> = evc$c_nma_popr;
+	ptr = .ptr + 2;
+	CH$WCHAR_A (nma$m_pty_cod or 1, ptr);
+	CH$WCHAR_A (.mom$gb_evt_popr, ptr);
+	END;
+    !
+    ! Add reason code.
+    !
+    [evc$c_nma_abs]:
+	BEGIN
+	(.ptr)<0,16> = evc$c_nma_prsn;
+	ptr = .ptr + 2;
+	CH$WCHAR_A (nma$m_pty_cod OR 1, ptr);
+	CH$WCHAR_A (.mom$gb_evt_prsn, ptr);
+	END;
+    !
+    ! Add status message.
+    !
+    [evc$c_nma_abs,evc$c_nma_als]:
+	BEGIN
+	(.ptr)<0,16> = evc$c_nma_psts;
+	ptr = .ptr + 2;
+	CH$WCHAR_A (nma$m_pty_cmu OR 3, ptr);
+
+	CH$WCHAR_A (nma$m_pty_cod OR 1, ptr);
+	IF .msgsize GTR 0 THEN
+	    CH$WCHAR_A (.(.msgadr)<0,8>, ptr)
+	ELSE
+	    CH$WCHAR_A (0, ptr);
+
+	CH$WCHAR_A (nma$m_pty_cod OR 2, ptr);
+	IF .msgsize GTR 2 THEN
+	    (.ptr)<0,16> = .(.msgadr + 1)<0,16>
+	ELSE
+	    (.ptr)<0,16> = -1;
+	ptr = .ptr + 2;
+
+	CH$WCHAR_A (nma$m_pty_asc, ptr);
+	IF .msgsize GTR 4 THEN
+	    BEGIN
+
+	    CH$WCHAR_A (.(.msgadr + 3)<0,8>, ptr);
+	    ptr = CH$MOVE (.(.msgadr + 3)<0,8>,
+			   .msgadr + 4,
+			   .ptr);
+	    END
+	ELSE
+	    CH$WCHAR_A (0, ptr);
+
+	END;
+    !
+    ! If it's in the Service Data Table (SVD) add the target's node ID.
+    !
+    [evc$c_nma_abs, evc$c_nma_als]:
+	BEGIN
+	node_cmu = 0;
+	IF .mom$ab_service_data [svd$gk_pcno_add, svd$l_param] NEQ 0 THEN
+	    node_cmu = 1;
+	IF .mom$ab_service_data [svd$gk_pcno_nna, svd$b_string_len] GTR 0 THEN
+	    node_cmu = .node_cmu + 1;
+	IF .node_cmu GTR 0 THEN
+	    BEGIN
+	    (.ptr)<0,16> = evc$c_nma_pnod;
+	    ptr = .ptr + 2;
+	    CH$WCHAR_A (nma$m_pty_cmu OR .node_cmu, ptr);
+	    IF .mom$ab_service_data [svd$gk_pcno_add, svd$l_param] NEQ 0 THEN
+		BEGIN
+		CH$WCHAR_A (2, ptr);
+		(.ptr)<0,16> = .mom$ab_service_data [svd$gk_pcno_add,
+							svd$l_param];
+		ptr = .ptr + 2;
+		END;
+	    IF .mom$ab_service_data [svd$gk_pcno_nna, svd$b_string_len] GTR 0
+	    THEN
+		BEGIN
+		CH$WCHAR_A (nma$m_pty_asc,
+			    ptr);
+		CH$WCHAR_A (.mom$ab_service_data [svd$gk_pcno_nna, svd$b_string_len],
+			    ptr);
+		ptr = CH$MOVE (.mom$ab_service_data [svd$gk_pcno_nna,
+							svd$b_string_len],
+				mom$ab_service_data [svd$gk_pcno_nna,
+							svd$t_string],
+				.ptr);
+		END;
+	    END;
+	END;
+    !
+    ! Add file and software type to load events.
+    !
+    [evc$c_nma_als]:
+	BEGIN
+	IF .mom$gb_evt_pser EQL evc$c_nma_pser_loa THEN
+	    BEGIN
+	    !
+	    ! File ID of load file.
+	    !
+	    (.ptr)<0,16> = evc$c_nma_pfil;
+	    ptr = .ptr + 2;
+	    SELECTONE .mom$ab_service_data [svd$gk_pcno_sty, svd$l_param] OF
+		SET
+		[nma$c_soft_secl]: svd_index = svd$gk_pcno_slo;
+		[nma$c_soft_terl]: svd_index = svd$gk_pcno_tlo;
+		[nma$c_soft_osys]: svd_index = svd$gk_pcno_loa;
+		TES;
+	    CH$WCHAR_A (nma$m_pty_asc,
+		    ptr);
+	    CH$WCHAR_A (.mom$ab_service_data [.svd_index, svd$b_string_len],
+		    ptr);
+	    ptr = CH$MOVE (.mom$ab_service_data [.svd_index, svd$b_string_len],
+		    mom$ab_service_data [.svd_index, svd$t_string],
+		    .ptr);
+	    !
+	    ! Software type of load file.
+	    !
+	    (.ptr)<0,16> = evc$c_nma_psty;
+	    ptr = .ptr + 2;
+	    CH$WCHAR_A (nma$c_pty_cd1, ptr);
+	    CH$WCHAR_A (.mom$ab_service_data [svd$gk_pcno_sty, svd$l_param],
+			ptr);
+	    END;
+	END;	
+    !
+    ! If the circuit is an Ethernet, add the target system's Ethernet address
+    ! to the event.
+    !
+    [evc$c_nma_abs,evc$c_nma_als]:
+	BEGIN
+	IF .mom$gl_service_flags [mom$v_ni_circ] THEN
+	    BEGIN
+	    !
+	    ! Add parameter ID = source NI address
+	    !
+	    (.ptr)<0,16> = evc$c_nma_psni;
+	    ptr = .ptr + 2;
+	    CH$WCHAR_A (nma$c_pty_hi,		! It's a hex image field
+			ptr);
+	    CH$WCHAR_A (mom$k_ni_addr_length,
+			ptr);
+	    !
+	    ! Add the Ethernet address.
+	    !
+	    ptr = CH$MOVE (mom$k_ni_addr_length,
+		    mom$ab_service_data [svd$gk_pcno_pha, svd$t_string],
+		    .ptr);
+	    END;
+	END;	
+    TES;
+!
+! Set up the descriptor of the event buffer.
+!
+evtdsc [0] = .ptr - evtbuf;
+(evtbuf)<0,16> = .evtdsc [0];
+evtdsc [1] = evtbuf;
+!
+! Set up the NFB.
+!
+CH$FILL (0, nfb$k_length, nfb);
+nfb [nfb$b_fct] = nfb$c_logevent;
+nfbdsc [0] = nfb$k_length;
+nfbdsc [1] = nfb;
+!
+! Log the event to NETACP.
+!
+mom$netacp_qio (nfbdsc, evtdsc, 0, 0);
+!
+! Dump out the event message.
+!
+mom$debug_msg (dbg$c_events,
+	       .evtdsc [1],
+	       .evtdsc [0],
+	       $ASCID ('Event logged'));
+  
+END;				! End of MOM$LOG_EVENT
+
+%SBTTL 'mom$chk_mop_error  Get volatile byte parameter'
+GLOBAL ROUTINE mom$chk_mop_error (code) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Check the status of a MOP function.
+!
+!--
+
+BEGIN
+
+LOCAL
+    msgsize;
+
+IF NOT .code THEN
+    BEGIN
+    mom$bld_reply (mom$ab_msgblock, msgsize);
+    $signal_msg (mom$ab_nice_xmit_buf, .msgsize);
+    END;
+
+END;					! End of mom$chk_mop_error
+
+END
+
+ELUDOM

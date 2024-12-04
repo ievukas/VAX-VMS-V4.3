@@ -1,0 +1,771 @@
+MODULE SMG$BUILD_TERM_TABLE( %TITLE 'Build terminal table'
+		MAIN = SMG$BUILD_TERM_TABLE,
+		IDENT = '1-002'		! File: SMGBLDTAB.B32 Edit: PLL1002
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	Screen Management 
+!
+! ABSTRACT:
+!
+!	This module contains the parser for the TERMTABLE.TXT terminal 
+!	capabilities file.  It accepts an ascii TERMTABLE.TXT file as input and 
+!	produces a binary capabilities file, TERMTABLE.EXE, as output.
+!
+!	This module is used in conjunction with the RTL Screen Management
+!	routines.
+!
+! ENVIRONMENT:	User mode - AST reentrant
+!
+! AUTHOR: P. Levesque CREATION DATE: 1-Nov-1983
+!
+! MODIFIED BY:
+!
+! 1-001	- Original.  PLL 1-Nov-1983
+! 1-002 - For output file, use default extension .EXE and default name
+!	  of TERMTABLE (so logical name may be used).  PLL 19-Mar-1984
+!--
+
+
+%SBTTL 'Declarations'
+!
+! SWITCHES:
+!
+
+!
+! LINKAGES:
+!
+!	NONE
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+	SMG$BUILD_TERM_TABLE : NOVALUE,! mainline interpretter
+	OPEN_FILES,			! open ascii & binary TERMTABLEs
+	PARSE_TERM_DEFS,		! parse a terminal definition & insert
+					! it into the binary file
+	CLOSE_FILES,			! close ascii & binary TERMTABLEs
+	CLOSE_WITH_DLT;			! exit handler to close the .exe
+					! file with the delete bit set
+
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'RTLIN:SMGPROLOG';		! Defines psects, macros, etc.
+
+LIBRARY 'RTLML:SMGTPALIB';		! Definitions & macros used
+					! to construct TERMTABLE.EXE
+LIBRARY 'RTLTPAMAC';			! TPARSE library of macros
+
+!
+! MACROS:
+!
+!+
+! If we get interupted by a control Y or control C, we don't want to leave
+! an incomplete TERMTABLE.EXE in the user's directory.  Establish an exit
+! handler that will close the file with the delete bit set.
+!-
+MACRO $DECLARE_EXIT_HANDLER =
+BEGIN
+    EXIT_BLOCK [1] = CLOSE_WITH_DLT;	! address of exit handler routine
+    EXIT_BLOCK [2] = 2;			! number of args passed
+    EXIT_BLOCK [3] = EXIT_REASON;	! addr to hold reason
+    EXIT_BLOCK [4] = .PARAM_BLOCK;	! parameter for exit handler routine
+
+    $DCLEXH (DESBLK = EXIT_BLOCK);		! establish exit handler
+END;%;
+
+!
+! EQUATED SYMBOLS:
+!
+!	NONE
+!
+! FIELDS:
+!
+!	NONE
+!
+! PSECTS:
+!
+
+
+!
+! OWN STORAGE:
+!
+OWN
+    BINARY_NAM : REF $NAM_DECL,		! name block for binary file
+    EXIT_REASON : INITIAL (0),		! addr to put in exit block
+    EXIT_BLOCK : VECTOR [5] INITIAL (REP 5 OF (0));
+					! info block for exit handler
+
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL ROUTINE
+	LIB$TPARSE,			! parser
+	LIB$GET_VM,			! allocate virtual memory
+	LIB$FREE_VM;			! deallocate virtual memory
+
+EXTERNAL
+	SMG$$A_STMT_STATES,		! TPARSE state table
+	SMG$$A_STMT_KEYWDS,		! TPARSE key words
+	SMG$$DATA_OFFSET,		! offset into TERMTABLE.EXE
+	SMG$$CURRENT_DEF_BLOCK;		! block number of current definition
+
+EXTERNAL LITERAL
+	SMG$_SYNERR;			! syntax error
+
+%SBTTL 'SMG$BUILD_TERM_TABLE'
+GLOBAL ROUTINE SMG$BUILD_TERM_TABLE : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+! This is the mainline logic to build the binary terminal capabilities file.
+! It builds the binary file by:
+!	opening the ascii TERMTABLE.TXT for read access
+!	opening the binary TERMTABLE.EXE for write access (block I/O)
+! 	parsing & moving the capabilities from the .txt file to the .exe
+!	exits after closing TERMTABLE.TXT and TERMTABLE.EXE
+!
+! CALLING SEQUENCE:
+!
+!	SMG$BUILD_TERM_TABLE ()
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS: 
+!
+!	Errors are signalled
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    LOCAL
+	TPARSE_BLOCK,			! address of param block for LIB$TPARSE
+	STATUS;				! status returned by called routines
+
+!+
+! Allocate virtual memory for control blocks.  Our local parameter
+! block will follow the TPARSE parameter block.
+!-
+
+    IF NOT (STATUS = LIB$GET_VM (%REF (SMG$K_PARAM_BLOCK_SIZE),
+				TPARSE_BLOCK))
+    THEN
+	SIGNAL_STOP (.STATUS);
+
+    CH$FILL (0, SMG$K_PARAM_BLOCK_SIZE, .TPARSE_BLOCK);
+					! init to zeroes
+!+
+! OPEN_FILES will fill in the PARAM_BLOCK with the FAB and RAB for the
+! ascii TERMTABLE.TXT, and the channel and virtual addresses of TERMTABLE.EXE
+! which will be mapped as a section.  This data is needed later to access
+! the files, and to close the files.
+!-
+    
+    IF NOT (STATUS = OPEN_FILES (.TPARSE_BLOCK))
+    THEN
+	SIGNAL_STOP (.STATUS);
+
+!+
+! Do the real work.  Get records from the ascii file and move and/or
+! convert them to the binary file.
+!-
+
+    IF NOT (STATUS = PARSE_TERM_DEFS (.TPARSE_BLOCK))
+    THEN
+	SIGNAL_STOP (.STATUS);
+
+!+
+! Done.  Close the ascii TERMTABLE and unmap the section from the binary
+! TERMTABLE.
+!-
+
+    IF NOT (STATUS = CLOSE_FILES (.TPARSE_BLOCK))
+    THEN 
+	SIGNAL_STOP (.STATUS);
+    
+!+
+! Deallocate control blocks.
+!-
+
+    IF NOT (STATUS = LIB$FREE_VM (%REF (SMG$K_PARAM_BLOCK_SIZE),
+					TPARSE_BLOCK))
+    THEN
+	SIGNAL_STOP (.STATUS);
+
+    END;				! End of routine SMG$BUILD_TERM_TABLE
+
+%SBTTL 'OPEN_FILES'
+ROUTINE OPEN_FILES ( PARAM_BLOCK : REF BLOCK [,BYTE]
+    ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine opens TERMTABLE.TXT for read access, and creates a file
+!	named TERMTABLE.EXE.  TERMTABLE.EXE is accessed via block I/O.
+!
+!
+! CALLING SEQUENCE:
+!
+!	ret_status = OPEN_FILES (PARAM_BLOCK.mz.r)
+!
+!
+! FORMAL PARAMETERS:
+!
+!	PARAM_BLOCK.mz.r	Parameter block in which to place information
+!				needed to access files
+!
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS: 
+!
+!	SS$_NORMAL
+!	Errors returned from $OPEN, $CREATE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+!+
+! Set up pointers to RMS structures.  The FAB and RAB for the
+! ascii file will be needed later to do $GETs and $CLOSE.
+!-
+    BEGIN
+    LOCAL
+	ASCII_FAB : REF $FAB_DECL,	! ptr to FAB for ascii file
+	ASCII_RAB : REF $RAB_DECL,	! ptr to RAB for ascii file
+	OPEN_STATUS,			! status retd from $OPEN
+	STATUS;				! status retd from called routines
+
+    IF NOT (STATUS = LIB$GET_VM (%REF (FAB$C_BLN), PARAM_BLOCK [PARAM_A_TXT_FAB]))
+    THEN
+	RETURN (.STATUS);
+
+    IF NOT (STATUS = LIB$GET_VM (%REF (RAB$C_BLN), PARAM_BLOCK [PARAM_A_TXT_RAB]))
+    THEN
+	RETURN (.STATUS);
+
+    ASCII_FAB = .PARAM_BLOCK [PARAM_A_TXT_FAB];
+    ASCII_RAB = .PARAM_BLOCK [PARAM_A_TXT_RAB];
+    
+!+
+! First attempt to open the ascii TERMTABLE.TXT.  If this fails,
+! processing ends.
+!-
+
+    $FAB_INIT (FAB = .ASCII_FAB, FNM = 'TERMTABLE', DNM = '.TXT',
+	       FAC = GET, SHR = NIL, ORG = SEQ);
+    						! set up FAB fields
+    IF NOT (OPEN_STATUS = $OPEN (FAB = .ASCII_FAB))
+    THEN
+	RETURN (.OPEN_STATUS);
+
+!+
+! If we get here, we successfully opened TERMTABLE.TXT.  Connect a
+! RAB to the FAB so we can access it.
+!-
+
+    $RAB_INIT (RAB = .ASCII_RAB, FAB = .ASCII_FAB); ! init RAB fields
+
+    IF NOT (STATUS = $CONNECT (RAB = .ASCII_RAB))
+    THEN
+	RETURN (.STATUS); 		! connect to ASCII_FAB
+
+    END;
+
+!+
+! Open the binary TERMTABLE.EXE.  We will be using block I/O to write to this
+! file.
+!
+! We always want to create a new file.
+!-
+    BEGIN
+    LOCAL
+	STATUS,				! status retd from calls
+	BINARY_FAB : REF $FAB_DECL,	! ptr to FAB for binary file
+	BINARY_RAB : REF $RAB_DECL,	! ptr to RAB for binary file
+	RESULT_NAME : VECTOR [NAM$C_MAXRSS,BYTE],! storage for name block
+	EXPAND_NAME : VECTOR [NAM$C_MAXRSS,BYTE];! storage for name block
+
+    IF NOT (STATUS = LIB$GET_VM (%REF (FAB$C_BLN), 
+			         PARAM_BLOCK [PARAM_A_BINARY_FAB]))
+    THEN
+	RETURN (.STATUS);
+
+    IF NOT (STATUS = LIB$GET_VM (%REF (RAB$C_BLN),
+				 PARAM_BLOCK [PARAM_A_BINARY_RAB]))
+    THEN
+	RETURN (.STATUS);
+
+    IF NOT (STATUS = LIB$GET_VM (%REF (NAM$C_BLN),
+				 BINARY_NAM))
+    THEN
+	RETURN (.STATUS);
+
+!+
+! Establish an exit handler which will delete TERMTABLE.EXE if the file is
+! still open when it is called.  (Normally we should close the file ourselves
+! without the DLT bit set.)  This prevents partial .exe's from being
+! left in the user's directory.
+!-
+
+    $DECLARE_EXIT_HANDLER;
+
+    BINARY_FAB = .PARAM_BLOCK [PARAM_A_BINARY_FAB];
+    BINARY_RAB = .PARAM_BLOCK [PARAM_A_BINARY_RAB];
+
+!+
+! Need a NAM block in order to use the DLT bit (delete on close).  DLT
+! prevents an incomplete file from being left in the user's directory
+! if the compiler is interupted.
+!-
+
+    $NAM_INIT (NAM = .BINARY_NAM, RSA = RESULT_NAME, RSS = NAM$C_MAXRSS,
+	       ESA = EXPAND_NAME, ESS = NAM$C_MAXRSS);
+
+    $FAB_INIT (FAB = .BINARY_FAB, ALQ = 20, FAC=<BIO,GET,PUT,DEL>, 
+	       NAM = .BINARY_NAM, FOP = CBT, SHR=NIL, ORG = SEQ, 
+	       FNM = 'TERMTABLE', DNM = '.EXE');
+
+    IF NOT (STATUS = $CREATE (FAB = .BINARY_FAB))
+    THEN
+	RETURN (.STATUS);
+
+!+
+! Connect a RAB to the binary FAB so we can access the records.
+!-
+
+    $RAB_INIT (RAB = .BINARY_RAB, FAB = .BINARY_FAB);
+
+    IF NOT (STATUS = $CONNECT (RAB = .BINARY_RAB))
+    THEN
+	RETURN (.STATUS);
+
+    END;
+
+    RETURN (SS$_NORMAL);
+    END;					! End of routine OPEN_FILES
+
+%SBTTL 'PARSE_TERM_DEFS'
+ROUTINE PARSE_TERM_DEFS ( TPARSE_BLOCK : REF BLOCK [,BYTE]
+    ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine moves data from TERMTABLE.TXT to TERMTABLE.EXE.
+!	The data is compacted and stored in a manner that allows easy
+! 	retrieval.
+!
+!	PARSE_TERM_DEFS initializes some unique fields in TERMTABLE.EXE
+!	(for instance the ident), and inserts the terminal definition
+!	index at the end of the file.  Terminal definitions are actually
+!	parsed and moved by LIB$TPARSE.
+!
+!
+! CALLING SEQUENCE:
+!
+!	ret_status = PARSE_TERM_DEFS (PARAM_BLOCK.rz.r)
+!
+! FORMAL PARAMETERS:
+!
+!	PARAM_BLOCK.rz.r	Address of control block with info needed
+!				to access files
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS: 
+!
+!	
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    LOCAL
+	TXT_RAB : REF $RAB_DECL,	! ptr to RAB for TERMTABLE.TXT
+	BUFFER : VECTOR [255,BYTE],	! buffer to hold .TXT records
+	PARALLEL_BUFFER : VECTOR [255,BYTE],
+					! another buffer to hold .TXT records
+	VM_STATUS,			! status from LIB$GET/FREE_VM
+	TERM_INDEX;			! addr for local terminal index
+
+!+
+! Allocate the buffers used to construct terminal definitions.  We write
+! to these buffers until we start a new terminal definition or until they
+! are full, and then we do a block I/O write to flush them.
+!-
+
+    IF NOT (VM_STATUS = LIB$GET_VM (%REF (SMG$K_HEADER_SIZE),
+	  			    TPARSE_BLOCK [PARAM_A_HEADER]))
+    THEN
+	RETURN (.VM_STATUS);
+
+    CH$FILL (0, SMG$K_HEADER_SIZE, .TPARSE_BLOCK [PARAM_A_HEADER]);
+
+    IF NOT (VM_STATUS = LIB$GET_VM (%REF (SMG$K_TERM_DEF_SIZE),
+				    TPARSE_BLOCK [PARAM_A_CAP_PTRS]))
+    THEN
+	RETURN (.VM_STATUS);
+  
+    CH$FILL (0, SMG$K_TERM_DEF_SIZE, .TPARSE_BLOCK [PARAM_A_CAP_PTRS]);
+
+    TPARSE_BLOCK [PARAM_A_CAP_DATA] = .TPARSE_BLOCK [PARAM_A_CAP_PTRS] +
+				      SMG$K_CAP_PTRS_SIZE;
+    
+    TPARSE_BLOCK [PARAM_L_CUR_DATA_BYTE] = .TPARSE_BLOCK [PARAM_A_CAP_DATA];
+					! start with 1st byte of data buffer
+
+!+
+! Point to the first terminal definition.  A terminal definition consists
+! of capability pointers followed by capability data.  Each terminal
+! definition will begin on a block boundary.
+!
+! See SMGTABDEF.REQ for more info on the structure of TERMTABLE.EXE.
+!-
+
+    BEGIN				! new block for BIND
+
+    BIND
+	TERM_TAB = .TPARSE_BLOCK [PARAM_A_HEADER] : BLOCK [,BYTE];
+
+!+
+! Set up some fields at the beginning of TERMTABLE.EXE.
+!-
+
+    TERM_TAB [TTB_W_IDENT] = 1;		! 1st version of terminal table
+
+!+
+! We call LIB$TPARSE to parse and move all the terminal definitions into
+! TERMTABLE.EXE.
+!
+! Since the TPARSE action routines have access to the RAB, we can set up
+! a buffer to hold TERMTABLE.TXT records here.  
+!
+! We set up 2 buffers, one for the RAB and a second 'parallel' buffer.
+! The text in the RAB buffer will be upcased for parsing purposes, and 
+! the text in the parallel buffer will remain the way the user specified
+! in TERMTABLE.TXT for copying into TERMTABLE.EXE.  (Note that case is
+! significant in escape and control sequences, but we parse only uppercase
+! to avoid having upper and lower case keywords.)
+!-
+
+    TXT_RAB = .TPARSE_BLOCK [PARAM_A_TXT_RAB];
+    TXT_RAB [RAB$W_USZ] = 255;
+    TXT_RAB [RAB$L_UBF] = BUFFER [0];
+
+    TPARSE_BLOCK [PARAM_L_ORIG_TXT] = PARALLEL_BUFFER [0];
+
+!+
+! Initialize fields needed by LIB$TPARSE.
+!-
+
+    TPARSE_BLOCK [TPA$L_COUNT] = TPA$K_COUNT0;
+    TPARSE_BLOCK [TPA$V_BLANKS] = 0;
+				! start by skipping over blanks
+
+!+
+! Allocate temporary virtual memory to hold the terminal index.  This
+! index belongs at the end of the terminal table but we don't know how
+! much space the terminal definitions will take.  So we will move it 
+! there after all the terminal definitions have been processed.
+!-
+
+    IF NOT (VM_STATUS = LIB$GET_VM (%REF (SMG$K_TERM_INDEX_SIZE), TERM_INDEX))
+    THEN
+	RETURN (.VM_STATUS);
+
+    CH$FILL (0, SMG$K_TERM_INDEX_SIZE, .TERM_INDEX);
+
+    TPARSE_BLOCK [PARAM_A_TERM_INDEX] = .TERM_INDEX;   
+
+!+
+! Ready to do the real work.
+!-
+
+    IF NOT LIB$TPARSE (.TPARSE_BLOCK, SMG$$A_STMT_STATES, SMG$$A_STMT_KEYWDS)
+    THEN
+	SIGNAL_STOP (SMG$_SYNERR);		! syntax error
+
+!+
+! Now that all terminal definitions are in place, append the terminal index.
+!-
+
+    BEGIN
+    LOCAL
+	BINARY_RAB : REF $RAB_DECL;
+    MAP
+	TERM_INDEX : REF VECTOR [,BYTE];
+
+    BINARY_RAB = .TPARSE_BLOCK [PARAM_A_BINARY_RAB];
+
+    TERM_INDEX [.TPARSE_BLOCK [PARAM_L_TERM_INDEX_SIZE]] = 0;
+					! mark end of index with a zero
+    
+    TERM_TAB [TTB_L_INDEX_OFFSET] = (.SMG$$CURRENT_DEF_BLOCK - 1) * 512;
+					! offset in bytes 
+
+    BINARY_RAB [RAB$W_RSZ] = .TPARSE_BLOCK [PARAM_L_TERM_INDEX_SIZE] + 1;
+					! add one for zero
+    BINARY_RAB [RAB$L_RBF] = .TERM_INDEX;
+
+    BINARY_RAB [RAB$L_BKT] = .SMG$$CURRENT_DEF_BLOCK;
+
+    $WRITE (RAB = .BINARY_RAB);
+
+!+
+! Write out the header block.
+!-
+
+    BINARY_RAB [RAB$W_RSZ] = SMG$K_HEADER_SIZE;
+
+    BINARY_RAB [RAB$L_RBF] = .TPARSE_BLOCK [PARAM_A_HEADER];
+
+    BINARY_RAB [RAB$L_BKT] = 1;		! 1st block of file
+
+    $WRITE (RAB = .BINARY_RAB);
+
+    END;
+
+!+
+! Deallocate temporary storage.
+!-
+
+    IF NOT (VM_STATUS = LIB$FREE_VM (%REF (SMG$K_HEADER_SIZE),
+	  			    TPARSE_BLOCK [PARAM_A_HEADER]))
+    THEN
+	RETURN (.VM_STATUS);
+
+    IF NOT (VM_STATUS = LIB$FREE_VM (%REF (SMG$K_TERM_DEF_SIZE),
+				    TPARSE_BLOCK [PARAM_A_CAP_PTRS]))
+    THEN
+	RETURN (.VM_STATUS);
+
+    IF NOT (VM_STATUS = LIB$FREE_VM (%REF (SMG$K_TERM_INDEX_SIZE), TERM_INDEX))
+    THEN
+	RETURN (.VM_STATUS);
+
+    RETURN (SS$_NORMAL);
+
+    END;					! end of BIND
+    END;					! End of routine PARSE_TERM_DEFS
+
+%SBTTL 'CLOSE_FILES'
+ROUTINE CLOSE_FILES (PARAM_BLOCK
+    )  =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine cleans up after TERMTABLE.TXT has been processed.  It
+!	closes TERMTABLE.TXT and TERMTABLE.EXE.
+!
+! CALLING SEQUENCE:
+!
+!	ret_status = CLOSE_FILES (PARAM_BLOCK.rz.r)
+!
+! FORMAL PARAMETERS:
+!
+!	PARAM_BLOCK.rz.r	Address of control block with info needed
+!				to access files
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS: 
+!
+!	SS$_NORMAL
+!	Errors from $CLOSE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	STATUS;
+
+    MAP
+	PARAM_BLOCK : REF BLOCK [,BYTE];
+
+!+
+! Close the ascii TERMTABLE.
+!-
+
+    IF NOT (STATUS = $CLOSE (FAB = .PARAM_BLOCK [PARAM_A_TXT_FAB]))
+    THEN
+	RETURN (.STATUS);
+
+!+
+! Close the binary TERMTABLE.  
+!-
+
+    IF NOT (STATUS = $CLOSE (FAB = .PARAM_BLOCK [PARAM_A_BINARY_FAB]))
+    THEN
+	RETURN (.STATUS);
+
+!+
+! Now that we have closed the file properly, there's no need to worry about
+! an incomplete .exe (due to a ctrl Y or ctrl C).
+!-
+
+    $CANEXH (DESBLK = EXIT_BLOCK);
+
+!+
+! Deallocate virtual memory used for FABs and RABs.
+!-
+
+    IF NOT (STATUS = LIB$FREE_VM (%REF (FAB$C_BLN), PARAM_BLOCK [PARAM_A_TXT_FAB]))
+    THEN
+	RETURN (.STATUS);
+
+    IF NOT (STATUS = LIB$FREE_VM (%REF (RAB$C_BLN), PARAM_BLOCK [PARAM_A_TXT_RAB]))
+    THEN
+	RETURN (.STATUS);
+
+    IF NOT (STATUS = LIB$FREE_VM (%REF (FAB$C_BLN), PARAM_BLOCK [PARAM_A_BINARY_FAB]))
+    THEN
+	RETURN (.STATUS);
+
+    IF NOT (STATUS = LIB$FREE_VM (%REF (RAB$C_BLN), PARAM_BLOCK [PARAM_A_BINARY_RAB]))
+    THEN
+	RETURN (.STATUS);
+
+    IF NOT (STATUS = LIB$FREE_VM (%REF (NAM$C_BLN), BINARY_NAM))
+    THEN
+	RETURN (.STATUS);
+
+    RETURN (SS$_NORMAL);
+    END;					! End of routine CLOSE_FILES
+
+%SBTTL 'CLOSE_WITH_DLT'
+ROUTINE CLOSE_WITH_DLT (EXIT_REASON, 
+		        PARAM_BLOCK : REF BLOCK [,BYTE]
+    )  =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is an exit handler.  It is called only if
+!	we are interupted (it is de-established as an exit handler
+!	somewhere before the end of execution).  This routine will
+!	close TERMTABLE.EXE, if it is still open, with the DLT bit
+!	set.  We ignore errors since there is a possibility that we
+!	were interupted before TERMTABLE.EXE was opened, or just
+!	after we did a normal close.
+!
+! CALLING SEQUENCE:
+!
+!	ret_status = CLOSE_FILES (EXIT_REASON.rl.r, PARAM_BLOCK.rz.r)
+!
+! FORMAL PARAMETERS:
+!
+!	EXIT_REASON.rl.r	Address of exit reason.  $DCLEXH passes
+!				this although we don't need it here.
+!
+!	PARAM_BLOCK.rz.r	Address of control block with info needed
+!				to access files
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS: 
+!
+!	SS$_NORMAL
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+    BEGIN
+    BIND
+	BINARY_FAB = .PARAM_BLOCK [PARAM_A_BINARY_FAB] : $FAB_DECL;
+
+    BINARY_FAB [FAB$V_DLT] = 1;		! mark the file for delete
+
+    $CLOSE (FAB = BINARY_FAB);
+
+    RETURN (SS$_NORMAL);
+    END;				! end of routine CLOSE_WITH_DLT
+!<BLF/PAGE>
+
+END					! End of module SMG$BUILD_TERM_TABLE
+
+ELUDOM

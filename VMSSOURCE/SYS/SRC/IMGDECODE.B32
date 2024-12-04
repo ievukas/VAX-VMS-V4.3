@@ -1,0 +1,666 @@
+%TITLE	'Get and Decode Image Header and Sections'
+MODULE IMG$DECODE (
+		LANGUAGE (BLISS32),
+		IDENT = 'V04-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	Exec, Shareable routines to decode image header and sections
+!
+! ABSTRACT:
+!
+!	This module contains the routines to retrieve and decode
+!	an image header and the image section descriptors.
+!
+! ENVIRONMENT:	VAX/VMS Operating System
+!
+! AUTHOR:	Bob Grosso, 	CREATION DATE:  16-Mar-1983
+!
+! MODIFIED BY:
+!
+!	V03-010	MSH0051		Michael S. Harvey	20-May-1984
+!		Convert old format image name string to new format.
+!
+!	V03-009	MSH0043		Michael S. Harvey	8-May-1984
+!		When converting x-linker image headers into a modern
+!		form, update the image IDs correspondingly.
+!
+!	V03-008	MSH0041		Michael S. Harvey	2-May-1984
+!		Add some beef to the bounds checking code to ensure that
+!		only valid images are run. These checks filter obviously
+!		bad image headers and images with bad ISD lists.
+!
+!	V03-007	LJK0269		Lawrence J. Kenah	31-Mar-1984
+!		Miscellaneous cleanup.
+!		Do not perform consistence checks on TYPE 2 images. They are 
+!		not necessarily produced by the linker.
+!		Make sure that a primitive length check is performed on the 
+!		IHD and ISD sizes before the buffer is copied.
+!
+!	V03-006	LJA0110		Laurie J. Anderson	 6-Feb-1984
+!		Change the error messages returned from the image decode
+!		routines to be something more intelligent than "bad hdr".
+!
+!	V03-005	WMC0001		Wayne Cardoza		24-Jan-1984
+!		Add support for cross-linker and V3 FT1 images.
+!
+!	V03-004	LJK0243		Lawrence J. Kenah	23-Aug-1983
+!		Return IHD$Q_PRIVREQS of all privileges for old images,
+!		ones that do not contain a SYSVER field.
+!
+!	V03-003	LJK0234		Lawrence J. Kenah	26-Jul-1983
+!		Fix code that transforms old image header into latest
+!		form of image header.
+!
+!	V03-002	LJK0229		Lawrence J. Kenah	12-Jul-1983
+!		Treat the alias and offset as words. Treat the ISD
+!		size as a signed word.
+!
+!	V03-001	LJK0223		Lawrence J. Kenah	6-Jul-1983
+!		Make IHD and ISD sizes into words so that the comparisons
+!		are made correctly.
+!--
+
+%SBTTL	'Definitions'
+
+!
+! INCLUDE FILES:
+!
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';			! Define system data structures
+
+REQUIRE 'LIB$:IMGMSGDEF.R32';			! Get status code definitions
+
+!
+! PSECT DECLARATIONS:
+!
+
+PSECT
+	CODE	= YF$$SYSIMGACT (WRITE),
+	PLIT	= YF$$SYSIMGACT (WRITE, EXECUTE);
+
+!
+! LITERALS
+!
+
+LITERAL
+	TRUE = 1,
+	FALSE = 0,
+
+	IMG$C_BLOCKSIZ = 512;
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL LITERAL
+
+	EXE$C_SYSEFN : UNSIGNED (6);	! System event flag for QIO Wait read
+
+!
+! FORWARD ROUTINE REFERENCES
+!
+
+FORWARD ROUTINE
+	CONVERT_XLINK;
+
+!
+! Define VMS block structures
+!
+STRUCTURE
+	BBLOCK [O, P, S, E; N] =
+		[N]
+		(BBLOCK + O) <P, S, E>;
+
+
+%SBTTL	'IMG$DECODE_IHD  Get Image Header'
+GLOBAL ROUTINE IMG$DECODE_IHD 
+	( CHAN, BLK_BUFADR, IHD_BUFADR, VBN_ADR, OFFSET_ADR, HDRVER_ADR, ALIAS_ADR ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+! FORMAL PARAMETERS:
+!
+!	Chan		Channel on which image file is open
+!	Blk_bufadr	Address of buffer to contain 1st block of image
+!	Ihd_bufadr	Address of buffer to contain decoded IHD
+!	VBN_adr		Address of VBN to be set to 1
+!	Offset_adr	Address of Offset in which to return offset to 1st ISD
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+LITERAL
+    IHDMAXSIZ =	IHD$C_LENGTH +	! Maximum length for fixed portion of header
+		IHA$C_LENGTH +
+		IHS$C_LENGTH +
+		IHI$C_LENGTH +
+		IHP$C_LENGTH ,
+    IHI_S_IMGNAM = 16;		! Length of image name string prior to VMS V4
+
+LOCAL
+    B_IHD : REF BBLOCK,		! Buffer IHD
+    IHD : REF BBLOCK,
+    IOSB : BBLOCK [8],		! Quadword IO status block
+    HDR_INSERT,
+    IHI_INSERT,
+    OFF2 : WORD,
+    SIZE,
+    STATUS;			! Status
+
+BIND
+    V4_MAJORID = UPLIT (%ASCII'02'),		! Major ID for VMS V4 images
+    V4_MINORID = UPLIT (%ASCII'05'),		! Minor ID for VMS V4 images
+    HEADER_VERSION = .HDRVER_ADR	: WORD,
+    LAST_WORD = .ALIAS_ADR		: SIGNED WORD,
+    OFFSET = .OFFSET_ADR		: WORD,
+    VBN = .VBN_ADR;
+
+VBN = 1;			! Read from first block
+SIZE = IMG$C_BLOCKSIZ;		! Read one block
+
+
+!
+!	Read first block
+!
+STATUS = $QIOW (
+		EFN = EXE$C_SYSEFN,	! Event flag
+		CHAN = .CHAN,		! Channel
+		FUNC = IO$_READVBLK,	! Read a virtual block
+		IOSB = IOSB,		! I/O status block
+		P1 = .BLK_BUFADR,	! Buffer to read in to
+		P2 = .SIZE,		! Number of bytes to read
+		P3 = .VBN		! Virtual block number to read
+	       );
+
+IF .STATUS
+THEN
+    STATUS = .IOSB [0,0,16,0];		! Pick up final status
+IF NOT .STATUS
+THEN 
+    RETURN .STATUS;
+
+B_IHD = .BLK_BUFADR;			! Image header
+LAST_WORD = .B_IHD [IHD$W_ALIAS];	! Contents of last word of header block
+
+!
+!	Process the image based upon which type of image it is. Screen
+!	out obvious image pretenders.
+!
+CASE .LAST_WORD
+FROM IHD$C_MINCODE TO IHD$C_MAXCODE OF
+    SET
+
+    [IHD$C_RSX, IHD$C_BPA, IHD$C_ALIAS] :
+
+        BEGIN
+        CH$MOVE (IMG$C_BLOCKSIZ, .B_IHD, .IHD_BUFADR);	! Copy image header to buffer
+        HEADER_VERSION = 0;
+        RETURN SS$_NORMAL;
+        END;
+
+    [IHD$C_NATIVE, IHD$C_CLI] :
+
+	BEGIN
+	IF .B_IHD [IHD$W_MAJORID] EQL IHX$K_MAJORID	! If Cross linker format
+	THEN
+	    BEGIN
+	    HEADER_VERSION = IHD$C_GEN_XLNKR;
+	    STATUS = CONVERT_XLINK (.BLK_BUFADR, .IHD_BUFADR);
+	    OFFSET = .B_IHD [IHD$W_SIZE];
+	    RETURN .STATUS;
+	    END;
+
+	!
+	! Check for a reasonable header record size and set of offsets.
+	! Simply verify that the offsets and the regions they point to
+	! fall within the image header record.
+	!
+	OFFSET = .B_IHD [IHD$W_SIZE];
+	IF (.OFFSET LSSU $BYTEOFFSET(IHD$L_LNKFLAGS))
+	   OR
+	   (.OFFSET GTRU IHDMAXSIZ)
+	THEN
+	    RETURN IMG$_IMG_SIZ;
+
+	!	Verify range of activation data offset
+
+	OFF2 = .B_IHD [IHD$W_ACTIVOFF];
+	IF (.OFF2 LSSU $BYTEOFFSET(IHD$L_LNKFLAGS))
+	   OR
+	   (.OFF2 + IHA$C_LENGTH GTRU IHDMAXSIZ)
+	THEN
+	    RETURN IMG$_BADOFFSET;
+
+	!	Verify range of debug and global symbol table offset
+
+	IF .B_IHD [IHD$W_SYMDBGOFF] NEQ 0
+	THEN
+	    BEGIN
+	    OFF2 = .B_IHD [IHD$W_SYMDBGOFF];
+	    IF (.OFF2 LSSU $BYTEOFFSET(IHD$L_LNKFLAGS))
+	       OR
+	       (.OFF2 + IHS$C_LENGTH GTRU IHDMAXSIZ)
+	    THEN
+	        RETURN IMG$_BADOFFSET;
+	    END;
+
+	!	Verify range of image ID data offset
+
+	OFF2 = .B_IHD [IHD$W_IMGIDOFF];
+	IF (.OFF2 LSSU $BYTEOFFSET(IHD$L_LNKFLAGS))
+	   OR
+	   (.OFF2 + IHI$C_LENGTH GTRU IHDMAXSIZ)
+	THEN
+	    RETURN IMG$_BADOFFSET;
+
+	!	Verify range of patch data offset
+
+	IF .B_IHD [IHD$W_PATCHOFF] NEQ 0
+	THEN
+	    BEGIN
+	    OFF2 = .B_IHD [IHD$W_PATCHOFF];
+	    IF (.OFF2 LSSU $BYTEOFFSET(IHD$L_LNKFLAGS))
+	       OR
+	       (.OFF2 + IHP$C_LENGTH GTRU IHDMAXSIZ)
+	    THEN
+	        RETURN IMG$_BADOFFSET;
+	    END;
+
+	!
+	! Copy image header to buffer
+	!
+	CH$MOVE (.B_IHD [IHD$W_SIZE], .B_IHD, .IHD_BUFADR);
+
+	HDR_INSERT = 0;				! Length by which header will be pried open
+	HEADER_VERSION = IHD$C_GEN_FIXUP;	! Default to most current
+	IHD = .IHD_BUFADR;
+
+	!
+	! Calculate the degree by which the fixed portion of this header
+	! differs from the current format of the fixed part of an image header.
+	! Then, expand the fixed portion of the header by the required amount,
+	! thus converting it to the current format as if the image had been
+	! relinked.
+	!
+	IF $BYTEOFFSET (IHD$L_LNKFLAGS) GEQ .IHD [IHD$W_ACTIVOFF]
+	THEN					! Link flags were not present
+	    BEGIN				! so insert a longword
+	    HDR_INSERT = 4;
+	    HEADER_VERSION = IHD$C_GEN_NATIVE;
+	    END;
+
+	IF $BYTEOFFSET (IHD$L_SYSVER) GEQ .IHD [IHD$W_ACTIVOFF]
+	THEN					! System version and Ident were not pressent
+	    BEGIN				! so insert two blank longwords
+
+	    BIND
+	        PRIVILEGE_MASK = IHD [IHD$Q_PRIVREQS]	: VECTOR [2];
+
+	    HDR_INSERT = .HDR_INSERT + 8;
+	    HEADER_VERSION = IHD$C_GEN_LNKFLG;
+	    PRIVILEGE_MASK [0] = -1;		! Insure that image privilege mask
+	    PRIVILEGE_MASK [1] = -1;		!  indicates that all privileges are set
+	    END;
+
+	IF $BYTEOFFSET (IHD$L_IAFVA) GEQ .IHD [IHD$W_ACTIVOFF]
+	THEN					! Relative virtual address of fixup vector
+	    BEGIN				! not present so insert a blank longword
+	    HDR_INSERT = .HDR_INSERT + 4;
+	    HEADER_VERSION = IHD$C_GEN_SYSVER;
+	    END;
+
+
+	IF .HDR_INSERT NEQ 0 
+	THEN					! Shift non-fixed portion of image
+	    BEGIN				! to insert missing part of fixed section
+
+	    CH$MOVE (
+	        (.IHD [IHD$W_SIZE] - .IHD [IHD$W_ACTIVOFF]),	! Shift the portion beginning at the
+	        (.IHD + .IHD [IHD$W_ACTIVOFF]), 		!  point located by the first offset
+		(.IHD + .IHD [IHD$W_ACTIVOFF] + .HDR_INSERT));	!  by the amount to be inserted
+
+	    CH$FILL (0, .HDR_INSERT, 		! Fill the space created for the insert
+		.IHD + .IHD [IHD$W_ACTIVOFF]);
+	    END;
+ 
+	!
+	! Determine the extent that the image ident area differs in size from
+	! the current format. Expand the image ident area by the required
+	! amount, thus converting to the current format without relinking.
+	!
+	IHI_INSERT = 0;				! Assume no conversion required
+	IF (.IHD [IHD$W_MAJORID] LSSU .V4_MAJORID)
+	   OR
+	   (
+	    (.IHD [IHD$W_MAJORID] EQL .V4_MAJORID)
+	    AND
+	    (.IHD [IHD$W_MINORID] LSSU .V4_MINORID)
+	   )
+	THEN
+	    !
+	    ! The image name string grew between VMS V3 and V4. Split the
+	    ! image ident area after the old image name string and expand
+	    ! the string to the current maximum size, zero filled.
+	    !
+	    BEGIN
+	    IHI_INSERT = IHI$S_IMGNAM - IHI_S_IMGNAM; ! Calculate size difference
+	    CH$MOVE (
+		(.IHD [IHD$W_SIZE] - (.IHD [IHD$W_IMGIDOFF] + IHI_S_IMGNAM)),
+		(.IHD + .IHD [IHD$W_IMGIDOFF] + IHI_S_IMGNAM),
+		(.IHD + .IHD [IHD$W_IMGIDOFF] + IHI$S_IMGNAM) );
+	    CH$FILL (0, .IHI_INSERT,
+		(.IHD + .IHD [IHD$W_IMGIDOFF] + IHI_S_IMGNAM) );
+	    END;
+!
+!   Correct all the offsets to compensate for the insertion(s). Note that two of
+!   the offsets locate optional parts of the image header and are only updated
+!   if the associated areas are present in the image (offsets are nonzero).
+!
+	IF (.HDR_INSERT NEQ 0)
+	   OR
+	   (.IHI_INSERT NEQ 0)
+	THEN
+	    BEGIN
+	    IHD [IHD$W_SIZE]     = .IHD [IHD$W_SIZE]     + .HDR_INSERT + .IHI_INSERT;
+	    IHD [IHD$W_ACTIVOFF] = .IHD [IHD$W_ACTIVOFF] + .HDR_INSERT;
+	    IHD [IHD$W_IMGIDOFF] = .IHD [IHD$W_IMGIDOFF] + .HDR_INSERT;
+
+	    IF .IHD [IHD$W_SYMDBGOFF] NEQU 0
+	    THEN
+	        IHD [IHD$W_SYMDBGOFF] = .IHD [IHD$W_SYMDBGOFF] + .HDR_INSERT;
+
+	    IF .IHD [IHD$W_PATCHOFF] NEQU 0
+	    THEN
+	        IHD [IHD$W_PATCHOFF]  = .IHD [IHD$W_PATCHOFF]  + .HDR_INSERT + .IHI_INSERT;
+
+	    END;
+    
+	RETURN SS$_NORMAL;
+	END;
+
+    [INRANGE,OUTRANGE] :
+
+	RETURN IMG$_BADHDR;		! Unrecognizable or unsupported image type
+
+    TES;				! CASE of image types
+
+END;					! IMG$DECODE_IHD routine
+
+
+%SBTTL	'IMG$GET_NEXT_ISD  Get Image Section Descriptor'
+GLOBAL ROUTINE IMG$GET_NEXT_ISD
+  ( CHAN, BLK_BUFADR, IHD_BUFADR, VBN_ADR, OFFSET_ADR, ISD_BUFADR, HEADER_VERSION ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+! FORMAL PARAMETERS:
+!
+!	Chan		Channel on which image file is open
+!	Blk_bufadr	Address of buffer which contains block of image header
+!	Ihd_bufadr	Address of buffer containing decoded IHD
+!	VBN_adr		Address of VBN in blk_bufadr
+!	Offset_adr	Address of Offset to ISD
+!	ISD_bufadr	Address of buffer to contain decoded ISD
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+    IOSB 		: BBLOCK [8],	! Quadword IO status block
+    B_ISD 		: REF BBLOCK,	! ISD is header block buffer
+    ISD 		: REF BBLOCK,
+    ISD_SIZ		: SIGNED WORD,
+    SIZE,
+    STATUS;				! Status
+
+BIND
+    IHD = .IHD_BUFADR		: BBLOCK,
+    OFFSET = .OFFSET_ADR	: WORD,
+    VBN = .VBN_ADR;
+
+!
+!   Validate that offset and VBN are reasonable
+!
+IF .OFFSET GEQU
+	(IF .VBN EQL 1
+	THEN IMG$C_BLOCKSIZ - 2 
+	ELSE IMG$C_BLOCKSIZ)
+THEN
+    RETURN IMG$_ISD_OFF;
+
+IF .VBN GTR .IHD [IHD$B_HDRBLKCNT]
+THEN 
+    RETURN IMG$_ISD_VBN;
+
+!
+!   Get next ISD
+!
+B_ISD = .BLK_BUFADR + .OFFSET;
+ISD_SIZ = .B_ISD [ISD_W_SIZE];
+
+!
+!   See whether offset points off the block and we need to read the next block
+!
+IF .ISD_SIZ EQL -1
+THEN 					! Read next block
+    BEGIN
+    VBN = .VBN + 1;			! Increment VBN
+    OFFSET = 0;
+    SIZE = IMG$C_BLOCKSIZ;
+
+    STATUS = $QIOW 
+		(
+		EFN = EXE$C_SYSEFN,	! Event flag
+		CHAN = .CHAN,		! Channel
+		FUNC = IO$_READVBLK,	! Read a virtual block
+		IOSB = IOSB,		! I/O status block
+		P1 = .BLK_BUFADR,	! Buffer to read in to
+		P2 = .SIZE,		! Number of bytes to read
+		P3 = .VBN		! Virtual block number to read
+		);
+
+    IF .STATUS
+    THEN
+	STATUS = .IOSB [0,0,16,0];	! Pick up final status
+    IF NOT .STATUS
+    THEN 
+	RETURN .STATUS;
+
+    B_ISD = .BLK_BUFADR;
+    ISD_SIZ = .B_ISD [ISD_W_SIZE];
+
+    IF .ISD_SIZ EQL -1			! Trap consecutive 'wrap' ISDs
+    THEN
+	RETURN IMG$_INCONISD;
+
+    END;
+
+!
+!   See whether there are any ISDs left
+!
+IF .ISD_SIZ EQL 0
+THEN 					! No more ISDs left
+    RETURN IMG$_ENDOFHDR;
+
+!
+!   Validate that the ISD size is reasonable
+!
+IF (.ISD_SIZ LSS ISD$C_LENDZRO)
+   OR
+   (.ISD_SIZ GTR ISD$C_MAXLENGLBL)
+THEN 
+    RETURN IMG$_ISD_SIZ;
+
+!
+!   Make sure that ISD doesn't attempt to wrap around to the next block
+!
+IF (.OFFSET + .ISD_SIZ) GTRU
+	(IF .VBN EQL 1
+	THEN IMG$C_BLOCKSIZ - 2
+	ELSE IMG$C_BLOCKSIZ)
+THEN
+    RETURN IMG$_INCONISD;
+
+ISD = .ISD_BUFADR;
+CH$MOVE (.ISD_SIZ, .B_ISD, .ISD);	! Copy from block to ISD buffer
+OFFSET = .OFFSET + .ISD_SIZ;
+
+!
+! Don't use page fault cluster size for cross-linker images
+!
+IF .HEADER_VERSION EQL IHD$C_GEN_XLNKR
+THEN
+    ISD [ISD$B_PFC] = 0;
+
+!
+! Some V3 images use IHD$L_IAFVA to identify the fixup vectors
+!
+IF .HEADER_VERSION EQL IHD$C_GEN_FIXUP
+THEN
+    IF (.ISD [ISD$V_VPN] * 512) EQL .IHD [IHD$L_IAFVA]
+	AND
+	.ISD [ISD$V_VPN] NEQ 0
+    THEN
+	ISD [ISD$V_FIXUPVEC] = 1;
+
+RETURN SS$_NORMAL;
+END;					! IMG$GET_NEXT_ISD routine
+
+
+%SBTTL	'CONVERT_XLINK Convert a cross-linker image header to standard format'
+ROUTINE CONVERT_XLINK
+  ( BLK_BUFADR	: REF $BBLOCK,
+    IHD		: REF $BBLOCK ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	An image header produced by the cross-linker is converted to the 
+!	standard format.
+!
+! FORMAL PARAMETERS:
+!
+!	Blk_bufadr	Address of buffer which contains first block of image header
+!	Ihd		Address of buffer to contain decoded IHD
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+BIND
+    PRIV_MASK = IHD [IHD$Q_PRIVREQS]  : VECTOR [2],
+    IHD_ACT_ADR = .IHD + IHD$K_LENGTH : VECTOR [3],
+    IHX_ACT_ADR = BLK_BUFADR [IHX$Q_STARTADR] : VECTOR [2],
+    IHS		= .IHD + IHD$K_LENGTH + IHA$K_LENGTH : $BBLOCK;
+!
+! Zero the one page buffer which will contain decoded IHD
+!
+CH$FILL (0, 512, .IHD);
+!
+! Fill in offsets and directly transportable fields
+!
+IHD [IHD$W_ACTIVOFF] = IHD$K_LENGTH;
+IHD [IHD$W_SIZE] = IHD$K_LENGTH + IHA$K_LENGTH + IHS$K_LENGTH;
+IHD [IHD$B_HDRBLKCNT] = .BLK_BUFADR [IHX$B_HDRBLKCNT];
+!
+! Convert image ID fields
+!
+IHD [IHD$W_MAJORID] = IHD$K_MAJORID;
+IHD [IHD$W_MINORID] = IHD$K_MINORID;
+!
+! Assume all privileges
+!
+PRIV_MASK [0]= -1;
+PRIV_MASK [1]= -1;
+!
+! Add image activation data
+!
+IHD_ACT_ADR [0] = .IHX_ACT_ADR [0];
+IHD_ACT_ADR [1] = .IHX_ACT_ADR [1];
+!
+! Check for DEBUG data
+!
+IF .BLK_BUFADR [IHX$W_MINORID] GEQ IHX$K_MINORID1
+THEN
+    BEGIN
+    IHD [IHD$W_SYMDBGOFF] = IHD$K_LENGTH + IHA$K_LENGTH;
+    IHD_ACT_ADR [2] = .BLK_BUFADR [IHX$L_TFRADR3];
+    IHS [IHS$L_DSTVBN] = .BLK_BUFADR [IHX$L_DSTVBN] ;
+    IHS [IHS$L_GSTVBN] = .BLK_BUFADR [IHX$L_GSTVBN] ;
+    IHS [IHS$W_DSTBLKS] = .BLK_BUFADR [IHX$W_DSTBLKS] ;
+    IHS [IHS$W_GSTRECS] = .BLK_BUFADR [IHX$W_GSTRECS] ;
+    END;
+
+RETURN SS$_NORMAL;
+END;
+
+END					!End of module IMGDECODE
+ELUDOM

@@ -1,0 +1,741 @@
+MODULE lexical		(IDENT='V04-000',
+			OPTLEVEL=3, ZIP,
+			ADDRESSING_MODE(EXTERNAL=GENERAL))
+= BEGIN
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! Facility:	Command Definition Utility, Lexical Analysis
+!
+! Abstract:	This module provides the lexical analysis routines for the
+!		Command Definition Utility.  These routines handle the
+!		reading of CLD input files and the lexical analysis of
+!		the files.
+!
+!		See the PARSE1 module for an overview of CDU parsing.
+!
+! Environment:	Standard CDU environment.
+!
+! Author:	Paul C. Anagnostopoulos
+! Creation:	29 November 1982
+!
+! Modifications:
+!
+!	V04-006	BLS0348			Benn Schreiber		29-AUG-1984
+!		Put status from find_file into fab sts field.
+!
+!	V04-005	BLS0276			Benn Schreiber		25-FEB-1984
+!		Correct small problem in error reporting
+!
+!	V04-004	BLS0270			Benn Schreiber		 9-FEB-1984
+!		Correct comment handling with unquoted strings
+!
+!	V04-003	BLS0269			Benn Schreiber		 6-FEB-1984
+!		Convert to using LIB$FIND_FILE
+!
+!	V04-002	BLS0247			Benn Schreiber		28-Nov-1983
+!		Correct obscure file opening problems.
+!
+!	V04-001	PCA1025			Paul C. Anagnostopoulos 25-Jul-1983
+!		Change character class table to conform to the DEC
+!		international character set.
+!--
+
+
+library 'sys$library:lib';
+require 'cdureq';
+
+!	T A B L E   O F   C O N T E N T S
+!	---------   ---   ---------------
+
+forward routine
+	cdu$open_next_cld,
+	cdu$report_listing_heading2: novalue,
+	cdu$get_next_token: novalue,
+	cdu$token_must_be: novalue,
+	cdu$report_syntax_error: novalue;
+
+!	E X T E R N A L   R E F E R E N C E S
+!	---------------   -------------------
+
+external routine
+	cdu$eject_listing_page,
+	cdu$report_listing_line,
+	cdu$report_rms_error,
+	cli$get_value,
+	lib$find_file,
+	lib$signal,
+	str$upcase;
+
+$shr_msgdef(cdu,17,local,
+	(closein,severe),
+	(openin,error),
+	(readerr,severe)
+	);
+
+!	I N P U T   F I L E   C O N T R O L   B L O C K S
+!	---------   -------   -------------   -----------
+
+! The following items define the RMS control blocks needed to open and
+! read CLD input files.
+
+own
+	cld_xabdat: $xabdat(),
+
+	cld_esa1: block[nam$c_maxrss,byte],
+	cld_rsa1: block[nam$c_maxrss,byte],
+	cld_nam1: $nam(
+			esa=cld_esa1,
+			ess=%allocation(cld_esa1),
+			rsa=cld_rsa1,
+			rss=%allocation(cld_rsa1)
+			),
+
+	cld_spec: $bblock[dsc$c_s_bln] preset([dsc$b_class] = dsc$k_class_d,
+					[dsc$b_dtype] = dsc$k_dtype_t),
+	out_spec: $bblock[dsc$c_s_bln] preset([dsc$b_class] = dsc$k_class_d,
+					[dsc$b_dtype] = dsc$k_dtype_t),
+	cld_fab: $fab(
+			fac=get,
+			fop=<sqo>,
+			nam=cld_nam1,
+			shr=get,
+			xab=cld_xabdat
+			),
+
+	cld_buffer: block[tkn_k_max_length,byte],
+	cld_rab: $rab(
+			fab=cld_fab,
+			rac=seq,
+			rop=<rah,loc,nlk>,
+			ubf=cld_buffer,
+			usz=%allocation(cld_buffer)
+			);
+
+!	S C A N N I N G   C O N T R O L
+!	---------------   -------------
+
+! The following global item counts lines as we read them from the CLD file.
+
+global
+	cdu$gl_line_number: long;
+
+! The following two items describe the token after it has been extracted
+! from the CLD file.  Each token has an associated class, plus we save the
+! token itself.
+
+global
+	cdu$gl_token_class: long,
+	dbuffer(cdu$gq_token,tkn_k_max_length);
+
+! The following item keeps track of the number of errors encountered in a
+! CLD file.
+
+global
+	cdu$gl_cld_errors: long;
+
+own
+! The following item tells us whether or not we are currently recovering
+! from a syntax error.
+
+	recovering: boolean,
+	find_context;			!FIND_FILE context
+
+!++
+! Description:	This routine is called to open the next CLD input file,
+!		which contains the definitions for one or more DCL commands.
+!
+! Parameters:	none
+!
+! Returns:	By reference, the FAB for the CLD input file, 
+!		or zero if no more files.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$open_next_cld
+= BEGIN
+
+local
+	status: long;
+
+
+! Determine if we have just finished with a CLD input file.
+
+if .cld_fab[fab$w_ifi] eqlu 0 then (
+
+	! Nope, this must be the first call, or we just recursed needing
+	! another CLD spec.  Get the next input CLD spec.
+
+	status = cli$get_value(dtext('CLD_SPEC'),cld_spec);
+	if not .status then
+		return 0;
+
+) else (
+
+	! We just finished processing a CLD input file, so close it.
+
+	status = $close(fab=cld_fab);
+	if not .status then
+		cdu$report_rms_error(msg(cdu$_closein),cld_fab);
+);
+
+! OK, now we go into a loop in hopes of determining a file that matches the
+! current spec and opening it.
+
+loop (
+	local rms_stv;
+
+	status = lib$find_file(cld_spec,out_spec,find_context,
+				$descriptor('.CLD'),0,rms_stv,%REF(2));
+	cld_fab[fab$b_fns] = .out_spec[dsc$w_length];
+	cld_fab[fab$l_fna] = .out_spec[dsc$a_pointer];
+	cld_fab[fab$l_sts] = .status;
+	cld_fab[fab$l_stv] = .rms_stv;
+	if .status eqlu rms$_nmf then exitloop;
+
+	! If we have a file to open, then do it.  Otherwise report the error
+	! and loop for another try.
+
+	if .status then (
+		status = $open(fab=cld_fab);
+		if .status then (
+			status = $connect(rab=cld_rab);
+			if .status then (
+				cdu$gl_line_number = 0;
+				return cld_fab;
+			) else
+				cdu$report_rms_error(msg(cdu$_openin),cld_rab);
+		) else
+			cdu$report_rms_error(msg(cdu$_openin),cld_fab);
+	) else
+		cdu$report_rms_error(msg(cdu$_openin),.find_context);
+);
+
+! We don't have any more files that match the spec.  Recurse to get the
+! next spec.
+
+return cdu$open_next_cld();
+
+END;
+
+!++
+! Description:	This routine is called from the LISTING module to generate
+!		the second heading line for a page header.  This line
+!		contains the CLD file spec and its creation date.
+!
+! Parameters:	None.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$report_listing_heading2	: novalue
+= BEGIN
+
+bind
+	nam = .cld_fab[fab$l_nam]: block[,byte];
+
+
+! Generate a heading line with the CLD file's revision date, spec, and
+! revision number.
+
+cdu$report_listing_line(msg(cdu$_heading2),nobabble+4,
+			cld_xabdat[xab$q_rdt],
+			.nam[nam$b_rsl],.nam[nam$l_rsa],
+			.cld_xabdat[xab$w_rvn]);
+
+return;
+
+END;
+
+!++
+! Description:	This routine is called to obtain the next token from the
+!		CLD file being compiled.
+!
+! Parameters:	hint		Optional, by value, a hint about the fact that
+!				the caller expects an h-string, which is a
+!				quoted string or arbitrary stuff ending at
+!				certain	delimiters.
+!
+! Returns:	Nothing
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$get_next_token(hint: long): novalue
+= BEGIN
+
+builtin
+	nullparameter;
+
+linkage
+	jsb_for_speed = jsb(; register=0);
+
+own
+	line_index: long,
+	char: byte,
+	char_saved: boolean;
+
+local
+	status: long;
+
+!	C H A R A C T E R   C L A S S   T A B L E
+!	-----------------   ---------   ---------
+
+! The following table maps each of the 256 ASCII character codes into
+! their corresponding character class.
+
+own
+	char_class: vector[256,byte] initial(byte(
+			rep 3 of (tkn_k_invalid),	! NUL - STX
+			tkn_k_eof,			! ETX
+			rep 5 of (tkn_k_invalid),	! EOT - BS
+			tkn_k_whitespace,		! HT
+			rep 2 of (tkn_k_invalid),	! LF - VT
+			tkn_k_ignored,			! FF
+			tkn_k_eol,			! CR
+			rep 18 of (tkn_k_invalid),	! SO - US
+			tkn_k_whitespace,		! space
+			tkn_k_comment,			! !
+			tkn_k_string,			! "
+			tkn_k_invalid,			! #
+			tkn_k_symbol,			! $
+			rep 3 of (tkn_k_invalid),	! % & '
+			tkn_k_open_paren,		! (
+			tkn_k_close_paren,		! )
+			rep 2 of (tkn_k_invalid),	! * +
+			tkn_k_comma,			! ,
+			tkn_k_invalid,			! -
+			tkn_k_dot,			! .
+			tkn_k_invalid,			! /
+			rep 10 of (tkn_k_symbol),	! 0 - 9
+			rep 2 of (tkn_k_invalid),	! : ;
+			tkn_k_open_angle,		! <
+			tkn_k_equal,			! =
+			tkn_k_close_angle,		! >
+			rep 2 of (tkn_k_invalid),	! ? @
+			rep 26 of (tkn_k_symbol),	! A - Z
+			rep 4 of (tkn_k_invalid),	! [ \ ] ^
+			tkn_k_symbol,			! _
+			tkn_k_invalid,			! `
+			rep 26 of (tkn_k_symbol),	! a - z
+			rep 5 of (tkn_k_invalid),	! { | } ~ DEL
+			rep 64 of (tkn_k_invalid),	! bit 7 on...
+			rep 63 of (tkn_k_symbol),	! int'l alphabetics
+			rep 1 of (tkn_k_invalid)
+			));
+
+! This internal routine is called to obtain the next character from the CLD
+! file.  It handles reading lines from the file and pulling characters from
+! the lines.  It also writes the lines into the listing file.
+
+ROUTINE get_next_char		: jsb_for_speed
+= BEGIN
+
+local
+	status: long;
+
+
+! If the line number is zero, or we've run out of characters on the current
+! line, let's get another line.
+
+if .cdu$gl_line_number eqlu 0 or .line_index gtru .cld_rab[rab$w_rsz] then (
+
+	! Sit in a loop reading lines until we get one that isn't null.
+	! If we get end of file, return an ETX character.  List the lines
+	! as we go.
+
+	do (
+		status = $get(rab=cld_rab);
+		if .status eqlu rms$_eof then
+			return ETX;
+		if not .status then
+			cdu$report_rms_error(msg(cdu$_readerr),cld_rab);
+		increment(cdu$gl_line_number);
+		if .cld_rab[rab$w_rsz] eqlu 1 and ch$rchar(.cld_rab[rab$l_rbf]) eqlu FF then
+			cdu$eject_listing_page()
+		else
+			cdu$report_listing_line(msg(cdu$_listline),nobabble+3,
+				.cdu$gl_line_number,.cld_rab[rab$w_rsz],.cld_rab[rab$l_rbf]);
+	) until .cld_rab[rab$w_rsz] nequ 0;
+
+	! Reset the line index to zero.
+
+	line_index = 0;
+);
+
+! Now we can pull a character from the line.  We always pretend that there
+! is a carriage return at the end.  Make sure to increment the line index.
+
+if .line_index lssu .cld_rab[rab$w_rsz] then (
+	increment(line_index);
+	return ch$rchar(.cld_rab[rab$l_rbf]+.line_index-1);
+) else (
+	increment(line_index);
+	return CR;
+);
+
+END;
+
+! The following internal routine is called to get an h-string, if the
+! caller has told us that one is expected.  An h-string is either a
+! normal quoted string, or it is an arbitrary sequence of characters ending
+! at certain delimiters or at end of line.
+
+ROUTINE get_h_string	: novalue
+= BEGIN
+
+local
+	quoted: boolean,
+	class: long;
+
+
+! Clear the token buffer.
+
+cdu$gq_token[len] = 0;
+
+! Pull a character from the CLD file.  We may already have one saved from
+! the previous call.
+
+if not .char_saved then
+	char = get_next_char();
+char_saved = true;
+
+! Pass up any leading whitespace.
+
+while .char_class[.char] eqlu tkn_k_whitespace do
+	char = get_next_char();
+
+! If we now have a quotation mark, then it's a quoted string.  Just return
+! and let the normal routine process it.
+
+if .char_class[.char] eqlu tkn_k_string then
+	return;
+
+! Sit in a loop and collect the characters into the global token buffer.
+! We quit when we encounter one of the ending delimiters, or if we hit end
+! of line.
+
+loop (
+	case .char_class[.char] from 0 to tkn_k_max_class of set
+	[tkn_k_eol,
+	tkn_k_comma,
+	tkn_k_equal,
+	tkn_k_comment,
+	tkn_k_open_paren,
+	tkn_k_close_paren]:	exitloop;
+
+	[inrange,
+	outrange]:		;
+	tes;
+	ch$wchar(.char, .cdu$gq_token[ptr]+.cdu$gq_token[len]);
+	increment(cdu$gq_token[len]);
+	char = get_next_char();
+);
+
+! Set the token globals to say it's a string.
+
+cdu$gl_token_class = tkn_k_string;
+
+! Upcase the string for compatibility with the old CDU, even though that
+! doesn't really seem reasonable.
+
+str$upcase(cdu$gq_token,cdu$gq_token);
+
+return;
+
+END;
+
+! If the line number is zero, then a new CLD file has just been opened.
+! Reset the error counter, the error recovery flag, and the flag that
+! tells us that a character is being saved for processing.
+
+if .cdu$gl_line_number eqlu 0 then (
+	cdu$gl_cld_errors = 0;
+	recovering = false;
+	char_saved = false;
+);
+
+! If we have been told that the caller is expecting an h-string, then we
+! call a special internal routine to get it.  If we end up with a null
+! string, then it was either a normal quoted string, or the h-string
+! was null.
+
+if not nullparameter(1) then
+	if .hint eqlu tkn_k_h_string then (
+		get_h_string();
+		if .cdu$gq_token[len] nequ 0 then
+			return;
+	);
+
+! We cycle through the following loop once for each "noise" character,
+! until we finally find an interesting one.  Then we collect the token
+! and return.
+
+loop (
+
+	! Pull a character from the CLD file.  We may already have one
+	! saved from the previous call.  Initialize the token globals
+	! with the character.
+
+	if not .char_saved then
+		char = get_next_char();
+	char_saved = false;
+	cdu$gq_token[len] = 1;
+	ch$wchar(.char, .cdu$gq_token[ptr]);
+
+	! Determine the class of the character by looking it up in the
+	! class table.  Initialize the token globals with the class.
+
+	cdu$gl_token_class = .char_class[.char];
+
+	! Case on the character class.
+
+	case .cdu$gl_token_class from 0 to tkn_k_max_class of set
+	[tkn_k_invalid]:
+
+		! Invalid characters result in an error message, and then
+		! they are ignored.
+
+		cdu$report_syntax_error(msg(cdu$_invchar),1,.line_index);
+
+	[tkn_k_ignored,
+	 tkn_k_whitespace,
+	 tkn_k_eol]:
+
+		! All these characters are just ignored.
+
+		;
+
+	[tkn_k_eof,
+	 tkn_k_comma,
+	 tkn_k_equal,
+	 tkn_k_open_paren,
+	 tkn_k_close_paren,
+	 tkn_k_open_angle,
+	 tkn_k_close_angle,
+	 tkn_k_dot]:
+
+		! All of these single-character tokens are very simple.
+		! We're all done.
+
+		return;
+
+	[tkn_k_comment]:
+
+		! To handle a comment, we want to ignore the rest of the
+		! line.  Advance the line index off the face of the earth
+		! so that GET_NEXT_CHAR will get the next line.
+
+		line_index = 999999;
+
+	[tkn_k_string]:
+
+		! To collect a string, we keep pulling characters and
+		! adding them to the string.  If we hit end-of-line, that's
+		! an error.  If we hit two string delimiters in a row, then
+		! we include one in the string and keep going.
+
+		(local
+			char2: byte;
+
+		cdu$gq_token[len] = 0;
+		loop (
+			char2 = get_next_char();
+			selectoneu .char_class[.char2] of set
+			[tkn_k_eol]:
+				(cdu$report_syntax_error(msg(cdu$_missquote));
+				exitloop;);
+
+			[tkn_k_string]:
+				if (char = get_next_char()) eqlu .char2 then (
+					ch$wchar(.char2, .cdu$gq_token[ptr]+.cdu$gq_token[len]);
+					increment(cdu$gq_token[len]);
+				) else (
+					char_saved = true;
+					exitloop;
+				);
+
+			[otherwise]:
+				(ch$wchar(.char2, .cdu$gq_token[ptr]+.cdu$gq_token[len]);
+				increment(cdu$gq_token[len]););
+			tes;
+		);
+
+		return;);
+
+	[tkn_k_h_string]:
+
+		! There are no characters of class h-string.
+
+		signal(msg(cdu$_inthchar));
+
+	[tkn_k_symbol]:
+
+
+		! To collect an symbol, we keep pulling characters and
+		! adding them to the token until we hit something that
+		! isn't a letter or digit.  We save the final character
+		! for later.
+
+		(loop (
+			char = get_next_char();
+			if .char_class[.char] nequ tkn_k_symbol then exitloop;
+			ch$wchar(.char, .cdu$gq_token[ptr]+.cdu$gq_token[len]);
+			increment(cdu$gq_token[len]);
+		);
+		char_saved = true;
+
+		! Upcase the symbol for comparison purposes.
+
+		str$upcase(cdu$gq_token,cdu$gq_token);
+
+		! Complain if the symbol is longer than 31 characters.
+
+		if .cdu$gq_token[len] gtru 31 then
+			cdu$report_syntax_error(msg(cdu$_symtoolong),1,cdu$gq_token);
+		return;);
+	tes;
+);
+
+END;
+
+!++
+! Description:	This routine is called when the current token from the CLD
+!		file must be of a specified class.  Optionally, we can also
+!		check that the token is equal to a specified text string.
+!
+!		This routine also implements our simple error recovery
+!		scheme.
+!
+! Parameters:	class		By value, the required class of the token.
+!		text_string	Optional, by reference, an ASCIC text string
+!				that must be equal to the token.
+!		hint		Optional, by value, a hint to the
+!				CDU$GET_NEXT_TOKEN routine.  See it.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$token_must_be(class: long,
+				 text_string: ref vector[,byte],
+				 hint: long)			: novalue
+= BEGIN
+
+builtin
+	nullparameter;
+
+
+! If we previously encountered a syntax error, then we are going to recover
+! from it.  Eat tokens from the CLD file until we get the one that the
+! caller demands be present.  Hopefully we won't encounter end of file in
+! the process.  If this recovery succeeds, the input token stream will
+! be resynchronized with the recursive descent.
+
+if .recovering then (
+	until	.cdu$gl_token_class eqlu .class and
+		(if nullparameter(2) then true else
+		    ch$eql(.cdu$gq_token[len],.cdu$gq_token[ptr],
+		    .text_string[0],text_string[1],%x'00'))	   do (
+
+		if token_is(tkn_k_eof) then return;
+		cdu$get_next_token();
+	);
+	recovering = false;
+);
+
+! Check that the current token is as required by the caller.  If so,
+! get the next token.  If not, we have a syntax error and don't get the
+! next token in case the required one is simply missing.
+
+if	.cdu$gl_token_class eqlu .class and
+	(if nullparameter(2) then true else
+	    ch$eql(.cdu$gq_token[len],.cdu$gq_token[ptr],
+	    .text_string[0],text_string[1],%x'00'))	   then
+
+	cdu$get_next_token((if nullparameter(3) then 0 else .hint))
+else
+	cdu$report_syntax_error(msg(cdu$_invitem),1,cdu$gq_token);
+
+return;
+
+END;
+
+!++
+! Description:	This routine is called when a syntax error is encountered.
+!		It signals the error so that it will appear on the terminal.
+!		It also includes the error in the listing file, if any.
+!
+!		This routine also implements part of our simple error
+!		recovery scheme.
+!
+! Parameters:	Standard $PUTMSG argument list.
+!
+! Returns:	Nothing.
+!
+! Notes:
+!--
+
+GLOBAL ROUTINE cdu$report_syntax_error		: novalue
+= BEGIN
+
+builtin
+	argptr,
+	callg;
+	
+
+! If we are recovering from a previous syntax error, then ignore this new
+! one.  Doing so prevents a lot of spurious error messages.
+
+if .recovering then
+	return;
+
+! Signal the error along with the offending source line.
+
+lib$signal(msg(cdu$_listline),nobabble+3,.cdu$gl_line_number,
+			      .cld_rab[rab$w_rsz],.cld_rab[rab$l_rbf]);
+callg(argptr(),lib$signal);
+
+! Include the error in the listing file.
+
+callg(argptr(),cdu$report_listing_line);
+
+! Keep track of the number of syntax errors.
+
+increment(cdu$gl_cld_errors);
+
+! Set a flag saying that we are recovering from a syntax error.  This flag
+! will be reset later when we resynchronize the input.
+
+recovering = true;
+return;
+
+END;
+END
+ELUDOM

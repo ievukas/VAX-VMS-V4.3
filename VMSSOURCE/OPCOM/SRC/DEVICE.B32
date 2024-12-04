@@ -1,0 +1,336 @@
+MODULE	OPC$DEVICE	(
+			 LANGUAGE (BLISS32),
+			 IDENT = 'V04-000'
+			) =
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:
+!
+!	OPCOM
+!
+! ABSTRACT:
+!
+!	This module contains the specialized logic to service
+!	a particular type of request sent by a user to OPCOM.
+!
+! Environment:
+!
+!	VAX/VMS operating system.
+!
+! Author:
+!
+!	Steven T. Jeffreys
+!
+! Creation date:
+!
+!	March 10, 1981
+!
+! Revision history:
+!
+!	V03-005	CWH3005		CW Hobbs			15-May-1984
+!		If a device name already contains a "$", then use the name
+!		as it was received.  If no "$", then expand to fulldevnam.
+!		This fixes two problems:
+!		 - When a dual-pathed device goes offline, we have been
+!		   reporting the good path as going offline, since by the
+!		   time we performed the $GETDVI the device had failed over
+!		   to the good path.
+!		 - The previous change (CWH3169) made line printers, etc
+!		   show up as _LPA0:, with no node information.  We can now
+!		   show the correct node info and avoid confusion.
+!
+!	V03-004	CWH3169		CW Hobbs			5-May-1984
+!		Second pass for cluster-wide OPCOM:
+!		 - Change interface to SHARE_FULL_DEVNAME so that DVI$_ item
+!		   code is specified, lets use show pathname in messages
+!		 - Add OPC$_CTLRUCODE for generic controller microcode not
+!		   up to rev level, convert TM78MVER and UDA50MVER to use it,
+!		   add RC25MVER, RDRXMVER, TU81MVER, MAYAMVER messages.
+!
+!	V03-003	CWH3001		CW Hobbs			30-Jul-1983
+!		Various and sundry things to make OPCOM distributed
+!		across the cluster.
+!
+!	V03-002	STJ50798	Steven T. Jeffreys,	1-Dec-1982
+!		Check secondary device characteristics to detect and
+!		handle spooled devices.
+!
+!	V03-001	RLRV3A1		Robert L. Rappaport	5-Apr-1982
+!		Added MSG$_UDA50MVER and MSG$_DUPUNITNO.
+!
+!	V02-003	STJ0155		Steven T. Jeffreys,	05-Feb-1982
+!		More mount verification message support.
+!
+!	V02-002	STJ0065		Steven T. Jeffreys,	14-Jul-1981
+!		Added support for mount verification messages.
+!
+!--
+
+BEGIN						! Start of DEVICE
+
+LIBRARY	'SYS$LIBRARY:LIB.L32';
+LIBRARY 'LIB$:OPCOMLIB';
+
+FORWARD ROUTINE
+	DEVICE_HANDLER		: NOVALUE;
+
+BUILTIN
+
+	INSQUE,					! Insert entry onto a queue
+	REMQUE;					! Remove entry from a queue
+
+EXTERNAL ROUTINE
+	ALLOCATE_DS,				! Allocate a data structure
+	CLUSMSG_RQCB_SEND,			! Send RQCB to remote nodes
+	SHARE_FULL_DEVNAME,			! Get full device name, including SCS nodename
+	DEALLOCATE_RQCB	: NOVALUE,		! Dispose of an RQCB
+	DUMP_LOG_FILE,				! Put a random string in the log file
+	FORMAT_MESSAGE,				! Format a message
+	LOG_MESSAGE,				! Log an event
+	NOTIFY_LISTED_OPERATORS;		! Notify interested operators
+
+EXTERNAL
+	OCD_VECTOR	: VECTOR;		! OCD list heads
+
+EXTERNAL LITERAL
+	RQCB_K_TYPE,				! RQCB structure type
+	MIN_SCOPE,				! Minimum scope value
+	MAX_SCOPE;				! Maximum scope value
+
+GLOBAL ROUTINE DEVICE_HANDLER (BUFFER_DESC) : NOVALUE =
+
+!++
+! Functional description:
+!
+!	This routine is the handler for all device ONLINE or OFFLINE messages.
+!	Note that this message has a special format, different from all other
+!	messages.  This is because the message is sent via  EXE$SNDEVMSG
+!	instead of $SNDOPR.
+!
+!
+!
+! Input:
+!
+!	BUFFER_DESC : The address of a quadword buffer descriptor that
+!		      describes the buffer containing the message.
+!
+! Implicit Input:
+!
+!	The format of the message is as follows:
+!		WORD  <MSG$_DEVONLIN or MSG$_DEVOFFLIN>
+!		WORD  <device unit number>
+!		ASCIC <device name (DDC)>
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	Some accounting data will be updated 
+!	to reflect the receipt of the message.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of DEVICE_HANDLER
+
+MAP
+
+	BUFFER_DESC	: $ref_bblock;
+
+LOCAL
+	MESSAGE_VECTOR	: VECTOR [5,LONG],	! Message info
+	DEV_CHAR1	: $bblock [DIB$K_LENGTH],! Device characteristics buffer
+	CHAR_DESC1	: $desc_block,		! Descriptor for above buffer
+	DEV_CHAR2	: $bblock [DIB$K_LENGTH],! Secondary characteristics
+	CHAR_DESC2	: $desc_block,		! Sec. char. buffer descriptor
+	DEV_CLASS	: LONG,			! Device class
+	NAM_BUF		: $bblock [MAX_DEV_NAM],! Buffer for device name
+	NAM_DESC	: $desc_block,		! Descriptor for above buffer
+	FULL_DESC	: $ref_bblock,		! Pointer to descriptor returned
+	MESSAGE		: LONG,			! Message code
+	MSG		: $ref_bblock,		! Pointer to message text
+	RQCB		: $ref_bblock,		! RQCB data structure
+	OCD		: $ref_bblock,		! OCD data structure
+	OCD_COUNT	: LONG,			! Count of OCDs in OCD list
+	OCD_INDEX	: LONG,			! Index into OCD_VECTOR
+	OPER_COUNT	: LONG,			! Count of operators in operator list
+	DVI_ITEM	: LONG,			! Name item code
+	STATUS		: LONG;
+
+!
+! Check the message for a minimum length.  Assume minimum
+! length for a device name (minus the unit #) is 2 characters.
+!
+IF .BUFFER_DESC [DSC$W_LENGTH] LSS (2+2+3)
+THEN
+    RETURN;
+!
+! The message must be one of the known device messages.  All others
+! are ignored.  Set the message code in the message vector to the
+! proper value.
+!
+MSG = .BUFFER_DESC [DSC$A_POINTER];
+SELECTONE .MSG [0,0,16,0] OF
+    SET
+    [ MSG$_DEVONLIN	] : MESSAGE_VECTOR [0] = OPC$_DEVONLINE;
+    [ MSG$_DEVOFFLIN	] : MESSAGE_VECTOR [0] = OPC$_DEVOFFLINE;
+    [ MSG$_DEVOFFLINX	] : MESSAGE_VECTOR [0] = OPC$_DEVOFFLINX;
+    [ MSG$_WRONGVOL	] : MESSAGE_VECTOR [0] = OPC$_WRONGVOL;
+    [ MSG$_DEVWRTLCK	] : MESSAGE_VECTOR [0] = OPC$_DEVWRTLCK;
+    [ MSG$_MVCOMPLETE	] : MESSAGE_VECTOR [0] = OPC$_MVCOMPLETE;
+    [ MSG$_MVABORTED	] : MESSAGE_VECTOR [0] = OPC$_MVABORTED;
+    [ MSG$_DUPUNITNO	] : MESSAGE_VECTOR [0] = OPC$_DUPUNITNO;
+    [ MSG$_UDA50MVER	] : BEGIN MESSAGE_VECTOR [0] = OPC$_CTLRUCODE;
+				  MESSAGE_VECTOR [3] = UPLIT BYTE (%ASCIC 'UDA50') END;
+    [ MSG$_TM78MVER	] : BEGIN MESSAGE_VECTOR [0] = OPC$_CTLRUCODE;
+				  MESSAGE_VECTOR [3] = UPLIT BYTE (%ASCIC 'TM78') END;
+    [ MSG$_RC25MVER	] : BEGIN MESSAGE_VECTOR [0] = OPC$_CTLRUCODE;
+				  MESSAGE_VECTOR [3] = UPLIT BYTE (%ASCIC 'RC25') END;
+    [ MSG$_RDRXMVER	] : BEGIN MESSAGE_VECTOR [0] = OPC$_CTLRUCODE;
+				  MESSAGE_VECTOR [3] = UPLIT BYTE (%ASCIC 'RD/RX') END;
+    [ MSG$_TU81MVER	] : BEGIN MESSAGE_VECTOR [0] = OPC$_CTLRUCODE;
+				  MESSAGE_VECTOR [3] = UPLIT BYTE (%ASCIC 'TU81') END;
+    [ MSG$_MAYAMVER	] : BEGIN MESSAGE_VECTOR [0] = OPC$_CTLRUCODE;
+				  MESSAGE_VECTOR [3] = UPLIT BYTE (%ASCIC 'MAYA') END;
+    [ OTHERWISE		] : RETURN;
+    TES;
+!
+! Format the device name into the local format.
+!
+NAM_DESC [0,0,32,0] = MAX_DEV_NAM;
+NAM_DESC [DSC$A_POINTER] = NAM_BUF;
+IF NOT $FAO (%ASCID '_!AC!UW:', NAM_DESC, NAM_DESC, MSG [4,0,0,0], .MSG [2,0,16,0])
+THEN
+    RETURN;
+!
+! Expand the device name to the clusterwide format, and stick it in the local name buffer.
+! If the device name already contains a dollar sign, then use it as is.
+!
+FULL_DESC =    (IF CH$FIND_CH (.NAM_DESC [DSC$W_LENGTH], .NAM_DESC [DSC$A_POINTER], '$') NEQ 0
+		THEN
+		    NAM_DESC
+		ELSE
+		    SHARE_FULL_DEVNAME (NAM_DESC, DVI$_FULLDEVNAM));
+CH$MOVE (.FULL_DESC [DSC$W_LENGTH], .FULL_DESC [DSC$A_POINTER], NAM_BUF);
+NAM_DESC [0,0,32,0] = .FULL_DESC [DSC$W_LENGTH];
+!
+! Get the device characteristics and put the device class code into a
+! local variable.  Note that if a device is spooled, the primary device
+! characteristics are those of the intermediate device.
+!
+CHAR_DESC1 [0,0,32,0] = DIB$K_LENGTH;
+CHAR_DESC1 [DSC$A_POINTER] = DEV_CHAR1;
+CHAR_DESC2 [0,0,32,0] = DIB$K_LENGTH;
+CHAR_DESC2 [DSC$A_POINTER] = DEV_CHAR2;
+IF NOT $GETDEV  (DEVNAM = NAM_DESC,
+		 PRILEN = CHAR_DESC1 [DSC$W_LENGTH],
+		 PRIBUF = CHAR_DESC1,
+		 SCDLEN = CHAR_DESC2 [DSC$W_LENGTH],
+		 SCDBUF = CHAR_DESC2
+		)
+THEN
+    RETURN;
+DEV_CLASS = .DEV_CHAR1 [DIB$B_DEVCLASS];		! Assume not spooled
+IF  .$bblock [DEV_CHAR2 [DIB$L_DEVCHAR], DEV$V_SPL]
+AND NOT CH$EQL (.CHAR_DESC1 [DSC$W_LENGTH],
+		 .CHAR_DESC1 [DSC$A_POINTER],
+		 .CHAR_DESC2 [DSC$W_LENGTH],
+		 .CHAR_DESC2 [DSC$A_POINTER],
+		 %C' '
+		)
+THEN
+    DEV_CLASS = .DEV_CHAR2 [DIB$B_DEVCLASS];		! Device is spooled
+!
+! Allocate an RQCB.  This is necessary 
+! to format and later issue the message.
+!
+IF NOT ALLOCATE_DS (RQCB_K_TYPE, RQCB)
+THEN
+    RETURN;
+!
+! Set the operator interest mask depending on the device class.
+! Also target the message to DEVICE class operators.
+!
+RQCB [RQCB_L_ATTNMASK1] = (SELECTONEU .DEV_CLASS OF
+			     SET
+			     [ DC$_DISK ]	: OPC$M_NM_DISKS;
+			     [ DC$_TAPE ]	: OPC$M_NM_TAPES;
+			     [ DC$_CARD ]	: OPC$M_NM_CARDS;
+			     [ DC$_LP ]		: OPC$M_NM_PRINT;
+			     [ OTHERWISE ]	: OPC$M_NM_DEVICE;
+			     TES);
+RQCB [RQCB_L_ATTNMASK1] = (.RQCB [RQCB_L_ATTNMASK1] OR OPC$M_NM_DEVICE); 
+!
+! Format the message, then send it to everyone else in the cluster
+!
+MESSAGE_VECTOR [1] = 0;				! Use current system time
+MESSAGE_VECTOR [2] = NAM_DESC;			! Set addr of dev name descriptor
+FORMAT_MESSAGE (.RQCB, MESSAGE_VECTOR);
+CLUSMSG_RQCB_SEND (-1, CLM__DEVICE, .RQCB);	! Send it everywhere
+!
+! Log the message, and send it to all interested operators.
+! Every operator in the data base is a candidate for the message.
+!
+OCD_INDEX = MAX_SCOPE;
+WHILE (.OCD_INDEX GEQ MIN_SCOPE) DO
+    BEGIN
+    !
+    ! Scan the OCD list for each class of operator.
+    !
+    OCD_COUNT = .OCD_VECTOR [(.OCD_INDEX - 1) * 2 + 1];
+    OCD = .OCD_VECTOR [(.OCD_INDEX - 1) * 2];
+    WHILE (.OCD_COUNT GTR 0) DO
+	BEGIN
+	!
+	! Notify every operator in the OCD's operator list.
+	! Also log the message for each OCD.
+	!
+	RQCB [RQCB_L_OCD] = .OCD;		! Set OCD address
+	LOG_MESSAGE (.RQCB);			! Log the message
+	NOTIFY_LISTED_OPERATORS (.RQCB);	! Inform the operators
+	OCD_COUNT = .OCD_COUNT - 1;		! Decrement operator count
+	OCD = .OCD [OCD_L_FLINK];		! Get next OCD address
+	END;
+    OCD_INDEX = .OCD_INDEX - 1;
+    END;
+!
+! Free the rqcb
+!
+DEALLOCATE_RQCB (.RQCB);
+RETURN; 	
+
+END;						! End of DEVICE_HANDLER
+
+END						! End of DEVICE
+ELUDOM

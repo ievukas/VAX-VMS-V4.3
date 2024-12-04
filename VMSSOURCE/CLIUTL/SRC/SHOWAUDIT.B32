@@ -1,0 +1,396 @@
+MODULE showaudit ( IDENT = 'V04-000',
+		ADDRESSING_MODE (EXTERNAL = GENERAL)) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  SHOW Command
+!
+! ABSTRACT:
+!
+!	This module implements the DCL command SHOW AUDIT.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system, user and kernel mode
+!
+! AUTHOR:  Gerry Smith				29-Jun-1983
+!
+! Modified by:
+!
+!	V03-005	RSH0103		R. Scott Hanna		17-Feb-1984
+!		Fix field test 1 problems, comment out journaling code
+!		and make changes due to new layout of $NSAEVTDEF.
+!
+!	V03-004	RSH0102		R. Scott Hanna		05-Feb-1984
+!		Temporarily disable SHOW AUDIT.
+!
+!	V03-003	GAS0190		Gerry Smith		22-Sep-1983
+!		Fix an index which caused an accvio in file_access display.
+!
+!	V03-002	GAS0176		Gerry Smith		 9-Sep-1983
+!		Add more comments, remove some kludges, and straighten
+!		up the displays.
+!
+!	V03-001	GAS0171		Gerry Smith		24-Aug-1983
+!		Remove mailbox and terminal I/O, add remote and 
+!		interactive login/out.
+!
+!--
+
+!
+! Include files
+!
+LIBRARY 'SYS$LIBRARY:LIB';			! VAX/VMS common definitions
+!REQUIRE 'SHRLIB$:JNLDEFINT';			! Journal definitions
+
+!
+! Define the linkage for the routine that obtains the device name.
+!
+!LINKAGE
+!    CVTDEV = JSB (REGISTER = 0,			! Length of output buffer,
+!		  REGISTER = 1,			! Address of output buffer
+!		  REGISTER = 4,			! Format of device name
+!		  REGISTER = 5;			! Address of UCB
+!		  REGISTER = 1);		! Length of final name
+
+
+!
+! Declare some storage for tables
+!
+$ASSUME($BITPOSITION(nsa$v_evt_spare), EQL, 3)
+OWN
+    sys_events : VECTOR[3]			! System events
+		  INITIAL(%ASCID 'ACL',
+			  %ASCID 'MOUNT',
+			  %ASCID 'AUTHORIZATION'),
+    file_events : VECTOR[8]			! File access events
+    		  INITIAL(%ASCID 'FAILURE',
+    		          %ASCID 'SUCCESS',
+    		          %ASCID 'SYSPRV',
+    		          %ASCID 'BYPASS',
+    		          %ASCID 'UPGRADE',
+    		          %ASCID 'DOWNGRADE',
+    		          %ASCID 'GRPPRV',
+    		          %ASCID 'READALL'),
+    loginout_events : VECTOR[4]			! Loginout events
+		   INITIAL(%ASCID 'BREAKIN',
+			   %ASCID 'LOGIN',
+			   %ASCID 'LOGFAILURE',
+		    	   %ASCID 'LOGOUT'),
+    loginout_types : VECTOR[7]			! Types of login/logout
+		   INITIAL(%ASCID 'BATCH,',
+    			   %ASCID 'DIALUP,',
+    			   %ASCID 'LOCAL,',
+    			   %ASCID 'REMOTE,',
+    			   %ASCID 'NETWORK,',
+    			   %ASCID 'SUBPROCESS,',
+    			   %ASCID 'DETACHED,'),
+    access_types : VECTOR[5]			! Types of file access
+    		  INITIAL(%ASCID 'READ,',
+    			  %ASCID 'WRITE,',
+    			  %ASCID 'EXECUTE,',
+    			  %ASCID 'DELETE,',
+    			  %ASCID 'CONTROL,');
+
+!
+! Table of contents
+!
+FORWARD ROUTINE
+    show$audit : NOVALUE,		! Main module of SHOW AUDIT
+    decode_bits : NOVALUE;		! Make sense of all the bits
+!   get_device;				! Get device journal is going to
+
+!
+! Library routines
+!
+EXTERNAL ROUTINE
+    show$write_line : NOVALUE,
+!   ioc$cvt_devnam : CVTDEV,
+    str$append;
+
+
+!
+! Declare literals defined elsewhere
+!
+!EXTERNAL LITERAL
+!    show$_audreaderr,			! Error getting alarm/journal bits
+!    show$_auddeverr;			! Error getting journal device 
+
+
+!
+! Declare some cells in the exec
+!
+EXTERNAL
+    ctl$gq_procpriv : $BBLOCK,
+!   ctl$gl_ccbbase,
+!   nsa$gr_journvec,
+    nsa$gr_alarmvec;
+
+
+GLOBAL ROUTINE show$audit : NOVALUE =
+BEGIN
+
+!++
+! Functional description
+!
+!	This is the routine for the SHOW AUDIT command.  It is called
+!	from the SHOW command processor, and displays the class of events
+!	for which security audits and alarms are enabled.  If there is a
+!	security journal available, it also displays the device on which
+!	the journal file resides.
+!
+! Inputs
+!	None
+!
+! Outputs
+!	None
+!
+!--
+
+LOCAL
+!   status,
+    flags : VECTOR[nsa$k_evt_length,BYTE];
+!   arglist : VECTOR[2],
+!   device : VECTOR[2],
+!   dev_string : VECTOR[10];
+
+!
+! See if the user has the SECURITY privilege.
+!
+IF NOT .ctl$gq_procpriv[prv$v_security]
+THEN
+    BEGIN
+    SIGNAL(ss$_nosecurity);
+    RETURN;
+    END;
+
+!
+! Get and decode the bits in the alarm vector.
+!
+CH$MOVE(nsa$k_evt_length,			! Copy the alarm bits
+    	nsa$gr_alarmvec,			! to program local
+    	flags);					! storage.
+IF CH$EQL(nsa$k_evt_length,			! If no bits are 
+    	  flags,				! set, 
+    	  nsa$k_evt_length,
+    	  UPLIT BYTE(REP nsa$k_evt_length OF (0)))
+THEN show$write_line(%ASCID 'Security alarms currently disabled',
+    		     %REF(0))
+ELSE 
+    BEGIN
+    show$write_line(%ASCID 'Security alarms currently enabled for:',
+    		    %REF(0));
+    decode_bits(flags);
+    show$write_line(%ASCID ' ', %REF(0));
+    END;
+
+!
+! Get and decode the bits in the journal vector.
+!
+!CH$MOVE(nsa$k_evt_length,			! Copy the journal bits
+!    	nsa$gr_journvec,			! to program local
+!    	flags);					! storage.
+!IF CH$EQL(nsa$k_evt_length,			! If no bits are 
+!    	  flags,				! set, 
+!    	  nsa$k_evt_length,
+!    	  UPLIT BYTE(REP nsa$k_evt_length OF (0)))
+!THEN show$write_line(%ASCID 'Security journaling currently disabled',
+!    		     %REF(0))
+!ELSE 
+!    BEGIN
+!    show$write_line(%ASCID 'Security journaling currently enabled for:',
+!    		    %REF(0));
+!    decode_bits(flags);
+!    show$write_line(%ASCID ' ', %REF(0));
+
+!
+! If there are journal bits set, try to find out what device the journal
+! is writing to.
+!
+!    device[0] = %ALLOCATION(dev_string);
+!    device[1] = dev_string;
+!    arglist[0] = 1;
+!    arglist[1] = device;
+!    status = $CMEXEC(ROUTIN = get_device,
+!    	             ARGLST = arglist);
+!    IF .status
+!    THEN show$write_line(%ASCID 'Journaling file resides on !AS', %REF(device))
+!    ELSE SIGNAL(show$_auddeverr,
+!    		0,
+!		.status);
+!    END;
+
+RETURN;
+END;
+
+ROUTINE decode_bits (flags) : NOVALUE =
+BEGIN
+
+!++
+!
+! Given a set of bits, determine what security events are set.
+!
+! Inputs:
+!	flags - address of security alarm/journal vector
+!
+! Outputs:
+!	None.  The appropriate events are displayed.
+!
+!--
+
+MAP
+    flags : REF $BBLOCK;
+
+BIND
+    sys = flags[nsa$l_evt_sys] : BITVECTOR,
+    file_access = flags[nsa$l_evt_failure] : VECTOR,
+    log_event = flags[nsa$b_evt_logb] : VECTOR[,BYTE];
+
+!
+! Get the system-wide general events
+!
+INCR i FROM 0 TO $BITPOSITION(nsa$v_evt_spare)-1 DO
+    IF .sys[.i] THEN show$write_line(%ASCID '    !AS', sys_events[.i]);
+
+!
+! The loginout events
+!
+INCR j FROM 0 TO 3 DO
+    BEGIN
+    IF .log_event[.j] NEQ 0
+    THEN 
+	BEGIN
+	BIND
+	    login = log_event[.j] : BITVECTOR;
+	LOCAL
+	    desc : $BBLOCK[dsc$c_s_bln],
+	    arglist : VECTOR[2];
+	$init_dyndesc(desc);
+	INCR i FROM 0 TO 6 DO
+	    BEGIN
+	    IF .login[.i]
+	    THEN str$append(desc, .loginout_types[.i]);
+	    END;
+	desc[dsc$w_length] = .desc[dsc$w_length] - 1;
+	arglist[0] = .loginout_events[.j];
+	arglist[1] = desc;
+	show$write_line(%ASCID '    !12<!AS:!>(!AS)', arglist);
+	END;
+    END;
+    
+!
+! The file access events.
+!
+sys[0] = 0;					! Cheat, use SYS[0] as a flag.
+INCR i FROM 0 TO 7 DO				! Look at each type of file
+    BEGIN					! access cell
+    IF .file_access[.i] NEQ 0			! If something is set,
+    THEN					! display the info...
+	BEGIN
+	BIND
+	    access = file_access[.i] : BITVECTOR;	! Look at the cell
+	LOCAL						! as a set of bits.
+	    desc : $BBLOCK[dsc$c_s_bln],
+	    arglist : VECTOR[2];
+    	IF NOT .sys[0]					! If not yet done,
+    	THEN						! print a header.
+	    BEGIN
+	    show$write_line(%ASCID '    FILE_ACCESS:', %REF(0));
+	    sys[0] = 1;					! Show that header
+	    END;					! has been written.
+	$init_dyndesc(desc);				! Setup a descriptor
+	INCR j FROM 0 TO ($BITPOSITION(arm$v_fill) - 1) DO	! Go thru each
+	    BEGIN						! type of access
+	    IF .access[.j]					! type; if set,
+	    THEN str$append(desc, .access_types[.j]);		! add to display
+	    END;
+	desc[dsc$w_length] = .desc[dsc$w_length] -1;	! Strip trailing comma
+	arglist[0] = .file_events[.i];			! Get file option
+	arglist[1] = desc;				! and string of accesses
+	show$write_line(%ASCID '        !11<!AS:!>(!AS)', arglist);
+	END;
+    END;
+
+END;
+!
+!ROUTINE get_device (desc) =
+!BEGIN
+
+!+++
+!
+! Get the name of the device to which the security journal is writing.
+!
+! Inputs:
+!	desc - address of a descriptor, where to put the device name
+!
+! Outputs:
+!	desc - will be filled in with the ASCII string,
+!		 the name of the journal file device.
+!
+!---
+
+!MAP
+!    desc : REF VECTOR;
+
+!LOCAL
+!    status,
+!    chan : WORD,
+!    item_list : $ITMLST_DECL(ITEMS=2);
+
+!
+! Attempt to access the journal device.
+!
+!status = $ASSJNL(CHAN   = chan,
+!    		 ACMODE = UPLIT BYTE(jsb$c_exec),
+!    		 FLAGS  = cjf$m_read OR cjf$m_write,
+!		 JNLTYP = dt$_atjnl,
+!		 JNLNAM = %ASCID 'SECURITY');
+
+!IF NOT .status				! If the assign failed,
+!THEN RETURN .status;			! give up now.
+
+!
+! Now, using the channel, obtain the name of the device to which
+! the journal writes data.
+!
+!$ITMLST_INIT(ITMLST = item_list,	! Set up an item list
+!	    (ITMCOD = cji$_fildsknam,	! asking for the device name
+!	     BUFADR = .desc[1],		! Store it here,
+!	     BUFSIZ = .desc[0],	
+!	     RETLEN = desc[0]));	! and return the length here.
+
+!status = $GETCJI(CHAN = .chan,		! Do it.
+!	    	 ITMLST = item_list);
+
+!$DEASJNL(CHAN = .chan);
+
+!RETURN .status;				! Return the final status.
+!END;
+!
+	
+END
+ELUDOM

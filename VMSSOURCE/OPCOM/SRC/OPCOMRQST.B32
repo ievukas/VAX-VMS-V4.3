@@ -1,0 +1,574 @@
+MODULE	OPC$OPCOMRQST	(
+			 LANGUAGE (BLISS32),
+			 IDENT = 'V04-000'
+			) =
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:
+!
+!	OPCOM
+!
+! ABSTRACT:
+!
+!	This module contains the specialized logic to service
+!	a particular type of request sent by a user to OPCOM.
+!
+! Environment:
+!
+!	VAX/VMS operating system.
+!
+! Author:
+!
+!	Steven T. Jeffreys
+!
+! Creation date:
+!
+!	March 10, 1981
+!
+! Revision history:
+!
+!	V03-002	CWH3001		CW Hobbs		16-Sep-1983
+!		Use jacket routines for VM calls.
+!
+!	V03-001	CWH3001		CW Hobbs		30-Jul-1983
+!		Various and sundry things to make OPCOM distributed
+!		across the cluster.
+!
+! V02-0164	STJ0164		Steven T. Jeffreys,	08-Feb-1982
+!		Make references to library routines use general addressing mode.
+!
+!--
+
+BEGIN						! Start of OPCOMRQST
+
+LIBRARY	'SYS$LIBRARY:LIB.L32';
+LIBRARY 'LIB$:OPCOMLIB';
+
+FORWARD ROUTINE
+	REQUEST_HANDLER	: NOVALUE,		! Handle normal request
+	REQUEST_CLM_HANDLER : NOVALUE,		! Handle request from remote node
+	REQUEST_CLM_CHECK_HANDLER : NOVALUE;	! Check to see if request is in database
+
+BUILTIN
+	INSQUE,					! Insert entry onto a queue
+	REMQUE;					! Remove entry from a queue
+
+EXTERNAL
+	LCL_NOD		: $ref_bblock,
+	NOD_HEAD	: VECTOR [2, LONG],
+	GLOBAL_STATUS	: BITVECTOR,		! Global status bits
+	REQUEST_NUMBER	: LONG;			! Current request #
+
+EXTERNAL ROUTINE
+	CHECK_REQUEST,				! Common sanity checks
+	CLUSMSG_CONV_CLM_RQCB,			! Convert cluster message to RQCB
+	CLUSMSG_RQCB_SEND,			! Send RQCB to remote nodes
+	CLUSUTIL_INCR_SEQUENCE,			! Cluster-unique sequence incrementor
+	DEALLOCATE_MCB	: NOVALUE,		! Dispose of an MCB
+	DEALLOCATE_RQCB	: NOVALUE,		! Dispose of an RQCB
+	DUMP_LOG_FILE,				! Write random string to log file
+	FIND_OCD,				! Find a given OCD
+	FORMAT_MESSAGE,				! Format a message and create an MCB
+	LOG_MESSAGE,				! Write a message to a logfile
+	NOTIFY_LISTED_OPERATORS,		! Notify operators on an operator list
+	SEND_REPLY,				! Send reply to a requestor
+	TRIM_LENGTH;				! Length with trailing spaces trimmed
+
+GLOBAL ROUTINE REQUEST_HANDLER (BUFFER_DESC) : NOVALUE =
+
+!++
+! Functional description:
+!
+!	This routine is the handler for all REQUEST messages received by OPCOM.
+!
+!
+! Input:
+!
+!	BUFFER_DESC : The address of a quadword buffer descriptor that
+!		      describes the buffer containing the message.
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	Some accounting data will be updated 
+!	to reflect the receipt of the message.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of REQUEST_HANDLER
+
+MAP
+
+	BUFFER_DESC	: $ref_bblock;
+
+LOCAL
+	MESSAGE_VECTOR	: VECTOR [9, LONG],	! Message info
+	ON_BUF		: VECTOR [64, BYTE],	! Buffer for preposition (" on " node)
+	ON_DSC		: VECTOR [2, LONG]	! Desc for preposition
+			INITIAL (64, ON_BUF),
+	RQCB		: $ref_bblock,		! RQCB data structure
+	OCD		: $ref_bblock,		! OCD data structure
+	MCB		: $ref_bblock,		! MCB data structure
+	MSG		: $ref_bblock,		! Pointer to user request
+	FOUND		: LONG,			! Boolean
+	SCOPE		: LONG,			! Scope of request
+	SCOPE_LIMIT	: LONG,			! Loop control
+	STATUS		: LONG;
+
+EXTERNAL
+	LCL_NODENAME	: $bblock;		! Name of local node (DECnet or cluster)
+!
+! Make sure there is enough data in the request.
+!
+IF .BUFFER_DESC [DSC$W_LENGTH] LSS (OPC$K_COMHDRSIZ + OPC$K_REQUEST_MIN_SIZE)
+THEN
+    RETURN;					! Ignore the request
+!
+! Do some common sanity checks.
+!
+IF NOT CHECK_REQUEST (.BUFFER_DESC, RQCB)
+THEN
+    RETURN;
+MESSAGE_VECTOR [0] = 0;				! Assume no errors
+!
+! See if the requestor is issuing this request on another's behalf.
+! If so, and the requestor does not have the privilege to do so,
+! then dismiss the request.
+!
+IF .RQCB [RQCB_L_SENDERUIC] NEQ .RQCB [RQCB_L_UIC]
+THEN
+    IF  (NOT .$bblock [RQCB [RQCB_L_PRIVMASK1], PRV$V_OPER])
+    THEN
+	IF NOT ((.$bblock [RQCB [RQCB_L_SENDERUIC], 2,0,16,0] EQL .$bblock [RQCB [RQCB_L_UIC], 2,0,16,0]) AND
+		(.$bblock [RQCB [RQCB_L_PRIVMASK1], PRV$V_GROUP]))
+	THEN
+	    BEGIN
+	    MESSAGE_VECTOR [0] = OPC$_ILLRQST;
+	    MESSAGE_VECTOR [1] = 0;
+	    END;
+!
+! Create a descriptor within the RQCB to point to the request text.
+!
+MSG = .BUFFER_DESC [DSC$A_POINTER] + OPC$K_COMHDRSIZ;
+RQCB [RQCB_L_TEXT_LEN] = .MSG [OPC$W_REQUEST_LENGTH];
+IF (.RQCB [RQCB_L_TEXT_LEN] GTR 0)
+THEN
+    BEGIN
+    !
+    ! Create a buffer for the request text and copy the text to the buffer.
+    !
+    IF NOT (STATUS = OPC$GET_VM (RQCB [RQCB_L_TEXT_LEN], RQCB [RQCB_L_TEXT_PTR]))
+    THEN
+	BEGIN
+	DEALLOCATE_RQCB (.RQCB);
+	RETURN;
+	END;
+    CH$MOVE (.RQCB [RQCB_L_TEXT_LEN], MSG [OPC$T_REQUEST_TEXT], .RQCB [RQCB_L_TEXT_PTR]);
+    END
+ELSE
+    BEGIN
+    !
+    ! There is no request text.  Inform the requestor that this is not allowed.
+    !
+    MESSAGE_VECTOR [0] = OPC$_ILLRQST;
+    MESSAGE_VECTOR [1] = 0;
+    END;
+!
+! Find an OCD that can handle this request. The OCD is selected
+! according to the SCOPE and UIC of the requestor.  If the SCOPE
+! is unspecified, then look for operator coverage starting in the
+! least privileged scope and continuing to the most privileged.
+! If no OCD is found, then dismiss the request.
+!
+IF (.RQCB [RQCB_B_SCOPE] EQL OPC$K_UNSPEC)
+THEN
+    SCOPE_LIMIT = OPC$K_SYSTEM
+ELSE
+    SCOPE_LIMIT = .RQCB [RQCB_B_SCOPE];
+FOUND = FALSE;
+SCOPE = .RQCB [RQCB_B_SCOPE];
+WHILE (.SCOPE GEQ .SCOPE_LIMIT) AND (NOT .FOUND) DO
+    IF NOT (FOUND = FIND_OCD (.SCOPE, .RQCB [RQCB_L_UIC], OCD))
+    THEN
+	SCOPE = .SCOPE - 1;
+IF NOT .FOUND
+THEN
+    BEGIN
+    MESSAGE_VECTOR [0] = OPC$_NOPERATOR;		! No operator coverage
+    MESSAGE_VECTOR [1] = 0;
+    END;
+!
+! If there is an error message to output,
+! do so and dismiss the request.
+!
+IF .MESSAGE_VECTOR [0] NEQ 0
+THEN
+    BEGIN
+    FORMAT_MESSAGE (.RQCB, MESSAGE_VECTOR);
+    SEND_REPLY (.RQCB, MESSAGE_VECTOR);
+    DEALLOCATE_RQCB (.RQCB);
+    RETURN;
+    END;
+!
+! Set the scope of the request.
+! Format the request message and send it to all
+! interested operators on the OCD's operator list.
+!
+RQCB [RQCB_L_OCD] = .OCD;			! Save OCD address
+RQCB [RQCB_B_SCOPE] = .OCD [OCD_B_SCOPE];	! Set request scope
+IF .LCL_NODENAME [DSC$W_LENGTH] NEQ 0
+THEN
+    BEGIN
+    IF NOT (STATUS = $GETMSG (MSGID=OPC$_ON_NODE, MSGLEN=ON_DSC, BUFADR=ON_DSC, FLAGS=1))
+    THEN
+	$signal_stop (.STATUS);
+    END
+ELSE
+    ON_DSC [0] = 0;
+IF .RQCB [RQCB_W_REPLYMBX] NEQ 0			! Set the message code
+THEN
+    BEGIN						! Request with reply expected
+    REQUEST_NUMBER = CLUSUTIL_INCR_SEQUENCE (.REQUEST_NUMBER);	! Increment the number of request
+    RQCB [RQCB_L_RQSTNUM] = .REQUEST_NUMBER;		! Set the request number
+    MESSAGE_VECTOR [0] = OPC$_USERQST;			! Set the message code
+    MESSAGE_VECTOR [1] = 0;				! Set the message Nargs
+    MESSAGE_VECTOR [2] = .RQCB [RQCB_L_RQSTNUM];	! Set the request number
+    MESSAGE_VECTOR [3] = .RQCB [RQCB_W_USERNAMELEN];	! Set the username string length
+    MESSAGE_VECTOR [4] = RQCB [RQCB_T_USERNAME];	! Set the username string addr
+    MESSAGE_VECTOR [5] = ON_DSC;			! The " on " field
+    MESSAGE_VECTOR [6] = .LCL_NODENAME [DSC$W_LENGTH];	! Length of nodename
+    MESSAGE_VECTOR [7] = .LCL_NODENAME [DSC$A_POINTER];	! Length of nodename
+    MESSAGE_VECTOR [8] = RQCB [RQCB_L_TEXT_LEN];	! Set address request descriptor
+    END
+ELSE
+    BEGIN						! Request with no reply expected
+    MESSAGE_VECTOR [0] = OPC$_USERMSG;			! Set message code
+    MESSAGE_VECTOR [1] = 0;				! Set number of paramters
+    MESSAGE_VECTOR [2] = .RQCB [RQCB_W_USERNAMELEN];	! Set the username string length
+    MESSAGE_VECTOR [3] = RQCB [RQCB_T_USERNAME];	! Set the username string addr
+    MESSAGE_VECTOR [4] = ON_DSC;			! The " on " field
+    MESSAGE_VECTOR [5] = .LCL_NODENAME [DSC$W_LENGTH];	! Length of nodename
+    MESSAGE_VECTOR [6] = .LCL_NODENAME [DSC$A_POINTER];	! Length of nodename
+    MESSAGE_VECTOR [7] = RQCB [RQCB_L_TEXT_LEN];	! Set address request descriptor
+    END;
+FORMAT_MESSAGE (.RQCB, MESSAGE_VECTOR);			! Format the message
+IF NOTIFY_LISTED_OPERATORS (.RQCB)
+THEN
+    BEGIN
+    !
+    ! At least one operator was notified of the request, so send it off to the cluster.
+    ! Note that NOTIFY_LISTED_OPERATORS returns true if a remote operator is enabled for the
+    ! request, even if no operators on the local node were notified.
+    !
+    CLUSMSG_RQCB_SEND (-1, CLM__REQUEST, .RQCB);		! Send it everywhere
+    !
+    ! If the request expects a reply, then queue the RQCB
+    ! onto the OCD for future reference.  Log the request.
+    !
+    LOG_MESSAGE (.RQCB);
+    IF .RQCB [RQCB_W_REPLYMBX] NEQ 0
+    THEN
+	BEGIN
+	INSQUE (.RQCB, .OCD [OCD_L_RQSTFLINK]);
+	OCD [OCD_W_RQSTCOUNT] = .OCD [OCD_W_RQSTCOUNT] + 1;
+	$bblock [RQCB [RQCB_L_OPTIONS], OPC$V_NOBRD] = 0;	! Clear option bits
+	$bblock [RQCB [RQCB_L_OPTIONS], OPC$V_NOLOG] = 0;
+	END
+    ELSE
+	DEALLOCATE_RQCB (.RQCB);				! Dellocate the RQCB
+    END
+ELSE
+    BEGIN
+    !
+    ! None of the operators on the OCD's operator list were
+    ! enabled to receive the request.  If no reply is expected,
+    ! just return.  If a reply was expected, then cancel the
+    ! request and log the cancelation.
+    !
+    IF .RQCB [RQCB_W_REPLYMBX] NEQ 0
+    THEN
+	BEGIN
+	MESSAGE_VECTOR [0] = OPC$_NOPERATOR;
+	MESSAGE_VECTOR [1] = 0;
+	FORMAT_MESSAGE (.RQCB, MESSAGE_VECTOR);
+	SEND_REPLY (.RQCB);
+	LOG_MESSAGE (.RQCB);
+	END;
+    DEALLOCATE_RQCB (.RQCB);
+    END;
+	
+END;						! End of REQUEST_HANDLER
+
+GLOBAL ROUTINE REQUEST_CLM_HANDLER (BUFFER_DESC : $ref_bblock, CLM : $ref_bblock, LEN) : NOVALUE =
+
+!++
+! Functional description:
+!
+!	This routine is the handler for all REQUEST messages received by OPCOM from remote nodes.
+!
+!
+! Input:
+!
+!	BUFFER_DESC -	pointer to message from remote node, including $SNDOPR header
+!	CLM -		pointer to CLMRQCB structure
+!	LEN -		length of LEN
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	Some accounting data will be updated 
+!	to reflect the receipt of the message.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of REQUEST_CLM_HANDLER
+
+LOCAL
+	RQCB		: $ref_bblock,		! RQCB data structure
+	OCD		: $ref_bblock,		! OCD data structure
+	MCB		: $ref_bblock,		! MCB data structure
+	MSG		: $ref_bblock,		! Pointer to user request
+	FOUND		: LONG,			! Boolean
+	SCOPE		: LONG,			! Scope of request
+	SCOPE_LIMIT	: LONG,			! Loop control
+	STATUS		: LONG;
+
+
+!
+! Check the version number of the message.  If the message is from any other version,
+! simply ignore it.
+!
+IF .CLM [CLM_B_DS_VERSION] NEQ CLMRQCB_K_DS_VERSION
+THEN
+    RETURN DUMP_LOG_FILE (.BUFFER_DESC, %ASCID 'CLM__REQUEST mismatch');
+!
+! Allocate an RQCB and convert the message RQCB into the new RQCB
+!
+IF NOT CLUSMSG_CONV_CLM_RQCB (.CLM, RQCB)
+THEN
+    RETURN DUMP_LOG_FILE (.BUFFER_DESC, ascid_INVALIDRQCB);
+!
+! Find an OCD that can handle this request. The OCD is selected
+! according to the SCOPE and UIC of the requestor.  If the SCOPE
+! is unspecified, then look for operator coverage starting in the
+! least privileged scope and continuing to the most privileged.
+! If no OCD is found, then dismiss the request.
+!
+IF (.RQCB [RQCB_B_SCOPE] EQL OPC$K_UNSPEC)
+THEN
+    SCOPE_LIMIT = OPC$K_SYSTEM
+ELSE
+    SCOPE_LIMIT = .RQCB [RQCB_B_SCOPE];
+FOUND = FALSE;
+SCOPE = .RQCB [RQCB_B_SCOPE];
+WHILE (.SCOPE GEQ .SCOPE_LIMIT) AND (NOT .FOUND) DO
+    IF NOT (FOUND = FIND_OCD (.SCOPE, .RQCB [RQCB_L_UIC], OCD))
+    THEN
+	SCOPE = .SCOPE - 1;
+IF NOT .FOUND
+THEN
+    BEGIN
+    DEALLOCATE_RQCB (.RQCB);
+    RETURN;
+    END;
+RQCB [RQCB_L_OCD] = .OCD;			! Save OCD address
+RQCB [RQCB_B_SCOPE] = .OCD [OCD_B_SCOPE];	! Set request scope
+!
+! Tell the world about the request, first to the log file, then to the operators.  We
+! know that an operator was notified, otherwise the remote node would not have sent the
+! message.
+!
+LOG_MESSAGE (.RQCB);
+NOTIFY_LISTED_OPERATORS (.RQCB);
+!
+! At least one operator was notified of the request.  If the request expects a reply,
+! then queue the RQCB onto the OCD for future reference.
+!
+IF .RQCB [RQCB_W_REPLYMBX] NEQ 0
+THEN
+    BEGIN
+    INSQUE (.RQCB, .OCD [OCD_L_RQSTFLINK]);
+    OCD [OCD_W_RQSTCOUNT] = .OCD [OCD_W_RQSTCOUNT] + 1;
+    $bblock [RQCB [RQCB_L_OPTIONS], OPC$V_NOBRD] = 0;	! Clear option bits
+    $bblock [RQCB [RQCB_L_OPTIONS], OPC$V_NOLOG] = 0;
+    END
+ELSE
+    DEALLOCATE_RQCB (.RQCB);				! Dellocate the RQCB
+	
+END;						! End of REQUEST_CLM_HANDLER
+
+GLOBAL ROUTINE REQUEST_CLM_CHECK_HANDLER (BUFFER_DESC : $ref_bblock, CLM : $ref_bblock, LEN) : NOVALUE =
+
+!++
+! Functional description:
+!
+!	This routine is the handler for all CHECK_REQUEST messages received by OPCOM from remote nodes.
+!
+!
+! Input:
+!
+!	BUFFER_DESC -	pointer to message from remote node, including $SNDOPR header
+!	CLM -		pointer to CLMRQCB structure
+!	LEN -		length of LEN
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	Some accounting data will be updated 
+!	to reflect the receipt of the message.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of REQUEST_CLM_CHECK_HANDLER
+
+LOCAL
+	RQST		: $ref_bblock,		! RQCB data structure
+	RQCB		: $ref_bblock,		! RQCB data structure
+	OCD		: $ref_bblock,		! OCD data structure
+	MCB		: $ref_bblock,		! MCB data structure
+	MSG		: $ref_bblock,		! Pointer to user request
+	RQST_COUNT	: LONG,			! Count of requests
+	FOUND		: LONG,			! Boolean
+	SCOPE		: LONG,			! Scope of request
+	SCOPE_LIMIT	: LONG,			! Loop control
+	STATUS		: LONG;
+
+!
+! Check the version number of the message.  If the message is from any other version,
+! simply ignore it.
+!
+IF .CLM [CLM_B_DS_VERSION] NEQ CLMRQCB_K_DS_VERSION
+THEN
+    RETURN DUMP_LOG_FILE (.BUFFER_DESC, %ASCID 'CLM__CHECK_REQUEST mismatch');
+!
+! Allocate an RQCB and convert the message RQCB into the new RQCB
+!
+IF NOT CLUSMSG_CONV_CLM_RQCB (.CLM, RQCB)
+THEN
+    RETURN DUMP_LOG_FILE (.BUFFER_DESC, ascid_INVALIDRQCB);
+!
+! Find an OCD that can handle this request. The OCD is selected according to the SCOPE and UIC of the
+! requestor.  If the SCOPE is unspecified, then look for operator coverage starting in the least
+! privileged scope and continuing to the most privileged.  If no OCD is found, then dismiss the request.
+!
+IF (.RQCB [RQCB_B_SCOPE] EQL OPC$K_UNSPEC)
+THEN
+    SCOPE_LIMIT = OPC$K_SYSTEM
+ELSE
+    SCOPE_LIMIT = .RQCB [RQCB_B_SCOPE];
+FOUND = FALSE;
+SCOPE = .RQCB [RQCB_B_SCOPE];
+WHILE (.SCOPE GEQ .SCOPE_LIMIT) AND (NOT .FOUND) DO
+    IF NOT (FOUND = FIND_OCD (.SCOPE, .RQCB [RQCB_L_UIC], OCD))
+    THEN
+	SCOPE = .SCOPE - 1;
+IF NOT .FOUND
+THEN
+    BEGIN
+    DEALLOCATE_RQCB (.RQCB);
+    RETURN;
+    END;
+RQCB [RQCB_L_OCD] = .OCD;			! Save OCD address
+RQCB [RQCB_B_SCOPE] = .OCD [OCD_B_SCOPE];	! Set request scope
+!
+! Search through the requests queued to this OCD for the specified request.  If it is already present,
+! then free the RQCB and return.
+!
+RQST_COUNT = .OCD [OCD_W_RQSTCOUNT];	! Get # of requests
+RQST = .OCD [OCD_L_RQSTFLINK];		! Get first request address
+WHILE .RQST_COUNT GTR 0 DO
+    BEGIN
+    IF .RQCB [RQCB_L_RQSTNUM] NEQ .RQST [RQCB_L_RQSTNUM]
+    THEN
+	BEGIN
+	RQST_COUNT = .RQST_COUNT - 1;	! Decrement request count
+	RQST = .RQST [RQCB_L_FLINK];	! Get address of next request RQCB
+	END
+    ELSE
+	BEGIN
+	DEALLOCATE_RQCB (.RQCB);
+	RETURN;
+	END;
+    END;
+!
+! Tell the world about the request, first to the log file, then to the operators.  We
+! know that an operator was notified, otherwise the remote node would not have sent the
+! message.
+!
+LOG_MESSAGE (.RQCB);
+NOTIFY_LISTED_OPERATORS (.RQCB);
+!
+! Everything looks good, add it to the list
+!
+INSQUE (.RQCB, .OCD [OCD_L_RQSTFLINK]);
+OCD [OCD_W_RQSTCOUNT] = .OCD [OCD_W_RQSTCOUNT] + 1;
+	
+END;						! End of REQUEST_CLM_CHECK_HANDLER
+
+END						! End of OPCOMRQST
+ELUDOM

@@ -1,0 +1,451 @@
+MODULE RM3UPDDEL (LANGUAGE (BLISS32) ,
+		IDENT = 'V04-000'
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:	RMS32 INDEX SEQUENTIAL FILE ORGANIZATION
+!
+! ABSTRACT:
+!
+!	This module contains routines common to $UPDATE and $DELETE
+!
+! ENVIRONMENT:
+!
+!		VAX/VMS OPERATING SYSTEM
+!
+!--
+
+!
+! AUTHOR:        Todd M. Katz		RE-CREATION DATE:	17-Jul-1982
+!
+!
+! MODIFIED BY:
+!
+!	V03-009	JWT0183		Jim Teague		21-May-1984
+!		Fix cause of infrequent "invalid RRV" error.  If a
+!		record not in its original bucket is moved out of
+!		its current bucket as a result of a split, then any
+!		one who wants that record will get an "invalid RRV"
+!		error any time 1) after the split, and 2) before the
+!		RRV gets updated to point to the new location of
+!		the record.  The solution for now is just to retry
+!		the RRV a number of times.  Note that if anything 
+!		keeps the process from updating the RRV (waiting on
+!		the CPU, for example), large numbers of retries 
+!		may be necessary for those who are after the record.
+!		
+!	V03-008	MCN0002		Maria del C. Nasr	15-Mar-1983
+!		More linkages reorganization
+!
+!	V03-007 MCN0001		Maria del C. Nasr	01-Mar-1983
+!		Reorganize linkages
+!
+!	V03-006	TMK0004		Todd M. Katz		03-Feb-1983
+!		Add support for Recovery Unit Journalling and RU ROLLBACK
+!		Recovery of ISAM files. If RMS is within a Recovery Unit and
+!		pseudo record locking is enabled, then make sure all required
+!		record locking is done.
+!
+!	V03-005	RAS0116		Ron Schaefer		18-Jan-1983
+!		Enhance TMK0003 to match the corresponding .BUG correction;
+!		by returning the status of RMS$_RRV rather than RMS$_BUG
+!		if the repositioning fails.  Also simplify the IF-THEN-ELSE
+!		logic during repositioning.
+!
+!	V03-004	TMK0003		Todd M. Katz		27-Dec-1982
+!		I have added another method of positioning to the primary data
+!		record to be deleted/updated. This method is used when the
+!		attempt to position to the primary data record by means of its
+!		RFA fails because the RFA is incorrect, or has been deleted, and
+!		RMS positioned orginally to the current primary data record by
+!		means of the primary index. In this case RMS knows that the 
+!		record must be somewhere in the file, because it is the current 
+!		record for this stream, and that the primary key of the record
+!		resides in keybuffer 2. This primary key together with the RFA
+!		is used to position to the current primary data record by 
+!		searching the primary index by exact key value and comparing the
+!		RFA of the current primary data record with the RFA saved in
+!		each of the primary data records with this key value until a
+!		match is found.
+!
+!	V03-003	KBT0236		Keith B. Thompson	23-Aug-1982
+!		Reorganize psect
+!
+!	V03-002	TMK0002		Todd M. Katz		17-Jul-1982
+!		REFORMAT the routines within this module.
+!
+!*****
+
+LIBRARY 'RMSLIB:RMS';
+
+REQUIRE 'RMSSRC:RMSIDXDEF';
+
+! Define default PSECTS for code
+!
+PSECT
+    CODE = RM$RMS3(PSECT_ATTR),
+    PLIT = RM$RMS3(PSECT_ATTR);
+
+! Linkages
+!
+LINKAGE
+    L_ERROR_LINK1,
+    L_PRESERVE1,
+    L_QUERY_AND_LOCK,
+    L_RABREG_67,
+    L_RABREG_7;
+
+! External Routines
+!
+EXTERNAL ROUTINE
+    RM$CLEAN_BDB	: RL$ERROR_LINK1 NOVALUE,
+    RM$CSEARCH_TREE	: RL$RABREG_67,
+    RM$FIND_BY_RRV	: RL$RABREG_67,
+    RM$GETNEXT_REC	: RL$RABREG_67,
+    RM$KEY_DESC		: RL$RABREG_67,
+    RM$QUERY_HARD	: RL$QUERY_AND_LOCK ADDRESSING_MODE (GENERAL),
+    RM$RECORD_ID	: RL$RABREG_67,
+    RM$RECORD_VBN	: RL$PRESERVE1,
+    RM$UNLOCK_HARD	: RL$QUERY_AND_LOCK ADDRESSING_MODE (GENERAL);
+
+%SBTTL 'RM$UPDDELCOM'
+GLOBAL ROUTINE RM$UPDDELCOM : RL$RABREG_67 =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine performs common checks for $UPDATE and $DELETE.
+!
+!	1. As there must be a current primary data record to $DELETE or $UPDATE
+!	   a check is made for one.
+!
+!	2. If this is a $UPDATE, the temporary IRAB locations IRB$L_PUTUP_VBN
+!	   and IRB$W_PUTUP_ID are set up with the RFA address of the current
+!	   primary data record. This is so code common to $UPDATE and $PUT maybe
+!	   utilized.
+!
+!	3. The current primary data record is positioned to by means of its RFA
+!	   address. During this positioning the primary data bucket is accessed,
+!	   and if the opration is a $DELETE the RRV bucket (if there is one) is
+!	   accessed too. If for some reason the primary data record can not be
+!	   positioned to by its RFA, then it is positioned to by its key value
+!	   which will be found in keybuffer 2. This alternate positioning can
+!	   only be done if RMS originally positioned to the primary data record
+!	   by means of the primary index.
+!
+!	4. Unlock the current primary data record or just query its lock status
+!	   based upon whether record locking is necessary, automatic record
+!	   locking is or isn't requested, and whether the operation is a $DELETE
+!	   or an $UPDATE.
+!
+! CALLING SEQUENCE:
+!
+!	RM$UPDDELCOM()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	IFAB			- address if IFAB
+!	    IFB$W_KBUFSZ	- size of a keybuffer
+!	    IFB$V_NORECLK	- if set, no record locking is necessary
+!	    IFB$V_RUP		- if set, Recovery Unit is in progress
+!	    IRB$V_RU_RLK	- if set, pseudo record locking is enabled
+!
+!	IRAB			- address of IRAB
+!	    IRB$L_KEYBUF	- address of the contigious keybuffers
+!	    IRB$B_RP_KREF	- key of reference of last positioning
+!	    IRB$W_UDR_ID	- ID of current record(RRV)
+!	    IRB$L_UDR_VBN	- VBN of current record(RRV)
+!	    IRB$V_UNLOCK_RP	- if set, there is a current record to unlock
+!	    IRB$V_UPDATE	- if set, current operation is an $UPDATE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	IRAB			- address of the IRAB
+!	    IRB$B_CACHEFLGS	- the bit CSH$V_LOCK is set
+!	    IRB$L_CURBDB	- address of BDB for primary data bucket
+!	    IRB$L_NXTBDB	- address of BDB for RRV data bucket (or 0)
+!	    IRB$B_KEYSZ		- size of primary key (if alternate positioning)
+!	    IRB$L_PUTUP_VBN	- RFA VBN of record to be updated
+!	    IRB$W_PUTUP_ID	- RFA ID of record to be updated
+!	    IRB$W_SRCHFLAGS	- 0 (if alternate positioning is used)
+!	    IRB$V_UNLOCK_RP	- 0
+!
+!	REC_ADDR		- address of current primary data record
+!
+! ROUTINE VALUE:
+!
+!	BUG		- unable to position to primary data record
+!	CUR		- illegal or no current primary data record
+!	RNL		- current primary data record is not locked
+!	SUC		- success
+!
+! SIDE EFFECTS:
+!
+!	If RMS must perform a tree search to position to the current primary
+!	    data record then AP will be trashed.
+!	If record locking is unnecessary then the lock status of the current 
+!	    primary data record is not checked.
+!	If automatic locking is specified, then the current primary data record 
+!	    is unlocked only if the operation is a $DELETE. In the case of an
+!	    $UPDATE, just the existance of a lock on the current primary data
+!	    record is verified.
+!	If automatic locking is not specified then the current primary data
+!	    record is never unlocked, and the existance of a lock on the 
+!	    current primary data record is verified.
+!	If all goes successfully, RMS accesses the primary data bucket and
+!	    positions to the current primary data record. If there is an RRV for
+!	    the current primary data record and the operation is a $DELETE the
+!	    bucket containing it is accessed too.
+!	Otherwise, all accessed buckets are released.
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	COMMON_RAB_STR,
+	R_REC_ADDR,
+	R_IDX_DFN_STR;
+
+    LOCAL
+	FLAGS,
+	STATUS;
+
+    ! Initialize the IRB$L_NXTBDB and IRB$L_LOCK_BDB fields to 0.
+    !
+    IRAB[IRB$L_NXTBDB] = 0;
+    IRAB[IRB$L_LOCK_BDB] = 0;
+
+    ! If this stream does not have a current primary data record then 
+    ! immediately return an error.
+    !
+    IF  .IRAB[IRB$L_UDR_VBN] EQLU 0
+	  OR
+	.IRAB[IRB$W_UDR_ID] EQLU 0
+    THEN
+	RETURN (RMSERR(CUR));
+
+    ! If this operation is an $UPDATE then RMS saves the RFA address of the 
+    ! current primary data record in a temporary IRAB location (so that code 
+    ! common to both $PUT and $UPDATE maybe used), and sets up to signal the
+    ! routine RM$FIND_BY_RRV that there is no need to keep a lock on the RRV
+    ! bucket if the current primary data record is not in its original bucket.
+    !
+    IF .IRAB[IRB$V_UPDATE]
+    THEN
+	BEGIN
+	IRAB[IRB$L_PUTUP_VBN] = .IRAB[IRB$L_UDR_VBN];
+	IRAB[IRB$W_PUTUP_ID]  = .IRAB[IRB$W_UDR_ID];
+	FLAGS = 0;
+	END
+
+    ! If this operation is a $DELETE then RMS sets up to signal RM$FIND_BY_RRV
+    ! that if the current primary data record is not in its original bucket
+    ! it should keep a lock on the original bucket anyway since that bucket
+    ! contains the RRV for the current primary data record which must also be
+    ! deleted as part of the $DELETE.
+    !
+    ELSE
+	FLAGS = 1;
+
+    ! Position to the current primary data record locking the primary data
+    ! bucket and the RRV bucket (if it is required).
+    !
+    IRAB[IRB$B_CACHEFLGS] = CSH$M_LOCK;
+
+    STATUS = RM$FIND_BY_RRV (.IRAB[IRB$L_UDR_VBN], 
+			     .IRAB[IRB$W_UDR_ID], 
+			     .FLAGS);
+!
+! Here's the scoop -- if someone has split the bucket containing
+!	the desired record but hasn't updated the RRV yet, then
+!	we're going to get "invalid RRV" errors.  If we just got
+!	one of those errors, then release our bucket locks and
+!	retry a finite number of times until we can hopefully get 
+!	the new and improved RRV.
+!
+	IF .STATUS<0,16> EQLU RMSERR(RRV)
+	THEN
+	    INCRU I FROM 0 TO 25 DO
+		BEGIN
+		IRAB[IRB$B_CACHEFLGS] = CSH$M_LOCK;
+		IF (STATUS = RM$FIND_BY_RRV ( .IRAB[IRB$L_UDR_VBN],
+					  .IRAB[IRB$W_UDR_ID],
+					  .FLAGS))
+		THEN
+		    EXITLOOP;
+		END; 
+
+    ! If RMS encounters some obscure I/O error during its positioning by
+    ! means of the current record's RFA, return the obscure error. 
+    ! 
+    IF NOT .STATUS
+    THEN
+	BEGIN
+
+	IF .STATUS<0,16> NEQU RMSERR(DEL)
+	THEN
+	    RETURN .STATUS;
+
+	! If RMS is unable to position to the current primary data record 
+	! because its RFA has been deleted and is unable to use the alternate 
+	! positioning method because the primary index was not used during the
+	! positioning to the current primary data record, then also return an
+	! error.
+	! 
+	IF .IRAB[IRB$B_RP_KREF] NEQU 0
+	THEN
+	    RETURN RMSERR(RRV);
+
+	! If RMS is unable to position to the current primary data record 
+	! because either the RFA has been deleted, or does not currently 
+	! point to the current primary data record, then make use of the 
+	! current record's primary key in keybuffer 2, and the current 
+	! record's RFA to position to it.
+	!
+
+
+	! Retrieve the primary key index descriptor and set up to 
+	! position to the first record with this primary key value.
+	!
+	RM$KEY_DESC(0);
+
+	IRAB[IRB$B_KEYSZ] = .IDX_DFN[IDX$B_KEYSZ];
+	IRAB[IRB$W_SRCHFLAGS] = 0;
+
+	! Continue until either the current primary data record has
+	! been positioned to, or all records with this primary key
+	! have been exhausted.
+	!
+	WHILE 1
+	DO
+	    BEGIN
+
+	    GLOBAL REGISTER
+		R_BDB;
+
+	    BUILTIN
+		AP;
+
+	    ! If RMS is unable to position to the current primary data
+	    ! record by means of this alternate method, return a "bug"
+	    ! error.
+	    !
+	    IF NOT RM$CSEARCH_TREE()
+	    THEN
+		RETURN RMSERR(RRV);
+
+	    ! If the record current positioned to is in fact the current
+	    ! primary data record then leave the positioning loop;
+	    ! otherwise, position immediately to the record that follows
+	    ! and continue.
+	    !
+	    AP = 3;
+
+	    IF  .IRAB[IRB$W_UDR_ID] EQLU RM$RECORD_ID()
+		 AND
+		.IRAB[IRB$L_UDR_VBN] EQLU RM$RECORD_VBN()
+	    THEN
+		EXITLOOP
+	    ELSE
+		RM$GETNEXT_REC();
+
+	    END;
+	END;
+
+    ! Unlocking of the current primary data record.
+    !
+    ! It will never be necessary to unlock the current primary data record
+    ! when the file is opened for exclusive access unless the process is within
+    ! a Recovery Unit and pseudo record locking is indicated.
+    !
+    ! Always call the _HARD lock entry points to map REA held locks to a RNL 
+    ! status.  REA locked records are not protected from concurrent update or 
+    ! delete except by this mechanism.
+    !
+    IF  NOT .IFAB[IFB$V_NORECLK]
+	 OR
+	(.IFAB[IFB$V_RUP]
+		 AND
+		.IFAB[IFB$V_RU_RLK])
+    THEN
+	BEGIN
+
+	! If automatic record locking is specified and the operation is a 
+	! $DELETE then the current primary data record must be unlocked. Return
+	! an error if the record was not locked in the first place.
+	!
+	IF .IRAB[IRB$V_UNLOCK_RP]
+	     AND
+	    NOT .IRAB[IRB$V_UPDATE]
+	THEN
+	    BEGIN
+	    IRAB[IRB$V_UNLOCK_RP] = 0;
+
+	    RETURN_ON_ERROR (RM$UNLOCK_HARD (.IRAB[IRB$L_UDR_VBN], 
+					     .IRAB[IRB$W_UDR_ID]),	
+		BEGIN
+		IRAB[IRB$V_UPDATE] = 0;
+		RM$CLEAN_BDB();
+		STATUS = RMSERR(RNL);
+		END)
+	    END
+
+	! If either automatic record locking is specified and the operation
+	! is an $UPDATE or automatic record locking is not specified, just
+	! check that the current primary data record is locked, and return
+	! an error if it is not. If this is an $UPDATE and automatic record
+	! locking is specified, then the current primary data record will be
+	! unlocked after the $UPDATE completes.
+	!
+	ELSE
+	    IF RM$QUERY_HARD (.IRAB[IRB$L_UDR_VBN], 
+			      .IRAB[IRB$W_UDR_ID]) NEQU RMSSUC(OK_ALK)
+	    THEN
+		BEGIN
+		IRAB[IRB$V_UPDATE] = 0;
+		RM$CLEAN_BDB();
+		RETURN RMSERR(RNL);
+		END;
+
+	END;
+
+    RETURN RMSSUC();
+
+    END;					! end of routine
+
+END
+
+ELUDOM

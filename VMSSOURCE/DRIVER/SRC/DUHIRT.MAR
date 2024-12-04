@@ -1,0 +1,2652 @@
+	.TITLE	DUHIRT HOST INITIATED REPLACEMENT FOR THE DISK CLASS DRIVER
+	.IDENT	'V04-000'
+ 
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+
+;++
+;
+; FACILITY:
+;
+;	MSCP Disk Class Driver
+;
+; ABSTRACT:
+;
+;	Buddy!  You're in a world of HIRT (Host Inititated Replacement Table).
+;
+;	This module contains all the routines and data structure definitions 
+;	needed by the disk class driver to perform host initiated replacement 
+;	of questionable blocks on disks conforming to the DSA specification.
+;
+; ENVIRONMENT:
+;
+;	This module is linked into DUDRIVER, the VMS disk class driver.
+;
+;--
+;
+; AUTHOR: Ralph O. Weber (ghost writer for Robert L. Rappaport)
+;
+; CREATION DATE: 21-JAN-1984
+;
+; MODIFIED BY:
+;
+;	V03-004	ROW0398		Ralph O. Weber		21-JUL-1984
+;		Setup use of class driver write-lock bit in UCB$W_DEVSTS.  
+;		Also eliminate alteration and use of DEV$V_SWL bit in 
+;		UCB$L_DEVCHAR.  That bit is controlled by the file system.
+;
+;	V03-003	ROW0346		Ralph O. Weber		11-APR-1984
+;		> Add worst failure status reporting to insure that I/O 
+;		  requests producing failed replacement requests get failure 
+;		  status codes.
+;		> Add several more error logging points.
+;		> Supress error recovery and error correction when testing 
+;		  the possibly bad block in step 7.
+;		> Use cheep class driver macros for common functions like 
+;		  testing MSCP success/failure and initializing a MSCP command 
+;		  packet.
+;
+;	V03-002	ROW0332		Ralph O. Weber		 2-APR-1984
+;		Cause message to appear on the system console whenever an 
+;		error occurs during RDT processing.
+;
+;	V03-001	ROW0331		Ralph O. Weber		29-MAR-1984
+;		Change DU$CANCEL_FROM_HIRT to count wait count adjustment in 
+;		CDRP$W_DUTUCNTR.  Also add comments from old DUDRIVER to its 
+;		module header.
+;
+;--
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+	$CDDBDEF			;Define CDDB offsets
+	$CDRPDEF			;Define CDRP offsets
+	$CDTDEF				;Define CDT offsets
+	$CRBDEF				;Define CRB offsets
+	$DDBDEF				;Define DDB offsets
+	$DEVDEF				;Define DEVICE CHARACTERISTICS bits
+	$DYNDEF				;Define DYN symbols
+	$EMBLTDEF			;Define EMB Log Message Types
+	$FKBDEF				;Define FKB offsets
+	$IODEF				;Define I/O FUNCTION codes
+	$IPLDEF				;Define IPL levels
+	$IRPDEF				;Define IRP offsets
+	$MSCPDEF			;Define MSCP packet offsets
+	$MSLGDEF			;Define MSCP Error Log offsets
+	$PBDEF				;Define Path Block offsets
+	$PCBDEF				;Define PCB offsets
+	$PDTDEF				;Define PDT offsets
+	$PRDEF				;Define Processor Registers
+	$RCTDEF				;Define RCT offsets
+	$RDDEF				;Define RDTE offsets
+	$SBDEF				;Define System Block Offsets
+	$SCSCMGDEF			;Define SCS Connect Message offsets
+	$SSDEF				;Define System Status values
+	$UCBDEF				;Define UCB offsets
+	$VADEF				;Define Virtual Address offsets
+	$VECDEF				;Define INTERRUPT DISPATCH VECTOR offsets
+
+
+	$DUTUDEF			;Define common class driver CDDB
+					; extensions and other common symbols
+
+
+; CONSTANTS
+
+TEST_PATTERN=^xB6DBCB6D			; Pattern to write on bad blocks.
+
+;
+; MODULE PSECT
+;
+	.PSECT	$$$115_DRIVER LONG
+;
+; SET DEFAULT DISPLACEMENT
+;
+	.DEFAULT DISPLACEMENT WORD
+
+	.SBTTL	MACRO DEFINITIONS
+
+	.MACRO	HIRT_SUBSAVE		; Save return on HIRT substack.
+	POPL	@HIRT$L_STKPTR		; Pop return from stack onto substack.
+	ADDL	#4,HIRT$L_STKPTR	; Bump substack pointer.
+	.ENDM	HIRT_SUBSAVE
+
+	.MACRO	HIRT_SUBUNSAVE		; Pop top of SUBSTACK and push onto stack.
+	SUBL	#4,HIRT$L_STKPTR	; Pop substack.
+	PUSHL	@HIRT$L_STKPTR		; Put top of substack onto top of stack.
+	.ENDM	HIRT_SUBUNSAVE
+
+	.MACRO	HIRT_SUBRETURN		; HIRT_SUBUNSAVE and return to caller.
+	HIRT_SUBUNSAVE
+	RSB				; Return to subroutine caller.
+	.ENDM	HIRT_SUBRETURN
+
+;
+; Expanded opcode macros - Branch word conditional psuedo opcodes.
+;
+
+;
+; BWNEQ - Branch (word offset) not equal
+;
+
+	.MACRO	BWNEQ	DEST,?L1
+	.SHOW
+	BEQL	L1		; Branch around if NOT NEQ.
+	BRW	DEST		; Branch to destination if NEQ.
+L1:				; Around.
+	.NOSHOW
+	.ENDM	BWNEQ
+
+;
+; BWEQL - Branch (word offset) equal
+;
+
+	.MACRO	BWEQL	DEST,?L1
+	.SHOW
+	BNEQ	L1		; Branch around if NOT EQL.
+	BRW	DEST		; Branch to destination if EQL.
+L1:				; Around.
+	.NOSHOW
+	.ENDM	BWEQL
+
+;
+; BWBS - Branch (word offset) bit set.
+;
+
+	.MACRO	BWBS	BIT,FIELD,DEST,?L1
+	.SHOW
+	BBC	BIT,FIELD,L1		; Branch around if bit NOT set.
+	BRW	DEST			; Branch to destination if bit set.
+L1:					; Around.
+	.NOSHOW
+	.ENDM	BWBS
+
+;
+; BWBC - Branch (word offset) bit clear.
+;
+
+	.MACRO	BWBC	BIT,FIELD,DEST,?L1
+	.SHOW
+	BBS	BIT,FIELD,L1		; Branch around if bit NOT clear.
+	BRW	DEST			; Branch to destination if bit clear.
+L1:					; Around.
+	.NOSHOW
+	.ENDM	BWBC
+
+	.SBTTL	IRP - CDRP Consistancy Check
+
+; The following set of ASSUME statements will all be true as long as
+;	the IRP and CDRP definitions remain consistent.
+
+	ASSUME	CDRP$L_IOQFL-CDRP$L_IOQFL	EQ	IRP$L_IOQFL
+	ASSUME	CDRP$L_IOQBL-CDRP$L_IOQFL	EQ	IRP$L_IOQBL
+	ASSUME	CDRP$W_IRP_SIZE-CDRP$L_IOQFL	EQ	IRP$W_SIZE
+	ASSUME	CDRP$B_IRP_TYPE-CDRP$L_IOQFL	EQ	IRP$B_TYPE
+	ASSUME	CDRP$B_RMOD-CDRP$L_IOQFL	EQ	IRP$B_RMOD
+	ASSUME	CDRP$L_PID-CDRP$L_IOQFL		EQ	IRP$L_PID
+	ASSUME	CDRP$L_AST-CDRP$L_IOQFL		EQ	IRP$L_AST
+	ASSUME	CDRP$L_ASTPRM-CDRP$L_IOQFL	EQ	IRP$L_ASTPRM
+	ASSUME	CDRP$L_WIND-CDRP$L_IOQFL	EQ	IRP$L_WIND
+	ASSUME	CDRP$L_UCB-CDRP$L_IOQFL		EQ	IRP$L_UCB
+	ASSUME	CDRP$W_FUNC-CDRP$L_IOQFL	EQ	IRP$W_FUNC
+	ASSUME	CDRP$B_EFN-CDRP$L_IOQFL		EQ	IRP$B_EFN
+	ASSUME	CDRP$B_PRI-CDRP$L_IOQFL		EQ	IRP$B_PRI
+	ASSUME	CDRP$L_IOSB-CDRP$L_IOQFL	EQ	IRP$L_IOSB
+	ASSUME	CDRP$W_CHAN-CDRP$L_IOQFL	EQ	IRP$W_CHAN
+	ASSUME	CDRP$W_STS-CDRP$L_IOQFL		EQ	IRP$W_STS
+	ASSUME	CDRP$L_SVAPTE-CDRP$L_IOQFL	EQ	IRP$L_SVAPTE
+	ASSUME	CDRP$W_BOFF-CDRP$L_IOQFL	EQ	IRP$W_BOFF
+	ASSUME	CDRP$L_BCNT-CDRP$L_IOQFL	EQ	IRP$L_BCNT
+	ASSUME	CDRP$W_BCNT-CDRP$L_IOQFL	EQ	IRP$W_BCNT
+	ASSUME	CDRP$L_IOST1-CDRP$L_IOQFL	EQ	IRP$L_IOST1
+	ASSUME	CDRP$L_MEDIA-CDRP$L_IOQFL	EQ	IRP$L_MEDIA
+	ASSUME	CDRP$L_IOST2-CDRP$L_IOQFL	EQ	IRP$L_IOST2
+	ASSUME	CDRP$L_TT_TERM-CDRP$L_IOQFL	EQ	IRP$L_TT_TERM
+	ASSUME	CDRP$B_CARCON-CDRP$L_IOQFL	EQ	IRP$B_CARCON
+	ASSUME	CDRP$Q_NT_PRVMSK-CDRP$L_IOQFL	EQ	IRP$Q_NT_PRVMSK
+	ASSUME	CDRP$L_ABCNT-CDRP$L_IOQFL	EQ	IRP$L_ABCNT
+	ASSUME	CDRP$W_ABCNT-CDRP$L_IOQFL	EQ	IRP$W_ABCNT
+	ASSUME	CDRP$L_OBCNT-CDRP$L_IOQFL	EQ	IRP$L_OBCNT
+	ASSUME	CDRP$W_OBCNT-CDRP$L_IOQFL	EQ	IRP$W_OBCNT
+	ASSUME	CDRP$L_SEGVBN-CDRP$L_IOQFL	EQ	IRP$L_SEGVBN
+	ASSUME	CDRP$L_JNL_SEQNO-CDRP$L_IOQFL	EQ	IRP$L_JNL_SEQNO
+	ASSUME	CDRP$L_DIAGBUF-CDRP$L_IOQFL	EQ	IRP$L_DIAGBUF
+	ASSUME	CDRP$L_SEQNUM-CDRP$L_IOQFL	EQ	IRP$L_SEQNUM
+	ASSUME	CDRP$L_EXTEND-CDRP$L_IOQFL	EQ	IRP$L_EXTEND
+	ASSUME	CDRP$L_ARB-CDRP$L_IOQFL		EQ	IRP$L_ARB
+
+	.SBTTL	Static Storage
+	.SBTTL	- HIRT - Host Initiated Replacement Table
+
+;+
+; The following table is allocated within the Disk Class Driver.  There is 
+; only one such table per system.  The HIRT is used to control resources 
+; needed by the Host Initiated Replacement of disk blocks algorithms.  In 
+; order to limit the resources dedicated to this activity, only one such 
+; replacement is allowed to proceed at any given instant of time.  Replacement 
+; requests which cannot be immediately satisfied are queued.
+;-
+
+		.SAVE
+		.PSECT	$$$300_HIRT LONG
+
+HIRT$L_RPLQFL:	.LONG	0		; Request Queue FLINK.
+HIRT$L_RPLQTP:	.LONG	0		; Request Queue Tail Pointer.
+HIRT$W_IOST:	.WORD	0		; Static storage for routines.
+HIRT$W_IOWORST:	.WORD	0		; Worst I/O status encountered.
+		.WORD	0
+HIRT$W_STS:	.WORD	0		; HIRT status word.
+
+	$VIELD	HIRT,0,<-
+			<ACTIVE,,M>,-	; Set means HIRT has been initialized.
+			<BUSY,,M>,-	; Set means HIRT being used currently.
+			<FE,,M>,-	; Set means force error on original data
+			<MATCH,,M>,-	; SEARCH RCT bit - set => LBN matched
+			<EMPTYPE,,M>,-	; SEARCH RCT BIT - set => not primary
+			<RESCAN,,M>,-	; SEARCH RCT BIT - set => reached NULLS
+			<RCTFULL,,M>,-	; SEARCH RCT BIT - set => no more RBNs available
+			<ERLOGIP,,M>,-	; Error Log message has been generated
+			<RCTFE,,M>,-	; Write RCT block with Forced Error
+		       >
+
+HIRT$L_LOOPCNT:	.LONG	0		; Loop count used in READ_RCT_BLOCK and
+					;  WRITE_RCT_BLOCK.
+HIRT$L_OWNUCB:	.LONG	0		; If HIRT busy, owner UCB address.
+HIRT$L_LBN:	.LONG	0		; LBN being replaced for UCB.
+HIRT$L_SAVDCDRP:.LONG	0		; CDRP address of I/O request of owner.
+HIRT$L_CDRP:	.LONG	0		; Address of permanent CDRP for replacement.
+
+HIRT$L_PAGE0PTR:.LONG	0		; System Virtual Address of scratch page
+					;  needed by Replacement algorithm.
+HIRT$L_PAGE1PTR:.LONG	0		; System Virtual Address of scratch page
+					;  needed by Replacement algorithm.
+HIRT$L_PAGE2PTR:.LONG	0		; System Virtual Address of scratch page
+					;  needed by Replacement algorithm.
+HIRT$L_PAGE3PTR:.LONG	0		; System Virtual Address of scratch page
+					;  needed by Replacement algorithm.
+
+HIRT$L_SVAPTE0:	.LONG	0		; SVAPTE of page 0.
+HIRT$L_SVAPTE1:	.LONG	0		; SVAPTE of page 1.
+HIRT$L_SVAPTE2:	.LONG	0		; SVAPTE of page 2.
+HIRT$L_SVAPTE3:	.LONG	0		; SVAPTE of page 3.
+
+HIRT$W_BOFF0:	.WORD	0		; BOFF of page 0.
+HIRT$W_BOFF1:	.WORD	0		; BOFF of page 1.
+HIRT$W_BOFF2:	.WORD	0		; BOFF of page 2.
+HIRT$W_BOFF3:	.WORD	0		; BOFF of page 3.
+
+; Array of words that give the relative RCT sector number contained in a page.
+
+HIRT$W_PG0CNTNT:.WORD	0		; Page 0 contents.
+HIRT$W_PG1CNTNT:.WORD	0		; Page 1 contents.
+HIRT$W_PG2CNTNT:.WORD	0		; Page 2 contents.
+HIRT$W_PG3CNTNT:.WORD	0		; Page 3 contents.
+
+; Static storage needed by several routines that read and write RCT blocks.
+
+HIRT$W_SECTORNO:.WORD	0		; Sector number.
+HIRT$W_PAGENO:	.WORD	0		; Page number.
+
+; Static storage needed by SEARCH_RCT subroutine.
+
+HIRT$L_RBN:	.LONG	0 		; RBN returned to caller.
+HIRT$L_MATCHRBN:.LONG	0		; Previous RBN that failed.
+HIRT$L_BADRBND:	.LONG	0		; Bad RBN descriptor contents,
+					;  used in STEP15 error recovery.
+HIRT$L_STARTBLK:.LONG	0		; Sector number of Primary RBN.
+HIRT$L_RCTBLOCK:.LONG	0		; Current RCT sector number.
+HIRT$L_OFFSET:	.LONG	0		; Offset into current RCT sector.
+
+; HIRT SUBSTACK - used by single threaded replacement algorithm as a return
+;	point stack.
+
+HIRT$L_STKPTR:	.LONG	0		; Pointer to top of SUBSTACK.
+HIRT$L_SUBSTACK:.LONG	0,0,0,0,0	; SUBSTACK itself.
+HIRT$K_SUBSTKLN=<.-HIRT$L_SUBSTACK>/4	; Total length of SUBSTACK in longwords.
+
+	.RESTORE
+	.PAGE
+	.SBTTL	- HIR Error Processing Information
+
+;  Constants used in forming HIR error messages
+
+	$VIELD	HIRER, 0, <-
+		<STEP,8,M>, -			; Step number
+		<TYPE,4,M>, -			; Error type
+		<ONLINE,,M> -			; Online (not HIR)
+		>
+HIRER$M_REPLACE = 0
+
+						; Error type codes:
+HIRER$K_READ	= 1				;	READ
+HIRER$K_WRITE	= 2				;	WRITE
+HIRER$K_RCTFULL = 3				;	RCT FULL
+HIRER$K_REPFAIL = 4				;	REPLACE FAILURE
+
+	.SAVE
+	.PSECT	$$$301_HIR_ERRORS LONG
+
+HIR_ERR_TYPES:
+
+	.BYTE	0
+	.ASCIC	/READ/
+	.ASCIC	/WRITE/
+	.ASCIC	/RCT FULL/
+	.ASCIC	/REPLACE FAILURE/
+
+HIR_ERR_REPLACE:
+
+	.ASCIC	/REPLACE/
+
+HIR_ERR_ONLINE:
+
+	.ASCIC	/ONLINE/
+
+HIR_ERR_SEG1:
+
+	.ASCIC	/ encountered a /
+
+HIR_ERR_SEG2:
+
+	.ASCIC	/ error in /
+
+HIR_ERR_SEG3:
+
+	.ASCIC	/ step /
+
+;
+; Compute maximum HIR message size
+;
+
+DEVNAMSIZ = 18				; size of a device name
+TYPSIZ	  =  7				; largest error type character count
+FUNCSIZ   =  7				; largest REPLACE/ONLINE character count
+STEPSIZ	  =  2				; max characters in step number
+FIXEDSIZ  = <. - HIR_ERR_SEG1> + 1	; size of fixed text
+
+HIRER$K_DEVNAMSIZ = DEVNAMSIZ
+SIZE = FIXEDSIZ + DEVNAMSIZ + TYPSIZ + FUNCSIZ + STEPSIZ
+HIRER$K_MSGSIZE = <SIZE + 3> & ^c3
+
+	.RESTORE
+
+;++
+;
+; HIR_ERROR
+;
+;	This macro calls the HIR error reporting routine.
+;
+; Parameters:
+;
+;	STEP	step number in which the error occured
+;	TYPE	error type (one of READ / WRITE / RCTFULL)
+;	FUNC	function incuring error (one of REPLACE / ONLINE; 
+;		default = REPLACE)
+;--
+
+	.MACRO	HIR_ERROR step, type, func=REPLACE
+	ASSUME	HIRER$V_ONLINE LE 15
+	MOVZWL	#<HIRER$M_'func' -
+		+<HIRER$K_'type' @ HIRER$V_TYPE > -
+		+ 'step'>, R0
+	BSBW	DU$HIR_ERROR
+	.ENDM	HIR_ERROR
+
+	.SBTTL	DU$INIT_HIRT - Initialize Host Initiated Replacement Table
+;++
+;
+; DU$INIT_HIRT - Initialize Host Initiated Replacement Table
+;
+; Functional Description:
+;
+;	This routine initializes the HIRT, if it has not already been 
+;	initialized.  There is one HIRT per system and it resides in the
+;	disk class driver.  It is initialized the first time an intelligent 
+;	controller that requires Host Initiated Bad Block Replacement is 
+;	brought online.
+;
+;	HIRT initialization includes setting up its FLINK and BLINK, allocating
+;	a permanent CDRP for it, allocating an RSPID for it, allocating an
+;	MSCP buffer (without Send Credit on any connection) and allocating
+;	four pages of memory that are needed by the replacement algorithm.
+;
+; Inputs:
+;
+;	R3	CDDB address
+;	R4	PDT address
+;	R5	Connection permanent CDRP address
+;
+; Outputs:
+;
+;	Registers R0-R2 are modified.
+;	Registers R3-R5 are preserved.
+;
+; Implicit Outputs:
+;
+;	The HIRT is initialized as described above.
+;--
+
+DU$INIT_HIRT::
+
+	POPL	CDDB$L_SAVED_PC(R3)	; Save caller's PC in CDDB.
+	BBCS	s^#HIRT$V_ACTIVE,-	; Now see if HIRT already init'ed.
+		HIRT$W_STS,10$
+	BRW	END_INIT_HIRT		; Branch around if already initialized.
+
+10$:	CLRL	HIRT$L_RPLQFL		; Singly linked list with second
+	MOVAB	HIRT$L_RPLQFL,-		;  longword pointing to tail of list.
+		HIRT$L_RPLQTP
+
+	BISW	s^#HIRT$M_BUSY, -	; Prevent use of HIRT until fully
+		HIRT$W_STS		;  init'ed.
+;
+; Allocate the CDRP to be used and re-used during the I/O operations 
+; associated with dynamic Host Initiated Replacement of bad blocks.
+;
+
+20$:	MOVZWL	#IRP$K_LENGTH,R1	; R1 contains amount of space to alloc.
+	BSBW	ALLOC_POOL		; Allocate space. Returns R2=>space.
+
+	MOVB	#DYN$C_IRP,-		; Make first part of CDRP look like an
+		IRP$B_TYPE(R2)		;  IRP.
+	MOVW	R1,IRP$W_SIZE(R2)	; Save type and size inside "IRP".
+	MOVAB	-CDRP$L_IOQFL(R2),R5	; R5 => CDRP portion of packet.
+	MOVL	R5,HIRT$L_CDRP		; Save address of replacement CDRP.
+	MOVW	#CDRP$L_IOQFL,-		; Size field in CDRP portion is negative
+		CDRP$W_CDRPSIZE(R5)	;  offset of IRP from CDRP portion.
+	MOVB	#DYN$C_CDRP,-		; Mark type of CDRP portion.
+		CDRP$B_CD_TYPE(R5)
+	CLRL	CDRP$L_CDT(R5)		; So far we have no connection for CDRP.
+	CLRL	CDRP$L_RWCPTR(R5)	; This CDRP will not use RWAITCNT.
+	CLRL	CDRP$L_LBUFH_AD(R5)	; Signal that no mapping resources allocated.
+
+	CLRL	CDRP$L_RSPID(R5)	; Clear RSPID to show none yet allocated.
+	CLRL	CDRP$L_MSG_BUF(R5)	; Likewise show no MSCP buffer.
+	MOVZBL	#CDRP$M_HIRT, -		; Set HIRT permanent CDRP flag.
+		CDRP$L_DUTUFLAGS(R5)
+
+;
+; Allocate pages from pool to serve as buffers when reading RCT sectors
+; during replacement of bad blocks on a disk.
+;
+
+50$:	MOVZWL	#512+12,R1		; R1 contains amount of space for a
+					;  page and a VMS structure header.
+
+	MOVAB	CDDB$A_PRMCDRP(R3), R5	; ALLOC_POOL needs R5 => Permanent CDRP.
+	BSBW	ALLOC_POOL		; Allocate space. Returns R2=>space.
+	MOVL	HIRT$L_CDRP,R5		; Restore R5 => Hirt CDRP.
+
+	ASSUME	CDDB$B_SUBTYPE  EQ  CDDB$B_TYPE+1
+	MOVW	#DYN$C_CLASSDRV-	; Place type and subtype descriptors
+		!<DYN$C_CD_BBRPG@8>,-	;  into header using convenient (CDDB)
+		CDDB$B_TYPE(R2)		;  offset definition.
+	MOVW	R1,CDDB$W_SIZE(R2)	; Also place size into header.
+	MOVAB	12(R2),R2		; R2 => beyond VMS structure header.
+	CLRL	R1			; Clear loop index register.
+
+80$:	TSTL	HIRT$L_PAGE0PTR[R1]	; Test where to put address of allocated page.
+	BEQL	90$			; EQL implies we have found a depository.
+	INCL	R1			; Else bump index register
+	BRB	80$			;  and go back and try again.
+
+90$:	MOVL	R2,HIRT$L_PAGE0PTR[R1]	; Else save Page address.
+	BICW3	#^XFE00,R2,-		; Calculate BOFF of page just allocated
+		HIRT$W_BOFF0[R1]	;  and save it in the Indexed slot.
+	EXTZV	S^#VA$V_VPN,-		; Now calculate SVAPTE of allocated
+		S^#VA$S_VPN,R2,R2	;  page.  First get VPN.
+	MOVL	G^MMG$GL_SPTBASE,R0	; Then R0 => base of system page table.
+
+	MOVAL	(R0)[R2],HIRT$L_SVAPTE0[R1]
+					; Move SVAPTE into proper slot.
+	CMPL	R1,#3			; See if we are done allocating.
+	BLSS	50$			; LSS implies NO, so we go to try again.
+
+	BICW	s^#HIRT$M_BUSY, -	; Allow use of HIRT now that it has
+		HIRT$W_STS		;  been initialized.
+	MOVAB	CDDB$A_PRMCDRP(R3), R5	; Get controller permanent CDRP in R5.
+
+END_INIT_HIRT:
+	JMP	@CDDB$L_SAVED_PC(R3)	; Return to caller.
+
+	.SBTTL	ALLOC_POOL
+
+;+
+; This subroutine allocates and zeroes nonpaged pool.
+;
+; Inputs:
+;
+;	R1			-# bytes of pool to allocate
+;	R5			-Addr of CDRP
+;	
+; Outputs:
+;
+;	R0			-0/1 for fail/success
+;	R1			-# bytes actually allocated
+;	R2			-Addr of buffer allocated
+;-
+
+ALLOC_POOL:				; Allocate and zero pool
+
+	PUSHL	R3			; Save R3.
+	JSB	G^EXE$ALONONPAGED	; Allocate from nonpaged pool
+	BLBC	R0,10$			; Skip clearing structure if failure
+	PUSHR	#^M<R0,R1,R2,R4,R5>	; Save MOVC registers
+	MOVC5	#0,(SP),#0,R1,(R2)	; Zero initialize structure
+
+	POPR	#^M<R0,R1,R2,R4,R5>	; Restore MOVC registers
+	POPL	R3			; Restore R3.
+	RSB
+
+10$:	; Allocation failure.
+	; Prepare to wait awhile before trying again.
+
+	POPL	CDRP$L_FR3(R5)		; Save R3 in R5=>UCB or CDRP.
+	MOVL	R4, CDRP$L_FR4(R5)	; Likewise R4
+	POPL	CDRP$L_SAVD_RTN(R5)	; and caller's return address.
+	MOVL	R1, CDRP$L_RSPID(R5)	; Save allocation size.
+	FORK_WAIT			; Wait awhile.
+	MOVL	CDRP$L_RSPID(R5), R1	; Restore size of block to allocate.
+	CLRL	CDRP$L_RSPID(R5)	; Restore CDRP field.
+	PUSHL	CDRP$L_SAVD_RTN(R5)	; Restore caller's return address.
+	BRB	ALLOC_POOL		; Go try again.
+
+	.SBTTL	DU$LOCK_HIRT - Gain exclusive access to HIRT
+;++
+;
+; DU$LOCK_HIRT - Gain exclusive access to HIRT
+;
+; Functional Description:
+;
+; 	Gain exclusive access to the H(ost) I(initiated) bad block 
+;	R(eplacement) T(able).  Also, lockout new activity on the unit by 
+;	bumping UCB$W_RWAITCNT.
+;
+; Inputs:
+;
+;	R3	UCB address
+;	R5	a fork block
+;
+; Implicit Inputs:
+;
+;	 (SP)	caller's return address
+;	4(SP)	caller's caller's return address
+;
+; Outputs:
+;
+;	R0 - R2 are modified.
+;	All other registers are preserved.
+;
+; Implicit Outputs:
+;
+;	HIRT is owned by caller.
+;--
+
+DU$LOCK_HIRT::
+
+	BBS	s^#HIRT$V_ACTIVE, -	; Make sure HIRT is active.
+		HIRT$W_STS, 5$
+	BUG_CHECK	DISKCLASS,FATAL
+
+5$:	INCW	UCB$W_RWAITCNT(R3)	; Prevent new CDRP's from being begun
+					;  on this UCB.
+	BBCS	s^#HIRT$V_BUSY, -		; Allocate the Host Initiated Replace-
+		HIRT$W_STS, 10$		;  ment Table (HIRT).
+
+	MOVQ	R3, FKB$L_FR3(R5)	; If here, already allocated, save
+	POPL	FKB$L_FPC(R5)		;  thread context in fork block.
+
+	; Thread R5 (a fork block) onto the tail of the singly threaded list
+	; of fork blocks awaiting use of the HIRT.  The listhead is a quadword
+	; whose first longword points to the first fork block on the list and
+	; whose second longword points to the last forkblock on the list.  An
+	; empty list is characterized by having the first longword contain a 
+	; zero with the second longword pointing to the first longword.  Each 
+	; fork block on the list, has the first longword of its link quadword 
+	; pointing to the next fork block on the list, with the last fork 
+	; block containing a zero in this longword.  The second longword of 
+	; each fork block's link quadword contains the address of the CDDB of 
+	; the intelligent controller associated with the device unit 
+	; attempting to gain exclusive use of the HIRT.
+	;
+	; Note the reason for CDDB address here is to facilitate finding CDRPs
+	; associated with a CONNECTION that has failed (gone down).
+
+	CLRL	FKB$L_FQFL(R5)		; Prepare this fork block to be at
+					;  tail of the list.
+	MOVL	UCB$L_CDDB(R3), -	; Second longword of link quadword
+		FKB$L_FQBL(R5)		;  points to CDDB.
+	MOVAB	FKB$L_FQFL(R5), -	; Move address of this fork block into
+		@HIRT$L_RPLQTP		;  forward ptr of previous tail.
+	MOVAB	FKB$L_FQFL(R5), -	; Also move address of this fork block
+		HIRT$L_RPLQTP		;  to list tail pointer.
+	RSB				; Terminate this execution thread by
+					;  returning to caller's caller.
+
+10$:	; The HIRT is owned.
+	BSBB	GRANT_HIRT		; Call to initialize various structures
+					;  with data of the new HIRT owner.
+	RSB				; And return to caller who now owns HIRT.
+
+	.SBTTL	GRANT_HIRT - Complete granting access to the HIRT
+;++
+;
+; GRANT_HIRT - Complete granting access to the HIRT
+;
+; Functional Description:
+;
+; 	This routine is called from DU$LOCK_HIRT and DU$UNLOCK_HIRT, upon 
+;	granting ownership of the HIRT to a thread.  GRANT_HIRT initializes 
+;	various data fields reflecting this ownership and facilitating the 
+;	thread's use of the HIRT CDRP.
+;
+; Note:
+;	Since both subroutines that require ownership of the HIRT, REPLACE_LBN 
+;	and ONLINE_COMPLETE, make use of the user's original RSPID so as to be 
+;	able to co-relate all Error Log messages generated by a user I/O 
+;	request, GRANT_HIRT passes the RSPID form the user CDRP to the HIRT 
+;	permanent CDRP.
+;
+; Inputs:
+;
+;	R3	UCB address
+;	R5	User CDRP address
+;
+;Outputs:
+;
+;	Various HIRT and CDRP fields updated.
+;--
+
+GRANT_HIRT:
+
+	PUSHL	CDRP$L_RSPID(R5)	; Pass current RSPID to HIRT CDRP.
+	CLRL	CDRP$L_RSPID(R5)	; Prevent spurious deallocates.
+	MOVL	R5, HIRT$L_SAVDCDRP	; Save given R5.
+	MOVAB	HIRT$L_SUBSTACK, -	; Initialize SUBSTACK in HIRT.
+		HIRT$L_STKPTR
+	MOVL	R3, HIRT$L_OWNUCB	; Indicate who owns HIRT.
+
+	MOVL	(SP), R5		; Get RSPID.
+	MOVQ	R0, -(SP)		; Save registers.
+	FIND_RSPID_RDTE			; Lookup RDT for RSPID.
+	BLBS	R0, 10$			; Branch if lookup successful.
+	BUG_CHECK	DISKCLASS,FATAL	; Else, major inconsistancy.
+10$:	MOVL	HIRT$L_CDRP, -		; For now pass ownership of RDTE to HIRT
+		RD$L_CDRP(R5)		;  permanent CDRP.
+	MOVQ	(SP)+, R0		; Restore saved registers.
+	MOVL	HIRT$L_CDRP,R5		; R5 => permanent replacement CDRP.
+	POPL	CDRP$L_RSPID(R5)	; Pickup RSPID to use thruout replacement.
+	CLRL	CDRP$L_LBUFH_AD(R5)	; Indicate no resources yet allocated
+	CLRL	CDRP$L_MSG_BUF(R5)	;  except RSPID.
+	MOVL	R3,CDRP$L_UCB(R5)	; Make HIRT permanent CDRP => this UCB.
+					;  This allow UNIBUS mapping to work.
+	MOVL	UCB$L_CDT(R3),-		; Place CDT pointer into CDRP for handy
+		CDRP$L_CDT(R5)		;  reference by SCS routines.  Note this
+					;  must be done each time the HIRT is
+					;  locked since we may be using a different
+					;  port (and therefore CONNECTION) each
+					;  time.
+	MOVAB	UCB$W_RWAITCNT(R3),-	; Point CDRP field to UCB field.
+		CDRP$L_RWCPTR(R5)
+	BICW	#HIRT$M_ERLOGIP,-	; Initialize bit.
+		HIRT$W_STS
+	RSB				; Return to caller.
+
+	.SBTTL	DU$UNLOCK_HIRT - Release HIRT access
+;++
+;
+; DU$UNLOCK_HIRT - Release HIRT access
+;
+; Functional Description:
+;
+;	Caller wishes to relinquish exclusive control of the HIRT.
+;	It becomes the current owner's obligation to restart the first
+;	thread (if any are there) that may be waiting on the HIRT wait
+;	list.
+;
+; Note: 
+;
+;	DU$UNLOCK_HIRT passes back the user's RSPID from the HIRT permanent
+;	CDRP to the user's CDRP.
+;
+; Inputs:
+;
+;	R3	UCB of HIRT owner
+;
+; Implicit Inputs:
+;
+;	HIRT owned by caller
+;
+; Outputs:
+;
+;	R5	Original CDRP address
+;	All other registers are preserved.
+;
+; Implicit Outputs:
+;
+;	HIRT ownership relinquished.  If any threads are on the HIRT wait list,
+;	first of these is granted HIRT ownership and is started up.
+;--
+
+DU$UNLOCK_HIRT::
+
+	DECW	UCB$W_RWAITCNT(R3)	; Decrement to again allow normal I/O.
+	MOVQ	R0, -(SP)		; Save some registers.
+	PUSHR	#^M<R2,R3,R4>		; Save more registers.
+	MOVL	R3, R5			; Setup UCB for UNSTALLUCB.
+	JSB	G^SCS$UNSTALLUCB	; Call to start up IRP's on UCB$L_IOQFL.
+	POPR	#^M<R2,R3,R4>		; Restore registers.
+
+	MOVL	HIRT$L_CDRP,R5		; R5 => HIRT CDRP.
+	PUSHL	CDRP$L_RSPID(R5)	; Save current RSPID so as to restore to
+					;  user CDRP.
+	BEQL	15$			; EQL implies RSPID has been deallocated
+					;  due to re-CONNECT. Branch around.
+	CLRL	CDRP$L_RSPID(R5)	; Prevent spurious deallocates.
+	MOVL	(SP), R5		; Get RSPID.
+	FIND_RSPID_RDTE			; Lookup RDT entry for RSPID.
+	BLBS	R0, 5$			; Branch if lookup successful.
+	BUG_CHECK	DISKCLASS,FATAL	; Else, major inconsistancy.
+5$:	MOVL	HIRT$L_SAVDCDRP, R0	; Get saved CDRP address.
+	BNEQ	10$			; Branch if there still is a saved CDRP.
+					; Else, it has been canceled.
+	MOVL	RD$L_CDRP(R5), R5	; Which means, use HIRT CDRP.
+	POPL	CDRP$L_RSPID(R5)	; Restore its RSPID so it can be
+	DEALLOC_RSPID			; deallocated.
+	BRB	19$			; And branch around.
+
+10$:	MOVL	R0, RD$L_CDRP(R5)	; Pass ownership of RDTE back to user 
+15$:	POPL	R0			; Get RSPID.
+	MOVL	HIRT$L_SAVDCDRP, R5	; Get original CDRP address in R5.
+	BEQL	19$			; Branch if original CDRP canceled.
+	MOVL	R0, CDRP$L_RSPID(R5)	; Else, restore user's original RSPID.
+
+19$:	MOVQ	(SP)+, R0		; Restore 1st group of saved registers.
+
+
+	TSTL	HIRT$L_RPLQFL		; Determine if HIRT wait list is empty.
+	BEQL	50$			; EQL implies list empty.
+
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; Save caller's registers.
+
+	MOVL	HIRT$L_RPLQFL,R5	; R5 => 1st fork block on list.
+	MOVL	FKB$L_FQFL(R5),-	; Replace 1st fork block on list with
+		HIRT$L_RPLQFL		;  next fork block.
+	BNEQ	35$			; NEQ implies there was a next fork block.
+	MOVAB	HIRT$L_RPLQFL,-		; Else wait list is now empty, so re-
+		HIRT$L_RPLQTP		;  direct list Tail Pointer to listhead.
+35$:	MOVQ	FKB$L_FR3(R5),R3	; Restore waiting thread's context.
+	BSBW	GRANT_HIRT		; Call to initialize various structures
+					;  with data of the new HIRT owner.
+	MOVL	HIRT$L_SAVDCDRP,R0	; R0 => User CDRP. Now
+	JSB	@FKB$L_FPC(R0)		;  resume its waiting thread.
+	POPR	#^M<R0,R1,R2,R3,R4,R5>	; Restore relinquisher's registers.
+	RSB				; And return to relinquisher.
+
+50$:					; If here, list was empty.
+	BICW	s^#HIRT$M_BUSY, -	; So mark HIRT as NOT busy.
+		HIRT$W_STS
+	RSB				; And return to relinquisher.
+
+	.SBTTL	DU$TEST_HIRT_RWAITCNT - Accumulate RWAITCNT for HIRT
+;++
+;
+; DU$TEST_HIRT_RWAITCNT - Accumulate RWAITCNT for HIRT
+;
+; Functional Description:
+;
+;	This routine accumulates an RWAITCNT value for the input UCB based 
+;	upon the amount RWAITCNT has been increment for HIRT usage.
+;
+; Inputs:
+;
+;	R0	RWAITCNT accumulator
+;	R5	UCB address
+;
+; Outputs:
+;
+;	R0	RWAITCNT accumulator (with additions for HIRT usage)
+;	R1	destroyed
+;
+;	All other registers preserved.
+;--
+
+DU$TEST_HIRT_RWAITCNT::
+
+	BBC	s^#HIRT$V_BUSY, HIRT$W_STS, 90$	; Branch if HIRT not busy.
+
+	CMPL	R5, HIRT$L_OWNUCB		; Is the UCB the HIRT owner?
+	BNEQ	10$				; Branch if not HIRT owner.
+	INCL	R0				; Else, increment RWAITCNT.
+
+10$:	ASSUME	FKB$L_FQFL EQ 0
+	MOVAB	HIRT$L_RPLQFL, R1		; Init. "previous" wait CDRP.
+11$:	MOVL	FKB$L_FQFL(R1), R1		; Link to next waiting CDRP.
+	BEQL	90$				; Branch if no more waiters.
+	CMPL	R5, CDRP$L_UCB(R1)		; Is this waiter for this UCB?
+	BNEQ	11$				; Branch if not right UCB.
+	INCL	R0				; Else, increment RWAITCNT.
+	BRB	11$				; Loop, till no more waiters.
+
+90$:	RSB					; All done; exit.
+
+	.SBTTL	DU$CANCEL_FROM_HIRT - Cancel requests from the HIRT
+;++
+;
+; DU$CANCEL_FROM_HIRT - Cancel requests from the HIRT
+;
+; Functional Description:
+;
+;	This routine is called to locate and cancel any I/O requests current 
+;	or pending for host initiated replacement.  The queue of pending 
+;	requests is scanned.  The then current HIRT owner is tested.
+;
+;	The HIRT wait queue is scanned and all CDRPs that meet the cancel 
+;	criteria are removed from the HIRT wait queue and queued for I/O post 
+;	processing.  The current owner of the HIRT (if any) is similarly 
+;	tested against the cancel criteria and if needed it too is queued for 
+;	I/O post processing.  The HIRT is left "ownerless" in the sense that 
+;	HIRT$L_SAVDCDRP is left zero.  This allows the current HIRT I/O to 
+;	continue until it completes on its own.  Then, when the HIRT is 
+;	UNLOCKED, the "ownerless" state is noticed and the HIRT thread for the 
+;	former owner is evaporated.
+;
+; Inputs:
+;
+;	R3	UCB address
+;	R5	Cancel CDRP address
+;
+; Implicit Inputs:
+;
+;	CDRP$W_DUTUCNTR(R5)	count of number of times to increment RWAITCNT
+;				after cancel is completed.
+;
+; Outputs:
+;
+;	R0 through R2 are destroyed
+;	All other registers are preserved.
+;
+; Implicit Outputs:
+;
+;	CDRP$W_DUTUCNTR(R5)	count of number of times to increment RWAITCNT
+;				after cancel is completed.
+;--
+
+DU$CANCEL_FROM_HIRT::
+
+	BBC	s^#HIRT$V_BUSY, -	; Is the HIRT busy?  If not, there is
+		HIRT$W_STS, 900$	; nothing to do: so branch to exit.
+
+	; Scan the HIRT pending requests queue
+
+	ASSUME	FKB$L_FQFL EQ 0
+	MOVAB	HIRT$L_RPLQFL, R1	; Get "previous" CDRP on wait list.
+
+10$:	MOVL	FKB$L_FQFL(R1), R2	; Get nect CDRP.
+	BEQL	100$			; Branch if no more CDRPs on wait list.
+	CMPL	UCB$L_CDDB(R3), -	; Is CDRP for this CDDB?
+		FKB$L_FQBL(R2)
+	BNEQ	40$			; Branch if not the right CDDB.
+	IFCANCEL cdrp=(R2), then=70$	; Branch if CDRP should be canceled.
+40$:	MOVL	R2, R1			; Current becomes previous.
+	BRB	10$			; Loop through all waiting CDRPs.
+
+70$:	MOVL	FKB$L_FQFL(R2), -	; Unlink cancelable CDRP.
+		FKB$L_FQFL(R1)
+	BNEQ	75$			; If cancelable CDRP was last,
+	MOVL	R1, HIRT$L_RPLQTP	; adjust queue tail pointer.
+75$:	MOVL	R2, R0			; Setup CDRP to cancel.
+	INCW	CDRP$W_DUTUCNTR(R5)	; Account for RWAITCNT increment during
+					; attempt to lock the HIRT.
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; Save registers.
+	MOVL	R0, R5			; Setup for message deallocate.
+	DEALLOC_MSG_BUF			; Deallocate End Message that told of
+					; block to be replaced.
+	POPR	#^M<R0,R1,R2,R3,R4,R5>	; Restore registers.
+	POST_CDRP status=SS$_CANCEL	; Insert IRP/CDRP in IOPOST queue.
+	BRB	10$			; Branch back to scan entire list.
+
+100$:	; Is the HIRT owner a cancelable CDRP?  If so retrieve this HIRT owner 
+	; CDRP, clear HIRT$L_SAVDCDRP, and POST_CDRP the retrieved CDRP.  Note 
+	; this works in conjunction with DU$UNLOCK_HIRT and DU$RSTRTQ_HIRT_CDRP
+	; which must be prepared to find HIRT$L_SAVDCDRP = 0.
+
+	CMPL	HIRT$L_OWNUCB, -	; Check for correct HIRT owner UCB.
+		CDRP$L_UCB(R5)
+	BNEQ	900$			; Branch in wrong HIRT owner.
+	MOVL	HIRT$L_SAVDCDRP, R2	; Get CDRP owner of HIRT.
+	BEQL	900$			; Branch if owner already canceled,
+					; replacement running to completion.
+	IFNOCANCEL cdrp=(R2), then=900$	; Branch if owner shouldn't be canceled.
+	CLRL	HIRT$L_SAVDCDRP		; Else, indicate HIRT owner canceled.
+	MOVL	R2, R0			; Setup CDRP to cancel.
+	; Following instruction deleted due to its causing RWAITCNT to be 
+	; decremented twice; once here and once Replacement runs to completion.
+	;INCW	CDRP$W_DUTUCNTR(R5)	; Account for owning the HIRT.
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; Save registers.
+	MOVL	R0, R5			; Setup for message deallocate.
+	DEALLOC_MSG_BUF			; Deallocate End Message that told of
+					; block to be replaced.
+	POPR	#^M<R0,R1,R2,R3,R4,R5>	; Restore registers.
+	POST_CDRP status=SS$_CANCEL	; Insert IRP/CDRP in IOPOST queue.
+
+900$:	RSB				; Return to caller.
+
+	.SBTTL	DU$DISCONNECT_HIRT - Do HIRT cleanup for a disconnect
+;++
+;
+; DU$DISCONNECT_HIRT - Do HIRT cleanup for a disconnect
+;
+; Functional Description:
+;
+;	Scan the HIRT wait queue for CDRPs belonging to this CDDB.  Remove 
+;	them and place on the restart queue.  This must be done before the RDT 
+;	resource wait is scanned.  It is essential to deallocate SCS resources 
+;	held by CDRPs on the HIRT wait queue before scanning any of the SCS 
+;	resource wait queues.
+;
+; Inputs:
+;
+;	R3	CDDB address
+;	R4	PDT address
+;	R5	Permanent CDRP address
+;
+; Outputs:
+;
+;	R0 through R2 are destroyed.
+;	All other registers are preserved.
+;--
+
+DU$DISCONNECT_HIRT::
+
+	BBC	s^#HIRT$V_ACTIVE, -	; See if HIRT has been activated.
+		HIRT$W_STS, 99$		; If HIRT not active, branch around.
+	PUSHL	R5			; Save a register.
+
+30$:	ASSUME	FKB$L_FQFL EQ 0
+	MOVAB	HIRT$L_RPLQFL, R0	; Get "previous" CDRP on wait list.
+
+40$:	MOVL	FKB$L_FQFL(R0), R5	; Get next CDRP on wait list.
+	BEQL	90$			; Branch if no more waiting CDRPs.
+	CMPL	R3, FKB$L_FQBL(R5)	; See if waiter has right CDDB.
+	BNEQ	60$			; Branch if wrong CDDB.
+	MOVL	FKB$L_FQFL(R5), -	; Let previous point to next.
+		FKB$L_FQFL(R0)		
+	BNEQ	50$			; Branch if current CDRP is not last.
+	MOVL	R0, HIRT$L_RPLQTP	; Else, previous is new end.
+50$:	MOVL	CDRP$L_UCB(R5), R0	; Get UCB of interest.
+	DECW	UCB$W_RWAITCNT(R0)	; Decrement count incremented during
+					; attempt to allocate HIRT.
+	BSBW	DUTU$INSERT_RESTARTQ	; Insert this CDRP in restart queue.
+	BRB	30$			; Branch back to re-scan entire
+					; HIRT wait queue.
+60$:	; Setup to move to next waiting CDRP.
+	MOVL	R5, R0			; Current becomes previous.
+	BRB	40$			; Loop back.
+
+90$:	POPL	R5			; Restore saved register.
+99$:	RSB				; Return to caller.
+
+	.SBTTL	DU$RSTRTQ_HIRT_CDRP - Do connection failed cleanup of HIRT CDRP
+;++
+;
+; DU$RSTRTQ_HIRT_CDRP - Do connection failed cleanup of HIRT CDRP
+;
+; Functional Description:
+;
+;	This routine is called by DUTU$INSERT_RESTARTQ when it is discovered 
+;	that the CDRP destined for the restart queue is the HIRT permanent 
+;	CDRP.  This action is taken instead of placing the HIRT permanent CDRP 
+;	on the restart queue.
+;
+;	The CDRP owning the HIRT is located and processed with a recursive 
+;	call to DUTU$INSERT_RESTARTQ.  Any mapping resources owned by the HIRT 
+;	permanent CDRP are copied to one of the CDDB permanent CDRPs.  This 
+;	allows the resources to be deallocated sometime after the connection 
+;	is DISCONNECTed.  This prevents "insane" servers for incorrectly 
+;	overwriting memory due to reallocation of mapping resources.  Finally, 
+;	the HIRT is unlocked, thus making it available for some other 
+;	replacement operation.
+;
+; Inputs:
+;
+;	R3	CDDB address
+;	R4	PDT address
+;	R5	HIRT permanent CDRP address
+;
+; Outputs:
+;
+;	R0 is destroyed.
+;	All other registers are preserved.
+;--
+
+DU$RSTRTQ_HIRT_CDRP::
+
+	PUSHL	R5			; Save permanent replacement CDRP addr.
+	MOVL	HIRT$L_SAVDCDRP, R5	; Get HIRT owner CDRP address.
+	BEQL	10$			; Branch if HIRT owner was canceled.
+	BBS	#CDRP$V_PERM, -		; Branch if HIRT owner was a CDDB
+		CDRP$L_DUTUFLAGS(R5), - ; permanent CDRP.
+		10$
+	BSBW	DUTU$INSERT_RESTARTQ	; Insert HIRT owner on restart queue.
+10$:	POPL	R5			; Restore HIRT permanent CDRP addr.
+
+	TSTL	CDRP$L_LBUFH_AD(R5)	; Were mapping resources allocated?
+	BEQL	20$			; Branch if no mapping res. allocated.
+	CLRL	CDRP$L_LBUFH_AD(R5)	; Prevent duplicate deallocations.
+	MOVAB	CDDB$A_PRMCDRP(R3), R0	; Get CDDB permanent CDRP address.
+	MOVAB	CDRP$T_LBUFHNDL(R0), -	; Put address of Local BUFfer HaNDLe
+		CDRP$L_LBUFH_AD(R0)	; field into field that points to it.
+	ASSUME	CDRP$L_UBARSRCE EQ CDRP$T_LBUFHNDL+12
+	MOVQ	CDRP$T_LBUFHNDL(R5), -	; Copy contents of buffer handle to
+		CDRP$T_LBUFHNDL(R0)	; CDDB permanent CDRP.  Also copy
+	MOVQ	CDRP$T_LBUFHNDL+8(R5), -; CDRP$L_UBARSRCE in case this is
+		CDRP$T_LBUFHNDL+8(R0)	; a UNIBUS controller.
+
+20$:	PUSHL	R3			; Save CDDB address.
+	MOVL	CDRP$L_UCB(R5), R3	; Setup UCB for unlocking HIRT.
+	BSBW	DU$UNLOCK_HIRT		; Release HIRT.
+	POPL	R3			; Restore CDDB address.
+
+	RSB				; Return
+
+	.SBTTL	DU$REPLACE_LBN - Replace a failing block
+;++
+;
+; DU$REPLACE_LBN - Replace a failing block
+;
+; Functional Description:
+;
+; 	Perform dynamic bad block replacement.  At the time of invocation, 
+;	the HIRT is already owned by the caller.
+;
+;	Also entry to this routine made be made by branching (from subroutine
+;	ONLINE_COMPLETE) to labels STEP7 and STEP11.
+;
+; Inputs:
+;
+;	R3	UCB address
+;	R5	HIRT permanent CDRP address
+;
+; Implicit Inputs:
+;
+;	CDRP$L_RSPID(R5)	user RSPID
+;	HIRT$L_SAVDCDRP 	original user CDRP address
+;
+;	HIRT owned by caller which implies HIRT SUBSTACK is operative
+;
+; Outputs:
+;
+;	R0	Replacement status
+;	R1	Setting for CDRP$V_ERLIP
+;	R3	UCB address (unchanged)
+;
+;	R2, R4, R5 destroyed.
+;	All other registers preserved.
+;--
+
+
+DU$REPLACE_LBN::
+
+	HIRT_SUBSAVE			; Save callers return point on SUBSTACK.
+	MOVL	HIRT$L_SAVDCDRP,R0	; R0 => original CDRP.
+	MOVL	CDRP$L_MSG_BUF(R0),R0	; R0 => END PACKET.
+	MOVL	MSCP$L_FRST_BAD(R0),-	; Indicate which LBN we are
+		HIRT$L_LBN		;  fixing on this unit.
+	MOVW	#SS$_NORMAL, -		; Initialize worst case I/O status.
+		HIRT$W_IOWORST
+
+; Invalidate contents of incore scratch pages.
+
+	ASSUME	HIRT$W_PG0CNTNT+2	EQ	HIRT$W_PG1CNTNT
+	MNEGL	#1,HIRT$W_PG0CNTNT	; Invalidate pages 0 and 1.
+
+	ASSUME	HIRT$W_PG2CNTNT+2	EQ	HIRT$W_PG3CNTNT
+	MNEGL	#1,HIRT$W_PG2CNTNT	; Invalidate pages 2 and 3.
+
+
+	ALLOC_MSG_BUF			; Allocate a send credit.
+	BLBS	R0,10$			; Branch around if successful alloc.
+	BRW	REPLACE_CONNECT_FAILURE	; If we had an allocation failure branch,
+10$:
+
+; STEP 4 of replacement algorithm.
+; We clear (zero) a sector sized buffer, then read the  current
+;   contents  of  the bad block into the buffer.  The buffer is cleared first
+;   for the rare case when no data can be transferred (such as a  valid  sync
+;   pattern  is not detected).  The read is performed with error recovery and
+;   error correction enabled.  In addition to saving the  data,  we
+;   remember  whether  or  not  the  read  succeeded.   The  saved  data  is
+;   considered valid if the read succeeded, or invalid if it did not.
+;
+
+; First we zero out the buffer to receive the contents of the failing block.
+
+	PUSHR	#^M<R2,R3,R4,R5>	; Save registers.
+	MOVC5	#0,.,#0,#512,-		; Clear page 1 prior to read.
+		@HIRT$L_PAGE1PTR
+	POPR	#^M<R2,R3,R4,R5>	; Restore registers.
+
+; Step 4 continued.  Prepare the CDRP with SVAPTE, BOFF, and BCNT of page 1
+;	(receiving field for upcoming read) so as to facilitate mapping of
+;	this region.
+
+	MOVL	#1,R0			; Pass page to map to subroutine.
+	BSBW	MAP_PAGE		; Map page 1.
+
+; Step 4 continued. Prepare the MSCP packet to read failing block into page 1.
+
+	BSBW	FILL_RCT_PACKET		; Subroutine that fills most fields in
+					;  MSCP packet. Returns R2=>MSCP packet.
+	MOVB	#MSCP$K_OP_READ,-	; Copy the READ opcode, field not filled
+		MSCP$B_OPCODE(R2)	;  by above subroutine.
+	MOVL	HIRT$L_LBN,-		; And also the LBN of the bad block.
+		MSCP$L_LBN(R2)
+
+	SEND_MSCP_MSG			; Send message to the MSCP server.
+
+	BBC	#MSCP$V_EF_ERLOG,-	; Test for error log message generated
+		MSCP$B_FLAGS(R2),15$	;  and branch around if not.
+	BISW	#HIRT$M_ERLOGIP,-	; Else remember that error log messages
+		HIRT$W_STS		;  Have been generated.
+15$:
+
+	UNMAP				; Release mapping resources.
+	CLRL	CDRP$L_LBUFH_AD(R5)	; Show no mapping resources allocated.
+	MOVL	CDRP$L_MSG_BUF(R5),R2	; Refresh R2 after unmap.
+
+; Remember status of read of failing block so as to be able to write it later
+; 	with or without the forced error flag.
+
+	BICW	s^#HIRT$M_FE,HIRT$W_STS ; Initialize bit.
+	IF_MSCP	SUCCESS, then=20$	; Branch if READ succeeded.
+	BISW	s^#HIRT$M_FE,HIRT$W_STS	; Set bit if read failed.
+20$:
+
+; Step 5.
+;  Record the data obtained when the bad block was read  during  step  4  in
+;  sector  1  of each RCT copy.  If the data cannot be successfully recorded
+;  in the RCT, report the error to the error log and go to  step  18.   Note
+;  that  the  Multi-Write algorithm used to record the data in sector 1 uses
+;  write-compare operations to  guarantee  that  the  data  is  successfully
+;  recorded.
+;
+
+STEP5:
+
+; Write contents of page 1 to sector 1 of each RCT copy.
+
+	MOVL	#1,R0			; Pass sector and page number to routine,
+	MOVW	R0,HIRT$W_PG1CNTNT	; Indicate that page 1 contains RCT sector
+					;  #1.
+	BSBW	WRITE_RCT_BLOCK		; Call internal subroutine to write.
+	BLBS	R0,STEP6		; LBS implies successful write to at
+	HIR_ERROR -			; Signal HIR error.
+		step=5, type=WRITE
+	BRW	STEP18			; And branch to step 18.
+
+; Step 6. Record bad block's LBN, whether or not the saved data is valid and
+;	the fact that we are now in phase 1 of replacement in sector 0 of each
+;	RCT copy.  This means that we read sector 0 modify it and
+;	then rewrite the updated sector to each RCT copy.  If we cannot
+;	read any sector 0 successfully, we go to step 18.  If we cannot
+;	successfully write at least one sector 0, we go to step 17.
+
+STEP6:
+	CLRQ	R0			; Prepare to read sector #0 into page #0.
+					;  We pass the page number in R0 and
+					;  the sector number in R1.
+
+	BSBW	READ_RCT_BLOCK		; Call to read RCT block.
+	BLBS	R0,10$			; LBS implies successful read.
+	HIR_ERROR -			; Signal HIR error.
+		step=6, type=READ
+	BRW	STEP18			; On failure goto step 18.
+10$:
+	MOVL	HIRT$L_PAGE0PTR,R0	; R0 => sector 0 in memory.
+	MOVL	HIRT$L_LBN,-		; Copy bad block's LBN to RCT sector
+		RCT$L_LBN(R0)		;  0 copy in memory.
+
+	BISW	#RCT$M_RP1,RCT$W_FLAGS(R0); Set bit to signal phase 1.
+	BICW	#RCT$M_RP2-		  ; Clear bit to signal not phase 2
+		!RCT$M_BR-		  ;  clear bad RBN flag,
+		!RCT$M_FE,-		  ;  and also clear force error before
+		RCT$W_FLAGS(R0)		  ;  testing for valid data.
+
+	BBC	s^#HIRT$V_FE, -		; See if original data is valid.
+		HIRT$W_STS, 20$ 
+	BISW	#RCT$M_FE, -		; Set force error if appropriate.
+		RCT$W_FLAGS(R0)
+20$:
+	CLRL	R0			; Rewrite page 0.
+	BSBW	WRITE_RCT_BLOCK		; Go to rewrite sector 0.
+	BLBS	R0,STEP7		; LBS implies successful rewrite.
+	HIR_ERROR -			; Signal HIR error.
+		step=6, type=WRITE
+	BRW	STEP17			; And go to step 17.
+; STEP7.
+;  Write and read test patterns on the  suspected  bad  block  to  determine
+;  whether  or  not  it  is  in  fact  a  bad  block.
+;  Go  to  step  9  if  the  test  patterns  fail,
+;  indicating  that  the  block  is indeed bad.  Continue with step 8 if the
+;  test patterns succeed, indicating that the block may be good.   The  test
+;  patterns  fail if either the block is again reported as a bad block or if
+;  the test patterns cannot be written and read back correctly.
+;
+
+STEP7:
+	MOVL	HIRT$L_PAGE2PTR,R2	; R2 => target page.
+	MOVL	#TEST_PATTERN,R1	; Get test pattern to write to bad block.
+	MOVZBL	#512/4,R0		; Loop counter set to # longwords in block.
+10$:
+	MOVL	R1,(R2)+		; Copy test pattern to page 2.
+	SOBGTR	R0,10$			; Loop thru page.
+
+	MOVL	#2,R0			; Pass page to map to subroutine.
+	BSBW	MAP_PAGE		; Call to map page 2.
+
+; Call subroutine that recycles current END PACKET, recycles current RSPID and
+;	fills in most relevant data in the MSCP packet.
+
+	BSBW	BUILD_RCT_PACKET	; Build a packet to transfer mapped
+					;  page to random LBN.
+
+	ASSUME	MSCP$W_MODIFIER  EQ  MSCP$B_OPCODE+2
+	MOVL	#MSCP$K_OP_WRITE-	; Fill in field not prepared by
+		!<<MSCP$M_MD_COMP -	;  BUILD_RCT_PACKET.
+		  !MSCP$M_MD_SECOR -
+		  !MSCP$M_MD_SEREC> @ 16>, -
+		MSCP$B_OPCODE(R2)
+
+	MOVL	HIRT$L_LBN,-		; Fill in field filled in incorrectly
+		MSCP$L_LBN(R2)		;  by BUILD_RCT_PACKET.
+	SEND_MSCP_MSG			; Send message to the MSCP server.
+
+	BBC	#MSCP$V_EF_ERLOG,-	; Test for error log message generated
+		MSCP$B_FLAGS(R2),15$	;  and branch around if not.
+	BISW	#HIRT$M_ERLOGIP,-	; Else remember that error log messages
+		HIRT$W_STS		;  Have been generated.
+15$:
+	UNMAP				; If write no good, give up resources.
+	CLRL	CDRP$L_LBUFH_AD(R5)	; And show that deallocation was done.
+	MOVL	CDRP$L_MSG_BUF(R5),R2	; Refresh R2 => END PACKET after unmap.
+	IF_MSCP	SUCCESS, then=30$	; Branch if WRITE successful.
+20$:
+	BRW	STEP9			; Proceed to next step of replacement.
+30$:
+	BBS	#MSCP$V_EF_BBLKR,-	; If bad block reported again on write,
+		MSCP$B_FLAGS(R2),20$	;  then branch back to proceed with
+					;  replacement.
+40$:
+
+; Clear page to receive test pattern written block.
+
+	PUSHR	#^M<R2,R3,R4,R5>	; Save registers.
+	MOVC5	#0,.,#0,#512,-		; Clear page 2 prior to read.
+		@HIRT$L_PAGE2PTR
+	POPR	#^M<R2,R3,R4,R5>	; Restore registers.
+
+; Call subroutine that recycles current END PACKET, recycles current RSPID and
+;	fills in most relevant data in the MSCP packet.
+
+	MOVL	#2,R0			; Pass page to map to subroutine.
+	BSBW	MAP_PAGE		; Call to map page 2.
+	BSBW	BUILD_RCT_PACKET	; Build MSCP packet to transfer page 2
+
+	ASSUME	MSCP$W_MODIFIER  EQ  MSCP$B_OPCODE+2
+	MOVL	#MSCP$K_OP_READ-	; Fill in field not prepared by
+		!<<MSCP$M_MD_COMP -	;  BUILD_RCT_PACKET.
+		  !MSCP$M_MD_SECOR -
+		  !MSCP$M_MD_SEREC> @ 16>, -
+		MSCP$B_OPCODE(R2)
+
+	MOVL	HIRT$L_LBN,-		; Fill in field filled in incorrectly
+		MSCP$L_LBN(R2)		;  by BUILD_RCT_PACKET.
+	SEND_MSCP_MSG			; Send message to the MSCP server.
+
+	BBC	#MSCP$V_EF_ERLOG,-	; Test for error log message generated
+		MSCP$B_FLAGS(R2),45$	;  and branch around if not.
+	BISW	#HIRT$M_ERLOGIP,-	; Else remember that error log messages
+		HIRT$W_STS		;  Have been generated.
+45$:
+	UNMAP				; Give up MAP resources.
+	CLRL	CDRP$L_LBUFH_AD(R5)	; And show that deallocation was done.
+	MOVL	CDRP$L_MSG_BUF(R5),R2	; Refresh R2 => END PACKET after unmap.
+
+	IF_MSCP	SUCCESS, then=60$	; Branch if WRITE successful.
+50$:
+	BRW	STEP9			; On any error, goto step 9.
+60$:
+	BBS	#MSCP$V_EF_BBLKR,-	; If bad block reported on read,
+		MSCP$B_FLAGS(R2),50$	;  then branch back to proceed with
+					;  replacement of same.
+	MOVL	HIRT$L_PAGE2PTR,R2	; R2 => target page.
+	MOVL	#TEST_PATTERN,R1	; Test pattern to compare to bad block.
+	MOVZBL	#512/4,R0		; Loop counter set to # longwords in block.
+70$:
+	CMPL	R1,(R2)+		; Compare test pattern to page 2.
+	BNEQ	50$			; On any discrepancy, branch.
+	SOBGTR	R0,70$			; Loop thru page.
+
+; STEP8.
+;  We write the saved data back out  to  the  bad  block  using  a
+;  write-compare  operation.  The write-compare is performed with the "force
+;  error" modifier if and only if the saved data is invalid.  Go to step  13
+;  if the write-compare both succeeds AND the block is no longer reported as
+;  a bad block -- the original problem was a transient.   The  write-compare
+;  succeeds if no error is detected and the saved data is valid or if only a
+;  forced error is detected and the saved data is invalid.
+;
+
+STEP8:
+
+; Try to write original data out to block originally reported as bad since
+;	error now appears to have been transient.
+
+	MOVL	#1,R0			; Data from bad block is in page 1.
+	BSBW	MAP_PAGE		; Map page 1.
+	BSBW	BUILD_RCT_PACKET	; Recycle etc., and fill in packet.
+
+	ASSUME	MSCP$W_MODIFIER  EQ  MSCP$B_OPCODE+2
+	MOVL	#MSCP$K_OP_WRITE-	; Fill in field not prepared by
+		!<MSCP$M_MD_COMP@16>,-	;  BUILD_RCT_PACKET.
+		MSCP$B_OPCODE(R2)
+
+	BBC	s^#HIRT$V_FE, -		; See if original data is valid.
+		HIRT$W_STS, 10$
+	BISW	#MSCP$M_MD_ERROR, -	; Set force error modifier if
+		MSCP$W_MODIFIER(R2)	;  original data is invalid.
+10$:
+	MOVL	HIRT$L_LBN,-		; Fill in field filled in incorrectly
+		MSCP$L_LBN(R2)		;  by BUILD_RCT_PACKET.
+	SEND_MSCP_MSG			; Send message to the MSCP server.
+
+	BBC	#MSCP$V_EF_ERLOG,-	; Test for error log message generated
+		MSCP$B_FLAGS(R2),15$	;  and branch around if not.
+	BISW	#HIRT$M_ERLOGIP,-	; Else remember that error log messages
+		HIRT$W_STS		;  Have been generated.
+15$:
+	UNMAP				; If write no good, give up resources.
+	CLRL	CDRP$L_LBUFH_AD(R5)	; And show that deallocation was done.
+	MOVL	CDRP$L_MSG_BUF(R5),R2	; Refresh R2 => END PACKET after unmap.
+
+	IF_MSCP	FAILURE, then=STEP9	; Branch if problem not transient.
+	BBS	#MSCP$V_EF_BBLKR,-	; If bad block reported on write,
+		MSCP$B_FLAGS(R2),STEP9	;  then branch ahead to proceed with
+					;  replacement of same.
+	BRW	STEP13			; Branch if error was transient.
+
+; STEP9.
+;  We scan the RCT and determine  what  new  RBN  the  bad  block
+;  should  be  replaced  with,  whether  or  not  the the bad block has been
+;  previously replaced, and (if it has previously  been  replaced)  the  bad
+;  block's  old  RBN.  The RCT is NOT updated at this time.  If the RCT scan
+;  fails, we report the error to the error log and go to step 16.
+;
+
+
+STEP9:
+	BSBW	SEARCH_RCT		; Routine to search the RCT for an RBN.
+	BLBS	R0,STEP10		; LBC implies success, so goto step 10.
+	BBS	s^#HIRT$V_RCTFULL, -	; Check for RCTFULL error and
+		HIRT$W_STS, 910$	; branch if that is the problem.
+	HIR_ERROR -			; Else, signal HIR READ error.
+		step=9, type=READ
+	BRB	980$			; Join common branch to step 16.
+910$:	HIR_ERROR -
+		step=9, type=RCTFULL	; Signal HIR RCTFULL error.
+	MOVW	#SS$_BADRCT, -		; Also, supply a worst case error
+		HIRT$W_IOWORST		; status.
+980$:	BRW	STEP16			; Go to step 16 after any failure.
+
+; STEP10.
+;  Record the new RBN, whether or not the  bad  block  has  been  previously
+;  replaced,  the  bad block's old RBN (if it has been previously replaced),
+;  and the fact that we are in phase 2 of bad block replacement in sector  0
+;  of  each  RCT  copy.   The  RCT must be updated without reading sector 0,
+;  instead using the copy of sector 0 last read from or written to the  RCT.
+;  If the RCT cannot be updated, report the error to the error log and go to
+;  step 16.
+;
+
+
+STEP10:
+	MOVL	HIRT$L_PAGE0PTR,R0	; R0 => Page 0.
+	MOVL	HIRT$L_RBN,-		; Update date to sector 0 copy in
+		RCT$L_RBN(R0)		;  in memory.
+	BBC	s^#HIRT$V_MATCH, -	; See if we had a failing RBN, and
+		HIRT$W_STS,10$		;  if NOT, branch around.
+	BISW	#RCT$M_BR,-		; Indicate failing RBN in sector 0
+		RCT$W_FLAGS(R0)		;  flags word.
+	MOVL	HIRT$L_MATCHRBN,-	; And also indicate the failing RBN.
+		RCT$L_BAD_RBN(R0)
+10$:
+	BICW	#RCT$M_RP1,-		; Show that we are leaving phase 1
+		RCT$W_FLAGS(R0)		;  of replacement processing.
+	BISW	#RCT$M_RP2,-		; And entering phase 2.
+		RCT$W_FLAGS(R0)
+
+	CLRL	R0			; Rewrite page 0.
+	BSBW	WRITE_RCT_BLOCK		; Go write the sector.
+	BLBS	R0,STEP11		; If success, go to next step.
+	HIR_ERROR -			; Signal HIR error.
+		step=10, type=WRITE
+	BRW	STEP16			; Branch on failure.
+
+; STEP11.
+;  We update the RCT to indicate  that  the  bad  block  has  been
+;  replaced with the new RBN, and that the old RBN (if any) is unusable.  If
+;  this requires updating two blocks in the RCT, then both  blocks  must  be
+;  read  before  either is written.  If a block cannot be read successfully,
+;  report the error to the error log and go to step 16.  If a  block  cannot
+;  be written successfully, report the error to the error log and go to step
+;  15.
+;
+
+
+STEP11:
+	EXTZV	#0,#7,HIRT$L_RBN,R0	; R0 = offset in sector of RBN descriptor.
+	MOVL	HIRT$L_PAGE2PTR,R1	; R1 => sector containing RBN descriptor.
+	MOVAL	(R1)[R0],R0		; R0 => RBN descriptor.
+
+	BISL3	#RCT$M_ALLOCATED,-	; Put LBN being replaced into descriptor.
+		HIRT$L_LBN,(R0)		;  and or in ALLOCATED bit.
+	BBC	s^#HIRT$V_EMPTYPE, -	; Branch if primary RBN allocation.
+		HIRT$W_STS,10$
+	BISL	#RCT$M_NONPRIME,(R0)	; Indicate non prime allocation.
+10$:
+	BBS	s^#HIRT$V_MATCH, -	; Branch if RCT search showed RBN failed.
+		HIRT$W_STS,20$
+	BRW	60$			; If NOT RBN failure, skip RBN
+					;  descriptor update.
+20$:
+	ASHL	#-7,HIRT$L_MATCHRBN,R1	; R1 = relative RCT block containing
+					;  bad RBN descriptor.
+	ADDL	#2,R1			; Add in sectors 0 and 1.
+	CMPW	R1,HIRT$W_PG2CNTNT	; Page 2 contains RBN descriptor of
+					;  allocatable RBN and maybe also
+					;  descriptor of bad RBN.
+	BEQL	40$			; EQL implies both descriptors in same
+					;  block.
+	MOVL	#3,R0			; Indicate that we want to read into
+					;  page 3.
+	BSBW	READ_RCT_BLOCK		; Read sector (R1) into page 3.
+	BLBS	R0,30$			; If success, continue.
+	HIR_ERROR -			; Signal HIR error.
+		step=11, type=READ
+	BRW	STEP16			; Branch on failure.
+
+30$:
+	MOVL	HIRT$L_PAGE3PTR,R2	; R2 => page with bad RBN descriptor.
+	BRB	50$			; Branch around.
+40$:
+	MOVL	HIRT$L_PAGE2PTR,R2	; R2 => page with bad RBN descriptor.
+50$:
+	EXTZV	#0,#7,HIRT$L_MATCHRBN,R0; R0 = offset of bad RBN descriptor.
+	MOVAL	(R2)[R0],R0		; R0 => bad RBN descriptor.
+	MOVL	(R0),HIRT$L_BADRBND	; Save Bad RBN descriptor in case
+					;  we have to restore due to failure.
+	MOVL	#RCT$M_UNUSABLE,(R0)	; Clear LBN and mark unusable bit in
+					;  descriptor.
+	CMPL	R2,HIRT$L_PAGE2PTR	; See if both descriptors in same page.
+	BEQL	60$			; EQL implies yes. Go do only 1 write.
+
+	MOVL	#3,R0			; Rewrite page 3 [R0].
+	BSBW	WRITE_RCT_BLOCK		; Go write.
+	BLBS	R0,60$			; If success, continue.
+	HIR_ERROR -			; Signal HIR error.
+		step=11, type=WRITE
+	BRW	STEP15_A		; Branch on failure.
+
+60$:
+	MOVL	#2,R0			; Prepare to write page 2.
+	BSBW	WRITE_RCT_BLOCK		; Go write.
+	BLBS	R0,STEP12		; If success, goto next step.
+	HIR_ERROR -			; Signal HIR error.
+		step=11, type=WRITE
+	BRW	STEP15_B		; Branch on failure.
+
+; STEP12.
+;  We use the REPLACE command to revector the  bad  block  to  the
+;  chosen replacement block, then use the standard WRITE command (addressed
+;  to the bad block's LBN) with the "compare" modifier asserted to store the
+;  saved data in the replacement block.  The write-compare is performed with
+;  the "force error" modifier if and only if  the  saved  data  is  invalid.
+;  Note  that  the  REPLACE command implicitly verifies that a head or servo
+;  track failure has not  occurred,  causing  a  large  number  of  improper
+;  replacements.  If the REPLACE command fails, go to step 15.  If the WRITE
+;  command fails, go to step 9 to re-scan the RCT  for  another  RBN.   Note
+;  that  the  current  new  RBN  will become the old RBN for this next pass.
+;  Either failure will have already been reported to  the  error  log.   The
+;  WRITE  command  succeeds  if  no  error is detected and the saved data is
+;  valid or if only a forced  error  is  detected  and  the  saved  data  is
+;  invalid.
+;
+
+STEP12:
+	RECYCH_MSG_BUF			; Recycle END PACKET into MSCP buffer.
+	BLBS	R0,5$			; LBS means allocation success.
+	BRW	REPLACE_CONNECT_FAILURE	; Allocation failure means CONNECTION
+					;  failure.
+5$:
+	INIT_MSCP_MSG ucb=(R3)		; Initialize MSCP packet for REPLACE.
+
+	ASSUME	MSCP$W_MODIFIER  EQ  MSCP$B_OPCODE+2
+	MOVL	#MSCP$K_OP_REPLC-	; Fill in field not prepared by
+		!<MSCP$M_MD_EXPRS@16>,-	;  BUILD_RCT_PACKET.
+		MSCP$B_OPCODE(R2)
+
+	BBS	s^#HIRT$V_EMPTYPE, -	; See if primary or secondary RBN,
+		HIRT$W_STS,10$		;  branch if secondary.
+	BISW	#MSCP$M_MD_PRIMR,-	; Set primary modifier if
+		MSCP$W_MODIFIER(R2)	;  called for.
+10$:
+	MOVL	HIRT$L_RBN,MSCP$L_RBN(R2); Fill in special REPLACE field.
+	MOVL	HIRT$L_LBN,-		 ; Fill in field filled in incorrectly
+		MSCP$L_LBN(R2)		 ;  by BUILD_RCT_PACKET.
+	SEND_MSCP_MSG			; Send message to the MSCP server.
+
+	BBC	#MSCP$V_EF_ERLOG,-	; Test for error log message generated
+		MSCP$B_FLAGS(R2),15$	;  and branch around if not.
+	BISW	#HIRT$M_ERLOGIP,-	; Else remember that error log messages
+		HIRT$W_STS		;  Have been generated.
+15$:
+	IF_MSCP	SUCCESS, then=20$	; Branch if REPLACE was successful.
+	HIR_ERROR -			; Signal HIR error.
+		step=12, type=REPFAIL
+	BRW	STEP15_B
+20$:
+	MOVL	#1,R0			; Data from bad block is in page 1.
+	BSBW	MAP_PAGE		; Map page 1.
+	BSBW	BUILD_RCT_PACKET	; Recycle etc., and fill in packet.
+
+	ASSUME	MSCP$W_MODIFIER  EQ  MSCP$B_OPCODE+2
+	MOVL	#MSCP$K_OP_WRITE-	; Fill in field not prepared by
+		!<MSCP$M_MD_COMP@16>,-	;  BUILD_RCT_PACKET.
+		MSCP$B_OPCODE(R2)
+
+	BBC	s^#HIRT$V_FE, -		; See if original data is valid.
+		HIRT$W_STS, 30$
+	BISW	#MSCP$M_MD_ERROR, -	; Set force error modifier if
+		MSCP$W_MODIFIER(R2)	;  original data is invalid.
+30$:
+	MOVL	HIRT$L_LBN,-		; Fill in field filled in incorrectly
+		MSCP$L_LBN(R2)		;  by BUILD_RCT_PACKET.
+	SEND_MSCP_MSG			; Send message to the MSCP server.
+
+	BBC	#MSCP$V_EF_ERLOG,-	; Test for error log message generated
+		MSCP$B_FLAGS(R2),35$	;  and branch around if not.
+	BISW	#HIRT$M_ERLOGIP,-	; Else remember that error log messages
+		HIRT$W_STS		;  Have been generated.
+35$:
+	UNMAP				; If write no good, give up resources.
+	CLRL	CDRP$L_LBUFH_AD(R5)	; And show that deallocation was done.
+	MOVL	CDRP$L_MSG_BUF(R5),R2	; Refresh R2 => END PACKET after unmap.
+
+	IF_MSCP	SUCCESS, then=STEP13	; If WRITE successful go to step 13.
+
+;	ASSUME that the force data subcode is zero
+	CMPW	#MSCP$K_ST_DATA,-	; See if data error with force error
+		MSCP$W_STATUS(R2)	;  subcode.
+	BNEQ	50$			; If NOT, then branch to take action.
+
+	BBS	s^#HIRT$V_FE, -		; To STEP13 if force error expected.
+		HIRT$W_STS, STEP13
+	BUG_CHECK	DISKCLASS,FATAL		; Shouldn't happen.
+50$:
+	HIR_ERROR -			; Signal HIR error.
+		step=12, type=WRITE
+	BRW	STEP9			; Following algorithm, goto step 9.
+
+; STEP13.
+;  We update sector 0 of the RCT copies to indicate that we are no
+;  longer  in  the middle of replacing a bad block.  The RCT must be updated
+;  without reading sector 0, instead using the copy of sector  0  last  read
+;  from  or  written  to  the RCT.  If the RCT cannot be updated, report the
+;  error to the error log and go to step 17.
+;
+
+STEP13:
+	MOVL	HIRT$L_PAGE0PTR,R0	; R0 => page 0, which contains sector 0.
+	BICW	#RCT$M_RP1-		; Reset flags in sector zero.  We are
+		!RCT$M_RP2-		;  NOT in phase 1 nor in phase 2.
+		!RCT$M_BR-		;  Also we clear Bad RBN flag and
+		!RCT$M_FE,-		;   force error flag as well.
+		RCT$W_FLAGS(R0)
+
+;	ASSUME	RCT$L_RBN	EQ	RCT$L_LBN+4
+	CLRQ	RCT$L_LBN(R0)		; Zero out RBN and LBN.
+	CLRL	RCT$L_BAD_RBN(R0)	; Also clear BADRBN field.
+
+	CLRL	R0			; Rewrite page 0.
+	BSBW	WRITE_RCT_BLOCK		; Go write page into sector.
+	BLBS	R0,STEP14		; LBS is success.
+	HIR_ERROR -			; Signal HIR error.
+		step=13, type=WRITE
+	BRW	STEP17			; After failure goto step 17.
+
+; STEP14.
+;  We set the success return code and return to our internal caller.
+;
+
+STEP14:
+	DEALLOC_MSG_BUF
+	CLRL	R1			; Prepare to return ERLIP bit if set.
+	BBCC	s^#HIRT$V_ERLOGIP,-	; Branch around if clear and clear if
+		HIRT$W_STS,10$		;  already set.
+	BISW	#CDRP$M_ERLIP,R1	; Set bit in R1 so as to return to caller.
+10$:
+	MOVZWL	S^#SS$_NORMAL,R0	; Prepare to return status to caller.
+	HIRT_SUBRETURN			; Return to caller.
+
+; STEP15 - If here we failed to update the RCT (STEP11) or we failed in the
+;	REPLACE (STEP12).
+;  We restore the RCT to indicate that the new RBN is  unallocated
+;  and usable and that the bad block is either not replaced or revectored to
+;  the old RBN, whichever was it's original status.  The RCT must be updated
+;  without  reading  any  blocks  from  it,  instead using the copies of the
+;  relevent blocks that were read from the RCT in step 11.  Any  errors  are
+;  reported to the error log but otherwise ignored.
+;
+
+STEP15_A:
+
+; Here we failed to write the RCT block containing the Bad RBN only when
+;	this descriptor resided in a different RCT block than that of the
+;	selected RBN.   Because of the way that STEP11 works the copy
+;	of the RCT Block is in page 3.
+
+	MOVL	HIRT$L_PAGE3PTR,R2	; R2 => copy of page 3 in memory.
+	EXTZV	#0,#7,HIRT$L_MATCHRBN,R0; R0 = offset (longword) of Bad RBN
+					;  descriptor in page 3.
+	MOVAL	(R2)[R0],R0		; R0 => Bad RBN descriptor slot.
+	MOVL	HIRT$L_BADRBND,(R0)	; Restore Bad RBN descriptor.
+	MOVL	#3,R0			; Prepare to try to rewrite page 3.
+	BSBW	WRITE_RCT_BLOCK		; Try to rewrite.
+	BLBS	R0, 90$			; Branch if WRITE succeeded.
+	HIR_ERROR -			; Else, signal HIR error.
+		step=15, type=WRITE
+90$:	BRB	STEP16			; Always go to step 16.
+
+STEP15_B:
+
+; If here we failed in the REPLACE operation or in updating the RCT block
+;	containing the selected RBN descriptor.  So we try to restore the
+;	RCT sector(s) that contained the RBN descriptor(s).  If there was
+;	no Bad RBN, then we simply want to restore the contents of page 2
+;	to the sector indicated by HIRT$W_PG2CNTNT, after clearing the
+;	RBN descriptor slot associated with the selected RBN.
+
+	BBC	s^#HIRT$V_MATCH, -	; If NO Bad RBN, branch ahead to
+		HIRT$W_STS,20$		;  restore only one descriptor.
+
+; If there was a Bad RBN, and its descriptor happened to reside in the
+;	same RCT sector as the descriptor of the selected RBN, then we first
+;	first restore the old contents of the Bad RBN descriptor then
+;	if this descriptor resided in a different sector than the selected
+;	RBN's descriptor, we rewrite this other sector first.  Note the
+;	other sector is contained in page 3 while the selected
+;	RBN's descriptor is always in page 2.
+
+	MOVL	HIRT$L_PAGE2PTR,R2	; R2 => copy of page 2.
+	ASHL	#-7,HIRT$L_MATCHRBN,R1	; Calculate RCT sector # for Bad RBN.
+	ADDL	#2,R1			; Add in RCT sectors 0 and 1.
+	CMPW	R1,HIRT$W_PG2CNTNT	; See if in same sector.
+	BEQL	10$			; EQL implies yes.
+
+	MOVL	HIRT$L_PAGE3PTR,R2	; R2 => copy of page 3.
+10$:
+	EXTZV	#0,#7,HIRT$L_MATCHRBN,R0; R0 = offset (longword) of Bad RBN
+					;  descriptor in page 2 or 3.
+	MOVAL	(R2)[R0],R0		; R0 => Bad RBN descriptor slot.
+	MOVL	HIRT$L_BADRBND,(R0)	; Restore Bad RBN descriptor.
+	CMPL	R2,HIRT$L_PAGE2PTR	; See if we have to do both pages.
+	BEQL	20$			; EQL implies NO, only page 2.
+	MOVL	#3,R0			; Prepare to try to rewrite page 3.
+	BSBW	WRITE_RCT_BLOCK		; Try to rewrite.
+	BLBS	R0, 20$			; Branch if WRITE succeeded.
+	HIR_ERROR -			; Else, signal HIR error.
+		step=15, type=WRITE
+20$:
+
+; Here we clear the selected RBN's descriptor and rewrite the sector from
+;	page 2.
+
+	MOVL	HIRT$L_PAGE2PTR,R2	; R2 => page 2 in memory.
+	EXTZV	#0,#7,HIRT$L_RBN,R0	; R0 = offset (longword) of selected RBN
+					;  descriptor in page 2.
+	MOVAL	(R2)[R0],R0		; R0 => RBN descriptor slot.
+	CLRL	(R0)			; Restore to available RBN descriptor.
+
+	MOVL	#2,R0			; Prepare to try to rewrite page 2.
+	BSBW	WRITE_RCT_BLOCK		; Try to rewrite.
+	BLBS	R0, STEP16		; Branch if WRITE succeeded.
+	HIR_ERROR -			; Else, signal HIR error.
+		step=15, type=WRITE
+; -----	BRB	STEP16			; Always continue with step 16.
+
+; STEP16.
+;  We use the standard WRITE command (addressed to the bad block's
+;  LBN)  to  restore the saved data.  The write is performed with the "force
+;  error" modifier if and only if the saved data is invalid.  Any errors are
+;  reported to the error log but otherwise ignored.
+;
+
+STEP16:
+	MOVL	#1,R0			; Prepare to try to write original data
+					;  to bad block that we could not replace.
+	BSBW	MAP_PAGE		; Map page 1.
+	BSBW	BUILD_RCT_PACKET	; Build MSCP packet.
+
+	ASSUME	MSCP$W_MODIFIER	EQ	MSCP$B_OPCODE+2
+	MOVL	#MSCP$K_OP_WRITE,-	; Put in write opcode.
+		MSCP$B_OPCODE(R2)
+	BBC	s^#HIRT$V_FE, -		; Branch around if NO forced error.
+		HIRT$W_STS,10$
+	BISW	#MSCP$M_MD_ERROR,-	; Set forced error bit modifier on.
+		MSCP$W_MODIFIER(R2)
+10$:
+	MOVL	HIRT$L_LBN,-		; Indicate LBN to write.
+		MSCP$L_LBN(R2)
+	SEND_MSCP_MSG			; Send message to the MSCP server.
+	IF_MSCP	SUCCESS, then=12$	; Branch if WRITE succeeded.
+	HIR_ERROR -			; Else, signal HIR error.
+		step=16, type=WRITE
+12$:	BBC	#MSCP$V_EF_ERLOG, -	; Test for error log message generated
+		MSCP$B_FLAGS(R2),15$	;  and branch around if not.
+	BISW	#HIRT$M_ERLOGIP,-	; Else remember that error log messages
+		HIRT$W_STS		;  Have been generated.
+15$:
+	UNMAP
+	CLRL	CDRP$L_LBUFH_AD(R5)	; Indicate no mapping resources.
+
+; STEP17.
+;  We update sector 0 of the RCT copies to indicate that it is  no
+;  longer  in  the middle of replacing a bad block.  The RCT must be updated
+;  without reading sector 0, instead using the copy of sector  0  last  read
+;  from or written to the RCT.  Any errors are reported to the error log but
+;  otherwise ignored.
+;
+
+
+STEP17:
+	MOVL	HIRT$L_PAGE0PTR,R0	; R0 => page 0, which contains sector 0.
+	BICW	#RCT$M_RP1-		; Reset flags in sector zero.  We are
+		!RCT$M_RP2-		;  NOT in phase 1 nor in phase 2.
+		!RCT$M_BR-		;  Also we clear Bad RBN flag and
+		!RCT$M_FE,-		;   force error flag as well.
+		RCT$W_FLAGS(R0)
+
+;	ASSUME	RCT$L_RBN	EQ	RCT$L_LBN+4
+	CLRQ	RCT$L_LBN(R0)		; Zero out RBN and LBN.
+	CLRL	RCT$L_BAD_RBN(R0)	; Also clear BADRBN field.
+
+	CLRL	R0			; Rewrite page 0.
+	BSBW	WRITE_RCT_BLOCK		; Go write page into sector.
+	BLBS	R0, STEP18		; Branch if WRITE successful.
+	HIR_ERROR -			; Else, signal HIR error.
+		step=17, type=WRITE
+
+; STEP18.
+;  We set the failure return code and return to our internal caller.
+;
+
+STEP18:
+	DEALLOC_MSG_BUF
+	CLRL	R1			; Prepare to return ERLOGIP bit if set.
+	BBCC	s^#HIRT$V_ERLOGIP, -	; Branch around if clear and clear if
+		HIRT$W_STS,10$		;  already set.
+	BISW	#CDRP$M_ERLIP,R1	; Set bit in R1 so as to return to caller.
+10$:
+	MOVZWL	HIRT$W_IOST,R0		; Indicate failure to caller.
+	BLBC	R0, 15$			; Branch if error already found.
+	MOVZWL	HIRT$W_IOWORST, R0	; Else, get worst case I/O status.
+15$:	HIRT_SUBRETURN
+
+REPLACE_CONNECT_FAILURE:		; Come here if CONNECTION failure
+					;  anywhere in REPLACE logic.
+
+	BRW	DUTU$KILL_THIS_THREAD	; Branch to kill this thread.
+
+	.SBTTL	DU$ONLINE_COMPLETE - Perform HIRT operations after ONLINE
+;++
+;
+; DU$ONLINE_COMPLETE - Perform HIRT operations after ONLINE
+;
+; Functional Description:
+;
+; 	Complete bringing a unit ONLINE when it is attached to a controller 
+;	that require HOST INITIATED dynamic bad block replacement.  This 
+;	routine reads sector zero of the RCT to see if the disk went offline 
+;	in the middle of bad block replacement.  If so the replacement is 
+;	completed.
+;
+; Inputs:
+;
+;	R3	UCB address for the unit that being brought ONLINE
+;	R5 	HIRT permanent CDRP address
+;
+; Implicit Inputs:
+;
+;	HIRT$L_SAVDCDRP 	CDRP that describes the current operation
+;
+;	HIRT is owned by the current thread
+;	HIRT SUBSTACK is reset
+;
+; Outputs:
+;
+;	R0	Replacement status
+;	R1	Setting for CDRP$V_ERLIP
+;	R3	UCB address (unchanged)
+;
+;	R2, R4, R5 destroyed.
+;	All other registers preserved.
+;--
+
+
+DU$ONLINE_COMPLETE::
+
+	HIRT_SUBSAVE			; Save return point on SUBSTACK.
+
+	ASSUME	HIRT$W_PG0CNTNT+2	EQ	HIRT$W_PG1CNTNT
+	MNEGL	#1,HIRT$W_PG0CNTNT	; Invalidate contents of pages 0 and 1.
+
+	ASSUME	HIRT$W_PG2CNTNT+2	EQ	HIRT$W_PG3CNTNT
+	MNEGL	#1,HIRT$W_PG2CNTNT	; Invalidate contents of pages 2 and 3.
+
+; Here we want to read sector 0 of the RCT into page 0 so as to be able to
+;	determine whether or not we went down in the middle of Dynamic Bad
+;	Block replacement.
+; Note we have NOT allocated a Message Buffer.  READ_RCT_BLOCK (via a call
+;	to BUILD_RCT_PACKET) will do it for us.
+
+	CLRQ	R0			; Indicate read sector 0 (R1) into
+					;  page 0 (R0).
+	BSBW	READ_RCT_BLOCK		; Read indicated sector into page.
+	BLBS	R0,20$			; LBS means successful read.
+	HIR_ERROR -			; Signal HIR error.
+		step=1, func=ONLINE, -
+		type=READ
+	BRW	STEP18			; Goto deallocate and set RCT_FAILURE
+					;  status code before returning.
+20$:
+
+; Here we do a write of page 0 to sector 0 (all copies) to insure that we
+;	did not crash in the middle of an update of sector 0 and thereby
+;	get a set of inconsistent copies.
+
+	CLRL	R0			; Rewrite page 0.
+	BSBW	WRITE_RCT_BLOCK		; Write indicated sector from page.
+	BLBS	R0,30$			; LBS means successful write.
+	HIR_ERROR -			; Signal HIR error.
+		step=2, func=ONLINE, -
+		type=WRITE
+	BRW	STEP18			; Goto deallocate and set RCT_FAILURE
+					;  status code before returning.
+30$:
+	MOVL	HIRT$L_PAGE0PTR,R0	; R0 => sector 0 in memory.
+	BITW	#RCT$M_RP1-		; Test for phase 1 of replacement
+		!RCT$M_RP2,-		;  or phase 2.
+		RCT$W_FLAGS(R0)
+	BNEQ	40$			; NEQ implies that we were in the
+					;  middle of replacement.
+	DEALLOC_MSG_BUF			; Else we deallocate the buffer
+	CLRL	R1			; Prepare to return ERLOGIP bit if set.
+	BBCC	s^#HIRT$V_ERLOGIP, -	; Branch around if clear and clear if
+		HIRT$W_STS,35$		;  already set.
+	BISW	#CDRP$M_ERLIP,R1	; Set bit in R1 so as to return to caller.
+35$:
+	MOVZWL	#SS$_NORMAL,R0		; deallocate the RSPID, and we return
+					;  to caller with a success status.
+	HIRT_SUBRETURN			; Return.
+40$:
+	MOVL	RCT$L_LBN(R0),-		; Restore LBN to replace to HIRT.
+		HIRT$L_LBN
+	MOVL	#1,R0			; Read into page 1.
+	MOVL	#1,R1			; From RCT sector 1.
+	BSBW	READ_RCT_BLOCK		; Read RCT block.
+	BLBS	R0,50$			; LBS means successful read.
+	HIR_ERROR -			; Signal HIR error.
+		step=3, func=ONLINE, -
+		type=READ
+	BRW	STEP18			; Goto deallocate and set RCT_FAILURE
+					;  status code before returning.
+50$:
+	MOVL	HIRT$L_PAGE0PTR,R0	; Again, R0 => sector 0 contents.
+
+	BICW	#HIRT$M_FE-		; Initialize incore bits.
+		!HIRT$M_MATCH-
+		!HIRT$M_EMPTYPE-
+		!HIRT$M_RESCAN-
+		!HIRT$M_RCTFULL,-
+		HIRT$W_STS
+
+	BBC	#RCT$V_FE,-		; Branch if no forced error.
+		RCT$W_FLAGS(R0),60$
+	BISW	s^#HIRT$M_FE,HIRT$W_STS	; Set incore forec error bit.
+60$:
+	BBC	#RCT$V_RP1,-		; See if NOT in phase 1.
+		RCT$W_FLAGS(R0),70$
+	BRW	STEP7			; Branch into step 7 to continue.
+70$:
+	BBS	#RCT$V_RP2,-		; Sanity check.
+		RCT$W_FLAGS(R0),75$
+	BUG_CHECK	DISKCLASS,FATAL
+75$:
+	MOVL	RCT$L_RBN(R0),-		; Remember RBN that we had selected.
+		HIRT$L_RBN
+
+	BBC	#RCT$V_BR,-		; See if we had had bad RBN.
+		RCT$W_FLAGS(R0),80$	; Clear means no.
+	BISW	s^#HIRT$M_MATCH, -	; We set equivalent bit in core.
+		HIRT$W_STS
+	MOVL	RCT$L_BAD_RBN(R0),-	; Copy the old bad RBN.
+		HIRT$L_MATCHRBN
+80$:
+
+; Here figure out whether this is prime RBN.
+
+	BSBW	HASH_LBN		; Hash HIRT$L_LBN to produce values
+					;  for HIRT$L_RCTBLOCK and HIRT$L_OFFSET.
+	SUBL3	#2,HIRT$L_RCTBLOCK,R1	; Subtract out RCT sectos 0 and 1.
+	ASHL	#7,R1,R1		; R1 = relative block containing prime
+					;  RBN descriptor * 128.
+	ADDL	HIRT$L_OFFSET,R1	; R1 = prime RBN.
+	CMPL	R1,HIRT$L_RBN		; See if this the one.
+	BEQL	90$			; EQL implies yes.
+	BISW	#HIRT$M_EMPTYPE,-	; Set bit meaning NOT prime RBN.
+		HIRT$W_STS
+90$:
+
+; Here read sector containing allocatable RBN into page 2.
+
+	ASHL	#-7,HIRT$L_RBN,R1	; R1 = relative RCT block containing
+					;  this RBN descriptor.
+	ADDL	#2,R1			; Add in sectors 0 and 1.
+	MOVL	#2,R0			; Read into page 2.
+	BSBW	READ_RCT_BLOCK		; Go read RCT sector.
+	BLBS	R0,100$			; Branch on success.
+
+	HIR_ERROR -			; Signal HIR error.
+		step=4, func=ONLINE, -
+		type=READ
+	BRW	STEP18			; Goto deallocate and set RCT_FAILURE
+					;  status code before returning.
+100$:
+	BRW	STEP11
+
+	.SBTTL	WRITE_RCT_BLOCK - Write an RCT sector
+
+;+
+; WRITE_RCT_BLOCK - internal subroutine to write a block to a particular
+;	relative sector in each RCT copy.
+;
+; INPUTS:
+;	R0 =  page number from which we write the sector
+;	R3 => UCB
+;	R5 => CDRP
+;	HIRT$W_PG0CNTNT[R0] contains relative sector number to write
+;	CDRP$L_MSG_BUF contains an END PACKET to recycle
+;	CDRP$L_RSPID   contains an RSPID to recycle
+;
+; OUTPUTS:
+;	R0 - LBS indicates we were successful in writing at least one
+;		RCT.
+;	R0 - LBC indicates failure in all writes.
+;
+; SIDE EFFECTS:
+;	In this routine we use HIRT$W_IOST as the repository of the
+;	combined status of the writes that we execute.  In other words, if
+;	on finishing the writes, the low bit of HIRT$W_IOST is set,
+;	one or more of the writes was successful.
+;
+; NOTE:
+;	Since this subroutine is one of those that calls SCS routines which
+;	may fork, and since we may not leave anything permanent on the stack,
+;	the caller's return point is popped off the stack and pushed onto
+;	the HIRT SUBSTACK via use of the HIRT_SUBSAVE macro.  Return to the
+;	caller is effected by use of the HIRT_SUBRETURN macro.
+;
+
+WRITE_RCT_BLOCK:
+
+	HIRT_SUBSAVE			; Save return point in SUBSTACK.
+	MOVW	R0,HIRT$W_PAGENO	; Save input argument as to which page.
+	MOVW	HIRT$W_PG0CNTNT[R0],-	; Also save input argument as to which
+		HIRT$W_SECTORNO		;  sector (page) to write.
+	MOVW	#SS$_BADRCT,HIRT$W_IOST	; Initialize combined status word.
+	CLRL	HIRT$L_LOOPCNT		; Initialize loop counter. Note loop
+					;  counter is longword even though we
+					;  only use one byte since we MULL2
+					;  with the counter in BUILD_RCT_PACKET.
+	BBS	#UCB$V_MSCP_WRTP, -	; If disk is software write protected
+		UCB$W_DEVSTS(R3), 46$	; branch around and reject.
+20$:
+	BICW	#HIRT$M_RCTFE,-		; Initialize flag each time thru loop.
+		HIRT$W_STS
+	CMPB	HIRT$L_LOOPCNT,-	; See if we are all done with all
+		UCB$B_DU_RCTCPYS(R3)	;  RCT copies.
+	BLSSU	30$			; LSSU implies NOT done.
+	BRB	70$			; If done, branch around.
+30$:
+	MOVZWL	HIRT$W_PAGENO,R0	; R0 contains which page to map.
+	BSBW	MAP_PAGE		; Map page selected by R0.
+
+; Recycle the current END PACKET, the current RSPID and then prepare
+;	the MSCP packet to write page into the next RCT copy at relative
+;	sector of this copy.  All this is accomplished by BUILD_RCT_PACKET.
+
+	BSBW	BUILD_RCT_PACKET	; Routine fills most MSCP fields.
+					;  Returns R2 => MSCP packet.
+	MOVB	#MSCP$K_OP_WRITE,-	; Copy the WRITE opcode.
+		MSCP$B_OPCODE(R2)
+	MOVW	#MSCP$M_MD_COMP,-	; Move in compare modifier to get a
+		MSCP$W_MODIFIER(R2)	;  write compare operation.
+
+	BBC	s^#HIRT$V_RCTFE, -	; Bit clear says write WITHOUT force
+		HIRT$W_STS,40$		;  error.
+	BISW	#MSCP$M_MD_ERROR,-	; Set force error modifier.
+		MSCP$W_MODIFIER(R2)
+40$:
+	SEND_MSCP_MSG			; Send message to the MSCP server.
+	UNMAP				; Unmap page.
+	CLRL	CDRP$L_LBUFH_AD(R5)	; Indicate no mapping resources
+					;  currently allocated.
+	MOVL	CDRP$L_MSG_BUF(R5),R2	; Refresh R2 => End message.
+
+	BBC	#MSCP$V_EF_ERLOG,-	; Test for error log message generated
+		MSCP$B_FLAGS(R2),45$	;  and branch around if not.
+	BISW	#HIRT$M_ERLOGIP,-	; Else remember that error log messages
+		HIRT$W_STS		;  Have been generated.
+45$:
+
+; See if write succeeded and if so set HIRT$W_IOST to success; otherwise
+;	do nothing.  In this way if one or more writes succeed, HIRT$W_IOST
+;	will have a success indication.
+
+	BBS	s^#HIRT$V_RCTFE, -	; Branch around status update if
+		HIRT$W_STS,60$		;  we had force error.
+	IF_MSCP	SUCCESS, then=50$, -	; Branch if request was successful,
+		status=R0		; leaving MSCP status in R0.
+	CMPW	#MSCP$K_ST_WRTPR, R0	; Check for write protected.
+	BNEQ	48$			; If NOT, some other error.
+46$:
+	MOVW	#SS$_WRITLCK,HIRT$W_IOST; Indicate why we couldn't write.
+	BRB	70$			; And branch around.
+48$:
+	BISW	#HIRT$M_RCTFE,-		; Set force error flag and
+		HIRT$W_STS
+	BRB	30$			;  branch back to rewrite it.
+50$:
+	MOVW	S^#SS$_NORMAL,-		; If success, remember it in static
+		HIRT$W_IOST		;  HIRT field.
+60$:
+	INCL	HIRT$L_LOOPCNT		; Increment loop counter.
+	BRB	20$			; And branch back to do next copy.
+
+70$:					; Here after we finish all RCT copies.
+	MOVZWL	HIRT$W_IOST,R0		; Return status to caller.
+	BLBS	R0, 75$			; Branch if successful.
+	MOVW	R0, HIRT$W_IOWORST	; Else, save "worst" error.
+75$:	HIRT_SUBRETURN			; Return to caller.
+
+	.SBTTL	READ_RCT_BLOCK - Read an RCT sector
+
+;+
+; READ_RCT_BLOCK - internal routine to read contents of a relative sector of
+;	the RCT.
+;
+; INPUTS:
+;	R0 =  page number of page into which we read the sector
+;	R1 =  relative sector number to read
+;	R3 => UCB
+;	R5 => CDRP
+;	CDRP$L_MSG_BUF contains an END PACKET to recycle
+;	CDRP$L_RSPID   contains an RSPID to recycle
+;
+; OUTPUTS:
+;	R0 - LBS indicates we were successful in the block from one of the
+;		RCT copies.
+;	R0 - LBC indicates failure in reading from all RCT copies.
+;
+; SIDE EFFECTS:
+;	We use HIRT$W_IOST to temporarily save the status to be returned
+;	to out caller.
+;
+; NOTE:
+;	Since this subroutine is one of those that calls SCS routines which
+;	may fork, and since we may not leave anything permanent on the stack,
+;	the caller's return point is popped off the stack and pushed onto
+;	the HIRT SUBSTACK via use of the HIRT_SUBSAVE macro.  Return to the
+;	caller is effected by use of the HIRT_SUBRETURN macro.
+;
+
+READ_RCT_BLOCK:
+
+	HIRT_SUBSAVE			; Save return point in SUBSTACK.
+	MOVW	R0,HIRT$W_PAGENO	; Save input argument as to which page.
+	MOVW	R1,HIRT$W_SECTORNO	; Also save input argument as to which
+					;  sector to write.
+	MNEGW	#1,HIRT$W_PG0CNTNT[R0]	; Invalidate page(R0) contents.
+	CLRL	HIRT$L_LOOPCNT		; Initialize loop counter.
+20$:
+	CMPB	HIRT$L_LOOPCNT,-	; See if we are all done with all
+		UCB$B_DU_RCTCPYS(R3)	;  RCT copies.
+	BLSSU	30$			; LSSU implies NOT done.
+
+	MOVW	#SS$_BADRCT,HIRT$W_IOST	; Pass failure to our caller.
+	BRB	50$			; If done, branch around.
+30$:
+	MOVZWL	HIRT$W_PAGENO,R0	; R0 contains which page to map.
+	BSBW	MAP_PAGE		; Map page selected by R0.
+
+; Recycle the current END PACKET, the current RSPID and then prepare
+;	the MSCP packet to read page from the next RCT copy at relative
+;	sector of this copy.  All this is accomplished by BUILD_RCT_PACKET.
+
+	BSBB	BUILD_RCT_PACKET	; Routine fills in most of MSCP packet.
+					;  Returns R2 => MSCP packet.
+	MOVB	#MSCP$K_OP_READ,-	; Copy the READ opcode since this field
+		MSCP$B_OPCODE(R2)	;  is not filled in by BUILD_RCT_PACKET.
+	MOVW	#MSCP$M_MD_COMP,-	; Move in compare modifier to get a
+		MSCP$W_MODIFIER(R2)	;  compare operation.
+
+	SEND_MSCP_MSG			; Send message to the MSCP server.
+	UNMAP				; Unmap page.
+	CLRL	CDRP$L_LBUFH_AD(R5)	; Indicate no mapping resources
+					;  currently allocated.
+	MOVL	CDRP$L_MSG_BUF(R5),R2	; Refresh R2 => End message.
+
+	BBC	#MSCP$V_EF_ERLOG,-	; Test for error log message generated
+		MSCP$B_FLAGS(R2),35$	;  and branch around if not.
+	BISW	#HIRT$M_ERLOGIP,-	; Else remember that error log messages
+		HIRT$W_STS		;  Have been generated.
+35$:
+
+; See if read succeeded and if so we now have a valid copy of the sector so we
+;	simply continue.  If we did not succeed we bump the loop counter and
+;	go back to try and read the sector from the next (if any) RCT copy.
+
+	IF_MSCP	SUCCESS, then=40$	; Branch if request was successful.
+	INCL	HIRT$L_LOOPCNT		; Increment loop counter.
+	BRB	20$			; And branch back to try next copy.
+
+40$:					; Here after we finish all RCT copies.
+	MOVZWL	HIRT$W_PAGENO,R0	; R0 = page number into which we read.
+	MOVW	HIRT$W_SECTORNO,-	; Update contents of this page by
+		HIRT$W_PG0CNTNT[R0]	;  remembering sector therein contained.
+	MOVW	S^#SS$_NORMAL,HIRT$W_IOST; Indicate success.
+50$:
+	MOVZWL	HIRT$W_IOST,R0		; Return status to caller.
+	BLBS	R0, 55$			; Branch if successful.
+	MOVW	R0, HIRT$W_IOWORST	; Else, save "worst" error.
+55$:	HIRT_SUBRETURN			; Return to caller.
+
+	.SBTTL	BUILD_RCT_PACKET - Recycle an MSCP end message
+	.SBTTL	FILL_RCT_PACKET - Prepare an MSCP packet for an RCT transfer
+
+;+
+; BUILD_RCT_PACKET - internal subroutine to recycle the current END PACKET
+;			and then to fall thru to
+;
+; FILL_RCT_PACKET - which prepares an MSCP packet to do an I/O transfer
+;	to or from the RCT.
+;
+; INPUTS:
+;	R3 => UCB
+;	R5 => CDRP
+;	CDRP$L_RSPID	contains a RSPID to re-cycle
+;	CDRP$L_MSG_BUF	address of MSCP buffer to re-cycle or 0 (zero)
+;			0 (zero) means that we must here allocate an MSCP buffer
+;	CDRP$L_BUFHNDL	contains 96 bit buffer handle
+;	UCB$L_ABCNT     contains which RCT copy we are accessing
+;	HIRT$W_SECTORNO contains which relative sector number in the RCT copy
+;
+; OUTPUTS:
+;	R2 => MSCP PACKET
+;	Registers R0 and R1 are modified
+;
+; NOTE:
+;	Since BUILD_RCT_PACKET is one of those that calls SCS routines which
+;	may fork, and since we may not leave anything permanent on the stack,
+;	the caller's return point is popped off the stack upon entry to
+;	this entrypoint and pushed onto the HIRT SUBSTACK via use of the
+;	HIRT_SUBSAVE macro.  Upon return from those SCS routines, the caller's
+;	return point is restored to the normal stack via use of the
+;	HIRT_SUBUNSAVE macro.  all this is done prior to entrypoint 
+;	FILL_RCT_PACKET so that we may fall into this routine and then use
+;	its RSB to return to our caller.
+;
+
+BUILD_RCT_PACKET:
+
+	HIRT_SUBSAVE			; Save return point on HIRT SUBSTACK.
+
+	ASSUME	MSCP$L_CMD_REF	EQ	0
+	TSTL	CDRP$L_MSG_BUF(R5)	; See if we need a Message Buffer.
+	BEQL	20$			; EQL means Buffer needed.
+
+	RECYCH_MSG_BUF			; Else Recycle END PACKET into MSCP buffer.
+	BLBS	R0,30$			; LBS means allocation success.
+10$:	BRW	REPLACE_CONNECT_FAILURE	; Allocation failure means CONNECTION
+					;  failure.
+20$:
+	ALLOC_MSG_BUF			; Allocate a Message Buffer.
+	BLBC	R0,10$			; LBC means allocation failure.
+30$:
+	HIRT_SUBUNSAVE			; Restore caller's return point.
+
+FILL_RCT_PACKET:			; Alternate entry that only fills in packet.
+
+	INIT_MSCP_MSG ucb=(R3)		; Initialize MSCP command packet.
+	MOVZWL	#512, -			; Setup transfer byte count.
+		MSCP$L_BYTE_CNT(R2)
+	MOVQ	CDRP$T_LBUFHNDL(R5),-	; Copy 96 bit buffer handle.
+		MSCP$B_BUFFER(R2)	;		"
+	MOVL	CDRP$T_LBUFHNDL+8(R5),-	;		"
+		MSCP$B_BUFFER+8(R2)	;		"
+
+; Calculate LBN of relative sector for this RCT copy.
+;	It is done by multipling the number of RCT copies already written,
+;	(contained in HIRT$L_LOOPCNT) by the size of an RCT copy (contained in
+;	UCB$W_DU_RCTSIZE), adding in the LBN of the base of the first RCT copy
+;	(UCB$L_DU_USIZE) and then adding in the relative sector number
+;	passed to us when we were called (HIRT$W_SECTORNO).
+
+	MOVZWL	UCB$W_DU_RCTSIZE(R3),R0	; R0 contains size of one RCT copy.
+	MULL2	HIRT$L_LOOPCNT,R0	; R0 contains COPY# * COPYSIZE.
+	ADDL	UCB$L_DU_USIZE(R3),R0	; R0 contains LBN of base of this copy.
+	MOVZWL	HIRT$W_SECTORNO,R1	; R1 contains input relative sector #.
+	ADDL	R1,R0			; R0 contains LBN.
+	MOVL	R0,MSCP$L_LBN(R2)	; Move LBN to MSCP packet.
+
+	RSB				; Return to caller.
+
+	.SBTTL	MAP_PAGE - Map a page for a transfer
+
+;+
+; MAP_PAGE - internal subroutine to map the page selected by R0.
+;
+; INPUTS:
+;	R0    contains the number of the page to map.
+;	R5 => CDRP
+;
+; OUTPUTS:
+;	CDRP$L_SVAPTE, CDRP$W_BOFF, CDRP$L_BCNT and set to page parameters.
+;
+;	CDRP$L_LBUFH_AD set to => CDRP$T_LBUFHNDL
+;
+;	Mapping resources allocated.
+
+MAP_PAGE:
+	HIRT_SUBSAVE			; Save caller's return point on SUBSTACK.
+	MOVL	HIRT$L_SVAPTE0[R0],-	; Copy mapping date for relative page 
+		CDRP$L_SVAPTE(R5)	;  to CDRP.
+	MOVW	HIRT$W_BOFF0[R0],-	; Copy BOFF as well as SVAPTE.
+		CDRP$W_BOFF(R5)
+	MOVZWL	#512,CDRP$L_BCNT(R5)	; Finally copy BCNT for page.
+
+	MOVAB	CDRP$T_LBUFHNDL(R5),-	; Point CDRP field to local buffer
+		CDRP$L_LBUFH_AD(R5)	;  handle field.
+	MAP_IRP				; Map page.
+
+	HIRT_SUBRETURN			; Return to caller.
+
+	.SBTTL	SEARCH_RCT - Locate an available RBN
+
+;+
+; SEARCH_RCT - internal subroutine to search the RCT for an available RBN
+;	to allocate for the current failing LBN.  This routine is called from
+;	STEP9 of the replacement algorithm and is only done here as an
+;	internal subroutine to simplify the reading of that algorithm.
+;
+; INPUTS:
+;	R3 => UCB
+;	R5 => CDRP
+;	HIRT$L_LBN LBN that is failing
+;	UCB$W_DU_LBNPTRK number of LBNs on a track of this unit
+;	UCB$B_DU_RBNPTRK number of RBNs on a track of this unit
+;
+; OUTPUTS:
+;	R0 = SS$_NORMAL then:
+;		HIRT$L_RBN - new RBN selected to replace the failing LBN
+;		and HIRT$V_EMPTYPE clear means this is a primary RBN, else
+;		secondary RBN.
+;
+;		If HIRT$V_MATCH set this implies that the LBN which failed
+;			had previously been replaced by an RBN which in
+;			turn has failed.  This failing RBN is in
+;			HIRT$L_MATCHRBN.
+;
+;	R0 = 0 then we could not find an allocatable RBN and HIRT$L_RBN is
+;		not valid. The cause of the failure to find an RBN is
+;		transmitted to the caller by:
+;
+;			HIRT$V_RCTFULL set implies that the RCT on the disk
+;				is full
+;			HIRT$V_RCTFULL clear implies we had a read error on
+;				some RCT sector.
+;
+
+SEARCH_RCT:
+
+	HIRT_SUBSAVE			; Save return on HIRT substack.
+
+	BSBW	HASH_LBN		; Hash LBN value in HIRT$L_LBN returning
+					;  HIRT$L_RCTBLOCK and HIRT$L_OFFSET.
+
+	MOVL	HIRT$L_RCTBLOCK,-	; And remember the starting sector
+		HIRT$L_STARTBLK		;  number in static storage.
+
+; Here we initialize a few bits.
+
+	BICW	#HIRT$M_MATCH-		; Initialize the following flags.
+		!HIRT$M_EMPTYPE-	;  Match set implies valid MATCHRBN,
+		!HIRT$M_RESCAN-		;  EMPTYPE set implies secondary RBN,
+		!HIRT$M_RCTFULL,-	;  Rescan implies reached Nulls,
+		HIRT$W_STS		;  and RCTFULL means the RCT is full.
+
+; Here we prepare to read the RCT sector containing the primary RBN descriptor.
+
+	MOVL	#2,R0			; Prepare to read into page #2.
+	MOVL	HIRT$L_RCTBLOCK,R1	; And we read this relative sector #.
+	BSBW	READ_RCT_BLOCK		; Subroutine does read.
+	BLBC	R0,SEARCH_RTN		; LBC implies read failure.
+
+; Here we scan the RCT sector containing the primary RBN descriptor.  The
+;	method of scanning is to scan outward from the primary RBN descriptor.
+
+10$:
+	CLRL	R2			; Set up delta.
+20$:
+	ADDL3	R2,HIRT$L_OFFSET,R1	; R1 = next entry to test in first RCT
+					;  sector to scan.
+	BLSS	40$			; LSS implies invalid offset into page.
+30$:
+	CMPL	R1,#127			; See if we are within sector page.
+	BGTR	40$			; GTR implies no, out of bounds, go
+					;  to increment delta.
+	BSBW	TEST_RCT_ENTRY		; If in bounds, go test RCT entry.
+	BLBS	R0,SEARCH_RTN		; LBS implies success.
+40$:
+	MNEGL	R2,R2			; Negate delta.
+	BLSS	20$			; Branch to try again if negative.
+	INCL	R2			; Else increment delta.
+	CMPL	R2,#128			; See if delta too big.
+	BLSS	20$			; LSS implies not too big.
+					; Else we fall thru to try next sector.
+NEXT:
+	INCL	HIRT$L_RCTBLOCK		; Increment RCT sector to scan.
+10$:
+	CMPL	HIRT$L_RCTBLOCK,-	; See if we are all done with search.
+		HIRT$L_STARTBLK
+	BEQL	SEARCH_FAIL		; EQL means that we are finished.
+
+	MOVL	#2,R0			; Prepare to read into page 2.
+	MOVL	HIRT$L_RCTBLOCK,R1	; And to read this sector.
+	BSBW	READ_RCT_BLOCK		; Go to read sector into page.
+	BLBC	R0,SEARCH_RTN		; LBC implies read failure
+
+	BBC	#RCT$V_NULL,-		; Before linear scan of this sector,
+		@HIRT$L_PAGE2PTR,20$	;  see if we are beyond RCT.
+	MOVL	#2,HIRT$L_RCTBLOCK	; Here beyond RCT.  Wrap to start and
+	BBCS	s^#HIRT$V_RESCAN, -	;  go back to search some more after
+		HIRT$W_STS,10$		;  setting bit that says we have wrapped.
+	BUG_CHECK	DISKCLASS,FATAL	; Impossible situation.
+20$:
+	CLRL	R2			; Clear loop index register.
+30$:
+	MOVL	R2,R1			; Pass RCT entry of interest to routine.
+	BSBW	TEST_RCT_ENTRY		; Call subroutine to test entry.
+	BLBS	R0,SEARCH_RTN		; LBS means we have the RBN, go from loop.
+	AOBLSS	#128,R2,30$		; If we return here, (entry not avail.)
+					;  then loop back after incrementing R2.
+	BRB	NEXT			; If we fall thru, goto NEXT sector.
+
+SEARCH_FAIL:
+	CLRL	R0			; Indicate failure to caller and
+	BISW	#HIRT$M_RCTFULL,-	;  indicate reason for failure.
+		HIRT$W_STS
+SEARCH_RTN:
+	HIRT_SUBRETURN			; Return to caller.
+
+	.SBTTL	TEST_RCT_ENTRY - Test for allocated RBN
+
+;+
+; TEST_RCT_ENTRY - internal subroutine called to test an RCT entry to see
+;	if it represents an allocatable RBN or if it is already allocated.
+;
+; INPUTS:
+;	R1 = index of RCT entry.
+;
+; OUTPUTS:
+;	R0 = success code.
+;	   = SS$_NORMAL then HIRT$L_RBN is set to the RBN associated with the
+;		RCT entry defined by HIRT$L_RCTBLOCK and R1 (entry index).
+;
+;	   = 0 implies that the entry is not allocatable.  In in addition if
+;		the RBN is currently allocated and if it is allocated to this
+;		LBN (i.e. to HIRT$L_LBN), then HIRT$V_MATCH is set in
+;		HIRT$W_STS and the RBN associated with the current entry is
+;		stored in HIRT$L_MATCHRBN.
+;
+
+
+TEST_RCT_ENTRY:
+	PUSHL	R2			; Save register.
+	SUBL3	#2,HIRT$L_RCTBLOCK,R0	; R0 = found sector without bias of 2.
+	ASHL	#7,R0,R0		; Multiply by 128.
+	ADDL	R1,R0			; R0 = RBN associated with this entry.
+
+	MOVL	HIRT$L_PAGE2PTR,R2	; R2 => page 2, which contains sector.
+	TSTL	(R2)[R1]		; Test contents of current entry.
+	BNEQ	10$			; NEQ implies that it is not available.
+	MOVL	R0,HIRT$L_RBN		; Save RBN of this entry in HIRT.
+	MOVZWL	#SS$_NORMAL,R0		; Set success code.
+	BRB	40$			; And branch to return to caller.
+10$:
+	MOVAL	(R2)[R1],R2		 ; R2 => entry of interest.
+	BISW	#HIRT$M_EMPTYPE,-	 ; Set bit meaning any find will now
+		HIRT$W_STS		 ;  have to be a secondary RBN.
+	BBC	#RCT$V_ALLOCATED,(R2),30$; If clear, then unusable RBN.
+
+	EXTZV	#RCT$V_LBN,-		; If allocated, see if for this LBN.
+		#RCT$S_LBN,(R2),R2	; R2 = LBN for this RBN.
+	CMPL	R2,HIRT$L_LBN		; See if this LBN.
+	BNEQ	30$			; NEQ means not for this LBN.
+	BBCS	s^#HIRT$V_MATCH, -	; Set bit that means we have a match.
+		HIRT$W_STS,20$
+	BUG_CHECK	DISKCLASS,FATAL	; Impossible situation.
+20$:
+	MOVL	R0,HIRT$L_MATCHRBN	; Save RBN that matched.
+30$:
+	CLRL	R0			; Failure to find allocatable RBN.
+40$:
+	POPL	R2			; Restore register.
+	RSB				; Return to caller.
+
+	.SBTTL	HASH_LBN - Hash an LBN into a RCT block and an offset
+
+;+
+; HASH_LBN - internal routine to hash HIRT$L_LBN giving HIRT$L_RCTBLOCK and
+;	HIRT$L_OFFSET.
+;
+; INPUTS:
+;
+;	R3 => UCB
+;	HIRT$L_LBN
+;
+; OUTPUTS:
+;
+;	HIRT$L_RCTBLOCK = RCT sector containing prime RBN descriptor for this
+;			LBN
+;	HIRT$L_OFFSET = offset of prime RBN descriptor in sector.
+;
+; SIDE EFFECTS:
+;
+;	Registers R0 an R1 altered.
+;
+
+HASH_LBN:
+
+	MOVZWL	UCB$W_DU_LBNPTRK(R3),R0	; R0 contains LBNs per track.
+	DIVL3	R0,HIRT$L_LBN,R1	; R1 =  QUO(LBN/(LBNs per track)).
+
+	MOVZBL	UCB$B_DU_RBNPTRK(R3),R0	; R0 = RBNs per track.
+	MULL	R1,R0			; R0 = (RBNs per)*QUO(LBN/(LBNs per))
+	CLRL	R1			; Clear high order part of dividend.
+
+	EDIV	#128,R0,-		; Divide result by 128 giving the
+		HIRT$L_RCTBLOCK,-	;  quotient and the
+		HIRT$L_OFFSET		;  remainder.
+
+	ADDL	#2,HIRT$L_RCTBLOCK	; Add in sector 0 and sector 1.
+	RSB				; Return to caller
+	.PAGE
+	.SBTTL	DU$HIR_ERROR - Process error encountered during HIRT processing
+;++
+;
+; DU$HIR_ERROR - Process error encountered during HIRT processing
+;
+; Functional Description:
+;
+;	This routine performs any operations necessary to inform the world 
+;	that an error was encountered during HIRT processing.  It is invoked 
+;	via the HIR_ERROR macro.
+;
+;	Currently, the error processing consists of broadcasting a message to 
+;	OPA0.  The general text of the error message is:
+;
+;		%<devnam> encountered a <type> error in <func> step <n>
+;
+;	Where:
+;
+;		<devnam>	is the device name
+;		<type>		is one of READ / WRITE / RCT FULL
+;		<func>		is one of REPLACE / ONLINE
+;		<n>		is a number giving the failing step in the 
+;				replacement algorithm
+;
+; Inputs:
+;
+;	R0	A parameter giving the <type>, <func>, and <n> values above
+;	R3	UCB address
+;
+; Outputs:
+;
+;	R0 is destroyed
+;	All other registers are preserved.
+;--
+
+DU$HIR_ERROR:
+
+	PUSHR	#^M<R1,R2,R3,R4,R5,R6,R7>	; Save some registers.
+	MOVAB	-HIRER$K_MSGSIZE(SP), SP	; Make message space on stack.
+	MOVL	SP, R6				; Save base of message space.
+	MOVL	R0, R7				; Copy error parameter.
+
+	; Form device name.
+	MOVL	R3, R5				; Move UCB address.
+	MOVL	R6, R1				; Setup buffer address.
+	MOVB	#^A/%/, (R1)+			; Insert percent sign.
+	MOVL	#HIRER$K_DEVNAMSIZ, R0		; Setup buffer size.
+	MNEGL	#1, R4				; Setup formation code.
+	JSB	G^IOC$CVT_DEVNAM		; Get device name for UCB.
+	ADDL3	R1, R6, R3			; Init working buffer pointer.
+	INCL	R3				; Adjust for percent sign.
+
+	; Copy first fixed segment.
+	MOVAB	HIR_ERR_SEG1, R1		; Get string address.
+	BSBB	COPY_ASCIC			; Copy string.
+
+	; Insert proper <type> segment.
+	EXTZV	#HIRER$V_TYPE, #HIRER$S_TYPE, R7, R2	; Get type number.
+	MOVAB	HIR_ERR_TYPES, R1		; Get error types strings base.
+32$:	MOVZBL	(R1)+, R0			; Get length of this message.
+	ADDL	R0, R1				; Point to next message.
+	SOBGTR	R2, 32$				; Loop till message located.
+	BSBB	COPY_ASCIC			; Copy <type> string.
+
+	; Copy second fixed segment.
+	MOVAB	HIR_ERR_SEG2, R1		; Get string address.
+	BSBB	COPY_ASCIC			; Copy string.
+
+	; Insert proper <func> segment.
+	MOVAB	HIR_ERR_REPLACE, R1		; Assume REPLACE.
+	BBC	#HIRER$V_ONLINE, R7, 45$	; Branch if not ONLINE.
+	MOVAB	HIR_ERR_ONLINE, R1		; Else, get ONLINE.
+45$:	BSBB	COPY_ASCIC			; Copy <func> string.
+
+	; Copy third fixed segment.
+	MOVAB	HIR_ERR_SEG3, R1		; Get string address.
+	BSBB	COPY_ASCIC			; Copy string.
+
+	; Convert two digits of <n> and insert them.
+	ASSUME	HIRER$V_STEP EQ 0
+	ASSUME	HIRER$S_STEP EQ 8
+	MOVZBL	R7, R0				; Get step number.
+	CMPB	#99, R0				; Is number to big?
+	BLEQ	60$				; Branch if number to big.
+	CLRL	R1				; Quadword extend number.
+	EDIV	#10, R0, R0, R1			; Split digits.
+	ADDB3	#^A/0/, R0, (R3)+		; Insert tens digit.
+	ADDB3	#^A/0/, R1, (R3)+		; Insert units digit.
+
+60$:	; Compute message size and broadcast message to OPA0:.
+	MOVL	R6, R2				; Setup base message address.
+	SUBL3	R2, R3, R1			; Setup message size.
+	MOVAB	G^OPA$UCB0, R5			; Get OPA0 UCB address.
+	JSB	G^IOC$BROADCAST			; Broadcast message.
+
+	MOVAB	HIRER$K_MSGSIZE(SP), SP		; Clear message from stack.
+	POPR	#^M<R1,R2,R3,R4,R5,R6,R7>	; Restore saved registers.
+	RSB					; Exit.
+
+;++
+;
+; Routine to copy ASCIC string to buffer.
+;
+; Inputs:
+;
+;	R1	ASCIC string address
+;	R3	buffer address
+;
+; Outputs:
+;
+;	R3	updated buffer address (complements of MOVC3)
+;
+;	R0 through R5 are altered.
+;	All other registers are preserved.
+;--
+
+COPY_ASCIC:
+	MOVZBL	(R1)+, R0		; Get string size.
+	MOVC3	R0, (R1), (R3)		; Copy string.
+	RSB
+
+
+
+	.END

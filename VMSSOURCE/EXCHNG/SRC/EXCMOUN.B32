@@ -1,0 +1,1300 @@
+MODULE	exch$moun				%TITLE 'MOUNT verb dispatch and misc routines'
+		(
+		IDENT = 'V04-000',
+		ADDRESSING_MODE (EXTERNAL=LONG_RELATIVE, NONEXTERNAL=WORD_RELATIVE)
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:	EXCHANGE - Foreign volume interchange facility
+!
+! ABSTRACT:	Primary action routines for MOUNT verb
+!
+! ENVIRONMENT:	VAX/VMS User mode
+!
+! AUTHOR:	CW Hobbs	 CREATION DATE: 19-July-1982
+!
+! MODIFIED BY:
+!
+!	V03-003	CWH3003		CW Hobbs		26-Jul-1984
+!		Message chosen for CWH3002 needs an FAO parm, supply it.
+!
+!	V03-002	CWH3002		CW Hobbs		12-Apr-1984
+!		Give explicit message for mount on remote link.  If a
+!		TU58, attempt to read and write block 1 so that we can
+!		sense whether the device is write-locked.  The TU58
+!		driver does not report write-lock status until a
+!		write is actually done.
+!
+!
+!--
+
+! Include files:
+!
+MACRO $module_name_string = 'exch$moun' %;	! The require file needs to know our module name
+REQUIRE 'SRC$:EXCREQ'				! Facility-wide require file
+    ;
+
+%SBTTL 'Module table of contents'
+
+! Module table of contents:
+!
+FORWARD ROUTINE
+    exch$moun_dismount,				! Main entry routine for DISMOUNT verb
+    exch$moun_dismount_action,			! Action routine for DISMOUNT
+	 moun_foreign,				! Specific routine to do foreign device mounts
+    exch$moun_implied_mount,			! Perform an automatic mount
+	 moun_init : NOVALUE,			! Setups common to Moun_implied_mount and Moun_mount
+    exch$moun_mount,				! Main action routine for MOUNT
+	 moun_virtual,				! Specific routine to do virtual device mounts
+    exch$moun_vms_mount				! Call the $MOUNT service to do an implied $ MOUNT /FOREIGN
+    ;
+
+! EXCHANGE facility routines
+!
+EXTERNAL ROUTINE
+    exch$cmd_namb_clone,			! Make a duplicate of a namb
+    exch$cmd_parse_filespec,			! Parse a file specification
+    exch$cmd_unwind_cli_syntax,			! Unwind out of a CLI$PRESENT call if qualifier not allowed
+    exch$dos11_mount,				! DOS-11 volume mount processing
+    exch$io_rt11_read,				! Read a block from a foreign disk
+    exch$io_rt11_write,				! Write a block to a foreign disk
+    exch$rt11_dircache_stop	: NOVALUE,	! Flush RT-11 caches during dismount
+    exch$rt11_mount,				! RT-11 volume mount processing
+    exch$util_file_error,			! Signal RMS error
+    exch$util_namb_release	: NOVALUE,	! Release name block
+    exch$util_vm_allocate_zeroed,		! Allocate virtual memory
+    exch$util_vol_getdvi,			! Get device information
+    exch$util_volb_release	: NOVALUE,	! Release volume block
+    exch$util_volb_allocate			! Allocate volume block
+    ;
+
+! Equated symbols:
+!
+!LITERAL
+!    ;
+
+! Bound declarations:
+!
+BIND
+    ascid_devicename = %ASCID 'DEVICENAME'
+    ;
+
+GLOBAL ROUTINE exch$moun_dismount =	%SBTTL 'exch$moun_dismount'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Entry routine for the dismount verb, parses and performs main control functions for dismount
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	Command parameters and qualifiers as returned from CLI$xxx routines.
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	device will be dismounted
+!--
+
+$dbgtrc_prefix ('moun_dismount> ');
+
+LOCAL
+    namb	: $ref_bblock,			! Local pointer to a namb
+    volb	: $ref_bblock,			! Local pointer to a volb
+    status
+    ;
+
+BIND
+    moun = exch$a_gbl [excg$a_moun_work] : $ref_bblock	! pointer to our work area
+    ;
+
+! Allocate and/or initialize the work area
+!
+moun_init ();
+
+! Parse the device name parameter into a newly allocated $NAMB, there are no defaults
+!
+status = exch$cmd_parse_filespec (ascid_devicename, 0, 0, moun [moun$q_device], namb);
+moun [moun$a_namb] = .namb;			! Save it in the work area too
+IF NOT .status
+THEN
+    $exch_signal_return (exch$_parseerr, 1, moun [moun$q_device], .status);
+IF NOT .namb [namb$v_explicit_device]
+THEN
+    $exch_signal_return (exch$_nodevice, 1, moun [moun$q_device]);
+IF .namb [namb$v_explicit_node]
+THEN
+    $exch_signal_return (exch$_noremote, 1, moun [moun$q_device]);
+IF   .namb [namb$v_explicit_directory] OR .namb [namb$v_explicit_name]
+  OR .namb [namb$v_explicit_type] OR .namb [namb$v_explicit_version]
+THEN
+    $exch_signal (exch$_devonly, 1, moun [moun$q_device]);
+
+! Make sure that the volume is already mounted
+!
+IF (.namb [namb$a_assoc_volb] NEQ 0)
+THEN
+    status = exch$moun_dismount_action (.namb [namb$a_assoc_volb])
+
+ELSE
+
+    ! Signal and return the error
+    !
+    $exch_signal (exch$_notmounted, 1, namb [namb$q_device]);
+
+! Release the namb
+!
+exch$util_namb_release (.namb);
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE exch$moun_dismount_action (volb : $ref_bblock)  =	%SBTTL 'exch$moun_dismount_action (volb)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Action routine for the dismount verb, cleans up and closes the volb
+!
+! INPUTS:
+!
+!	volb - pointer to volume to be released
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	file will be closed, volb returned to internal tables
+!--
+
+$dbgtrc_prefix ('moun_dismount_action> ');
+
+LOCAL
+    status
+    ;
+
+BIND
+    moun = exch$a_gbl [excg$a_moun_work] : $ref_bblock,	! pointer to our work area
+    fab = volb [volb$a_fab] : $ref_bblock,
+    rab = volb [volb$a_rab] : $ref_bblock
+    ;
+
+! If we have global caching for an RT-11 volume, flush the cache
+!
+IF .exch$a_gbl [excg$v_q_cache]
+THEN
+    IF .volb [volb$b_vol_format] EQL volb$k_vfmt_rt11
+    THEN
+	BEGIN
+
+	! If we are in an exit handler, it is possible that I/O is active (likely if the device is a TU58),
+	! so wait for it to complete.
+	!
+	IF NOT (status = $wait (rab = .rab))
+	THEN
+	    exch$util_file_error (exch$_waiterr, .status, .fab, .rab [rab$l_stv]);
+
+	exch$a_gbl [excg$v_q_cache] = false;	! Kill global caching, otherwise nothing will happen
+	exch$rt11_dircache_stop (.volb);	! Flush the caches
+	exch$a_gbl [excg$v_q_cache] = true;	! Reenable global caching
+	END;
+
+! Close the RMS file associated with the device
+!
+$trace_print_fao ('closing, fab=!XL', .volb [volb$a_fab]);
+IF NOT (status = $close (FAB = .volb [volb$a_fab]))
+THEN
+    $exch_signal_stop (.status);
+
+! Tell them it is gone unless we are dismounting from the exit handler.  Note that the MOUN work area is not
+! valid if we are in an exit handler.
+!
+IF NOT .exch$a_gbl [excg$v_exiting]
+THEN
+    IF .moun [moun$v_q_message]
+    THEN
+	$exch_signal (exch$_dismounted, 4, .volb [volb$l_vol_type_len], volb [volb$t_vol_type],
+					.volb [volb$l_vol_ident_len],  volb [volb$t_vol_ident]);
+
+! Release the $VOLB 
+!
+exch$util_volb_release (.volb);
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE moun_foreign =	%SBTTL 'moun_foreign'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Make a foreign volume known to EXCHANGE.  If the device is not mounted in the VMS sense, then mount it
+!	foreign with the $mount service.
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	namb - name block describing the device
+!	write - flag saying if we allow writes
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	volb - volume block which will describe the mounted volume
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	lots
+!--
+
+$dbgtrc_prefix ('moun_foreign> ');
+
+LOCAL
+    ptr	: $ref_bblock,				! Pointer to scan along the queue
+    status
+    ;
+
+BIND
+    moun = exch$a_gbl [excg$a_moun_work] : $ref_bblock,	! pointer to our work area
+    namb = .moun [moun$a_namb] : $bblock,		! Pointer to exchange NAMB structure
+    volb = .moun [moun$a_volb] : $bblock,		! Pointer to exchange VOLB structure
+    fab  = .volb [volb$a_fab] : $bblock,		! File Access Block for the volume
+    rab  = .volb [volb$a_rab] : $bblock,		! Record Access Block for the volume
+    nam  = .volb [volb$a_nam] : $bblock,		! RMS name block for the volume
+    dev_desc = namb [namb$q_device] : $desc_block	! Pointer to the device name
+    ;
+
+$block_check (2, .moun, moun, 433);
+$block_check (2, namb, namb, 434);
+$block_check (2, volb, volb, 435);
+
+! Get the device information
+!
+IF NOT (status = exch$util_vol_getdvi (dev_desc, volb))
+THEN
+    BEGIN
+    $exch_signal (exch$_accessfail, 1, dev_desc, .status);
+    RETURN .status;
+    END;
+
+! Check to make sure that this physical device is not already mounted as a foreign.  This could
+! happen if we are dealing with hidden device names.
+!
+ptr = .exch$a_gbl [excg$a_volb_use_flink];	! Start at the front of the queue
+WHILE .ptr NEQA exch$a_gbl [excg$q_volb_use]	! And work to the end
+DO
+    BEGIN
+
+    $block_check (2, .ptr, volb, 540);		! If these aren't volbs we are in deep trouble
+
+    IF .ptr NEQ volb				! Our volb is already in queue, so ignore it
+    THEN
+
+	! If the physical names match, then this device has already been mounted via a concealed device name
+	!
+	IF CH$EQL (.ptr [volb$l_devnamlen], ptr [volb$t_devnam], .volb [volb$l_devnamlen], volb [volb$t_devnam])
+	THEN
+	    BEGIN
+	    LOCAL
+		desc : VECTOR [2, LONG];
+	    desc [0] = .volb [volb$l_devnamlen];
+	    desc [1] = volb [volb$t_devnam];
+	    $exch_signal_return (exch$_volmount, 1, desc);
+	    END;
+
+    ptr = .ptr [volb$a_flink];			! Advance to next volb in the in-use queue
+    END;
+
+! Look at the device characteristics and make some decisions
+!
+BEGIN	! scope "devbits"
+    BIND
+	devbits = volb [volb$l_devchar] : $bblock;
+    REGISTER
+	must_have, cannot_have;			! masks for device tests
+
+    ! We need to make sure that the thing is at least similar to a disk or tape.  First define masks for all
+    ! required and all prohibited device characteristics
+    !
+    IF .devbits [dev$v_rnd]
+    THEN
+	BEGIN					! bits for "disks"
+	must_have = (dev$m_rnd OR dev$m_fod OR dev$m_shr OR dev$m_avl OR dev$m_idv OR dev$m_odv OR dev$m_dir);
+	cannot_have = (dev$m_rec OR dev$m_ccl OR dev$m_trm OR dev$m_sdi OR dev$m_sqd OR dev$m_spl OR dev$m_opr
+			OR dev$m_net OR dev$m_gen OR dev$m_mbx OR dev$m_dmt OR dev$m_rtm);
+	END
+    ELSE
+	BEGIN					! bits for "tapes"
+	must_have = (dev$m_sqd OR dev$m_fod OR dev$m_avl OR dev$m_idv OR dev$m_odv);
+	cannot_have = (dev$m_ccl OR dev$m_trm OR dev$m_spl OR dev$m_opr
+			OR dev$m_net OR dev$m_gen OR dev$m_mbx OR dev$m_dmt OR dev$m_rtm);
+	END;
+
+    ! If we are missing any "must_have" items or if we have any "cannot_have" items, scream and shout
+    !
+    IF	(((.volb [volb$l_devchar] XOR .must_have) AND .must_have) NEQ 0)
+      OR
+	((.volb [volb$l_devchar] AND .cannot_have) NEQ 0)
+    THEN
+	$exch_signal_return (exch$_devnotsuit, 1, dev_desc);
+
+    ! If the device is not mounted in the VMS sense, then we must do that
+    ! and recursively call ourself
+    !
+    IF NOT .devbits [dev$v_mnt]
+    THEN
+	BEGIN
+	IF NOT exch$moun_vms_mount (volb, dev_desc)
+	THEN
+	    RETURN false;
+	RETURN moun_foreign ();
+	END;
+
+    ! The device must be mounted foreign
+    !
+    IF NOT .devbits [dev$v_for]			! If the volume is write-locked
+    THEN
+	$exch_signal_return (exch$_opnotperf11, 1, namb [namb$q_device]);
+
+END;	! scope "devbits"
+
+! Now set the unique ident field of this volb
+!
+$trace_print_fao ('volb devnam "!AF", namb device "!AF", namb volid "!AF", concealed !UL',
+	.volb [volb$l_devnamlen], volb [volb$t_devnam], 
+	(BIND ndev = namb [namb$q_device] : $desc_block; .ndev [dsc$w_length]),
+	(BIND ndev = namb [namb$q_device] : $desc_block; .ndev [dsc$a_pointer]),
+	.namb [namb$l_vol_ident_len], namb [namb$t_vol_ident],
+	.namb [namb$v_concealed_device]);
+CH$MOVE (volb$s_vol_ident, namb [namb$t_vol_ident], volb [volb$t_vol_ident]);
+volb [volb$l_vol_ident_len] = .namb [namb$l_vol_ident_len];
+
+%IF switch_debug				! Debugging trace code
+%THEN
+    BEGIN
+    LOCAL
+	tmp_desc : $desc_block;
+    $stat_str_desc_init (tmp_desc, .volb [volb$l_devnamlen], volb [volb$t_devnam]);
+    $trace_print_fao ('Getdvi for name "!AS" resolved to device "!AS"', dev_desc, tmp_desc);
+    END;
+%FI
+
+! Init the RMS blocks for the volume
+!
+$fab_init (
+	FAB = fab,				! Volume FAB
+	FAC = (BIO,GET),			!  Block I/O, read-only
+	FNA = volb [volb$t_vol_ident], 		!  Set name addr
+	FNS = .volb [volb$l_vol_ident_len], 	!  Set name size
+	FOP = NFS,				!  Non-File Structured
+	NAM = nam);				!  Name block
+$rab_init (
+	RAB = rab,				! Volume RAB
+	ROP = BIO,				!  Block I/O
+	FAB = fab);				!  FAB addr
+$nam_init (
+	NAM = nam,				! File name block
+	RSA = .volb [volb$a_rsbuf],		!  Result name addr
+	RSS = nam$c_maxrss,			!  Result name size
+	ESA = .volb [volb$a_esbuf],		!  Expanded name addr
+	ESS = nam$c_maxrss);			!  Expanded name size
+
+! Make any adjustments to the RMS blocks as necessary for dynamic conditions
+!
+fab [fab$v_put] = .moun [moun$l_q_write];
+
+! Open and connect to the volume
+!
+$trace_print_fao ('opening, fab=!XL', fab);
+IF NOT (status = $open (fab = fab))
+THEN
+    RETURN exch$util_file_error (exch$_openforeign, .status, fab, .fab [fab$l_stv]);
+$check_call (4, exch$dbg_fab_dump, fab);
+
+volb [volb$w_channel] = .fab [fab$l_stv];	! Save the channel number (NFS ==> user mode channel)
+
+IF NOT (status = $connect (rab = rab))
+THEN
+    RETURN exch$util_file_error (exch$_openforeign, .status, fab, .rab [rab$l_stv]);
+
+! Fill in the rest of the state
+!
+volb [volb$v_connected] = true;
+volb [volb$v_foreign] = true;
+volb [volb$v_write] = (BIND devbits = fab [fab$l_dev] : $bblock;	! Device can't be writelocked
+		(NOT .devbits [dev$v_swl]) AND .fab [fab$v_put]);	!  and the put bit must be set
+
+! The TU58 driver does not tell us if the cartridge is writelocked, therefore let us read and then
+! attempt to write block 1 of the cartridge.
+!
+IF .volb [volb$v_write]
+THEN
+    IF .volb [volb$l_devclass] EQL dc$_disk
+      AND
+       .volb [volb$l_devtype] EQL dt$_tu58
+    THEN
+	BEGIN
+	LOCAL
+	    buf : $bvector [512];
+	rab [rab$l_ubf] = buf;			! User buffer address
+	rab [rab$w_usz] = 512;			! User buffer size
+	rab [rab$l_bkt] = 1;			! LBN 1
+	IF NOT (status = $read (rab = rab))
+	THEN
+	    BEGIN
+	    LOCAL
+		tmp_desc : $desc_block;
+	    $stat_str_desc_init (tmp_desc, .volb [volb$l_vol_ident_len], volb [volb$t_vol_ident]);
+	    $exch_signal_return (exch$_accessfail, 1, tmp_desc, .status, .rab [rab$l_stv]);
+	    END;
+	rab [rab$l_rbf] = buf;			! Record buffer address
+	rab [rab$w_rsz] = 512;			! Record buffer size
+	rab [rab$l_bkt] = 1;
+	IF NOT (status = $write (rab = rab))
+	THEN
+	    BEGIN
+	    $trace_print_fao ('status from TU-58 write check is !XL, stv !XL', .status, .rab [rab$l_stv]);
+	    IF .status EQL rms$_wlk
+	    THEN
+		volb [volb$v_write] = false
+	    ELSE
+		BEGIN
+		LOCAL
+		    tmp_desc : $desc_block;
+		$stat_str_desc_init (tmp_desc, .volb [volb$l_vol_ident_len], volb [volb$t_vol_ident]);
+		$exch_signal_return (exch$_accessfail, 1, tmp_desc, .status, .rab [rab$l_stv]);
+		END;
+	    END;
+	END;
+
+! Set the volume format
+!
+volb [volb$b_vol_format] = .namb [namb$b_vol_format];
+volb [volb$v_vfmt_explicit] = .namb [namb$v_vfmt_explicit];
+
+RETURN true;
+END;
+
+GLOBAL ROUTINE exch$moun_implied_mount (namb : $ref_bblock) =	%SBTTL 'exch$moun_implied_mount'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Perform an implied mount.  This routine is called by verb routines when a request
+!	is made to operate on an unmounted volume.  In particular, this is necessary for
+!	EXCHANGE to work as a "foreign" DCL command (e.g. $EXCH DIRE CSA1:).
+!
+! INPUTS:
+!
+!	namb - a pointer to a completed namb
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	namb [namb$a_assoc_volb] receives the address of the volb
+!
+! IMPLICIT OUTPUTS:
+!
+!	a volb is allocated and mounted
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	A device may be added to internal tables.  It might also be mounted to VMS.
+!--
+
+$dbgtrc_prefix ('moun_implied_mount> ');
+
+LOCAL
+    volb	: $ref_bblock,			! Local pointer to the volb
+    status
+    ;
+
+BIND
+    moun = exch$a_gbl [excg$a_moun_work] : $ref_bblock	! pointer to our work area
+    ;
+
+$block_check (2, .namb, namb, 436);
+
+! Allocate and/or initialize the work area
+!
+moun_init ();
+
+! Get or default all the qualifiers
+!
+moun [moun$v_q_foreign]	= true;
+moun [moun$v_q_virtual]	= false;
+moun [moun$l_q_write]	= true;
+
+! Make sure that the volume is not already mounted
+!
+$logic_check (2, (.namb [namb$a_assoc_volb] EQL 0), 115);
+
+! Allocate a $VOLB to describe the volume
+!
+volb = exch$util_volb_allocate ();
+moun [moun$a_volb] = .volb;
+
+! The moun routine expects to access the namb from the moun block
+!
+moun [moun$a_namb] = .namb;
+
+! Set some state in the volb.  Since the RX01 and RX02 drives do not support read and write checking, if we
+! see that one of these has been mounted /DATA_CHECK, we will do it by hand.
+!
+BEGIN
+BIND
+    devbits = namb [namb$l_fabdev] : $bblock;
+LOCAL
+    check;
+check = (.devbits [dev$v_rck] 
+	AND ((.namb [namb$b_devtype] EQL dt$_rx01) OR (.namb [namb$b_devtype] EQL dt$_rx02)));
+volb [volb$v_read_check] = .moun [moun$v_q_read_check] OR .check;
+check = (.devbits [dev$v_wck]
+	AND ((.namb [namb$b_devtype] EQL dt$_rx01) OR (.namb [namb$b_devtype] EQL dt$_rx02)));
+volb [volb$v_write_check] = .moun [moun$v_q_write_check] OR .check;
+$trace_print_fao ('read_check !UL, write_check !UL', .volb [volb$v_read_check], .volb [volb$v_write_check]);
+END;
+
+! Now dispatch to foreign mount to complete the task
+!
+status = moun_foreign ();
+
+! If this worked, attempt the volume-specific mount
+!
+IF .status
+THEN
+    BEGIN
+
+    CASE .volb [volb$b_vol_format] FROM volb$k_vfmt_lobound TO volb$k_vfmt_hibound OF
+    SET
+	[volb$k_vfmt_dos11]	: status = exch$dos11_mount (.volb);
+	[volb$k_vfmt_rt11]	: status = exch$rt11_mount (.volb);
+!\	[volb$k_vfmt_rtmt]	: $exch_signal_stop (exch$_notimplement);
+	[OUTRANGE,INRANGE]	: $logic_check (0, (false), 228);
+    TES;
+
+    END;
+
+! If the foreign mount or volume-specific mount failed, then deallocate our VOLB
+!
+IF NOT .status
+THEN
+    BEGIN
+    $trace_print_fao ('closing, fab=!XL', .volb [volb$a_fab]);
+    $close (fab=.volb [volb$a_fab]);		! Close it, ignore any errors
+    exch$util_volb_release (.volb);
+    exch$util_namb_release (.namb);
+    END
+!
+! Otherwise, signal the implied mount and return the address of the volb
+!
+ELSE
+    BEGIN
+
+    IF	NOT .volb [volb$v_write]
+      AND
+	.moun [moun$v_q_message]
+    THEN
+	$exch_signal (exch$_writelock, 2, .volb [volb$l_vol_ident_len],  volb [volb$t_vol_ident]);
+
+    $debug_print_fao ('volb address !XL', .volb);
+
+    IF .moun [moun$v_q_message]
+    THEN
+	$exch_signal (exch$_mounted, 4, .volb [volb$l_vol_type_len], volb [volb$t_vol_type],
+					.volb [volb$l_vol_ident_len],  volb [volb$t_vol_ident]);
+    namb [namb$a_assoc_volb] = .volb;
+
+    ! Make a copy of the namb, since someone else owns the input namb
+    !
+    volb [volb$a_assoc_namb] = exch$cmd_namb_clone (.namb);
+
+    END;
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE moun_init : NOVALUE =	%SBTTL 'moun_init'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Perform setups common to both EXCH$MOUN_MOUNT and EXCH$MOUN_IMPLIED_MOUNT, also EXCH$MOUN_DISMOUNT
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	global environment
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	memory might be allocated for the moun control block
+!--
+
+$dbgtrc_prefix ('moun_init> ');
+
+BIND
+    moun = exch$a_gbl [excg$a_moun_work] : $ref_bblock	! pointer to our work area
+    ;
+
+LOCAL
+    message
+    ;
+
+! If this is an implied mount, then the /MESSAGE qualifier will not be allowed.  Enable the condition handler
+! so that it will be ignored.
+!
+ENABLE
+    exch$cmd_unwind_cli_syntax;
+
+! If our pointer is null, we need to allocate and initialize the work area
+!
+IF .moun EQL 0
+THEN
+    BEGIN
+
+    ! Get the right sized chunk of memory, conveniently set to nulls
+    !
+    moun = exch$util_vm_allocate_zeroed (exchblk$s_moun);
+
+    ! Set the ident fields
+    !
+    $block_init (.moun, moun);
+
+    ! Set the descriptors up
+    !
+    $dyn_str_desc_init (moun [moun$q_device]);
+    $dyn_str_desc_init (moun [moun$q_filename]);
+
+    END;
+
+! Make sure that our work area is valid
+!
+$block_check (2, .moun, moun, 437);
+
+! Set the flag for printing mount and dismount messages.  
+!
+moun [moun$v_q_message] = .exch$a_gbl [excg$v_q_message];	! Default to external state
+message = cli$present (%ASCID 'MESSAGE');			! Find the flag state for the 
+
+!******************************************************************************************************************
+!*  NOTE:  On an implied mount we will UNWIND out of the above call to CLI$PRESENT.  Therefore, none of the code  *
+!*  which follows this comment will be executed during an implied mount!!!					  *
+!******************************************************************************************************************
+
+IF  .message EQL cli$_present			! Either /MESSAGE or /NOMESSAGE must be specified in order to
+  OR						!  override the external default
+    .message EQL cli$_negated
+THEN
+    moun [moun$v_q_message] = .message;
+
+RETURN;
+END;
+
+GLOBAL ROUTINE exch$moun_mount =	%SBTTL 'exch$moun_mount'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Action routine for the MOUNT verb, parses and performs main control functions for MOUNT
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	Command parameters and qualifiers as returned from CLI$xxx routines.
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	A device may be added to internal tables.  It might also be mounted to VMS.
+!--
+
+$dbgtrc_prefix ('moun_mount> ');
+
+LOCAL
+    namb	: $ref_bblock,			! Local pointer to a namb
+    volb	: $ref_bblock,			! Local pointer to a volb
+    status
+    ;
+
+BIND
+    moun = exch$a_gbl [excg$a_moun_work] : $ref_bblock	! pointer to our work area
+    ;
+
+
+! Allocate and/or initialize the work area
+!
+moun_init ();
+
+! Get the individual boolean qualifiers.
+!
+moun [moun$v_q_read_check]  = cli$present (%ASCID 'DATA_CHECK.READ');
+moun [moun$v_q_write_check] = cli$present (%ASCID 'DATA_CHECK.WRITE');
+moun [moun$v_q_foreign]     = (cli$present (%ASCID 'FOREIGN') EQL cli$_present);	! Only set if explicit /FOREIGN given.
+moun [moun$v_q_virtual]	    = cli$present (%ASCID 'VIRTUAL');
+moun [moun$l_q_write]	    = cli$present (%ASCID 'WRITE');
+
+! Do some consistency checks on the qualifiers
+!
+IF .moun [moun$v_q_foreign] AND .moun [moun$v_q_virtual]	! /FOR/VIR is not allowed
+THEN
+    $exch_signal_return (exch$_confqual);
+moun [moun$v_q_foreign] = NOT .moun [moun$v_q_virtual];
+
+! Parse the device name parameter into a newly allocated $NAMB, there are no defaults
+!
+status = exch$cmd_parse_filespec (ascid_devicename, 0, 0, moun [moun$q_device], namb);
+moun [moun$a_namb] = .namb;			! Save it in the work area too
+IF NOT .status
+THEN
+    $exch_signal_return (exch$_parseerr, 1, moun [moun$q_device], .status);
+IF NOT .namb [namb$v_explicit_device]
+THEN
+    $exch_signal_return (exch$_nodevice, 1, moun [moun$q_device]);
+IF .namb [namb$v_explicit_node]
+THEN
+    $exch_signal_return (exch$_noremote, 1, moun [moun$q_device]);
+IF   .namb [namb$v_explicit_directory] OR .namb [namb$v_explicit_name]
+  OR .namb [namb$v_explicit_type] OR .namb [namb$v_explicit_version]
+THEN
+    $exch_signal (exch$_devonly, 1, moun [moun$q_device]);
+
+! Make sure that the volume is not already mounted
+!
+IF (.namb [namb$a_assoc_volb] NEQ 0)
+THEN
+    BEGIN
+
+    ! Signal and return the error
+    !
+    $exch_signal (exch$_volmount, 1, namb [namb$q_device]);
+    status = exch$_volmount;
+
+    END
+ELSE
+    BEGIN
+
+    ! Allocate a $VOLB to describe the volume
+    !
+    volb = exch$util_volb_allocate ();
+    moun [moun$a_volb] = .volb;
+
+    ! Set some state in the volb.  Since the RX01 and RX02 drives do not support read and write checking, if we
+    ! see that one of these has been mounted /DATA_CHECK, we will do it by hand.
+    !
+    BEGIN
+    BIND
+	devbits = namb [namb$l_fabdev] : $bblock;
+    LOCAL
+	check;
+    check = (.devbits [dev$v_rck] 
+	    AND ((.namb [namb$b_devtype] EQL dt$_rx01) OR (.namb [namb$b_devtype] EQL dt$_rx02)));
+    volb [volb$v_read_check] = .moun [moun$v_q_read_check] OR .check;
+    check = (.devbits [dev$v_wck]
+	    AND ((.namb [namb$b_devtype] EQL dt$_rx01) OR (.namb [namb$b_devtype] EQL dt$_rx02)));
+    volb [volb$v_write_check] = .moun [moun$v_q_write_check] OR .check;
+    $trace_print_fao ('read_check !UL, write_check !UL', .volb [volb$v_read_check], .volb [volb$v_write_check]);
+    END;
+
+    ! Now dispatch to either the virtual mount or to foreign mount to complete the task
+    !
+    IF .moun [moun$v_q_virtual]
+    THEN
+	status = moun_virtual ()
+    ELSE
+	status = moun_foreign ();
+
+    !**********************************************************************************************************
+    !*  moun_virtual will have reparsed the device name and created a new namb.  All references to namb must  *
+    !*  use moun [moun$a_namb] from this point on!!                                                           *
+    !**********************************************************************************************************
+
+    ! If this worked, attempt the volume-specific mount
+    !
+    IF .status
+    THEN
+	BEGIN
+
+	CASE .volb [volb$b_vol_format] FROM volb$k_vfmt_lobound TO volb$k_vfmt_hibound OF
+	SET
+		[volb$k_vfmt_dos11]	: status = exch$dos11_mount (.volb);
+		[volb$k_vfmt_rt11]	: status = exch$rt11_mount (.volb);
+!\		[volb$k_vfmt_rtmt]	: $exch_signal_stop (exch$_notimplement);
+		[OUTRANGE,INRANGE]	: $logic_check (0, (false), 227);
+	TES;
+	END;
+
+    ! If the mount or the specific mount failed, then deallocate our VOLB
+    !
+    IF NOT .status
+    THEN
+	BEGIN
+	$trace_print_fao ('closing, fab=!XL', .volb [volb$a_fab]);
+	$close (fab=.volb [volb$a_fab]);	! Close it, ignore any errors
+	exch$util_volb_release (.volb);
+	exch$util_namb_release (.moun [moun$a_namb]);
+	END
+
+    ! If it worked then finish the mount
+    !
+    ELSE
+	BEGIN
+
+	! Save the namb so that we can look at it later
+	!
+	volb [volb$a_assoc_namb] = .moun [moun$a_namb];
+
+	! If the volume is write-locked, signal this information
+	!
+	IF  (NOT .volb [volb$v_write])		! If the volb is marked no write
+	  AND					!  and
+	    .moun [moun$l_q_write]		!  we thought we were going to write
+	THEN
+	    BEGIN
+	    LOCAL
+		status2;
+
+	    IF .moun [moun$l_q_write] EQL cli$_present
+	    THEN
+		status2 = $warning_stat_copy (exch$_writelock)	! If an explicit /WRITE, then warning status
+	    ELSE
+		status2 = exch$_writelock;			! otherwise its info status.
+	    $exch_signal (.status2, 2, .volb [volb$l_vol_ident_len],  volb [volb$t_vol_ident]);
+
+	    END;
+
+	! Now tell that we mounted it
+	!
+	IF .moun [moun$v_q_virtual]
+	THEN
+	    BEGIN
+	    BIND
+		nam = .volb [volb$a_nam] : $bblock;	! RMS nam block for the opened file
+	    IF .moun [moun$v_q_message]
+	    THEN
+		$exch_signal (exch$_mountvir, 4, .volb [volb$l_vol_ident_len], volb [volb$t_vol_ident],
+					.nam [nam$b_rsl], .nam [nam$l_rsa]);
+	    $debug_print_fao ('volb address !XL', .volb);
+	    END
+	ELSE
+	    BEGIN
+	    IF .moun [moun$v_q_message]
+	    THEN
+		$exch_signal (exch$_mounted, 4, .volb [volb$l_vol_type_len], volb [volb$t_vol_type],
+					.volb [volb$l_vol_ident_len],  volb [volb$t_vol_ident]);
+	    $debug_print_fao ('volb address !XL', .volb);
+	    END;
+	END
+    END;
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE moun_virtual =	%SBTTL 'moun_virtual'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Make a virtual volume known to EXCHANGE.  An RMS file is opened on the volb.
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	q_namb - name block describing the device
+!	q_write - flag saying if we allow writes
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	q_volb - volume block which will describe the mounted volume
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	lots
+!--
+
+$dbgtrc_prefix ('moun_virtual> ');
+
+LOCAL
+    status,
+    xab : $bblock [xab$c_fhclen],		! file header char xab so that we can read the size of the file
+    namb : $ref_bblock,				! a pointer to the namb
+    vir_namb : $ref_bblock			! a local namb for the virtual name
+    ;
+
+BIND
+    moun = exch$a_gbl [excg$a_moun_work] : $ref_bblock,	! pointer to our work area
+    inpfile = moun [moun$q_filename] : $desc_block,	! Name of virtual device filename as input
+    volb = .moun [moun$a_volb] : $bblock,		! Pointer to exchange VOLB structure
+    fab  = .volb [volb$a_fab] : $bblock,		! File Access Block for the volume
+    rab  = .volb [volb$a_rab] : $bblock,		! Record Access Block for the volume
+    nam  = .volb [volb$a_nam] : $bblock			! RMS name block for the volume
+    ;
+
+$block_check (2, .moun, moun, 438);
+namb = .moun [moun$a_namb];			! Grab pointer to exchange NAMB structure for device name
+$block_check (2, .namb, namb, 439);
+$block_check (2, volb, volb, 440);
+
+! Reparse the virtual volume name.  The "no_get_value" option is used to reparse the original name rather than
+! calling CLI$GET_VALUE again.  We request a virtual device parse to prevent the device from being
+! expanded, for example to prevent "R:" from becoming "_RTA0:" and "DM:" from becoming "_DMA0:".  The NAMB from
+! the first parse has to be discarded.
+!
+exch$util_namb_release (.namb);
+status = exch$cmd_parse_filespec (moun [moun$q_device], 0, (prsopt$m_no_get_value OR prsopt$m_virtual_device),
+					moun [moun$q_device], namb);
+IF NOT .status			!?? We probably don't need to check the status, since we have parsed it once.
+THEN
+    $exch_signal_return (exch$_parseerr, 1, moun [moun$q_device], .status);
+moun [moun$a_namb] = .namb;			! Save namb address in work area
+$logic_check (3, (.namb [namb$a_assoc_volb] EQL 0), 317);
+
+! Fetch the name of the file which is underneath the virtual volume
+!
+status = exch$cmd_parse_filespec (%ASCID 'FILENAME', %ASCID 'VIRTUAL.DSK', 0, inpfile, vir_namb);
+IF NOT .status
+THEN
+    $exch_signal_return (exch$_parseerr, 1, inpfile, .status);
+
+BEGIN	! scope "fulfile"
+    BIND
+	fulfile = vir_namb [namb$q_fullname] : $desc_block;
+
+    ! Get the device information.  Note that we will later change the volb$l_devmaxblock to the actual in-use block 
+    ! count for the file.
+    !
+    IF NOT (status = exch$util_vol_getdvi (fulfile, volb))
+    THEN
+	BEGIN
+	$exch_signal (exch$_accessfail, 1, fulfile, .status);
+	status = false;
+	exch$util_namb_release (.vir_namb);
+	RETURN .status;
+	END;
+
+    ! Now set the unique ident field of this volb, we use the ident given by EXCH$CMD_PARSE_FILESPEC
+    !
+    $trace_print_fao ('volb devnam "!AF", namb device "!AF", namb volid "!AF", concealed !UL',
+		.volb [volb$l_devnamlen], volb [volb$t_devnam], 
+		(BIND ndev = namb [namb$q_device] : $desc_block; .ndev [dsc$w_length]),
+		(BIND ndev = namb [namb$q_device] : $desc_block; .ndev [dsc$a_pointer]),
+		.namb [namb$l_vol_ident_len], namb [namb$t_vol_ident],
+		.namb [namb$v_concealed_device]);
+    CH$MOVE (volb$s_vol_ident, namb [namb$t_vol_ident], volb [volb$t_vol_ident]);
+    volb [volb$l_vol_ident_len] = .namb [namb$l_vol_ident_len];
+
+    %IF switch_debug				! Debugging trace code
+    %THEN
+	BEGIN
+	LOCAL
+	    tmp_desc : $desc_block;
+	$stat_str_desc_init (tmp_desc, .volb [volb$l_devnamlen], volb [volb$t_devnam]);
+	$trace_print_fao ('Getdvi for name "!AS" resolved to device "!AS"', fulfile, tmp_desc);
+	END;
+    %FI
+
+    ! Init the RMS blocks for the volume
+    !
+    $fab_init (
+	FAB = fab,				! Volume FAB
+	FAC = (BIO,GET),			!  Block I/O, read-only
+	FNA = .fulfile [dsc$a_pointer],		!  Set name addr
+	FNS = .fulfile [dsc$w_length],		!  Set name size
+	NAM = nam,				!  Name block
+	XAB = xab);				!  A file header char xab so that we can read the file size
+    $rab_init (
+	RAB = rab,				! Volume RAB
+	ROP = BIO,				!  Block I/O
+	FAB = fab);				!  FAB addr
+    $nam_init (
+	NAM = nam,				! File name block
+	RSA = .volb [volb$a_rsbuf],		!  Result name addr
+	RSS = nam$c_maxrss,			!  Result name size
+	ESA = .volb [volb$a_esbuf],		!  Expanded name addr
+	ESS = nam$c_maxrss);			!  Expanded name size
+    $xabfhc_init (				! File header char xab so that we can read the file size
+	XAB = xab);				!  RMS will fill it in when we open
+
+    ! Make any adjustments to the RMS blocks as necessary
+    !
+    fab [fab$v_put] = .moun [moun$l_q_write];
+
+    ! Open and connect to the volume
+    !
+    $trace_print_fao ('opening, fab=!XL', fab);
+    IF NOT (status = $open (fab = fab))
+    THEN
+	BEGIN
+
+	! If we failed with a privilege violation and we were going to write, try again /NOWRITE
+	!
+	IF (.status EQL rms$_prv) AND .fab [fab$v_put]
+	THEN
+	    BEGIN
+	    fab [fab$v_put] = false;			! Cancel the write option
+	    $trace_print_fao ('try open again, fab=!XL', fab);
+	    IF NOT (status = $open (fab = fab))
+	    THEN
+		BEGIN
+		exch$util_file_error (exch$_openvirtual, .status, fab, .fab [fab$l_stv]);
+		status = false;
+		exch$util_namb_release (.vir_namb);
+		RETURN .status;
+		END;
+	    END
+	ELSE
+	    BEGIN
+	    exch$util_file_error (exch$_openvirtual, .status, fab, .fab [fab$l_stv]);
+	    status = false;
+	    exch$util_namb_release (.vir_namb);
+	    RETURN .status;
+	    END;
+	END;
+
+    IF NOT (status = $connect (rab = rab))
+    THEN
+	BEGIN
+	exch$util_file_error (exch$_openvirtual, .status, fab, .rab [rab$l_stv]);
+	status = false;
+	exch$util_namb_release (.vir_namb);
+	RETURN .status;
+	END;
+
+END;	! scope "fulfile"
+
+! Fill in the rest of the state in the volb
+!
+volb [volb$v_connected] = true;
+volb [volb$v_virtual] = true;
+volb [volb$v_write] = .fab [fab$v_put];
+volb [volb$l_devmaxblock] = .xab [xab$l_ebk] -	! Put the file size in the device block size field
+		    (IF .xab [xab$w_ffb] NEQ 0	! (Eof block is one too high if the first free byte is zero)
+		     THEN 0 ELSE 1);
+volb [volb$l_volmaxblock] = .volb [volb$l_devmaxblock];	! Make the physical
+$trace_print_fao ('device max blocks !UL', .volb [volb$l_devmaxblock]);
+fab [fab$l_xab] = 0;				! Remove the xab from the fab, won't be valid after return
+
+! A virtual volume must be RT11.  If /VOL was specified, make sure that it was RT11, otherwise assume it
+!
+IF .namb [namb$v_vfmt_explicit]
+THEN
+    BEGIN
+    IF .namb [namb$b_vol_format] NEQ volb$k_vfmt_rt11
+    THEN
+	status = exch$_invvolfmt
+    ELSE
+	BEGIN
+	volb [volb$v_vfmt_explicit] = true;
+	volb [volb$b_vol_format] = volb$k_vfmt_rt11;
+	END;
+    END
+ELSE
+    BEGIN
+    volb [volb$v_vfmt_explicit] = false;
+    volb [volb$b_vol_format] = volb$k_vfmt_rt11;
+    END;
+
+! Release the namb
+!
+exch$util_namb_release (.vir_namb);
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE exch$moun_vms_mount (volb : $ref_bblock, devname : $ref_bblock) =	%SBTTL 'exch$moun_vms_mount (volb, devname)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Call the $MOUNT system service to perform a mount on VMS
+!
+! INPUTS:
+!
+!	volb	- address of volume block describing the volume to be mounted
+!	devname - address of string descriptor containing the device name
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	A device may be mounted to VMS.
+!--
+
+$dbgtrc_prefix ('moun_vms_mount> ');
+
+LOCAL
+    mnt_item : VECTOR [10, LONG],		! item list for $mount
+    status
+    ;
+
+OWN
+    flags : INITIAL (mnt$m_foreign OR mnt$m_noassist OR mnt$m_nounload);
+
+$block_check (2, .volb, volb, 633);
+
+! Prepare the item list
+!
+mnt_item [0] = (mnt$_devnam^16 OR .devname [dsc$w_length]);
+mnt_item [1] = .devname [dsc$a_pointer];
+mnt_item [2] = 0;
+
+mnt_item [3] = (mnt$_volnam^16 OR 8);
+mnt_item [4] = UPLIT BYTE ('Exchange');
+mnt_item [5] = 0;
+
+mnt_item [6] = (mnt$_flags^16 OR 4);
+mnt_item [7] = flags;
+mnt_item [8] = 0;
+
+mnt_item [9] = 0;				! End of list
+
+! Do the $mount service
+!
+IF NOT (status = $mount (itmlst=mnt_item))
+THEN
+    BEGIN
+    BIND
+	status2 = status : $bblock [4];
+    status2 [sts$v_inhib_msg] = 0;
+    $exch_signal_return (exch$_mounterror, 1, .devname, .status2);
+    END
+ELSE
+    $exch_signal (exch$_vmsmount, 1, .devname);
+
+RETURN .status;
+END;
+
+END
+ELUDOM

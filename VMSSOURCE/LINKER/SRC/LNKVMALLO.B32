@@ -1,0 +1,965 @@
+module lnk_vmallo 
+		(ident = 'V04-000'
+		,addressing_mode
+			(external    = general
+			,nonexternal = long_relative
+			)
+		) =
+
+begin
+!
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!
+!
+!
+!
+!++
+!
+! MODULE: LNK_VMALLO
+!
+! FACILITY: LINKER
+!
+! ABSTRACT: ALLOCATION OF VIRTUAL MEMORY TO IMAGE.
+!
+! HISTORY:
+!
+!	VERSION: X01.00
+!
+!	AUTHOR: T.J. PORTER 30-MAR-77
+!
+! MODIFIED BY:
+!
+!	V03-017	ADE0001		Alan D. Eldridge	30-Jul-1984
+!		Use error returned by LNK$REQUESTMEM rather than assuming
+!		LIN$_MEMFUL.
+!
+!	V03-016	JWT0152		Jim Teague		20-Feb-1984
+!		Adjustment for longer global section names.
+!
+!	V03-015	JWT0088		Jim Teague		12-Jan-1983
+!		Filter 0-length psects out of DMT.
+!
+!	V03-014	JWT0083		Jim Teague		07-Jan-1983
+!		Don't let Linker fill in vacant low address space in
+! 		in based executable images.
+!
+!	V03-013	JWT0078		Jim Teague		15-Dec-1982
+!		Change implementation of DMT.
+!
+!	V03-012	JWT0074		Jim Teague		09-Dec-1982
+!		Finalize DMT info.
+!
+!	V03-011	JWT0061		Jim Teague		22-Oct-1982
+!		Add debugger image section for images linked /debug.
+!
+!--
+
+!
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	THIS MODULE CONTAINS THE VIRTUAL MEMORY ALLOCATION LOGIC
+!	OF THE LINKER. THERE IS ONE ROUTINE:
+!		LNK$VMALLO()
+!	WHICH ALLOCATES MEMORY TO P-SECTIONS OF EACH OF THE 
+!	FOUR POSSIBLE IMAGE SECTIONS, READ-ONLY, READ-WRITE
+!	EXECUTE-ONLY AND EXECUTE-WRITE, AS WELL AS TO 
+!	THE USER STACK.
+!	AS EACH IMAGE-SECTION IS BUILT, THE P-SECTIONS WHOSE
+!	ATTRIBUTES MATCH THOSE OF THE IMAGE SECTION ARE
+!	ASSIGNED A BASE ADDRESS IN LEXICAL ORDER. AS EACH
+!	IS ASSIGNED ITS BASE ADDRESS, ANY RELOCATABLE SYMBOLS OWNED
+!	BY THAT P-SECTION ARE RELOCATED BY ADDITION OF 
+!	THE ALIGNED P-SECTION BASE ADDRESS.
+!	AFTER ALL REQUIRED IMAGE SECTIONS HAVE BEEN BUILT
+!	THE HEADER SIZE IS CALCULATED AND THE BASE VIRTUAL
+!	BLOCK NUMBER IN EACH ISD (ON SINGLY LINKED LIST)
+!	IS RELOCATED BY THE NUMBER OF HEADER BLOCKS.
+!
+!--
+!
+library
+	'LIBL32';				! SYSTEM USER DATA STRUCTURES
+require
+	'PREFIX';				! GENERAL DATA, MACROS ETC.
+library
+	'DATBAS';				! DATA BASE DESCRIPTION
+require
+	'ISGENC';				! GENERATION CONTROL TABLES
+!
+forward routine
+	allocluster : novalue,			! GATHER P-SECTIONS INTO I-SECTIONS FOR CURRENT CLUSTER
+	compare_bases,				! ACTION ROUTINE FOR LIB$INSERT_TREE
+	alloc_node,				! ACTION ROUTINE FOR LIB$INSERT_TREE
+	relocluster : novalue,			! RELOCATE CONTENTS OF CURRENT CLUSTER
+	lnk$crefixisd,				! BUILD FIXUP SECTION ISD
+	lnk$cluvirmem,				! ALLOCATE VIRTUAL MEMORY FOR A CLUSTER
+	lnk$setlastclu,				! TEST/SET LAST CLUSTER
+	stack_isectbld : novalue,		! BUILD USER STACK IMAGE SECTION
+	normal_isectbld : novalue,		!   "   NORMAL USER ISECT
+	buildisd : novalue;			! CREATE ISD
+!
+external
+	lnk$gl_omddst,				! COUNT OF OBJMODS CONTRIBUTING TO DST
+	lnk$gw_pscdst: word,			! COUNT OF PSECTS IN ABOVE OBJMODS
+	lnk$gl_shrsyms,				! NUMBER OF SYMBOLS IN OTHER SHAREABLE IMAGES
+	lnk$gl_shrimgs,				! NUMBER OF SHAREABLE IMAGES REFERENCED
+	lnk$gl_shrclstrs,			! NUMBER OF PIC/NON-PIC SHR IMAGES IN LINK
+	lnk$al_valctltb,			! ADDRESS OF CREF BY VALUE CONTROL TABLE
+	lnk$al_sytblfmt,			! CREF CONTROL TABLE
+	lnk$gl_tfrpsc : ref block[,byte],	! POINTER TO P-SECT CONTAING USER
+	lnk$gl_tfradr,				! TRANSFER ADDRESS
+	lnk$gl_dbgtfps : ref block[,byte],	! POINTER TO PSECTION CONTAINING DEBUG
+	lnk$gl_dbgtfr,				! TRANSFER ADDRESS
+	lnk$gl_ctlmsk : block[,byte],		! LINK CONTROL MASK
+	lnk$gl_minva,				! LOWEST VIRTUAL ADDRESS ALLOCATED
+	lnk$gl_clulst : vector[2],		! CLUSTER DESCRIPTOR LISTHEAD
+	lnk$gl_lastclu : ref block[,byte],	! POINTER TO LAST CLUSTER DESCRIPTOR ALLOCATED
+	lnk$gl_curclu : ref block[,byte],	! CURRENT CLUSTER DESCRIPTOR POINTER
+	lnk$gl_defclu : block[,byte],		! DEFAULT CLUSTER
+	lnk$gl_fvmlst : ref block[,byte];	! FREE V.M. LIST ENTRY
+!
+external routine
+	crf$insrtkey,				! INSERT KEY
+	crf$insrtref,				! INSERT REF TO KEY IN CREF TABLE
+	lib$insert_tree,			! INSERT INTO BALANCED BINARY TREE
+	lnk$alloblk : novalue,			! DYNAMIC MEMORY ALLOCATOR
+	lnk$allovirmem,				! ALLOCATE SPECIFICE REGION OF VIRTUAL MEMORY
+	lnk$findvirmem,				! FIND A LARGE ENOUGH REGION OF   "      "
+	lnk$fndpscmsk,				! FIND P-SECTIONS BY MASK
+	lnk$requestmem;				! REQUEST SOME VM FOR IMAGE BUFFER
+!
+external literal
+	lin$_basesym,				! BAD BASE ADDRESS SYMBOL
+	lin$_clubelbas,				! CLUSTER= BASED CLUSTER BELOW BASE= BASE
+	lin$_confmem,				! CONFLICTING MEMORY REQUIREMENTS
+	lin$_insvirmem,				! INSUFFICIENT VIRTUAL MEMORY
+	lin$_memful,
+	lin$_noimgfil,				! NO IMAGE FILE CREATED
+	lin$_stkovflo;				! STACK OVERFLOW
+!
+global
+	lnk$gl_dmtbuffer: vector[2,long],	! BUFFER FOR DMT
+	lnk$gl_dmtbytes,			! SIZE OF DBG MODULE/PSECT INFO TABLE
+	lnk$gl_lowclu : ref block[,byte],	! ADDR OF CLUSTER DESCRIPTOR OF LOWEST VA CLUSTER (NO SHR IMGS)
+	lnk$gl_highclu : ref block[,byte],	! ADDR OF CLUSTER DESCRIPTOR OF HIGHEST VA CLUSTER (NO SHR IMGS)
+	lnk$gl_lstclstr : ref block[,byte],	! ADDR OF CLUSTER DESCRIPTOR OF LAST CLUSTER (INCLUDES SHR IMGS)
+	lnk$gl_fixisd : ref block[,byte],	! ADDR OF FIXUP ISD
+	lnk$gl_1stgadr,				! VA OF FIRST SPECIAL G^ FIXUP
+	lnk$gl_lastgadr,			! VA OF LAST ""
+	lnk$gw_shriscts : word,			! NUMBER OF ISECTS FROM PIC SHAREABLE IMAGES
+	lnk$gl_maplst,				! LIST OF P-SECTIONS FOR MAP OUTPUT (IN V.A. ORDER)
+	lnk$gw_stack : word,			! STACK SIZE (PAGES)
+	lnk$gw_nisects : word;			! NUMBER OF IMAGE SECTIONS
+!
+global literal
+	def$c_stack = 20,			! DEFAULT STACK SIZE (PAGES)
+	def$c_base = %x'200';			! DEFAULT BASE ADDRESS
+!
+!	GENERATE IMAGE SECTION GENERATION CONTROL TABLES
+!
+	psect own = $plit$ (nopic,concatenate,local,noshare,noexecute,nowrite);
+
+isgentbl(exe,					! EXECUTABLE IMAGE
+	_u_r_,  rdwrtexerelvec,			! READ ONLY PART
+	_u_rw,  rdwrtexerelvec,			! READ WRITE DATA
+	_u_x_,  rdwrtexerelvec,			! EXECUTE ONLY
+	_u_xw,  rdwrtexerelvec,			! OVERWRITTEN CODE
+	_u_r_v, rdwrtexerelvec,			! READ ONLY VECTOR
+	_u_rwv, rdwrtexerelvec,			! READ WRITE VECTOR
+	_u_x_v, rdwrtexerelvec,			! EXECUTE ONLY VECTOR
+	_u_xwv, rdwrtexerelvec,			! OVERWRITTEN CODE VECTOR
+	_stack,0);				! STACK -- MUST BE LAST
+isgentbl(sys,					! SYSTEM IMAGE
+	s_alone,gps$m_rel);			! IS A SINGLE SECTION
+isgentbl(shr,					! SHAREABLE IMAGE
+	_s_r_,  shrpicvec,
+	_s_rw,  shrpicvec,
+	_s_x_,  shrpicvec,
+	_s_xw,  shrpicvec,
+	___r_,  shrpicvec,
+	___rw,  shrpicvec,
+	___x_,  shrpicvec,
+	___xw,  shrpicvec,
+	_spr_,  shrpicvec,
+	_sprw,  shrpicvec,
+	_spx_,  shrpicvec,
+	_spxw,  shrpicvec,
+	__pr_,  shrpicvec,
+	__prw,  shrpicvec,
+	__px_,  shrpicvec,
+	__pxw,  shrpicvec,
+	_s_r_v, shrpicvec,			! VECTOR IMAGE SECTIONS
+	_s_rwv, shrpicvec,
+	_s_x_v, shrpicvec,
+	_s_xwv, shrpicvec,
+	___r_v, shrpicvec,
+	___rwv, shrpicvec,
+	___x_v, shrpicvec,
+	___xwv, shrpicvec,
+	_spr_v, shrpicvec,
+	_sprwv, shrpicvec,
+	_spx_v, shrpicvec,
+	_spxwv, shrpicvec,
+	__pr_v, shrpicvec,
+	__prwv, shrpicvec,
+	__px_v, shrpicvec,
+	__pxwv, shrpicvec,
+	__pxwv, shrpicvec,
+	_stack,0);				! MUST BE THE LAST
+
+	psect own = $own$ (nopic,concatenate,local,noshare,noexecute,write);
+
+own
+	defclubased,						! REMEMBER IF DEFAULT CLUSTER IS BASED
+	curpsect : ref block[,byte],				! POINTER TO CURRENT PSECT DESCRIPTOR
+	current_base,						! CURRENT BASE IN ISECT
+	isect_base,						! BASE OF THE IMAGE SECTION
+	cntrl_reg_addr : initial(system_space),			! CONTROL REGION ADDRESS (FOR NEXT ISECT ALLOCATED DOWNWARD)
+	isect : byte,						! I-SECT CONTROL TABLE INDEX
+	numisects : byte,					! POTENTIAL NUMBER OF ISECTS IN THIS CLUSTER OF IMAGE
+	isectgentbl : ref blockvector[,isc$c_size,byte],	! ISECT GENERATION TABLE FOR CURRENT CLUSTER
+	previsect : ref block[,byte],				! POINTER TO PREVIOUS ISECT DESCRIPTOR BLOCK
+	isctdesc : ref block[,byte];				! I-SECT DESCRIPTOR BLOCK
+
+global routine lnk$vmallo : novalue =
+begin
+!++
+!	THIS ROUTINE IS THE DRIVER FOR MEMORY ALLOCATION. 
+!
+!	TWO PASES OF THE CLUSTER LIST ARE MADE. THE FIRST PASS ALLOCATES
+!	SPECIFIC ADDRESS SPACE TO CLUSTERS WHICH HAVE BEEN GIVEN A
+!	BASE ADDRESS . THE SECOND PASS
+!	ALLOCATES MEMORY TO POSITION INDEPENDENT SHAREABLE IMAGES AND
+!	OTHER USER CLUSTERS NOT EXPLICITLY POSITIONED. THIS IS DONE IN
+!	CLUSTER LIST ORDER AND THE FIRST SPACE LARGE ENOUGH FROM THE BASE
+!	OF THE REGION IS ALLOCATED.
+!--
+local	status,
+	baseaddrsym	: ref block[,byte],			! THE SYMBOL TABLE ENTRY FOR THE SYMBOL
+	basesymsnb	: ref block[,byte];
+!
+! SELECT THE CORRECT ISECT GENERATION CONTROL TABLE
+! 
+if .lnk$gl_ctlmsk[lnk$v_exe]					! IF NORMAL EXE IMAGE POINT TO
+then begin
+     isectgentbl =  exe_isgentbl;				! ITS CONTROL TABLE AND SET 
+     numisects   = .exe_isects;					! NUMBER OF POTENTIAL ISECTS PER CLUSTER
+     end
+else if .lnk$gl_ctlmsk[lnk$v_sys]				! POINT TO SYSTEM IMAGE CONTROL TABLE
+     then begin
+	  isectgentbl =  sys_isgentbl;				! AND THEN
+	  numisects   = .sys_isects;				! POTENTIAL NUMBER OF ISECTS
+	  end
+     else begin							! IT MUST BE A SHAREABLE IMAGE
+	  isectgentbl =  shr_isgentbl;				! SO SET THE CONTROL TABLE
+	  numisects   = .shr_isects;				! AND NUMBER OF ISECTS PER CLUSTER
+	  end;
+
+defclubased    = .lnk$gl_defclu [clu$v_based];			! REMEMBER IF DEFAULT CLUSTER BASED
+lnk$gl_highclu = 0;						! INITIALLY POINTS TO NO CLUSTER
+lnk$gl_lowclu  = 0;						!
+lnk$gl_curclu  = lnk$gl_clulst [0];				! START AT TOP OF CLUSTER LIST
+while (lnk$gl_curclu = .lnk$gl_curclu [clu$l_nxtclu]) neq 0	! GET NEXT CLUSTER DESCRIPTOR
+do if not .lnk$gl_curclu [clu$v_shrimg]				! AND IF A USER CLUSTER WITH A
+   and    .lnk$gl_curclu [clu$v_based]				! BASE ADDRESS SPECIFIED
+   then begin							! ITS TIME HAS COME
+	lnk$gl_ctlmsk [lnk$v_picimg] = false;			! THE IMAGE IS NON-PIC
+	baseaddrsym = .lnk$gl_curclu [clu$l_base];		! CELL CONTAINS POINTER TO THE SYMBOL TABLE ENTRY
+	if  .lnk$gl_curclu [clu$v_symbas]			! IF THE ADDRESS IS SYMBOLICALLY SPECIFIED
+	and .baseaddrsym neq 0					!  AND IT WAS DEFINED
+	then begin						! FIRST FIGURE OUT IF VALID
+	     basesymsnb = .baseaddrsym - .baseaddrsym [sym$b_namlng]
+						 - snb$c_fxdlen; ! POINT TO NAME BLOCK
+	     if (.baseaddrsym [sym$w_flags] and (gsy$m_def	! FIRST CHECK ABSOLUTE DEFINITION
+			or gsy$m_rel)) neq gsy$m_def
+	     then begin
+		  signal (lin$_basesym,1,			! AND ISSUE ERROR IF NOT
+			  basesymsnb [snb$b_namlng]);
+		  if .lnk$gl_ctlmsk [lnk$v_sys]			! IF A SYSTEM IMAGE SET THE
+		  then lnk$gl_curclu [clu$l_base] = system_space  ! BASE ADDRESS FOR IT
+		  else lnk$gl_curclu [clu$l_base] = 0;		! OTHERWISE DEFAULT TO ZERO
+		  end
+	     else begin
+		  if not (.lnk$gl_ctlmsk [lnk$v_sys] and not	! OTHERWISE UNLESS SYSTEM IMAGE WITHOUT A HEADER
+				.lnk$gl_ctlmsk [lnk$v_sysheadr])
+		  then lnk$gl_curclu [clu$l_base] = .baseaddrsym [sym$l_value] + ! THEN SET TO NEXT PAGE BEYOND VALUE
+							511 and not 511
+		  else lnk$gl_curclu [clu$l_base] = .baseaddrsym [sym$l_value]; ! IF NO /HEADER, THEN DON'T ROUND IT
+		  end;
+	     if  .lnk$gl_ctlmsk [lnk$v_sys]					! IF A SYSTEM IMAGE SYMBOLICALLY
+	     then lnk$gl_fvmlst [fvm$l_address] = .lnk$gl_curclu [clu$l_base];	! BASED THEN SET V.M. BASE
+	     end;
+	if  .defclubased						! IF DEFAULT CLUSTER IS BASED
+	and .lnk$gl_curclu [clu$l_base] lssu .lnk$gl_defclu [clu$l_base]
+	then   signal	( lin$_clubelbas, 3
+			,.lnk$gl_curclu [clu$l_base]
+			, lnk$gl_curclu [clu$b_namlng]
+			,.lnk$gl_defclu [clu$l_base]
+			);
+	allocluster ();						! GO ALLOCATE THE CLUSTER
+	if not lnk$allovirmem (.lnk$gl_curclu [clu$l_base]	! CONTENTS TO VIRTUAL MEMORY
+			      ,.lnk$gl_curclu [clu$l_pages])	! THEN ATTEMPT TO ALLOCATE THAT REGION
+	then begin
+	     lnk$gl_ctlmsk[lnk$v_image] = false;		! TURN OFF IMAGE PRODUCTION
+	     signal ( lin$_confmem, 3				! AND ISSUE ERROR ON FAILURE
+		    ,.lnk$gl_curclu[clu$l_base]
+		    ,.lnk$gl_curclu[clu$l_pages]
+		    , lnk$gl_curclu [clu$b_namlng]
+		    , lin$_noimgfil
+		    );
+	     end;
+	lnk$setlastclu (.lnk$gl_curclu);			! SEE IF LAST CLUSTER
+	relocluster ();						! 
+	end
+
+   else if  .lnk$gl_curclu [clu$v_shrimg]			! IF THIS IS A BASED SHAREABLE IMAGE
+	and .lnk$gl_curclu [clu$v_based]
+ 	then lnk$cluvirmem (.lnk$gl_curclu);			! ALLOCATE VIRTUAL MEMORY FOR CLUSTER
+!
+! ALL EXPLICITLY BASED VIRTUAL MEMORY HAS NOW BEEN ALLOCATED. NOW MAKE
+! ANOTHER PASS DOWN THE CLUSTER LIST, ALLOCATING MEMORY TO THE USER
+! DEFINED CLUSTERS WHICH HAVE NO EXPLICIT ADDRESS SPECIFICATION.
+!
+baseaddrsym = .lnk$gl_minva;					! SAVE MINIMUM ADDRESS
+
+if not .lnk$gl_ctlmsk [lnk$v_shr]				! IF NOT CREATING SHAREABLE IMAGE
+then if lnk$allovirmem (0,1)					!  FORCE ALLOCATE FIRST PAGE IF STILL FREE
+     then lnk$gl_minva = .baseaddrsym;				! RESTORE MINIMUM ADDRESS IF SUCCEEDED
+
+lnk$gl_curclu = lnk$gl_clulst[0];				! START AT TOP OF LIST
+
+while (lnk$gl_curclu = .lnk$gl_curclu[clu$l_nxtclu]) neq 0	! GET NEXT CLUSTER DESCRIPTOR
+do  begin
+    if  not .lnk$gl_curclu [clu$v_based]			! IF BASE ADDRESS NOT YET ESTABLISHED
+    and not .lnk$gl_curclu [clu$v_shrimg]			! AND NOT FROM A SHAREABLE IMAGE
+    then begin
+	 allocluster ();					! GATHER P-SECTIONS
+	 lnk$cluvirmem (.lnk$gl_curclu);			! ALLOCATE VIRT. MEMORY FOR CLUSTER
+	 end;
+    end;
+
+! ALLOCATE BUFFER FOR DMT INFORMATION
+
+if (lnk$gl_dmtbytes = .lnk$gl_omddst * dcm$c_size +.lnk$gw_pscdst * dcp$c_size) gtr 0 
+then if not (status = lnk$requestmem ( ((.lnk$gl_dmtbytes or 511)+1)/512, lnk$gl_dmtbuffer))
+     then begin
+	  signal (.status, 0, lin$_noimgfil);
+	  lnk$gl_ctlmsk [lnk$v_image] = false;
+	  end;
+
+!
+! IF THIS IMAGE IS A BASED IMAGE, THEN ALLOCATE THE FIXUP SECTION
+! NOW, IF THERE ARE ANY SHAREABLE IMAGES LINKED IN ALSO, SO THAT WHEN THE
+! VIRTUAL MEMORY IS ALLOCATED FOR THESE SHAREABLE IMAGES, THEY DON'T OVERMAP
+! THE FIXUP SECTION.  WE CAN'T ALLOCATE VIRTUAL MEMORY FOR THE FIXUP SECTION
+! YET, SINCE WE DON'T KNOW THE EXTENT OF IT'S SIZE (DUE TO NOT KNOWING THE
+! NUMBER OF .ADDRESS FIXUPS YET TO BE FOUND), WE CAN ONLY SPECIFY IT'S
+! BASE, AND THEN COMPUTE THE SIZE AT LNK$FLUSHIMG AFTER PASS 2.
+!
+! WE CAN DO THIS IF THE IMAGE IS BASED, BECAUSE THE .ADDRESS FIXUPS ARE NOT
+! DONE THEN.
+!
+if  not .lnk$gl_ctlmsk[lnk$v_sys]
+and not .lnk$gl_ctlmsk[lnk$v_shr]
+and .defclubased
+then begin
+     local  fixisdhdr : ref block[,byte];
+
+     lnk$crefixisd();
+     fixisdhdr = lnk$gl_fixisd[isl$t_hdrisd];
+     if not lnk$allovirmem(.fixisdhdr[isd$v_vpn]^9,.fixisdhdr[isd$w_pagcnt])
+     then begin
+	  signal(lin$_confmem,3,
+			.fixisdhdr[isd$v_vpn]^9,.fixisdhdr[isd$w_pagcnt],
+			cstring('FIXUP SECTION'),lin$_noimgfil);
+	 lnk$gl_ctlmsk [lnk$v_image] = false;
+	 end;
+     lnk$gl_fixisd [isl$v_memalo] = true;			! FLAG MEMORY ALLOCATED
+     end;
+				
+!
+! IF IMAGE IS BASED, MAKE ONE MORE PASS DOWN THE LIST AND ALLOCATE VM
+! FOR PIC SHAREABLE IMAGES
+!
+lnk$gl_curclu = lnk$gl_clulst[0];				! START AT TOP OF LIST
+
+if .defclubased							! IF DEFAULT CLUSTER IS BASED (BASE=)
+    and not .lnk$gl_ctlmsk[lnk$v_sys]
+then while (lnk$gl_curclu = .lnk$gl_curclu[clu$l_nxtclu]) neq 0		! GET NEXT CLUSTER DESCRIPTOR
+do begin
+    if not .lnk$gl_curclu[clu$v_based]					! IF BASE ADDRESS NOT YET ESTABLISHED
+	and .lnk$gl_curclu[clu$v_shrimg]				! AND A SHAREABLE IMAGE
+    then begin
+	lnk$cluvirmem(.lnk$gl_curclu);					! ALLOCATE VIRT. MEMORY FOR CLUSTER
+	end;
+    end;
+
+!
+! IF LNK$GL_HIGHCLU IS 0, THEN THERE WERE PROBABLY NO OBJECT INPUT FILES,
+! ONLY SHAREABLE IMAGES.  MAKE THE DEFAULT CLUSTER THE HIGHEST CLUSTER.
+!
+if .lnk$gl_highclu eql 0
+then begin
+    if .lnk$gl_defclu[clu$l_fstfdb] eql 0				! IF IT HAS NO FILES IN IT
+    then begin
+	lnk$gl_lastclu[clu$l_nxtclu] = lnk$gl_defclu;			! LINK IT ON THE END OF THE LIST
+	if (lnk$gl_defclu[clu$l_prevclu] = .lnk$gl_lastclu) eql 0
+	    then lnk$gl_defclu[clu$l_prevclu] = lnk$gl_clulst;
+	lnk$gl_lastclu = lnk$gl_defclu;
+	end;
+    lnk$allovirmem(0,1);						! ALLOCATE FIRST PAGE
+    lnk$gl_highclu = lnk$gl_defclu;					! MAKE DEFAULT CLUSTER THE HIGHEST CLUSTER
+    lnk$gl_lowclu = lnk$gl_defclu;
+    end;
+!
+! NOW CREATE THE FIXUP SECTION WITH THE ISD AS THE LAST ISECT IN THE IMAGE.
+! THEN, GO THROUGH ALL THE CLUSTERS AND DEFINE THE SYMBOLS IN THE FIXUP SECTION
+! AS NEEDED.
+!
+if (.lnk$gl_fixisd eql 0)
+    and ((not .lnk$gl_ctlmsk[lnk$v_sys]
+	and (.lnk$gl_shrclstrs neq 0)					! CREATE SECTION ONLY IF NEEDED
+	and not .defclubased)
+    or .lnk$gl_ctlmsk[lnk$v_exe])					! UNLESS EXECUTABLE, THEN ALWAYS CREATE IT
+    then lnk$crefixisd();
+
+if .lnk$gl_tfrpsc neq 0							! IF A TRANSFER ADDRESS EXISTS
+    then lnk$gl_tfradr = .lnk$gl_tfradr + .lnk$gl_tfrpsc[psc$l_base];	! THEN RELOCATE IT
+if .lnk$gl_dbgtfps neq 0 and .lnk$gl_dbgtfps neq 1			! IF A DEBUG TRANSFER ADDRESS (AND NOT SYS$IMGSTA)
+    then lnk$gl_dbgtfr = .lnk$gl_dbgtfr + .lnk$gl_dbgtfps[psc$l_base];	! RELOCATE IT ALSO
+return;									! MEMORY ALLOCATION/RELOCATION COMPLETE
+end;						! OF ROUTINE.
+
+routine allocluster : novalue =
+begin
+!
+!	THIS ROUTINE INDEXES DOWN THE I-SECTION GENERATION CONTROL
+!	TABLE, CALLING THE I-SECT SPECIFIC ROUTINE.
+!	FIRST HOWEVER ESTABLISH THE BASE ADDRESS IF IT WAS SYMBOLIC
+!
+isect_base = .lnk$gl_curclu[clu$l_base];			! START AT BASE DETERMINED BY COMMAND
+isctdesc = lnk$gl_curclu[clu$l_fstisd];				! INITIALIZE TO LISTHEAD FOR ISECTIONS
+previsect = lnk$gl_curclu[clu$l_fstisd];
+!
+incr iloop from 1 to .numisects do				! INCREMENT THROUGH GENERATION
+begin								! CONTROL TABLE
+	isect = .iloop;						! REMEMBER INDEX
+	if not (.lnk$gl_ctlmsk[lnk$v_sys]			! UNLESS A SYSTEM IMAGE WITHOUT A HEADER
+			and not .lnk$gl_ctlmsk[lnk$v_sysheadr])
+	    then isect_base = (.isect_base+511) and not 511;	! ROUND UP NEXT PAGE
+	if .isectgentbl[.isect-1,isc$b_code] eql stack_code	! CALL THE BUILD ROUTINE BASED ON
+	then stack_isectbld()					! THE KIND OF ISECT .. STACK
+	else normal_isectbld();					! AND ALL OTHERS
+end;
+if .isctdesc[isl$l_nxtisd] eql -1				! IF AN ALLOCATED ISD IS UNUSED
+then begin
+	isctdesc = .lnk$gl_curclu[clu$l_lstisd];		! THEN DISCONNECT IT FROM LIST
+	isctdesc[isl$l_nxtisd] = 0;
+     end;
+return;
+end;
+
+routine compare_bases (psectbase, currentnode, psectdesc) =
+begin
+!
+! COMPARE PSECT BASE WITH BASE OF CURRENT NODE
+!
+map
+    currentnode : ref block[,byte],
+    psectdesc : ref block[,byte];
+
+local
+    pdesc : ref block[,byte];
+
+pdesc = .currentnode[node$l_ptr];			! GET POINTER TO PSECT DESCRIPTOR
+if .psectbase lssu .pdesc[psc$l_base]
+    then return -1
+    else if .psectbase eql .pdesc[psc$l_base]
+	then begin
+	    if .psectdesc[psc$l_length]			! BASES THE SAME...DOES CURRENT NODE EXTEND FARTHER?
+			lssu .pdesc[psc$l_length]
+		then return -1
+		else return ch$compare(.psectdesc[psc$b_namlng],! IF THEY ARE EQUAL COMPARE THE NAMES
+				psectdesc[psc$t_name],
+				.pdesc[psc$b_namlng],
+				pdesc[psc$t_name]);
+	    end
+	else return 1
+end;
+
+routine alloc_node (keyvalue, retadr, psectdesc) =
+begin
+!
+! ALLOCATE A NODE AND POINT TO CURRENT PSECT DESCRIPTOR
+!
+local
+    blockaddr : ref block[,byte];
+
+lnk$alloblk(node$c_long,blockaddr);
+blockaddr[node$l_ptr] = .psectdesc;
+.retadr = .blockaddr;
+return true
+end;
+
+routine relocluster : novalue =
+begin
+!
+!	THIS ROUTINE RELOCATES THE CONTENTS OF THE CURRENT CLUSTER. THIS MEANS
+!	GOING DOWN EACH OF THE I-SECTION AND P-SECTION LISTS AND ADDING
+!	THE CLUSTER BASE TO THEIR BASES. IN ADDITION, FOR EACH P-SECTION,
+!	THE LIST OF SYMBOLS IS SCANNED AND THOSE THAT ARE RELOCATABLE ARE
+!	ALSO RELOCATED BY THE CLUSTER BASE ADDRESS. IN THE PROCESS OF DOING THIS
+!	EACH P-SECTION DESCRIPTOR IS REMOVE FROM THE CLUSTER LIST AND PUT
+!	ON THE MAPPING LIST IN VIRTUAL ADDRESS ORDER FOR LATER MAP
+!	OUTPUT.
+!
+!		IF THE CURRENT CLUSTER HAS ALREADY BEEN BASED, HOWEVER, THE
+!	RELOCATION IS NOT DONE - THE P-SECTIONS ARE MERELY MOVED TO THE
+!	MAPPING LIST.
+!
+routine relocpsects (psectdesc) =
+begin
+!
+! THIS LOCAL ROUTINE RELOCATES THE PSECTS ON THE SPECIFIED PSECT
+! LIST AND TRANSFERS THEM TO THE MAPPING LIST.
+!
+map
+	psectdesc : ref block[,byte];
+
+local
+	blockaddr,
+	symsnb : ref block[,byte],
+	symbol : ref block[,byte];
+
+if .psectdesc eql 0
+    then return true;
+if .psectdesc[psc$l_left] neq 0
+    then relocpsects(.psectdesc[psc$l_left]);
+if not .psectdesc[psc$v_deleted]					! IF PSECT IS NOT DELETED
+    and (.psectdesc[psc$l_isect] neq 0					! IF P-SECTION ALLOCATED TO MEMORY
+   or (.psectdesc[psc$w_flags] and (gps$m_lib or gps$m_gbl)) neq 0	! OR IS GLOBAL OR IN SHAREABLE
+   or .lnk$gl_ctlmsk[lnk$v_shr]						! OR A SHAREABLE OR
+   or .lnk$gl_ctlmsk[lnk$v_dbg]						! DEBUGGABLE IMAGE
+   or .lnk$gl_ctlmsk[lnk$v_symtbl])					! OR CREATING A SYMBOL TABLE
+   then begin
+	if .psectdesc[psc$v_rel]					! AND THIS P-SECTION IS RELOCATABLE
+	    and not .lnk$gl_curclu[clu$v_based]				! AND CLUSTER IS NOT BASED
+	    or (.lnk$gl_curclu[clu$v_shrimg] and .lnk$gl_curclu[clu$v_pic])
+	    then psectdesc[psc$l_base] = .psectdesc[psc$l_base] +
+					.lnk$gl_curclu[clu$l_base];	! ADD CLUSTER BASE TO ITS BASE
+	symbol = .psectdesc[psc$l_symlst];				! GO DOWN LIST OF
+	while .symbol neq 0						! SYMBOLS OWNED BY
+	do begin							! P-SECTION AND ADD ITS
+		if .symbol[sym$v_rel]					! BASE TO ANY THAT
+!		    OR (.LNK$GL_CURCLU[CLU$V_SHRIMG] AND .LNK$GL_CURCLU[CLU$V_PIC])
+		then begin						! ARE RELOCATABLE
+			bind
+			    symsnb = .symbol - .symbol[sym$b_namlng]	! POINT TO NAME BLOCK
+						- snb$c_fxdlen : block[,byte];
+			if .lnk$gl_curclu[clu$v_shrimg]			! IF THIS IS SHAREABLE IMAGE
+			then symbol[sym$v_rel] = false;			!  IT'S NOT RELOCATABLE ANYMORE
+			if .symbol[sym$v_gref]				! IF SYMBOL WAS IN PIC, NON-BASED IMAGE
+			    then symbol[sym$l_value] = .symbol[sym$l_offset]
+							+ .lnk$gl_curclu[clu$l_base]
+			    else symbol[sym$l_value] = .symbol[sym$l_value]
+							+ .psectdesc[psc$l_base];
+			if .lnk$gl_ctlmsk[lnk$v_long]			! IF A LONG FORM MAP IS REQUIRED
+			    and .symbol[sym$v_crosref]			! AND SYMBOL HAS BEEN CROSS REFERENCED IN PASS 1
+			    and not .symbol[sym$v_supres]		! AND THE SYMBOL IS NOT  SUPPRESSED
+			    and not .symbol[sym$v_lclsym]		! AND IT'S NOT A LOCAL SYMBOL
+			then begin
+			    crf$insrtkey(lnk$al_sytblfmt,symsnb[snb$b_namlng],
+					symbol[sym$l_value],
+					.symbol[sym$w_flags]);
+			    crf$insrtref(lnk$al_valctltb,		! THEN INSERT THIS SYMBOL
+				symbol[sym$l_value],symsnb[snb$b_namlng], ! AS A REFERENCE TO ITS
+				.symbol[sym$w_flags],0);		! OWN VALUE RELOCATED
+			    end;
+		     end;
+		symbol = .symbol[sym$l_psclst];				! MOVE ON TO NEXT
+	end;
+	lib$insert_tree(lnk$gl_maplst,.psectdesc[psc$l_base],%ref(1),	!  INSERT NODE INTO VA 
+			compare_bases, alloc_node, blockaddr,.psectdesc);! ORDERED TREE (PSECT MAPPING LIST)
+									! (IF ABS, SUPRESSED IN MAP, BUT NEEDED
+									! IN LIST FOR SYMBOL TABLE FILE OUTPUT
+   end;
+
+if .psectdesc[psc$l_right] neq 0					! PROCESS RIGHT SUBTREE IF PRESENT
+    then relocpsects(.psectdesc[psc$l_right]);
+
+return true
+end;									! OF RELOCPSECTS
+!
+! MAIN BODY OF RELOCLUSTER
+!
+
+if not .lnk$gl_curclu[clu$v_shrimg]
+then begin
+    if (.lnk$gl_highclu eql 0					! IF NO HIGHEST CLUSTER
+	or .lnk$gl_curclu[clu$l_base] gtru .lnk$gl_highclu[clu$l_base])! OR THIS IS NEW HIGHEST
+	then lnk$gl_highclu = .lnk$gl_curclu;			! THEN MAKE IT NEW HIGHEST CLUSTER
+    if (.lnk$gl_lowclu eql 0					! IF NO LOWEST CLUSTER
+	or .lnk$gl_curclu[clu$l_base] lssu .lnk$gl_lowclu[clu$l_base]) ! OR THIS ONE IS LOWER
+	then lnk$gl_lowclu = .lnk$gl_curclu;
+    end;
+!
+! RELOCATE THE PSECTS IN THIS CLUSTER
+!
+relocpsects(.lnk$gl_curclu[clu$l_lpslst]);
+
+return true
+end;									! OF RELOCLUSTER
+
+global routine lnk$crefixisd =
+begin
+!
+! THIS ROUTINE CREATES THE FIXUP IMAGE SECTION AT THE END OF THE HIGHEST
+! USER CLUSTER
+!
+
+    local
+	lastisd : ref block[,byte],
+	lasthdrisd : ref block[,byte],
+	stackisd : ref block[,byte],
+	symbolblock : ref block[,byte],
+	symbolsnb : ref block[,byte],
+	hdrisd : ref block[,byte],
+	fixadr,
+	savecurclu,
+	tempisd : block[isl$c_size+isd$c_maxlenglbl,byte];
+
+    lastisd = stackisd = .lnk$gl_highclu[clu$l_lstisd];			! POINT TO LAST ISD IN CLUSTER
+    lasthdrisd = lastisd[isl$t_hdrisd];					! POINT TO PART OF LAST ISD BOUND FOR HEADER
+    if .lastisd eql lnk$gl_highclu[clu$l_fstisd]			! IF CLUSTER HAS NO IMAGE SECTIONS
+    then begin
+	ch$fill(0,isl$c_size+isd$c_maxlenglbl,tempisd);			! ZERO TEMPORARY ISECT
+	lasthdrisd = tempisd[isl$t_hdrisd];				! USE IT FOR THE PAGE COUNT
+	lasthdrisd[isd$w_pagcnt] = 1;					! SET ONE PAGE (SO FIXUP SECTION NOT BASED AT 0)
+	end;
+    if .lasthdrisd[isd$b_type] neq isd$k_usrstack			! IF THE LAST SECTION IS NOT A STACK SECTION
+	then stackisd = 0						! THEN REMEMBER THAT
+	else begin
+	    lastisd = .lastisd[isl$l_previsd];				! POINT TO ONE JUST BEFORE STACK ISD
+	    lasthdrisd = lastisd[isl$t_hdrisd];				! AND IT'S HEADER PART
+	    end;
+    savecurclu = .lnk$gl_curclu;					! SAVE CURRENT CLUSTER DESCRIPTOR POINTER
+    lnk$gl_curclu = .lnk$gl_highclu;					! MAKE HIGHEST CLUSTER THE CURRENT CLUSTER
+    isect_base = fixadr = (.lasthdrisd[isd$v_vpg]^9)			! SET BASE OF ISECT WE WILL CREATE
+					+(.lasthdrisd[isd$w_pagcnt]*512);
+    if .isect_base eql 0						! IF BASE IS 0, MAKE IT X'200', THIS CLUSTER IS
+	then isect_base = %x'200';					!  NULL.
+    lnk$alloblk(isd$c_size,isctdesc);					! ALLOCATE ISECT DESCRIPTOR
+    lnk$gl_fixisd = lastisd[isl$l_nxtisd] = .isctdesc;			! LINK INTO ISD LIST AND REMEMBER DESCRIPTOR ADDRESS
+    if .lnk$gl_ctlmsk[lnk$v_shr]					! SET THE CORRECT INDEX INTO ISGENTBL
+        then isect = 6							! (IF A SHAREABLE IMAGE)
+	else isect = 2;							! (IF AN EXECUTABLE IMAGE)
+    previsect = .lastisd;						! POINT TO PREVIOUS ISECT DESCRIPTOR FOR BUILDISD
+    buildisd(((((.lnk$gl_shrimgs*2)+.lnk$gl_shrsyms+1)*4)		! FILL IN AND LINK INTO CURRENT CLUSTER
+						+iaf$c_length+511)/512);
+    if .stackisd neq 0
+    then begin
+	isctdesc[isl$l_nxtisd] = .stackisd;				! PUT STACK ISD BACK IN IF IT WAS THERE
+	stackisd[isl$l_previsd] = .isctdesc;
+	lnk$gl_curclu[clu$l_lstisd] = .stackisd;
+	end;
+    hdrisd = isctdesc[isl$t_hdrisd];					! POINT TO PART IN HEADER
+    fixadr = .fixadr + iaf$c_length;					! POINT TO START OF FIXUP AREA (SKIP HEADER)
+    !
+    ! NOW LOOP THROUGH ALL THE CLUSTERS, AND FOR EACH CLUSTER THAT HAS SYMBOLS
+    ! IN THE SHR LST, REDEFINE THE SYMBOL AT THE PROPER LOCATION IN THE FIXUP
+    ! AREA.
+    !
+    lnk$gl_curclu = lnk$gl_clulst[0];					! START AT TOP OF CLUSTER LIST
+
+    if .lnk$gl_shrsyms neq 0
+    then while (lnk$gl_curclu = .lnk$gl_curclu[clu$l_nxtclu]) neq 0
+    do if .lnk$gl_curclu[clu$l_shrsyms] neq 0				! IF THIS CLUSTER HAS SHAREABLE IMAGE REFERENCES
+    then begin
+	fixadr = .fixadr + 8;						! LEAVE ROOM FOR # OF REFS, AND SHR IMAGE NUMBER
+	symbolblock = .lnk$gl_curclu[clu$l_shrlst];			! NOW RUN THROUGH ALL THE SYMBOLS
+	while .symbolblock neq 0
+	do begin
+	    symbolsnb = .symbolblock - .symbolblock[sym$b_namlng]	! POINT TO NAME BLOCK PART
+							- snb$c_fxdlen;
+	    symbolblock[sym$l_offset] = .symbolblock[sym$l_value];	! SAVE OFFSET
+	    symbolblock[sym$l_value] = .fixadr;				! DEFINE SYMBOL TO BE HERE INSTEAD
+	    fixadr = .fixadr + 4;					! NEXT SLOT
+	    symbolblock = .symbolblock[sym$l_shrlnk];			! AND LINK TO NEXT
+	    end;
+	end;
+
+    lnk$gl_1stgadr = .fixadr+4;
+    lnk$gl_lastgadr = .fixadr+4;
+    lnk$gl_curclu = .savecurclu;					! RESTORE CURRENT CLUSTER
+
+return true
+end;
+
+global routine lnk$cluvirmem (clusterdesc) =
+begin
+!
+!	THIS ROUTINE ALLOCATES VIRTUAL MEMORY FOR A CLUSTER
+!	IF THE MEMORY CANNOT BE ALLOCATED THE IMAGE PRODUCTION IS
+!	DISABLED.
+!
+! INPUTS:
+!
+!	CLUSTERDESC	A POINTER TO THE CLUSTER DESCRIPTOR FOR CLUSTER TO
+!			BE ALLOCATED
+!
+! OUTPUTS:
+!
+!	VIRTUAL MEMORY ALLOCATED. [CLU$L_BASE] IN THE CLUSTER DESCRIPTOR
+!	SET TO VA OF ALLOCATED MEMORY.
+!
+!
+map
+    clusterdesc : ref block[,byte];
+
+local
+    savecluster,
+    status;
+
+if not (status = (if not .clusterdesc[clu$v_based]		!  IF THIS CLUSTER NOT BASED
+!	    AND .LNK$GL_CTLMSK[LNK$V_SHR]			!  AND WE ARE PRODUCING A SHAREABLE IMAGE
+	    and .defclubased					!  THAT IS BASED
+	then lnk$findvirmem(clusterdesc[clu$l_base],		! THEN FIND THE VIRTUAL MEMORY
+				.clusterdesc[clu$l_pages],
+				.lnk$gl_defclu[clu$l_base])	! BUT INSIST THAT IT BE ABOVE THE BASE= BASE.
+	else if .clusterdesc[clu$v_based]			! IF THIS CLUSTER IS BASED
+	    then lnk$allovirmem(.clusterdesc[clu$l_base],.clusterdesc[clu$l_pages])
+	    else lnk$findvirmem(clusterdesc[clu$l_base],	! ATTEMPT TO FIND ENOUGH MEMORY
+			.clusterdesc[clu$l_pages])))		! FOR CLUSTER, RETURNING BASE ADDRESS
+then begin
+    signal(lin$_insvirmem,2,			! BUT ISSUE ERROR IF INSUFFICIENT
+		.clusterdesc[clu$l_pages],clusterdesc[clu$b_namlng],lin$_noimgfil);
+    lnk$gl_ctlmsk[lnk$v_image] = false;		! AND DISABLE IMAGE OUTPUT
+    end;
+if .clusterdesc[clu$v_shrimg]
+    then clusterdesc[clu$v_based] = true;	! IT'S BASED NOW
+isctdesc = clusterdesc[clu$l_fstisd];		! INITIALIZE TO LISTHEAD FOR ISECTIONS
+if (if .clusterdesc[clu$v_shrimg]
+	then .clusterdesc[clu$v_pic]
+	else not .clusterdesc[clu$v_based])
+then while (isctdesc = .isctdesc[isl$l_nxtisd]) neq 0	! GET NEXT ISD IN LIST
+do begin
+    bind
+	hdrisd = isctdesc[isl$t_hdrisd] : block[,byte];	! POINT TO HEADER PART
+
+    if not .hdrisd[isd$v_p1]				! IF NOT CONTROL REGION
+	then hdrisd[isd$v_vpg] = .hdrisd[isd$v_vpg] + 	! ADD THE CLUSTER BASE PAGE
+			(.clusterdesc[clu$l_base] ^ -9);! TO I-SECTION PAGE NUMBER
+    if .clusterdesc[clu$v_shrimg]			! IF SHAREABLE IMAGE
+	then hdrisd[isd$v_based] = true;		! FLAG SECTION AS BASED
+    end;
+!
+! SEE IF LAST CLUSTER
+!
+lnk$setlastclu(.clusterdesc);
+!
+! RELOCATE CONTENTS OF CLUSTER
+!
+if (if .clusterdesc[clu$v_shrimg]
+	then .clusterdesc[clu$v_pic]
+	else not .clusterdesc[clu$v_based])
+then begin
+    savecluster = .lnk$gl_curclu;
+    lnk$gl_curclu = .clusterdesc;
+    relocluster();
+    lnk$gl_curclu = .savecluster;
+    end;
+
+return .status
+end;
+
+
+global routine lnk$setlastclu (cludesc) =
+begin
+!
+!	THIS ROUTINE TESTS IF THE CLUSTER PASSED TO IT IS INDEED
+!	THE LAST CLUSTER.  IF SO, IT SETS LNK$GL_LSTCLSTR
+!
+map
+    cludesc : ref block[,byte];
+
+if (.lnk$gl_lstclstr eql 0)
+    or (.cludesc[clu$l_base] gtru .lnk$gl_lstclstr[clu$l_base])
+    then lnk$gl_lstclstr = .cludesc;
+
+return true
+end;
+
+routine stack_isectbld : novalue =
+begin
+!
+!	THIS ROUTINE BUILDS A DEMAND ZERO IMAGE SECTION FOR
+!	USER STACK, IF ANY AND IF ON THE LAST CLUSTER.
+!
+if .lnk$gw_stack neq 0						! IF THERE IS SOME STACK
+and (.lnk$gl_curclu[clu$l_nxtclu] eql 0				! AND WE ARE ON THE LAST CLUSTER
+    or .lnk$gl_curclu eql lnk$gl_defclu)
+then begin
+	if (isect_base = .cntrl_reg_addr - .lnk$gw_stack*512)	! SET BASE OF STACK
+		lssu control_region				! IF IT GOES BELOW CONTROL REGION
+	then signal_stop(lin$_stkovflo,2,			! AN ERROR
+			.lnk$gw_stack,.isect_base);
+	if .isctdesc[isl$l_nxtisd] eql 0			! IF CURRENT ISD IS THE LAST
+	then begin						! ONE IN USE
+		lnk$alloblk(isd$c_size,isctdesc[isl$l_nxtisd]);	! GO ALLOCATE A NEW DESCRIPTOR
+		isctdesc = .isctdesc[isl$l_nxtisd];		! AND LINK TO THE PREVIOUS ONE
+	     end;
+	buildisd(.lnk$gw_stack);				! GO CREATE ISD
+	cntrl_reg_addr = .isect_base;				! UPDATE CONTROL REGION POINTER
+   end;
+return;								! AND ALL DONE
+end;								! OF STACK ALLOCATOR
+
+routine normal_isectbld : novalue =
+begin
+!
+!	THIS ROUTINE BUILDS THE NORMAL IMAGE-SECTIONS OF THE 
+!	PROGRAM REGION BY GATHERING COMPATIBLE P-SECTIONS IN
+!	LEXICAL ORDER
+!
+routine findmask_action (psctdesc) =
+begin
+!
+! THIS ROUTINE IS CALLED BY LNK$FNDPSCMSK FOR EACH PSECT
+! THAT MATCHES THE MASK
+!
+map
+    psctdesc : ref block[,byte];
+
+local
+	around,
+	isect_blks,
+	symsnb : ref block[,byte],			! PTR TO NAME BLOCK
+	psect_length,
+	pscpart_base,
+	symbol : ref block[,byte];
+!
+bind
+	isd$c_maxblk = %x'FFFF',				! MAX ISD BLOCK SIZE
+	isd$c_maxblkbyt = isd$c_maxblk*512;			! EXPRESSED IN BYTES ALSO
+!
+begin								! WITH APPROPRIATE ATTRIBUTES
+	if .isctdesc[isl$l_nxtisd] eql 0			! IF WE HAVEN'T ALLOCATED AN ISECT
+	then begin						! DESCRIPTOR THAT WASN'T USED
+		lnk$alloblk(isd$c_size,isctdesc[isl$l_nxtisd]);	! GO ALLOCATE DESCRIPTOR
+		isctdesc = .isctdesc[isl$l_nxtisd];		! AND LINK TO THE PREVIOUS ONE
+		isctdesc[isl$l_nxtisd] = -1;			! TEMPORARILY MARK AS ALLOCATED
+	     end;
+	around = (1^.psctdesc[psc$b_align]) - 1;		! COMPUTE THE ADJUSTMENT FOR ALIGNING
+	current_base = (.current_base + .around) and not .around;! AND DO IT THEN
+	pscpart_base = .current_base;					! SET BASE OF PSECT SEGMENT
+	psect_length = .psctdesc[psc$l_length];				! SET LENGTH OF PSECT
+	psctdesc[psc$l_isect] = 0;					! ENSURE 0 ISECT POINTER
+	while ((.pscpart_base - .isect_base + .psect_length) gtru isd$c_maxblkbyt
+		and (.psect_length gtru 0))
+	do begin
+	    isect_blks = isd$c_maxblk;				! SET TO MAXIMUM ISD
+	    buildisd(.isect_blks);				! BUILD ISD WE HAVE
+	    lnk$gl_curclu[clu$l_pages] = .lnk$gl_curclu[clu$l_pages] + .isect_blks; ! ADD ISECT SIZE TO CLUSTER SIZE
+	    if .psctdesc[psc$l_isect] eql 0 then psctdesc[psc$l_isect] = .isctdesc; ! IF PSECT NOT BOUND TO ISECT, DO SO
+	    lnk$alloblk(isd$c_size,isctdesc[isl$l_nxtisd]);		! ALLOCATE A NEW ISD
+	    isctdesc = .isctdesc[isl$l_nxtisd];				! LINK INTO LIST
+	    isctdesc[isl$l_nxtisd] = -1;				! TEMPORARILY MARK AS ALLOCATED
+	    psect_length = (.pscpart_base - .isect_base + .psect_length) - isd$c_maxblkbyt; ! REDUCE PSECT LENGTH
+	    isect_base = (.isect_base + isd$c_maxblkbyt);			! SET NEW ISECT BASE
+	    pscpart_base = .isect_base;					! SET BASE OF PART OF PSECT
+	    end;
+	psctdesc[psc$l_base] = .current_base;			! SET P-SECT BASE
+	if .psctdesc[psc$l_isect] eql 0 then psctdesc[psc$l_isect] = .isctdesc; ! BIND PSECT TO ISECT IF NOT DONE
+	current_base = .current_base + .psctdesc[psc$l_length];		! THEN UPDATE FOR THE NEXT
+	pscpart_base = .current_base;					! UPDATE PSECT BASE POINTER
+end;
+return true							! AND DONE
+end;								! OF FINDMASK_ACTION
+!
+! MAIN BODY OF NORMAL_ISECTBLD
+!
+local
+    isect_blks;
+
+bind
+	attribmask = .isectgentbl[.isect-1,isc$w_mask],		! CREATE MORE
+	attribvalue = .isectgentbl[.isect-1,isc$w_match];	! CONVENIENT NAMES
+
+current_base = .isect_base;					! SET FIRST PSECT BASE
+lnk$fndpscmsk(attribmask,attribvalue,findmask_action);		! FIND COMPATIBLE PSECTS
+isect_blks = (.current_base - .isect_base+511)/512;		! COMPUTE NUMBER OF BLOCKS
+if .isctdesc[isl$l_nxtisd] eql -1				! IF A DESCRIPTOR WAS ALLOCATED
+then buildisd(.isect_blks);					! THEN CREATE ISD
+lnk$gl_curclu[clu$l_pages] = .lnk$gl_curclu[clu$l_pages] +	! ADD I-SECTION SIZE TO CLUSTER SIZE
+					.isect_blks;
+isect_base = .current_base;					! SET BASE OF NEXT I-SECT
+return true
+end;
+
+routine buildisd (npages) : novalue =
+begin
+!
+!	ROUTINE TO ALLOCATE AN IMAGE SECTION DESCRIPTOR AND
+!	FILL IN ITS FIELDS, THEN LINK ON TO THE ISD LIST
+!	NPAGES = NUMBER OF PAGES TO ALLOCATE IN SECTION.
+!
+bind
+	hdrisd = isctdesc[isl$t_hdrisd] : block[,byte],		! SET POINTER TO PART FOR HEADER
+	matchctrl = .isectgentbl[.isect-1,isc$b_matctl],	! ISD MATCH CONTROL
+	isectflags = .isectgentbl[.isect-1,isc$b_flags],	! I-SECT FLAGS
+	isectpscflags = .isectgentbl[.isect-1, isc$w_match],	! MATCH CONTROL FLAGS FOR ISECT
+	iscpfc = .isectgentbl[.isect-1,isc$b_pfc],		! PAGE FAULT CLUSTER PARAMETER
+	isdsize = .isectgentbl[.isect-1,isc$b_size],		! ISD SIZE PARAMETER
+	isdtype = .isectgentbl[.isect-1,isc$b_code];		! ISECTION TYPE
+
+if isdsize eql 0
+    then return;						! SKIP NULL ISECT DESCRIPTOR
+isctdesc[isl$l_nxtisd] = 0;					! ENSURE END OF LIST
+isctdesc[isl$l_previsd] = .previsect;				! SET POINTER TO PREVIOUS ISECT
+previsect = .isctdesc;						! SET THIS AS NEW PREVIOUS
+isctdesc[isl$l_cludsc] = .lnk$gl_curclu;			! SET POINTER TO CLUSTER DESCRIPTOR
+isctdesc[isl$l_bufadr] = 0;					! NO BUFFER FOR ITS BINARY YET
+isctdesc[isl$l_bufend] = 0;					! SO ZERO THE QUADWORD
+lnk$gw_nisects = .lnk$gw_nisects + 1;				! COUNT THIS ISECTION
+hdrisd[isd$w_size] = isdsize;					! AND COPY INTO ISD
+hdrisd[isd$w_pagcnt] = .npages;					! INSERT PAGE COUNT
+hdrisd[isd$l_vpnpfc] = .isect_base ^-9;				! INSERT VIRTUAL PAGE ADDRESS
+if (hdrisd[isd$b_pfc] = minu(.npages,.lnk$gl_curclu[clu$b_pfc])) eql 0 ! IF NO PFC GIVEN FOR CLUSTER
+then hdrisd[isd$b_pfc] = minu(iscpfc,.npages);			! PFC IS MINIMUM OF DEFAULT
+								! VALUE AND NUMBER OF PAGES
+hdrisd[isd$l_flags] = isectflags;				! INSERT FLAGS
+hdrisd[isd$v_matchctl] = matchctrl;				! INSERT THE MATCH CONTROL FIELD
+hdrisd[isd$b_type] = isdtype;					! AND TYPE
+hdrisd[isd$l_vbn] = 0;						! SET NO RELATIVE DISK BLOCK YET ALLOCATED
+lnk$gl_curclu[clu$l_lstisd] = .isctdesc;			! WHICH WILL BE ADJUSTED LATER
+lnk$gl_curclu[clu$l_nisects] = .lnk$gl_curclu[clu$l_nisects] + 1;! COUNT THIS ISECT IN CLUSTER
+if (isectpscflags and gps$m_vec) neq 0				! IF THIS IS A VECTOR ISECT
+	then hdrisd[isd$v_vector] = true;			! THEN SET THE FLAG
+return;								! SAVE END POINTER
+end;		! OF ISECT DESCRIPTOR BUILDER
+end eludom

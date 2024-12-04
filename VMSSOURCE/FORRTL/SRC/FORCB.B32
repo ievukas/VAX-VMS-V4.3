@@ -1,0 +1,1040 @@
+MODULE FOR$$CB (%TITLE 'Push, Pop, Allocate, and deallocate LUB/ISB/RAB'
+		IDENT = '2-005'		! File: FORCB.B32  Edit: LEB2005
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY: language support library
+!
+! ABSTRACT:
+!
+!	This module interfaces to FOR$$CCB_DATA to allocate,
+!	deallocate, push and pop the LUB/ISB/RAB data structure, which
+!	is central to the I/O system.
+!
+! ENVIRONMENT: User mode, AST level or not or mixed
+!
+! AUTHOR:  Thomas N. Hastings, CREATION DATE: 01-June-77
+!
+! MODIFIED BY:
+!
+! 	Thomas N. Hastings, 01-June-77: VERSION 01
+! [Previous edit history removed.  SBL 24-Sept-1982]
+! 1-032 - Remove AST reentrancy window by performing IOINPROG interlock before
+!	  LUN_OWNR test in FOR$$CB_PUSH.  Replace individual zeroing of ISB
+!	  bits with a zero of the word in which they are contained for better
+!	  code.  Use a new structure for OTS$$V_LUN_OWNR for smaller code.
+!	  SBL 25-Sept-1980
+! 1-033 - Include secondary message FOR$_IO_NONFOR when signaling
+!	  FOR$K_MIXFILACC.  JAW 29-Aug-1981
+! 1-034 - Clear OTS$$V_IOINPROG before signaling FOR$K_MIXFILACC, to
+!	  ensure that unit is left in a consistent state.  SPR 11-38566.
+!	  JAW 29-Aug-1981
+! 1-035 - Replace $DESCRIPTOR in edit 1-033 with UPLIT to keep code PIC.
+!	  JAW 31-Aug-1981
+! 1-036 - Add missing external declarations.  SBL 2-Dec-1981
+! 2-001 - Remove all references to OTS$$ routines and data structures.
+!	  The data structures are now FORTRAN-only, although their layout
+!	  and use is still in parallel with BASIC's.  Change to use
+!	  prologue file, and general cleanup for inclusion in FORRTL
+!	  shared image.  SBL 24-Sept-1982
+! 2-002 - Use ISB$A_PREVIOUS_LUB for backlink to previous LUB instead of
+!	  second entry in FOR$$AA_LUB_TAB.  Add logic to allow simultaneous
+!	  ENCODE/DECODE/Internal File operations.  SBL 2-Dec-1982
+! 2-003 - Allocate FAB and NAM along with RAB and rest of CCB from heap.
+!	  SBL 17-Jan-1983
+! 2-004 - Deallocate RFA cache if necessary.  SBL 2-June-1983
+! 2-005 - Change reference in DEALLOCATE from LUB$A_RFA_CACHE_PTR to
+!	  LUB$A_RFA_CACHE_BEG to fix problem with BACKSPACE.
+!	  LEB 27-Jan-1984
+!--
+
+
+%SBTTL'Declarations'
+!
+! PROLOGUE FILE:
+!
+
+REQUIRE 'RTLIN:FORPROLOG';			! Structure and symbol definitions
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+    FOR$$CB_PUSH : JSB_CB_PUSH NOVALUE,		! Allocate or find  LUB/ISB/RAB - beg of each I/O statment
+    ALLOCATE : CALL_CCB NOVALUE,		! Allocate CCB
+    FOR$$CB_POP : JSB_CB_POP NOVALUE,		! Pop LUB/ISB/RAB - end of each I/O statement
+    DEALLOCATE : CALL_CCB NOVALUE,		! Deallcoate CCB
+    FOR$$CB_GET : JSB_CB_GET NOVALUE,		! Get current LUB/ISB/RAB (called by non-shared code only)
+    FOR$$CB_FETCH : CALL_CCB NOVALUE,		! Fetch a LUB, or 0
+    FOR$$NEXT_LUN : NOVALUE,			! Get next FORTRAN LUN.
+    FOR$$FP_MATCH : CALL_CCB NOVALUE,		! Get CCB that matches FP
+    INITIALIZE_INTFIL_QUEUE: NOVALUE;		! Initialize INTFIL_QUEUE
+
+!+
+! Include FOR$$CB_RET as a synonym for FOR$$CB_POP to maintain
+! compatability with old versions of FOR$$ERROR.
+!-
+
+GLOBAL BIND
+    ROUTINE
+    FOR$$CB_RET = FOR$$CB_POP : JSB_CB_POP NOVALUE;
+
+!
+! GLOBAL STORAGE:
+!
+
+GLOBAL
+    FOR$$A_CUR_LUB : INITIAL (0);	! Contains the address of the current LUB
+
+!+
+! The following structure is used for addressing FOR$$AA_LUB_TAB.
+! It is similar to VECTOR, but offsets the index so that
+! negative logical unit numbers can be used.
+!-
+
+STRUCTURE
+    FOR$$LUB_TAB_ST [I; N, LB, UNIT = 4, EXT = 0] =
+	[N*UNIT]
+	(FOR$$LUB_TAB_ST + ((I - LB)*UNIT))<0, %BPUNIT*UNIT, EXT>;
+
+!+
+! The following table of longwords is used to associate LUB addresses with
+! unit numbers.  Each entry contains 0 if there is no
+! LUB, or the address of the LUB.
+!-
+
+GLOBAL
+    FOR$$AA_LUB_TAB : VOLATILE FOR$$LUB_TAB_ST 
+	[-LUB$K_ILUN_MIN + LUB$K_LUN_MAX + 1, LUB$K_ILUN_MIN];
+
+!
+! OWN STORAGE:
+!
+
+!+
+! Each bit of the following BITVECTOR corresponds to a LUN.  The bit is
+! set if there is any I/O activity outstanding for the LUN.  The bit
+! must be kept here rather than in the LUB because there can be I/O
+! activity outstanding even before the LUB is allocated.
+!
+! The name FOR$$V_IOINPROG is bound to the appropriate offset in the
+! bitvector so that the correct bit can be directly addressed by unit number.
+!-
+
+OWN
+    IOINPROG_VECTOR : VOLATILE BITVECTOR
+	[((-LUB$K_ILUN_MIN + LUB$K_LUN_MAX + %BPVAL)/%BPVAL)*%BPVAL];
+BIND
+    FOR$$V_IOINPROG = IOINPROG_VECTOR [((7-LUB$K_ILUN_MIN)/8)*8]: 
+	VOLATILE BITVECTOR [];
+
+!+
+! The following is a queue (non-interlocked) that holds LUBs for ENCODE/DECODE
+! and internal file operations.  This permits more than one of these operations
+! to be active simultaneously.
+!-
+
+OWN
+    INTFIL_QUEUE: VOLATILE VECTOR [2] INITIAL (0,0),
+    V_INTFIL_QUEUE_INIT: VOLATILE INITIAL (0);	! 1 when queue initialized
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL ROUTINE
+    FOR$$ERRSNS_SAV : NOVALUE,
+    FOR$$SIG_NO_LUB : NOVALUE,			! convert FORTRAN err # to 32-bit code
+    						! Pass LUN explicitly since no current LUB.
+    						! and call LIB$STOP. should never return
+    FOR$$SIG_DATCOR : NOVALUE,			! SIGNAL_STOP OTS$_INTDATCOR (INTERNAL
+    						! DATA CORRUPTED IN RUN-TIME LIBRARY)
+    						! in FORTRAN environment
+    FOR$$SIGNAL_STO : NOVALUE,			! Signal a fatal FORTRAN error
+    FOR$$GET_VM,				! Get virtual memory
+    FOR$$FREE_VM : NOVALUE;			! Free virtual memory
+
+
+GLOBAL ROUTINE FOR$$CB_PUSH (%SBTTL'Allocate or find CCB'
+	LOGICAL_UNIT, 				! Logical unit no. (by-value)
+	LUN_MIN)				! Minimum logical unit number (by-value)
+    : JSB_CB_PUSH NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	FOR$$CB_PUSH checks for legal logical UNIT number
+!	which varyies depending on whether this is OPEN or
+!	default open.  If logical_unit already has
+!	a LUB/ISB/RAB allocated, only part of the per I/O statement part
+!	of LUB/ISB/RAB is cleared, namely just the status bits in ISB.
+!	Otherwise virtual memory is allocated for this logical_unit
+!	and the entire block is initialized to 0.  Then the allocated address
+!	is remembered in OWN table FOR$$A_LUB_TAB indexed by
+!	logical_unit.  The RAB is initialized to constants which
+!	do not change during execution.
+!
+!	If an I/O statement on this unit is already in progress, this
+!	routine signals an error and does not return.
+!
+! CALLING SEQUENCE:
+!
+!	JSB FOR$$CB_PUSH (R2=logical_unit.rl.v, R0=lun_min.rl.v)
+!
+! FORMAL PARAMETERS:
+!
+!	LOGICAL_UNIT.rl.v	Value of logical unit for which LUB/ISB/RAB is desired (signed)
+!				May be negative for TYPE, ACCEPT, READ, PRINT
+!	LUN_MIN.rl.v		Value of minimum legal logical unit number (signed)
+!				Since in a register, must be present.
+!
+! IMPLICIT INPUTS:
+!
+!	FOR$$AA_LUB_TAB[logical_unit]	Adr. of LUB/ISB/RAB or 0 for
+!					this unit
+!	FOR$$V_IOINPROG[logical unit]	I/O in progress flag
+!
+! IMPLICIT OUTPUTS:
+!
+!	CCB				Base pointer set to adr. of LUB/ISB/RAB for logical_unit.
+!	FOR$$AA_LUB_TAB[logical_unit]	Adr. of LUB/ISB/RAB for logical_unit
+!	LUB$W_LUN			signed logical unit number
+!	RAB$B_BID
+!	RAB$B_BLN
+!	RAB$V_TPT			1
+!	RAB$V_RAH			1
+!	RAB$V_WBH			1
+!	RAB$V_LOC			1
+!
+! ROUTINE VALUE:
+!
+!	None
+!
+! SIDE EFFECTS:
+!
+!	Allocates virtual memory if needed.
+!	SIGNAL_STOPs FOR$_RECIO_OPE (40='RECURSIVE I/O OPERATION') if
+!	logical_unit already is in the middle of an I/O statement
+!	SIGNAL_STOPs FOR$_INVLOGUNI (32='INVALID LOGICAL UNIT NUMBER')
+!	if logical_unit is out of range.
+!	SIGNAL_STOPs FOR$_INSVIRMEM (41='INSUFFICIENT VIRTUAL MEMORY')
+!	if cannot expand program region if needed.
+!--
+
+    BEGIN
+
+    BUILTIN
+	TESTBITSS;
+
+    EXTERNAL REGISTER
+	CCB : REF $FOR$CCB_DECL;
+
+    !+
+    ! Check range of logical_unit.  If out of range,
+    ! SIGNAL_STOP FOR$_INVLOGUNI (32='INVALID LOGICAL UNIT NUMBER")
+    !-
+
+    IF ((.LOGICAL_UNIT GTR LUB$K_LUN_MAX) OR (.LOGICAL_UNIT LSS .LUN_MIN))
+    THEN
+	BEGIN
+	FOR$$SIG_NO_LUB (FOR$K_INVLOGUNI, .LOGICAL_UNIT);
+	RETURN;
+	END;
+
+    !+
+    ! Test and set IO in progress interlock before doing anything else!
+    ! If this is ENCODE/DECODE/Internal File, ignore interlock.
+    !-
+
+    IF (TESTBITSS (FOR$$V_IOINPROG [.LOGICAL_UNIT]))
+    THEN
+	IF .LOGICAL_UNIT NEQ LUB$K_LUN_ENCD
+	THEN
+	    BEGIN
+	    FOR$$SIG_NO_LUB (FOR$K_RECIO_OPE, .LOGICAL_UNIT);
+	    RETURN;
+	    END;
+
+    !+
+    ! The following assignment generates no code, but it causes BLISS to generate
+    ! optimal code for the remainder of the routine by preventing the CSE
+    ! .LOGICAL_UNIT-LUB$K_ILUN_MIN from being bound to R2.  Thanks, and a tip
+    ! of the keyboard to Steve Hobbs.
+    !-
+
+    LOGICAL_UNIT = .LOGICAL_UNIT;
+
+    !+
+    ! Get the CCB address for this unit.  
+    !-
+
+    CCB = .FOR$$AA_LUB_TAB [.LOGICAL_UNIT];
+
+    !+
+    ! Allocate a LUB/ISB/RAB if necessary. 
+    !-
+
+    IF .CCB EQLA 0
+    THEN
+	ALLOCATE (.LOGICAL_UNIT)
+    ELSE
+    !+
+    ! LUB/ISB/RAB already allocated.  Perform sanity check.
+    !-
+	BEGIN
+
+	IF ((.CCB [LUB$W_LUN] NEQU .LOGICAL_UNIT<0,16,1>) OR 
+	    (.CCB [RAB$B_BID] NEQU RAB$C_BID))
+	THEN
+	    FOR$$SIG_DATCOR ();
+	END;
+
+    !+
+    ! Initialize certain ISB fields, to save FOR$$IO_BEG the trouble.
+    !-
+
+    CCB [ISB$W_STTM_STAT] = 0;
+    CCB [ISB$W_FMT_LEN] = 0;
+    CCB [ISB$A_USER_FP] = 0;
+
+    !+
+    ! Link in previous LUB and make this LUB the current one.
+    !-
+
+    CCB [ISB$A_PREVIOUS_LUB] = .FOR$$A_CUR_LUB;
+    FOR$$A_CUR_LUB = .CCB;
+
+    !+
+    ! Return with register CCB loaded.
+    !-
+
+    RETURN;
+    END;					! End of routine FOR$$CB_PUSH
+
+
+ROUTINE ALLOCATE (%SBTTL'Allocate CCB'
+	LOGICAL_UNIT				! LUN to which to allocate the CCB
+    ) : CALL_CCB NOVALUE = 			! Allocate LUB/ISB/RAB
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Allocate heap storage for the LUB/ISB/RAB/FAB/NAM.  This is done 
+!	the first time a logical unit is referenced, and the first 
+!	time after a CLOSE.
+!
+!	If this is an ENCODE/DECODE/Internal File, try getting a "short LUB"
+!	from Q_INTFIL_QUEUE.  If empty, allocate a short LUB.
+!
+! CALLING SEQUENCE:
+!
+!	ALLOCATE (.LOGICAL_UNIT)
+!
+! FORMAL PARAMETERS:
+!
+!	LOGICAL_UNIT.rl.v	LUN to which to allocate the CCB
+!
+! IMPLICIT INPUTS:
+!
+!	INTFIL_QUEUE		Queue of internal file LUBs
+!
+! IMPLICIT OUTPUTS
+!
+!	FOR$$AA_LUB_TAB [.LOGICAL_UNIT] and CCB are set
+!
+! SIDE EFFECTS:
+!
+!	Allocates virtual storage.
+!	Signals if virtual storage is exhausted.
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	CCB : REF $FOR$CCB_DECL;
+
+    BIND
+	FAB = CCB: REF $FOR$FAB_CCB_STRUCT,
+	NAM = CCB: REF $FOR$NAM_CCB_STRUCT;
+
+    BUILTIN
+	REMQUE;
+
+    !+
+    ! Split depending on whether or not this is an internal file.
+    !-
+
+    IF .LOGICAL_UNIT NEQ LUB$K_LUN_ENCD
+    THEN
+	BEGIN
+
+	!+
+	! This is not an internal file or ENCODE/DECODE.  Allocate a full-length
+	! LUB from heap storage and initialize it.
+	!-
+
+	CCB = FOR$$GET_VM ((ISB$K_ISB_LEN + LUB$K_LUB_LEN + RAB$C_BLN +
+	    FAB$C_BLN + NAM$C_BLN), .LOGICAL_UNIT);
+	CH$FILL (0, LUB$K_LUB_LEN + RAB$C_BLN + FAB$C_BLN + NAM$C_BLN, 
+	    .CCB + ISB$K_ISB_LEN);
+	CCB = .CCB + ISB$K_ISB_LEN + LUB$K_LUB_LEN;
+	CCB [LUB$W_LUN] = .LOGICAL_UNIT;
+	CCB [RAB$B_BID] = RAB$C_BID;
+	CCB [RAB$B_BLN] = RAB$C_BLN;
+	FAB [FAB$B_BID] = FAB$C_BID;
+	FAB [FAB$B_BLN] = FAB$C_BLN;
+	NAM [NAM$B_BID] = NAM$C_BID;
+	NAM [NAM$B_BLN] = NAM$C_BLN;
+	CCB [RAB$L_FAB] = FAB [0,0,0,0];
+	
+	CCB [RAB$V_TPT] = 1;
+	CCB [RAB$V_RAH] = 1;
+	CCB [RAB$V_WBH] = 1;
+	CCB [RAB$V_LOC] = 1;
+	FOR$$AA_LUB_TAB [.LOGICAL_UNIT] = .CCB;
+	RETURN;
+	END;
+
+    !+
+    ! This is an internal file or ENCODE/DECODE.  First check to see if the
+    ! queue of LUBs has been intialized.  If not, initialize it.
+    !-
+
+    IF NOT .V_INTFIL_QUEUE_INIT
+    THEN
+	INITIALIZE_INTFIL_QUEUE ();
+
+    !+
+    ! Try to remove a LUB from the head of the queue.  If empty, 
+    ! allocate one instead.
+    !-
+
+    IF REMQUE (.INTFIL_QUEUE [0], CCB)
+    THEN
+	BEGIN
+	!+
+	! Queue was empty.  Allocate a short LUB and initialize it.
+	!-
+	
+	CCB = FOR$$GET_VM ((ISB$K_ISB_LEN + LUB$K_LUB_LEN + RAB$C_BLN), 
+	    .LOGICAL_UNIT);
+	CH$FILL (0, LUB$K_LUB_LEN + RAB$C_BLN, .CCB + ISB$K_ISB_LEN);
+	CCB = .CCB + ISB$K_ISB_LEN + LUB$K_LUB_LEN;
+	CCB [LUB$W_LUN] = .LOGICAL_UNIT;
+	CCB [RAB$B_BID] = RAB$C_BID;
+	CCB [LUB$V_DEALLOC] = 1;	! Force "deallocation" on POP
+	END
+    ELSE
+	CCB = .CCB + ISB$K_ISB_LEN + LUB$K_LUB_LEN;	! Get right base for CCB
+
+    RETURN;	! With LUB address in CCB
+    END;
+
+
+GLOBAL ROUTINE FOR$$CB_POP 	%SBTTL'Pop current CCB'
+    : JSB_CB_POP NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	FOR$$CB_POP pops the curents LUB/ISB/RAB and restores the
+!	previous pushed down LUB/ISB/RAB, if any (usually none).
+!	Flags old current LUB/ISB/RAB as no longer having as active I/O statement
+!
+! CALLING SEQUENCE:
+!
+!	JSB FOR$$CB_POP ()
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	CCB			Adr. of current LUB/ISB/RAB
+!
+! IMPLICIT OUTPUTS:
+!
+!	CCB			Set to 0 (to catch attempt to reference after a pop).
+!
+! RETURN VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Changes entire I/O system to another logical unit or none at all
+!	SIGNAL_STOPs FORTRAN INTERNAL ERROR if CB was not active.
+!--
+
+    BEGIN
+
+    BUILTIN
+	TESTBITCC;
+
+    EXTERNAL REGISTER
+	CCB : REF $FOR$CCB_DECL;
+
+    LOCAL
+	LOGICAL_UNIT;
+
+    !+
+    ! Pop this CCB.
+    !-
+
+    LOGICAL_UNIT = .CCB [LUB$W_LUN];
+    FOR$$A_CUR_LUB = .CCB [ISB$A_PREVIOUS_LUB];
+
+    !+
+    ! Deallocate run-time format
+    !-
+
+    IF (.CCB [ISB$W_FMT_LEN] NEQ 0)
+    THEN
+	BEGIN
+	FOR$$FREE_VM (.CCB [ISB$W_FMT_LEN], .CCB [ISB$A_FMT_BEG]);
+	CCB [ISB$W_FMT_LEN] = 0;
+	CCB [ISB$A_FMT_BEG] = 0;
+	END;
+
+    !+
+    ! Deallocate this LUB if requested to.  
+    !-
+
+    IF (.CCB [LUB$V_DEALLOC])
+    THEN
+	DEALLOCATE (.LOGICAL_UNIT);
+
+    !+
+    ! Flag old current LUB/ISB/RAB as no longer having
+    ! an I/O statement in progress.
+    ! If LUB was not active, then signal OTS$_INTDATCOR (INTERNAL DATA
+    ! CORRUPTED IN RUN-TIME LIBRARY).
+    !-
+
+    IF (TESTBITCC (FOR$$V_IOINPROG [.LOGICAL_UNIT]))
+    THEN
+	IF .LOGICAL_UNIT NEQU LUB$K_LUN_ENCD
+	THEN
+	    FOR$$SIG_DATCOR ();
+
+    CCB = 0;
+
+    RETURN;
+
+    END;					! End of FOR$$CB_POP routine
+
+
+ROUTINE DEALLOCATE (%SBTTL'Deallocate a CCB'
+	LOGICAL_UNIT				! The LUN on which to deallocate
+    ) : CALL_CCB NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Release the heap storage associated with a CCB.  This is done after
+!	a CLOSE.  If the file is an internal file, insert the LUB on
+!	INTFIL_QUEUE rather than deallocating it.
+!
+! CALLING SEQUENCE:
+!
+!	DEALLOCATE (.LOGICAL_UNIT)
+!
+! FORMAL PARAMETERS:
+!
+!	LOGICAL_UNIT.rl.v	The LUN for which to deallocate the CCB
+!
+! IMPLICIT INPUTS:
+!
+!	INTFIL_QUEUE
+!	Several fields of the LUB
+!
+! IMPLICIT OUTPUTS:
+!
+!	INTFIL_QUEUE
+!	FOR$$A_LUB_TAB [.LOGICAL_UNIT] is cleared
+!
+! SIDE EFFECTS:
+!
+!	Deallocates heap storage
+!
+!--
+
+    BEGIN
+
+    BUILTIN
+	INSQUE,
+	TESTBITCC;
+
+    EXTERNAL REGISTER
+	CCB : REF $FOR$CCB_DECL;
+
+    !+
+    ! Split depending on whether or not this is an internal file/ENCODE/DECODE.
+    !-
+
+    IF .CCB [LUB$W_LUN] NEQ LUB$K_LUN_ENCD
+    THEN
+	BEGIN
+	
+	!+
+	! Remove this LUB from the LUB table.
+	!-
+    
+	FOR$$AA_LUB_TAB [.LOGICAL_UNIT] = 0;
+    
+	!+
+	! Deallocate record buffer, if present.
+	!-
+    
+	IF (( NOT .CCB [LUB$V_USER_RBUF]) AND (.CCB [LUB$A_UBF] NEQA 0))
+	THEN
+	    FOR$$FREE_VM (.CCB [LUB$W_RBUF_SIZE], .CCB [LUB$A_UBF]);
+    
+	!+
+	! Deallocate FAB if allocated by ASSIGN/FDBSET.  If filename
+	! also allocated, deallocate it.
+	!-
+
+	IF .CCB [LUB$A_FAB] NEQA 0
+	THEN
+	    BEGIN
+	    LOCAL
+		HEAP_FAB: REF BLOCK [, BYTE];
+	    HEAP_FAB = .CCB [LUB$A_FAB];
+	    IF .HEAP_FAB [FAB$B_FNS] NEQU 0
+	    THEN
+		FOR$$FREE_VM (.HEAP_FAB [FAB$B_FNS], .HEAP_FAB [FAB$L_FNA]);
+	    FOR$$FREE_VM (.HEAP_FAB [FAB$B_BLN], .HEAP_FAB);
+	    END;
+
+	!+
+	! Deallocate resultant name string, if present.
+	!-
+    
+	IF (.CCB [LUB$V_VIRT_RSN]) 
+	THEN 
+	    FOR$$FREE_VM (.CCB [LUB$B_RSL], .CCB [LUB$A_RSN]);
+    
+	!+
+	! Deallocate RFA cache, if present.
+	!-
+
+	IF .CCB [LUB$A_RFA_CACHE_BEG] NEQA 0
+	THEN
+	    FOR$$FREE_VM ((RCE_K_CACHE_SIZE * RCE_S_RCE_STRUCT),
+		.CCB [LUB$A_RFA_CACHE_BEG]);
+
+	!+
+	! Deallocate LUB memory.
+	!-
+    
+	FOR$$FREE_VM ((ISB$K_ISB_LEN + LUB$K_LUB_LEN + RAB$C_BLN +
+	    FAB$C_BLN + NAM$C_BLN), .CCB - (ISB$K_ISB_LEN + LUB$K_LUB_LEN));
+    
+	RETURN;
+	END;
+
+    !+
+    ! This is an ENCODE/DECODE/internal file. Insert the LUB on the queue.
+    ! Use the first two longwords of the ISB as the queue link.
+    !-
+
+    INSQUE (.CCB - (ISB$K_ISB_LEN + LUB$K_LUB_LEN), INTFIL_QUEUE);
+
+    RETURN;
+
+    END;
+
+
+GLOBAL ROUTINE FOR$$CB_GET %SBTTL'GET current CCB'
+    : JSB_CB_GET NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	FOR$$CB_GET gets the curents LUB/ISB/RAB.
+!	This routine is only called from non-shared procedures which
+!	can't access FOR$$A_CUR_LUB directly.  (Entry vectors for
+!	data would mean that the code would have to change when the
+!	decision to make a module shared or non-shared is changed.
+!	Unless the LINKER got smarter and changed the level of indirection
+!	on data references which were vectored.)
+!
+! CALLING SEQUENCE:
+!
+!	JSB FOR$$CB_GET ()
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	FOR$$A_CUR_LUB		Adr. of current LUB/ISB/RAB
+!
+! IMPLICIT OUTPUTS:
+!
+!	CCB			Set to adr. of current LUB/ISB/RAB.
+!
+! RETURN VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	CCB : REF $FOR$CCB_DECL;
+
+    CCB = .FOR$$A_CUR_LUB;
+
+    RETURN
+
+    END;					! End of FOR$$CB_GET routine
+
+
+GLOBAL ROUTINE FOR$$CB_FETCH (%SBTTL'Fetch a LUB, or 0'
+	LUN					! LUN of the LUB
+    ) : CALL_CCB NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	FOR$$CB_FETCH returns the CCB address for a given LUN without
+!	"pushing" it.  This is used by FOR$$CLOSE_ALL and FOR$INQUIRE.
+!	ASTs must be disabled before FOR$$CB_FETCH is called and not
+!	reenabled until after the CCB is no longer needed.
+!
+! CALLING SEQUENCE:
+!
+!	CALL FOR$$CB_FETCH (LUN)
+!
+! FORMAL PARAMETERS:
+!
+!	LUN.rl.v		Logical Unit Number at which to "peek"
+!
+! IMPLICIT INPUTS:
+!
+!	FOR$$V_LUN_OWNR		Table of LUN owners
+!	FOR$$AA_LUB_TAB		Table of pointers to LUBs
+!
+! IMPLICIT OUTPUTS:
+!
+!	CCB			This register is set to 0 if the LUN is not owned by FORTRAN
+!				or is not allocated, or to the address of the LUB/ISB/RAB
+!				otherwise.
+!
+! RETURN VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	CCB : REF $FOR$CCB_DECL;
+
+    CCB = .FOR$$AA_LUB_TAB [.LUN];
+
+    RETURN;
+    END;					! of routine FOR$$CB_FETCH
+
+
+GLOBAL ROUTINE FOR$$NEXT_LUN (%SBTTL'Get next LUN which might be open'
+	FLAG: REF VECTOR [, LONG], 		! First-time and last-time flag
+	LUN: REF VECTOR [, LONG]		! Logical Unit Number
+    ) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	FOR$$NEXT_LUN gets a LUN which might be open.  It is used by
+!	the exit handler declared by FORTRAN OPEN, which must look
+!	through all the LUNs and do the DELETE or PRINT handling by
+!	calling CLOSE.  (RMS close won't do DELETE or PRINT handling.)
+!	This routine scans the table of LUB pointers and returns those
+!	which are non-zero.  The caller must use CB_PUSH and CB_POP
+!	to obtain control of the LUB.
+!
+! CALLING SEQUENCE:
+!
+!	CALL FOR$$NEXT_LUN (FLAG, LUN)
+!
+! FORMAL PARAMETERS:
+!
+!	FLAG.mv.r		If 0 on entry, this is the first call
+!				and LUN is invalid.  If 1 on entry, LUN
+!				is the last LUN processed.  On exit, 0
+!				means that there are no more LUNs, and 1
+!				means that LUN contains the Logical Unit
+!				Number to process.
+!	LUN.ml.r		Logical Unit Number, as described above.
+!
+! IMPLICIT INPUTS:
+!
+!	FOR$$AA_LUB_TAB
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! RETURN VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+
+    BEGIN
+
+    LOCAL
+	LOCAL_LUN;
+
+    !+
+    ! If this is the first entry, arrange to return the first logical
+    ! unit.
+    !-
+
+    IF NOT .FLAG [0]
+    THEN
+	BEGIN
+	FLAG [0] = 1;
+	LOCAL_LUN = LUB$K_ILUN_MIN;
+	END
+    ELSE
+	BEGIN
+	LOCAL_LUN = .LUN [0] + 1;
+	END;
+
+    !+
+    ! While the unit number is in range, look for a LUB entry that is
+    ! non-zero.
+    !-
+
+    WHILE (.LOCAL_LUN LEQ LUB$K_LUN_MAX) DO
+	BEGIN
+	IF .FOR$$AA_LUB_TAB [.LOCAL_LUN] NEQ 0
+	THEN
+	    BEGIN
+	    LUN [0] = .LOCAL_LUN;
+	    RETURN;
+	    END;
+	LOCAL_LUN = .LOCAL_LUN + 1;
+	END;
+
+    !+
+    ! We dropped out of the loop.  Return failure.
+    !-
+
+    FLAG [0] = 0;
+
+    RETURN;
+    END;					! End of FOR$$NEXT_LUN routine
+
+
+%SBTTL'FOR$$FP_MATCH - Find current incarnation'
+GLOBAL ROUTINE FOR$$FP_MATCH (
+	SIG_FP					! of ISB that has SIG_FP
+    ) : CALL_CCB NOVALUE = 			! in ISB$A_USER_FP
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	FOR$$FP_MATCH is part of the I/O in progress handling scheme.
+!	It is called with one argument, the value of the frane pointer
+!	desired.  It looks through the current ISB chain until it finds
+!	an ISB that has the desired FP in ISB$A_USER_FP.  This means that
+!	that ISB was the one in effect when the I/O in progress handler
+!	was established.  If it finds one, external register CCB is set
+!	to the CCB of that ISB.  If no match is found, there is something
+!	seriously wrong in the database so error OTS$_INTDATCOR is
+!	signalled.
+!
+! CALLING SEQUENCE:
+!
+!	CALL FOR$$FP_MATCH (SIG_FP)
+!
+! FORMAL PARAMETERS:
+!
+!	SIG_FP.rl.v		The FP present in the signal mechanism
+!				list when the I/O in progress handler
+!				was signalled.  This value is searched for
+!				in the current ISB chain.
+!
+! IMPLICIT INPUTS:
+!
+!	FOR$$AA_LUB_TAB		Table of pointers to LUBs.
+!	FOR$$A_CUR_LUB		Address of current LUB.
+!
+! IMPLICIT OUTPUTS:
+!
+!	CCB			This register is set to the address of the
+!				ISB/LUB/RAB block that has SIG_FP in its
+!				ISB$A_USER_FP.
+!
+! RETURN VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Signals OTS$_INTDATCOR (Internal data corrupted in Run-Time Library)
+!	if no ISB is found that matches SIG_FP.
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	CCB : REF $FOR$CCB_DECL;
+
+    LOCAL
+	LOGICAL_UNIT;				! Logical unit number of current LUB
+
+    !+
+    ! Get current LUB
+    !-
+
+    CCB = .FOR$$A_CUR_LUB;
+
+    !+
+    ! Search through ISB chain to find matching FP
+    !-
+
+    WHILE .CCB NEQ 0 DO
+	BEGIN
+	LOGICAL_UNIT = .CCB [LUB$W_LUN];
+
+	IF .CCB [ISB$A_USER_FP] EQL .SIG_FP
+	THEN
+	    RETURN;
+
+	CCB = .CCB [ISB$A_PREVIOUS_LUB];
+	END;
+
+    !+
+    ! If we get here, then there must not have been a match.
+    ! This should never happen, therefore signal an error.
+    !-
+
+    FOR$$SIG_DATCOR ();
+    RETURN;
+    END;
+
+%SBTTL 'INITIALIZE_INTFIL_QUEUE - Initialize INTFIL_QUEUE'
+ROUTINE INITIALIZE_INTFIL_QUEUE  
+    : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Initializes INTFIL_QUEUE to be an empty queue.
+!
+! CALLING SEQUENCE:
+!
+!	INITIALIZE_INTFIL_QUEUE ()
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	INTFIL_QUEUE	
+!	V_INTFIL_QUEUE_INIT
+!
+! IMPLICIT OUTPUTS:
+!
+!	INTFIL_QUEUE	
+!	V_INTFIL_QUEUE_INIT
+!
+! COMPLETION STATUS: 
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Makes INTFIL_QUEUE an empty queue.
+!
+! SIGNALLED ERRORS:
+!
+!	NONE
+!--
+
+    BEGIN
+
+    LOCAL
+	AST_STATUS;				! Previous AST enable status
+
+    BUILTIN
+	TESTBITCS;
+
+    !+
+    ! Disable ASTs.
+    !-
+
+    AST_STATUS = $SETAST (ENBFLG = 0);
+
+    !+
+    ! If V_INTFIL_QUEUE_INIT is still clear, initialize INTFIL_QUEUE to
+    ! be an empty queue.  Set V_INTFIL_QUEUE_INIT.
+    !-
+
+    IF TESTBITCS (V_INTFIL_QUEUE_INIT)
+    THEN
+	BEGIN
+	INTFIL_QUEUE [0] = INTFIL_QUEUE;	! Set forward link
+	INTFIL_QUEUE [1] = .INTFIL_QUEUE [0];	! Set backward link
+	END;
+
+    !+
+    ! Reenable ASTs if previously enabled.
+    !-
+
+    IF .AST_STATUS EQL SS$_WASSET
+    THEN
+	$SETAST (ENBFLG = 1);
+
+    RETURN;
+
+    END;					! End of routine INITIALIZE_INTFILQUEUE
+
+END						! End of module FOR$$CB
+
+ELUDOM

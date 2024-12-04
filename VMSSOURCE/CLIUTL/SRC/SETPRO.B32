@@ -1,0 +1,1015 @@
+MODULE setpro ( IDENT = 'V04-000',
+		ADDRESSING_MODE (EXTERNAL = GENERAL)) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  SETPRO Command
+!
+! ABSTRACT:
+!
+!	This utility sets protection for files and directories.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system. Privileged user mode,
+!
+! AUTHOR:  Greg Robert, Nov 1979
+!
+! Modified by:
+!
+!	V03-006	GAS0112		Gerry Smith		29-Mar-1983
+!		Remove references to old command dispatcher.
+!
+!	V03-005	GAS0100		Gerry Smith		12-Mar-1983
+!		Remove all references to old CLI interface.
+!
+!	V03-004	GAS0094		Gerry Smith		19-Nov-1982
+!		Fix /LOG qualifier.
+!
+!	V03-003	GAS0093		Gerry Smith		27-Oct-1982
+!		Fix protection parse algorithm.  Also, change the
+!		protection descriptor to a dynamic one, and let the
+!		system de/allocate memory as appropriate.
+!
+!	V03-002	GAS0092		Gerry Smith		22-Oct-1982
+!		Hybridize the CLI interface, so that if /DEVICE is
+!		not specified, use the new interface.  This fixes a
+!		problem that keeps SET PROT=prot from working correctly.
+!
+!	V03-001	GAS0091		Gerry Smith		19-Oct-1982
+!		Change input request for new CLD syntax.
+!
+!	V02-006	MLJ0066		Martin L. Jack,	29-Dec-1981  13:36
+!		Integrate new LIB$SET_FILE_PROT (formerly LIB$SET_PROT).
+!
+!	V205	GRR2005		G. R. Robert		17-Nov-1981
+!		Fixed handling of filespecs in confirmation and logging
+!		messages to use expanded string if resultant not available,
+!		and to use RMS parse to insure that passwords are blanked.
+!
+!	V204	GRR2004		G. R. Robert		16-Nov-1981
+!		Made all external references addressing mode general.
+!
+!	V203	GRR2003		G. R. Robert		14-Sep-1981
+!		Fixed improper descriptor initialization in confirm_action
+!		by making them OWN instead of LOCAL.
+!
+!	002	GRR2002		Greg Robert	12-Jun-1981
+!		Added non-fatal error message to continue
+!		processing files after a fatal error.
+!
+!	001	TMH0001		Tim Halvorsen	21-Jan-1980
+!		Add dispatching for SET PROT/DEVICE to SETDEV and include
+!		code from require file into here and obsolete require file.
+!--
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:STARLET.L32';	! VAX/VMS common definitions
+
+!
+! Table of contents
+!
+
+FORWARD ROUTINE
+    set$protection : NOVALUE,		! Main setpro routine
+    setpro_action,			! Called for each file
+    get_output_file,			! Get next output file
+    confirm_action,			! Interrogate user
+    log_results,			! Inform user of results
+    expand_prot,			! Converts binary prot to ascii
+    parse_class,			! Parse protection of one user class
+    search_error,			! LIB$FILE_SCAN error handler
+    cli_error;				! Handler for CLI errors
+
+
+!
+! External routines
+!
+
+EXTERNAL ROUTINE
+    cli$get_value,			! Get value from CLI interface
+    cli$present,			! Test for presence of qualifier
+    sys$fao,				! Formats ascii output
+    sys$setprv,				! Set privileges
+    lib$get_command,			! Reads from SYS$COMMAND
+    lib$file_scan,			! Handles stickiness etc
+    lib$set_file_prot,			! Set file protection
+    set$device;				! SET PROT/DEVICE action routine
+
+!
+! External data references
+!
+
+EXTERNAL LITERAL
+    set$_pronotchg;		! Error message - "Protection not changed"
+
+
+!
+!	DEFINE VMS BLOCK STRUCTURES
+!
+
+STRUCTURE
+	BBLOCK [O, P, S, E; N] =
+		[N]
+		(BBLOCK+O)<P,S,E>;
+
+MACRO
+
+!
+! A) Macro to describe a string
+! B) Macro to generate a quadword string descriptor
+! C) Macro to generate the address of a string descriptor
+
+    PRIMDESC (str) = %CHARCOUNT (str), UPLIT (%ASCII str)%,
+    INITDESC (str) = BBLOCK [DSC$C_S_BLN] INITIAL (PRIMDESC (str))%,
+    ADDRDESC (str) = UPLIT (PRIMDESC (str))%,
+
+!
+!	Macro to signal a condition to the handler
+!
+
+    write_message(msg) =
+	SIGNAL(msg			! Pass the message code
+	%IF %LENGTH GTR 1		! and if more than 1 arg
+	    %THEN ,%REMAINING %FI) %;	! then the rest too
+
+
+!
+!	Define message codes.
+!
+
+$shr_msgdef(set,119,local,
+	(protected,info),	! File protection changed
+	(syntax,severe),	! Failure in parse routines
+	(searchfail,error));	! Could not find file
+
+
+!
+!	EQUATED SYMBOLS
+!
+
+LITERAL
+    TRUE	= 1,			! BOOLEAN TRUE
+    FALSE	= 0,			! BOOLEAN FALSE
+    OK		= 1,			! SUCCESS RETURN CODE
+    ERROR	= 2;			! ERROR RETURN CODE
+
+
+
+!
+!	Define CLI qualifier bit flag numbers (see setpro$flags)
+!
+
+LITERAL
+    $EQULST (QUAL_,,0,1,
+	(protection,),		! /PROTECTION
+	(log,),			! /LOG
+	(confirm,),		! /CONFIRM
+	(device,));		! /DEVICE
+
+!
+! Storage definitions
+!
+
+OWN
+    setpro$flags	: BITVECTOR[32]	! General DCL flagword
+	INITIAL(0),			! Initially none present
+
+    qualifier$flags	: BITVECTOR[32] ! Qualifier presence bitmap
+	INITIAL(0),			! Initially clear
+
+    setpro_prot		: WORD		! Contains /PROTECTION value
+			INITIAL(0),	! In case user gives no value
+
+    setpro_mask		: WORD		! Contains /PROTECTION mask
+			INITIAL(0),	! In case user gives no value
+
+    global_mask		: WORD,		! Command wide mask
+    global_prot		: WORD,		! Command wide protection
+
+    result_mask		: WORD,		! Combined mask
+    result_prot		: WORD,		! Combined protection
+
+    oldpriv		: BBLOCK[8],	! Permanent priv's stored here
+
+    newpriv		: BBLOCK[8]	! Mask describing system priv
+		PRESET ([prv$v_sysprv]=true), ! Initialize this bit
+
+    worst_error: BBLOCK[4]		! Worst error encountered
+		INITIAL(ss$_normal);	! Initially normal status
+
+!
+! Define RMS blocks
+!
+
+OWN
+    output_filename: 			! Place to store the file name
+	    	VECTOR[nam$c_maxrss,BYTE],
+
+    output_nam_result:			! Resultant output name
+		VECTOR [nam$c_maxrss,BYTE],
+
+    output_nam_expanded:		! Expanded output name
+		VECTOR [nam$c_maxrss,BYTE],
+
+    output_rlf:	$NAM(			! Related name block
+		),
+
+    output_nam:	$NAM(			! File name block
+	RLF = output_rlf,		! Point to related name block
+	ESA = output_nam_expanded,	! File name before open
+	ESS = nam$c_maxrss,
+	RSA = output_nam_result,	! File name after open
+	RSS = nam$c_maxrss),
+
+    output_fab:	$FAB(			! FAB for output
+	NAM = output_nam);		! Address of name block
+
+
+GLOBAL ROUTINE set$protection : NOVALUE =
+
+!++
+! Functional description
+!
+!	This is the main control routine for the SET PROTECTION cmd.
+!	It is called from the command language interpreter to 
+!	set protection for files and directories.
+!
+! Calling sequence
+!
+!	set$protection (option_desc_block) from the CLI as an
+!	action routine for the /PROTECTION OPTION of the SET command
+!
+! Input parameters
+!
+!	None
+!
+! Output parameters
+!
+!	None
+!
+! Routine value
+!
+!	Worst error encountered during processing or SS$_NORMAL.
+!
+!----
+
+BEGIN
+
+LOCAL
+    prot_desc : $BBLOCK[dsc$c_s_bln],	! Protection descriptor
+    status;				! Status return
+
+
+!
+! The SET command is installed with system privileges (SYSPRV), however
+! we don't want the user to have this much power unless s/he
+! explicitly asks for it.  Therefore we will inspect the existing
+! privileges.  If SYSPRV is true on a process permanent basis we will
+! leave it alone, but if only enabled on a temporary basis (for this
+! image) then we will disable the privilege
+!
+
+!
+! First we get the permanent privileges
+!
+
+IF NOT (status =
+SYS$SETPRV	(1,		! Enable
+		0,		! No mask supplied
+		1,		! Permanent privileges
+		oldpriv)	! Place to deposit current privileges
+) THEN BEGIN
+	write_message (.status);	! Tell the user whats wrong
+	return;				! And give up
+	END;
+
+!
+! Now decide whether or not to clear the privilege
+!
+
+IF NOT (.oldpriv[prv$v_sysprv])	! If privilege NOT permanent
+THEN BEGIN
+	IF NOT (status =
+	SYS$SETPRV 	(0,	! Disable
+			newpriv,! This mask
+			0,	! Temporary
+			0)	! Don't return old mask
+	) THEN BEGIN
+		write_message (.status);! Tell the user what's wrong
+		return;		! And give up
+	     END
+     END;
+
+
+!
+!	If SET PROT/DEVICE, call SETDEV module to do the job
+!
+IF cli$present(%ASCID 'DEVICE')
+THEN
+    BEGIN
+    set$device(1);
+    RETURN;
+    END;
+
+!
+! 	Parse the SET PROTECTION= value if any
+!
+$init_dyndesc(prot_desc);		! Make a dynamic descriptor
+
+IF cli$present(%ASCID 'OPTION.PROTECTION.SYSTEM')
+THEN
+    BEGIN
+    setpro_mask = .setpro_mask OR %X'000F';
+    IF cli$get_value(%ASCID 'OPTION.PROTECTION.SYSTEM',prot_desc)
+    THEN setpro_prot = parse_class(prot_desc);
+    END;
+IF cli$present(%ASCID 'OPTION.PROTECTION.OWNER')
+THEN
+    BEGIN
+    setpro_mask = .setpro_mask OR %X'00F0';
+    IF cli$get_value(%ASCID 'OPTION.PROTECTION.OWNER',prot_desc)
+    THEN setpro_prot = .setpro_prot OR parse_class(prot_desc)^4;
+    END;
+IF cli$present(%ASCID 'OPTION.PROTECTION.GROUP')
+THEN
+    BEGIN
+    setpro_mask = .setpro_mask OR %X'0F00';
+    IF cli$get_value(%ASCID 'OPTION.PROTECTION.GROUP',prot_desc)
+    THEN setpro_prot = .setpro_prot OR parse_class(prot_desc)^8;
+    END;
+IF cli$present(%ASCID 'OPTION.PROTECTION.WORLD')
+THEN
+    BEGIN
+    setpro_mask = .setpro_mask OR %X'F000';
+    IF cli$get_value(%ASCID 'OPTION.PROTECTION.WORLD',prot_desc)
+    THEN setpro_prot = .setpro_prot OR parse_class(prot_desc)^12;
+    END;
+
+!
+! Complement the protection value since at this point, a bit set true 
+! indicates that we want to ALLOW access, while the system convention
+! is that a bit set true indicates that we want to DENY access.
+!
+IF .setpro_mask NEQ 0			! If any protections specified
+THEN setpro_prot = NOT .setpro_prot;	! then get the complement
+
+!
+! Now save the command level protection in the global protection
+! area so it can be combined with individual file specifications
+! later.  If the user did not supply a command level protection then 
+! the global_mask will have a value of zero.  If no local protection
+! options are specified then the final result_mask will also have a
+! value of zero.  This will cause the protection of the target file
+! to be set to the current process default.
+!
+
+global_mask = .setpro_mask;
+global_prot = .setpro_prot;
+
+!
+!	Parse command qualifiers
+!
+qualifier$flags[qual_log] = cli$present(%ASCID 'LOG');
+qualifier$flags[qual_confirm] = cli$present(%ASCID 'CONFIRM');
+
+!
+! Loop thru all output files specified
+!
+WHILE get_output_file () DO		! For each output file
+    BEGIN
+	lib$file_scan (			! Search for file names
+		output_fab,		!  -using this file name
+		setpro_action,		!  -call here on match
+		search_error)		!  -call here on error
+
+    END;
+
+RETURN;
+
+END;
+
+ROUTINE setpro_action (fab): =
+
+!----
+!
+! Functional description
+!
+!	This routine is called from lib$file_scan whenever
+!	a file name match occurs
+!
+! Input parameters
+!
+!	fab = Address of block describing the file
+!	fab$l_nam = pointer to name block
+!
+! Output parameters
+!
+!	First error encountered, or TRUE is RETURNed
+!
+!----
+
+BEGIN
+
+MAP fab: REF BBLOCK;			! Define fab block format
+BIND nam = .fab[fab$l_nam]: BBLOCK;	! Define name block
+
+LOCAL
+    p_res_mask,				! Enable-mask parameter
+    p_res_prot,				! Value-mask parameter
+    final_prot:	WORD,			! Recieves final protection
+    desc:	VECTOR[2],		! Temporary sting descriptor
+    status;				! Recieves status
+
+!
+! If /CONFIRM was set by the user then interrogate him to see if 
+! this file is to be unlocked
+!
+
+IF (.qualifier$flags[qual_confirm])	! If confirmation requested
+THEN
+	IF NOT (confirm_action (	! Call confirmation rout. with
+		.fab))			!  -address of fab
+	   THEN return(false);		! If not confirmed then exit
+
+!
+! Now load the local descriptor with the file name size and address
+! from the nam block
+!
+
+desc[0] = .nam[nam$b_rsl];		! Load file name size
+desc[1] = .nam[nam$l_rsa];		! Load file name address
+
+!
+! But if this is a non-wildcarded network specification, then filescan
+! doesn't do the $SEARCH, so we use the expanded file specification instead.
+!
+
+IF .nam [nam$b_rsl] EQL 0 
+THEN BEGIN
+	desc[0] = .nam[nam$b_esl];	! Load file name size
+	desc[1] = .nam[nam$l_esa];	! Load file name address
+     END;
+
+
+!
+! Compute the parameters for lib$set_file_prot.  If no /PROTECTION value was
+! specified, call with null parameters for enable-mask and value-mask to cause
+! protection to be set to the process default.
+!
+
+p_res_mask = result_mask;		! Assume not default
+p_res_prot = result_prot;
+IF .result_mask EQL 0			! If no protection values specified,
+    THEN p_res_mask = p_res_prot = 0;	!     pass null parameters
+
+!
+! Call lib$set_file_prot to set file protection
+!
+
+IF NOT (status = lib$set_file_prot (	! Call library routine with
+			desc,		!  - file name
+			.p_res_mask,	!  - result mask
+			.p_res_prot,	!  - result protection
+			final_prot))	!  - final protection returned
+					!    by lib$set_file_prot
+    THEN
+	BEGIN
+	write_message (			! Tell the user of error
+			set$_pronotchg,!  - "Not changed" error message
+			1,		!  - 1 FAO arguement
+			desc,		!  - descriptor of filename
+			.status);	!  - original error
+	return (.status);		! Return to the caller
+	END;
+
+
+!
+! If /LOG was set then do it
+!
+
+IF (.qualifier$flags[qual_log])		! If logging requested
+THEN log_results (.fab,.final_prot);	!  then call the logger
+
+RETURN (true);
+
+END;
+
+ROUTINE get_output_file =
+
+!----
+! Functional Description
+!
+!	Obtain the next file specification from the output file
+!	list and perform the initial parsing to ensure legality.
+!
+! Output Parameters
+!
+!	RETURNs TRUE if a file name was obtained
+!	RETURNS FALSE if the command line is exhausted
+!
+!	output_fab = FAB initialized for current file name
+!	output_nam = NAM block associated with FAB
+!
+!----
+
+BEGIN
+
+LOCAL
+    prot_desc : $BBLOCK[dsc$c_s_bln],	! Descriptor to define protection
+    file_desc : $BBLOCK[dsc$c_s_bln];	! Descriptor to define filename
+
+CH$FILL(0, dsc$c_s_bln, file_desc);
+file_desc[dsc$w_length] = nam$c_maxrss;
+file_desc[dsc$a_pointer] = output_filename;
+
+!
+!	If the output file list is depleted, then exit.
+!
+IF NOT cli$get_value(%ASCID 'FILE',file_desc)
+THEN RETURN false;
+
+!
+! Otherwise, continue processing.  Put new filename into FAB.
+!
+output_fab[fab$l_fna] = .file_desc[dsc$a_pointer];
+output_fab[fab$b_fns] = .file_desc[dsc$w_length];
+
+!
+! Get protection values (if any) for this file
+!
+setpro_prot = 0;	! Clear any left over values
+setpro_mask = 0;	! Clear any left over values
+
+IF cli$present(%ASCID 'PROTECTION')
+THEN
+    BEGIN
+
+    $init_dyndesc(prot_desc);	! Make protection descriptor dynamic
+
+    IF cli$present(%ASCID 'PROTECTION.SYSTEM')
+    THEN
+	BEGIN
+	setpro_mask = .setpro_mask OR %X'000F';
+	IF cli$get_value(%ASCID 'PROTECTION.SYSTEM',prot_desc)
+	THEN setpro_prot = parse_class(prot_desc);
+	END;
+    IF cli$present(%ASCID 'PROTECTION.OWNER')
+    THEN
+	BEGIN
+	setpro_mask = .setpro_mask OR %X'00F0';
+	IF cli$get_value(%ASCID 'PROTECTION.OWNER',prot_desc)
+	THEN setpro_prot = .setpro_prot OR parse_class(prot_desc)^4;
+	END;
+    IF cli$present(%ASCID 'PROTECTION.GROUP')
+    THEN
+	BEGIN
+	setpro_mask = .setpro_mask OR %X'0F00';
+        IF cli$get_value(%ASCID 'PROTECTION.GROUP',prot_desc)
+	THEN setpro_prot = .setpro_prot OR parse_class(prot_desc)^8;
+	END;
+    IF cli$present(%ASCID 'PROTECTION.WORLD')
+    THEN
+	BEGIN
+	setpro_mask = .setpro_mask OR %X'F000';
+        IF cli$get_value(%ASCID 'PROTECTION.WORLD',prot_desc)
+	THEN setpro_prot = .setpro_prot OR parse_class(prot_desc)^12;
+	END;
+
+!
+! Complement the protection value since at this point, a bit set true 
+! indicates that we want to ALLOW access, while the system convention
+! is that a bit set true indicates that we want to DENY access.
+!
+    setpro_prot = NOT .setpro_prot;
+    END;
+
+!
+! Build the combined protection values.  That is, apply the command
+! level protection first, and then any local protection values
+! supplied with this parameter
+!
+result_mask =	.global_mask OR .setpro_mask;		! OR masks
+result_prot =	(.global_prot AND (NOT .setpro_mask))	! -global part
+				OR			! -OR'd with
+		(.setpro_prot AND .setpro_mask);	! -local part
+	     
+RETURN true;
+
+END;
+
+ROUTINE confirm_action (fab) =
+
+!----
+!
+! Functional description
+!
+!	This routine is called from the main loop whenever
+!	confirmation is requested.
+!
+! Input parameters
+!
+!	fab = Address of block describing the file
+!	fab$l_nam = pointer to name block
+!
+! Output parameters
+!
+!		TRUE	--> Action should be taken
+!		FALSE	--> Action should be cancelled
+!
+!
+!----
+
+BEGIN
+
+MAP fab: REF BBLOCK;			! Define fab block format
+BIND nam = .fab[fab$l_nam]: BBLOCK;	! Define name block
+
+OWN
+    file_desc:	BBLOCK[dsc$c_s_bln],	! file_descriptor for file name
+    fao_desc:	BBLOCK[dsc$c_s_bln],	! FAO work area descriptor
+    reply_desc:	BBLOCK[dsc$c_s_bln]	! Buffer desc. for reply
+		INITIAL (
+		WORD (0),		!  -size = 0
+		BYTE (dsc$k_dtype_t),	!  -arguement type = ascii
+		BYTE (dsc$k_class_d),	!  -class = dynamic
+		LONG (0));		!  -pointer = 0
+LOCAL
+    status:	BLOCK[1],		! Recieves status
+    length : 	WORD,			! Length of resultant message
+    char,				! Character work area
+    fao_buffer:	VECTOR[512,BYTE];	! FAO work area
+
+
+!
+! Initialize descriptors with:
+!	1) FAO buffer	-->	fao_desc
+!	2) file name	-->	file_desc
+!
+
+fao_desc[dsc$w_length] = 512;			! FAO work area size
+fao_desc[dsc$a_pointer] = fao_buffer;		! FAO work area address
+
+file_desc[dsc$w_length] = .nam[nam$b_rsl];	! Resultant file name length
+file_desc[dsc$a_pointer] = .nam[nam$l_rsa];	! Resultant file name address
+
+IF .nam [nam$b_rsl] EQL 0			! If resultant name is blank
+THEN BEGIN					!    then use expanded name
+     file_desc[dsc$w_length] = .nam[nam$b_esl];	!  - expanded file name length
+     file_desc[dsc$a_pointer] = .nam[nam$l_esa];!  - expanded file name address
+     END;
+
+
+!
+! Now call SYS$FAO to expand message
+!
+
+IF NOT (status = SYS$FAO (		! Call system service with
+					!  -messages desc. address
+		addrdesc('!AS, change protection? (Y or N): '),
+		length,			!  -place to put result length
+		fao_desc,		!  -descriptor of a work area
+		file_desc))		!  -one FAO arguement
+   THEN
+	BEGIN
+	write_message (.status);	! Tell the user
+	return (.status);		! Return to the caller
+	END;
+
+!
+! Now question user by calling LIB$GET_COMMAND using the result
+! of the FAO call as a prompt string
+!
+
+fao_desc[dsc$w_length] = .length;	! Move in prompt string size
+
+IF NOT (status = LIB$GET_COMMAND (	! Call library routine with
+		reply_desc,		!  -reply buffer desc. addr.
+		fao_desc))		!  -prompt string desc. addr.
+   THEN
+	BEGIN
+	IF (.status EQL rms$_eof)	! If this was end of file then
+	THEN status[sts$v_severity] =	!  make it a severe (i.e. non-
+		sts$k_severe;		!  returnable) error
+	write_message (.status);	! Tell the user
+	return (.status);		! Return to the caller
+	END;
+
+
+!
+! Now retrieve one charater from the buffer and set the return 
+! status depending on its value
+!
+
+IF (.reply_desc[dsc$w_length] EQL 0)	! Did user hit <CR>?
+THEN return (false);			! Yes, return false
+
+char = CH$RCHAR (CH$PTR (.reply_desc[dsc$a_pointer]));
+
+IF (.char EQL 'Y' OR			! If user responded 'Y'
+    .char EQL 'y' OR			!    or 'y'
+    .char EQL 'T' OR			!    or 'T' (TRUE)
+    .char EQL 't')			!    or 't'
+THEN return (true)			! Return 'TAKE ACTION'
+ELSE return (false);			! Return 'CANCEL ACTION'
+
+END;
+
+ROUTINE log_results (fab,final_prot): =
+
+!----
+!
+! Functional description
+!
+!	This routine is called from the main loop whenever
+!	logging is requested
+!
+! Input parameters
+!
+!	fab = Address of block describing the file
+!	fab$l_nam = pointer to name block
+!
+! Output parameters
+!
+!	First error encountered, or TRUE is RETURNed
+!
+!----
+
+BEGIN
+
+LITERAL
+    pbufsize = 32;			! Buffer for generating string
+
+MAP fab: REF BBLOCK;			! Define fab block format
+
+BIND nam = .fab[fab$l_nam]: BBLOCK;	! Define name block
+
+LOCAL
+    status:,				! Recieves status
+    pbuf:	VECTOR[pbufsize,BYTE],	! Place for protection string
+    pdesc:	VECTOR[2],		! Temporary string descriptor
+    desc:	VECTOR[2],		! Temporary string descriptor
+    prot_table:	VECTOR[4];		! Protection string table
+
+IF .nam[nam$b_rsl] NEQ 0		! IF result string nonblank,
+THEN BEGIN
+    desc[0] = .nam[nam$b_rsl];		! then display it
+    desc[1] = .nam[nam$l_rsa];
+    END
+ELSE IF .nam[nam$b_esl] NEQ 0		! Or if expanded name nonblank
+THEN BEGIN
+    desc[0] = .nam[nam$b_esl];		! then display it
+    desc[1] = .nam[nam$l_esa];
+    END
+ELSE BEGIN
+    desc[0] = .fab[fab$b_fns];		! Otherwise, use original
+    desc[1] = .fab[fab$l_fna];		! name string in FAB
+    END;
+
+!
+! Now build the resultant protection string from the value passed
+! in the call.
+!
+
+expand_prot(				! Call sub with
+	prot_table,			!  -place for the result
+	.final_prot);			!  -final protection value
+
+pdesc[0] = pbufsize;			! Initialize descriptor size
+pdesc[1] = pbuf;			! Initialize descriptor address
+
+IF NOT (status =
+$FAOL	(				! Call system service with
+	CTRSTR = ADDRDESC ('S:!AS,O:!AS,G:!AS,W:!AS'),	! -FAO string
+	OUTLEN = pdesc[0],		!  -place for resultant length
+	OUTBUF = pdesc,			!  -output buffer descriptor
+	PRMLST = prot_table)		!  -address of list of args
+) THEN BEGIN
+	write_message (.status);	! Oops, tell the user
+	return (.status);		! And exit immediately
+	END;
+
+write_message (set$_protected,		! Inform user with
+		2,			!  -two FAO arguements
+		desc,			!  -file name
+		pdesc);			!  -new protection
+
+RETURN (true);
+
+END;
+
+ROUTINE expand_prot (table, protection): =
+
+!----
+!
+! Functional description
+!
+!	This routine fills a given VECTOR with the addresses of
+!	strings corresponding to a given protection word.
+!
+! Input parameters
+!
+!	table = Address of the table to be filled in.
+!	protection = Protection word.
+!
+! Output parameters
+!
+!	table has been filled in with the addresses of descriptors
+!	of strings describing each type of user (SYS,OWN,GRP,WORLD).
+!
+!----
+
+BEGIN
+
+BIND
+    prot_table = .table: VECTOR[4];	! Table of addresses
+
+OWN
+    prot_values: VECTOR[16] INITIAL(	! Protection descriptions
+	ADDRDESC('RWED'),
+	ADDRDESC('WED'),
+	ADDRDESC('RED'),
+	ADDRDESC('ED'),
+	ADDRDESC('RWD'),
+	ADDRDESC('WD'),
+	ADDRDESC('RD'),
+	ADDRDESC('D'),
+	ADDRDESC('RWE'),
+	ADDRDESC('WE'),
+	ADDRDESC('RE'),
+	ADDRDESC('E'),
+	ADDRDESC('RW'),
+	ADDRDESC('W'),
+	ADDRDESC('R'),
+	ADDRDESC(''));
+
+INCR index FROM 0 TO 3 DO
+    prot_table[.index] = .prot_values [.protection<.index*4,4>];
+
+RETURN (true);		! Always return true
+
+END;
+
+ROUTINE parse_class (desc) =
+
+!---
+!
+! This routine parses one class of user (e.g. SYSTEM, OWNER, GROUP, WORLD)
+! to see what protection is allowed.  The value returned in the low 4 bits
+! is the protection code, with the bits set to reflect that access is 
+! requested.  Note that this is exactly the opposite of what the system wants.
+!
+! Inputs:
+!
+!	DESC -- a descriptor pointing to the ASCII representation of the
+!		protection desired
+!
+!---
+
+BEGIN
+
+MAP desc : REF $BBLOCK;
+
+LOCAL
+    pointer,				! Pointer to string
+    result;				! Resultant protection
+
+!
+! Initially set the value to all zeros, no access
+!
+result = 0;
+
+!
+! Scan for the occurrence of each keyletter, and, if it is there, set the
+! appropriate bit.
+!
+pointer = .desc[dsc$a_pointer];
+INCR index FROM 1 to .desc[dsc$w_length] DO
+    BEGIN
+    LOCAL char : BYTE;
+    char = CH$RCHAR_A(pointer);
+    IF .char EQL'R'
+    THEN result = .result OR %X'1'
+    ELSE IF .char EQL  'W'
+    THEN result = .result OR %X'2'
+    ELSE IF .char EQL 'E'
+    	 OR .char EQL 'P'
+    THEN result = .result OR %X'4'
+    ELSE IF .char EQL 'D'
+    	 OR .char EQL 'L'
+    THEN result = .result OR %X'8'
+    ELSE SIGNAL_STOP (set$_syntax, 1, .desc);
+    END;
+
+RETURN .result;
+END;
+
+ROUTINE search_error (fab): =
+
+!----
+!
+! Functional description
+!
+!	This routine is called from RMS whenever an error
+!	occurs during an RMS file function call.
+!
+! Input parameters
+!
+!	fab = Address of block used in the RMS call.
+!	fab$l_nam = pointer to name block
+!
+! Output parameters
+!
+!	FAB status is returned
+!
+!----
+
+BEGIN
+
+MAP fab: REF BBLOCK;			! Define fab block format
+BIND nam = .fab[fab$l_nam]: BBLOCK;	! Define name block
+
+LOCAL desc: VECTOR[2];			! Temporary string descriptor
+
+IF .nam[nam$b_rsl] NEQ 0		! IF result string nonblank,
+THEN BEGIN
+    desc[0] = .nam[nam$b_rsl];		! then display it
+    desc[1] = .nam[nam$l_rsa];
+    END
+ELSE IF .nam[nam$b_esl] NEQ 0		! Or if expanded name nonblank
+THEN BEGIN
+    desc[0] = .nam[nam$b_esl];		! then display it
+    desc[1] = .nam[nam$l_esa];
+    END
+ELSE BEGIN
+    desc[0] = .fab[fab$b_fns];		! Otherwise, use original
+    desc[1] = .fab[fab$l_fna];		! name string in FAB
+    END;
+
+write_message(set$_searchfail,1,DESC,	! Output an error message
+		.fab[fab$l_sts],	! with fab error code
+		.fab[fab$l_stv]);	! and secondary code
+
+RETURN (.fab[fab$l_sts]);
+
+END;
+
+ROUTINE cli_error (cli_block,error): =
+
+!----
+!
+! Functional description
+!
+!	This routine is called as an error handler for
+!	CLI errors.
+!
+! Input parameters
+!
+!	cli_block = Address of CLI request block
+!	error = CLI error message
+!
+! Output parameters
+!
+!	Input 'error' is RETURNed
+!
+!----
+
+BEGIN
+
+MAP cli_block: REF BBLOCK;		! Define CLI request block
+
+signal_stop(.error);
+
+RETURN (.error);
+
+END;
+
+END
+ELUDOM

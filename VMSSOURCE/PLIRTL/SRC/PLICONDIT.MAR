@@ -1,0 +1,1081 @@
+	.title	pli$condit -  condition handler routines
+	.ident	/1-008/					; Edit DSB1008
+							; Edit DSB1007
+							; Edit CGN1006
+							; Edit CGN1005
+							; Edit CGN1004
+							; Edit CGN1003
+							; Edit WHM1002
+;
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+; facility:
+;
+;	VAX/VMS PL1 runtime library.
+;
+; abstract:
+;
+;	This module contains the pl1 runtime routines for condition
+;	handling and non-local goto processing.
+;
+; author: r. heinen 18-jan-1979
+;
+; Modifications:
+;
+;
+;	1-002	Bill Matthews	29-September-1982
+;
+;		Invoke macros $defdat and rtshare instead of $defopr and share.
+;
+;	1-003	Chip Nylander	25-January-1983
+;
+;		Fix the ONCODE() bif.  It was blown to bits by a previous
+;		edit, and did not return the correct results for most cases.
+;		The new, and correct, behavior is:
+;
+;		1) For PLI$_ENDFILE, PLI$_ENDPAGE, PLI$_FINISH, and all
+;		   non-PLI conditions, return the primary condition code.
+;		   Note that FIXEDOVERFLOW, OVERFLOW, UNDERFLOW, and
+;		   ZERODIVIDE are not signalled as PL/I conditions.
+;
+;		2) for all other conditions (currently ERROR, KEY,
+;		   UNDEFINEDFILE, and VAXCONDITION) search the signal
+;		   argument list and return the last (most specific)
+;		   condition, but ignore all instances of PLI$_FILENAME,
+;		   PLI$_RMSF, PLI$_RMSR, and PLI$_IOERROR because they 
+;		   are "uninteresting".
+;
+;	1-004	Chip Nylander	07-February-1983
+;
+;		Make floating faults visible to ON units.
+;
+;	1-005	Chip Nylander	22-February-1983
+;
+;		Prevent spurious error messages when a VAX condition is
+;		signalled and not handled:
+;		when calling LIB$SIGNAL from the OPTIONS(MAIN) condition
+;		to make PLI$_ERROR the primary error, don't pass the saved
+;		psl/pc to LIB$SIGNAL for those system errors that don't
+;		want it.
+;
+;	1-006	Chip Nylander	17-March-1983
+;
+;		Make SIGNAL_ERROR a local symbol rather than a global one.
+;
+;	1-007	Dave Blickstein	14-February-1984
+;
+;		Fixup norm_exit in PL$DEF_HND to resignal to the system
+;		handler when PLIG-ERROR is received with I severity.  
+;		It was signalling FINISH before passing the error on.
+;	
+;	1-008	Dave Blickstein	23-May-1984
+;
+;		Changed PLI$OPTMAIN_HND to resignal SS$_DEBUG.  This was
+;		done so that PL/I programs can be ^Y-ed and examined with
+;		the debugger with the DEBUG command.  Previously, SS$_DEBUG
+;		would be resignalled like any other error and a traceback
+;		would occur followed by an image exit.
+;--
+ 
+;
+; external definitions
+;
+ 
+	$chfdef				; define condition handler offsets
+	$defcnd				; define condition handler block
+	$deffcb				; define runtime file control block
+	$defstk				; define runtime stack
+	$fabdef				; define fab offsets
+	$rabdef				; define rab offsets
+	$namdef				; define nam offsets
+	$sfdef				; define stack offset
+ 
+;
+; local definitions
+;
+	zerodiv = 0
+	anycond = 4
+	intovf	= 8
+	
+ 
+	rtshare
+;
+; table of subscript range message numbers
+;
+subscript_table:
+	.long	pli$_subrange
+	.long	pli$_subrange1
+	.long	pli$_subrange2
+	.long	pli$_subrange3
+	.long	pli$_subrange4
+	.long	pli$_subrange5
+	.long	pli$_subrange6
+	.long	pli$_subrange7
+	.long	pli$_subrange8
+	.long	0,0,0,0,0,0,0,0,0,0,0
+	.long	pli$_substr2
+	.long	pli$_substr3
+
+;
+; table of hardware-raised errors that need the PSL and PC returned to DCL
+; for FAO formatting.
+;
+hardware_table:
+	.long	ss$_intovf
+	.long	ss$_intdiv
+	.long	ss$_fltovf
+	.long	ss$_fltovf_f
+	.long	ss$_fltund
+	.long	ss$_fltund_f
+	.long	ss$_fltdiv
+	.long	ss$_fltdiv_f
+	.long	ss$_decovf
+	.long	ss$_subrng
+	.long	ss$_accvio
+	.long	ss$_roprand
+	.long	ss$_radrmod
+	.long	ss$_opcdec
+	.long	ss$_opccus
+	.long	0			; must be last
+
+	.page
+	.sbttl	pli$def_hnd - pl1 default condition handler
+;++
+; pli$def_hnd - pl1 default condition handler
+;
+; functional description:
+;
+; This routine is the condition handler for all pl1 main programs.
+; The action is to search the normal on unit list in the same way
+; as the standard handler. If a condition handler was found then the
+; condition is continued. If no condition handler was found then error is signaled. 
+;
+; inputs:
+;
+;	condition argument list
+;
+; outputs:
+;
+;	none, but the program may be aborted.
+; Two entry points are provided so that the remainder of the runtime
+; can distinguish the highest level options main handler
+;--
+	.entry	pli$optmain_hnd,^m<r2,r3,r4,r5,r5,r6,r7,r8,r9,r10,r11>
+	brb	def_hnd_common		; use common code for handler
+	.entry	pli$def_hnd,^m<r2,r3,r4,r5,r6,r7,r8,r9,r10,r11>;
+def_hnd_common:
+;
+; search this frames condition list for an on unit
+;
+	bsbw	search_cnd_list		; look for a handler in this frame
+	movl	chf$l_sigarglst(ap),r2	; address the signal arg list
+;
+; if an on unit was found then continue
+;
+	cmpl	r0,#ss$_continue	; handler found?
+	bneq	10$			; if neq then perform default action
+	ret				; continue after user handler
+
+;
+; perform default action based on the condition value
+;
+10$:	
+	cmpw	chf$l_sig_name+2(r2),#<pli$_error@-16>; pl1 defined?
+	bneq	20$			; signal pl1 error condition
+	extzv	#3,#10,chf$l_sig_name(r2),r0; get message number
+	cmpw	r0,#<pli$_finish&^xfff>@-3; finish?
+	beql	23$			; if eql then continue
+	case	r0,<-
+		signal_error,-		; never signaled
+		end_of_page,-		; end page
+		signal_error,-		; end file
+		signal_error,-		; unknown file
+		signal_error,-		; key
+		norm_exit-		; error signaled, so exit
+		>
+	brb	signal_error		; all others cause error signal
+;
+; non pl1 condition
+;
+20$:	cmpl	chf$l_sig_name(r2),#ss$_fltund; floating underflow trap?
+	beql	25$			; if eql then ignore
+	cmpl	chf$l_sig_name(r2),#ss$_fltund_f; floating underflow fault?
+	beql	25$			; if eql then ignore
+	cmpl	chf$l_sig_name(r2),#ss$_debug	; if activate debugger
+	bneq	22$			;
+	brw	finish_signal_return	; then resignal
+22$:	cmpzv	#3,#29,chf$l_sig_name(r2),#<ss$_unwind@-3>; unwind?
+	bneq	signal_error		; all others get default handling
+23$:	jsb	pli$$term_prog		; shut off program exit control
+25$:	movzwl	#ss$_continue,r0	; continue
+	ret
+;
+; end of page
+;
+end_of_page:
+	movl	chf$l_mcharglst(ap),r2	;get mech args
+	movl	chf$l_mch_savr0(r2),ap	;set fcb addr
+	clrl	r0			;set no line
+	movl	#1,r1			;set to put page
+	movq	#0,r2			;set no skip, no options
+	clrl	r4			;set no format
+	jsb	g^pli$putfile_r6	;do put page
+	jmp	g^pli$put_end_r6	;finish it off and return
+;
+; signal error condition
+;
+signal_error:
+	pushl	stk_l_pc(fp)		;save system pc/psl
+	pushl	stk_l_psl(fp)		;
+	movl	chf$l_sig_args(r2),r0	;get size of arg list
+	movl	chf$l_sig_args-4(r2)[r0],stk_l_pc(fp) ;set original pc/psl
+	movl	chf$l_sig_args(r2)[r0],stk_l_psl(fp) ;
+	moval	hardware_table,r3	; set to top of hardware error table
+10$:	tstl	(r3)			; any more?
+	beql	30$			; no, so throw away pc/psl
+	cmpl	chf$l_sig_name(r2),(r3)+; need pc/psl?
+	bneq	10$			; if not, loop back to check again
+	addl3	#2,r0,r3		;get number of args for signal
+	brb	50$			; rejoin common
+30$:	movl	r0,r3			;copy number of args for signal
+	subl	#2,r0			;set number of args to copy less pc/psl
+50$:	pushl	chf$l_sig_args(r2)[r0]	;copy args to stack
+	sobgtr	r0,50$			;
+	pushl	#0			;set no args for error
+	pushl	#pli$_error		;set error
+	extzv	#0,#3,chf$l_sig_name(r2),r0; get severity of previous condition
+	insv	r0,#0,#3,(sp)		; insert as severity of this signal
+	clrl	(fp)			;disappear our condition handler
+	clrq	r0			;set no secondary arguments
+	calls	r3,g^lib$signal		;signal error
+error_signal:				;if we come back, the signal was handled
+	popl	stk_l_psl(fp)		;restore system pc/psl
+	popl	stk_l_pc(fp)		;
+	movzbl	#ss$_continue,r0	;set to continue
+	ret				;return
+;
+; end the program
+;
+norm_exit:
+	cmpzv	#0,#3,chf$l_sig_name(r2),#4; fatal severity?
+	blss	finish_signal_return	; if leq then no
+	jsb	g^pli$$term_prog	; shut off exit handler finish condition
+	pushl	stk_l_pc(fp)		;save system pc/psl
+	pushl	stk_l_psl(fp)		;
+	movab	b^10$,stk_l_pc(fp) 	;set unrecognized pc/psl
+	movpsl	stk_l_psl(fp)		;
+	pushl	#pli$_finish		; signal finish condition
+	clrl	(fp)			; remove trouble handler
+	calls	#1,g^lib$signal
+10$:	popl	stk_l_psl(fp)		;restore system pc/psl
+	popl	stk_l_pc(fp)		;
+;
+; print messages via system or next handler
+;
+finish_signal_return:
+	movzwl	#ss$_resignal,r0	; get the messages
+	ret				; just return
+
+	.sbttl	pli$cnd_hnd - condition handler for pl1
+;++
+; pli$cnd_hnd - condition handler for pl1
+;
+; functional description:
+;
+; This routine handles conditions for pl1 programs by searching the
+; current condition handler list for a control block which specifies
+; the same enable. The first control block with a matching enable is 
+; used to call the associated condition handler routine.
+; If no handler is found then the condition is resignaled.
+;
+; inputs:
+;
+;	exception stack frame
+;	The signaller's r1 is meaningfull on known pl1 conditions.
+;	If the condition relates to a file then that r1 is the fcb address
+;	of the file.
+;
+; outputs:
+;
+;	none
+;
+; If an error occurs while handling the exception, a fatal exit is taken.
+; A signal will not work because control will return here.
+;
+; The call to the condition handler is done with the argument list of the condition.
+;
+;--
+	.enabl	lsb
+	.entry	pli$cnd_hnd,^m<r2,r3,r4>
+	bsbb	search_cnd_list		; search the condition list
+	ret				; done
+
+	.sbttl search_cnd_list
+;
+; subroutine to search the establisher's condition handler list
+;
+search_cnd_list:
+	movab	w^fatal_exception,(fp)	; set up fatal exception vector
+	clrq	-(sp)			; zero stack locals
+	clrl	-(sp)			;
+	movl	chf$l_sigarglst(ap),r1	; get the signal value
+	movl	chf$l_sig_name(r1),r2	; 
+	movl	chf$l_sig_args(r1),r4	; get argument numbers
+	moval	chf$l_sig_args-4(r1)[r4],r4; address the pc
+	movl	chf$l_mcharglst(ap),r3	; address arg list with fp of establisher
+	movl	chf$l_mch_savr0(r3),r0	;get fcb addr if its there
+1$:	movl	chf$l_mch_frame(r3),r1	;
+;
+; search condition list in that frame
+;
+	movab	stk_l_cnd_lst(r1),r3	; address condition handler control list
+5$:	movl	(r3),r3			; get next block
+	bneq	10$			; if eql then done
+	brw	40$			; resignal condition
+10$:	tstl	cnd_l_addr(r3)		; reverted condition handler?
+	beql	5$			; if eql then yes
+;
+; look for fixed overflow handler
+;
+	cmpzv	#3,#29,cnd_l_enabl(r3),#<pli$_zerodiv+8>@-3; PLI fixed overflow?
+	bneq	15$			; if neq then no
+	tstl	intovf(sp)		; handler found already?
+	bneq	15$			; if neq then yes
+	movl	r3,intovf(sp)		; save for default case
+;
+; look for an anycondition handler
+;
+15$:	cmpzv	#3,#29,cnd_l_enabl(r3),#<pli$_anycond>@-3; PLI any condition?
+	bneq	20$			; if neq then no
+	tstl	anycond(sp)		; already found in list?
+	bneq	20$			; if neq then yes
+	movl	r3,anycond(sp)		; save for default condition
+	brb	25$			; continue
+;
+; look for zero divide handler
+;
+20$:	cmpzv	#3,#29,cnd_l_enabl(r3),#<pli$_zerodiv>@-3; PLI zero divide
+	bneq	25$			; if neq then no
+	tstl	zerodiv(sp)		; this condition enabled already?
+	bneq	25$			; if neq then yes
+	movl	r3,zerodiv(sp)		; save special dual value case
+;
+; look at secondary argument if PLI condition
+;
+25$:	cmpzv	#16,#16,r2,#<<pli$_error>@-16>; pl1 defined condition signaled?
+	beql	29$			; if eql then yes
+	cmpl	cnd_l_enabl(r3),r2	; enabled?
+	beql	30$			; if eql then signal condition
+	cmpl	cnd_l_enabl(r3),#ss$_fltovf; enabled for overflow?
+	bneq	26$			; no - check next fault
+	cmpl	r2,#ss$_fltovf_f	; yes - is this an overflow fault?
+	beql	30$			; if yes signal condition
+26$:	cmpl	cnd_l_enabl(r3),#ss$_fltund; enabled for underflow?
+	bneq	27$			; no - check next fault
+	cmpl	r2,#ss$_fltund_f	; yes - is this an underflow fault?
+	beql	30$			; if yes signal condition
+27$:	cmpl	cnd_l_enabl(r3),#ss$_fltdiv; enabled for divide?
+	bneq	28$			; no - go find next handler
+	cmpl	r2,#ss$_fltdiv_f	; yes - is this a divide fault?
+	beql	30$			; if yes signal condition
+28$:	brw	5$			; look for next handler
+29$:	extzv	#3,#29,r2,-(sp)		; get internal bits
+	cmpzv	#3,#29,cnd_l_enabl(r3),(sp)+; match in pl1 bits?
+	bneq	28$			; if neq then no
+	cmpzv	#3,#29,cnd_l_enabl(r3),#<pli$_key@-3>; file type?
+	bgtru	30$			; if gtru then no additional arg
+	cmpl	cnd_l_arg(r3),r0	; same secondary argument?
+	bneq	28$			; if neq then no
+;
+; call with r1 as establisher's frame pointer
+;
+30$:	clrl	(fp)			; disable fatal exception vector
+	pushl	stk_l_psl(fp)		; save system's psl
+	pushl	stk_l_pc(fp)		; save system's stack key
+	movl	(r4),stk_l_pc(fp)	; set pc/psw to original
+	movw	4(r4),stk_l_psl(fp)	; change psw only
+	callg	(ap),@cnd_l_addr(r3)	; call handler with our arg list
+norm_signal:				; condition handler stack key
+	movab	w^fatal_exception,(fp)	; setup a condition handler
+	popl	stk_l_pc(fp)		; restore system's stack key
+	popl	stk_l_psl(fp)		; restore system's psl
+35$:	movzwl	#ss$_continue,r0	; set up to continue
+	addl	#12,sp			; purge stack
+	rsb				; and do so
+;
+; no condition handler found - check defaults
+;
+40$:	movl	zerodiv(sp),r3		; get zero divide handler
+	beql	45$			; if eql then none
+	cmpl	r2,#ss$_fltdiv		; floating divide trap?
+	beql	60$			; if yes then merge 
+	cmpl	r2,#ss$_fltdiv_f	; floating divide fault?
+	beql	60$			; if yes then merge 
+	cmpl	r2,#ss$_intdiv		; integer divide?
+	beql	60$			; if eql then merge
+45$:	movl	intovf(sp),r3		; integer overflow?
+	beql	50$			; if eql then no handler found
+	cmpl	r2,#ss$_decovf		; decimal overflow?
+	beql	60$			; if eql then handle condition
+	cmpl	r2,#ss$_intovf		; integer overflow?
+	beql	60$			; if eql then handle
+50$:	movl	anycond(sp),r3		; any condition handler?
+	bneq	60$			; if neq then handle
+55$:	movzwl	#ss$_resignal,r0	; set up to continue signal
+	addl	#12,sp			; purge stack
+	rsb				;
+60$:	brw	30$			; signal contdition
+;
+; exception handler for exception handler
+;
+fatal_exception:
+	.word	0			;
+fatal_error:
+	$exit_s	#pli$_error		; fatal error
+ 
+	.dsabl	lsb
+
+	.sbttl	pli$nonloc_ret - non-local return processing
+;++
+; pli$nonloc_ret - non-local return
+;
+; functional description:
+;
+; This routine is entered via a jmp from a pl1 program when a non-local
+; return occurs. The action is to unwind the call stack.
+; The unwind is done in a manner similar to that of SYS$UNWIND.
+;
+; At each stack frame that is passed, the SS$_UNWIND condition is signaled.
+;
+; No provision is made for protecting r0/r1 from restoration by a call mask.
+; PL/I does not save r0/r1
+;
+; inputs:
+;
+;	r0/r1 return value if any
+;	r2 = number of frames to skip
+;
+; outputs:
+;
+;	none
+;--
+pli$nonloc_ret::			; not a call entry
+	movq	r0,-(sp)		; save return value and regs
+	movl	fp,r0			; copy current fp
+;
+; check for proper frame
+;
+10$:	movab	b^canned_return,stk_l_pc(r0); force return in this module
+	movl	stk_l_fp(r0),r0		; link to next frame on stack
+	probew	#3,#stk_l_pc,(r0)	; frame accessible?
+	beql	fatal_error		; if eql then insuff frames
+	sobgtr	r2,10$			; continue until done
+
+;
+; proper frame found
+;
+	movq	(sp)+,r0		; restore return value
+	ret				; unwind stack and goto
+
+;++
+; pli$optmain_ret - return in options main block
+;
+; functional description:
+;
+; This routine performs a return inside an options main block
+; The action is to return unless this is the outermost options main block.
+; If it the outermost block then a STOP is done.
+;
+; inputs:
+;
+;	none
+;
+; outputs:
+;
+;	none - r0,r1 are preserved for function returns
+;--
+pli$optmain_ret::
+;
+; if this frame is the options main frame then STOP otherwise just return
+;
+	pushab	w^pli$optmain_hnd	; address options main handler
+	cmpl	(sp)+,stk_l_cnd_hnd(fp)	; this frame the outermost?
+	bneq	5$			; if neq then return
+;
+; cause a stop to occur
+;
+	pushl	r0			; set return value for exit code
+	calls	#1,g^pli$stop_prog	; execute STOP
+5$:	ret				; continue
+
+	.sbttl	pli$nonloc_goto - non-local goto processing
+;++
+; pli$nonloc_goto - non-local goto
+;
+; functional description:
+;
+; This routine is entered via a jmp from a pl1 program when a non-local
+; goto occurs. The action is to unwind the call stack.
+; The unwind is done in a manner similar to that of SYS$UNWIND.
+;
+; At each stack frame that is passed, the SS$_UNWIND condition is signaled.
+;
+; inputs:
+;
+;	r0 = new pc
+;	r1 = fp of target frame
+;
+; outputs:
+;
+;	none
+;--
+pli$nonloc_goto::
+pli$goto::				; not a call entry
+	.enabl	lsb
+	cmpl	r1,fp			; is this the frame?
+	bneq	10$			; if neq then no
+	jmp	(r0)			; goto new pc
+;
+; this goto is outside this stack frame
+;
+10$:	pushl	r0			; save new pc
+	movl	fp,r0			; copy current fp
+;
+; check for proper frame
+;
+20$:	cmpl	r1,stk_l_fp(r0)		; is the next frame the last?
+	beql	40$			; if eql then yes
+	movab	w^norm_signal,-(sp)	;address normal signal ret addr
+	cmpl	stk_l_pc(r0),(sp)+	;does this frame point there?
+	beql	25$			;if eql, yes, special case
+	movab	w^error_signal,-(sp)	;address error signal ret addr
+	cmpl	stk_l_pc(r0),(sp)+	;does this frame point there?
+	beql	25$			;if eql, yes, special case
+	movab	b^canned_return,stk_l_pc(r0); force return in this module
+	brb	27$			;cont
+25$:	movab	b^unwind_signal,stk_l_pc(r0); force return for signal frame
+27$:	movl	stk_l_fp(r0),r0		; link to next frame on stack
+	probew	#3,#stk_l_pc,(r0)	; frame accessible?
+	beql	fatal_error		; if eql then insuff frames
+	brb	20$			; continue search
+;
+; proper frame found
+;
+40$:	popl	stk_l_pc(r0)		; force new pc on return
+	clrq	r0			; force null return arguments
+	ret				; unwind stack and goto
+;
+; return control handler
+;
+unwind_signal:
+	nop				;different than canned_return;
+canned_return:
+	tstl	stk_l_cnd_hnd(fp)	; frame have condition handler?
+	beql	100$			; if eql then no
+;
+; signal unwind condition by building stach frame
+;
+	movq	r0,-(sp)		; save current return args
+	movl	fp,r1			; set up call as if called from procedure itself
+	movpsl	-(sp)			; psl
+	pushab	b^100$			; pc
+	pushl	#ss$_unwind		; build signal args
+	pushl	#3			;
+					; build mechanism args
+	clrq	-(sp)			; r0,r1
+	clrl	-(sp)			; unwind count
+	pushl	r1			; target fp
+	pushl	#4			;
+	pushab	(sp)			; set up exception arg list
+	pushab	24(sp)			;
+	clrq	r0			; zap input registers
+	calls	#2,@stk_l_cnd_hnd(fp)	; call handler
+	movq	36(sp),r0		; restore value of return
+100$:	ret				; continue;
+	.dsabl	lsb
+	.page
+	.sbttl	pli$rvrt_cnd - revert condition handler
+;++
+; pli$rvrt_cnd - revert condition handler
+;
+; functional description:
+;
+; This routine removes a condition handler in the current frame that
+; matchs a specified condition value.
+;
+; inputs:
+;
+;	r0 = condition enable
+;	r1 = fcb address if file related condition or 0 if not file related
+;
+; outputs:
+;
+;	r0,r1 are distroyed.
+;--
+pli$rvrt_cnd::
+	movq	r2,-(sp)		; save a register
+	tstl	stk_l_cnd_hnd(fp)	; is there a condition handler?
+	beql	30$			; if eql then no
+	extzv	#3,#29,r0,r2		; get condition value less severity
+	movab	stk_l_cnd_lst(fp),r3	; address list of control blocks
+15$:	movl	(r3),r3			; get next block
+	beql	30$			; if eql then done
+	tstl	cnd_l_addr(r3)		; reverted?
+	beql	15$			; if eql then yes
+	cmpzv	#3,#29,cnd_l_enabl(r3),r2; match on this block?
+	bneq	15$			; if neq then no
+	cmpw	#<<pli$_error>@-16>,cnd_l_enabl+2(r3); pl1 condition?
+	bneq	20$			; if neq then no
+	cmpl	r1,cnd_l_arg(r3)	; fcb match?
+	bneq	15$			; if neq then continue
+20$:	clrl	cnd_l_addr(r3)		; release from use
+	brb	15$			;get next block
+30$:	movq	(sp)+,r2		; restore
+	rsb
+
+;++
+; pli$bound_check - range check error subroutine
+;
+; functional description:
+;
+; This routine is entered on a subscript range check. The action is to signal
+; the error. If the users continues program execution is resumed.
+;
+; inputs:
+;
+;	0(sp) = address of range check code and return address
+;
+; outputs:
+;
+;	none
+;--
+pli$bound_check::
+	popl	r0			; get return address
+	calls	#0,b^10$		; create a stack frame
+	ret				; never used
+10$:	.word	0			; 
+	movzbl	(r0)+,r1		; fetch index in table
+	movl	r0,stk_l_pc(fp)		; zap return address
+	pushl	subscript_table[r1]	;
+	calls	#1,g^lib$signal		;
+	ret
+
+	.sbttl	pli$resignal - cause resignal of most recent condition
+;++
+; pli$resignal - resignal most recent condition
+;
+; functional description:
+;
+; This routine searches the stack for a condition stack frame and if found
+; causes that condition to be resignaled.
+;
+; inputs:
+;
+;	none
+;
+; outputs:
+;
+;	none
+;--
+	.entry	pli$resignal,^m<r2,r3,r4>
+3$:	movl	fp,r0			; search for a condition
+	bsbw	find_cnd_ap		; look for a condition stack
+	beql	10$			; if eql then none
+	cmpl	r0,stk_l_fp(fp)		; next fram is the condition fram?
+	beql	b^5$			; yes, prepare the return address
+;
+	movab	b^3$,stk_l_pc(fp)	; no. pop fram and keep search
+;
+	ret				; return to pli$resignal
+;
+5$:	movab	b^30$,stk_l_pc(r0)	; force return here
+	movab	b^10$,stk_l_pc(fp)	; force return to here, instead of
+					; the caller, so skip the rest of 
+					; this condition handler
+10$:	ret
+;
+; trapped return
+;
+30$:	popl	stk_l_pc(fp)		; restore system's stack key
+	popl	stk_l_psl(fp)		; restore system's psl
+	clrl	r1			;
+	movl	#ss$_resignal,r0	; resignal condition
+	ret				; continue
+	.page
+	.sbttl	pli$oncode - get most recent condition name
+;++
+; pli$oncode - get most recent condition name
+;
+; functional description:
+;
+; This routine is a built-in-function that returns a fixed bin(31) value
+; which is the name of the most recent condition.  The object is to
+; obtain as much information as possible about the condition.
+;
+; inputs:
+;
+;	pl1 stack frame.
+;
+; outputs:
+;
+;	r0 = condition name value or 0 if no condition is active
+;--
+	.entry	pli$oncode,^m<r2,r3,r4>
+	movl	fp,r0			; start with this frame
+;
+; find the argument list of the last signal
+;
+	bsbw	find_cnd_ap		; use common routine
+	beql	50$			; if eql then none found
+;
+; begin search for more information
+;
+	movl	chf$l_sigarglst(r1),r2	; address signal arguments
+10$:	movl	(r2),r3			; get count of arguments
+	movl	chf$l_sig_name(r2),r0	; get actual name
+	cmpw	chf$l_sig_name+2(r2),#<pli$_error@-16>; pl1 code?
+	bneq	50$			; if neq then return
+	cmpl	r0,#pli$_endfile	; endfile condition?
+	beql	50$			; yes, return it
+	cmpl	r0,#pli$_endpage	; endpage condition?
+	beql	50$			; yes, return it
+	cmpl	r0,#pli$_finish		; finish condition?
+	beql	50$			; yes, return it
+;
+; the most recent condition was a pl1 defined condition
+;
+; PL/I condition of some sort
+;
+	addl	#4,r2			; address first name
+	subl	#2,r3			; remove pc/psl from count
+20$:	cmpl	(r2),#pli$_rmsf		; rmsf condition?
+	beql	30$			; yes, ignore it
+	cmpl	(r2),#pli$_rmsr		; rmsr condition?
+	beql	30$			; yes, ignore it
+	cmpl	(r2),#pli$_ioerror	; ioerror condition?
+	beql	30$			; yes, ignore it
+	cmpl	(r2),#pli$_filename	; filename condition?
+	beql	30$			; yes, ignore it
+	movl	(r2),r0			; save most recent condition name
+30$:	addl	#4,r2			; point past name
+	subl	#2,r3			; adjust count for name and arg count
+	bleq	50$			; if args runout then done
+	movl	(r2)+,r1		; fetch arg count
+	subl	r1,r3			; remove this condition name's args
+	bleq	50$			; if done then no more
+	moval	(r2)[r1],r2		; look to next
+	brb	20$			;
+50$:	ret				; done
+
+	.sbttl	pli$oncndargs - fetch ap of most recent contition
+;++
+; pli$oncndargs - fetch ap of most recent condition
+;
+; functional description:
+;
+; This routine is a built-in-function that returns a pointer which is the
+; ap of the most recent condition.
+; If no condition is active then the pointer returned is null.
+;
+; inputs:
+;
+; 	pl1 stack frame
+;
+; outputs:
+;
+;	r0 = return pointer value.
+;--
+	.entry	pli$oncndarg,^m<r2,r3,r4>
+	movl	fp,r0			; start with this frame
+	bsbb	find_cnd_ap
+	beql	10$			; if eql then none found
+	movl	r1,r0			; return value
+10$:	ret				;
+;
+; subroutine to find the ap of the most recent condition
+;
+; r0 = fp to start search so that the search may be continued
+;
+find_cnd_ap:
+	movab	w^norm_signal,r1	; address normal signal
+	movab	w^error_signal,r2	; address error signal
+	movab	w^unwind_signal,r3	;address unwind signal
+	movab	w^pli$optmain_hnd,r4	; address options main handler
+10$:	movl	stk_l_fp(r0),r0		; address next frame
+	probew	#3,#stk_l_pc,(r0)	; frame accessible?
+	beql	20$			; if eql then end of stack found
+	cmpl	r1,stk_l_pc(r0)		; this frame return to the pl1 handler?
+	beql	30$			; if eql then this is it
+	cmpl	r2,stk_l_pc(r0)		;this frame called by error signal?
+	beql	30$			;if eql, then this is it
+	cmpl	r3,stk_l_pc(r0)		;this frame called by goto (unwind)?
+	beql	30$			; if eql then this is it
+	cmpl	r4,stk_l_cnd_hnd(r0)	; this frame's handler the default handler?
+	bneq	10$			; if neq then search again
+20$:	clrl	r0			; set eql condition codes
+	rsb				; return failure
+30$:	movl	stk_l_ap(r0),r1		; address ap of the caller's frame
+					; condition codes also set
+	rsb				; return
+
+	.sbttl	pli$onfile - onfile bif support
+;++
+; pli$onfile - onfile bif support routine
+;
+; functional description:
+;
+; This routine returns a character varying string which is the file name
+; of the most recent file condition.
+;
+; inputs:
+;
+;	0(ap) = 2;
+;	4(ap) = size of string
+;	8(ap) = address of the string
+;--
+	.entry pli$onfile,^m<r2,r3,r4,r5>
+	movl	fp,r0			; start with this frame
+;
+; look for the next signal
+;
+10$:	bsbb	find_cnd_ap		; locate the current ap
+	beql	30$			; if eql then none
+	movl	chf$l_sigarglst(r1),r2	; check for pl1 type
+	cmpw	chf$l_sig_name+2(r2),#<pli$_error@-16>; pl1 type?
+	bneq	10$			; if neq then no - continue search
+	cmpzv	#3,#29,chf$l_sig_name(r2),#<pli$_key@-3>; file type?
+	bgtru	10$			; if no - continue search
+	movl	chf$l_mcharglst(r1),r2	; address mechanism arguments
+	movl	chf$l_mch_savr0(r2),r3	; fetch fcb address if any
+	beql	30$			; if eql then no file name
+	movab	fcb_b_ident_nam(r3),r1	; use identifier name
+	movzwl	fcb_w_ident_len(r3),r0	;
+	beql	30$			; if eql then no name
+20$:	cmpw	r0,4(ap)		; in range?
+	bleq	25$			; if leq then yes
+	movzwl	4(ap),r0		; get return size
+25$:	movl	8(ap),r2		; address target
+	movw	r0,(r2)+		; load size
+	movc3	r0,(r1),(r2)		; return string
+	ret
+30$:	clrw	@8(ap)			; return null string
+	ret
+
+	.sbttl	pli$onkey - onkey bif support routine
+;++
+; pli$onkey - onkey bif support routine
+; 
+; functional description:
+;
+; This routine returns the key associated with a key condition
+;
+; inputs:
+;
+;	0(ap) = 2;
+;	4(ap) = size of return string
+;	8(ap) = address of the return string
+;
+; --
+	.entry pli$onkey,^m<r2,r3,r4,r5>
+	movl	fp,r0			; begin search with this frame
+;
+; search for a condition on the stack
+;
+10$:	bsbw	find_cnd_ap		; find the last condition ap
+	beql	30$			; if eql then no condition found
+	movl	chf$l_sigarglst(r1),r2	; check for pl1 type
+	cmpw	chf$l_sig_name+2(r2),#<pli$_error@-16>; pl1 type?
+	bneq	10$			; if neq then no - continue search
+	cmpzv	#3,#29,chf$l_sig_name(r2),#<pli$_key@-3>; key type?
+	bneq	10$			; if no - continue search
+	movl	chf$l_mcharglst(r1),r0	; fetch the secondary arguments
+	movl	chf$l_mch_savr0(r0),r1	; get fcb address
+	beql	30$			; if eql then no key error
+	movl	chf$l_mch_savr1(r0),r0	; get string address
+	beql	30$			; if eql then none
+	movzwl	(r0)+,r1		; get size of string and address it
+	cmpl	r1,4(ap)		; string fit?
+	bleq	15$			; if leq then yes
+	movl	4(ap),r1		; use passed max size
+15$:	movl	8(ap),r2		; address target
+	movw	r1,(r2)+		; insert size
+	movc3	r1,(r0),(r2)		; return string
+	ret
+30$:	clrw	@8(ap)			; return null string
+	ret
+
+	.sbttl	pli$io_error
+;++
+; pli$io_error - signal I/O related error
+;
+; functional description:
+;
+; This routine is used by the runtime I/O routines to signal an error.
+; inputs:
+;	(ap) - 3 or 4
+;	4(ap) - condition value
+;	8(ap) - error code
+;	12(ap) - fcb addr
+;	16(ap) - address of onkey value
+; outputs:
+;	the error message arguments are pushed on the stack and the
+;	condition is signaled.
+;--
+
+	.entry	pli$io_error,^m<r2,r3,r4,r5,r6,r7,r8,r9,r10,r11>
+	clrl	r3			;set no parms
+	movl	12(ap),r2		;fcb passed?
+	bneq	5$			;if neq, yes
+	brw	100$			;if eql, no
+5$:	bicl	#atr_m_recur,fcb_l_attr(r2) ;clear recursion
+	cmpl	8(ap),#pli$_rmsf	;rms fab error?
+	bneq	10$			;in neq, no
+	pushl	<fcb_b_fab+fab$l_stv>(r2) ;push stv
+	pushl	<fcb_b_fab+fab$l_sts>(r2) ;push sts
+	brb	25$			;cont
+10$:	cmpl	8(ap),#pli$_rmsr	;rms rab error?
+	bneq	20$			;if neq, no
+	pushl	<fcb_b_rab+rab$l_stv>(r2) ;push stv
+	pushl	<fcb_b_rab+rab$l_sts>(r2) ;push sts
+	brb	25$			;cont
+20$:	tstl	8(ap)			;error code specified?
+	beql	30$			;if eql, no
+	pushl	#0			;set no fao args
+	pushl	8(ap)			;set error code
+25$:	addl	#2,r3			;update parm count
+30$:	bbs	#atr_v_string,fcb_l_attr(r2),37$
+	movzbl	<fcb_b_nam+nam$b_rsl>(r2),r4 ;get length of rsa
+	bneq	31$			;if neq, cont
+	movzbl	<fcb_b_nam+nam$b_esl>(r2),r4 ;get length of esa
+	beql	35$			;if eql, cont
+31$:	pushab	fcb_b_esa(r2)		;set expanded string addr
+	movl	r4,-(sp)		;set len
+	pushl	#2			;set number of fao args
+	pushl	#pli$_filename		;set message
+	addl	#4,r3			;update parm count
+35$:	pushab	fcb_b_ident_nam(r2)	;set up file name descr
+	movzwl	fcb_w_ident_len(r2),-(sp) ;
+	pushl	#2			;set number of fao args
+	addl	#3,r3			;update parm count
+	cmpl	4(ap),#pli$_error	;error condition?
+	bneq	40$			;if neq, no
+	pushl	#pli$_ioerror		;set io error to print file name
+	incl	r3			;update parm count
+37$:	pushl	#0			;set number of fao args for error
+	incl	r3			;update parm count
+40$:	pushl	4(ap)			;set pl1 condition
+	incl	r3			;update parm count
+	movl	12(ap),r0		;set fcb addr
+	clrl	r1			;zap other argument
+	cmpl	(ap),#4			;onkey passed?
+	bneq	50$			;if neq, no, cont
+	movl	16(ap),r1		;set onkey address
+50$:	calls	r3,g^lib$signal		;signal the condition
+	movl	#1,r0			;enuf messages
+	ret				;return
+100$:	pushl	#0			;set no fao args
+	pushl	8(ap)			;set error code
+	pushl	#0			;set no fao args
+	pushl	4(ap)			;set error condition
+	clrq	r0			;set no secondary arguments
+	calls	#4,g^lib$signal		;signal error
+	movl	#1,r0			;
+	ret				;
+
+
+
+;++
+; pli$$stream_hnd
+; this routine is the condition handler for pli$getfile and pli$putfile.
+; it is jsb'd to from an entry mask that lies within the file control
+; block. This vectoring is necessary, in order to get the address of the
+; file control block.  After calculating the address of the file control
+; block, this routine clears the recursion bit in it, so i/o may be performed
+; on the file in the users on-unit. Finally, it sets the return address
+; for the frame of the get or put to be the address of a return statement
+;
+; inputs:
+;	0(sp) - address of byte following jsb instruction in fcb.
+; outputs:
+;	none
+;--
+
+pli$$stream_hnd::
+	movl	#ss$_resignal,r0	;assume resignal
+	subl3	#fcb_l_cndaddr+4,(sp),r2 ;get fcb address
+	bbcc	#atr_v_recur,fcb_l_attr(r2),30$ ;clear recursion bit
+	movab	fcb_l_condit(r2),(sp)	;get addr of handler
+	movl	fp,r2			;start with this frame
+10$:	movl	stk_l_fp(r2),r2		;address next frame
+	probew	#3,#stk_l_pc,(r2)	;frame accessible?
+	beql	30$			;if eql then end of stack found, return
+	cmpl	(sp),stk_l_cnd_hnd(r2)	;this frame's handler us?
+	bneq	10$			;if neq, no, look at next frame
+	clrl	stk_l_cnd_hnd(r2)	;we aren't needed anymore
+	movl	chf$l_sigarglst(ap),r2	;address arg list
+	movl	chf$l_sig_args(r2),r1	;if exception handled force
+					;continuation at establisher's saved pc
+	cmpl	chf$l_sig_name(r2),#ss$_roprand;check for roprand
+	bneq	20$			;if neq, resignal
+	pushl	stk_l_pc(fp)		;save system pc/psl
+	pushl	stk_l_psl(fp)		;
+	movl	chf$l_sig_args-4(r2)[r1],stk_l_pc(fp) ;set original pc/psl
+	movl	chf$l_sig_args(r2)[r1],stk_l_psl(fp) ;
+	pushl	#pli$_cnverr		;set conversion error subcode
+	clrl	-(sp)			;
+	pushl	#pli$_error		;set error condition code
+	clrq	r0			;
+	calls	#3,g^lib$signal		;and signal pli error
+	movzbl	#ss$_continue,r0	;continue after the stream I/O statement
+	popl	stk_l_psl(fp)		;restore system pc/psl
+	popl	stk_l_pc(fp)		;
+	movl	chf$l_sig_args(r2),r1	;if exception handled force
+					;continuation at establisher's saved pc
+	movab	30$,chf$l_sig_args-4(r2)[r1];(execute a ret upon continuation)
+30$:	ret				;return
+
+20$:
+	pushl	stk_l_pc(fp)		;save system pc/psl
+	pushl	stk_l_psl(fp)		;
+	movl	chf$l_sig_args-4(r2)[r1],stk_l_pc(fp);set original pc/psl
+	movl	chf$l_sig_args(r2)[r1],stk_l_psl(fp);
+	pushl	r3
+	subl	#2,r1
+	movl	r1,r3
+25$:	pushl	chf$l_sig_args(r2)[r1]
+	sobgtr	r1,25$
+	extzv	#0,#3,chf$l_sig_name(r2),r0
+	insv	r0,#0,#3,(sp)
+	clrq	r0
+	calls	r3,g^lib$signal
+	popl	r3
+	popl	stk_l_psl(fp)
+	popl	stk_l_pc(fp)
+	movzbl	#ss$_continue,r0
+	movl	chf$l_sig_args(r2),r1
+	movab	40$,chf$l_sig_args-4(r2)[r1]
+40$:	ret
+	.end

@@ -1,0 +1,3672 @@
+	.TITLE	CTDRIVER - Command Terminal Protocol Driver
+	.IDENT	'V04-000'
+
+;DEBUG = 1;	; general debug on/off
+;DEBUG_LOG = 1	; logging on/off
+
+flg$v_ctrlc = 7
+flg$m_ctrlc = 1@flg$v_ctrlc
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+;
+; FACILITY:
+;
+;	VAX/VMS Remote Terminal Driver
+;
+; ABSTRACT:
+;
+;	This module contains the remote terminal driver routines.  This driver
+;	is used by the application process side of the operation.  In other
+;	words, it receives the QIO requests from the process that does not
+;	have local access to the terminal.
+;
+;	This driver's primary function is to receive QIO system service
+;	requests, repackage the QIO arguments, and hand the new package to
+;	the tranport mechanism for delivery to the remote terminal
+;	handler process on the system with local access to the terminal.
+;	The transport mechanism is DECnet.  Netdriver is called directly
+;	via the internal IRP mechanism.
+;
+; AUTHOR:
+;
+;	Jake VanNoy	3-Aug-1982
+;
+; MODIFICATION HISTORY:
+;
+;	V03-011	LMP0308		L. Mark Pilant,		31-Aug-1984  11:53
+;		Change the default ACL state in to ORB to be a descriptor,
+;		not a queue.
+;
+;	V03-010	JLV0388		Jake VanNoy		25-JUL-1984
+;		Add CTERM bugcheck code.  Add code to do implicit
+;		enable of ^C when set host from RSX.  Enhance
+;		logic that returns SS$_CONTROLY to also return
+;		SS$_CONTROLC (for BASIC group).  Add code to return
+;		SS$_INCOMPL for read verify.
+;
+;	V03-009	JLV0359		Jake VanNoy		11-JUL-1984
+;		Add paranoia code to IOPST.  Fix bug that returned
+;		extened mode IOSB for regular read.  Pick up SYSPASSWORD
+;		from HOST system, not server.
+;
+;	V03-008	JLV0349		Jake VanNoy		10-APR-1984
+;		Send UNBIND at refc=0 and setmode HANGUP.
+;		Fix bug in writes larger than single buffer.
+;		Make sure UNREAD message is sent from CANCEL routine.
+;		This fixes a problem exhibited by the PHONE utility.
+;		Fix bug that did not set CANCEL ^O on first write
+;		after DISCARD OFF received.  Fix all calls to COM$DELxxxAST
+;		to have PID as input.
+;
+;	V03-007	LMP0221		L. Mark Pilant,		30-Mar-1984  11:43
+;		Change UCB$L_OWNUIC to ORB$L_OWNER and UCB$W_VPROT to
+;		ORB$W_PROT.
+;
+;	V03-006	JLV0338		Jake VanNoy		 1-MAR-1984
+;		Replace PSECT removed in JLV0335 that set CT_END after
+;		remainder of modules.
+;
+;	V03-005	JLV0335		Jake VanNoy		28-FEB-1984
+;		Clean up SET MODE function code parsing. Add support
+;		for set and sense broadcast, set pid.  Return SS$_DEVREQERR
+;		for modem or maintenance functions.
+;		Make check in WRITE FDT routine to be sure that
+;		current PID equals PID doing last write.  If
+;		they are not equal, an old style single shot
+;		write is done.  Rewrite out of band handling.
+;		Add use of cursor position offset from EOL in READ_DATA.
+;		Shorten CTP Queue parameters. Removed CT_BROADCAST routine.
+;		Remove debug code.  Remove use of CTP$L_IRP.
+;
+;	V03-004	JLV0310		Jake VanNoy		10-OCT-1983
+;		Clean up logging assembly switches for PLUTO team.
+;		Fix race condition in FDT_WRITE that causes system
+;		crashes.  Change restriction in FDT_READ that blows
+;		away reads too large for PLUTO.
+;
+;	V03-003	JLV0287		Jake VanNoy		28-JUL-1983
+;		Numerous cleanup bits. Add INIT mesage parsing. Add VMS
+;		specific INIT parameter #4. Change VMS specific QIO
+;		protocol to use extended CTERM bits (specified in INIT).
+;		Use receipt INIT to start LOGINOUT. Add checking of 
+;		message length received from net. Add sense typeahead 
+;		to CTERM (CHECK_INPUT and INPUT_COUNT messages).
+;		Change characteristic selectors over to new format.
+;		Use new $TTYUCBDEF for UCB symbols. Add IO$M_NEWLINE.
+;		Add read verify interface.
+;
+;--
+
+	$TSADEF			; Cterm definitions
+
+.ENABLE SUPPRESSION
+
+	$ACBDEF				; AST control block
+	$AQBDEF				; ACP queue block
+	$CANDEF				; Cancel interface codes
+	$CRBDEF				; Channel request block
+	$DCDEF				; Device classes and types
+	$DDBDEF				; Device data block
+	$DEVDEF				; Device characteristics
+	$DYNDEF				; Buffer type codes
+	$IDBDEF				; Interrupt data block
+	$IODEF				; I/O function codes
+	$IPLDEF				; Hardware IPL definitions
+	$IRPDEF				; I/O request packet
+	$JIBDEF				; Job Information block
+	$MSGDEF				; Mailbox message types
+	$ORBDEF				; Object's Rights Block
+	$PCBDEF				; Process control block
+	$PRDEF				; Processor registers
+	$PRVDEF				; Privilege bits
+	$PSLDEF				; Processor status longword
+;***	$REMDEF				; General constants
+	$SSDEF				; System status codes
+	$TASTDEF			; Out of band AST blocks
+	$TQEDEF				; Timer Queue Entry
+	$TRMDEF				; Item list definitions
+	$TTDEF				; Terminal definitions
+	$TT2DEF				; More definitions
+	$TTYDEF				; Terminal driver definitions *** remove with brdcst
+	$TTYSYMDEF			; TTY symbols and constants
+	$UCBDEF				; Unit control block
+	$TTYUCBDEF			; local/remote terminal UCB
+	$VCBDEF				; Volume control block
+	$VECDEF				; Interrupt vector block
+
+;
+; Local symbols
+;
+
+;
+; Argument list (AP) offsets for device-dependent QIO parameters
+;
+
+P1	= 0				; First QIO parameter
+P2	= 4				; Second QIO parameter
+P3	= 8				; Third QIO parameter
+P4	= 12				; Fourth QIO parameter
+P5	= 16				; Fifth QIO parameter
+P6	= 20				; Sixth QIO parameter
+
+
+
+;
+; Other constants
+;
+
+CT$K_FIPL = 8				; IPL to synchronize
+CT$K_MAXCTP = ^X88+^X88+12+^X2F		; Size of write CTP to allocate ??
+CT$K_CTPQLIM = 3			; Maximum number of queued CTP's
+CT$K_CTPLOLIM = 1			; Desired low number of queued CTP's
+CT$K_TQE_DELTA = 2000000		; tqe wakeup delta (200 milliseconds)
+
+REMOTE_1 = <TT$M_NOECHO!TT$M_ESCAPE!TT$M_HOSTSYNC!TT$M_TTSYNC!TT$M_LOWER!-
+	   TT$M_MECHTAB!TT$M_WRAP!TT$M_CRFILL!TT$M_LFFILL!-
+	   TT$M_SCOPE!TT$M_SCRIPT!-
+	   TT$M_HOLDSCREEN!TT$M_EIGHTBIT!TT$M_MECHFORM!TT$M_MODEM!TT$M_PAGE>
+
+REMOTE_2 = <TT2$M_AUTOBAUD>
+
+;
+; Definitions that follow the standard UCB fields
+;
+
+	.SAVE LOCAL_BLOCK
+	.PSECT $ABS$,ABS
+
+UCB$L_CT_RIIRP = UCB$L_RTT_NETIRP	; Read Internal IRP address
+
+    $VIELD TQE,0,<-			; Flags in FR3 definition
+	<BSY,1,M>,-			; TQE is queued
+	<DELETE,1,M>-			; terminal has hungup, delete TQE
+	>
+
+. = UCB$T_CT_DEBUG_FILL		; *** temporary
+
+; up to 10 longwords allowed here 
+
+UCB$B_CT_CRFILL:	.BLKB		; CR fill
+UCB$B_CT_LFFILL:	.BLKB		; LF fill
+UCB$W_CT_SPEED:		.BLKW		; speed
+
+UCB$L_CNT_TQE:		.BLKL		; TQE flush count *** performance hook
+UCB$L_CNT_OVR:		.BLKL		; CTP overflow flush count *** performance hook
+UCB$L_CNT_FRC:		.BLKL		; forced flush count *** performance hook
+UCB$L_CNT_ADDR:		.BLKL		; address
+UCB$L_CT_PID:		.BLKL		; *** add to TTYUCBDEF
+UCB$L_CT_INCLUDE:	.BLKL		; ***V
+UCB$L_CT_EXCLUDE: 	.BLKL		; 
+UCB$L_CT_ABORT:		.BLKL		; 
+
+
+UCB$W_CT_PARITY: 	.BLKW		; parity
+			.BLKW		; spare
+
+    .RESTORE
+;
+; Redefinitions of the irp fields
+;
+
+IRP$B_CT_RESPTYPE == IRP$Q_TT_STATE	; Response type
+IRP$B_CT_CANCEL	  = IRP$Q_TT_STATE + 1	; Cancel flag
+IRP$W_CT_POST	  = IRP$Q_TT_STATE + 2	; I/O posted tag
+
+
+	.SBTTL	Standard tables
+
+;
+; Driver prologue table
+;
+
+	DPTAB	-				; DPT-creation macro
+		END=CT_END,-			; End of driver label
+		ADAPTER=NULL,-			; Adapter type
+		UCBSIZE=<UCB$K_RTT_LENGTH>,-	; Length of UCB
+		NAME=CTDRIVER			; Driver name
+
+	DPT_STORE INIT				; Start of load
+						; initialization table
+	DPT_STORE DDB,DDB$L_ACPD,L,<^A\REM\> 	; Default ACP name
+	DPT_STORE DDB,DDB$L_ACPD+3,B,3		; ACP class
+	DPT_STORE UCB,UCB$B_FIPL,B,CT$K_FIPL	; Device fork IPL
+	DPT_STORE UCB,UCB$B_DIPL,B,CT$K_FIPL	; Device interrupt IPL
+	DPT_STORE UCB,UCB$L_DEVCHAR,L,<-	; Device characteristics
+		DEV$M_REC!-			;   record device
+		DEV$M_AVL!-			;   available
+		DEV$M_IDV!-			;   input device
+		DEV$M_ODV!-			;   output device
+		DEV$M_TRM!-			;   terminal device
+		DEV$M_CCL>			;   carriage control device
+	DPT_STORE UCB,UCB$L_DEVCHAR2,L,<-	; Device characteristics (2)
+		DEV$M_RTT>			; remote terminal UCB extension
+	DPT_STORE UCB,UCB$W_STS,W,<-		; Device status
+		UCB$M_VALID>			; set valid
+	DPT_STORE UCB,UCB$B_DEVCLASS,B,DC$_TERM	; Terminal device
+	DPT_STORE UCB,UCB$B_DEVTYPE,B,TT$_UNKNOWN ; Unknown type
+	DPT_STORE UCB,UCB$W_DEVBUFSIZ,@W,TTY$GW_DEFBUF ; Default buffer size
+	DPT_STORE UCB,UCB$L_DEVDEPEND,@L,TTY$GL_DEFCHAR ; Default characteristics
+	DPT_STORE ORB,ORB$B_FLAGS,B,-		; Protection block flags
+			   <ORB$M_PROT_16>	; SOGW protection word
+	DPT_STORE ORB,ORB$W_PROT,@W,TTY$GW_PROT ; Default allocation protection
+	DPT_STORE ORB,ORB$L_OWNER,@L,TTY$GL_OWNUIC ; Default owner UIC
+
+	DPT_STORE REINIT			; Start of reload
+						; initialization table
+	DPT_STORE DDB,DDB$L_DDT,D,CT$DDT	; Address of DDT
+	DPT_STORE CRB,CRB$L_INTD+4,D,-		; Address of interrupt
+		CT_INTERRUPT			; service routine
+
+	DPT_STORE END				; End of initialization
+						; tables
+;
+; Driver dispatch table
+;
+	DDTAB	-				; DDT-creation macro
+		DEVNAM=CT,-			; Name of device
+		FUNCTB=CT_FUNCTABLE,-		; FDT address
+		UNSOLIC=CT_UNSOLIC,-		; Unsolicited attention routine
+		CANCEL=CT_CANCEL		; Cancel I/O routine
+
+;
+; Function dispatch table
+;
+
+CT_FUNCTABLE:					; FDT for driver
+	FUNCTAB	,-				; Valid I/O functions
+		<READVBLK,-			; Read virtual
+		READLBLK,-			; Read logical
+		READPBLK,-			; Read physical
+		READPROMPT,-			; Read with prompt
+		TTYREADALL,-			; Read passall
+		TTYREADPALL,-			; Read with prompt passall
+		WRITEVBLK,-			; Write virtual
+		WRITELBLK,-			; Write logical
+		WRITEPBLK,-			; Write physical
+		SENSEMODE,-			; Sense device mode
+		SENSECHAR,-			; Sense device characteristics
+		SETMODE,-			; Set device mode
+		SETCHAR>			; Set device characteristics
+	FUNCTAB	,-				; Buffered functions
+		<READVBLK,-			; Read virtual
+		READLBLK,-			; Read logical
+		READPBLK,-			; Read physical
+		READPROMPT,-			; Read with prompt
+		TTYREADALL,-			; Read passall
+		TTYREADPALL,-			; Read with prompt passall
+		WRITEVBLK,-			; Write virtual
+		WRITELBLK,-			; Write logical
+		WRITEPBLK,-			; Write physical
+		SENSEMODE,-			; Sense device mode
+		SENSECHAR,-			; Sense device characteristics
+		SETMODE,-			; Set device mode
+		SETCHAR>			; Set device characteristics
+	FUNCTAB	CT_READ,-			; FDT read routine for
+		<READVBLK,-			; read virtual,
+		READLBLK,-			; read logical,
+		READPBLK,-			; read physical,
+		READPROMPT,-			; read with prompt
+		TTYREADALL,-			; read passall,
+		TTYREADPALL>			; and read with prompt passall
+	FUNCTAB	CT_WRITE,-			; FDT write routine for
+		<WRITEVBLK,-			; write virtual,
+		WRITELBLK,-			; write logical,
+		WRITEPBLK>			; and write physical.
+	FUNCTAB	CT_SENSEMODE,-			; FDT sense mode routine
+		<SENSECHAR,-			; for sense characteristics
+		SENSEMODE>			; and sense mode.
+	FUNCTAB	CT_SETMODE,-			; FDT set mode routine
+		<SETCHAR,-			; for set characteristics and
+		SETMODE>			; set mode.
+
+.SBTTL	Read status table
+
+stat_table:
+	.word	SS$_NORMAL		; 0	terminator character
+	.word	SS$_NORMAL		; 1	valid escape sequence
+	.word	SS$_NORMAL		; 2	invalid escape sequence
+	.word	SS$_CONTROLY		; 3	out-of-band character (^C/^Y)
+	.word	SS$_NORMAL		; 4	input buffer full
+	.word	SS$_TIMEOUT		; 5	time out
+	.word	SS$_ABORT		; 6	unread  (*** why not CANCEL?)
+	.word	SS$_NORMAL		; 7	underflow
+	.word	SS$_PARTESCAPE		; 8	absentee token
+	.word	SS$_NORMAL		; 9	vertical position change
+	.word	SS$_PARITY		; 10	line break
+	.word	SS$_PARITY		; 11	framing error
+	.word	SS$_PARITY		; 12	parity error
+	.word	SS$_DATAOVERUN		; 13	receiver overrun
+	.word	SS$_OPINCOMPL		; 14	VMS ONLY - operation incomplete
+	.word	SS$_NORMAL		; 15	15 is just for grins
+
+.SBTTL	INIT MESSAGE BLOCK
+
+.ENABL	LSB
+
+INIT_MSGBLK:
+
+1$:	.WORD	20$-10$			; Length of cterm protocol
+10$:	.WORD	CTP$C_MT_INIT		; init message type, zero flags
+	.BYTE	1			; version 1
+	.BYTE	3,0			; 0 eco, customer mod
+	.QUAD	0			; No revision 
+	.BYTE	1			; parameter 1
+	.BYTE	2			; length in bytes
+W_INIT_BUFSIZ = .-1$+CTP$W_MSGSIZE	; Offset to next field
+	.WORD	0			; data filled in 
+
+	.BYTE	3			; parameter 3
+	.BYTE	4			; length in bytes
+	.LONG	^B0111111111111111110	; valid messages (1-17)
+20$:
+	;
+	; end of INIT, also send initial characteristics here
+	;
+	; input state message here
+	;
+	.WORD	CTP$C_CH_PROLEN+2	; protocol length
+	.WORD	CTP$C_MT_CHAR		; Characteristics and flags
+	.WORD	<CH$C_CTERM@8!-
+		CH$C_CT_INPUT_COUNT>	; set input-count-state
+	.WORD	2			; no-read send
+
+C_INIT_MSGLEN = .-INIT_MSGBLK
+
+.DSABL	LSB
+
+
+POST_COUNT = 2		; 0 is FINISHIO, 1 is ABORT
+
+.MACRO	POST_IO,?L1
+
+	.LIST	MEB
+	MOVZBL	#POST_COUNT,R0		; set position
+	BSBW	CHECK_POST_IO		; check for error, set posted
+	JSB	G^COM$POST		; post I/O
+	.NLIST	MEB
+
+POST_COUNT = POST_COUNT + 1
+
+.ENDM	POST_IO
+
+.if df DEBUG_LOG
+
+;*** OPT macros are debug only
+
+OPT$V_LOGGING = 0
+
+.macro	IFOPT	option,label
+	.IF DF DEBUG_LOG
+	BBS	#OPT$V_'option',G^SGN$GL_VMSD4,'label'
+	.IFF
+	BBS	#OPT$V_'option',VMSD4,'label'
+	.ENDC
+.ENDM	IFOPT
+
+.macro	IFNOTOPT option,label
+	.IF DF DEBUG_LOG
+	BBC	#OPT$V_'option',G^SGN$GL_VMSD4,'label'
+	.IFF
+	BBC	#OPT$V_'option',VMSD4,'label'
+	.ENDC
+.ENDM	IFNOTOPT
+
+.endc		; DEBUG_LOG
+
+
+
+	.SBTTL	CT_WRITE - Function Decision Routine for WRITE Functions
+;++
+; CT_WRITE - Function Decision Routine for WRITE Functions
+;
+; Functional description:
+;
+;	This routine is called by the SYS$QIO service to dispatch a WRITE
+;	I/O request.
+;
+;	The QIO parameters for terminal WRITES are:
+;
+;	P1 = address of the buffer
+;	P2 = size of the buffer
+;	P3 = (unused)
+;	P4 = carriage control specifier
+;
+;	The buffer is validated for access, the process's quota checked and
+;	decremented, the data and carriage control are copied to a message
+;	block, and the appropriate queueing of the message is done.
+;
+; Inputs:
+;
+;	R0-R2 = scratch registers
+;	R3 = address of the IRP (I/O request packet)
+;	R4 = address of the PCB (process control block)
+;	R5 = address of the UCB (unit control block)
+;	R6 = address of the CCB (channel control block)
+;	R7 = bit number of the I/O function code
+;	R8 = address of the FDT table entry for this routine
+;	R9-R11 = scratch registers
+;	AP = address of the 1st function dependent QIO parameter
+;
+; Outputs:
+;
+;	IRP$L_SVAPTE(R3) = address of message buffer
+;	IRP$W_BOFF(R3) = size of message buffer
+;	IRP$W_BCNT(R3) = size of user buffer (by EXE$WRITECHK)
+;
+;	The routine preserves all registers except R0-R2, and
+;	R6-R11.
+;
+;--
+
+CTRLO:
+	BBS	#IO$V_CANCTRLO,-
+		IRP$W_FUNC(R3),CAN_CTRLO ; If cancel ^O requested, do the write
+	MOVZWL	#SS$_CONTROLO,R0	; Set status
+	BRW	FDT_FINISHIOC		; Complete I/O
+
+CT_WRITE:				; WRITE FDT routine
+
+	CLRW	IRP$W_CT_POST(R3)	; Clear POSTed flag
+	BBS	#FLG$V_CTRLO,-
+		UCB$W_CT_FLAGS(R5),CTRLO ; Branch if in CTRL O state
+CAN_CTRLO:
+
+	BICW	#FLG$M_CTRLO,-
+		UCB$W_CT_FLAGS(R5)	; Set no control O
+	;
+	; Process all inputs completely before determining where to
+	; copy write data. Start by probing the write data.
+	;
+	MOVL	R7,R10			; Save I/O function code number
+	MOVL	P1(AP),R6		; Get user buffer virtual address
+	MOVL	R6,R0			; Set up for write check call
+	MOVZWL	P2(AP),R7		; Get buffer size
+	MOVL	R7,R1			; Set up for write check call
+	BEQL	10$			; Skip check if zero
+	JSB	G^EXE$WRITECHK		; Check buffer access
+					; (no return means no access)
+10$:	
+	;
+	; Map VMS QIO function modifiers into TSA function modifiers.
+	; Start by setting up CTP$W_WR_FLAGS in R9.
+	;
+	CLRW	IRP$W_BOFF(R3)		; Make sure BOFF is zero
+	MOVZWL	#<CTP$M_WR_BEGIN!-	; Assume no status requested, no passall
+		  CTP$M_WR_BEFAFT>,R9	; no canctrlo and no refresh
+    				  	; no prefix or postfix data, begin msg
+	CMPB	#IO$_WRITEPBLK,R10	; Write physical?
+	BNEQ	20$			; Branch if not
+	BISW	#CTP$M_WR_TRANSPARENT,R9 ; Yes, set write transparent
+20$:
+	MOVZWL	IRP$W_FUNC(R3),R1	; Function code
+	BBSC	#FLG$V_CANCTRLO,-
+		UCB$W_CT_FLAGS(R5),30$	; Internal cancel ^O set (set by ^Y)
+	BITW	#<IO$M_CANCTRLO!-
+		  IO$M_NOFORMAT!-
+		  IO$M_NEWLINE!-
+		  IO$M_REFRESH>,R1	; Optimization, see if all options zero
+	BEQL	90$
+	
+	BBC	#IO$V_CANCTRLO,R1,40$	; Cancel control O?
+30$:	BISW	#CTP$M_WR_DISCARD,R9	; Yes, set "do not discard" state
+40$:
+	BBC	#IO$V_NOFORMAT,R1,50$	; Write passall?
+	BISW	#CTP$M_WR_TRANSPARENT,R9 ; Yes, set write transparent
+50$:
+	BBC	#IO$V_REFRESH,R1,60$	; Refresh after write?
+	BISW	#CTP$M_WR_BEFAFTRE,R9	; Yes, set refresh after unlock
+60$:
+	BBC	#IO$V_NEWLINE,R1,90$	; new line flag?
+	BISW	#CTP$M_WR_NEWLINE,R9	; set bit (VMS specific)
+90$:
+	;
+	; Set up carriage control
+	;
+	CLRL	R10			; use for prefix/postfix
+	MOVL	P4(AP),IRP$B_CARCON(R3)	; get carriage control
+	BEQL	140$			; ok to continue if none
+	JSB	G^EXE$CARRIAGE		; Call exec routine to map
+	;
+	; Set up prefix
+	;
+	MOVZBL	IRP$B_CARCON+1(R3),R1	; Fetch character field for prefix
+	BEQL	100$			; If zero, then use newline count
+	CMPB	#TTY$C_LF,R1		; Also if linefeed
+	BEQL	100$			;  use newline count
+	TSTB	IRP$B_CARCON(R3)	; See if non-zero character count
+	BEQL	115$			; Branch if zero
+	BISW	#<CTP$C_WR_CHAR@ -
+		CTP$V_WR_PREFIX>,R9	; Set character flag
+	BRB	110$			; continue
+100$:	BISW	#<CTP$C_WR_NEWLINECNT@ -
+		CTP$V_WR_PREFIX>,R9	; Set newline count flag
+	MOVB	IRP$B_CARCON(R3),R1	; Fetch newline count
+110$:
+	MOVB	R1,R10			; Set newline count or character
+	;
+	; Set up postfix
+	;
+115$:
+	MOVZBL	IRP$B_CARCON+3(R3),R1	; Fetch character field for postfix
+	BEQL	120$			; If zero, then use newline count???
+	CMPB	#TTY$C_LF,R1		; Also if linefeed
+	BEQL	120$			;  use newline count
+	TSTB	IRP$B_CARCON+2(R3)	; See if non-zero character count
+	BEQL	140$			; Branch if zero
+	BISW	#<CTP$C_WR_CHAR@ -
+		CTP$V_WR_POSTFIX>,R9	; Set character flag
+	BRB	130$			; continue
+120$:	BISW	#<CTP$C_WR_NEWLINECNT@ -
+		CTP$V_WR_POSTFIX>,R9	; Set newline count flag
+	MOVB	IRP$B_CARCON+2(R3),R1	; Fetch newline count
+130$:
+	INSV	R1,#8,#8,R10		; Set newline count or character
+140$:
+	;
+	; At this point, all inputs have been verified. The remainder
+	; of the work here determines where to set up the protocol
+	; message. If buffering is off, a buffer is allocated and
+	; queued immediately to the net. If buffering is on, a current
+	; buffer is used, if possible, otherwise a new buffer is used.
+	; For large writes, it is possible for multiple protocol messages
+	; to be written.
+	;
+	BBS	#FLG$V_BUFFER,-
+		UCB$W_CT_FLAGS(R5),170$	; Branch if not buffering
+150$:
+	BRW	400$			; handle non-buffered data
+	;
+	; Note that two processes can be in the write FDT routine for the
+	; same terminal at the same time. The following check avoids
+	; a second process from messing up the context of the first
+	; by avoiding the buffering code.
+	;
+170$:
+	MOVL	UCB$L_CT_PID(R5),R0	; save last writer PID
+	MOVL	PCB$L_PID(R4),UCB$L_CT_PID(R5) ; set new writer PID
+	CMPL	R0,UCB$L_CT_PID(R5)	; compare PIDs
+	BNEQ	150$			; Branch if not equal
+	BBSS	#FLG$V_INWRTFDT,-
+		UCB$W_CT_FLAGS(R5),150$	; Set "in FDT" flag, check for busy
+	;
+	; R8 will be data + protocol overhead size
+	;
+300$:	
+	ADDL3	#<CTP$T_WR_DATA-CTP$W_MSGSIZE>,-
+		R7,R8			; Size of data and protocol overhead
+	MOVL	UCB$L_CT_WRTCUR(R5),R2	; fetch current buffer
+	BEQL	310$			; Branch if none
+	;
+	; There is a buffer that is being filled. See if the current
+	; data fits into it.
+	;
+	CMPW	UCB$W_CT_WRTSIZ(R5),R8	; Is there room?
+	BGEQU	320$			; Branch if there is room
+	;
+	; Not enough room in current buffer, flush current buffer and
+	; start with a new one.
+	;	
+	movab	ucb$l_cnt_ovr(r5),-	; %%% performance hook
+		ucb$l_cnt_addr(r5)	; set address to count if flush occurs
+	BSBW	CT_WRITE_WRTCTP		; Get rid of the thing
+	movab	ucb$l_cnt_frc(r5),-	; %%% performance hook
+		ucb$l_cnt_addr(r5)	; reset address to count if flush occurs
+	BLBS	R0,310$
+	BICB	#FLG$M_INWRTFDT,-
+		UCB$W_CT_FLAGS(R5)	; OK if timer fires now
+	BRW	FDT_ABORT		; abort, net must have hung up
+	;
+	; Allocate new buffer and initialize fields
+	;
+310$:	
+	MOVZWL	UCB$W_CT_MAXMSG(R5),R1	; Set size to allocate
+	MOVZWL	IRP$W_BOFF(R3),-(SP)	; Save BOFF
+	BSBW	FDT_ALLOC_MESSAGE	; get the buffer
+	POPL	R1			; Fetch old BOFF
+	ADDW	R1,IRP$W_BOFF(R3)	; Add to quota charged
+	MOVL	R2,UCB$L_CT_WRTCTP(R5)	; Set address
+	MOVL	R2,UCB$L_CT_WRTCUR(R5)	; Set address
+	SUBW3	#CTP$W_MSGSIZE, -
+    		CTP$W_SIZE(R2), -	
+    		UCB$W_CT_WRTSIZ(R5)	; Size - (nonpaged and foundation overhead)
+320$:
+	INCW	UCB$W_CT_WRTCNT(R5)	; Increment use count
+	;
+	; Fill in buffer
+	;
+	MOVZWL	#1,R0			; signal buffering
+	BSBW	CT_WRITE_FILLIN		; call fill in routine
+	;
+	; Now update UCB field that describe buffer
+	;
+	SUBW2	R8,UCB$W_CT_WRTSIZ(R5)	; Room left
+	ADDL2	R8,UCB$L_CT_WRTCUR(R5)	; Add in offset
+	;
+	; See if entire buffer was copied. If done, exit,
+	; if not, then queue packet and try again.
+	;
+	TSTL	R7			; Done?
+	BEQL	350$			; Branch if yes
+	BICB	#CTP$M_WR_BEGIN,R9	; Clear "start of message"	
+	BRW	300$			; Loop
+	;
+	; Finish up and Exit QIO
+	;
+350$:	
+	BISB	#CTP$M_WR_END,-
+		CTP$W_WR_FLAGS(R2)	; Set "end of message"
+	CLRL	IRP$L_SVAPTE(R3)	; Clear pointer
+	BSBW	SETUP_TQE		; Start timer...
+	MOVW	#SS$_NORMAL,IRP$L_IOST1(R3) 	; status
+	MOVW	IRP$W_BCNT(R3),IRP$L_IOST1+2(R3); byte count
+	CLRL	IRP$L_IOST2(R3)		; no cursor position or lines output
+	BICB	#FLG$M_INWRTFDT,-
+		UCB$W_CT_FLAGS(R5)	; OK if timer fires now
+	BLBS	UCB$L_CT_RIIRP(R5),500$	; branch if net hung up
+	CMPW	#CT$K_CTPQLIM,-
+		UCB$W_CT_QCTPCNT(R5)	; Queued CTP's >= limit?
+	BGEQ	360$			; Branch if no
+	;
+	; Many CTP's queued off UCB, don't complete this write now.
+	;	
+	INSQUE	(R3),@UCB$L_CT_STALLQBL(R5) ; Insert in stalled queue
+	JMP	G^EXE$QIORETURN		; Return from the qio
+360$:
+	MOVL	IRP$L_IOST1(R3),R0	; Set status
+370$:	BRW	FDT_FINISHIOC		; Finish write to user NOW!
+
+	;
+	; Non-buffered writes. Allocate CTP that is exactly the right size.
+	;
+400$:
+	ADDL3	#CTP$C_WR_LEN,R7,R1	; Add header to request size
+	BSBW	FDT_ALLOC_MESSAGE	; Allocate the message buffer
+
+	BISW	#<CTP$M_WR_STATUS!-
+    		CTP$M_WR_END>,R9 	; Set status and end of msg
+	MOVB	#CTP$C_MT_WRITE_COM, -
+		IRP$B_CT_RESPTYPE(R3)	; Set response type expected
+	CLRL	R0			; signal not buffering
+	BSBB	CT_WRITE_FILLIN		; fill in message
+	;
+	; Send the message to the remote device and exit QIO service
+	;
+	MOVL	R1,R2			; Pointer beyond data in message
+	BRW	CT_NETMSGSENDX		;
+
+	;
+	; NET has hung up during write formatting, abort write and CTP
+	;
+500$:
+	MOVL	UCB$L_CT_WRTCTP(R5),-
+		IRP$L_SVAPTE(R3)	; Move wrtctp to IRP, let iopost delete
+	CLRQ	UCB$L_CT_WRTCTP(R5)	; clear pointers
+	MOVZWL	#SS$_LINKABORT,R0	; set status
+	BRB	370$			; exit
+
+
+.SBTTL	CT_WRITE_FILLIN - Fill buffer with write protocol
+
+CT_WRITE_FILLIN:
+
+;
+; inputs:
+;
+;	R0 - lbs if single shot output, lbc if buffered
+;	R2 - CTP
+;	R5 - UCB
+;	R6 - address of user buffer
+;	R7 - length of user buffer
+;	R8 - size of data + overhead
+;
+; outputs:
+;
+;	R1 - last byte filled in
+;	R6 - updated user buffer address
+;	R7 - number of bytes remaining in user buffer
+;	R8 - number of bytes actually written in this call
+;
+	PUSHR	#^M<R2,R3,R4,R5>	; Save registers
+	MOVAB	CTP$W_MSGSIZE(R2),R3	; Base of write protocol message
+	PUSHL	R6			; Save Address
+	MOVL	R7,R1			; Assume size for MOVC
+
+	BLBC	R0,20$			; Branch if not buffering
+	MOVZWL	UCB$W_CT_WRTSIZ(R5),R2	; Fetch size of buffer remaining
+	CMPL	R8,R2			; Is data larger than buffer?
+	BLEQU	10$			; Branch if it fits
+	;
+	; Doesn't all fit, will have to do multiple buffers
+	;
+	MOVL	R2,R1			; Set size to copy
+	SUBL2	#<CTP$T_WR_DATA-CTP$W_MSGSIZE>,R1 ; minus overhead
+10$:	SUBL2	R1,R7			; this is how much will be left
+	ADDL2	R1,R6			; update address
+	ADDL3	#<CTP$T_WR_DATA-CTP$W_MSGSIZE>,-
+		R1,R8			; data + overhead transferred
+20$:
+	;
+	; Fill in buffer using autoincrement, assumes follow
+	;
+	ASSUME	CTP$B_MSGTYPE    EQ CTP$W_MSGSIZE+2
+	ASSUME	CTP$W_WR_FLAGS   EQ CTP$B_MSGTYPE+1
+	ASSUME	CTP$B_WR_PREFIX  EQ CTP$W_WR_FLAGS+2
+	ASSUME	CTP$B_WR_POSTFIX EQ CTP$B_WR_PREFIX+1
+	ASSUME	CTP$T_WR_DATA    EQ CTP$B_WR_POSTFIX+1
+
+	ADDW3	#<CTP$T_WR_DATA-CTP$B_MSGTYPE>,-
+		R1,(R3)+		; Set message size
+	MOVB	#CTP$C_MT_WRITE,(R3)+	; Set message type
+	MOVW	R9,(R3)+		; Copy flags
+	MOVW	R10,(R3)+		; Copy prefix/postfix
+	;
+	; Header is now set, data remains. If not buffering, it is
+	; assumed here that the buffer was allocated to be large
+	; enough for the one QIO. In other words, buffering is the
+	; only way that large QIO's will be broken up into smaller
+	; net packets.
+	;
+	MOVC3	R1,@(SP)+,(R3)		; Copy buffer
+	MOVL	R3,R1			; Address of next byte
+	POPR	#^M<R2,R3,R4,R5>	; Restore registers
+	RSB				; return
+
+
+.SBTTL	SETUP_TQE - Set up and queue TQE
+
+;
+; R5 - UCB
+;
+; R0-R2 scratch
+;
+
+SETUP_TQE:
+
+	DSBINT	#IPL$_TIMER		; Set IPL
+	MOVL	UCB$L_CT_TQE(R5),R2	; Fetch Timer Queue Entry
+	BEQL	30$			; Branch if one does not exist
+					; (because of error allocating
+					;  or hangup in progress)
+	BBS	#TQE$V_BSY,-
+		TQE$L_FR3(R2),30$	; Branch if busy (already queued)
+	;
+	; Queue TQE
+	;
+	PUSHR	#^M<R3,R4,R5>		; Save
+	CLRW	UCB$W_CT_WRTCNT(R5)	; Clear use count
+	MOVL	R5,TQE$L_FR4(R2)	; Set UCB address
+	MOVL	R2,R5			; Set TQE as input
+	MOVQ	G^EXE$GQ_SYSTIME,R0	; Fetch current time
+
+	ADDL	#CT$K_TQE_DELTA,R0	; Add delta
+	ADWC	#0,R1			; Add with carry into second part
+	BISB	#TQE$M_BSY,TQE$L_FR3(R2); Set as busy
+	JSB	G^EXE$INSTIMQ		; Insert in queue
+	POPR	#^M<R3,R4,R5>		; Restore
+30$:
+	ENBINT				; Reset IPL
+	RSB				; Exit
+
+
+.SBTTL	TQE_WAKEUP - timer wakeup routine
+TQE_WAKEUP:
+;
+; R3 - flags
+; R4 - UCB
+; R5 - TQE
+; IPL = IPL$TIMER (IPL$_SYNCH)
+;
+; On return:
+;
+; R0-R4 are scratch, R5 must point to a valid TQE
+;
+
+	MOVB	#TQE$C_SSSNGL,-
+		TQE$B_RQTYPE(R5)	 ; Set request type as system subroutine
+	BICB	#TQE$M_BSY,TQE$L_FR3(R5) ; clear busy flag
+
+	BBS	#TQE$V_DELETE,R3,30$	; if terminal has hungup, delete TQE
+	BBS	#FLG$V_INWRTFDT,-
+		UCB$W_CT_FLAGS(R4),20$	; if FDT in progress, exit
+	;
+	; If a write has occured since being queued, simply reschedule TQE
+	;
+	TSTW	UCB$W_CT_WRTCNT(R4)	; Test count
+	BEQL	10$			; zero implies no new qio's
+
+	CLRW	UCB$W_CT_WRTCNT(R4)	; Clear use count
+	MOVB	#TQE$C_SSREPT,-
+		TQE$B_RQTYPE(R5)	 ; Set request type as repeating
+	BISB	#TQE$M_BSY,TQE$L_FR3(R5) ; Set busy flag
+	RSB	
+	;
+	; TQE will now "fire" the write to the net
+	;
+10$:
+	PUSHL	R5			; Save TQE address
+	MOVL	R4,R5			; Set UCB address
+	movab	ucb$l_cnt_tqe(r5),-	; %%% performance hook
+		ucb$l_cnt_addr(r5)	; set address to count if flush occurs
+
+	BSBW	CT_WRITE_WRTCTP		; Flush write buffer if one exists
+
+	movab	ucb$l_cnt_frc(r5),-	; %%% performance hook
+		ucb$l_cnt_addr(r5)	; reset address to count if flush occurs
+	POPL	R5			; Must restore TQE address before
+20$:
+	RSB				;  returning
+	;
+	; Terminal has hungup while TQE was queued, delete TQE now
+	;
+30$:
+	MOVL	R5,R0			; TQE address
+	JSB	G^EXE$DEANONPAGED	; Deallocate the I/O packet (DRVDEALMEM?)
+	MOVAL	G^EXE$AL_TQENOREPT,R5	; Dummy TQE (needed for return to system)
+	RSB				; Return
+
+	.SBTTL	CT_READ - Function Decision Routine for READ Functions
+
+;++
+; CT_READ - Function Decision Routine for READ Functions
+;
+; Functional description:
+;
+;	This routine is called by the SYS$QIO service to dispatch a READ
+;	I/O request.
+;
+;	The QIO parameters for terminal READS are:
+;
+;	P1 = address of the buffer
+;	P2 = size of the buffer
+;	P3 = number of seconds to wait for characters
+;	P4 = address of terminator class bitmask or 0 if standard
+;	P5 = address of prompt string for IO$_READPROMPT or IO$_TTYREADPALL
+;	P6 = size of prompt string for IO$_READPROMPT or IO$_TTYREADPALL
+;
+;	The buffer is validated for access, the process's quota checked and
+;	decremented, the timeout, terminator mask, and prompt are copied to a
+;	message block, the address of the message block is stored in the IRP,
+;	and the IRP is queued to the ACP for delivery to the remote system.
+;
+; Inputs:
+;
+;	R0-R2 = scratch registers
+;	R3 = address of the IRP (I/O request packet)
+;	R4 = address of the PCB (process control block)
+;	R5 = address of the UCB (unit control block)
+;	R6 = address of the CCB (channel control block)
+;	R7 = bit number of the I/O function code
+;	R8 = address of the FDT table entry for this routine
+;	R9-R11 = scratch registers
+;	AP = address of the 1st function dependent QIO parameter
+;
+; Outputs:
+;
+;	IRP$L_SVAPTE(R3) = address of message buffer
+;	IRP$W_BOFF(R3) = size of message buffer
+;	IRP$L_MEDIA(R3) = address of user buffer
+;	IRP$W_BCNT(R3) = size of user buffer
+;
+;	The routine preserves all registers except R0-R2, and
+;	R6-R11.
+;
+;--
+
+; Local storage offsets on stack:
+
+.SAVE LOCAL_BLOCK		; save psect
+.PSECT $ABS$,ABS		; set null psect
+
+. = 0				; Initial offset
+
+bufaddr:	.BLKL		; Input buffer
+bufsize:	.BLKL		; 
+prmaddr:	.BLKL		; Prompt buffer
+prmsize:	.BLKL		; 
+trmaddr:	.BLKL		; Terminator Set buffer
+trmsize:	.BLKL		; 
+iniaddr:	.BLKL		; Initial String buffer
+inisize:	.BLKL		; 
+altechaddr:	.BLKL		; Alternate echo string buffer (READ VERIFY)
+altechsize:	.BLKL		;
+picstraddr:	.BLKL		; Picture string buffer (READ VERIFY)
+picstrsize:	.BLKL		; 
+timeout:	.BLKL		; timeout in seconds
+inioffset:	.BLKL		; initial string offset
+editflags:	.BLKW		; Edit flags (READ VERIFY)
+fillchar:	.BLKW		; fill characters (READ VERIFY)
+editmode:	.BLKW		; Edit mode (READ VERIFY)
+
+read_local = .			; overall size
+
+.RESTORE			; restore psect
+
+;
+; Register Usage:
+;
+; R0,R1 - temporary scratch
+; R2 	- CTP
+; R3	- IRP
+; R4	- PCB
+; R5	- UCB
+; R6	- 
+; R7	- function code
+; R8	- local storage pointer
+; R9	- flags
+; R10	- 
+; R11	- 
+;
+
+CT_READ:				; READ FDT routine
+
+	CLRW	IRP$W_CT_POST(R3)	; Clear POSTed flag
+	BICW	#FLG$M_CTRLO,-
+		UCB$W_CT_FLAGS(R5)	; Set no control O
+	BSBW	CT_WRITE_WRTCTP		; See if flush must happen
+	;
+	; Allocate and zero local storage
+	;
+	SUBL2	#READ_LOCAL,SP		; Allocate local storage
+	MOVL	SP,R8			; Save pointer
+	PUSHR	#^M<R3,R4,R5>		; save registers
+	MOVC5	#0,(SP),#0,-
+		#READ_LOCAL,(R8) 	; zero local storage
+	POPR	#^M<R3,R4,R5>		; restore registers
+
+	MOVZWL	#CTP$M_SR_FORMAT!-	; Assume formatting and 
+		 CTP$M_SR_NORMTERM!-	;  normal terminators and
+		 CTP$M_SR_TRMECHO,R9	;  normal terminator echo
+	;
+	; Check access to user's buffer
+	;
+	MOVL	P1(AP),R0		; Get user buffer virtual address
+	MOVL	R0,IRP$L_MEDIA(R3)	; Save address in packet
+	MOVZWL	P2(AP),R1		; Get buffer size
+	BEQL	5$			; Skip check if zero
+	MOVQ	R0,BUFADDR(R8)		; Save address and length
+	JSB	G^EXE$READCHK		; Check buffer access
+					; (no return means no access)
+5$:
+	CMPW	BUFSIZE(R8),-
+		UCB$W_CT_MAXREAD(R5)	; Size of read server can do
+	BLEQU	10$			; branch if ok
+;**	MOVZWL	#SS$_IVBUFLEN,R0	; ** status	
+;**	BRW	FDT_ABORT		; exit
+	MOVW	UCB$W_CT_MAXREAD(R5),-	; Force size of read server can do
+		BUFSIZE(R8)
+	;
+	; Check for extended item list format
+	;
+10$:
+	BBC	#IO$V_EXTEND,-
+		IRP$W_FUNC(R3),15$	; branch if not item list format
+	BSBW	CT_READ_ITMLST		; Format data
+	BRW	200$			; continue
+	;
+	; Check I/O function code for mode of read
+	;
+15$:
+	CMPB	#IO$_READPBLK,R7	; Function code IO$_READPBLK?
+	BEQL	20$			; Branch if yes
+	CMPB	#IO$_TTYREADALL,R7	; Function code IO$_TTYREADALL?
+	BNEQ	30$			; Branch if no
+20$:	BISW	#CTP$M_SR_ALLBUTX,R9	; Set read all but XON/XOFF in flags
+30$:
+	;
+	; Now check for prompting
+	;
+	CMPB	#IO$_READPROMPT,R7	; Read prompt?
+	BEQL	40$			; Branch if yes
+	CMPB	#IO$_TTYREADPALL,R7	; Read passall with prompt?
+	BNEQ	50$			; Branch if not
+	BISW	#CTP$M_SR_ALLBUTX,R9	; Set read all but XON/XOFF in flags
+40$:	MOVZWL	P6(AP),R1		; Get size of prompt
+	BEQL	50$			; If eql then make this normal read
+	MOVL	P5(AP),R0		; Get prompt buffer address
+;
+; Check access to prompt string
+;
+	MOVQ	R0,PRMADDR(R8)		; save address and size of prompt
+	JSB	G^EXE$WRITECHK		; Check prompt access
+					; (no return means no access)
+;
+; Get terminator bitmask and check access
+;
+50$:
+	CLRL	R2			; Assume no terminator specified
+	MOVL	P4(AP),R1		; Get address of terminator desc
+	BEQL	65$			; If eql none specified
+	MOVZWL	#SS$_ACCVIO,R0		; Assume no access
+	IFNORD	#8,(R1),62$		; Descriptor accessible?
+	MOVZWL	(R1),R2			; Get bitmask size
+	BNEQ	60$			; If neq long format
+	MOVL	#4,R2			; Size of short format
+	ADDL	#4,R1			; Set address of bitmask
+	BRB	65$			;
+60$:
+	MOVL	4(R1),R1		; Get address of long format bitmask
+	IFNORD	R2,(R1),62$		; Bitmask accessible?
+	CMPW	R2,#32			; Bitmask greater than allowed size?
+	BLEQU	65$			; If less than or equal, no
+	MOVZWL	#SS$_BADPARAM,R0	; Set status
+62$:	BRW	FDT_ABORT		; branch to read error
+65$:
+	MOVQ	R1,TRMADDR(R8)		; save address and size of terminators
+;
+; Set up read flags
+;
+	MOVZWL	IRP$W_FUNC(R3),R0	; Fetch function code and modifiers
+	BSBW	FDT_READFLAGS		; map bits to TSA
+	MOVL	P3(AP),TIMEOUT(R8)	; Copy timeout parameter
+;
+; Allocate the message buffer
+;
+200$:
+	MOVW	BUFSIZE(R8),-
+		IRP$W_BCNT(R3)		; reset BCNT written by EXE$WRITECHK
+	;
+	; Calculate size and allocate CTP
+	;
+	MOVL	PRMSIZE(R8),R7		; Set prompt size
+	ADDL3	#CTP$C_SR_LEN,R7,R1	; Add header size to prompt size
+	ADDL2	INISIZE(R8),R1		; Add in initial string size
+	ADDL2	TRMSIZE(R8),R1		; Add in terminator size
+	TSTW	EDITMODE(R8)		; non-zero if read verify
+	BEQL	202$			; branch if not read verify
+	ADDL2	#CTP$C_SR2_LEN-CTP$C_SR_LEN,R1	; Add additional header size 
+	ADDL2	ALTECHSIZE(R8),R1	; Add in alternate echo string size
+	ADDL2	PICSTRSIZE(R8),R1	; Add in Picture string size
+	BBS	#CTP$C_MT_VMS_READVFY,-
+		UCB$L_CT_LEGALMSG(R5),202$ ; branch if read verify allowed
+	MOVZWL	#SS$_ILLIOFUNC,R0	; exit with error
+	BRW	FDT_ABORT		; nope, illegal I/O
+202$:
+	BSBW	FDT_ALLOC_MESSAGE	; Allocate the message buffer
+	MOVB	#CTP$C_MT_START_RD,-
+		CTP$B_MSGTYPE(R2)	; Set message type
+	MOVB	#CTP$C_MT_READ_DATA, -
+		IRP$B_CT_RESPTYPE(R3)	; Set response type expected
+;
+; Copy the timeout, terminator bitmask, and prompt string to the message
+;
+	MOVL	R9,CTP$L_SR_FLAGS(R2)	; Set flags NB: FLAGS is really only 3 bytes
+	MOVW	IRP$W_BCNT(R3),-
+		CTP$W_SR_MAX_LEN(R2)	; Set requested byte count
+	MOVW	TIMEOUT(R8),-
+		CTP$W_SR_TIMEOUT(R2)	; Copy timeout value
+
+	ADDW3	INISIZE(R8),R7,-
+		CTP$W_SR_END_DATA(R2)	; Set end of data
+	ASSUME	CTP$W_SR_END_PRMT+2 EQ CTP$W_SR_STR_DISP
+	MOVZWL	R7,CTP$W_SR_END_PRMT(R2); Copy length, zero start display
+	MOVL	INIOFFSET(R8),R0	; Set initial offset
+	BEQL	210$			; skip if zero
+	ADDW3	R0,R7,CTP$W_SR_STR_DISP(R2) ; Set start display
+210$:
+	MOVW	R7,CTP$W_SR_LO_WATER(R2); Set Low water mark ***
+	PUSHR	#^M<R2,R3,R4,R5>	; Save registers
+	;
+	; Prompt is different based on start read type (Normal or read verify)
+	;
+	MOVAB	CTP$T_SR_TERM(R2),R3	; Assume normal read
+	TSTW	EDITMODE(R8)		; normal read is zero
+	BEQL	230$			; branch if normal read
+	;
+	; Set up read verify additional data
+	;
+	MOVB	#CTP$C_MT_VMS_READVFY,-
+		CTP$B_MSGTYPE(R2)	; Set message type
+	ASSUME	CTP$W_SR2_ALTECHSIZE   EQ CTP$T_SR_TERM
+	;
+	; SR2_ALTECHSIZE is the same as SR_TERM, R3 has correct address
+	;
+	ASSUME	CTP$W_SR2_ALTECHSIZE+2 EQ CTP$W_SR2_PICSTRSIZE
+	ASSUME	CTP$W_SR2_PICSTRSIZE+2 EQ CTP$W_SR2_EDITFLAGS
+	ASSUME	CTP$W_SR2_EDITFLAGS+2  EQ CTP$W_SR2_FILLCHAR
+	ASSUME	CTP$W_SR2_FILLCHAR+2   EQ CTP$T_SR2_TERM
+	MOVW	ALTECHSIZE(R8),(R3)+	; copy alternate echo size
+	MOVW	PICSTRSIZE(R8),(R3)+	; copy picture string size
+	MOVW	EDITFLAGS(R8),(R3)+	; copy flags
+	MOVW	FILLCHAR(R8),(R3)+	; copy fill characters
+	;
+	; fall into starndard read code path...
+	;	
+230$:	MOVQ	TRMADDR(R8),R0		; Set addr,size
+	MOVB	R1,(R3)+		; Copy byte count of term mask
+	BEQL	300$			; Branch if not specified
+	INSV	#CTP$C_SR_THISTERM,-
+		#CTP$V_SR_TERM_SET,-
+		#CTP$S_SR_TERM_SET,-
+		CTP$L_SR_FLAGS(R2)	; Set "Use this terminator mask"
+	MOVC3	R1,(R0),(R3)		; Copy terminator bitmask
+300$:
+	MOVQ	PRMADDR(R8),R0		; Set addr,size
+	MOVC3	R1,(R0),(R3)		; Copy prompt string
+	MOVQ	INIADDR(R8),R0		; Set addr,size
+	MOVC3	R1,(R0),(R3)		; Copy initial string
+
+	TSTW	EDITMODE(R8)		; normal read is zero
+	BEQL	320$			; branch if normal read
+	MOVQ	PICSTRADDR(R8),R0	; Set addr,size
+	MOVC3	R1,(R0),(R3)		; Copy initial string
+	MOVQ	ALTECHADDR(R8),R0	; Set addr,size
+	MOVC3	R1,(R0),(R3)		; Copy initial string
+320$:
+	MOVL	R3,R1			; Save addr beyond data
+	POPR	#^M<R2,R3,R4,R5>	; Restore registers
+;
+; Send the message the remote device and exit the QIO service
+;
+	MOVL	R1,R2			; Set address beyond data
+	BRW	CT_NETMSGSENDX		;
+
+	.SBTTL	CT_READ_ITMLST - FDT routine for read with item list
+;++
+;
+;
+;
+; *** a clean up pass is needed to here to verify that the paranoia
+;     checks made by TTDRIVER and this driver are the same.
+;
+;--
+
+CT_READ_ITMLST:
+
+	;
+	; Set up probe of itemlist with P3 as access mode
+	;
+	MOVL	R3,R6			; Save IRP
+	EXTZV	#0,#2,P3(AP),R0		; fetch low 2 bits of parameter
+	JSB	G^EXE$MAXACMODE		; maximize with mode of caller
+	MOVL	R0,R3			; Set input to probe routine
+
+	MOVL	P5(AP),R0		; Address of itemlist
+	MOVL	P6(AP),R1		; size of item list
+	BEQL	10$			; can't be zero?
+	MOVQ	R0,R10			; save both
+	BRB	30$			; ok, continue
+10$:	MOVZWL	#SS$_BADPARAM,R0	; status
+20$:	MOVL	R6,R3			; Restore IRP
+	BRW	FDT_ABORT		; abort
+
+30$:	JSB	G^EXE$PROBER		; Can it be read?
+	BLBC	R0,20$			; branch if not 
+	MOVL	R11,R0			; size
+	;
+	; Verify that size is multiple of 12
+	;
+	MOVL	R6,R3			; Restore IRP
+	CLRL	R1			; quadword r0/r1
+	EDIV	#12,R0,R11,R0		; divide
+	TSTL	R0			; must be zero remainder
+	BNEQ	10$			; error
+	;
+	; Now loop and conquer item list, item by item
+	;
+40$:
+	MOVZWL	(R10)+,R1		; Length
+	MOVZWL	(R10)+,R2		; item code
+	MOVL	(R10)+,R0		; address or immediate value
+	TSTL	(R10)+			; Must be zero field
+	BNEQ	10$			; error if not
+
+	CASE	R2,-			; case on message type
+		<100$,-			; TRM$_MODIFIERS
+		200$,-			; TRM$_EDITMODE
+		300$,-			; TRM$_TIMEOUT
+		400$,-			; TRM$_TERM
+		500$,-			; TRM$_PROMPT
+		600$,-			; TRM$_INISTRING
+		700$,-			; TRM$_PICSTRING
+		800$,-			; TRM$_FILLCHR
+		900$,-			; TRM$_INIOFFSET
+		1000$-			; TRM$_ALTECHSTR
+		>,-			; TRM$_LASTITM
+		TYPE = W
+;***	ASSUME	TRM$_LASTITM EQ 10	; Break assembly if not right
+	BRB	10$	
+	;
+	; TRM$_MODIFIERS
+	;
+100$:
+	BSBW	FDT_READFLAGS		; Handle read flags
+	BRB	2000$			; Loop
+	;
+	; TRM$_EDITMODE
+	;
+200$:
+	MOVW	R0,EDITMODE(R8)		; Save for use later
+	BRB	2000$			; Loop
+	;
+	; TRM$_TIMEOUT
+	;
+300$:	
+	MOVL	R0,TIMEOUT(R8)		; Set timeout
+	BISW	#CTP$M_SR_TIMED,R9	; set read timed bit
+	BRB	2000$			; loop
+	;
+	; TRM$_TERM
+	;
+400$:
+	TSTL	R1			; test length
+	BNEQ	410$			; If neq long format
+	MOVL	#4,R1			; Size of short format
+	MOVAB	-8(R10),R0		; Address of immediate data
+	BRB	430$			; skip
+410$:
+	IFNORD	R1,(R0),420$		; Bitmask accessible?
+	CMPW	R1,#32			; Bitmask greater than allowed size?
+	BLEQU	430$			; If less than or equal, no
+	BRB	10$			; bad param *** other status?
+420$:	MOVZWL	#SS$_ACCVIO,R0		; access violation
+	BRW	FDT_ABORT		; branch to read error
+430$:
+	MOVQ	R0,TRMADDR(R8)		; save address and size of terminators
+	BRB	2000$			; continue
+	;
+	; TRM$_PROMPT
+	;	
+500$:
+	MOVQ	R0,PRMADDR(R8)		; save address and length
+	BRB	1500$			; continue
+	;
+	; TRM$_INISTRING
+	;
+600$:
+	MOVQ	R0,INIADDR(R8)		; save address and length
+	BRB	1500$			; continue
+	;	
+	; TRM$_PICSTRING
+	;
+700$:
+	MOVQ	R0,PICSTRADDR(R8)	; save address and length
+	BRB	1500$			; continue
+	;
+	; TRM$_FILLCHR
+	;
+800$:	
+	MOVW	R0,FILLCHAR(R8)		; save for later
+	BRB	2000$			; continue
+	;
+	; TRM$_INIOFFSET
+	;
+900$:	MOVL	R0,INIOFFSET(R8)	; Set inioffset
+	BRB	2000$			; continue
+	;
+	; TRM$_ALTECHSTR
+	;
+1000$:	
+	MOVQ	R0,ALTECHADDR(R8)	; save address and length
+	BRB	1500$			; continue
+	;
+	; Check string for access
+	;
+1500$:	TSTL	R1			; no need to probe if zero
+	BEQL	2000$			; Skip probe
+	JSB	G^EXE$WRITECHK		; check for read access
+	;
+	; Loop for next parameter
+	;
+2000$:
+	SOBGTR	R11,2010$		; loop
+	RSB				; return
+2010$:	BRW	40$			;
+
+FDT_READFLAGS:	
+
+; Escape is left out of the following optimization because of the frequency
+; of its use.
+
+	BITW	#<IO$M_NOECHO!-
+		  IO$M_TIMED!-
+		  IO$M_PURGE!-
+		  IO$M_TRMNOECHO!-
+		  IO$M_CVTLOW!-
+		  IO$M_NOFILTR>,R0	; Optimization - any bits set?
+	BEQL	140$			; Branch if not
+
+	BBC	#IO$V_NOECHO,R0,90$	; Branch if not noecho
+	BISW	#CTP$M_SR_NOECHO,R9	; Set noecho
+90$:	
+	BBC	#IO$V_TIMED,R0,100$	; Branch if not timed
+	BISW	#CTP$M_SR_TIMED,R9	; Set timed
+100$:	
+	BBC	#IO$V_PURGE,R0,110$	; Branch if not purge typeahead
+	BISW	#CTP$M_SR_PURGE,R9	; Set purge
+110$:	
+	BBC	#IO$V_TRMNOECHO,R0,120$	; Branch if not terminator noecho
+	BICW	#CTP$M_SR_TRMECHO,R9	; Clear terminator echo
+120$:	
+	BBC	#IO$V_CVTLOW,R0,130$	; Branch if not CVTLOW
+	BISW	#CTP$M_SR_LOWTOUP,R9	; Set lower to upper case conversion
+130$:	
+	BBC	#IO$V_NOFILTR,R0,140$	; Branch if not filter control characters
+	BISW	#CTP$M_SR_EDIT,R9	; Set read edit characters
+140$:	
+	BBC	#IO$V_ESCAPE,R0,150$	; Branch if not escape reaad
+	BISL	#CTP$M_SR_ESCAPE,R9	; Set read with escape
+150$:	
+	;
+	; VMS extension - if VAX to VAX, send extra bits in spare bits.
+	;
+	BBC	#FLG$V_VAXTOVAX,-
+		UCB$W_CT_FLAGS(R5),300$	; If not VAX to VAX, skip next check
+	ASSUME	TRM$V_TM_NOEDIT+1 EQ TRM$V_TM_NORECALL
+	EXTZV	#TRM$V_TM_NOEDIT,#2,R0,R1 ; two bits
+	INSV	R1,#CTP$V_SR_NOEDIT,#2,R9 ; Stick in here
+300$:
+	ASSUME	TRM$V_TM_R_JUST+1 EQ TRM$V_TM_AUTO_TAB
+	EXTZV	#TRM$V_TM_R_JUST,#2,R0,R1 ; two bits
+	MOVW	R1,EDITFLAGS(R8)	  ; save	
+	RSB				  ; return
+
+
+	.SBTTL	CT_SETMODE, Function Decision Routine for SETMODE/SETCHAR
+;++
+; CT_SETMODE, Function Decision Routine for SETMODE/SETCHAR Functions
+;
+; Functional description:
+;
+;	This routine is called by the SYS$QIO service to dispatch a SETMODE
+;	or SETCHAR I/O request.
+;
+;	The QIO parameters for terminal SETMODE or SETCHAR are:
+;
+;
+;		P1 = address of 8 byte characteristics buffer
+;		P2 = 0, 8 or 12
+;		P3 = speed specifier
+;		P4 = fill specifier
+;		P5 = parity flags
+;
+;	IO$V_CTRLYAST -
+;		P1 = AST routine address or zero to cancel
+;
+;	IO$V_CTRLCAST -
+;		 P1 = AST routine address or zero to cancel
+;
+;	IO$V_HANGUP -
+;		NONE
+;
+;	The buffer (if any) is validated for access, the process's quota
+;	checked and decremented, a message block is allocated, the parameters
+;	(if any) are stored in the  message block, the address of the message
+;	block is stored in the IRP, and the IRP is queued to the ACP for
+;	delivery to the remote system.
+;
+;	If an AST is to be enabled, an AST control block is allocated locally
+;	hung off the UCB for later delivery upon receipt of a corresponding
+;	attention message from the remote system.
+;
+; Inputs:
+;
+;	R0-R2 = scratch registers
+;	R3 = address of the IRP (I/O request packet)
+;	R4 = address of the PCB (process control block)
+;	R5 = address of the UCB (unit control block)
+;	R6 = address of the CCB (channel control block)
+;	R7 = bit number of the I/O function code
+;	R8 = address of the FDT table entry for this routine
+;	R9-R11 = scratch registers
+;	AP = address of the 1st function dependent QIO parameter
+;
+; Outputs:
+;
+;	IRP$L_SVAPTE(R3) = address of message buffer
+;	IRP$W_BOFF(R3) = size of message buffer
+;
+;	The routine preserves all registers except R0-R2, R7, and R9-R11
+;--
+CT_SETMODE:				; SETMODE/SETCHAR FDT routine
+
+	CLRW	IRP$W_CT_POST(R3)	; Clear POSTed flag
+	BSBW	CT_WRITE_WRTCTP		; See if flush must happen
+
+	FFS	#IO$V_MAINT,#9,-
+		IRP$W_FUNC(R3),R1	; Find first set modifier
+	CASE	R1,TYPE=B,LIMIT=#IO$V_MAINT,<-
+		SET_MAINT,-		; IO$M_MAINT
+		SET_CTRLY,-		; IO$M_CTRLYAST
+		SET_CTRLC,-		; IO$M_CTRLCAST
+		SET_HANGUP,-		; IO$M_HANGUP
+		SET_OUTBAND,-		; IO$M_OUTBAND
+		SET_CONNECT,-		; IO$M_CONNECT
+		SET_DISCONNECT,-	; IO$M_DISCONNECT
+		SET_PID,-		; IO$M_SETPID
+		SET_BRDCST>		; IO$M_BRDCST
+;
+; Set terminal characteristics if CASE falls though
+;
+	BITW	#^CIRP$M_FCODE, -	; Extra bits?
+		IRP$W_FUNC(R3)		; as modifier
+	BEQL	10$			; Nope
+	MOVZWL	#SS$_ILLIOFUNC, R0	; Return as illegal operation
+	BRW	FDT_ABORT		; with an error not success
+10$:
+	BSBW	GET_PARAMS		; Fetch P1 and P2 into R1,R2
+	;
+	; Send CTERM or VMS message
+	;	
+	BBC	#CTP$C_MT_VMSQIO,-
+		UCB$L_CT_LEGALMSG(R5),12$ ; Branch if not VMSQIO support
+	BSBW	CT_VMS_SETMODE		; Format VMS message
+	BRW	CT_NETMSGSENDX		; Send message and exit
+12$:
+	MOVL	UCB$L_DEVDEPND2(R5),-	;
+		R11			; Extended word is defaulted
+	MOVQ	(R1)+,R9		; Get characteristics
+	CMPL	R2, #12			; Do we get another longword?
+	BLSS	20$			; Nope
+	MOVL	(R1)+, R11		; Obtain the third longword
+20$:
+;
+; Map VMS characteristics into TSA
+;
+	MOVL	#200,R1			; Set size of message buffer *** FIX
+	BSBW	FDT_ALLOC_MESSAGE	; Allocate a message buffer
+	ASSUME	CTP$B_CH_FLAGS EQ CTP$B_MSGTYPE+1
+	MOVZBW	#CTP$C_MT_CHAR,-
+		CTP$B_MSGTYPE(R2)	; Set message type 
+
+	PUSHR	#^M<R4,R5>		; save
+	BSBW	CT_SET			; call external routine 
+	POPR	#^M<R4,R5>		; restore
+	MOVQ	R9,UCB$B_DEVCLASS(R5)	; Set local copy of characteristics
+	MOVL	R11,UCB$L_DEVDEPND2(R5)	; And extended longword
+
+	MOVW	P3(AP),UCB$W_CT_SPEED(R2) ; Set speed
+	ASSUME	UCB$B_CT_CRFILL+1 EQ UCB$B_CT_LFFILL
+	MOVW	P4(AP),UCB$B_CT_CRFILL(R2) ; Set fills
+	MOVW	P5(AP),UCB$W_CT_PARITY(R2) ; Set parity
+	;
+	; R0 has LBC if there is no new data to tell server about
+	;
+	BLBS	R0,30$			; continue if lbs
+	BRW	SET_NOP			; done
+30$:	
+	BRW	SET_READY		; Send message to net and exit
+
+SET_CTRLY:
+	MOVAL	UCB$L_TL_CTRLY(R5),R7	; Get address of CTRL/Y AST list
+	MOVL	#<1@TTY$C_CTRLY>,R10	; Set ^Y (for later)
+	BBS	#FLG$V_VAXTOVAX,-
+		UCB$W_CT_FLAGS(R5),10$	; If VAX to VAX, ^C enable is implicit
+	;
+	; For RSX and TOPS, this driver must always enable both ^C and ^Y
+	; when ^Y is enabled.
+	;
+	BISB	#<1@TTY$C_CTRLC>,R10	; Set ^C (for later)
+10$:
+	JSB	G^COM$SETATTNAST	; Enable an attention AST
+	;
+	; If hangup is set, deliver ^Y ast to immediately with hangup.
+	;
+	BBC	#UCB$V_TT_HANGUP, -
+		UCB$W_DEVSTS(R5),CTRL_CY ; Branch if not hangup
+	MOVL	R7,R4			; Set address of AST listhead
+	MOVL	(R4),R0			; get ast block address
+	MOVZWL	#SS$_HANGUP,ACB$L_KAST+4(R0) ; Set AST parameter to hangup
+	PUSHL	R6			; save... needed in FDT?
+	MOVL	UCB$L_TL_CTLPID(R5),R6	; Set controlling PID
+	JSB	G^COM$DELATTNASTP	; Deliver the AST immediately
+	POPL	R6			; restore
+	BRW	SET_NOP			; Nop this I/O function
+
+SET_CTRLC:
+	MOVAL	UCB$L_TL_CTRLC(R5),R7	; Assume CTRL/C AST enable
+	MOVL	#<1@TTY$C_CTRLC>,R10	; Set ^C (for later)
+	JSB	G^COM$SETATTNAST	; Enable an attention AST
+
+CTRL_CY:
+	MOVZWL	#<CTP$M_CH_OO!-		; out of band handling
+		CTP$M_CH_D!-		; discard output
+		CTP$M_CH_EE>,R9 	; mask
+	BISW	#<CTP$M_CH_D!-		; discard
+		<CTP$C_CH_ECHOSTANDARD@CTP$V_CH_EE>- ; echo ^C
+		@8>,R9			; Set mask
+	ASSUME	CTP$C_CH_CANCEL EQ 0	; assume cancel out of band  is zero
+	TSTL	P1(AP)			; Enable if non-zero
+	BEQL	40$			; If zero, then message ok
+	BISW	#<CTP$C_CH_ICLEAR@8>,R9	; immediate clear
+
+40$:	BRW	FDT_SET_OUTBAND		; Go format data
+
+;
+; Process a setmode for an outofband ast
+;
+
+SET_OUTBAND:
+
+	MOVAB	UCB$L_TL_OUTBAND(R5),R2	; Address of the include mask
+	MOVAB	UCB$L_TL_BANDQUE(R5),R7	; Address of the out of band list
+	JSB	G^COM$SETCTRLAST	; Enable the asts
+
+	;
+	; Now, must step through entire OOB AST list and build
+	; individual summary masks for INCLUDE, EXCLUDE and ABORT types.
+	;
+
+	ast_include = 0
+	ast_exclude = 4
+	ast_abort   = 8
+	assume ucb$l_ct_exclude EQ ucb$l_ct_include+4
+	assume ucb$l_ct_abort EQ ucb$l_ct_exclude+4
+
+	SUBL	#12,SP			; allocate 3 longwords
+	MOVL	SP,R11			; pointer
+	BSBW	FETCH_OOB_DATA		; fetch data from OOB LIST
+
+	MOVZWL	#<CTP$M_CH_OO!-
+    		CTP$M_CH_I!-
+		CTP$M_CH_D!-
+		CTP$M_CH_EE>,R9 	; init mask
+	ASSUME	CTP$C_CH_CANCEL EQ 0	; assume cancel = 0
+	ASSUME	CTP$C_CH_ECHONONE EQ 0	; and echo nothing = 0
+	;
+	; First, send all the OOB's that have been implicitly disabled
+	;
+	MOVAB	UCB$L_CT_INCLUDE(R5),R7	; Base of last enabled OOB's
+	BICL3	AST_INCLUDE(R11),-
+		AST_INCLUDE(R7),R10	; new AND NOT old into R10
+	BICL3	AST_EXCLUDE(R11),-
+		AST_EXCLUDE(R7),R0	; new AND NOT old into R10
+	BISL	R0,R10			; add to others
+	BICL3	AST_ABORT(R11),-
+		AST_ABORT(R7),R0	; new AND NOT old into R10
+	BISL	R0,R10			; add to others
+	BSBB	SEND_OOB_MSG		; send OOB message
+	;
+	; Now, check excludes
+	;
+	BISW	#<CTP$C_CH_HELLO@8>,R9	; Set hello
+	MOVL	AST_EXCLUDE(R11),R10	; Fetch exclude
+	CMPL	R10,AST_EXCLUDE(R7)	; compare excludes
+	BEQL	150$			; branch if no change
+	BSBB	SEND_OOB_MSG		; send message
+	;
+	; Now, check includes
+	;
+150$:
+	BISW	#<CTP$M_CH_I@8>,R9	; Set Include bit
+	MOVL	AST_INCLUDE(R11),R10	; Fetch include
+	CMPL	R10,AST_INCLUDE(R7)	; compare includes
+	BEQL	160$			; branch if no change
+	BSBB	SEND_OOB_MSG		; send message
+	;
+	; Now, Check aborts
+	;
+160$:
+	BICW	#<CTP$M_CH_I!3@8>,R9	; Clear Include bit and handling
+	BISW	#<CTP$C_CH_ICLEAR!-
+		CTP$M_CH_D@8>,R9	; immediate clear and discard output
+	MOVL	AST_ABORT(R11),R10	; Fetch aborts
+	CMPL	R10,AST_ABORT(R7)	; compare aborts
+	BEQL	170$			; branch if no change
+	BSBB	SEND_OOB_MSG		; send message
+170$:	
+	;
+	; Update UCB with new masks
+	;
+	MOVQ	AST_INCLUDE(R11),-
+		AST_INCLUDE(R7)		; include and exclude
+	MOVL	AST_ABORT(R11),-
+		AST_ABORT(R7)		; and abort
+	BRB	SET_NOP			; exit
+
+SEND_OOB_MSG:
+;
+; Send a no-quota-charged out of band message
+;
+; Inputs:
+;
+; R9  = 2 bytes of mask and attributes
+; R10 = Mask of characters to enable/disable 
+;
+	TSTL	R10			; test mask
+	BEQL	110$			; ignore if zero
+	PUSHR	#^M<R3,R4,R11>		; Save
+	CLRL	R3			; set no irp !!!
+	BSBW	SETUP_OUTBAND		; set up buffer
+	BLBC	R0,100$			; 
+	;
+	; CTP returned in R3 !
+	;
+	SUBL3	CTP$L_MSGDAT(R3),R2,R1	; Make the length of the data
+	MOVW	R1,CTP$W_DATSIZE(R3)	; save in the buffer
+	SUBW3	#<CTP$B_MSGTYPE-CTP$B_PRO_MSGTYPE>,-
+		R1,CTP$W_MSGSIZE(R3)	; Fill in size of single message
+	MOVL	R3,R2			; Set address
+	BSBW	CT_NET_Q_MSG		; Send the message to the server
+100$:
+	POPR	#^M<R3,R4,R11>		; Restore
+110$:
+	RSB
+
+SET_NOP:
+	BRW	FDT_FINISHIOC_OK	; Complete I/O
+	;
+	; The following types of modifiers are not allowed on remote terminals
+	;
+SET_MAINT:
+SET_CONNECT:
+SET_DISCONNECT:
+
+	MOVZWL	#SS$_DEVREQERR, R0	; Return as device request error
+	BRW	FDT_ABORT		; with an error not success
+
+SET_BRDCST:
+	BSBW	GET_PARAMS		; Get parameters
+	MOVQ	(R1),UCB$Q_TL_BRKTHRU(R5); Set bits
+	BRB	SET_NOP			; Set done
+
+SET_PID:
+	MOVL	PCB$L_PID(R4),-
+		UCB$L_TL_CTLPID(R5)	; Set controlling PID
+	BRB	SET_NOP			; done
+
+FDT_SET_OUTBAND:
+
+	BSBB	SETUP_OUTBAND		; set up out of band message
+	BRB	SET_READY		; Send message
+
+SET_HANGUP:
+
+	MOVZBL	#UNBIND$C_DISCONNECT,R0	; unbind reason code
+	BSBW	SEND_UNBIND		; send it with common routine
+	BRB	SET_NOP			; nop I/O
+
+SET_READY:
+	CLRQ	R0			; no status other than low word
+	ASSUME	IRP$L_IOST1+4 EQ IRP$L_IOST2
+	MOVQ	R0,IRP$L_IOST1(R3)	; Set status for I/O completion
+	MOVW	#SS$_NORMAL, -
+		IRP$L_IOST1(R3)		; Set status
+
+	BRW	CT_NETMSGSENDX		; Send message and exit
+
+
+	.SBTTL	SETUP_OUTBAND - Format out of band message
+
+;+++
+;
+; INPUTS:
+;
+; R3  = IRP (if called from FDT routine) or 0 (otherwise)
+; R9  = 2 bytes of mask and attributes
+; R10 = Mask of characters to enable/disable 
+;
+; OUTPUTS:
+;
+; R0 - status
+; R1 - destroyed
+; R2 - one byte past formatted message
+; R3 - IRP (if non-zero on entry)
+;    - CTP (if zero on entry)
+; R10,R11 - destroyed
+;
+;---
+
+SETUP_OUTBAND:
+	;
+	; Loop through to find out how many bits are set
+	;
+
+	CLRL	R0			; Count
+	MOVL	R10,R2
+10$:
+	FFS	#0,#31,R2,R1		; Find first bit set
+	BEQL	20$			; If zero, then exit
+	INCL	R0			; increment
+;***	PUSHL	R1			; Save char to use later?
+	BBSC	R1,R2,10$		; Clear bit and loop
+20$:
+	MULL3	#5,R0,R1		; length of data ***
+	ADDL2	#CTP$W_CH_PARAM,R1	; header
+	TSTL	R3			; irp or not?
+	BEQL	30$			; branch if not
+	BSBW	FDT_ALLOC_MESSAGE	; Allocate a message
+	BRB	35$			; skip
+30$:	BSBW	ALLOC_CTP		; get message buffer
+	BLBC	R0,60$			; exit if error
+	MOVL	R2,R3			; Set CTP address
+35$:
+	ASSUME	CTP$B_CH_FLAGS EQ CTP$B_MSGTYPE+1
+	MOVZBW	#CTP$C_MT_CHAR,-
+		CTP$B_MSGTYPE(R2)	; Set message type 
+	MOVAB	CTP$W_CH_PARAM(R2),R2	; Address of data in message
+40$:
+	FFS	#0,#31,R10,R11		; Find first bit set
+	BEQL	50$			; If zero, then exit
+	MOVW	#<CH$C_CTERM@8!-
+		CH$C_CT_CHAR_ATT>,(R2)+ ; set characteristic selector
+	MOVB	R11,(R2)+		; Set data
+	MOVW	R9,(R2)+		; Initialize longword
+	BBSC	R11,R10,40$		; clear bit and loop
+50$:
+	MOVL	#1,R0			; Set success
+60$:	RSB
+
+	.SBTTL	FETCH_OOB_DATA - fetch data from OOB list
+;++
+;	FETCH_OOB_DATA - fetch data from OOB list
+;
+; Functional description:
+;
+;	Run through OOB list and build 3 masks - one for each
+;	type of OOB enable.
+;
+; Inputs:
+;
+;	R11 = points to 3 long word region, uses AST_ offsets
+;
+; Outputs:
+;
+;	AST_INCLUDE (R11)
+;	AST_EXCLUDE (R11)
+;	AST_ABORT (R11)
+;
+;	R0,R1,R2 destroyed
+;--
+FETCH_OOB_DATA:
+
+	CLRQ	(R11)			; clear
+	CLRL	8(R11)			; clear
+	MOVAB	UCB$L_TL_BANDQUE(R5),R7	; Address of the out of band list
+	DSBINT	UCB$B_DIPL(R5)		; Interlock Queue access
+10$:
+	MOVL	(R7),R2			; get next TAST block
+	BEQL	100$			; done
+	MOVAB	-TAST$L_FLINK(R2),R2	; get base of block
+	MOVZBL	TAST$B_CTRL(R2),R0	; get control byte
+	BBS	#TAST$V_LOST,R0,50$	; flagged for delete, ignore
+	MOVL	TAST$L_MASK(R2),R1	; save mask
+	BBS	#TAST$V_ABORT,R0,40$	; branch if abort
+	BBS	#TAST$V_INCLUDE,R0,30$	; branch if include
+	BISL	R1,AST_EXCLUDE(R11)	; set exclude
+	BRB	50$			; continue
+30$:	BISL	R1,AST_INCLUDE(R11)	; set include
+	BRB	50$			; continue
+40$:	BISL	R1,AST_ABORT(R11)	; add to abort flags
+
+50$:	MOVAL	TAST$L_FLINK(R2),R7	; point at flink
+	BRB	10$			; loop
+
+100$:	ENBINT				; enable interrupts
+	RSB
+
+
+	.SBTTL	CT_SENSEMODE, Function Decision Routine for SENSEMODE/SENSECHAR
+;++
+; CT_SENSEMODE, Function Decision Routine for SENSEMODE/SENSECHAR Functions
+;
+; Functional description:
+;
+;	This routine is called by the SYS$QIO service to dispatch a SENSEMODE
+;	or SENSECHAR I/O request.
+;
+;	The QIO parameters for terminal SENSEMODE/SENSECHAR are:
+;
+;	P1 = address of 8 or 12 byte characteristics buffer
+;	P2 = 0, 8 or 12
+;
+;	The buffer is validated for access, the process's quota checked and
+;	decremented, a message block is allocated, the address of the message
+;	block is stored in the IRP, and the IRP is queued to the ACP for
+;	delivery to the remote system.
+;
+; Inputs:
+;
+;	R0-R2 = scratch registers
+;	R3 = address of the IRP (I/O request packet)
+;	R4 = address of the PCB (process control block)
+;	R5 = address of the UCB (unit control block)
+;	R6 = address of the CCB (channel control block)
+;	R7 = bit number of the I/O function code
+;	R8 = address of the FDT table entry for this routine
+;	R9-R11 = scratch registers
+;	AP = address of the 1st function dependent QIO parameter
+;
+; Outputs:
+;
+;	IRP$L_SVAPTE(R3) = address of message buffer
+;	IRP$W_BOFF(R3) = size of message buffer
+;	IRP$L_MEDIA(R3) = address of user characteristics buffer
+;	IRP$W_BCNT(R3) = size of user characteristics buffer, 8
+;
+;	The routine preserves all registers except R0-R2, and R9-R11
+;--
+CT_SENSEMODE:				; SENSEMODE/SENSECHAR FDT routine
+
+	CLRW	IRP$W_CT_POST(R3)	; Clear POSTed flag
+	BSBW	CT_WRITE_WRTCTP		; See if flush must happen
+
+	MOVZWL	IRP$W_FUNC(R3),R9	; Fetch function code
+	BBC	#IO$V_RD_MODEM,R9,2$	; skip if not read modem
+	MOVZWL	#SS$_DEVREQERR, R0	; Return as device request error
+	BRW	FDT_ABORT		; with an error not success
+2$:
+	MOVL	P1(AP),R1		; Get address of characteristics buffer
+	BSBW	FDT_CHARSIZE		; Size of chars buffer (return in R2)
+	MOVZWL	#SS$_ACCVIO,R0		; Assume access violation
+	IFWRT	R2,(R1),10$		; Buffer accessible?
+	BRW	FDT_ABORT		; Branch if not
+10$:
+	BBC	#IO$V_BRDCST,R9,12$	; Branch if not brdcst bit request
+	MOVQ	UCB$Q_TL_BRKTHRU(R5),(R1) ; read bits (no remoting of this?)
+	BRW	FDT_FINISHIOC_OK	; Complete I/O
+12$:
+	MOVL	R1,IRP$L_MEDIA(R3)	; Save address in packet
+	MOVW	R2,IRP$W_BCNT(R3)	; Set size in packet
+	BISW	#IRP$M_FUNC,IRP$W_STS(R3) ; Set READ type function
+	;
+	; For sense type-ahead, always use CTERM
+	;
+	BBS	#IO$V_TYPEAHDCNT,R9,15$	; Branch if sense type-ahead
+	;
+	; Send CTERM or VAX message
+	;	
+	BBC	#CTP$C_MT_VMSQIO,-
+		UCB$L_CT_LEGALMSG(R5),20$ ; Branch if not VMSQIO support
+	BSBW	CT_VMS_SENSEMODE	; Format VAX message
+	BRW	CT_NETMSGSENDX		; Send message and exit
+15$:
+	CLRQ	(R1)			; Clear output buffer
+	MOVZWL	#CTP$C_CI_LEN,R1	; Set size of message buffer
+	BSBW	FDT_ALLOC_MESSAGE	; Allocate the message buffer
+	MOVZBW	#CTP$C_MT_CHECK_INP,-
+		CTP$B_MSGTYPE(R2)
+	MOVB	#CTP$C_MT_INP_COUNT, -
+		IRP$B_CT_RESPTYPE(R3)	; Set expected response type (input count)
+		
+	MOVAB	CTP$B_CI_FLAGS+1(R2),R2	; Set end of message
+	BRB	30$
+20$:	
+	;
+	; CTP$AB_SENSEBUF is a fixed structure used to sense all characteristics 
+	; relevant to VMS.
+	;
+	MOVZWL	#CTP$K_SENSEBUF+4+ -
+		CTP$B_MSGTYPE,R1	; Set size of message buffer
+
+	BSBW	FDT_ALLOC_MESSAGE	; Allocate the message buffer
+	MOVB	#CTP$C_MT_CHAR, -
+		IRP$B_CT_RESPTYPE(R3)	; Set expected response type
+
+	PUSHR	#^M<R2,R3,R4,R5>	; Save registers
+	MOVC3	#CTP$K_SENSEBUF,-
+		W^CTP$AB_SENSEBUF, -
+		CTP$B_MSGTYPE(R2)	; Copy data
+	MOVL	R3,R1			; Save adr beyond data
+	POPR	#^M<R2,R3,R4,R5>	; Restore the registers
+	MOVL	R1,R2			; Pointer beyond data in message
+30$:
+	BRW	CT_NETMSGSENDX		; Send the message and exit service
+
+	.SBTTL	FDT support routines 
+;++
+; FDT_CHARSIZE
+;
+; INPUT:
+;	P2(AP)
+;
+; OUTPUT:
+;	R2 = 8 or 12 for size of characteristics buffer
+;
+; ABORT with status = SS$_BADPARAM if P2(AP) is not 0, 8, 12.
+;
+;--
+
+GET_PARAMS:
+
+	MOVL	P1(AP),R1		; Get address of characteristics
+	BSBB	FDT_CHARSIZE		; Obtain the size of the char buffer
+	MOVZWL	#SS$_ACCVIO,R0		; Assume access violation
+	IFNORD	R2,(R1),10$		; Characteristics accessible?
+	RSB				; return
+10$:
+	BRB	FDT_ABORT		; error 
+
+FDT_CHARSIZE:
+	MOVL	P2(AP), R2	; Size of characters buffer
+	BEQL	10$		; Zero is for 8
+	CMPL	R2, #8		; 8 is allowed
+	BEQL	20$		; Ok
+	BLSSU	30$		; Less is no good
+	CMPL	R2, #12		; Must be 12 and nothing else
+	BNEQ	30$		; No good
+	RSB			; Ok
+10$:	MOVL	#8, R2		; Use 8 if zero
+20$:	RSB
+
+30$:	MOVZWL	#SS$_BADPARAM, R0	; Abort qio with an error
+
+;
+; Finish I/O, clear R1
+;
+FDT_FINISHIOC_OK:
+	MOVZWL	#SS$_NORMAL,R0		; Set status OK
+FDT_FINISHIOC:
+	PUSHL	R0			; save
+	CLRL	R0			; set position
+	BSBW	CHECK_POST_IO		; check for error, set posted
+	POPL	R0			; restore
+	JMP	G^EXE$FINISHIOC		; Complete I/O request
+;
+; Error processing - abort I/O request
+;
+
+FDT_ABORT:				;
+	PUSHL	R0			; save
+	MOVZBL	#1,R0			; set position
+	BSBW	CHECK_POST_IO		; check for error, set posted
+	POPL	R0			; restore
+	JMP	G^EXE$ABORTIO		;
+
+
+	.SBTTL	FDT_ALLOC_MESSAGE, Allocate a message buffer
+;++
+; FDT_ALLOC_MESSAGE, Allocate a message buffer to send to remote process
+; SET_MSGHDR,    Setup a message header for broadcast
+;
+; Functional description:
+;
+;	This routine checks that the process has sufficient buffered I/O
+;	byte count quota for the message buffer, and then allocates the
+;	buffer from non-paged pool.  The process's buffered I/O byte count
+;	quota is decreased by the size of the allocated buffer and the
+;	message header information is stored.
+;
+; Inputs:
+;
+;	R1 = size of message required
+;	R3 = address of IRP
+;	R4 = address of PCB
+;
+; Outputs:
+;
+;	R1 = size of buffer
+;	R2 = address of buffer 
+;
+;	IRP$B_CT_RESPTYPE = response type cleared
+;	IRP$L_SVAPTE(R3) = address of buffer
+;	IRP$W_BOFF(R3) = size of buffer
+;
+;	CTP$B_TYPE(R2)		= Block type
+;	CTP$W_SIZE(R2)		= size of message buffer
+;	CTP$W_MSGSIZE(R2)	= message size, zeroed
+;	CTP$B_PRO_MSGTYPE(R2)	= PRO$C_DATA
+;	CTP$B_CT_RESPTYPE(R2)	= response type, zeroed
+;	CTP$L_MSGDAT(R2)	= address of data
+;	CTP$L_USRBFR(R2)	= zeroed
+;
+;	If process does not have sufficient quota, the I/O request
+;	is aborted.
+;--
+
+FDT_ALLOC_MESSAGE::			; Allocate message buffer
+
+	PUSHL	R3			; Save packet address
+	JSB	G^EXE$BUFFRQUOTA	; Check quota
+	BLBC	R0,ALLOC_ERR		; Branch if error
+;
+; Allocate the message buffer
+;
+10$:	JSB	G^EXE$ALLOCBUF		; Allocate the buffer	
+	BLBC	R0,ALLOC_ERR		; Branch if error
+	POPL	R3			; Restore packet address
+;
+; Adjust process's quota
+;
+	MOVL	PCB$L_JIB(R4),R0	; Get Job Information Block address
+	SUBL	R1,JIB$L_BYTCNT(R0)	; Adjust buffered I/O byte count quota
+	MOVW	R1,IRP$W_BOFF(R3)	; Save buffer size as quota
+;
+; Set up CTP with associated IRP data
+;
+	MOVL	R2,IRP$L_SVAPTE(R3)	; Save buffer address in packet
+	ASSUME IRP$B_CT_RESPTYPE+1 EQ IRP$B_CT_CANCEL
+	ASSUME IRP$B_CT_CANCEL+1   EQ IRP$W_CT_POST
+	CLRL	IRP$B_CT_RESPTYPE(R3)	; Set no response type, cancel or post
+;
+; Store message header information
+;
+;	R0	= Clobbered
+;	R1	= Buffer size
+;	R2	= Buffer address
+;
+
+SET_MSGHDR:
+
+	ASSUME	CTP$B_PRO_MSGTYPE+1 EQ CTP$B_PRO_FILL
+	ASSUME	CTP$B_PRO_MSGTYPE+2 EQ CTP$W_MSGSIZE
+
+	MOVZBL	#PRO$C_DATA,-	
+		CTP$B_PRO_MSGTYPE(R2)	; Assume data type, zero fill & msgsize
+	MOVW	R1,CTP$W_SIZE(R2)	; Save buffer size in message
+	MOVB	#DYN$C_BUFIO,-		; Set block type
+		CTP$B_TYPE(R2)
+	MOVAB	CTP$B_PRO_MSGTYPE(R2),-	; Set address of data
+		CTP$L_MSGDAT(R2)
+	CLRL	CTP$L_USRBFR(R2)	; Set user buffer address
+	RSB				;
+
+ALLOC_ERR:
+
+	POPL	R3			; Restore R3
+	BRW	FDT_ABORT		; Abort the IO
+
+.SBTTL	ALLOC_CTP - allocate a CTP
+
+ALLOC_CTP:
+;
+; Allocates a CTP and does not charge quota. 
+; 
+;
+	JSB	G^EXE$ALONONPAGED	; allocate CTP
+	BLBC	R0,10$			; Branch on error
+	BSBW	SET_MSGHDR		; Set up message header
+	MOVL	#1,R0			; success
+10$:
+	RSB				; return
+
+
+	.SBTTL	CT_INTERRUPT Interrupt handler
+;++
+; CT_INTERRUPT, I/O completion interrupt handler
+;
+; Functional description:
+;
+;	This routine handles an I/O completion "interrupt" from the ACP.
+;	The I/O status and data is obtained from the response packet from 
+;	the remote terminal handler process, and the I/O request is completed.
+;
+; Inputs:
+;
+;	R3 = address of the IRP
+;	R5 = address of UCB
+;	IRP$L_SVAPTE(R3) = address of response message
+;
+;	ipl = ipl$_iopost
+;
+; Legal message types are:
+;
+; 3  - read data
+; 8  - write complete
+; 11 - characteristics
+; 13 - input count
+;
+; Outputs:
+;
+;	I/O status copied to IRP$L_IOST and I/O request posted.
+;
+;	R0-R2 are scratch.
+;
+;--
+CT_INTERRUPT:				; I/O completion interrupt handler
+	PUSHL	R6			; Save R6
+	BISW	#IRP$M_TERMIO,-
+		IRP$W_STS(R3) 		; Set terminal I/O completion
+	MOVL	IRP$L_MEDIA(R3),R6	; Save media (same as IOST1 location)
+	MOVW	#SS$_NORMAL,-
+		IRP$L_IOST1(R3)		; Assume success
+	MOVL	IRP$L_SVAPTE(R3),R2	; Get address of message
+	SUBL3	#CTP$B_PRO_MSGTYPE,-
+		(R2),R1			; Point to message
+
+	MOVZBL	CTP$B_MSGTYPE(R1),R0	; fetch message type
+	CMPB	#CTP$C_MT_READ_DATA,R0	; is it a read?
+	BEQL	POST_READ		; Branch if yes
+	CMPB	#CTP$C_MT_WRITE_COM,R0	; is it a write?
+	BNEQ	10$
+	BRW	POST_WRITE		; Branch if yes
+10$:
+	CMPB	#CTP$C_MT_CHAR,R0	; is it a read char?
+	BNEQ	15$			; nope
+	BRW	POST_SENSE		; Branch if yes
+15$:
+	CMPB	#CTP$C_MT_INP_COUNT,R0	; Input count?
+	BNEQ	20$
+	BRW	POST_SENSE_TYPEAHD	; post send type ahead
+
+20$:	MINOR_ERROR			; increment error count
+	popl	R6			;
+	RSB				; Is this a minor error?
+;
+; Set up buffer to post READ
+;
+POST_READ:
+
+	BICW	#FLG$M_CTRLO,-
+		UCB$W_CT_FLAGS(R5)	; Set no control O
+	MOVAB	CTP$T_RD_DATA(R1),(R2)	; Set address of data
+	MOVL	R6,4(R2)		; Set address of user buffer
+;
+; Fill in IOSB status
+;
+	MOVZWL	IRP$L_IOST2(R3),R0	; Fetch net message data length
+	CLRQ	IRP$L_IOST1(R3)		; clear status
+	SUBL2	#<CTP$T_RD_DATA- -
+		CTP$B_PRO_MSGTYPE>,R0	; subtract out header
+	CMPW	R0,IRP$W_BCNT(R3)	; Size of data greater than user buffer?
+	BGTRU	10$			; If gtru yes - leave user's size
+	MOVW	R0,IRP$W_BCNT(R3)	; Else, set size to actual data size
+	BEQL	20$			; If no data, terminator data not needed
+;
+; Set terminator data into IOSB
+;
+10$:
+	MOVZWL	CTP$W_RD_TERM_POS(R1),R6 ; Fetch offset to terminator
+	MOVW	R6,IRP$L_IOST1+2(R3)	; Set offset to terminator
+	SUBW3	R6,R0,IRP$L_IOST1+6(R3)	; Size of terminator
+	MOVL	(R2),R0			; Fetch address of data
+	MOVZBW	(R0)[R6],IRP$L_IOST1+4(R3) ; Terminator character
+;
+; Skip final fill in if not extended mode read
+;
+	BBC	#IO$V_EXTEND,-
+		IRP$W_FUNC(R3),20$
+	MNEGB	#1,IRP$L_IOST1+5(R3)	; set unused byte to -1
+	MOVB	CTP$B_RD_CURS_POS(R1),-
+		IRP$L_IOST1+7(R3)	; Set cursor position from EOL
+;
+; Map TSA read status to VMS read status
+;
+20$:
+	EXTZV	#0,#4,-
+		CTP$B_RD_FLAGS(R1),R0	; fetch status bits from read data flags
+	CMPB	#CTP$M_RD_INPFULL,R0	; input buffer was full?
+	BNEQ	30$			; if no, branch
+	CLRL	IRP$L_IOST1+4(R3)	; Clear terminator data
+30$:	MOVW	STAT_TABLE[R0],-
+		IRP$L_IOST1(R3)		; Get VMS status
+	CMPW	IRP$L_IOST1(R3),-
+		#SS$_CONTROLY		; CONTROL Y?
+	BNEQ	50$			; no, continue
+	BBC	#FLG$V_CTRLC,-
+		UCB$W_CT_FLAGS(R5),50$	; branch if ^C not just delivered
+	MOVW	#SS$_CONTROLC,-
+		IRP$L_IOST1(R3)		; set VMS status to ^C
+50$:	BRW	POST			;
+
+;
+; Set up buffer to post SENSEMODE/CHAR
+;
+POST_SENSE:				;
+
+	MOVAB	CTP$W_CH_PARAM(R1),(R2)	; Set address of data
+	MOVL	R6,4(R2)		; Set address of user data
+
+	PUSHR	#^M<R1,R2,R4,R6,R7,R8,R9,R10,R11>	; save
+	MOVL	R1,R2			; Set address of of CTP
+	MOVAB	IRP$L_FPC(R3),R9	; Set address of 12 byte buffer
+	MOVAB	IRP$L_IOST1(R3),R10	; Set address of 8 byte buffer
+	CLRQ	(R9)			; clear
+	CLRL	8(R9)			; clear
+	CLRQ	(R10)			; clear
+	
+	BSBW	CT_POST_SENSE		; Map list into qio data
+
+	POPR	#^M<R1,R2,R4,R6,R7,R8,R9,R10,R11> ; Restore
+
+	MOVQ	IRP$L_FPC(R3),-
+		CTP$W_CH_PARAM(R1)	; Move data into place
+	MOVL	IRP$L_FR4(R3),-
+		CTP$W_CH_PARAM+8(R1)	; Move data into place
+;
+; Set bits that can't be read through CTERM
+;
+	BICL3	#REMOTE_1, -
+		UCB$L_DEVDEPEND(R5),R0	; Clear all bits that can be read
+	BISL	R0,CTP$W_CH_PARAM+4(R1) ; Set bits that can't in return data
+	BICL3	#REMOTE_2, -
+		UCB$L_DEVDEPND2(R5),R0	; Clear all bits that can be read
+	BISL	R0,CTP$W_CH_PARAM+8(R1) ; Set bits that can't in return data
+	MOVL	CTP$W_CH_PARAM(R1),-
+		UCB$B_DEVCLASS(R5)	; store class, type and bufsiz
+	MOVQ	CTP$W_CH_PARAM+4(R1),-
+		UCB$L_DEVDEPEND(R5)	; store in UCB 
+	BSBB	SENSE_SPAWN		; sense bits for DCL
+	BRB	POST
+
+POST_WRITE:
+
+	BBC	#CTP$V_WC_DISCARD,-
+		CTP$B_WC_FLAGS(R1),10$	; branch if not ^Oed
+	MOVW	#SS$_CONTROLO,-
+		IRP$L_IOST1(R3)		; Set ^O status
+10$:
+	MOVW	IRP$W_BCNT(R3),-
+		IRP$L_IOST1+2(R3)	; Set byte count ?
+	MOVB	CTP$W_WC_HORPOS(R1),-
+		IRP$L_IOST1+6(R3)	; horizontal position
+	MOVB	CTP$W_WC_VERPOS(R1),-
+		IRP$L_IOST1+7(R3)	; vertical position
+	BRB	POST
+
+POST_SENSE_TYPEAHD:
+	
+	MOVZWL	IRP$L_IOST2(R3),R0	; Fetch net message data length
+	CLRQ	IRP$L_IOST1(R3)		; IOSB *** ?
+	MOVW	#SS$_NORMAL,IRP$L_IOST1(R3) ; IOSB
+	MOVAB	CTP$W_IC_COUNT(R1),(R2)	; Set address of data
+	MOVL	R6,4(R2)		; Set address of user buffer
+	SUBW3	#CTP$C_IC_MSGLEN-2,R0,-	; normal msglen - 2 gives return length
+		IRP$W_BCNT(R3)		; note this works for VMS "longer" IC msg
+POST:
+	POPL	R6			; Restore R6
+	POST_IO				; post I/O
+	RSB
+
+	.SBTTL	SENSE_SPAWN  Sense for spawn
+
+;	Sense special characteristics bits for DCL spawn command.
+;	Return bits for ctrl/c ast, outofband ast and associated mailbox.
+;	These bits may be reused later and are not for customer application
+;	consumption.
+;
+; inputs:
+;	r1 -> CTP message
+;	R5 -> UCB
+
+SENSE_SPAWN:
+	MOVAB	CTP$W_CH_PARAM+8(R1),R0	; Address of the characteristics
+	BICW	#TT2$M_DCL_MAILBX,(R0)	; Reset mailbox
+	TSTL	UCB$L_AMB(R5)		; Any associated mailbox?
+	BEQL	10$			; No
+	BISW	#TT2$M_DCL_MAILBX,(R0)	; Yes, so set characteristic
+10$:
+	RSB
+
+.SBTTL	CHECK_POST_IO, validate I/O to be posted
+
+;++
+;
+; Make paranoia check that I/O about to be posted has not been posted before.
+; Bugcheck system if it has.
+;
+; Input:
+;	R0 - post location
+;	R3 - IRP
+;
+; Output:
+;
+;	IRP$W_CT_POST is set as "posted"
+;
+;--
+
+CHECK_POST_IO:
+
+	TSTW	IRP$W_CT_POST(R3)	; Error if non-zero
+	BNEQ	20$			; branch if problems
+	BBSS	R0,IRP$W_CT_POST(R3),10$; set posted flag
+10$:	RSB
+	
+20$:	BUG_CHECK CTERM,FATAL		; should never happen!
+	RSB				; never get here	
+
+
+	.SBTTL	CT_CANCEL, Cancel I/O routine
+;++
+; CT_CANCEL, Cancels an I/O operation in progress
+;
+; Functional description:
+;
+;	This routine cancels any CTRL/C or CTRL/Y AST's that were
+;	requested by the cancelling process on the cancelling channel.
+;
+;	If there are no more references remaining to the device, the UCB
+;	is queued to the ACP to notify it that the device is no longer in
+;	use.  The ACP will then check that the reference count is still zero
+;	and remove the UCB from I/O database and deallocate it.
+;
+; Inputs:
+;
+;	R2 = negated value of the channel index number
+;	R3 = address of the current IRP (I/O request packet)
+;	R4 = address of the PCB (process control block) for the
+;		  process canceling I/O
+;	R5 = address of the UCB (unit control block)
+;	R8 = Cancel reason code
+;
+;	IPL = driver fork IPL
+;
+; Outputs:
+;
+;	DEV$M_DMT is set in UCB$L_DEVCHAR to prevent a race if someone
+;	assigns and deassigns another channel to the UCB before the ACP 
+;	dequeues the UCB.
+;
+;	The routine preserves all registers except R0-R3.
+;--
+.ENABLE	LOCAL_BLOCK
+
+ASSUME	CAN$C_CANCEL EQ 0
+ASSUME	CAN$C_DASSGN EQ 1
+
+10$:	BRW	130$
+20$:	BRW	120$
+
+CT_CANCEL:				; Cancel an I/O operation
+
+	BSBW	CT_WRITE_WRTCTP		; Flush write buffer
+
+	PUSHR	#^M<R4,R5,R6,R7,R9,R10,R11>	; Save registers
+	BBC	#UCB$V_ONLINE,-		; If clr unit offline - probably template
+		UCB$W_STS(R5),10$	;
+	TSTW	UCB$W_REFC(R5)		; Any more references to device?
+	BEQL	20$			; Nope all done.
+	;
+	; Send UNREADs for all current reads in server.
+	;
+	BSBW	CT_SEND_UNREAD		; Cancel outstanding read IRPs
+	;
+	; Cancel all IRPs waiting in STALLQ that match this cancel
+	;
+	MOVAB	UCB$L_CT_STALLQFL(R5),R1 ; Stall Q
+	BSBW	CANCEL_LIST		; run down list
+	MOVAB	UCB$L_RTT_IRPFL(R5),R1	; Queue irp
+	BSBW	CANCEL_LIST		; run down list
+
+	CLRL	R10			; Mask for out of band disable
+	TSTL	R8			; Cancel or deassign
+	BEQL	40$			; Cancel
+	;
+	; Note that cancel ^Y out of bands are never sent
+	;
+	MOVAL	UCB$L_TL_CTRLY(R5),R7	; Get address of CTRL/Y AST list
+	JSB	G^COM$FLUSHATTNS	; Flush all cancelled AST's
+40$:
+	MOVAL	UCB$L_TL_CTRLC(R5),R7		; Get address of CTRL/C AST list
+	TSTL	(R7)				; zero list?
+	BEQL	50$				; skip flush
+	JSB	G^COM$FLUSHATTNS		; Flush any cancelled AST's
+	TSTL	UCB$L_TL_CTRLC(R5)		;  *** Did get flushed (status would
+						;  be nice here) this test may fail
+	BNEQ	50$				; Branch if no
+	MOVZBL	#<1@TTY$C_CTRLC>,R10		; Set ^C bit
+50$:
+	MOVAB	UCB$L_TL_OUTBAND(R5),R2	; Address of the include mask
+	MOVAB	UCB$L_TL_BANDQUE(R5),R7	; Address of the outofband list
+
+	PUSHL	R2			; Save mask address
+	BISL	(R2),R10		; Set bits now enabled
+	JSB	G^COM$FLUSHCTRLS	; Flush them by channel etc
+	POPL	R2			; Restore mask address	
+	BICL	(R2),R10		; Clear bits still enabled
+;
+; Check if Out of band's were disabled
+;
+	MOVZWL	#CTP$M_CH_OO!CTP$M_CH_D,R9	; Set up mask and cancel code
+	BSBW	SEND_OOB_MSG		; send out of band message
+;
+; Update UCB OOB masks
+;
+	SUBL	#12,SP			; allocate 3 longwords
+	MOVL	SP,R11			; pointer
+	BSBW	FETCH_OOB_DATA		; fetch data from OOB LIST
+	;
+	; Update UCB with new masks
+	;
+	MOVQ	AST_INCLUDE(R11),-
+		UCB$L_CT_INCLUDE(R5)	; set new OOB data
+	MOVL	AST_ABORT(R11),-
+		UCB$L_CT_ABORT(R5)	; and abort
+	ADDL	#12,SP			; reset stack
+
+	BRB	130$
+;
+; Clean up the ucb after all references have gone. 
+; An attempt is made to get an unbind through.  There is no
+; guarantee made about this message really being sent.
+;
+120$:
+	MOVZBL	#UNBIND$C_USER,R0	; unbind reason code
+	BSBW	SEND_UNBIND		; send it with common routine
+	BSBW	CT_ABORTIRPS		; Flush all irps from queue
+					; Insert UCB in ACP queue
+130$:
+	POPR	#^M<R4,R5,R6,R7,R9,R10,R11>	; Restore registers
+	RSB				; Return
+
+.DISABLE LOCAL_BLOCK
+
+;
+; R1 - address of IRP list to run down
+; R2 - channel number
+; R4 - PCB
+;
+
+CANCEL_LIST:
+
+	MOVL	R1,R7			; copy
+	MOVL	R2,R6			; Make a copy of channel number
+30$:	
+	MOVL	(R7),R7			; Get next IRP
+	CMPL	R7,R1			; At list head?
+	BEQL	35$			; exit if yes
+	CMPL	IRP$L_PID(R7),PCB$L_PID(R4) ; PID match?
+	BNEQ	30$			; branch if no
+	CMPW	R6,IRP$W_CHAN(R7)	; channel match?
+	BNEQ	30$			; branch if no
+	TSTB	IRP$B_CT_CANCEL(R7)	; UNREAD send?
+	BNEQ	30$			; if so, skip post and wait for server
+	PUSHL	R3			; save
+	MOVL	R7,R3			; save IRP
+	MOVL	4(R7),R7		; move back one link
+	REMQUE	(R3),R3			; remove from queue
+	POST_IO				; post I/O
+	POPL	R3			; restore
+	BRB	30$			; loop	
+35$:
+	RSB
+
+	.SBTTL	CT_HANGUP  - Perform hangup functions
+	.SBTTL	CT_ABORTIRPS - Abort irps outstanding
+;++
+; CT_HANGUP  Perform hangup functions
+; CT_ABORTIRPS
+;
+; Functional description:
+;
+;	Deliver any CTRL/Y AST's, specifying hang-up;
+;	deliver a hangup message to associated mailbox.
+;	Post any irps outstanding with abort.
+;	Set hangup status in device status.
+;	The ucb is passed on to the acp if there are no more
+;	channels open to it.
+;	HANGUP is called by net device errors and hangup operations
+;	from the line on the other end.
+;	ABORTIRPS is called on net device cancels and channel deassigns.
+;
+; Inputs:
+;
+;	R5 = address of UCB
+;
+;
+; Outputs:
+;
+;	Message or AST(s) delivered.
+;
+;--
+CT_HANGUP:
+	MOVAL	UCB$L_TL_CTRLY(R5),R4	; Get address of CTRL/Y AST list
+	MOVL	R4,R0			; Copy list address
+10$:
+	MOVL	(R0),R0			; Get address of next entry
+	BEQL	20$			; If eql none
+	MOVZWL	#SS$_HANGUP,-		; Insert new parameter for AST
+		ACB$L_KAST+4(R0)	;
+	BRB	10$			;
+20$:
+	PUSHL	R6			; save (Necessary?)
+	MOVL	UCB$L_TL_CTLPID(R5),R6	; Set controlling PID
+	JSB	G^COM$DELATTNASTP	; Deliver the AST's
+	POPL	R6			; restore
+	MOVL	#MSG$_TRMHANGUP,R4	; Set mailbox message type
+	MOVL	UCB$L_AMB(R5),R3	; Get associated mailbox address
+	BEQL	30$			; If eql none - forget it
+	JSB	G^EXE$SNDEVMSG		; Deliver notification to mailbox
+30$:
+	BISW	#UCB$M_TT_HANGUP,-	; Save hangup status
+		UCB$W_DEVSTS(R5) 	;
+
+
+;
+;	Clean up the outstanding iirp read to network so it completes
+;	without calling driver again.  Post all outstanding irps with
+;	abort.
+;
+
+CT_ABORTIRPS:
+
+;
+; Release TQE
+; 
+	DSBINT	#IPL$_TIMER		; Synch with timer queue ***
+	MOVL	UCB$L_CT_TQE(R5),R0	; Get TQE address
+	BEQL	7$			; Branch if none
+	CLRL	UCB$L_CT_TQE(R5)	; Clear address
+	BISB	#TQE$M_DELETE,-		; Assume timer is busy,
+		TQE$L_FR3(R0)		;  set delete pending bit
+	BBS	#TQE$V_BSY,-
+		TQE$L_FR3(R0),7$	; Branch if busy, will delete in timer routine
+	BSBW	50$			; Return to pool
+;
+;	We must be at ipl 7 or above here
+;
+
+7$:	ASSUME IPL$_TIMER EQ 8
+
+;
+;	Fix the interlock with the receive iirp so it will be deallocated
+;	when it completes.  We must say we did so here.  The condition is
+;	NETIRP = 1 and IRP$L_AST = 0 means that its gone.  If NETIRP = 0
+;	it has never been allocated and given to netdriver.
+;
+
+	MOVL	UCB$L_CT_RIIRP(R5),R0	; Look at address of receive iirp
+	BEQL	10$			; Nope not here
+	BLBS	R0,10$			; Dummy, all done?
+	CLRL	IRP$L_AST(R0)		; Nope so tell receive iirp
+10$:	MOVL	#1,UCB$L_CT_RIIRP(R5)	; Clobber address here
+;
+; Check if WIIRP is busy writing to net
+;
+	MOVL	UCB$L_CT_WIIRP(R5),R0	; Get address
+	BEQL	25$			; Branch if none
+	CLRL	IRP$L_AST(R0)		; Signal net dead, UCB gone
+	CLRL	UCB$L_CT_WIIRP(R5)	; zap pointer
+	BBS	#FLG$V_WIIRP_BSY,-
+		UCB$W_CT_FLAGS(R5),25$	; Branch if writing to net
+20$:
+	BSBW	50$			; WIIRP not busy, Return to pool
+;
+;	Now we abort all of the queued irps that we have at this time.
+;
+25$:
+	REMQUE	@UCB$L_RTT_IRPFL(R5),R3	; Obtain an irp from queue
+	BVS	30$			; No more
+	MOVZWL	#SS$_ABORT, -		; Complete with abort status
+		IRP$L_IOST1(R3)		;
+	CLRL	IRP$L_IOST2(R3)		;
+	POST_IO				; post I/O
+	BRB	25$			; and back for more irps
+
+30$:	REMQUE	@UCB$L_CT_NETQFL(R5),R0 ; Obtain a CTP from queue
+	BVS	40$			; No more
+	BSBB	50$			; delete
+	BRB	30$			; and back for more irps
+	;
+	; Abort STALLED IRP queue
+	;
+40$:
+	REMQUE	@UCB$L_CT_STALLQFL(R5),R3 ; Get stalled IRP
+	BVS	60$			; branch if done
+	MOVZWL	#SS$_ABORT, -		; Complete with abort status
+		IRP$L_IOST1(R3)		;
+	CLRL	IRP$L_IOST2(R3)		;
+	POST_IO				; post I/O
+	BRB	40$			; Loop until done
+	
+;
+; Local routine to return buffer to pool
+;
+50$:	JSB	G^EXE$DEANONPAGED	; Return to pool
+	RSB				; Exit
+60$:
+	BBS	#FLG$V_INWRTFDT,-
+		UCB$W_CT_FLAGS(R5),80$	; if FDT in progress, exit
+	MOVL	UCB$L_CT_WRTCTP(R5),R0	; Fetch multiple write buffer
+	BEQL	80$			; branch if none exists
+	BSBB	50$			; Dispose of buffer
+	ASSUME	UCB$L_CT_WRTCTP+4 EQ UCB$L_CT_WRTCUR
+	CLRQ	UCB$L_CT_WRTCTP(R5)	; Clear buffer addresses
+;
+;	If there are no more channels to this device, then pass it on
+;	to the acp for disposal.
+;
+80$:	TSTW	UCB$W_REFC(R5)		; Any channels to device?
+	BNEQ	100$			; Yes
+
+	BICW	#UCB$M_JOB,-		; Clear Job Controller notified
+		UCB$W_DEVSTS(R5)	;
+	BBSS	#DEV$V_DMT,-		; If set, UCB already queued
+		UCB$L_DEVCHAR(R5),100$	;
+	MOVL	R5,R3			; Set up ucb as the packet
+	MOVL	UCB$L_VCB(R5),R2	; Get address of VCB
+	MOVL	VCB$L_AQB(R2),R2	; Get address of ACP AQB
+	JSB	G^EXE$INSERTIRP		; Insert UCB in ACP queue
+	BNEQ	100$			; If neq, not first entry in queue
+	MOVL	AQB$L_ACPPID(R2),R1	; Get ACP process ID
+	JSB	G^SCH$WAKE		; Wake the ACP process
+
+;**************** DEBUG CODE ***
+.IF DF DEBUG_LOG
+	IFNOTOPT LOGGING,85$		; branch if not logging
+	PUSHR	#^M<R6,R7,R8>		; save
+	CLRQ	R6			; no length or address
+	MOVL	#3,R8			; abort net code
+	BSBW	TTY$LOG_IO		; log to mailbox	
+	POPR	#^M<R6,R7,R8>		; save
+85$:
+.ENDC
+;**************** DEBUG CODE ***
+
+100$:
+	ENBINT				; Restore IPL
+	RSB				;
+
+
+	.SBTTL CT_WRITE_WRTCTP - Send WRTCTP to NET
+
+;
+; CT_WRITE_WRTCTP - Send message if it exists
+;
+; Inputs:
+;	R4 - PCB
+;	R5 - CT UCB
+;
+; R0-R1 Scratch
+;
+
+CT_WRITE_WRTCTP:
+
+	DSBINT	#CT$K_FIPL		; synchronize 
+	PUSHR	#^M<R2,R3,R4,R5,R8>	; Save
+	MOVL	#1,R0			; Assume success
+	MOVL	UCB$L_CT_WRTCTP(R5),R2	; Fetch CTP address
+	BEQL	20$			; Branch if none
+	SUBL3	R2,-
+		UCB$L_CT_WRTCUR(R5),R3	; Calculate size of buffer
+	ADDL2	#2,R3			; Plus two for foundation type
+	MOVW	R3,CTP$W_DATSIZE(R2)	; Set size
+;
+; Clean up
+;
+	CLRL	UCB$L_CT_WRTCTP(R5)	; Clear address
+	ASSUME	UCB$L_CT_WRTCUR+4 EQ UCB$W_CT_WRTSIZ
+	ASSUME	UCB$L_CT_WRTCUR+6 EQ UCB$W_CT_WRTCNT
+	CLRQ	UCB$L_CT_WRTCUR(R5)	; Clear address, count, and offset
+	incl	@ucb$l_cnt_addr(r5)	; %%% performance hook
+;
+; Write to net
+;
+	BSBB	CT_NET_Q_MSG		; Send the message
+20$:
+	POPR	#^M<R2,R3,R4,R5,R8>	; Restore
+	ENBINT				; Lower IPL
+	RSB
+
+
+	.SBTTL CT_NETMSGSEND  - Send message to net driver
+;
+; CT_NETMSGSENDX  -  Send message to netdriver and exit qio
+; CT_NET_Q_MSG    -  Send message to netdriver without IRP
+; CT_NET_WRITE    -  Write message to net (through NETDRIVER)
+;
+; inputs:
+;	r2 - address beyond message data (maybe this should be CTP, 
+;			R0 is address of one byte past...***)
+;	r3 - CT irp
+;	r4 - pcb
+;	r5 - CT ucb
+;
+; R0-R2 Destroyed
+;
+
+CT_NETMSGSENDX:		; Called from FDT level routines
+
+	MOVL	IRP$L_SVAPTE(R3),R0	; The buffer address
+	CLRL	IRP$L_SVAPTE(R3)	; Clear buffer address
+	CLRB	IRP$B_CT_CANCEL(R3)	; No cancel has been sent yet
+	SUBL3	CTP$L_MSGDAT(R0),R2,R1	; Make the length of the data
+	MOVW	R1,CTP$W_DATSIZE(R0)	; save in the buffer
+	SUBW3	#<CTP$B_MSGTYPE-CTP$B_PRO_MSGTYPE>,-
+		R1,CTP$W_MSGSIZE(R0)	; Fill in size of single message
+	TSTB	IRP$B_CT_RESPTYPE(R3)	; See if response from SERVER expected
+	BEQL	10$			; Branch if not
+	INSQUE	(R3),-
+		@UCB$L_RTT_IRPBL(R5)	; Queue irp
+10$:
+	PUSHL	R3			; Save IRP
+	MOVL	R0,R2			; Set CTP address
+	DSBINT	#CT$K_FIPL		; Do this work at driver ipl
+	BSBB	CT_NET_Q_MSG		; Send the message and
+	ENBINT				; Enable interrupts
+	POPL	R3			; restore IRP
+	TSTB	IRP$B_CT_RESPTYPE(R3)	; See if response from SERVER expected
+	BEQL	20$			; Branch if not
+	JMP	G^EXE$QIORETURN		; Return from the qio
+20$:	BRW	FDT_FINISHIOC_OK	; Finish I/O
+
+;
+; Inputs:
+;	R2 - CTP
+;	R5 - CT UCB
+;
+;	IPL = ??? Driver ipl, right? (check all callers)
+;
+CT_NET_Q_MSG:
+
+.if df debug
+	movw	ctp$w_datsize(R2),R0	; ** debug
+	addw2	#ctp$b_pro_msgtype,R0	; ** debug
+	cmpw	8(R2),R0		; ** debug check size (should be equal)
+	bgequ	10$			; ** debug br if ok
+	jsb	G^ini$brk		; ** debug
+10$:
+.endc
+	BLBS	UCB$L_CT_RIIRP(R5),Q_ERR ; If LBS, Net has hungup
+	BBCS	#FLG$V_WIIRP_BSY,-
+		UCB$W_CT_FLAGS(R5),20$	; Branch if not busy, set busy flag
+;
+; Queue message until netdriver returns IIRP
+;
+	INSQUE	(R2), -
+		@UCB$L_CT_NETQBL(R5)	; Queue request on the ucb
+	INCW	UCB$W_CT_QCTPCNT(R5)	; Increment count
+	MOVL	#1,R0			; Set status
+	RSB				; return
+20$:
+
+CT_NET_WRITE:
+;
+;	R2 		      - CTP
+;	R5 		      - CT UCB
+;	CTP$W_DATSIZE	      - size of message to write
+;
+	MOVL	UCB$L_CT_WIIRP(R5),R3	; Get address of IIRP
+	ASSUME	CTP$L_MSGDAT+4 EQ CTP$L_USRBFR
+	MOVQ	CTP$L_MSGDAT(R2),(R2)	; Move to first two longwords of structure
+	MOVL	R2,IRP$L_SVAPTE(R3)	; Set address in IIRP
+	MOVW	CTP$W_DATSIZE(R2), -	; Set the size of the buffer
+		IRP$W_BCNT(R3)		;
+
+;**************** DEBUG CODE ***
+.IF DF DEBUG_LOG
+	IFNOTOPT LOGGING,15$		; branch if not logging
+	PUSHR	#^M<R6,R7,R8>		; save
+	MOVZWL	IRP$W_BCNT(R3),R6	; length
+	MOVL	@IRP$L_SVAPTE(R3),R7	; address
+	MOVL	#1,R8			; write to net code
+	BSBW	TTY$LOG_IO		; log to mailbox	
+	POPR	#^M<R6,R7,R8>		; save
+15$:
+.ENDC
+;**************** DEBUG CODE ***
+
+	PUSHR	#^M<R3,R4,R5>		; Save the magic three
+	MOVL	IRP$L_UCB(R3),R5	; The netucb from this packet
+	JSB	G^EXE$ALTQUEPKT		; Queue iirp to netdriver
+	POPR	#^M<R3,R4,R5>		; restore magic three
+	MOVL	#1,R0			; return success
+	RSB
+Q_ERR:
+	PUSHL	R2			; Save CTP
+	BSBW	CT_ABORTIRPS		; Clean up queues (again)
+	POPL	R0			; restore CTP
+	JSB	G^EXE$DEANONPAGED	; Get rid of the buffer
+	RSB
+
+
+	.SBTTL	CT_NETWRTDONE  - Post routine for net write
+;
+; CT_NETWRTDONE
+;
+;	Called here via JSB from IOPOST because PID field in IIRP is
+;	negative (i.e. the address of this routine). 
+;
+;	*** This routine has been coded so that there is no dependance
+;	*** on data in the CTP. This is because NETDRIVER may soon learn
+;	*** to use the CTP as it's own buffer and the IIRP will return
+;	*** here with SVAPTE as zero...
+;
+;	Enter here to post writes to net.
+;	Deallocate the message buffer if any.
+;
+;	r5 -> write iirp
+;	ipl = ipl$_iopost (is CT$K_FIPL ok for mucking with STALL Q???)
+;
+;	R0-R5 are scratch, return to IOPOST.
+;
+;
+
+CT_NETWRTDONE:
+
+	;
+	; Status of the write is not checked. This is 
+	; because if the link fails,
+	; it will be reported via the read queued at CT_NETREADDONE.
+	;
+	DSBINT	#CT$K_FIPL		; Set ipl
+	MOVL	IRP$L_SVAPTE(R5),R0	; Get buffer address if it exists
+	BEQL	10$			; Branch if it doesn't
+	CLRL	IRP$L_SVAPTE(R5)	; clear pointer
+	JSB	G^COM$DRVDEALMEM	; Deallocate buffer
+10$:
+	MOVL	R5,R2			; Move IIRP address
+	MOVL	IRP$L_AST(R2),R5	; Get UCB address
+	BEQL	150$			; If zero, net hungup during write
+	;
+	; See if there is another message to write
+	;
+100$:
+	REMQUE	@UCB$L_CT_NETQFL(R5),R2	; Another packet?
+	BVS	110$			; Branch if no
+	DECW	UCB$W_CT_QCTPCNT(R5)	; subtract one
+	BSBW	CT_NET_WRITE		; Write to net	
+	CMPW	#CT$K_CTPLOLIM,-	
+		UCB$W_CT_QCTPCNT(R5)	; Queue getting low
+	BLSS	140$			; Exit
+	BRB	120$			; complete stalled IRP
+	;
+	; Writing to net has emptied CTP queue, check if there are stalled IRPS...
+	;
+110$:
+	CLRW	UCB$W_CT_QCTPCNT(R5)	; Clear (should be redundant)
+	BICB	#FLG$M_WIIRP_BSY,-
+		UCB$W_CT_FLAGS(R5)	; Clear busy flag
+120$:
+	REMQUE	@UCB$L_CT_STALLQFL(R5),R3 ; Get stalled IRP
+	BVS	140$			; branch if done
+	POST_IO				; post I/O
+	BRB	120$			; Loop until done
+140$:	
+	ENBINT				; Back to ipl$_iopost
+	RSB
+
+;
+; Net has hung up while doing write, return WIIRP to pool, (UCB is gone?)
+;
+
+150$:
+	MOVL	R2,R0			; Set address of WIIRP
+	JSB	G^EXE$DEANONPAGED	; Return to pool
+	BRB	140$			; exit
+
+
+	.SBTTL	CT_UNSOLIC Unsolicited interrupt handler
+;++
+; CT_UNSOLIC, Unsolicted interrupt handler
+;
+; Functional description:
+;
+;	This routine handles unsolicted attention messages from the remote
+;	ACP (REMACP).
+;
+; Inputs:
+;
+;	R3 = address of attention message (type = DYN$_BUFIO)
+;		first longword in structure points to data.
+;	R5 = address of UCB
+;
+;	IPL = 0
+;
+; Outputs:
+;
+;	Buffer pointed to by R3 is returned to pool.
+;
+;--
+CT_UNSOLIC:				; Unsolicted interrupt handler
+
+; *** some checking of message type should take place here, right???
+
+	PUSHL	R3			; Save buffer address
+	DSBINT	#CT$K_FIPL		; Synch
+	BSBW	STARTNETRCV		; Start up net read
+	ENBINT				; Enable interrupts
+	POPL	R0			; Restore buffer address
+	JSB	G^EXE$DEANONPAGED	; Return to pool
+	RSB				; return to REMACP
+
+
+	.SBTTL	CT_NETREADDONE  - Post routine for net receive
+;
+; CT_NETREADDONE  Post net receive
+;
+;	This is the post routine for receives from the netdriver.
+;	If the type is not recognised or we can't find the irp,
+;	we hangup the terminal.
+;
+;	We are going to run this code at CT driver ipl.
+;
+; inputs:
+;	r5 -> net iirp
+;	ipl = ipl$_iopost
+;	
+;	R0-R5 are scratch, return to IOPOST.
+;
+
+CT_NETREADDONE:
+
+	DSBINT	#CT$K_FIPL		; Do this work at driver ipl
+	PUSHL	R5			; Save net read IIRP address
+	MOVL	R5,R3			; The iirp address is here
+	MOVL	IRP$L_AST(R3),R5	; The CT ucb?
+	BEQL	20$			; Its gone, we are hung up 
+	BLBC	IRP$L_IOST1(R3),15$	; Error? if so then hang up
+	MOVL	IRP$L_SVAPTE(R3),R2	; The buffer address
+	SUBL3	#CTP$B_PRO_MSGTYPE,-
+		(R2),R1			; Point to message
+	;
+	; Consistency check - make sure we really only get one
+	; message here
+	;
+	MOVZWL	CTP$W_MSGSIZE(R1),R0	; length of message
+	ADDL	#4,R0			; Plus 4 for found overhead & msg size
+	CMPW	R0,IRP$W_BCNT(R3)	; compare to DECnet message length
+	BEQL	5$			; Branch if OK
+	MINOR_ERROR			; increment error count
+	BRB	5$			; continue
+
+15$:	BRW	FOUND_ERROR		; error on net, must hangup
+20$:	BRW	FOUND_ERROR_2		; error, hangup already done
+
+5$:
+;**************** DEBUG CODE ***
+.IF DF DEBUG_LOG
+	IFNOTOPT LOGGING,7$		; branch if not logging
+	PUSHR	#^M<R6,R7,R8>		; save
+	MOVZWL	IRP$W_BCNT(R3),R6	; length
+	MOVL	(R2),R7			; address
+	MOVL	#2,R8			; write to net code
+	BSBW	TTY$LOG_IO		; log to mailbox	
+	POPR	#^M<R6,R7,R8>		; save
+7$:
+.ENDC
+;**************** DEBUG CODE ***
+
+	CASE	CTP$B_PRO_MSGTYPE(R1),-	; case on message type
+		<10$,-			; 0 is illegal
+		 FOUND_BIND,-		
+		 FOUND_UNBIND,-
+		 FOUND_REBIND,-
+		 FOUND_ACCEPT,-
+		 FOUND_ENTR_MODE,-
+		 FOUND_EXIT_MODE,-
+		 FOUND_CONF_MODE,-
+		 FOUND_NO_MODE,-
+		 FOUND_CTERM,-
+		 FOUND_MODE>,-		; type 10 not used yet
+		TYPE = B
+
+10$:	MINOR_ERROR			; increment error count
+	BRW	FOUND_EXIT		; requeue read
+
+
+.SBTTL	FOUNDATION - Miscellaneous foundation message
+
+FOUND_BIND:
+;
+;	Start the first receive iirp to the netdriver.  We make an iirp
+;	and queue it to the netdriver with a read function in it.
+;	Also, the write IIRP is allocated and the address is saved in the
+;	UCB for future reference.
+;
+; inputs:
+;	R3 - message buffer (IRP)
+;	R5 - CT ucb
+;	
+
+	BSBW	STARTNETRCV		; will we ever get here?
+	BRW	FOUND_EXIT		; exit
+
+FOUND_UNBIND:
+;
+; Deliver hangup notification ??? UNBIND ???
+;
+HANGUP:					; Dataset hangup
+	BSBW	CT_HANGUP		; Do the hangup stuff
+	BRW	FOUND_EXIT
+
+FOUND_REBIND:				; Ignore all these messages for now
+FOUND_ACCEPT:
+FOUND_ENTR_MODE:
+FOUND_EXIT_MODE:
+FOUND_CONF_MODE:
+FOUND_NO_MODE:
+FOUND_MODE:
+
+	BRW	FOUND_EXIT
+
+
+.SBTTL	FOUND_CTERM - Foundation CTERM message
+
+FOUND_CTERM:
+
+;
+; Legal message types are:
+;
+; 1  - init	
+; 3  - read data	+
+; 4  - out of band	
+; 8  - write complete	+
+; 9  - discard state
+; 11 - characteristics	+
+; 13 - input count	+
+; 14 - input state
+;
+; Those labeled above with "+" are expected data, i.e. they have an IRP
+; waiting in the CT ucb queue. The others are unsolicited data.
+; 
+
+	CASE	CTP$B_MSGTYPE(R1),-
+		<10$,-			; 0
+    		CTERM_INIT,10$,-	; 1,2
+		20$,-			; 3
+		CTERM_OUTBAND,-		; 4	
+		10$,10$,10$,-		; 5,6,7
+		20$,-			; 8
+		CTERM_DISCARD,-		; 9
+		10$,20$,-		; 10,11
+		10$,20$,-		; 12,13
+		CTERM_IN_STATE,-	; 14
+		VMS_QIO,-		; 15 (VMS specific)
+		VMS_BRDCST-		; 16 (VMS specific)
+		>-
+		TYPE = B
+;
+; Unknown
+;
+10$:
+	BRW	FOUND_EXIT
+		
+;
+; IRP queue is assumed to be in order for reads, characteristics,
+; and input counts. All these packets have the FUNC bit set in the 
+; queued IRP. The write packets can complete asynchronously to all
+; these other types, and they do not have the FUNC bit set. Search
+; for the associated IRP:
+;
+
+20$:
+	MOVAQ	UCB$L_RTT_IRPFL(R5),R4	; Look through the irps for ours
+	MOVL	R4,R0			; head of queue here
+
+30$:	MOVL	(R4),R4			; Link through chain
+	CMPL	R4,R0			; end of irps?
+	BEQL	40$			; Yes, could not find it, ignore it
+	; NB: this error used to abort link, now it only gets ignored.
+	; this is because of a change to CANCEL that could potentially
+	; zpa the IRP in the waiting list.
+	CMPB	CTP$B_MSGTYPE(R1), -
+		IRP$B_CT_RESPTYPE(R4)	; Does it match?
+	BNEQ	30$			; Branch if no
+;
+; A match has been found
+;
+	CLRL	IRP$L_SVAPTE(R3)	; Buffer not in net iirp now
+	MOVW	IRP$W_BCNT(R3),-
+		IRP$L_IOST2(R4)		; Set size of buffer read from net
+	REMQUE	(R4),R3			; Remove the CT irp from queue
+	MOVL	R2,IRP$L_SVAPTE(R3)	; stick buffer there
+	BSBW	CT_INTERRUPT		; and call interrupt routine
+40$:
+	BRW	FOUND_EXIT
+
+
+CTERM_INIT:
+	;
+	; Parse INIT message, set up parameters
+	;
+	ASSUME	CTP$B_IN_VERSION+1 EQ CTP$B_IN_ECO
+	ASSUME	UCB$B_CT_VERSION+1 EQ UCB$B_CT_ECO
+	MOVW	CTP$B_IN_VERSION(R1),-
+		UCB$B_CT_VERSION(R5)	; Save version and ECO	
+
+	PUSHR	#^M<R6,R7,R8,R9,R10>	; Save some work registers
+	MOVAB	CTP$B_IN_PARMTYPE(R1),R6 ; address of first parameter
+	MOVAB	CTP$B_MSGTYPE(R1),R7	; address of start of message
+	MOVZWL	CTP$W_MSGSIZE(R1),R10	; length of message
+	ADDL	R7,R10			; calculate end of message
+
+10$:	CMPL	R10,R6			; Check against end of message
+	BLEQ	90$			; Exit loop if done
+	MOVZBL	1(R6),R7		; Size of parameter
+	MOVL	#2,R9			; Default maximum storage area size
+	CASE	(R6),-
+		<20$,30$,40$,50$>,-	; case on selector
+		TYPE=B,LIMIT=#1		; Limit is really base?
+	MINOR_ERROR			; increment error count
+	BRB	90$			; continue (no attempt to continue parsing)
+	
+20$:	MOVAB	UCB$W_CT_MAXMSG(R5),R8	; Max message that can written to net
+	BRB	70$
+30$:	MOVAB	UCB$W_CT_MAXREAD(R5),R8	; Max read buffer server can handle
+	BRB	70$
+40$:	MOVAB	UCB$L_CT_LEGALMSG(R5),R8; Legal messages
+	MOVL	#4,R9			; Max size to store
+	BRB	70$
+	;
+	; parameter 4 is VMS-specific
+	;
+	ASSUME	UCB$B_DEVCLASS+1  EQ UCB$B_DEVTYPE	; assume 12 contiguous bytes
+	ASSUME	UCB$B_DEVTYPE+1   EQ UCB$W_DEVBUFSIZ
+	ASSUME	UCB$W_DEVBUFSIZ+2 EQ UCB$L_DEVDEPEND
+	ASSUME	UCB$L_DEVDEPEND+4 EQ UCB$L_DEVDEPND2
+50$:	MOVAB	UCB$B_DEVCLASS(R5),R8	; address of characteristics, etc.
+	MOVL	#12,R9			; length
+	
+70$:	MOVAB	2(R6),R6		; bias
+	CMPL	R7,R9			; check sizes
+	BLEQU	75$			; branch if it fits
+	MINOR_ERROR			; increment error count
+	SUBL3	R9,R7,-(SP)		; calculate remainder
+	MOVL	R9,R7			; set size
+	POPL	R9			; remainder
+	BRB	80$			;
+75$:	CLRL	R9			; Set no remainder
+		
+80$:	MOVB	(R6)+,(R8)+		; set up
+	SOBGTR	R7,80$			; Loop through
+	MOVAB	(R6)[R9],R6		; add remainder
+	BRB	10$			; Loop
+90$:
+	;
+	; Should have LEGALMSG filled in now, check for base cterm
+	;
+	CMPZV	#0,#15,-
+		UCB$L_CT_LEGALMSG(R5),-
+		#^B0111111111111110	; required messages
+	BEQL	95$			; branch if ok
+	MINOR_ERROR			; Minor protocol error
+95$:	POPR	#^M<R6,R7,R8,R9,R10>	; Restore
+	;
+	; Pick up host characteristic SYSPASWORD
+	;
+	BICL	#TT2$M_SYSPWD,UCB$L_DEVDEPND2(R5)	; Clear bit
+	BBC	#TT2$V_SYSPWD,G^TTY$GL_DEFCHAR2,97$	; skip if clear
+	BISL	#TT2$M_SYSPWD,UCB$L_DEVDEPND2(R5)	; Set bit
+97$:
+	;
+	; Notify JOB CONTROLER if logins are enabled. This is a difference
+	; from the old vax protocol. A unsolicted data message was generated
+	; in RTPAD to fake a login attempt. TSA defines this differently,
+	; so the login startup is done here. It is a protocol error to 
+	; receive more than one INIT message, but that isn't checked here.
+	;
+	MOVL	G^TTY$GL_JOBCTLMB,R3	; Get address of Job Controller mailbox
+	TSTW	UCB$W_DEVSTS(R3)	; Test high bit *** hack, needs symbol
+	BGTR	100$			; If clear, continue
+	BRW	FOUND_ERROR		; hangup and exit, logins are disabled
+100$:
+	BBS	#UCB$V_JOB,UCB$W_DEVSTS(R5),110$ ; Branch if notified already
+	MOVZBL	#MSG$_TRMUNSOLIC,R4	; Set mailbox message type
+	JSB	G^EXE$SNDEVMSG		; Deliver notification to mailbox
+	BLBC	R0,110$			; If lbc failure
+	BISW	#UCB$M_JOB,UCB$W_DEVSTS(R5) ; Set Job Controller notified
+110$:
+	BRW	FOUND_EXIT		; exit
+
+	;
+	; Deliver unsolicited data notification
+	;
+CTERM_IN_STATE:				; Unsolicited data
+
+	BBC	#CTP$V_IS_NONZERO,-
+		CTP$B_IS_FLAGS(R1),10$	; Branch if not a zero to non-zero change
+	TSTW	UCB$W_REFC(R5)		; Any references to device?
+	BEQL	10$			; If eql no - notify Job Controller
+	MOVL	UCB$L_AMB(R5),R3	; Get address of associated mailbox
+	BEQL	10$			; If eql none - forget it
+	MOVZBL	#MSG$_TRMUNSOLIC,R4	; Set mailbox message type
+	JSB	G^EXE$SNDEVMSG		; Deliver notification to mailbox
+10$:
+	BRW	FOUND_EXIT
+
+;
+; Change output discard state, user has typed ^O.
+;
+CTERM_DISCARD:
+
+	BISW	#FLG$M_CTRLO,-
+		UCB$W_CT_FLAGS(R5)	; Assume Set ^O
+	BBS	#CTP$V_DS_DISCARD,-
+		CTP$B_DS_FLAGS(R1),10$	; Branch if output being suppressed
+	BICW	#FLG$M_CTRLO,-
+		UCB$W_CT_FLAGS(R5)	; Clear ^O
+	BISW	#FLG$M_CANCTRLO,-
+		UCB$W_CT_FLAGS(R5)	; Set cancel ^O pending 
+10$:
+	BRW	FOUND_EXIT		; exit
+
+CTERM_OUTBAND:
+
+	MOVZBL	CTP$B_OB_CHAR(R1),R3	; Deliver the asts (char)
+	BBC	R3,UCB$L_TL_OUTBAND(R5),10$ ; branch if no OOB in mask
+	MOVAB	UCB$L_TL_BANDQUE(R5),R4	; List address
+	PUSHR	#^M<R1,R6>		; save CTP (and R6?)
+	MOVL	UCB$L_TL_CTLPID(R5),R6	; Set controlling PID
+	JSB	G^COM$DELCTRLASTP	; Deliver the asts
+	POPR	#^M<R1,R6>		; restore CTP, R6
+10$:
+;
+; Check for ^C or ^Y
+;
+	MOVZBL	CTP$B_OB_CHAR(R1),R3	; Deliver the asts (char)
+	MOVAL	UCB$L_TL_CTRLC(R5),R4	; Get address of CTRL/C AST list
+	CMPB	R3,#TTY$C_CTRLC		; ^C ?
+	BNEQ	20$			; Branch if not ^C
+	BISW	#FLG$M_CTRLC,-
+		UCB$W_CT_FLAGS(R5)	; Set control C delivered
+	BBS	#FLG$V_VAXTOVAX,-
+		UCB$W_CT_FLAGS(R5),30$	; If VAX to VAX, skip next check
+	;
+	; connected to TOPS or RSX, must do implicit ^C to ^Y mapping here.
+	; * the following check is probably wrong when a process
+	; * has spawned and has a ^C enabled...
+	;
+	TSTL	(R4)			; is there a ^C to deliver?
+	BEQL	25$			; turn ^C into ^Y
+	BRB	30$			; deliver ^C
+
+20$:	CMPB	R3,#TTY$C_CTRLY		; ^Y ?
+	BNEQ	40$			; Branch if not ^Y
+25$:	BICW	#FLG$M_CTRLC,-
+		UCB$W_CT_FLAGS(R5)	; Set NOT control C delivered
+	MOVAL	UCB$L_TL_CTRLY(R5),R4	; Get address of CTRL/Y AST list
+30$:
+	PUSHL	R6			; save (Necessary?)
+	MOVL	UCB$L_TL_CTLPID(R5),R6	; Set controlling PID
+	JSB	G^COM$DELATTNASTP	; Deliver the AST's
+	POPL	R6			; restore
+;
+; If OUT-OF-BAND DISCARD IS TRUE, SERVER IS DISCARD OUTPUT RIGHT NOW. ***
+;
+	BISW	#FLG$M_CANCTRLO,-
+		UCB$W_CT_FLAGS(R5)	; Set cancel ^O pending 
+40$:
+	BRW	FOUND_EXIT
+
+
+VMS_QIO:
+	BSBW	CT_VMSQIO_MSG		; VMS qio message
+	BLBC	R0,FOUND_ERROR		; hangup if error
+	BRB	FOUND_EXIT		; otherwise, fall through to found_exit
+
+VMS_BRDCST:
+
+	BSBW	CT_VMS_BRDCST		; VMS upline broadcast for mailbox
+					; fall through to found_exit
+FOUND_EXIT:
+;
+;	8(SP)	RTNADR
+;	4(SP)	SAVED IPL (iopost)
+;	0(SP)	R5 (iirp address)
+;
+	POPL	R3			; Obtain the net iirp address
+	MOVL	IRP$L_UCB(R3),R5	; Set the net ucb address up
+	MOVL	IRP$L_SVAPTE(R3),R0	; dump the buffer
+	BEQL	50$			; if there is one to dump
+	JSB	G^COM$DRVDEALMEM	; Deallocate buffer
+	CLRL	IRP$L_SVAPTE(R3)	; forget it
+50$:	MOVW	G^IOC$GW_MAXBUF,-	; setup for another read from net
+		IRP$W_BCNT(R3)		; with requested buffer size
+	JSB	G^EXE$ALTQUEPKT		; queue to net driver
+
+FOUND_EXIT_2:
+	ENBINT				; Restore the ipl
+	RSB
+;
+;	If we had on io error in the packet, then hangup the terminal
+;	deallocate the packet and any buffer and exit.
+;	If there is no CT ucb left anymore, just deallocate the packet
+;	and buffer and get out.
+;
+
+FOUND_ERROR:
+
+	BSBW	CT_HANGUP		; Bad error - hangup the terminal
+
+FOUND_ERROR_2:
+
+	POPL	R5			; Restore Read IIRP
+;
+; Deallocate IIRP and buffer
+;
+	MOVL	IRP$L_SVAPTE(R5),R0	; Buffer on this iirp?
+	BEQL	10$			; nope
+	JSB	G^EXE$DEANONPAGED	; back to the pool
+10$:	MOVL	R5,R0			; Now for the iirp itself
+	JSB	G^EXE$DEANONPAGED	; back to the pool
+
+	BRB	FOUND_EXIT_2		; Now we are done here
+
+
+	.SBTTL	CT_SEND_UNREAD  - Cancel irps
+;
+; CT_SEND_UNREAD
+;
+;	Cancel irps by sending a message to the terminal system.
+;
+; inputs:
+;	r2 -> channel
+;	r4 -> pcb for process
+;	r5 -> CT ucb
+;
+
+CT_SEND_UNREAD:
+
+	PUSHR	#^M<R2,R3,R4,R5,R6>
+	MOVAQ	UCB$L_RTT_IRPFL(R5),R6	; Point to the irp queue
+	PUSHL	R6			; save its address
+;
+;	20(SP)	R6
+;	16	R5
+;	12	R4
+;	8	R3
+;	4	R2 (channel)
+;	0	IRP LIST HEAD
+
+10$:	MOVL	(R6),R6			; Point to next irp
+	CMPL	R6,(SP)			; End of queue?
+	BEQL	20$			; Yes
+	CMPW	4(SP),IRP$W_CHAN(R6)	; Is this the correct channel?
+	BNEQ	10$			; Nope, try next?
+	CMPL	PCB$L_PID(R4), -	; Do the pids match?
+		IRP$L_PID(R6)		;
+	BNEQ	10$			; Nope, try next
+	CMPB	#CTP$C_MT_READ_DATA,-
+		IRP$B_CT_RESPTYPE(R6)	; Is it a read request?
+	BNEQ	10$			; If no, no way to cancel
+	TSTB	IRP$B_CT_CANCEL(R6)	; Did we send a cancel?	
+	BNEQ	20$			; We are done. just return
+
+	MOVL	#CTP$C_UR_LEN,R1	; Get a message buffer for cancel
+	BSBW	ALLOC_CTP		; allocate a buffer
+	BLBC	R0,15$			; If error, exit
+;
+; Set up unread message
+;
+	ASSUME	CTP$B_UR_FLAGS EQ CTP$B_MSGTYPE+1
+	MOVZBW	#CTP$C_MT_UNREAD,-
+		CTP$B_MSGTYPE(R2)	; 
+	MOVW	#CTP$C_UR_MSGLEN,-	; 
+		CTP$W_DATSIZE(R2)	; Set size of message
+	MOVW	#CTP$C_UR_PROLEN,-
+		CTP$W_MSGSIZE(R2)	; size of protocol with message
+	BSBW	CT_NET_Q_MSG		; Send the message
+
+15$:	MOVB	#1,IRP$B_CT_CANCEL(R6)	; Mark for we sent it
+
+20$:	POPL	R1			; Discard stack longword to r1
+	POPR	#^M<R2,R3,R4,R5,R6>	; Restore regs and return
+	RSB	
+
+
+.SBTTL	SEND_UNBIND - send unbind foundation message
+
+;
+; Input:
+;	R0 - unbind reason code.
+;
+SEND_UNBIND:
+
+	PUSHL	R0			; save
+	MOVZWL	#CTP$B_PRO_FILL+2,R1	; message length
+	BSBW	ALLOC_CTP		; allocate packet
+	BLBC	R0,20$			; exit if failure
+	MOVB	#PRO$C_UNBIND,-
+		CTP$B_PRO_MSGTYPE(R2)	; set unbind type
+	MOVW	(SP),CTP$B_PRO_FILL(R2)	; set reason for unbind
+	MOVW	#<CTP$B_PRO_FILL+2-CTP$B_PRO_MSGTYPE>,-
+		CTP$W_DATSIZE(R2)	; set transfer size
+	BSBW	CT_NET_Q_MSG		; Queue message
+20$:
+	TSTL	(SP)+			; get rid of reason code
+	RSB				; return
+
+
+.SBTTL	STARTNETRCV - initial net startup code
+
+STARTNETRCV:
+
+;
+; INIT UCB: (THIS SHOULDN'T BE DONE HERE...) ???
+;
+	TSTL	UCB$L_CT_NETQFL(R5)	; Been here before?
+	BNEQ	10$			; Branch if yes
+
+	MOVAB	UCB$L_CT_NETQFL(R5),-	; Init queue
+		UCB$L_CT_NETQFL(R5)
+	MOVAB	UCB$L_CT_NETQFL(R5),-
+		UCB$L_CT_NETQBL(R5)
+
+	MOVAB	UCB$L_CT_STALLQFL(R5),-	; Init queue
+		UCB$L_CT_STALLQFL(R5)
+	MOVAB	UCB$L_CT_STALLQFL(R5),-
+		UCB$L_CT_STALLQBL(R5)
+	;
+	; Initialize some parameters that should be reset by INIT message
+	; from server.
+	;
+	MOVW	#512,UCB$W_CT_MAXREAD(R5) ; Maximum read buffer in server
+	MOVW	#CT$K_MAXCTP,-
+		UCB$W_CT_MAXMSG(R5)	; Maximum net message
+	
+	movab	ucb$l_cnt_frc(r5),-	; %%% performance hook
+		ucb$l_cnt_addr(r5)	; 
+	clrl	ucb$l_cnt_ovr(r5)	; %%% performance hook
+	clrl	ucb$l_cnt_frc(r5)	; %%% performance hook
+	clrl	ucb$l_cnt_tqe(r5)	; %%% performance hook
+10$:
+	;
+	; Allocate TQE
+	;
+	CLRL	UCB$L_CT_TQE(R5)	; Clear address
+
+	MOVZBL	#TQE$C_LENGTH,R1	; Set length
+	JSB	G^EXE$ALONONPAGED	; Allocate the buffer
+	BLBC	R0,15$			; Branch if error, forget timer
+	MOVB	#DYN$C_TQE, -
+		TQE$B_TYPE(R2)		; Set block type
+	MOVW	R1,TQE$W_SIZE(R2)	; Set size
+	CLRQ	TQE$L_FR3(R2)		; Clear flags and ucb address
+	MOVAB	W^TQE_WAKEUP,-
+		TQE$L_FPC(R2)		; Set subroutine address
+	MOVB	#TQE$C_SSSNGL,-
+		TQE$B_RQTYPE(R2)	; Set request type as system subroutine
+	MOVL	#CT$K_TQE_DELTA,-
+		TQE$Q_DELTA(R2)		; Set Delta
+	CLRL	TQE$Q_DELTA+4(R2)	; Set Delta 
+	MOVL	R2,UCB$L_CT_TQE(R5)	; Set Timer Queue Entry address
+15$:	
+	;
+	; Allocate READ IIRP
+	;
+	TSTL	UCB$L_CT_RIIRP(R5)	; Is the iirp already out?
+	BNEQ	20$			; Yes, then ignore it
+	BSBW	CT_MAKEIIRP		; Make an iirp for use
+	BLBC	R0, 30$			; No good, clean it all up
+	MOVL	R2, UCB$L_CT_RIIRP(R5)	; Save the address of the iirp
+	MOVAB	W^CT_NETREADDONE, -	; Stuff the post address
+		IRP$L_PID(R2)		;
+	MOVW	#IO$_READLBLK, -	; Set the function
+		IRP$W_FUNC(R2)		;
+
+	PUSHR	#^M<R3,R4,R5>		; Save
+	MOVL	R2,R3			; Set R3 as IIRP
+	MOVL	IRP$L_UCB(R3),R5	; Set the net ucb address up
+	CLRL	IRP$L_SVAPTE(R3)	; forget it
+	MOVW	G^IOC$GW_MAXBUF,-	; setup for another read from net
+		IRP$W_BCNT(R3)		; with requested buffer size
+	BISW	#IRP$M_FUNC,-
+		IRP$W_STS(R3)		; Set read bit
+	JSB	G^EXE$ALTQUEPKT		; queue to net driver
+	POPR	#^M<R3,R4,R5>		; Restore
+	;
+	; Allocate the write IIRP
+	;
+	TSTL	UCB$L_CT_WIIRP(R5)	; Already done?
+	BNEQ	20$			; yes
+	BSBW	CT_MAKEIIRP		; Make an iirp for use
+	BLBC	R0, 30$			; No good, clean it all up
+	MOVL	R2, UCB$L_CT_WIIRP(R5)	; Save the address of the iirp
+	MOVAB	W^CT_NETWRTDONE, -	; Stuff the post address
+		IRP$L_PID(R2)		;
+	;
+	; Determine if we're talking to RTPAD...
+	;
+	CMPW	#7,UCB$W_RTT_SYSTYPE(R5) ; VMS?
+	BNEQ	17$			; nope
+	BISW	#FLG$M_VAXTOVAX,-
+		UCB$W_CT_FLAGS(R5)	; yup, set flag
+17$:	
+	BISW	#FLG$M_BUFFER,-
+		UCB$W_CT_FLAGS(R5)	; Defaults to buffering
+	;
+	; Send the INIT message
+	;
+	BSBB	SEND_INIT		; Send init message *** right place?
+	BLBC	R0,30$			; hangup if error
+20$:
+	RSB				; Return
+;
+;	We are in deep trouble.  Hangup the terminal to run it down
+;	and return failure in r0.  This is done when we cannot obtain
+;	memory for an iirp or any thing else.  IPL can be anything.
+;
+; inputs:
+;	r5 -> CT ucb
+;
+30$:
+	BSBW	CT_HANGUP		; Post irps and attn asts
+	CLRL	R0			; return failure
+	RSB
+
+SEND_INIT:
+	MOVZBL	#C_INIT_MSGLEN+CTP$W_MSGSIZE,R1	; Length of message
+	BSBW	ALLOC_CTP		; Allocate net write packet
+	BLBC	R0,10$			; exit on error
+	PUSHR	#^M<R2,R3,R4,R5>	; Save
+	MOVW	#C_INIT_MSGLEN+2,-
+		CTP$W_DATSIZE(R2)	; size for net write (+2 for foundation)
+	MOVC3	#C_INIT_MSGLEN,INIT_MSGBLK,-
+		CTP$W_MSGSIZE(R2)	; Copy Block
+	POPR	#^M<R2,R3,R4,R5>	; restore
+	MOVW	G^IOC$GW_MAXBUF,-
+		W_INIT_BUFSIZ(R2)	; set maxbuf
+	;
+	; write to net
+	;
+	BSBW	CT_NET_Q_MSG		; write to net
+	MOVL	#1,R0
+10$:
+	RSB				; returrn
+	
+
+
+	.SBTTL CT_MAKEIIRP  - Manufacture an internal irp
+;
+; CT_MAKEIIRP
+;
+;	Make an internal IRP for sending to the netdriver.
+;	If we can't get the space, return failure.
+;
+; inputs:
+;	r3 -> CT irp
+;	r5 -> CT ucb
+;
+; outputs:
+;	r0 = success or fail
+;
+
+CT_MAKEIIRP:
+
+	MOVZBL	#IRP$C_LENGTH,R1	; Obtain a buffer of correct size
+	JSB	G^EXE$ALONONPAGED	; from dynamic memory
+	BLBC	R0,10$			; No memory left, so return error
+	MOVB	#DYN$C_IRP, -		; Set the type and size fields
+		IRP$B_TYPE(R2)		;
+	MOVW	R1,IRP$W_SIZE(R2)	;
+	CLRL	IRP$L_PID(R2)		; No pid here
+	MOVL	R5,IRP$L_AST(R2)	; Save the CT ucb field
+	MOVL	UCB$L_RTT_NETWIND(R5),-	; Set up the window
+		IRP$L_WIND(R2)		;
+	MOVL	UCB$L_RTT_NETUCB(R5),-	; and the ucb for the net
+		IRP$L_UCB(R2)		;
+	MOVW	#IO$_WRITELBLK,-	; the function
+		IRP$W_FUNC(R2)		;
+	MOVB	#4,IRP$B_PRI(R2)	; priority of this in queue
+	MOVW	#IRP$M_BUFIO,-		; Its a buffered io function
+		IRP$W_STS(R2)		; and assume a write
+	CLRW	IRP$W_BOFF(R2)		; no quota to return for iirp
+	CLRQ	IRP$L_IOST1(R2)		; no status yet
+	ASSUME	IRP$L_OBCNT -
+		EQ -
+		IRP$L_ABCNT+4
+	CLRQ	IRP$L_ABCNT(R2)		; Some more byte counts
+	MOVL	IRP$L_SEQNUM(R3),-	; Grab a quick sequence number
+		IRP$L_SEQNUM(R2)	;
+	MOVL	IRP$L_ARB(R3),-		; Access rights block, incase needed
+		IRP$L_ARB(R2)		;
+10$:	RSB
+
+
+.IF DF DEBUG_LOG
+.sbttl TTY$LOG_IO - log data to mailbox
+;
+; R5 - RT UCB
+; R6 - message length
+; R7 - message address
+; R8 - message type
+;
+
+tty$log_io:
+
+	BBS	#1,G^SGN$GL_VMSD4,5$	; branch if all terminals logging
+	BBS	#tt2$v_disconnect,-
+		ucb$l_devdepnd2(R5),5$	; or this terminal set for logging
+	rsb
+5$:
+	pushr	#^m<R0,r1,r2,r3,r4,r5>
+
+	movl	G^sgn$gl_vms8,R0
+	beql	100$			; exit if 0
+	cmpb	#dyn$c_ucb,ucb$b_type(R0)
+	bneq	100$			; exit if not ucb
+
+	addl3	#6+12,R6,R1		; message length + non-paged header
+	jsb	G^exe$alononpaged	; get buffer
+	blbc	r0,100$			; exit if no memory
+	MOVB	#DYN$C_UNUSED_2, -
+		TQE$B_TYPE(R2)		; Set block type
+	MOVW	R1,TQE$W_SIZE(R2)	; Set size
+
+	pushl	R2			; save address
+	movab	12(R2),R2		; Skip non-paged header
+	pushl	R2			; save
+	movw	r8,(r2)+		; message type
+	movw	ucb$w_unit(R5),(R2)+	; unit #
+	movw	r6,(R2)+		; message length
+	beql	10$			; branch if zero
+	movc3	r6,(r7),(r2)		; data
+;
+; send message
+;
+10$:
+	addl3	#6,R6,R3		; length
+	popl	R4			; address of message
+	movl	G^sgn$gl_vms8,R5	; mailbox ucb
+	jsb	G^exe$wrtmailbox	; write to mailbox
+
+99$:	popl	r0			; restore address
+	jsb	G^exe$deanonpaged
+
+100$:	popr	#^m<R0,r1,r2,r3,r4,r5>
+	rsb
+.endc
+
+
+	.SBTTL	CT_END, End of driver
+
+;
+; Label that marks the end of the driver
+;
+
+.PSECT	$$$116_DRIVER,LONG
+CT_END:
+	.END

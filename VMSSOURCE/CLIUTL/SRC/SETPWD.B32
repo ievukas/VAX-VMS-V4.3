@@ -1,0 +1,733 @@
+MODULE SETPASSWORD(
+		IDENT = 'V04-000',
+	    	ADDRESSING_MODE(EXTERNAL = GENERAL)
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	Set Password
+!
+! ABSTRACT:	Changes a users password in SYSUAF.DAT
+!
+! ENVIRONMENT:	DCL Set Utility
+!
+! AUTHOR:	Chris Hume, CREATION DATE: 14-Jun-1979
+!
+! MODIFIED BY:
+!
+!	V03-009	JRL0017		John R. Lawson, Jr.	6-Jul-1984 10:18
+!		Place system password in SYSUAF.DAT in a special record
+!		unaccessible by AUTHORIZE.
+!
+!	V03-008	BLS0291		Benn Schreiber		24-MAR-1984
+!		Define SET$_BADVALUE here so we don't pull
+!		SETFILE into SETP0.
+!
+!	V03-007	SHZ0003		Stephen H. Zalewski,	02-Mar-1984
+!		no longer make special checks for null passwords.  LGI$HPWD
+!		will now return a null password.
+!
+!	V03-006	SHZ0002		Stephen H. Zalewski
+!		Add support for /SECONDARY.  All misc other security
+!		enhancements.
+!
+!	V03-005	SHZ0001		Stephen H. Zalewski	30-Dec-1983
+!		Add support for /GENERATE.
+!
+!	V03-004	CWH3004		CW Hobbs		9-Nov-1983
+!		Remove the test for CAPTIVE added in GAS0080.  This broke
+!		some existing applications and is not strictly necessary
+!		since the LOCKPWD bit can be used.
+!
+!	V03-003	GAS0139		Gerry Smith		17-Jun-1983
+!		Add the system password.
+!
+!	V03-002	GAS0112		Gerry Smith		29-Mar-1983
+!		Remove all references to the old command dispatcher.
+!
+!	V03-001	GAS0080		Gerry Smith		 4-May-1982
+!		Disallow changing of password if the CAPTIVE bit
+!		is set in the authorization record.
+!
+!--
+
+LIBRARY
+    'SYS$LIBRARY:LIB';
+
+!
+! Macro to make counted ASCII strings
+!
+MACRO
+    CSTRING[] = (UPLIT BYTE(%CHARCOUNT(%STRING(%REMAINING)),
+		%STRING(%REMAINING)))%;
+
+
+!
+! Table of contents
+!
+FORWARD ROUTINE
+    set$password : NOVALUE,		! The module entry point
+    get_pwd,				! Terminal dialogue
+    get_record,				! User Input
+    update_uaf : NOVALUE,		! Update the UAF record
+    update_sys : NOVALUE,		! Update the system password
+    open_uaf,				! $OPEN and $CONNECT to UAF
+    get_uaf_record,			! Get a record from UAF.
+    check_qualifiers;			! Get and check command qualifiers.
+
+
+!
+! External routines
+!
+EXTERNAL ROUTINE
+    str$upcase,
+    set_password_generate,
+    cli$present,
+    cli$get_value,
+    lib$cvt_dtb,
+    lgi$hpwd;
+
+!
+! External storage
+!
+EXTERNAL
+    ctl$gq_procpriv : $BBLOCK[8];	! Process privilege mask
+
+!
+! Define messages
+!
+EXTERNAL LITERAL
+    set$_pwdnotval,			! Error validating old password
+    set$_pwdnotver,			! Error verifying new password
+    set$_pwdlocked,			! Password is locked
+    set$_pwdsyntax,			! Syntax error on new password
+    set$_syspwderr,			! Error modifying system password
+    set$_uaferr,			! Error accessing authorization file
+    set$_invpwdlen,			! Invalid password length
+    set$_pwdnotdif;			! New password must be different from curretn one
+
+$SHR_MSGDEF(set,119,local,
+		(badvalue,error));
+
+!
+! Define TRUE and FALSE
+!
+LITERAL
+    false = 0,
+    true = 1;
+
+LITERAL
+    $EQULST (QUAL_,,0,1,
+	(system,),		! /SYSTEM
+	(generate,),		! /GENERATE
+	(secondary,));		! /SECONDARY
+
+!
+! OWN storage
+!
+OWN
+    setpwd$flags : BITVECTOR[32] INITIAL(0),
+    min_pwd_length : INITIAL(0),
+    old_pwd_buf : VECTOR[32,BYTE],
+    new_pwd_buf : VECTOR[32,BYTE],
+    vfy_pwd_buf : VECTOR[32,BYTE],
+    old_pwd_dsc: VECTOR[2] INITIAL(0, old_pwd_buf),
+    new_pwd_dsc: VECTOR[2] INITIAL(0, new_pwd_buf),
+    uafbuf : BLOCK[uaf$c_length,BYTE],
+    user_desc : VECTOR[2] INITIAL(0, uafbuf[uaf$t_username]),
+    uaffab : $FAB(
+	FAC = (get,put,upd),		! access types
+	FNM = 'SYSUAF',			! user authorization file name
+	DNM = 'SYS$SYSTEM:.DAT',
+	SHR = (get,put,del,upd)),
+    uafrab : $RAB(
+	RAC = key,
+	ROP = (rlk,uif),
+	KRF = 0,
+	KBF = uafbuf[uaf$t_username],
+	KSZ = uaf$s_username,
+	UBF = uafbuf,
+	USZ = uaf$c_length,
+	FAB = uaffab);
+
+
+GLOBAL ROUTINE set$password : NOVALUE =
+BEGIN
+!+++
+!
+! This is the entry for the SET PASSWORD command.  It is called by the SET
+! command dispatcher.
+!
+!---
+
+LOCAL
+    status;
+
+!
+! If not setting SYSTEM password, then open and connect to SYSUAF.DAT, 
+! then get uaf record of user.
+!
+IF NOT open_uaf()
+    THEN RETURN;
+IF NOT get_uaf_record()
+    THEN RETURN;
+IF .uafbuf[uaf$v_lockpwd] AND NOT CLI$PRESENT(%ASCID'SYSTEM') ! Check to see if the user has the right 
+    THEN 						! to change the password.
+    	BEGIN						! If the password is locked he can't.
+    	SIGNAL_STOP(set$_pwdlocked);
+    	RETURN;
+    	END;
+
+!
+! Check for command qualifiers, and determine minimum password length 
+! if /GENERATE was specified.
+!
+check_qualifiers();
+
+!
+! Get the old and new passwords.  If an error, then simply exit.
+!
+IF NOT (status = get_pwd())
+THEN
+    BEGIN
+    SIGNAL(.status);
+    RETURN;
+    END;
+
+!
+! If /SYSTEM, then modify the system password.  Otherwise change the password
+! for this user.
+!
+IF .setpwd$flags[qual_system]
+THEN update_sys();
+
+update_uaf();
+
+RETURN;
+END;
+
+
+ROUTINE get_pwd =
+BEGIN
+!+++
+!
+! Ask the user for the new and old passwords, and verify that the user can
+! type the new password twice in a row.
+!
+! Inputs:
+!	None.
+!
+! Outputs:
+!	None.
+!
+!---
+
+LOCAL
+    status,
+    fab : $FAB(FNM = 'SYS$INPUT',
+	       FAC = get),
+    rab : $RAB(ROP = <pmt,cvt,rne>,
+	       USZ = %ALLOCATION(old_pwd_buf),
+	       FAB = fab);
+
+!
+! Open sys$input.
+!
+IF NOT $OPEN(FAB = fab)
+THEN RETURN set$_pwdnotval;
+
+IF NOT $CONNECT(RAB = rab)
+THEN RETURN set$_pwdnotval;
+
+!
+! Get the old password.
+!
+rab[rab$l_ubf] = old_pwd_buf;
+IF NOT get_record(CSTRING('Old password: '), rab)
+THEN RETURN set$_pwdnotval
+ELSE old_pwd_dsc[0] = .rab[rab$w_rsz];
+
+!
+! Get the new password.  If user specified /GENERATE, then generate passwords
+! for s/he to choose from. (Grammar?)
+!
+IF .setpwd$flags[qual_generate]
+THEN
+    BEGIN
+    BIND new_password = new_pwd_buf : VECTOR[,WORD];
+    set_password_generate(new_pwd_buf,min_pwd_length);	! Returns ASCIC string.
+    new_pwd_dsc[0] = .new_password[0];		! Move count into descriptor.
+    new_pwd_dsc[1] = .new_pwd_dsc[1] + 2;	! Move buffer address past count.
+    str$upcase (new_pwd_dsc, new_pwd_dsc);	! Upcase the password
+    END
+ELSE
+    BEGIN
+    rab[rab$l_ubf] = new_pwd_buf;
+    IF NOT get_record(CSTRING(%CHAR(13),%CHAR(10),'New password: '), rab)
+      THEN RETURN set$_pwdnotver;
+    new_pwd_dsc[0] = .rab[rab$w_rsz];
+    IF .rab[rab$w_rsz] GTRU 31 				! Make sure password not to long.
+	THEN RETURN set$_invpwdlen;
+    IF NOT .setpwd$flags[qual_system] AND		! If not SYSTEM password,
+       .rab[rab$w_rsz] LSSU .uafbuf[uaf$b_pwd_length]	!  then check to make sure not to shord.
+    THEN 
+    	BEGIN
+	IF NOT (.setpwd$flags[qual_secondary] AND	! Null password allowed
+		.rab[rab$w_rsz] EQL 0)			! on SECONDARY password.
+	  THEN RETURN set$_invpwdlen;
+	END;
+
+    INCR i FROM 0 TO .new_pwd_dsc[0] - 1	! Check new password for illegal characters.  The only allowable 
+    DO						! characters are A to Z, 0 to 9, the $ and _.
+        BEGIN
+        BIND 
+ 	    char = new_pwd_buf[.i] : BYTE;
+
+        IF (.char GEQU %C'0' AND .char LEQU %C'9')
+        OR (.char GEQU %C'A' AND .char LEQU %C'Z')
+        OR .char EQLU %C'$'
+        OR .char EQLU %C'_'
+        THEN 1
+        ELSE RETURN set$_pwdsyntax;
+        END;
+    END;
+
+!
+! Make sure user knows what he typed in.  Do this by asking for the 
+! new password again, and then checking that it's the same as the
+! last one typed in.
+!
+rab[rab$l_ubf] = vfy_pwd_buf;
+IF NOT get_record(CSTRING(%CHAR(13),%CHAR(10),'Verification: '), rab)
+THEN RETURN set$_pwdnotver;
+
+IF .rab[rab$w_rsz] NEQU .new_pwd_dsc[0]
+THEN RETURN set$_pwdnotver;
+
+IF CH$NEQ(.rab[rab$w_rsz],
+    	  .new_pwd_dsc[1],
+    	  .rab[rab$w_rsz],
+    	  vfy_pwd_buf)
+THEN RETURN set$_pwdnotver;
+
+RETURN true;
+END;
+
+ROUTINE get_record (prompt_string, rab) =
+BEGIN
+!+++
+!
+! Given a prompt string and a RAB address, get an input record.
+!
+! Inputs:
+!	prompt_string - address of ASCIC prompt string
+!	rab - address of RAB
+!
+! Outputs:
+!	The RAB's buffer will be filled in with a password.
+!
+!---
+
+MAP
+    rab : REF $BBLOCK,
+    prompt_string : REF VECTOR[,BYTE];
+
+!
+! Set the specified prompt string and perform the $GET.
+!
+rab[rab$b_psz] = .prompt_string[0];		! Prompt size
+rab[rab$l_pbf] = prompt_string[1];		! and address
+
+RETURN $GET(RAB = .rab);			! Return status of $GET
+END;
+
+
+ROUTINE update_uaf : NOVALUE =
+BEGIN
+!+++
+!
+! Get the UAF record, verify that the user typed in the correct password,
+! and if s/he did, then replace the old password with the new one.
+!
+! Inputs:
+!	new_pwd_dsc - descriptor for new password
+!	old_pwd_dsc - descriptor for old password
+!
+! Outputs:
+!	None.  The UAF is updated.
+!
+!---
+
+LOCAL
+    status,
+    enc_buf: VECTOR[uaf$s_pwd,byte],
+    enc_dsc: VECTOR[2] INITIAL(uaf$s_pwd, enc_buf),
+    password,
+    password_date,
+    encrypt_byte : REF vector[,byte];
+
+!
+! Determine whether we are updating fields for the Primary or Secondary
+! password.
+!
+IF NOT .setpwd$flags[qual_secondary]
+THEN
+    BEGIN
+    password = uafbuf[uaf$q_pwd];
+    password_date = uafbuf[uaf$q_pwd_date];
+    encrypt_byte = uafbuf[uaf$b_encrypt];
+    END
+ELSE
+    BEGIN
+    password = uafbuf[uaf$q_pwd2];
+    password_date = uafbuf[uaf$q_pwd2_date];
+    encrypt_byte = uafbuf[uaf$b_encrypt2];
+    END;
+
+!
+! Encrypt what the user says is the old password.  Then compare that to
+! what is found in the UAF record.
+!
+LGI$HPWD(enc_dsc, 			! Encrypt what the user typed in
+     old_pwd_dsc,
+     .encrypt_byte[0],
+     .uafbuf[uaf$w_salt],
+     user_desc);
+
+IF CH$NEQ(uaf$s_pwd,			! Check to see if encrypted
+    	  enc_buf,			! passwords match.
+    	  uaf$s_pwd,
+    	  .password)
+THEN					! If they don't match, tell
+    BEGIN				! the user.
+    SIGNAL(set$_pwdnotval);
+    RETURN;
+    END;
+
+
+!
+! Compare the old password to the new password.  If they match, this is illegal,
+! so report an error and return.
+!
+IF (.new_pwd_dsc[0] EQL .old_pwd_dsc[0])
+  AND CH$EQL(.old_pwd_dsc[0],.old_pwd_dsc[1],.new_pwd_dsc[0],.new_pwd_dsc[1])
+THEN 
+    BEGIN
+    SIGNAL(set$_pwdnotdif);
+    RETURN;
+    END;
+
+!
+! Encrypt the new password, and put it into the UAF record.  If the salt field
+! in the uaf is zero, generate a new salt before the encryption.
+!
+IF .uafbuf[uaf$w_salt] EQL 0		! Is salt zero?
+THEN
+    BEGIN
+    LOCAL time : VECTOR[4,WORD];	! Get local quadword.
+    $GETTIM(TIMADR = time);		! Get current time.
+    uafbuf[uaf$w_salt] = .time[1];	! Salt is now 2nd word of time.
+    END;
+
+LGI$HPWD(enc_dsc, 			! Encrypt new password
+     new_pwd_dsc,
+     uaf$c_purdy_v,
+     .uafbuf[uaf$w_salt],
+     user_desc);
+
+!
+! Move new password into record, clear password expired bit, reset password
+! change date, and make sure we always use newest encryption algorithm for 
+! PRIMARY or SECONDARY password.
+!
+CH$MOVE(uaf$s_pwd,enc_buf,.password);	! Move new password to record.
+encrypt_byte[0] = uaf$c_purdy_v;	! Use PURDY_V encryption algorithm.
+IF .new_pwd_dsc[0] EQL 0		! Move new time (0 if password is is null)
+    THEN CH$FILL(0,uaf$s_pwd_date,.password_date)
+    ELSE $GETTIM(TIMADR = .password_date);
+
+IF NOT .setpwd$flags[qual_secondary]
+    THEN uafbuf[uaf$v_pwd_expired] = false	! Clear expired bit.
+    ELSE uafbuf[uaf$v_pwd2_expired] = false;	! Clear expired bit.
+
+IF NOT $PUT(RAB = uafrab)		! Now update (UIF) the UAF file.
+    THEN SIGNAL(set$_uaferr,0,		! If an error, tell the user.
+	    .uafrab[rab$l_sts],
+	    .uafrab[rab$l_stv]);
+
+$CLOSE(FAB = uaffab);			! Close the UAF.
+
+RETURN;
+END;
+
+ROUTINE update_sys : NOVALUE =
+BEGIN
+!+++
+!
+! Update the encrypted system password.
+!
+! Inputs:
+!	old_pwd_dsc - descriptor of old password
+!	new_pwd_dsc = descriptor of new password
+!
+!--
+
+!
+! First, check to see if the user has the SECURITY privilege.
+!
+IF NOT .ctl$gq_procpriv[prv$v_security] THEN
+    SIGNAL_STOP(set$_syspwderr, ss$_nosecurity);
+
+!
+! Make sure the special record has everthing it needs
+!
+uafbuf[uaf$b_encrypt] = uaf$c_purdy_v;
+
+RETURN;
+END;
+
+ROUTINE check_qualifiers =
+BEGIN
+!+++
+!
+! Get the minimum password length prior to generating passwords.
+!
+! Inputs:
+!
+!	none
+!
+! Outputs:
+!
+!	min_pwd_length = minimum password length to generate.
+!
+!---
+
+LOCAL 
+    infile_desc: $BBLOCK [dsc$c_s_bln] INITIAL(0),
+    status;
+
+infile_desc[dsc$b_class] = dsc$k_class_d;		! Make descriptor dynamic
+
+!
+! Get qualifiers
+!
+setpwd$flags[qual_generate] 	= cli$present($descriptor('GENERATE'));
+setpwd$flags[qual_system] 	= cli$present($descriptor('SYSTEM'));
+setpwd$flags[qual_secondary] 	= cli$present($descriptor('SECONDARY'))
+                                  AND NOT setpwd$flags[qual_system];
+
+!
+! If GENPWD bit set in uaf record, then user must use password generator.
+!
+IF NOT .setpwd$flags[qual_system]
+    THEN setpwd$flags[qual_generate] = .setpwd$flags[qual_generate] OR .uafbuf[uaf$v_genpwd];
+
+! If /GENERATE not set, we are done.
+!
+IF NOT .setpwd$flags[qual_generate]				! /GENERATE specified?
+    THEN RETURN TRUE;						! No, exit with success.
+
+!
+! Calculate minimum length of word to be generated by password generator.
+!
+IF status = cli$get_value($descriptor('GENERATE'), infile_desc)	! Get value for /GENERATE if one specified.
+THEN
+    BEGIN
+    lib$cvt_dtb(.infile_desc [dsc$w_length],			! Move value into Global variable
+       	       .infile_desc [dsc$a_pointer], min_pwd_length);
+    IF (.min_pwd_length LEQ 0) OR (.min_pwd_length GTR 10)	! If size LEQ 0 or GTR 10
+            THEN SIGNAL_STOP (set$_badvalue,1,infile_desc);	!  report an error.
+    END
+ELSE
+    min_pwd_length = 6;				! No value, default to 6.
+
+!
+! Minimum password length for /GENERATE is larger of current minimum password length versus
+! minimum password length specified in UAF, but no greater than 10.
+!
+IF NOT setpwd$flags[qual_system] THEN
+    min_pwd_length = MAX(.uafbuf[uaf$b_pwd_length],.min_pwd_length);
+min_pwd_length = MIN(.min_pwd_length,10);
+
+RETURN true;
+END;
+
+
+ROUTINE open_uaf =
+BEGIN
+!+++
+!
+! Open the UAF file, Connect to it, and stuff the username of this process
+! into the rab in preparation for the get of his record.
+!
+! Inputs:
+!	uaffab - fab to access the UAF.
+!	uafrab - rab to access the UAF.
+!
+! Outputs:
+!	None.
+!
+!---
+
+LOCAL
+    status,
+    iosb : VECTOR[4,WORD],
+    item_list : $ITMLST_DECL(ITEMS = 1);
+
+!
+! Only use EXEC logical name table when opening the authorization file.
+!
+uaffab[fab$v_lnm_mode] = psl$c_exec;
+
+!
+! Obtain the username of this process or the system.
+! Must fill username buffer with blanks first.
+!
+CH$FILL (' ',uaf$s_username,uafbuf[uaf$t_username]);
+
+IF cli$present(%ascid'SYSTEM') THEN
+   BEGIN
+      CH$MOVE(17, UPLIT('<System+Password>'), uafbuf[uaf$t_username]);
+      user_desc[0] = 17;
+   END
+ELSE
+   BEGIN
+      $ITMLST_INIT(ITMLST = item_list,
+	    		(ITMCOD = jpi$_username,
+	     		 BUFSIZ = jib$s_username,
+	     		 BUFADR = uafbuf[uaf$t_username],
+	     		 RETLEN = user_desc[0]));
+      $GETJPIW(ITMLST = item_list,
+	       IOSB = IOSB);
+   END;
+
+
+!
+! Try to open the UAF.  If a file-sharing problem, try one more time.
+! If that open doesn't work, then give up.
+!
+IF NOT (status = $OPEN(FAB = uaffab))
+THEN
+    BEGIN
+    IF .status EQL rms$_sne
+    OR .status EQL rms$_spe
+    OR .status EQL rms$_dme
+    THEN 
+	BEGIN
+	uaffab[fab$b_shr] = 0;
+	IF NOT (status = $OPEN(FAB = uaffab))
+	THEN SIGNAL(set$_uaferr,0,
+		    .uaffab[fab$l_sts],
+		    .uaffab[fab$l_stv]);
+	END
+    ELSE SIGNAL(set$_uaferr,0,
+    		.uaffab[fab$l_sts],
+    		.uaffab[fab$l_stv]);
+    END;
+
+!
+! Return if the open failed.
+!
+IF NOT .status
+    THEN RETURN .status;
+
+!
+! Do the same sort of stuff for the connect.
+!
+IF NOT (status = $CONNECT(RAB = uafrab))
+THEN
+    BEGIN
+    IF .status EQL rms$_crmp
+    THEN
+	BEGIN
+	uaffab[fab$w_gbc] = 0;
+	IF NOT (status = $CONNECT(RAB = uafrab))
+	THEN SIGNAL(set$_uaferr,0,
+		    .uafrab[rab$l_sts],
+		    .uafrab[rab$l_stv]);
+	END
+    ELSE SIGNAL(set$_uaferr,0,
+    		.uafrab[rab$l_sts],
+    		.uafrab[rab$l_stv]);
+    END;
+
+RETURN .status;
+END;
+
+
+ROUTINE get_uaf_record =
+BEGIN
+!+++
+!
+! Try to read the user record.  In the event that we get an error that says
+! the record was locked, then go into nap mode, scheduling this process to 
+! wake up in 2 milliseconsds.  If, after two naps, we still have a problem,
+! then forget it.
+!
+! Inputs:
+!	uafrab - rab to access the UAF.
+!
+! Outputs:
+!	None.
+!
+!---
+
+LOCAL
+    status;
+
+IF NOT (status = $GET(RAB = uafrab))
+THEN
+    BEGIN
+    IF .status EQL rms$_rlk
+    THEN INCR i FROM 1 TO 2 DO
+	BEGIN
+	IF $SCHDWK(DAYTIM = UPLIT(-200000, -1))
+	THEN $HIBER();
+	status = $GET(RAB = uafrab);
+	IF .status NEQ rms$_rlk
+	THEN EXITLOOP;
+	END
+    ELSE IF .status EQL rms$_rnf THEN
+       BEGIN
+	  UAFRAB[RAB$L_RBF] = UAFBUF;
+          UAFRAB[RAB$W_RSZ] = UAF$C_LENGTH;
+	  RETURN rms$_normal;
+       END;
+    END;
+
+IF NOT .status 
+THEN 
+    SIGNAL(set$_uaferr,0,
+	   .uafrab[rab$l_sts],
+	   .uafrab[rab$l_stv]);
+
+RETURN .status;
+END;
+
+
+END
+ELUDOM

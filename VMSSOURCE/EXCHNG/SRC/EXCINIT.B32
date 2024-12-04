@@ -1,0 +1,1275 @@
+MODULE	exch$init				%TITLE 'INIT verb dispatch and misc routines'
+		(
+		IDENT = 'V04-000',
+		ADDRESSING_MODE (EXTERNAL=LONG_RELATIVE, NONEXTERNAL=WORD_RELATIVE)
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:	EXCHANGE - Foreign volume interchange facility
+!
+! ABSTRACT:	Primary action routines for INIT verb
+!
+! ENVIRONMENT:	VAX/VMS User mode
+!
+! AUTHOR:	CW Hobbs	 CREATION DATE: 04-Jan-1983
+!
+! MODIFIED BY:
+!
+!	V03-002	CWH3002		CW Hobbs		12-Apr-1984
+!		Signal a specific error for an attempt to access a remote node
+!
+!
+!--
+
+! Include files:
+!
+MACRO $module_name_string = 'exch$init' %;	! The require file needs to know our module name
+REQUIRE 'SRC$:EXCREQ'				! Facility-wide require file
+    ;
+
+%SBTTL 'Module table of contents'
+
+! Module table of contents:
+!
+FORWARD ROUTINE
+	 init_dos11_init,			! DOS-11 volume init processing
+	 init_foreign_close,	 		! Close a foreign volume
+	 init_foreign_create,	 		! Open a file to a foreign virtual volume
+	 init_foreign_open,	 		! Open a file to a foreign device
+	 init_init : NOVALUE,			! Setups
+    exch$init_initialize,			! Main action routine
+	 init_rt11_init,			! RT-11 volume init processing
+	 init_zero_home_blocks			! Zero Files-11 home blocks
+    ;
+
+! EXCHANGE facility routines
+!
+EXTERNAL ROUTINE
+    exch$cmd_cli_get_integer,			! Get the value of an integer qualifier
+    exch$cmd_parse_filespec,			! Parse a file specification
+    exch$io_dos11_rewind,			! Rewind the sequential device
+    exch$io_dos11_set_density,			! Set magtape density
+    exch$io_dos11_write_tape_mark,		! Write a tape mark
+    exch$io_rt11_write,				! Write blocks to RT11 device
+    exch$moun_vms_mount,			! Perform VMS $mount service to mount volume
+    exch$rt11_format_current_date : NOVALUE jsb_r1,
+    exch$rtacp_verify_directory,		! Check for valid RT-11 directory
+    exch$util_file_error,			! Signal RMS error
+    exch$util_namb_release	: NOVALUE,	! Release name block
+    exch$util_vm_allocate_zeroed,		! Allocate virtual memory
+    exch$util_vm_release	: NOVALUE,	! Release memory
+    exch$util_vol_getdvi,			! Get device information
+    exch$util_volb_release	: NOVALUE,	! Release volume block
+    exch$util_volb_allocate			! Allocate volume block
+    ;
+
+! Equated symbols:
+!
+!LITERAL
+!    ;
+
+! Bound declarations:
+!
+!BIND
+!    ;
+
+GLOBAL ROUTINE init_dos11_init =	%SBTTL 'init_dos11_init'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Perform dos11 volume specific init actions
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	work area for INIT
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	dos11 tape will be initialized
+!--
+
+$dbgtrc_prefix ('init_dos11_init> ');
+
+LOCAL
+    dens,
+    dosv : $ref_bblock,
+    ent : $ref_bblock,
+    status
+    ;
+
+BIND
+    init = exch$a_gbl [excg$a_init_work] : $ref_bblock,	! pointer to our work area
+    volb = init [init$a_volb]		 : $ref_bblock	! pointer to exchange VOLB structure
+    ;
+
+$block_check (2, .init, init, 604);
+$block_check (2, .volb, volb, 605);
+
+! Make sure that we can do it
+!
+IF NOT .volb [volb$v_write]
+THEN
+    $exch_signal_return ($warning_stat_copy (exch$_writelock), 2, 
+				.volb [volb$l_vol_ident_len], volb [volb$t_vol_ident]);
+
+! Allocate and initialize our volb extension if it does not exist
+!
+dosv = .volb [volb$a_vfmt_specific];
+IF .dosv EQL 0
+THEN
+    BEGIN
+    dosv = exch$util_vm_allocate_zeroed (exchblk$s_dos11);	! Get the memory
+    volb [volb$a_vfmt_specific] = .dosv;			! Stash the address in the volb
+    $block_init (.dosv, dos11);					! Set the type
+    $queue_initialize (dosv [dos11$q_entry_header]);		! Init the directory cache queue
+    END;
+
+! Rewind the magtape, then write two tape marks, then rewind the tape again
+!
+IF (status = exch$io_dos11_rewind (.volb))
+THEN
+    IF (status = exch$io_dos11_write_tape_mark (.volb))
+    THEN
+	IF (status = exch$io_dos11_write_tape_mark (.volb))
+	THEN
+	    status = exch$io_dos11_rewind (.volb);
+
+! If the /DENSITY qualifier is present, set the drive to the new density.  Tape must be at BOT to change density.
+!
+IF .status
+THEN
+    IF cli$present (%ASCID 'DENSITY')
+    THEN
+	status = exch$io_dos11_set_density (.volb);
+
+! If there is a cached "directory", release it
+!
+IF .dosv [dos11$a_entry_flink] NEQ 0
+THEN
+    WHILE ((ent = $queue_remove_head (dosv [dos11$q_entry_header])) NEQ 0)
+    DO
+	exch$util_vm_release (dos11ent$k_length, .ent);
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE init_foreign_close =	%SBTTL 'init_foreign_close'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Close a temporarily opened foreign device.
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	INIT verb work area
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	work area
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	A file is no longer open on the volb
+!--
+
+$dbgtrc_prefix ('init_foreign_close> ');
+
+LOCAL
+    status
+    ;
+
+BIND
+    init = exch$a_gbl [excg$a_init_work] : $ref_bblock,	! pointer to our work area
+    volb = .init [init$a_volb] : $bblock,		! Pointer to exchange VOLB structure
+    fab  = .volb [volb$a_fab] : $bblock			! File Access Block for the volume
+    ;
+
+$block_check (2, volb, volb, 575);
+
+! Close the open RMS link to the volume
+!
+IF NOT (status = $close (fab = fab))
+THEN
+    RETURN exch$util_file_error (exch$_closeforeign, .status, fab, .fab [fab$l_stv]);
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE init_foreign_create =	%SBTTL 'init_foreign_create'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Create a foreign virtual volume with RMS so that we may initialize it.
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	namb - name block describing the device
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	volb - volume block which will describe the mounted volume
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	lots
+!--
+
+$dbgtrc_prefix ('init_foreign_create> ');
+
+LOCAL
+    len,
+    snum,
+    start,
+    status
+    ;
+
+BIND
+    init = exch$a_gbl [excg$a_init_work] : $ref_bblock,	! pointer to our work area
+    fildesc = init [init$q_device] : $bblock,		! file name
+    namb = .init [init$a_namb] : $bblock,		! Pointer to exchange NAMB structure
+    volb = .init [init$a_volb] : $bblock,		! Pointer to exchange VOLB structure
+    fab  = .volb [volb$a_fab] : $bblock,		! File Access Block for the volume
+    rab  = .volb [volb$a_rab] : $bblock,		! Record Access Block for the volume
+    nam  = .volb [volb$a_nam] : $bblock,		! RMS name block for the volume
+    dev_desc = namb [namb$q_device] : $desc_block	! Pointer to the device name
+    ;
+
+$trace_print_lit ('entry');
+$block_check (2, .init, init, 630);
+$block_check (2, namb, namb, 631);
+$block_check (2, volb, volb, 632);
+
+! Copy the input name to the volb for the signal
+!
+len = MINU (volb$s_vol_ident, .fildesc [dsc$w_length]);
+CH$MOVE (.len, .fildesc [dsc$a_pointer], volb [volb$t_vol_ident]);
+volb [volb$l_vol_ident_len] = .len;
+
+! Determine the number of device blocks
+!
+len =  (BEGIN
+	LOCAL
+	    bmax;
+	bmax = MINU (65535, .init [init$l_q_allocation]);
+	IF .bmax EQL 0
+	THEN
+	    bmax = 494;				! Default to single density diskette
+	IF .init [init$l_q_allocation] GTRU .bmax
+	THEN
+	    $exch_signal (exch$_rt11_toomanyblk, 1, .bmax);
+	.bmax
+	END);
+
+! Determine the number of directory segments, so that we can put a floor on the size of the file
+!
+snum = (SELECTONE true OF
+	SET
+	[.init [init$l_q_segments] NEQ 0] :	.init [init$l_q_segments];
+	[.len LEQU 512] :			 1;
+	[.len LEQU 2048] :			 4;
+	[.len LEQU 12288] :			16;
+	[OTHERWISE] :				31;
+	TES);
+
+! Apply the floor and determine the number of blocks
+!
+start = rt11$k_root_block + (2 * .snum);
+len = MAXU (.start+32, .len);			! Make it at least 32 blocks for files
+volb [volb$l_devmaxblock] = .len;		! We need to save it here too
+volb [volb$l_volmaxblock] = .len;		! We need to save it here too
+
+! Init the RMS blocks for the volume
+!
+$fab_init (
+	FAB = fab,				! Volume FAB
+	ALQ = .len,				!  Allocation quantity
+	FAC = (BIO,GET,PUT),			!  Block I/O, read and write
+	FNA = .fildesc [dsc$a_pointer],		!  Set name addr
+	FNS = .fildesc [dsc$w_length],		!  Set name size
+	DNA = UPLIT BYTE ('VIRTUAL.DSK'),	!  Default name address
+	DNS = 11,				!  Default name size
+	MRS = 512,				!  Records size
+	RAT = CR,				!  Carriage return
+	RFM = FIX,				!  Fixed length records
+	NAM = nam);				!  Name block
+$rab_init (
+	RAB = rab,				! Volume RAB
+	ROP = BIO,				!  Block I/O
+	FAB = fab);				!  FAB addr
+$nam_init (
+	NAM = nam,				! File name block
+	RSA = .volb [volb$a_rsbuf],		!  Result name addr
+	RSS = nam$c_maxrss,			!  Result name size
+	ESA = .volb [volb$a_esbuf],		!  Expanded name addr
+	ESS = nam$c_maxrss);			!  Expanded name size
+
+! Create and connect to the volume
+!
+IF NOT (status = $create (fab = fab))
+THEN
+    RETURN exch$util_file_error (exch$_createvirt, .status, fab, .fab [fab$l_stv]);
+
+! Now put as much of the result name into the volb as we can
+!
+len = MINU (volb$s_vol_ident, .nam [nam$b_rsl]);
+CH$MOVE (.len, .nam [nam$l_rsa], volb [volb$t_vol_ident]);
+volb [volb$l_vol_ident_len] = .len;
+
+volb [volb$w_channel] = .fab [fab$l_stv];	! Save the channel number (NFS ==> user mode channel)
+
+IF NOT (status = $connect (rab = rab))
+THEN
+    RETURN exch$util_file_error (exch$_createvirt, .status, fab, .rab [rab$l_stv]);
+
+! Set the volume format and other bits and pieces
+!
+volb [volb$b_vol_format] = volb$k_vfmt_rt11;
+volb [volb$v_write] = true;
+volb [volb$v_virtual] = true;
+
+! Write the last block to set the eof block correctly
+!
+IF NOT (status = exch$io_rt11_write (volb, .volb [volb$l_volmaxblock]-1, 1, exch$io_rt11_write))
+THEN
+    RETURN .status;
+
+RETURN true;
+END;
+
+GLOBAL ROUTINE init_foreign_open =	%SBTTL 'init_foreign_open'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Open a foreign device with RMS so that we may initialize it.
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	namb - name block describing the device
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	volb - volume block which will describe the mounted volume
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	lots
+!--
+
+$dbgtrc_prefix ('init_foreign_open> ');
+
+LOCAL
+    status
+    ;
+
+BIND
+    init = exch$a_gbl [excg$a_init_work] : $ref_bblock,	! pointer to our work area
+    namb = .init [init$a_namb] : $bblock,		! Pointer to exchange NAMB structure
+    volb = .init [init$a_volb] : $bblock,		! Pointer to exchange VOLB structure
+    fab  = .volb [volb$a_fab] : $bblock,		! File Access Block for the volume
+    rab  = .volb [volb$a_rab] : $bblock,		! Record Access Block for the volume
+    nam  = .volb [volb$a_nam] : $bblock,		! RMS name block for the volume
+    dev_desc = namb [namb$q_device] : $desc_block	! Pointer to the device name
+    ;
+
+$block_check (2, .init, init, 571);
+$block_check (2, namb, namb, 572);
+$block_check (2, volb, volb, 573);
+
+! Get the device information
+!
+IF NOT (status = exch$util_vol_getdvi (dev_desc, volb))
+THEN
+    BEGIN
+    $exch_signal (exch$_accessfail, 1, dev_desc, .status);
+    RETURN .status;
+    END;
+
+! Look at the device characteristics and make some decisions
+!
+BEGIN	! scope "devbits"
+    BIND
+	devbits = volb [volb$l_devchar] : $bblock;
+    REGISTER
+	must_have, cannot_have;			! masks for device tests
+
+    ! We need to make sure that the thing is at least similar to a disk or tape.  First define masks for all
+    ! required and all prohibited device characteristics
+    !
+    IF .devbits [dev$v_rnd]
+    THEN
+	BEGIN					! bits for "disks"
+	must_have = (dev$m_rnd OR dev$m_fod OR dev$m_shr OR dev$m_avl OR dev$m_idv OR dev$m_odv OR dev$m_dir);
+	cannot_have = (dev$m_rec OR dev$m_ccl OR dev$m_trm OR dev$m_sdi OR dev$m_sqd OR dev$m_spl OR dev$m_opr
+			OR dev$m_net OR dev$m_gen OR dev$m_mbx OR dev$m_dmt OR dev$m_rtm);
+	END
+    ELSE
+	BEGIN					! bits for "tapes"
+	must_have = (dev$m_sqd OR dev$m_fod OR dev$m_avl OR dev$m_idv OR dev$m_odv);
+	cannot_have = (dev$m_ccl OR dev$m_trm OR dev$m_spl OR dev$m_opr
+			OR dev$m_net OR dev$m_gen OR dev$m_mbx OR dev$m_dmt OR dev$m_rtm);
+	END;
+
+    ! If we are missing any "must_have" items or if we have any "cannot_have" items, scream and shout
+    !
+    IF	(((.volb [volb$l_devchar] XOR .must_have) AND .must_have) NEQ 0)
+      OR
+	((.volb [volb$l_devchar] AND .cannot_have) NEQ 0)
+    THEN
+	$exch_signal_return (exch$_devnotsuit, 1, dev_desc);
+
+    ! If the device is not mounted in the VMS sense, then we must do that
+    ! and recursively call ourself
+    !
+    IF NOT .devbits [dev$v_mnt]
+    THEN
+	BEGIN
+	IF NOT exch$moun_vms_mount (volb, dev_desc)
+	THEN
+	    RETURN false;
+	RETURN init_foreign_open ();
+	END;
+
+    ! The device must be mounted foreign
+    !
+    IF NOT .devbits [dev$v_for]			! If the volume is write-locked
+    THEN
+	$exch_signal_return (exch$_opnotperf11, 1, namb [namb$q_device]);
+
+END;	! scope "devbits"
+
+! Now set the unique ident field of this volb
+!
+$debug_print_fao ('volb devnam "!AF", namb device "!AF", namb volid "!AF", concealed !UL',
+	.volb [volb$l_devnamlen], volb [volb$t_devnam], 
+	(BIND ndev = namb [namb$q_device] : $desc_block; .ndev [dsc$w_length]),
+	(BIND ndev = namb [namb$q_device] : $desc_block; .ndev [dsc$a_pointer]),
+	.namb [namb$l_vol_ident_len], namb [namb$t_vol_ident],
+	.namb [namb$v_concealed_device]);
+CH$MOVE (volb$s_vol_ident, namb [namb$t_vol_ident], volb [volb$t_vol_ident]);
+volb [volb$l_vol_ident_len] = .namb [namb$l_vol_ident_len];
+
+%IF switch_debug				! Debugging trace code
+%THEN
+    BEGIN
+    LOCAL
+	tmp_desc : $desc_block;
+    $stat_str_desc_init (tmp_desc, .volb [volb$l_devnamlen], volb [volb$t_devnam]);
+    $debug_print_fao ('Getdvi for name "!AS" resolved to device "!AS"', dev_desc, tmp_desc);
+    END;
+%FI
+
+! Init the RMS blocks for the volume
+!
+$fab_init (
+	FAB = fab,				! Volume FAB
+	FAC = (BIO,GET,PUT),			!  Block I/O, read and write
+	FNA = volb [volb$t_vol_ident], 		!  Set name addr
+	FNS = .volb [volb$l_vol_ident_len], 	!  Set name size
+	FOP = NFS,				!  Non-File Structured
+	NAM = nam);				!  Name block
+$rab_init (
+	RAB = rab,				! Volume RAB
+	ROP = BIO,				!  Block I/O
+	FAB = fab);				!  FAB addr
+$nam_init (
+	NAM = nam,				! File name block
+	RSA = .volb [volb$a_rsbuf],		!  Result name addr
+	RSS = nam$c_maxrss,			!  Result name size
+	ESA = .volb [volb$a_esbuf],		!  Expanded name addr
+	ESS = nam$c_maxrss);			!  Expanded name size
+
+! Open and connect to the volume
+!
+IF NOT (status = $open (fab = fab))
+THEN
+    RETURN exch$util_file_error (exch$_openforeign, .status, fab, .fab [fab$l_stv]);
+
+volb [volb$w_channel] = .fab [fab$l_stv];	! Save the channel number (NFS ==> user mode channel)
+
+IF NOT (status = $connect (rab = rab))
+THEN
+    RETURN exch$util_file_error (exch$_openforeign, .status, fab, .rab [rab$l_stv]);
+
+! Set the volume format
+!
+volb [volb$b_vol_format] = .namb [namb$b_vol_format];
+volb [volb$v_vfmt_explicit] = .namb [namb$v_vfmt_explicit];
+volb [volb$v_write] = (BIND devbits = fab [fab$l_dev] : $bblock; (NOT .devbits [dev$v_swl]));	! Device can't be writelocked
+
+RETURN true;
+END;
+
+GLOBAL ROUTINE init_init : NOVALUE =	%SBTTL 'init_init'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Perform setups for EXCH$init_initialize
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	global environment
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	memory might be allocated for the init control block
+!--
+
+$dbgtrc_prefix ('init_init> ');
+
+BIND
+    init = exch$a_gbl [excg$a_init_work] : $ref_bblock	! pointer to our work area
+    ;
+
+
+! If our pointer is null, we need to allocate and initialize the work area
+!
+IF .init EQL 0
+THEN
+    BEGIN
+
+    ! Get the right sized chunk of memory, conveniently set to nulls
+    !
+    init = exch$util_vm_allocate_zeroed (exchblk$s_init);
+
+    ! Set the ident fields
+    !
+    $block_init (.init, init);
+
+    ! Set the descriptors up
+    !
+    $dyn_str_desc_init (init [init$q_device]);
+    $dyn_str_desc_init (init [init$q_volumeid]);
+
+    END;
+
+! Make sure that our work area is valid
+!
+$block_check (2, .init, init, 570);
+
+RETURN;
+END;
+
+GLOBAL ROUTINE exch$init_initialize =	%SBTTL 'exch$init_initialize'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Action routine for the INIT verb, parses and performs main control functions for INIT
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	Command parameters and qualifiers as returned from CLI$xxx routines.
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	Data is 
+!--
+
+$dbgtrc_prefix ('init_initialize> ');
+
+LOCAL
+    message,
+    namb	: $ref_bblock,			! Local pointer to a namb
+    volb	: $ref_bblock,			! Local pointer to a volb
+    status
+    ;
+
+BIND
+    init = exch$a_gbl [excg$a_init_work] : $ref_bblock	! pointer to our work area
+    ;
+
+
+! Allocate and/or initialize the work area
+!
+init_init ();
+
+! Get the individual boolean qualifiers.
+!
+init [init$v_q_create] = cli$present (%ASCID 'CREATE');
+
+! Set the flag for printing init messages.  
+!
+init [init$v_q_message] = .exch$a_gbl [excg$v_q_message];	! Default to external state
+message = cli$present (%ASCID 'MESSAGE');			! Find the flag state for the 
+IF  .message EQL cli$_present					! Either /MESSAGE or /NOMESSAGE must be specified
+  OR								!  in order to override the external default
+    .message EQL cli$_negated
+THEN
+    init [init$v_q_message] = .message;
+
+!\ init [init$v_q_badblocks]	 = cli$present (%ASCID 'BADBLOCKS');
+!\ init [init$v_q_badblocks_retain] = cli$present (%ASCID 'BADBLOCKS.RETAIN');
+!\ init [init$v_q_replace]		 = cli$present (%ASCID 'REPLACE');
+!\ init [init$v_q_replace_retain]	 = cli$present (%ASCID 'REPLACE.RETAIN');
+
+! Get individual integer-valued qualifiers, routine signals on errors.  If the qualifier is not present, 0 is put
+! in the second parameter and -1 (success) is returned as the routine value.  Here we also treat positionals on the
+! second parameter as globals.
+!
+IF NOT (status = exch$cmd_cli_get_integer (%ASCID 'ALLOCATION', init [init$l_q_allocation]))
+THEN
+    RETURN .status;
+
+IF NOT (status = exch$cmd_cli_get_integer (%ASCID 'EXTRA_WORDS', init [init$l_q_extra_words]))
+THEN
+    RETURN .status;
+IF .init [init$l_q_extra_words] GTRU 119
+THEN
+    BEGIN
+    $exch_signal (exch$_rt11_extra);
+    init [init$l_q_extra_words] = 119;
+    END;
+
+IF NOT (status = exch$cmd_cli_get_integer (%ASCID 'SEGMENTS', init [init$l_q_segments]))
+THEN
+    RETURN .status;
+IF .init [init$l_q_segments] GTRU 31
+THEN
+    BEGIN
+    $exch_signal (exch$_rt11_toomanyseg, 1, 31);
+    init [init$l_q_segments] = 31;
+    END;
+
+! Get the volume label
+!
+IF NOT (status = cli$get_value (%ASCID 'VOLUMELABEL', init [init$q_volumeid]))
+THEN
+    $exch_signal_return (.status);
+
+! Parse the device name parameter into a newly allocated $NAMB, there are no defaults
+!
+status = exch$cmd_parse_filespec (%ASCID 'DEVICENAME', 0, 0, init [init$q_device], namb);
+init [init$a_namb] = .namb;			! Save it in the work area too
+IF NOT .status
+THEN
+    $exch_signal_return (exch$_parseerr, 1, init [init$q_device], .status);
+
+! If a physical init, check the name
+!
+IF NOT (.init [init$v_q_create])
+THEN
+    BEGIN
+    IF NOT .namb [namb$v_explicit_device]
+    THEN
+	$exch_signal_return (exch$_nodevice, 1, init [init$q_device]);
+    IF .namb [namb$v_explicit_node]
+    THEN
+	$exch_signal_return (exch$_noremote, 1, init [init$q_device]);
+    IF   .namb [namb$v_explicit_directory] OR .namb [namb$v_explicit_name]
+      OR .namb [namb$v_explicit_type] OR .namb [namb$v_explicit_version]
+    THEN
+	$exch_signal (exch$_devonly, 1, init [init$q_device]);
+    END;
+
+! If the device is not mounted, attempt to temporarily open a file and perform the operation
+!
+volb = .namb [namb$a_assoc_volb];		! If it is mounted, we will have a pointer to a volb
+IF (.volb EQL 0)
+THEN
+    BEGIN
+
+    ! Allocate a $VOLB to describe the volume
+    !
+    volb = exch$util_volb_allocate ();
+    init [init$a_volb] = .volb;
+
+    ! Temporarily open a channel to the device
+    !
+    IF .init [init$v_q_create]
+    THEN
+	status = init_foreign_create ()
+    ELSE
+	status = init_foreign_open ();
+
+    ! Now do the actual initialize
+    !
+    IF .status
+    THEN
+	BEGIN
+
+	! The open worked, let's see if we can do the volume-specific part of it
+	!
+	CASE .volb [volb$b_vol_format] FROM volb$k_vfmt_lobound TO volb$k_vfmt_hibound OF
+	SET
+		[volb$k_vfmt_dos11] :	BEGIN
+					status = init_dos11_init ();
+					CH$MOVE (6, UPLIT BYTE ('DOS-11'), volb [volb$t_vol_type]);
+					volb [volb$l_vol_type_len] = 6;
+					END;
+		[volb$k_vfmt_rt11] :	BEGIN
+					status = init_rt11_init ();
+					CH$MOVE (5, UPLIT BYTE ('RT-11'), volb [volb$t_vol_type]);
+					volb [volb$l_vol_type_len] = 5;
+					END;
+!\ 		[volb$k_vfmt_rtmt] :	$exch_signal_stop (exch$_notimplement);
+		[OUTRANGE,INRANGE] :	$logic_check (0, (false), 226);
+	TES;
+
+	! Close the volb's file now
+	!
+	init_foreign_close ();
+	END;
+
+    ! Release the volb, since we don't plan to mount it
+    !
+    exch$util_volb_release (.volb);
+
+    END
+
+! OK, the device has already been mounted
+!
+ELSE
+    BEGIN
+
+    ! The open worked, let's see if we can do the volume-specific part of it
+    !
+    init [init$a_volb] = .volb;
+    CASE .volb [volb$b_vol_format] FROM volb$k_vfmt_lobound TO volb$k_vfmt_hibound OF
+    SET
+	[volb$k_vfmt_dos11]	: status = init_dos11_init ();
+	[volb$k_vfmt_rt11]	: status = init_rt11_init ();
+!\	[volb$k_vfmt_rtmt]	: $exch_signal_stop (exch$_notimplement);
+	[OUTRANGE,INRANGE]	: $logic_check (0, (false), 307);
+    TES;
+
+    END;
+
+! Tell them it has been done
+!
+IF .status
+  AND
+   .init [init$v_q_message]
+THEN
+    $exch_signal (exch$_initialized, 4, .volb [volb$l_vol_type_len], volb [volb$t_vol_type],
+					.volb [volb$l_vol_ident_len],  volb [volb$t_vol_ident]);
+
+! Release the namb we used for the input
+!
+exch$util_namb_release (.namb);
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE init_rt11_init =	%SBTTL 'init_rt11_init'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Perform RT11 volume specific init actions
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	work area for INIT
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error encountered.
+!
+! SIDE EFFECTS:
+!
+!	RT11 directory will be initialized
+!--
+
+$dbgtrc_prefix ('init_rt11_init> ');
+
+LOCAL
+    ent : $ref_bblock,				! the first entry in the block
+    hdr	: $ref_bblock,				! pointer to the rt11 directory block
+    hom	: $ref_bblock,				! pointer to the rt11 home block
+    rtv : $ref_bblock,				! rt11 volume extension
+    bnum,					! number of blocks on device
+    snum,					! number of segments in directory
+    start,					! start block for files
+    hdrbuf : $bvector [rt11$k_dirseglen],	! actual buffer
+    status
+    ;
+
+BIND
+    init = exch$a_gbl [excg$a_init_work] : $ref_bblock,	! pointer to our work area
+    volb = init [init$a_volb]		 : $ref_bblock	! pointer to exchange VOLB structure
+    ;
+
+! Boot program. The following PDP-11 program will type out the attached message when the volume is booted on a
+! PDP-11, informing the user that this is not a system disk.  (Thanks to <INIT.SRC>ININDX.B32)
+!
+BIND
+    boot_program = UPLIT WORD (
+
+			%O'000240',		     !  BOOTBK:	NOP			; NOP IDENTIFIES BOOT BLOCK
+			%O'012706',  %O'001000',     !		MOV	#1000,SP	; SET TEMP STACK
+			%O'010700',		     !	 	MOV	PC,R0		; SET ADDRESS
+			%O'062700',  %O'000036',     !		ADD	#BOTMSG-.,R0	; OF MESSAGE
+			%O'112001',		     !  10$:	MOVB	(R0)+,R1	; GET NEXT CHARACTER
+			%O'001403',		     !	 	BEQ	20$		; END
+			%O'004767',  %O'000006',     !		CALL	TYPIT		; NO, PRINT IT
+			%O'000773',		     !	 	BR	10$		; LOOP FOR NEXT CHARACTER
+			%O'000005',		     !  20$:	RESET			;
+			%O'000000',		     !	 	HALT			; HALT
+						     !
+						     !
+			%O'110137',  %O'177566',     ! 	TYPIT:	MOVB	R1,@#TPB	; PRINT CHARACTER
+			%O'105737',  %O'177564',     ! 	10$:	TSTB	@#TPS		; DONE?
+			%O'100375',		     !	 	BPL	10$		; NO, WAIT
+			%O'000207'		     !		RETURN			;
+						     !
+						     !
+						     !	BOTMSG:
+			),
+
+    ! Boot message, we will add the volume id a little later
+    !
+    boot_message = UPLIT BYTE (
+			7, 13, 10, 10, 7,
+			'The volume labeled "            " is not a system volume.',
+			7, 13, 10, 10, 7, 0
+			);
+
+LITERAL
+	boot_prog_len	= 38,			! boot program is 38 bytes long
+	boot_mesg_len	= 68,			! message is 68 bytes long
+	boot_volname	= boot_prog_len+25;	! volume label offset in boot block message
+
+$block_check (2, .init, init, 574);
+$block_check (2, .volb, volb, 576);
+
+! Make sure that we can do it
+!
+IF NOT .volb [volb$v_write]
+THEN
+    $exch_signal_return ($warning_stat_copy (exch$_writelock), 2, 
+				.volb [volb$l_vol_ident_len], volb [volb$t_vol_ident]);
+
+! Get a zeroed buffer for the block and a pointer to the first entry
+!
+hdr = hdrbuf;
+hom = hdrbuf + 512;
+CH$FILL (0, rt11$k_dirseglen, hdrbuf);
+ent = .hdr + rt11hdr$k_length;
+
+! Determine the number of device blocks
+!
+bnum = (BEGIN
+	LOCAL
+	    bmax;
+	bmax = MINU (65535, .volb [volb$l_devmaxblock]);
+	IF .volb [volb$v_virtual]
+	THEN
+	    BEGIN
+	    IF .init [init$l_q_allocation] NEQ 0
+	      AND
+	       NOT .init [init$v_q_create]
+	    THEN
+		$exch_signal (exch$_virtnochange);
+	    .bmax
+	    END
+	ELSE IF .init [init$l_q_allocation] NEQ 0
+	THEN
+	    BEGIN
+	    IF .init [init$l_q_allocation] GTRU .bmax
+	    THEN
+		BEGIN
+		$exch_signal (exch$_rt11_toomanyblk, 1, .bmax);
+		.bmax
+		END
+	    ELSE
+		.init [init$l_q_allocation]
+	    END
+	ELSE
+	    .bmax
+	END);
+bnum = MAXU (40, .bnum);
+
+! Determine the number of directory segments
+!
+snum = (SELECTONE true OF
+	SET
+
+	! If a /SEGMENTS was given, use that value
+	!
+	[.init [init$l_q_segments] NEQ 0] :	.init [init$l_q_segments];
+
+	! If no /SEGMENTS, use a default based on device size (ala RT-11 DUP)
+	!
+	[.bnum LEQU 512] :			 1;
+	[.bnum LEQU 2048] :			 4;
+	[.bnum LEQU 12288] :			16;
+	[OTHERWISE] :				31;
+
+	TES);
+
+! Determine the start block for files
+!
+start = rt11$k_root_block + (2 * .snum);
+IF .start+32 GTRU .bnum				! If room for fewer than 32 blocks for files
+THEN
+    BEGIN
+    snum = 1;					! Reduce to one segment
+    start = rt11$k_root_block + 2;		! Start at a given block
+    $exch_signal (exch$_rt11_toomanyseg, 1, 1);	! And tell the world
+    END;
+
+! Set up the boot and home blocks
+!
+$logic_check (0, (rt11hom$s_owner_name EQL excg$s_username), 310);
+CH$MOVE (rt11hom$s_owner_name, exch$a_gbl [excg$t_username], hom [rt11hom$t_owner_name]);
+CH$MOVE (rt11hom$s_system_id,  UPLIT BYTE ('DECVMSEXCHNG'),  hom [rt11hom$t_system_id]);
+CH$MOVE (boot_prog_len + boot_mesg_len, boot_program, hdrbuf [0]);
+(BEGIN
+ BIND
+     desc = init [init$q_volumeid] : $desc_block;
+ CH$COPY (.desc [dsc$w_length], .desc [dsc$a_pointer], %C ' ', rt11hom$s_volume_id, hom [rt11hom$t_volume_id]);
+ CH$COPY (.desc [dsc$w_length], .desc [dsc$a_pointer], %C ' ', rt11hom$s_volume_id, hdrbuf [boot_volname]);
+ END);
+hom [rt11hom$w_system_vers] = %RAD50_11 'V40';
+hom [rt11hom$w_cluster]     = 1;
+hom [rt11hom$w_first_seg]   = rt11$k_root_block;
+
+! Write the boot and home blocks.
+!
+IF NOT (status = exch$io_rt11_write (.volb, 0, 2, .hdr))
+THEN
+    RETURN .status;
+
+! If the volume format extension exists, overwrite the cached home block
+!
+rtv = .volb [volb$a_vfmt_specific];
+IF .rtv NEQ 0
+THEN
+    BEGIN
+    $block_check (2, .rtv, rt11, 629);					! If not an rtv we are hopelessly confused
+    CH$MOVE (512, .hom, rtv [rt11$t_block_1]);				! Copy the home block to cache
+    END;
+
+! We will zero the disk to the end of the directory area.
+!
+CH$FILL (0, rt11$k_dirseglen, hdrbuf);		! Set it back to zeroes
+INCR p FROM 2 TO .start-1 BY 2
+DO
+    IF NOT (status = exch$io_rt11_write (.volb, .p, 2, .hdr))
+    THEN
+	RETURN .status;
+
+! Since Files-11 writes a large number of home blocks on a device, make sure that we zero most of them so that we
+! don't see strange things happening during a foreign mount.
+!
+IF NOT (status = init_zero_home_blocks (.start, .hdr))		! Pass # of first unzeroed block and zeroed buffer
+THEN
+    RETURN .status;
+
+! Now set up the header of the first segment
+!
+hdr [rt11hdr$w_num_segs] = .snum;
+hdr [rt11hdr$w_next_seg] = 0;			! Only one segment in the directory
+hdr [rt11hdr$w_high_seg] = 1;
+hdr [rt11hdr$w_extra_bytes] = 2 * .init [init$l_q_extra_words];
+hdr [rt11hdr$w_start_block] = .start;
+
+! Make the empty entry followed by end of segment marker
+!
+ent [rt11ent$b_type_byte] = rt11ent$m_typ_empty;
+ent [rt11ent$l_filename] = r50_empty;		! Name is simple "EMPTY.FIL"
+ent [rt11ent$w_filetype] = r50_fil;
+exch$rt11_format_current_date (.ent);
+ent [rt11ent$w_blocks] = .bnum - .hdr [rt11hdr$w_start_block];
+ent = .ent + rt11ent$k_length + .hdr [rt11hdr$w_extra_bytes];
+$logic_check (2, (.ent LSSU .hdr + 510), 247);
+ent [rt11ent$b_type_byte] = rt11ent$m_typ_end_segment;
+
+! If the volume format extension exists, overwrite the cached directory
+!
+IF .rtv NEQ 0
+THEN
+    BEGIN
+    CH$MOVE (512, .hdr, rtv [rt11$t_dire_segments]);			! Copy the new directory to cache
+    $logic_check (2, (exch$rtacp_verify_directory (.volb)), 249);	! Make sure the directory is still ok
+    END;
+
+! Write out the new root directory, only the first block necessary
+!
+status = exch$io_rt11_write (.volb, rt11$k_root_block, 1, .hdr);
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE init_zero_home_blocks (start, buf) =	%SBTTL 'init_zero_home_blocks (start, buf)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Zero any possible Files-11 home blocks on the volume to prevent extraneous privilege problems with
+!	future mounts.
+!
+! INPUTS:
+!
+!	start - the pbn of the first uninitialized block on the volume
+!	buf   - the address of a 1024-byte buffer which has been set to zeroes
+!
+! IMPLICIT INPUTS:
+!
+!	work area for INIT
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Success or worst error
+!
+! SIDE EFFECTS:
+!
+!	disk blocks may be zeroed
+!--
+$dbgtrc_prefix ('init_zero_home_blocks> ');
+
+LOCAL
+    blockfact,						! device blocking factor
+    delta,						! home block search delta
+    device_char : $bblock [dib$k_length],		! block for device characteristics
+    devchar_desc : VECTOR [2, LONG],			! desc for above
+    pbn,						! physical block number to check
+    status
+    ;
+
+BIND
+    init = exch$a_gbl [excg$a_init_work] : $ref_bblock,	! pointer to our work area
+    volb = init [init$a_volb]		 : $ref_bblock	! pointer to exchange VOLB structure
+    ;
+
+! For virtual volumes we cannot perform a normal home block scan, since the home block search sequence depends on
+! the physical device geometry.  This is unfortunate, since a virtual volume might be a copy of (and be copied
+! back to) a physical device.  Usually, this copy will only be between a small disk (i.e. floppy or TU58) and a
+! virtual volume.  We will use our knowlege of these disks to perform ad hoc home block zeroing.
+!
+IF .volb [volb$v_virtual]
+THEN
+    BEGIN
+    status = true;				! Assume success
+
+    SELECTONE .volb [volb$l_volmaxblock] OF
+    SET
+	[494] :		IF .start LEQU 8	! Single density floppy puts alternate home on pbn 8
+			THEN
+			    status = exch$io_rt11_write (.volb, 8, 1, .buf);
+
+	[988] :		IF .start LEQU 15	! Double density floppy puts alternate home on pbn 15
+			THEN
+			    status = exch$io_rt11_write (.volb, 15, 1, .buf);
+
+	[OTHERWISE] :	;			! Ignore large disks, TU58 puts home blocks on pbn 1 and 2 which
+						!  we know that we have already hit
+    TES;
+
+    RETURN .status;				! All done with virtual volumes
+    END;
+
+! Read the device characteristics
+!
+devchar_desc [0] = dib$k_length;		! Init length of char buffer
+devchar_desc [1] = device_char;			!  and address of buffer
+
+IF NOT (status = $getchn (chan=.volb [volb$w_channel], pribuf=devchar_desc))
+THEN
+    $exch_signal_stop (.status);
+
+! (Home block geometry calculations borrowed from <INIT.SRC>RDHOME.B32)
+!
+! Compute the home block search delta from the volume geometry in the device table. This is done according to the
+! following rules, where volume geometry is expressed in the order sectors, tracks, cylinders:
+!
+!	n x 1 x 1:	1
+!	1 x n x 1:	1
+!	1 x 1 x n:	1
+!
+!	n x m x 1:	n+1
+!	n x 1 x m:	n+1
+!	1 x n x m:	n+1
+!
+!	s x t x c:	(t+1)*s+1
+!
+blockfact = (.device_char [dib$b_sectors]
+	   * .device_char [dib$b_tracks]
+	   * .device_char [dib$w_cylinders])
+	   / .device_char [dib$l_maxblock];
+
+delta = 1;
+IF  .device_char [dib$w_cylinders] GTR 1
+  AND
+    .device_char [dib$b_tracks] GTR 1
+THEN
+    delta = .delta + .device_char [dib$b_tracks];
+
+IF  .device_char [dib$b_sectors] GTR 1
+  AND
+    (.device_char [dib$w_cylinders] GTR 1
+     OR
+     .device_char [dib$b_tracks] GTR 1)
+THEN
+    delta = (.delta * .device_char [dib$b_sectors] + .blockfact) / .blockfact;
+
+IF .delta EQL 0
+  OR
+   .delta GTRU .device_char [dib$l_maxblock] / 10
+THEN
+    delta = 1;
+$trace_print_fao ('block factor is !UL, delta is !UL', .blockfact, .delta);
+
+! Search for the home blocks to zero.  To save time, we will just zap the first five possible positions for
+! home blocks.  Note the potential hole:  Disks with the home block far into the disk might not be completely
+! zeroed and might have protection anomalies.  C'est la vie.
+!
+pbn = 1;					! Start search at pbn 1
+DECR j FROM 4 TO 0
+DO
+    BEGIN
+    $trace_print_fao ('index !UL, pbn !UL', .j, .pbn);
+    IF .start LEQU .pbn
+    THEN
+	IF NOT (status = exch$io_rt11_write (.volb, .pbn, 1, .buf))
+	THEN
+	    RETURN .status;
+    pbn = .pbn + .delta;
+    END;
+
+RETURN .status;
+END;
+
+END
+ELUDOM

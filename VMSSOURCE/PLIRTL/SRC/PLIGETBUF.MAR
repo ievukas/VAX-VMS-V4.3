@@ -1,0 +1,549 @@
+	.title	pli$getbuffer - pl1 runtime input buffer manipulation
+	.ident	/1-002/					; Edit WHM1002
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; facility:
+;
+;	VAX/VMS PL1 runtime library.
+;
+; abstract:
+;
+;	This module contains the pl1 runtime routines for buffer manipulation
+;	used for input stream files.
+;
+; author: c. spitz 4-oct-79
+;
+; modified:
+;
+;
+;	1-002	Bill Matthews	29-September-1982
+;
+;		Invoke macros $defdat and rtshare instead of $defopr and share.
+;
+;--
+
+;
+; external definitions
+;
+	$deffcb				;define phile control block
+	$defstr				;define stream block offsets
+	$defcvtind			;define convert indices
+	$rmsdef				;define rms error codes
+	$defrtscan			;define runtime scan masks
+	$devdef				;define device bits in fab
+	$fabdef				;define fab offsets
+	$rabdef				;define rms rab offsets
+
+;
+; local definitions
+;
+
+terminator = pli$c_blank+pli$c_comma ;stream input field terminator
+
+	rtshare				;shareable
+
+;
+; local data
+;
+
+revbit:	.byte	0,1			;reversed bits for b1
+	.byte	0,2,1,3			;reversed bits for b2
+	.byte	0,4,2,6,1,5,3,7		;reversed bits for b3
+	.byte	0,8,4,12,2,10,6,14,1,9	;reversed bits for b4
+	.byte	5,13,3,11,7,15		;
+
+;++
+; local commentary
+;
+;	The stream input buffer manipulation routines operate on 2 entities.
+;These are the buffer and the field.  The buffer contains the characters re-
+;turned by an rms $get.  The field contains the characters that the conversion
+;routines process. They are different to handle quoted strings, bit strings,
+;and fields that cross buffer boundaries.  They are accessed by three pointers,
+;the starting address, the address of the next character to be processed, and
+;the address one byte past the current end of the buffer or field.  e.g.
+;
+;	|<-----------------------buffer--data------------------>|-|
+;	|this is the data in the|%|buffer. 123, 12345,	12345679| |
+;	|-----------------------|-|-----------------------------|-|
+;	 ^			 ^				 ^
+;    fcb_l_buf		    fcb_l_buf_pt		    fcb_l_buf_end
+;
+;		|<----------------------field--data-------------------->|-|
+; str_l_field:	|this is the data in the| |				| |
+;		|-----------------------|_|-----------------------------|-|
+;		 			 ^				 ^
+;	    			    str_l_fld_pt		str_l_fld_end
+;
+;	Note that str_b_field(r11) is the first character in the field,
+;while fcb_l_buf(ap) is the address of the first character in the buffer.
+;
+;	The following properties are used throughout this module:
+;1. The length of the string "this is the data in the" is:
+;	fcb_l_buf_pt - fcb_l_buf for the buffer and
+;	str_l_fld_pt - addr(str_l_field) for the field
+;2. The length of the un-processed characters in the buffer (from the
+;	character pointed to by fcb_l_buf_pt (the "%") to the end of
+;	the buffer (the "9") is: fcb_l_buf_end - fcb_l_buf_pt
+;3. Field overflow occurs when (str_l_fld_pt + <the length of the
+;	string to move to the field>) is gequ str_l_fld_end.
+;
+;--
+
+	.page
+;++
+; pli$$getnlis_r6 -- get next list field from the input stream
+;
+; functional description:
+;
+; This routine gets elements from a pl1 input stream. It is called by
+; the pli$getl*** routines to return the next list field in the
+; stream buffer.  It returns the address and length of the character
+; string or bit string that contains the value of the next field in the
+; stream.  It handles the allocation and filling of the stream buffer.
+;
+; calling sequence:
+;	jsb	pli$$getnlis_r6
+;
+; inputs:
+;	ap = address of file control block
+;	r11 = address of stream block
+; outputs: - the file control block and stream block are updated.
+;	r0 = address of field or 0 if the list element is to be skipped
+;	r1 = length of field
+;	r4 = data type of field set for src case index for pli$cvrt_cg_r3
+;--
+
+	.enabl	lsb
+
+pli$$getnlis_r6::			;get next list field
+	bbc	#atr_v_eof,fcb_l_attr(ap),20$ ;if end of file
+10$:	bbc	#atr_v_string,fcb_l_attr(ap),15$ ;if its reall end of string
+	movl	#pli$_endstring,r0	;set endstring error
+13$:	brw	fail			;and fail
+15$:	movl	#pli$_endfile,r0	;set endfile condition
+	brb	13$			;and fail
+20$:	movab	str_b_field(r11),str_l_fld_pt(r11) ;start at beginning of field
+;
+; skip blanks and tabs
+;
+30$:	subl3	fcb_l_buf_pt(ap), -	;get length left in buffer
+		fcb_l_buf_end(ap),r0	;
+	beql	40$			;if eql, get a new buffer
+	spanc	r0,@fcb_l_buf_pt(ap), - ;scan past blanks and tabs
+		g^pli$b_scan,#pli$c_blank ;
+	bneq	50$			;if neq, then not end of buffer, cont
+40$:	bbcc	#str_v_null_line,str_l_fs(r11),45$ ;if not null line, cont
+	bicl	#atr_m_comma_exp,fcb_l_attr(ap) ;set comma not expected
+	movab	str_b_field(r11),r0	;set addr of field
+	clrl	r1			;set zero length
+	movl	#cvt_k_src_char,r4	;set char data type
+	rsb				;return
+45$:	bsbw	pli$$get_rec		;end of buffer, so get new record
+	bbc	#atr_v_eof,fcb_l_attr(ap),30$ ;if not end of file, go again
+	brb	10$			;signal eof
+50$:	movl	r1,fcb_l_buf_pt(ap)	;copy address of next char in buffer
+;
+; if the next char is a comma then see if it is expected. if it is, then
+; ignore it, and skip any succeeding blanks and tabs. if it is not expected,
+; we will ignore this field.
+;
+	cmpb	#^x2c,@fcb_l_buf_pt(ap) ;is next character a comma?
+	bneq	60$			;if neq, then no
+	incl	fcb_l_buf_pt(ap)	;skip comma in buf
+	bbsc	#atr_v_comma_exp,fcb_l_attr(ap),20$ ;if comma expected
+	clrl	r0			;clear address
+	rsb				;return
+;
+; if the next char is a quote then try to parse as a string constant. double
+; quotes are converted to single quotes and inserted in field. after we find
+; the trailing quote, the next char must be either a valid terminator (space,
+; tab, or comma) or a B or b. if it is a terminator, process as a char string.
+; if it is a B or b, process as a bit string. otherwise, raise the error con-
+; dition.
+;
+60$:	cmpb	#^x27,@fcb_l_buf_pt(ap) ;is next char a quote?
+	beql	70$			;if eql, then yes
+	brw	300$			;go process as unquoted string
+70$:	incl	fcb_l_buf_pt(ap)	;skip the quote
+	subl3	fcb_l_buf_pt(ap), -	;get length remaining
+		fcb_l_buf_end(ap),r0	;
+	bgtr	90$			;if gtr, then continue
+80$:	bsbw	pli$$get_rec		;else get new record
+	bbc	#atr_v_eof,fcb_l_attr(ap),90$ ;if not end of file, continue
+	movl	#pli$_cnverr,r0		;set error code
+	brw	fail			;and fail
+;
+; find next quote
+;
+90$:	locc	#^x27,r0,@fcb_l_buf_pt(ap) ;look for a quote
+	bneq	100$			;if neq, then we found quote
+	bbc	#atr_v_app_comma,fcb_l_attr(ap),100$ ;if append comma
+	decl	r1			;then don't copy the comma
+100$:	pushl	r0			;save length remaining in buf
+	bsbw	copy_chars		;copy intervening chars to the field
+	tstl	(sp)+			;did we find a quote
+	beql	80$			;if eql, no so go again
+;
+; quote found.
+;
+110$:	incl	fcb_l_buf_pt(ap)	;skip the quote
+	cmpl	fcb_l_buf_pt(ap), -	;end of buffer?
+		fcb_l_buf_end(ap)	;
+	blssu	120$			;if lssu, then no
+	bsbw	pli$$get_rec		;get new record
+	bbc	#atr_v_eof,fcb_l_attr(ap),120$ ;if not eof continue
+	brw	310$			;treat eof as terminator
+;
+;check for double quotes
+;
+120$:	cmpb	#^x27,@fcb_l_buf_pt(ap) ;is next char a quote?
+	bneq	140$			;if neq, then no
+	cmpl	str_l_fld_pt(r11), -	;space left in field?
+		str_l_fld_end(r11)	;
+	blssu	130$			;if lssu, yes, continue
+	movl	#pli$_strovfl,r0	;set field overvflow
+	brw	fail			;and fail
+130$:	movb	#^x27,@str_l_fld_pt(r11) ;copy a single quote to field
+	incl	str_l_fld_pt(r11)	;include quote in field
+	brb	70$			;go again
+;
+;routine to check for valid terminator. if char pointed to by fcb_l_buf_pt(ap)
+;is a blank or tab or comma, r0 is non-zero. if @fcb_l_buf_pt(ap) is a comma,
+;comma_exp is set false. else, it is set to true.
+;
+;	
+;check for bit constant
+;
+140$:	spanc	#1,@fcb_l_buf_pt(ap), - ;is next char a blank,
+		g^pli$b_scan,#terminator ;tab or comma?
+	bneq	150$			;if neq, no, look for b/B
+	brw	310$			;if neq, then we found terminator
+150$:	cmpb	#^x42,@fcb_l_buf_pt(ap) ;next char a B?
+	beql	170$			;if eql, then yes
+	cmpb	#^x62,@fcb_l_buf_pt(ap) ;next char a b?
+	beql	170$			;if eql, then yes
+160$:	movl	#pli$_cnverr,r0		;set invalid conversion
+	brw	fail			;and fail
+;
+; found a b/B.
+;
+170$:	incl	fcb_l_buf_pt(ap)	;skip b/B in buf
+	cmpl	fcb_l_buf_pt(ap), -	;buf exhausted?
+		fcb_l_buf_end(ap)	;
+	blssu	180$			;if lssu, no
+	bsbw	pli$$get_rec		;get a new buffer
+	bbs	#atr_v_eof,fcb_l_attr(ap),190$ ;if eof, treat as terminator
+180$:	spanc	#1,@fcb_l_buf_pt(ap), - ;is next char a blank,
+		g^pli$b_scan,#terminator ;tab or comma?
+	bneq	200$			;if neq, no, look for 1-4
+190$:	movl	#1,r0			;treat as b1
+	brb	230$			;continue
+200$:	movzbl	@fcb_l_buf_pt(ap),r0	;get next char
+	subl	#^x30,r0		;normalize char to bin
+	bleq	160$			;if leq, then invalid char, fail
+	cmpl	r0,#4			;is it greater that 4?
+	bgtr	160$			;if gtr, then invalid char, fail
+	pushl	r0			;save radix
+	incl	fcb_l_buf_pt(ap)	;skip the 1-4
+	cmpl	fcb_l_buf_pt(ap), -	;buf exhausted?
+		fcb_l_buf_end(ap)	;
+	blssu	210$			;if lssu, no, continue
+	bsbw	pli$$get_rec		;get new record
+	bbs	#atr_v_eof,fcb_l_attr(ap),220$ ;if eof, treat as terminator
+210$:	spanc	#1,@fcb_l_buf_pt(ap), - ;look for a terminator
+		g^pli$b_scan,#terminator ;
+	bneq	160$			;if neq, then no terminator, error
+220$:	popl	r0			;restore radix
+;
+; allocate room for the bit string on the stack. convert the char string to
+; a bit string, based upon the character after the b/B.
+;
+; local reg usage
+;	r0 - radix, number of bits per char
+;	r1 - pointer to next char in field
+;	r2 - number of bytes to allocate for bit temp
+;	r3 - number of bytes in field
+;	r4 - 2**(r0-1)-1 max valid integer in field
+;	r5 - current char
+;	r6 - offset into bit temp
+;
+230$:	pushab	320$			;set return address
+pli$$chrbitn_r6::			;entry for getformat
+	movab	str_b_field(r11),r1	;get addr of start of field
+	subl3	r1,str_l_fld_pt(r11),r3 ;get length of field
+	mull3	r0,r3,r2		;get number of bits required
+	addl	#7,r2			;round up
+	ashl	#-3,r2,r2		;get number of bytes to allocate
+	subl	r2,sp			;allocate temp
+	clrb	-1(sp)[r2]		;clear last byte
+	ashl	r0,#1,r4		;get the max bit value
+	decl	r4			;
+	clrl	r6			;start at bit offset 0
+	brb	280$			;enter loop
+240$:	movzbl	(r1)+,r5		;pick up next char 
+	subb	#^x30,r5		;find bit equiv
+	bgeq	260$			;if geq then continue
+250$:	movl	#pli$_cnverr,r0		;else set invalid conversion
+	brw	fail			;and fail
+260$:	cmpb	r5,#9			;is it a number?
+	bleq	270$			;if leq, then yes, cont
+	cmpb	r5,#16			;is it between 9 and A
+	bleq	250$			;if leq, then yes, fail
+	subb	#7,r5			;try for cap A-F
+	cmpb	r5,#15			;is it A-F?
+	bleq	270$			;if leq, then yes, cont
+	cmpb	r5,#41			;is it between F and a?
+	bleq	250$			;if leq, then yes, fail
+	subb	#32,r5			;try for a-f
+	cmpb	r5,#15			;is it a-f?
+	bleq	270$			;if leq, then yes
+	brb	250$			;it's past f, fail
+270$:	cmpb	r5,r4			;is it in range?
+	bgtr	250$			;if gtr then fail
+	movab	<revbit-1>[r5],r5	;get addr of table entry
+	movb	(r5)[r4],r5		;get the reversed bits of the value
+	insv	r5,r6,r0,(sp)		;insert reversed bits in string
+	addl	r0,r6			;address next offset
+280$:	sobgeq	r3,240$			;go again
+290$:	movc3	r2,(sp),str_b_field(r11) ;copy temp to field
+	movl	r1,sp			;clean stack
+	movl	#cvt_k_src_abit,r4	;set data type
+	movab	str_b_field(r11),r0	;set data address
+	movl	r6,r1			;set data size
+	rsb				;return
+;
+; not a quoted string. find the terminator, copy intervening chars to field
+; 
+300$:	subl3	fcb_l_buf_pt(ap), -	;get length left in buf
+		fcb_l_buf_end(ap),r0	;
+	scanc	r0,@fcb_l_buf_pt(ap), - ;look for a blank,
+		g^pli$b_scan,#terminator ;tab or comma
+	pushl	r0			;save result
+	bsbw	copy_chars		;copy chars to field
+	tstl	(sp)+			;did we find the terminator?
+	bneq	310$			;if neq, yes, all done
+	bsbw	pli$$get_rec		;get a new record
+	bbc	#atr_v_eof,fcb_l_attr(ap),300$ ;if not eof, go again
+;
+; finish up. set size in r1, addr in r0, char src case index in r4, update
+; column in fcb.
+;
+310$:	movab	str_b_field(r11),r0	;set address
+	subl3	r0,str_l_fld_pt(r11),r1 ;set size
+	movl	#cvt_k_src_char,r4	;set data type
+320$:	bisl	#atr_m_comma_exp,fcb_l_attr(ap) ;set comma expected
+	cmpb	#^x2c,@fcb_l_buf_pt(ap) ;was the terminating char a comma?
+	bneq	330$			;if neq, then no
+	bicl	#atr_m_comma_exp,fcb_l_attr(ap) ;clear comma expected
+330$:	bbs	#atr_v_eof,fcb_l_attr(ap),340$ ;if eof, don't touch column
+	incl	fcb_l_buf_pt(ap)	;skip the terminating character
+	subl3	fcb_l_buf(ap), -	;update column
+		fcb_l_buf_pt(ap),r2	;
+	movw	r2,fcb_w_column(ap)	;
+340$:	rsb				;return
+
+	.dsabl	lsb
+
+;++
+; copy_chars
+;
+; copy chars from buffer to field.
+;--
+copy_chars:
+	subl3	fcb_l_buf_pt(ap),r1,r0	;get length to move
+	addl3	r0,str_l_fld_pt(r11),r1 ;will this put us 
+	cmpl	r1,str_l_fld_end(r11)	;past end of field?
+	blssu	10$			;if lssu, then no
+	movl	#pli$_strovfl,r0	;set field overflow
+	brw	fail			;and fail
+10$:	movc3	r0,@fcb_l_buf_pt(ap), - ;copy to field
+		@str_l_fld_pt(r11)	;
+	movl	r1,fcb_l_buf_pt(ap)	;update buf pointer
+	movl	r3,str_l_fld_pt(r11)	;update field pointer
+	rsb				;return
+
+;pli$$getnedi_r6
+; inputs:
+;	r0 - width of field to get
+; outputs:
+;	r0 - addr of str_b_field(r11)
+;	r1 - length of field
+; side effects:
+;	stream block and fcb updated
+;	r2-ap preserved
+pli$$getnedi_r6::
+	bbc	#atr_v_eof,fcb_l_attr(ap),2$ ;if end of file
+1$:	movl	#pli$_endfile,r0	;get endfile code
+	brw	fail			;fail	
+2$:	pushr	#^m<r2,r3,r4,r5,r6>	;save regs
+	movab	str_b_field(r11),str_l_fld_pt(r11) ;start at beginning of field
+	pushl	r0			;save requested width
+	movl	r0,r6			;copy width
+5$:	subl3	fcb_l_buf_pt(ap), -	;get length left in buffer
+		fcb_l_buf_end(ap),r0	;
+	bbc	#atr_v_app_comma,fcb_l_attr(ap),6$ ;if append comma set
+	decl	r0			;don't count comma
+6$:	tstl	r0			;set cond code
+	bgtr	10$			;if gtr, cont
+7$:	bbsc	#str_v_null_line,str_l_fs(r11),155$ ;if null line, return it
+8$:	bsbw	pli$$get_rec		;get a new record
+	bbc	#atr_v_eof,fcb_l_attr(ap),5$ ;if not eof, cont
+	bbc	#atr_v_app_comma,fcb_l_attr(ap),1$ ;if not append comma fail
+	cmpl	r6,(sp)			;was there anything copied yet?
+	beql	1$			;if eql, no, endfile
+	brb	155$			;use what we copied
+10$:	cmpl	r0,r6			;is there enough in the buffer?
+	bgeq	20$			;if geq, then yes
+	subl	r0,r6			;get length not processed
+	movl	fcb_l_buf_end(ap),r1	;set end addr for copy
+	bbc	#atr_v_app_comma,fcb_l_attr(ap),15$ ;if append comma set
+	decl	r1			;don't copy comma
+15$:	bsbw	copy_chars		;copy from buf to field
+155$:	bbc	#atr_v_app_comma,fcb_l_attr(ap),8$ ;if not app comma, get a rec
+	subl	r6,(sp)			;get length of what we did
+	brb	30$			;cont
+20$:	addl3	r6,fcb_l_buf_pt(ap),r1	;get end addr for copy
+	bsbw	copy_chars		;copy from buf to field
+30$:	addw	r6,fcb_w_column(ap)	;update column
+	movab	str_b_field(r11),r0	;set address of field
+	popl	r1			;set length
+	popr	#^m<r2,r3,r4,r5,r6>	;restore registers
+	rsb				;return
+
+
+;++
+; pli$$getskip_r2 - skip records for stream input
+; pli$$getskp1_r2 - skip 1 record for stream input
+;
+; functional description:
+;
+; This routine processes the skip option and skip formats of get statements.
+; It is called by pli$$getnlis_r6 and pli$$getnedi_r6. It will read enough
+; records to satisfy the skip request and update the line number and column
+; number of the stream file's fcb.
+;
+; inputs: r2 = number of skips to process
+; outputs: none
+;--
+	.enabl	lsb
+
+pli$$getskp1_r2::			;
+	movl	#1,r2			;set to skip 1
+pli$$getskip_r2::			;
+	movl	#^x0a0d,str_b_field(r11) ;set to prompt with <cr><lf>
+	movb	#2,<fcb_b_rab+rab$b_psz>(ap) ;set prompt size in rab
+	movab	str_b_field(r11),<fcb_b_rab+ - ;set prompt addr
+		rab$l_pbf>(ap)		;in rab
+	bisl	#rab$m_pmt,<fcb_b_rab+rab$l_rop>(ap) ;set to prompt in rab
+	bicl	#atr_m_currec,fcb_l_attr(ap) ;clear currec to do skips
+	bbc	#atr_v_virgin,fcb_l_attr(ap),10$ ;skip first rec if virgin
+5$:	bbs	#atr_v_eof,fcb_l_attr(ap),20$ ;if eof, signal endfile
+	bsbw	pli$$get_rec		;skip a record
+10$:	sobgeq	r2,5$			;dec count and go again
+	bisl	#atr_m_currec,fcb_l_attr(ap) ;set currec to turn off skipping
+	bicl	#rab$m_pmt,<fcb_b_rab+rab$l_rop>(ap) ;clear prompt in rab
+	rsb				;return
+20$:	movl	#pli$_endfile,r0	;set endfile condition
+	brw	fail			;and fail
+	.dsabl	lsb
+
+;++
+; pli$$get_rec
+;
+; functional description:
+;
+; This routine reads records from a stream file. It will append a blank
+; to each record if atr_m_app_comma is set in fcb_l_attr. null records are
+; are ignored unless append comma is 1 or atr_m_currec is 0. if atr_m_currec
+; is 0, we are processing a skip function so null records count. if the
+; end of file is encountered, atr_m_eof is set, and a null record is
+; returned. if atr_m_eof is set when this routine is called, the endfile
+; condition ; is raised.
+;
+; inputs: 	atr_m_currec = 0 to process a skip.
+;		atr_m_app_comma = 1 will append a blank unless we are
+;			parsing a quoted string
+; outputs:	r0 = number of chars in record
+;		atr_m_virgin = 0 (file has been touched)
+;		fcb_w_column is set to 1
+;		the buffer pointed to by fcb_l_buf gets the next non-null
+;			record.
+;--
+	.enabl	lsb
+
+pli$$get_rec::
+	bicl	#str_m_null_line,str_l_fs(r11) ;assume not a null line
+	bbc	#atr_v_string,fcb_l_attr(ap),10$ ;if string
+	tstl	str_l_fp(r11)		;is this get edit?
+	bneq	1$			;if neq, yes, cont
+	bisl	#atr_m_eof,fcb_l_attr(ap) ;set end of file
+	rsb				;return
+1$:	movl	#pli$_endstring,r0	;set endstring condition
+	brb	fail			;and fail
+10$:	movl	#pli$_endfile,r0	;assume eof
+	bbs	#atr_v_eof,fcb_l_attr(ap),fail ;if eof already, fail
+11$:	$get	fcb_b_rab(ap)		;get the record
+	blbs	r0,30$			;if lbs, cont
+15$:	cmpl	r0,#rms$_eof		;end of file encountered?
+	bneq	20$			;if neq, then no
+	bisl	#atr_m_eof,fcb_l_attr(ap) ;set end of file in fcb
+	brb	40$			;continue
+20$:	movl	#pli$_rmsr,r0		;set rms rab error
+fail:	pushl	ap			;set fcb addr
+	cmpl	r0,#pli$_endfile	;endfile condition?
+	beql	25$			;if eql, yes, cont
+	pushl	r0			;set error code
+	pushl	#pli$_error		;set error condition
+23$:	calls	#3,g^pli$io_error	;signal error
+	ret				;return
+25$:	pushl	#0			;set no error code
+	pushl	#pli$_endfile		;set endfile condtion
+	brb	23$			;signal endfile
+30$:	movzwl	<fcb_b_rab+rab$w_rsz>(ap),r0 ;get size of record
+	bneq	35$			;if neq, cont
+	bisl	#str_m_null_line,str_l_fs(r11) ;indicate null line
+35$:	movl	<fcb_b_rab+rab$l_rbf>(ap),fcb_l_buf(ap) ;set buffer address
+	addl3	r0,fcb_l_buf(ap), -	;set end of buffer
+		fcb_l_buf_end(ap)	;
+	bbc	#atr_v_app_comma,fcb_l_attr(ap),40$ ;if append comma set
+	movb	#^x20,@fcb_l_buf_end(ap) ;then append a comma
+	incl	fcb_l_buf_end(ap)	;update end of buffer
+	incl	r0			;update number of chars in rec
+40$:	movw	#1,fcb_w_column(ap)	;set column to 1
+	movl	fcb_l_buf(ap),fcb_l_buf_pt(ap) ;update buf pointer
+	cmpl	fcb_l_buf(ap),fcb_l_buf_end(ap) ;null record?
+	bneq	60$			;if neq, then no
+	bbc	#atr_v_currec,fcb_l_attr(ap),60$ ;if currec set (not skipping)
+	bbs	#atr_v_eof,fcb_l_attr(ap),60$ ;if eof, return
+	brw	pli$$get_rec		;then go again
+60$:	bicl	#atr_m_virgin,fcb_l_attr(ap) ;file has been touched
+	rsb				;return
+
+	.dsabl	lsb
+	.end

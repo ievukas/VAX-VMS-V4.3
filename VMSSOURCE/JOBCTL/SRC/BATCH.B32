@@ -1,0 +1,651 @@
+MODULE BATCH	(%TITLE	'Batch process control'
+		IDENT = 'V04-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:
+!	Job controller.
+!
+! ABSTRACT:
+!	This module contains the routines specific to batch processing.
+!
+! ENVIRONMENT:
+!	VAX/VMS user and kernel mode.
+!--
+!
+! AUTHOR: M. Jack, CREATION DATE: 16-Feb-1982
+!
+! MODIFIED BY:
+!
+!	V03-006	KPL0001		P Lieberwirth,	 9-Jul-1984
+!		Eliminate a source of queue file corruption in routine
+!		BATCH_DELETION.  Specifically, if the SJH describing a
+!		batch job being deleted was deallocated to the free list
+!		by the routine COMPLETE_JOB, and then a crash occured
+!		before routine BATCH_DELETION could finish the operation
+!		by re-writing the SMQ, the queue file would contain the
+!		old SMQ record image which now contained a pointer to a
+!		record on the free list.  Other routines in the JOB
+!		CONTROLLER would trip over this corruption, generally by
+!		trying to to follow a zero pointer in the now deallocated-SJH
+!		and encountering an RMS invalid-key by trying to read record
+!		zero.
+!
+!		The fix is to flush the SMQ before doing the complete job.
+!		This results in an extra read operation, since the SMQ is
+!		needed again after COMPLETE_JOB returns.  However, the extra
+!		trip to read_record is not so expensive because the SMQ
+!		may still have a non-zero reference count and as a result
+!		still be in the cache.  At any rate, the extra trip avoids
+!		possible file corruption.
+!
+!		By flushing the SMQ before doing COMPLETE_JOB on the SJH,
+!		we traded a window where if a crash occured file corruption
+!		would result, for a window where if a crash occured, we lost
+!		a record describing a batch job that was to be deleted.  The
+!		trade is a good one.
+!
+!	V03-005	PCG0001		Peter George	27-Feb-1984
+!		Fix CPU time limit logic.
+!
+!	V03-004	MLJ0115		Martin L. Jack,	30-Jul-1983  14:33
+!		Changes for job controller baselevel.
+!
+!	V03-003	MLJ0114		Martin L. Jack,	23-Jun-1983  4:56
+!		Changes for job controller baselevel.
+!
+!	V03-002	MLJ0113		Martin L. Jack,	26-May-1983  21:06
+!		Changes for job controller baselevel.
+!
+!	V03-001	MLJ0112		Martin L. Jack,	29-Apr-1983  2:52
+!		Changes for job controller baselevel.
+!
+!**
+
+REQUIRE 'SRC$:JOBCTLDEF';
+
+
+FORWARD ROUTINE
+	SJC_BATCH_SERVICE,
+	BATCH_DELETION:			NOVALUE;
+
+
+EXTERNAL ROUTINE
+	COMPLETE_JOB:			NOVALUE,
+	COMPLETE_SRB_OUTPUT_ITEM:	NOVALUE,
+	CREATE_SRB:			NOVALUE,
+	FETCH_VARIABLE_ITEM,
+	FETCH_VARIABLE_ITEM_LIST,
+	FIND_PENDING_JOBS:		NOVALUE,
+	FIND_PROCESS_DATA:		L_OUTPUT_3,
+	FLUSH_RECORD:			NOVALUE,
+	LOCATE_SRB_OUTPUT_ITEM,
+	READ_RECORD,
+	RELEASE_RECORD:			NOVALUE,
+	REWRITE_RECORD:			NOVALUE,
+	SEND_SERVICE_RESPONSE_MESSAGE:	NOVALUE,
+	UPDATE_GETQUI_DATA:		NOVALUE;
+
+
+BUILTIN
+	MOVC3,
+	MOVC5;
+
+GLOBAL ROUTINE SJC_BATCH_SERVICE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine processes the SJC$_BATCH_SERVICE request.
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	MBX		- Pointer to buffered mailbox message.
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	Completion status to be returned to requestor.
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	SJH_N,				! Record number of SJH
+	SJH:		REF BBLOCK,	! Pointer to SJH
+	SMQ_N,				! Record number of SMQ
+	SMQ:		REF BBLOCK,	! Pointer to SMQ
+	SQR_N,				! Record number of SQR
+	SQR:		REF BBLOCK,	! Pointer to SQR
+	DJI:		REF BBLOCK,	! Base of DJI item list
+	DJIITM:		REF BBLOCK,	! Cursor for DJI item list
+	DJIFLG:		REF BBLOCK,	! Pointer to DJI flags longword
+	SRB:		BBLOCK[1024],	! Local SRB
+	FLAGS:		BBLOCK[4],	! Local INPUT_FLAGS
+	T;				! Temporary for quota calculations
+
+
+! Ensure that the requesting process has CMKRNL privilege.
+!
+IF NOT .BBLOCK[MBX[ACM$Q_PRVMSK], PRV$V_CMKRNL]
+THEN
+    RETURN JBC$_NOCMKRNL;
+
+
+! Locate the data for this job.
+!
+IF NOT FIND_PROCESS_DATA(
+    PDE_K_BATCH, .MBX[ACM$L_PID], FALSE;
+    , SMQ_N, SJH_N)
+THEN
+    RETURN JBC$_NOSUCHJOB;
+
+
+! Read the queue record and the job record.
+!
+SMQ = READ_RECORD(.SMQ_N);
+SJH = READ_RECORD(.SJH_N);
+
+
+! Scan the input item buffer, if specified.
+!
+FLAGS = 0;
+IF .ITEM_PRESENT[SJC$_BATCH_INPUT]
+THEN
+    BEGIN
+    LOCAL
+	P:		REF BBLOCK,	! Cursor for item list
+	P_END;				! Pointer past end of item list
+
+
+    ! Pick up a pointer to the item list and one to the last item.
+    !
+    P = .VALUE_BATCH_INPUT[SDSC_A_POINTER];
+    P_END = .P + .VALUE_BATCH_INPUT[SDSC_W_LENGTH] - 4;
+
+
+    ! Loop over the items.
+    !
+    WHILE .P LSSA .P_END DO
+	BEGIN
+	LOCAL
+	    TYPE,			! Item type
+	    SIZE;			! Item size
+
+
+	! Get and advance over the item type and size.
+	!
+	TYPE = .P[DJI$W_ITEM_CODE];
+	SIZE = .P[DJI$W_ITEM_SIZE];
+	P = .P + DJI$S_ITEM_HEADER;
+
+
+	! Process the item.
+	!
+	CASE .TYPE FROM DJI$K_INPUT_FLAGS TO DJI$K_CONDITION_VECTOR OF
+	    SET
+
+
+	    [OUTRANGE]:
+		EXITLOOP;
+
+
+	    [DJI$K_INPUT_FLAGS]:
+		BEGIN
+		IF .SIZE EQL 4
+		THEN
+		    FLAGS = ..P;
+		END;
+
+
+	    [DJI$K_CONDITION_VECTOR]:
+		BEGIN
+		IF .SIZE LEQU 12
+		THEN
+		    MOVC5(
+			SIZE, .P,
+			%REF(0),
+			%REF(SJH$S_CONDITION_VECTOR), SJH[SJH$L_CONDITION_1]);
+		END;
+
+
+	    TES;
+
+
+	! Advance to the next item.
+	!
+	P = .P + .SIZE;
+	END;
+    END;
+
+
+! Initialize the SRB.
+!
+CREATE_SRB(SRB);
+DJIITM = DJI = LOCATE_SRB_OUTPUT_ITEM(
+    SRB,
+    SJC$_BATCH_OUTPUT, VALUE_BATCH_OUTPUT);
+
+
+IF .DJIITM NEQ 0
+THEN
+    BEGIN
+
+    ! Begin the DJI item list.
+    !
+    DJIITM[DJI$W_ITEM_SIZE] = DJI$S_FLAGS;
+    DJIITM[DJI$W_ITEM_CODE] = DJI$K_FLAGS;
+    DJIFLG = DJIITM = .DJIITM + DJI$S_ITEM_HEADER;
+    DJIITM[DJI$L_FLAGS] = 0;    
+    DJIITM = .DJIITM + DJI$S_FLAGS;
+    DJIFLG[DJI$V_TERMINATE] = TRUE;
+
+
+    ! Flags.
+    !
+    IF .SJH[SJH$V_NOTIFY] THEN DJIFLG[DJI$V_NOTIFY] = TRUE;
+    IF .SJH[SJH$V_RESTARTING] THEN DJIFLG[DJI$V_RESTARTING] = TRUE;
+    IF .SJH[SJH$V_LOG_NULL]
+    THEN
+	DJIFLG[DJI$V_LOG_NULL] = TRUE
+    ELSE
+	BEGIN
+	IF .SJH[SJH$V_LOG_DELETE] THEN DJIFLG[DJI$V_LOG_DELETE] = TRUE;
+	IF .SJH[SJH$V_LOG_SPOOL] THEN DJIFLG[DJI$V_LOG_SPOOL] = TRUE;
+	END;
+
+
+    ! Checkpoint data.
+    !
+    DJIITM = FETCH_VARIABLE_ITEM(
+	SJH$S_CHECKPOINT, SJH[SJH$T_CHECKPOINT],
+	DJI$K_RESTART,
+	.DJIITM);
+
+
+    ! CPU maximum.
+    !
+    T = 0;
+    IF .SJH[SJH$V_CPU_MAXIMUM] THEN T = .SJH[SJH$L_CPU_MAXIMUM]
+    ELSE IF .SMQ[SMQ$V_CPU_DEFAULT] THEN T = .SMQ[SMQ$L_CPU_DEFAULT];
+    IF .SMQ[SMQ$V_CPU_MAXIMUM]
+    THEN
+	BEGIN
+	DJIFLG[DJI$V_USE_CPU_MAXIMUM] = TRUE;
+	IF .SMQ[SMQ$L_CPU_MAXIMUM] - 1 LSSU .T - 1
+	THEN
+	    T = .SMQ[SMQ$L_CPU_MAXIMUM];
+	END;
+    IF .SJH[SJH$V_CPU_MAXIMUM] 
+    OR .SMQ[SMQ$V_CPU_DEFAULT] 
+    OR .SMQ[SMQ$V_CPU_MAXIMUM]
+    THEN
+	BEGIN
+	DJIITM[DJI$W_ITEM_SIZE] = 4;
+	DJIITM[DJI$W_ITEM_CODE] = DJI$K_CPU_MAXIMUM;
+	DJIITM = .DJIITM + DJI$S_ITEM_HEADER;
+	.DJIITM = .T;
+	DJIITM = .DJIITM + 4;
+	END;
+
+
+    ! Job name.
+    !
+    DJIITM[DJI$W_ITEM_SIZE] = CH$RCHAR(SJH[SJH$T_NAME]);
+    DJIITM[DJI$W_ITEM_CODE] = DJI$K_JOB_NAME;
+    DJIITM = .DJIITM + DJI$S_ITEM_HEADER;
+    MOVC3(
+	%REF(CH$RCHAR(SJH[SJH$T_NAME])),
+	SJH[SJH$T_NAME] + 1,
+	.DJIITM; ,,, DJIITM);
+
+
+    ! Log file queue.
+    !
+    IF .SJH[SJH$L_LOG_QUEUE_LINK] NEQ 0
+    THEN
+	BEGIN
+	LOCAL
+	    SMQ_N2,				! Record number of log SMQ
+	    SMQ_2:		REF BBLOCK;	! Pointer to log SMQ
+
+	SMQ_2 = READ_RECORD(SMQ_N2 = .SJH[SJH$L_LOG_QUEUE_LINK]);
+	DJIITM[DJI$W_ITEM_SIZE] = CH$RCHAR(SMQ_2[SMQ$T_NAME]);
+	DJIITM[DJI$W_ITEM_CODE] = DJI$K_LOG_QUEUE;
+	DJIITM = .DJIITM + DJI$S_ITEM_HEADER;
+	MOVC3(
+	    %REF(CH$RCHAR(SMQ_2[SMQ$T_NAME])),
+	    SMQ_2[SMQ$T_NAME] + 1,
+	    .DJIITM; ,,, DJIITM);
+	RELEASE_RECORD(.SMQ_N2);
+	END;
+
+
+    ! Log file specification.
+    !
+    DJIITM = FETCH_VARIABLE_ITEM(
+	SJH$S_LOG_SPECIFICATION, SJH[SJH$T_LOG_SPECIFICATION],
+	DJI$K_LOG_SPECIFICATION,
+	.DJIITM);
+
+
+    ! Parameters.
+    !
+    DJIITM = FETCH_VARIABLE_ITEM_LIST(
+	SJH$S_PARAMETERS, SJH[SJH$T_PARAMETERS],
+	DJI$K_PARAMETER_1,
+	.DJIITM);
+
+
+    ! User name.
+    !
+    DJIITM[DJI$W_ITEM_SIZE] = SJH$S_USERNAME;
+    DJIITM[DJI$W_ITEM_CODE] = DJI$K_USERNAME;
+    DJIITM = .DJIITM + DJI$S_ITEM_HEADER;
+    MOVC3(
+	%REF(SJH$S_USERNAME),
+	SJH[SJH$T_USERNAME],
+	.DJIITM; ,,, DJIITM);
+
+
+    ! Working set default.
+    !
+    T = -1;
+    IF .SMQ[SMQ$V_WSDEFAULT]
+    THEN
+	BEGIN
+	DJIFLG[DJI$V_USE_WSDEFAULT] = TRUE;
+	T = .SMQ[SMQ$W_WSDEFAULT];
+	END;
+    IF .SJH[SJH$V_WSDEFAULT]
+    THEN
+	BEGIN
+	IF .SJH[SJH$W_WSDEFAULT] LSSU .T THEN T = .SJH[SJH$W_WSDEFAULT];
+	END;
+    IF .T GEQ 0
+    THEN
+	BEGIN
+	DJIITM[DJI$W_ITEM_SIZE] = 4;
+	DJIITM[DJI$W_ITEM_CODE] = DJI$K_WSDEFAULT;
+	DJIITM = .DJIITM + DJI$S_ITEM_HEADER;
+	.DJIITM = .T;
+	DJIITM = .DJIITM + 4;
+	END;
+
+
+    ! Working set extent.
+    !
+    T = -1;
+    IF .SMQ[SMQ$V_WSEXTENT]
+    THEN
+	BEGIN
+	DJIFLG[DJI$V_USE_WSEXTENT] = TRUE;
+	T = .SMQ[SMQ$W_WSEXTENT];
+	END;
+    IF .SJH[SJH$V_WSEXTENT]
+    THEN
+	BEGIN
+	IF .SJH[SJH$W_WSEXTENT] LSSU .T THEN T = .SJH[SJH$W_WSEXTENT];
+	END;
+    IF .T GEQ 0
+    THEN
+	BEGIN
+	DJIITM[DJI$W_ITEM_SIZE] = 4;
+	DJIITM[DJI$W_ITEM_CODE] = DJI$K_WSEXTENT;
+	DJIITM = .DJIITM + DJI$S_ITEM_HEADER;
+	.DJIITM = .T;
+	DJIITM = .DJIITM + 4;
+	END;
+
+
+    ! Working set quota.
+    !
+    T = -1;
+    IF .SMQ[SMQ$V_WSQUOTA]
+    THEN
+	BEGIN
+	DJIFLG[DJI$V_USE_WSQUOTA] = TRUE;
+	T = .SMQ[SMQ$W_WSQUOTA];
+	END;
+    IF .SJH[SJH$V_WSQUOTA]
+    THEN
+	BEGIN
+	IF .SJH[SJH$W_WSQUOTA] LSSU .T THEN T = .SJH[SJH$W_WSQUOTA];
+	END;
+    IF .T GEQ 0
+    THEN
+	BEGIN
+	DJIITM[DJI$W_ITEM_SIZE] = 4;
+	DJIITM[DJI$W_ITEM_CODE] = DJI$K_WSQUOTA;
+	DJIITM = .DJIITM + DJI$S_ITEM_HEADER;
+	.DJIITM = .T;
+	DJIITM = .DJIITM + 4;
+	END;
+
+
+    IF NOT .FLAGS[DJI$V_NO_FILE]
+    THEN
+	BEGIN
+
+	! Locate the first or next file in the job.
+	!
+	IF .SJH[SJH$L_CURRENT_FILE_LINK] EQL 0
+	THEN
+	    SQR_N = .SJH[SJH$L_FILE_LIST]
+	ELSE
+	    BEGIN
+	    SQR = READ_RECORD(.SJH[SJH$L_CURRENT_FILE_LINK]);
+	    SQR_N = .SQR[SYM$L_LINK];
+	    RELEASE_RECORD(.SJH[SJH$L_CURRENT_FILE_LINK]);
+	    END;
+
+
+	! Update the current file link.
+	!
+	SJH[SJH$L_CURRENT_FILE_LINK] = .SQR_N;
+
+
+	! If the job is not complete, pass the next file to the job.
+	!
+	IF .SQR_N NEQ 0
+	THEN
+	    BEGIN
+
+	    ! Read the SQR record.
+	    !
+	    SQR = READ_RECORD(.SQR_N);
+
+
+	    ! Flags.
+	    !
+	    DJIFLG[DJI$V_TERMINATE] = FALSE;
+
+
+	    ! Command file ID.
+	    !
+	    DJIITM[DJI$W_ITEM_SIZE] = SQR$S_FILE_IDENTIFICATION;
+	    DJIITM[DJI$W_ITEM_CODE] = DJI$K_FILE_IDENTIFICATION;
+	    DJIITM = .DJIITM + DJI$S_ITEM_HEADER;
+	    MOVC3(
+		%REF(SQR$S_FILE_IDENTIFICATION),
+		SQR[SQR$T_FILE_IDENTIFICATION],
+		.DJIITM; ,,, DJIITM);
+
+
+	    RELEASE_RECORD(.SQR_N);
+	    END;
+	END;
+
+
+    ! Terminate the item list.
+    !
+    DJIITM[DJI$W_ITEM_SIZE] = 0;
+    DJIITM[DJI$W_ITEM_CODE] = 0;
+    DJIITM = .DJIITM + DJI$S_ITEM_HEADER;
+
+
+    COMPLETE_SRB_OUTPUT_ITEM(
+	SRB,
+	.DJIITM - .DJI);
+    END;
+
+
+! Rewrite the job header.
+!
+REWRITE_RECORD(.SJH_N);
+
+
+! Send the response message locally and then return a status of zero to inhibit
+! the central response return.
+!
+SEND_SERVICE_RESPONSE_MESSAGE(SRB, SS$_NORMAL);
+0
+END;
+
+GLOBAL ROUTINE BATCH_DELETION(SMQ_N,SJH_N): NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine handles the deletion of a batch process.
+!
+! INPUT PARAMETERS:
+!	SMQ_N		- Record number of SMQ.
+!	SJH_N		- Record number of SJH.
+!
+! IMPLICIT INPUTS:
+!	MBX		- Pointer to buffered mailbox message.
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	FLUSH_SMQ,			! Flag indicating SMQ should be flushed
+	SMQ:		REF BBLOCK,	! Pointer to SMQ
+	SJH:		REF BBLOCK,	! Pointer to SJH
+	SJH_NT,				! Record number of tentative SJH
+	SJH_NP,				! Record number of predecessor of SJH
+	SJH_P:		REF BBLOCK;	! Pointer to predecessor of SJH
+
+
+! Read and update the queue header.
+!
+SMQ = READ_RECORD(.SMQ_N);
+SMQ[SMQ$B_CURRENT_JOB_COUNT] = .SMQ[SMQ$B_CURRENT_JOB_COUNT] - 1;
+QUEUE_REFERENCE_COUNT = .QUEUE_REFERENCE_COUNT - 1;
+FLUSH_SMQ = FALSE;
+
+
+! Search the current queue for the job record.
+!
+SJH_NP = .SMQ_N;
+SJH_NT = .SMQ[SMQ$L_CURRENT_LIST];
+WHILE .SJH_NT NEQ 0 DO
+    BEGIN
+    SJH = READ_RECORD(.SJH_NT);
+    IF .SJH_NT EQL .SJH_N
+    THEN
+	BEGIN
+
+	! Unlink the job from the current queue.
+	!
+	UPDATE_GETQUI_DATA(.SJH_N, .SJH);
+	IF .SJH_NP EQL .SMQ_N
+	THEN
+	    BEGIN
+	    SMQ[SMQ$L_CURRENT_LIST] = .SJH[SYM$L_LINK];
+	    IF .SJH[SYM$L_LINK] EQL 0 THEN SMQ[SMQ$L_CURRENT_LIST_END] = 0;
+	    FLUSH_SMQ = TRUE;
+	    END
+	ELSE
+	    BEGIN
+	    SJH_P[SYM$L_LINK] = .SJH[SYM$L_LINK];
+	    IF .SJH[SYM$L_LINK] EQL 0
+	    THEN
+		BEGIN
+		SMQ[SMQ$L_CURRENT_LIST_END] = .SJH_NP;
+		FLUSH_SMQ = TRUE;
+		END;
+	    REWRITE_RECORD(.SJH_NP);
+	    END;
+
+
+	! If the SMQ is dirty and needs to be re-written before doing
+	! COMPLETE_JOB, do so.  Then re-read it for subsequent processing.
+	!
+	IF .FLUSH_SMQ
+	THEN
+	    FLUSH_RECORD(.SMQ_N);
+
+	! Complete the job.
+	!
+	COMPLETE_JOB(.SJH_N, .SJH, .SMQ, .MBX);
+
+
+	! Find more work for the queue.
+	!
+	FIND_PENDING_JOBS(.SMQ_N, .SMQ);
+	! (Note: probably need only to RELEASE here, not REWRITE.)
+	REWRITE_RECORD(.SMQ_N);
+	RETURN;
+	END;
+
+
+    ! Advance to next job.
+    !
+    IF .SJH_NP NEQ .SMQ_N THEN RELEASE_RECORD(.SJH_NP);
+    SJH_NP = .SJH_NT;
+    SJH_P = .SJH;
+    SJH_NT = .SJH[SYM$L_LINK];
+    END;
+END;
+
+END
+ELUDOM

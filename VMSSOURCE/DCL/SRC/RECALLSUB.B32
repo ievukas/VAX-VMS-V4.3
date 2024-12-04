@@ -1,0 +1,707 @@
+MODULE recallsub (IDENT='V04-000',
+	ADDRESSING_MODE(NONEXTERNAL=LONG_RELATIVE,
+			EXTERNAL=GENERAL)) =
+
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:  Command recall routines
+!
+! ABSTRACT:
+!
+!	These routines are used to manage the command recall
+!	functions of the command language intepreter.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system. supervisor mode,
+!
+! AUTHOR:  Peter George, March 1983
+!
+! Modified by:
+!
+!	V03-005	PCG0005		Peter George	06-Feb-1984
+!		Be more discerning about when to insert a space
+!		in a recalled command line.
+!
+!	V03-004	PCG0004		Peter George	03-Jan-1984
+!		Modify the structure of the recall buffer.
+!
+!	V03-003	PCG0003		Peter George	18-Nov-1983
+!		Add a routine to get a command by number.
+!
+!	V03-002	PCG0002		Peter George	20-Apr-1983
+!		Fix bug in EDIT_COMMAND algorithm.
+!
+!	V03-001	PCG0001		Peter George	30-Mar-1983
+!		Redo EDIT_COMMAND algorithm.
+!--
+
+!
+! Include files
+!
+LIBRARY 'SYS$LIBRARY:LIB';
+REQUIRE 'LIB$:DCLDEF';			! DCL definitions
+
+!
+! Table of contents
+!
+
+LINKAGE
+    common_linkage = call : GLOBAL (wrk=10,prc=11),
+    ptr_linkage = call : GLOBAL (ptr=9,wrk=10,prc=11);
+
+FORWARD ROUTINE
+    dcl$put_command : common_linkage,	! Put command in buffer
+    dcl$put_segment : common_linkage,	! Add to last command in buffer
+    compare_string : ptr_linkage,	! Compare current and last commands
+    insert_string : ptr_linkage,	! Insert a string in the buffer
+    zero_buffer : ptr_linkage,		! Zero part of the buffer
+    edit_command : ptr_linkage,		! Edit previous command
+    dcl$get_next_command:common_linkage,! Get next command from buffer
+    dcl$get_prev_command:common_linkage,! Get previous command from buffer
+    dcl$get_curr_command:common_linkage;! Get current command from buffer
+
+!
+! Change name of the PSECT's to conform to DCL standards.
+!
+PSECT PLIT = DCL$ZCODE(EXECUTE, ALIGN(0));
+PSECT CODE = DCL$ZCODE(EXECUTE, ALIGN(0));
+
+LITERAL
+    true = 1,
+    false = 0;
+
+!
+! Macros to check for ends of command buffer
+!
+MACRO overflow (address) =
+    (address) GEQU prc [prc_g_commands] + prc_c_cmdbufsiz%;
+
+MACRO underflow (address) =
+    (address) LSSU prc [prc_g_commands]%;
+
+
+GLOBAL ROUTINE dcl$put_command (desc) : common_linkage =
+
+!---
+!
+!	Put a command into the command buffer.
+!
+! Inputs:
+!
+!	desc = address of descriptor of command to insert
+!	R10 = address of WRK data structure
+!	R11 = address of PRC data structure
+!	PRC_L_RECALLPTR = pointer to location to insert command at
+!
+! Outputs:
+!
+!	The command is added to the buffer and PRC_L_RECALLPTR is updated
+!	to point to the next free space in the buffer.
+!
+!	The structure of the circular recall buffer is as follows:
+!
+!		0-byte,len-byte,char-string,len-byte,
+!		0-byte,len-byte,char-string,len-byte, ...
+!
+!	routine value = always true
+!
+!---
+
+BEGIN
+
+
+MAP
+    desc :	REF VECTOR;		! Input command descriptor
+
+GLOBAL REGISTER
+    ptr=9 :	REF VECTOR[,BYTE];	! Pointer into recall buffer
+
+EXTERNAL REGISTER
+    wrk=10 :	REF $BBLOCK,		! Address of WRK data structure
+    prc=11 :	REF $BBLOCK;		! Address of PRC data structure
+
+!
+! Compare the new command to the previous command.  If identical, then do not
+! insert the new command in the buffer.
+!
+IF compare_string (.desc)
+   THEN RETURN true;
+
+!
+! Skip past the leading zero and insert the command length.
+!
+ptr = .prc [prc_l_recallptr] + 1;
+IF OVERFLOW (.ptr)
+   THEN ptr = .ptr - prc_c_cmdbufsiz;
+ptr [0] = .desc [0];
+
+!
+! Copy the command string into the buffer and insert the trailing length byte.
+!
+ptr = .ptr + 1;
+IF OVERFLOW (.ptr)
+   THEN ptr = prc [prc_g_commands];
+insert_string (.desc);
+ptr [0] = .desc [0];
+
+!
+! Zero any partially overwritten commands in the buffer and reset the
+! pointer in the PRC data structure to the next free command space.
+!
+ptr = .ptr + 1;
+IF OVERFLOW (.ptr)
+   THEN ptr= prc [prc_g_commands];
+prc [prc_l_recallptr] = .ptr;
+RETURN zero_buffer();
+
+END;
+
+GLOBAL ROUTINE dcl$put_segment (desc) : common_linkage =
+
+!---
+!
+!	Add a command segment to the last command in the command buffer.
+!	If it causes the command to be longer that WRK_C_INPBUFSIZ-1 in
+!	length, then insert it as a new entry.
+!
+! Inputs:
+!
+!	desc = address of descriptor of command to insert
+!	R10 = address of WRK data structure
+!	R11 = address of PRC data structure
+!	PRC_L_RECALLPTR = pointer past end of last inserted command
+!
+! Outputs:
+!
+!	The command segment is added to the buffer and PRC_L_RECALLPTR is 
+!	updated to point to the next free space in the buffer.
+!
+!	routine value = always true
+!
+!---
+
+BEGIN
+
+MAP
+    desc :	REF VECTOR;		! Input command descriptor
+
+GLOBAL REGISTER
+    ptr=9 :	REF VECTOR[,BYTE];	! Pointer into recall buffer
+
+EXTERNAL REGISTER
+    wrk=10 :	REF $BBLOCK,		! Address of WRK data structure
+    prc=11 :	REF $BBLOCK;		! Address of PRC data structure
+
+LOCAL
+    lead_len :	REF VECTOR[,BYTE];	! Pointer to leading length in buffer
+
+!
+! Get the length of the previous command.  If the total concatenated length
+! of the command will now be greater than 255, then treat the new segment
+! as a new command.
+!
+ptr = .prc [prc_l_recallptr] - 1;
+IF UNDERFLOW (.ptr)
+   THEN ptr = .ptr + prc_c_cmdbufsiz;
+IF (.ptr [0] + .desc [0]) GTR wrk_c_inpbufsiz - 1
+   THEN RETURN dcl$put_command (.desc);
+
+!
+! Point at the first character of the previous command string and save 
+! the address of the byte to insert the leading length at for later use.
+!
+ptr = .ptr - .ptr [0];
+IF UNDERFLOW (.ptr)
+   THEN ptr = .ptr + prc_c_cmdbufsiz;
+lead_len = .ptr - 1;
+IF UNDERFLOW (.lead_len)
+   THEN lead_len = .lead_len + prc_c_cmdbufsiz;
+
+!
+! Remove the trailing continuation character or comments from the previously 
+! inserted part of the command and insert the new segment at the end.
+!
+edit_command (.lead_len);
+insert_string (.desc);
+  
+!
+! Set the length bytes.
+!
+ptr [0] = .ptr - .lead_len - 1;
+lead_len [0] = .ptr [0];
+
+!
+! Zero any partially overwritten commands in the buffer and reset the
+! pointer in the PRC data structure to the next free command space.
+!
+ptr = .ptr + 1;
+IF OVERFLOW (.ptr)
+   THEN ptr= prc [prc_g_commands];
+prc [prc_l_recallptr] = .ptr;
+RETURN zero_buffer();
+
+END;
+
+ROUTINE compare_string (desc) : ptr_linkage =
+
+!---
+!
+! 	Compare the new command to the previous command.  
+!	If identical, then return true.
+!
+! Inputs:
+!
+!	R10 = address of WRK data structure
+!	R11 = address of PRC data structure
+!	PRC_L_RECALLPTR = pointer past end of last inserted command
+!
+! Outputs:
+!
+!	routine value = true if strings are the same
+!			false otherwise
+!---
+
+BEGIN
+
+MAP
+    desc :	REF VECTOR;		! Input command descriptor
+
+EXTERNAL REGISTER
+    ptr=9 :	REF VECTOR[,BYTE],	! Pointer into recall buffer
+    wrk=10 :	REF $BBLOCK,		! Address of WRK data structure
+    prc=11 :	REF $BBLOCK;		! Address of PRC data structure
+
+LOCAL
+    len;
+
+!
+! Get length and address of previous command string.
+!
+ptr = .prc [prc_l_recallptr] - 1;
+IF UNDERFLOW (.ptr)
+   THEN ptr = .ptr + prc_c_cmdbufsiz;
+len = .ptr [0];
+ptr = .ptr - .len;
+IF UNDERFLOW (.ptr)
+   THEN ptr = .ptr + prc_c_cmdbufsiz;
+
+!
+! Compare the two strings and return false if they are different.
+!
+IF OVERFLOW (.ptr + .len - 1)			! Will we wrap around?
+   THEN BEGIN					! Yes, then compare in two pieces
+	LOCAL temp_len;
+	temp_len = prc [prc_g_commands] + 	! Get length of first piece
+		prc_c_cmdbufsiz - .ptr;		!
+	IF CH$NEQ (.temp_len, .ptr, 		! Compare first piece
+		.desc [0], .desc [1], %C' ')	!
+	   THEN RETURN false;			! Return false if not equal
+	IF CH$NEQ (.len - .temp_len, 		! Compare second piece
+		prc [prc_g_commands],		!
+		.desc [0] - .temp_len, 		!
+		.desc [1] + .temp_len, 		!
+		%C' ')				!
+	   THEN RETURN false;			! Return false if not equal
+	END					!
+   ELSE IF CH$NEQ (.len, .ptr, 			! Compare in whole
+		.desc [0], .desc [1], %C' ')	!
+	   THEN RETURN false;			! Return false if not equal
+
+RETURN true;					! Return true if equal
+END;
+
+ROUTINE insert_string (desc) : ptr_linkage =
+
+!---
+! 	Insert a string in the buffer.
+!
+! Inputs:
+!
+!	R9  = address to begin insertion at
+!	R10 = address of WRK data structure
+!	R11 = address of PRC data structure
+!
+! Outputs:
+!
+!	R9 = address of first byte after the insertion
+!
+!	routine value = always true
+!---
+
+BEGIN
+
+MAP
+    desc :	REF VECTOR;		! Input command descriptor
+
+EXTERNAL REGISTER
+    ptr=9 :	REF VECTOR[,BYTE],	! Pointer to retrieved command
+    wrk=10 :	REF $BBLOCK,		! Address of WRK data structure
+    prc=11 :	REF $BBLOCK;		! Address of PRC data structure
+
+IF OVERFLOW (.ptr + .desc [0] - 1)		! Will we wrap around?
+   THEN BEGIN					! Yes, then copy in two pieces
+	LOCAL temp_len;
+	temp_len = prc [prc_g_commands] + 	! Get length of first piece
+		prc_c_cmdbufsiz - .ptr;		!
+	CH$MOVE (.temp_len, .desc [1], .ptr);	! Move first piece
+	CH$MOVE (.desc [0] - .temp_len, 	! Move second piece
+		.desc [1] + .temp_len, 		!
+		prc [prc_g_commands]);		!
+	ptr = prc [prc_g_commands] + 		! Update the ptr
+		.desc [0] - .temp_len;		!
+	END					!
+   ELSE BEGIN					! No, then copy in whole
+	CH$MOVE (.desc [0], .desc [1], .ptr);	!
+	ptr = .ptr + .desc [0];			!
+	END;					!
+
+IF OVERFLOW(.ptr)				! Update the pointer
+   THEN ptr = prc [prc_g_commands];		!
+
+RETURN true;
+END;
+
+ROUTINE zero_buffer : ptr_linkage =
+
+!---
+!
+! 	Zero any partially overwritten commands in the buffer.
+!
+! Inputs:
+!
+!	R9  = address to start zeroing at
+!	R10 = address of WRK data structure
+!	R11 = address of PRC data structure
+!
+! Outputs:
+!
+!	routine value = always true
+!---
+
+BEGIN
+
+EXTERNAL REGISTER
+    ptr=9 :	REF VECTOR[,BYTE],	! Pointer to retrieved command
+    wrk=10 :	REF $BBLOCK,		! Address of WRK data structure
+    prc=11 :	REF $BBLOCK;		! Address of PRC data structure
+
+WHILE (.ptr [0] NEQ 0)
+DO BEGIN
+   ptr [0] = 0;
+   ptr = .ptr + 1;
+   IF OVERFLOW (.ptr)
+      THEN ptr = prc [prc_g_commands];
+   END;
+
+RETURN true;
+END;
+
+ROUTINE edit_command (len) : ptr_linkage =
+
+!---
+!
+!	Remove the continuation character and/or comment characters from the 
+!	end of the command line.  Insert a space in their place.
+!
+! Inputs:
+!
+!	len = address of byte length of command
+!	R9 = ptr to first character of command string
+!	R10 = address of WRK data structure
+!	R11 = address of PRC data structure
+!
+! Outputs:
+!
+!	R9 = ptr to end of edited command
+!
+!	routine value = always true
+!
+!---
+
+BEGIN
+
+MAP
+    len :	REF VECTOR[,BYTE];	! Address of length of command
+
+EXTERNAL REGISTER
+    ptr=9 :	REF VECTOR[,BYTE],	! Pointer to end of command to edit
+    wrk=10 :	REF $BBLOCK,		! Address of WRK data structure
+    prc=11 :	REF $BBLOCK;		! Address of PRC data structure
+
+LOCAL
+    flags :	BITVECTOR[3];		! Flags
+
+LITERAL
+    continue = 0,
+    blank = 1,
+    quote = 2;
+
+flags = 0;
+
+!
+! Search for EOL or trailing comment.
+!
+INCR i FROM 1 TO .len [0]
+DO BEGIN
+   
+   IF .ptr [0] EQL %C'"'
+      THEN flags [quote] = NOT .flags [quote];
+
+   IF NOT .flags [quote]
+      THEN IF .ptr [0] EQL %C'!'
+	      THEN EXITLOOP;
+
+   ptr = .ptr + 1;
+   IF OVERFLOW (.ptr)
+      THEN ptr = prc [prc_g_commands];
+   END;
+
+!
+! Back up to previous character.
+!
+ptr = .ptr - 1;
+IF UNDERFLOW (.ptr)
+   THEN ptr = .ptr + prc_c_cmdbufsiz;
+
+!
+! Delete trailing white space.
+!
+WHILE ((.ptr [0] EQL %X'20') OR (.ptr [0] EQL %X'09'))
+DO BEGIN
+   ptr = .ptr - 1;
+   IF UNDERFLOW (.ptr)
+      THEN ptr = .ptr + prc_c_cmdbufsiz;
+   END;
+
+!
+! Delete trailing continuation character.
+!
+IF .ptr [0] EQL %C'-'
+THEN BEGIN
+     flags [continue] = true;
+     ptr = .ptr - 1;
+     IF UNDERFLOW (.ptr)
+	THEN ptr = .ptr + prc_c_cmdbufsiz;
+     END;
+
+!
+! Delete trailing white space.
+!
+WHILE ((.ptr [0] EQL %X'20') OR (.ptr [0] EQL %X'09'))
+DO BEGIN
+   flags [blank] = true;
+   ptr = .ptr - 1;
+   IF UNDERFLOW (.ptr)
+      THEN ptr = .ptr + prc_c_cmdbufsiz;
+   END;
+
+!
+! Insert a space at the end.
+!
+ptr = .ptr + 1;
+IF OVERFLOW (.ptr)
+   THEN ptr = prc [prc_g_commands];
+IF (.flags [continue] AND .flags [blank]) OR NOT .flags [continue]
+   THEN BEGIN
+	ptr [0] = %X'20';
+	ptr = .ptr + 1;
+	IF OVERFLOW (.ptr)
+	   THEN ptr = prc [prc_g_commands];
+	END;
+
+RETURN true;
+END;
+
+GLOBAL ROUTINE dcl$get_prev_command (desc) : common_linkage =
+
+!---
+!	Get the previous command from the command buffer and put it into
+!	the input buffer.
+!
+! Inputs:
+!
+!	desc = address of descriptor in which to return recalled command
+!	R10 = address of WRK data structure
+!	R11 = address of PRC data structure
+!	WRK_L_RECALLPTR = pointer to last recalled command
+!
+! Outputs:
+!
+!	The command is copied into the input buffer and the descriptor
+!	is initialized.
+!
+!	routine value = true if success, false if empty buffer
+!---
+
+BEGIN
+
+GLOBAL REGISTER
+    ptr=9 :	REF VECTOR[,BYTE];	! Pointer to retrieved command
+
+EXTERNAL REGISTER
+    wrk=10 :	REF $BBLOCK,		! Address of WRK data structure
+    prc=11 :	REF $BBLOCK;		! Address of PRC data structure
+
+!
+! Back up one command.
+!
+ptr = .wrk [wrk_l_recallptr] - 1;
+IF UNDERFLOW (.ptr) 
+   THEN ptr = .ptr + prc_c_cmdbufsiz;
+IF .ptr [0] EQL 0 THEN RETURN false;
+ptr = .ptr - .ptr [0] - 2;
+IF UNDERFLOW (.ptr) 
+   THEN ptr = .ptr + prc_c_cmdbufsiz;
+wrk [wrk_l_recallptr] = .ptr;
+
+!
+! Now return the current command.
+!
+RETURN dcl$get_curr_command (.desc);
+END;
+
+GLOBAL ROUTINE dcl$get_next_command (desc) : common_linkage =
+
+!---
+!	Get the next command from the command buffer and put it into
+!	the input buffer.
+!
+! Inputs:
+!
+!	desc = address of descriptor in which to return recalled command
+!	R10 = address of WRK data structure
+!	R11 = address of PRC data structure
+!	WRK_L_RECALLPTR = pointer to last recalled command
+!
+! Outputs:
+!
+!	The command is copied into the input buffer and the descriptor
+!	is initialized.
+!
+!	routine value = true if success, false if empty buffer
+!---
+
+BEGIN
+
+GLOBAL REGISTER
+    ptr=9 : REF VECTOR[,BYTE];		! Pointer to retrieved command
+
+EXTERNAL REGISTER
+    wrk=10 :	REF $BBLOCK,		! Address of WRK data structure
+    prc=11 :	REF $BBLOCK;		! Address of PRC data structure
+
+!
+! Skip past the current command.
+!
+ptr = .wrk [wrk_l_recallptr] + 1;
+IF OVERFLOW (.ptr) 
+   THEN ptr = prc [prc_g_commands];
+IF .ptr [0] EQL 0 THEN RETURN false;
+ptr = .ptr + .ptr [0] + 2;
+IF OVERFLOW (.ptr) 
+   THEN ptr = .ptr - prc_c_cmdbufsiz;
+wrk [wrk_l_recallptr] = .ptr;
+
+!
+! Now return the current command.
+!
+RETURN dcl$get_curr_command (.desc);
+END;
+
+GLOBAL ROUTINE dcl$get_curr_command (desc) : common_linkage =
+
+!---
+!	Get the current command from the command buffer and put it into
+!	the input buffer.
+!
+! Inputs:
+!
+!	desc = address of descriptor in which to return recalled command
+!	R10 = address of WRK data structure
+!	R11 = address of PRC data structure
+!	WRK_L_RECALLPTR = pointer to last recalled command
+!
+! Outputs:
+!
+!	The command is copied into the input buffer and the descriptor
+!	is initialized.
+!
+!	routine value = true if success, false if empty buffer
+!---
+
+BEGIN
+
+MAP
+    desc :	REF VECTOR;		! Command descriptor
+
+GLOBAL REGISTER
+    ptr=9 :	REF VECTOR[,BYTE];	! Pointer to retrieved command
+
+EXTERNAL REGISTER
+    wrk=10 :	REF $BBLOCK,		! Address of WRK data structure
+    prc=11 :	REF $BBLOCK;		! Address of PRC data structure
+
+!
+! Init the output descriptor.
+!
+ptr = .wrk [wrk_l_recallptr] + 1;
+IF OVERFLOW (.ptr) 
+   THEN ptr = .ptr - prc_c_cmdbufsiz;
+desc [0] = .ptr [0];
+desc [1] = wrk [wrk_g_inpbuf] - 2;
+
+!
+! Find the start of the command string.
+!
+IF .ptr [0] EQL 0 THEN RETURN false;
+ptr = .ptr + 1;
+IF OVERFLOW (.ptr) 
+   THEN ptr = prc [prc_g_commands];
+
+!
+! Copy the command text into the input buffer.
+!
+IF OVERFLOW (.ptr + .desc [0] - 1)			! Wrap around?
+   THEN BEGIN						! Yes, then copy in two pieces
+	LOCAL temp_len;
+	temp_len = prc [prc_g_commands] 		! Get length of first piece
+		+ prc_c_cmdbufsiz - .ptr;		!
+	CH$MOVE (.temp_len, .ptr, .desc [1]);		! Move the first piece
+	CH$MOVE (.desc [0] - .temp_len, 		! Move the second piece
+		 prc [prc_g_commands],			!
+		.desc [1] + .temp_len);			!
+	END
+   ELSE CH$MOVE (.desc [0], .ptr, .desc [1]);		! No, then copy in whole
+
+RETURN true;
+END;
+
+END
+ELUDOM

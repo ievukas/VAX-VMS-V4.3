@@ -1,0 +1,354 @@
+MODULE setacntng ( IDENT = 'V04-000',
+		ADDRESSING_MODE (EXTERNAL = GENERAL, NONEXTERNAL=LONG_RELATIVE)
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  SET Command
+!
+! ABSTRACT:
+!
+!	This module implements the DCL command SET ACCOUNTING.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system, user mode
+!
+! AUTHOR:  Gerry Smith				15-Mar-1983
+!
+! Modified by:
+!
+!	V03-003	DAS0001		David Solomon		09-Jul-1984
+!		Fix truncation errors; make nonexternal refs LONG_RELATIVE.
+!
+!	V03-002	GAS0156		Gerry Smith		24-Jul-1983
+!		Fix error signaling for SET ACCOUNT/NEW.
+!
+!	V03-001	GAS0144		Gerry Smith		22-Jun-1983
+!		Convert to new SNDJBC service.
+!
+!--
+
+!
+! Include files
+!
+LIBRARY 'SYS$LIBRARY:STARLET';			! VAX/VMS common definitions
+
+
+!
+! Declare some storage for tables
+!
+OWN	
+    option_string : VECTOR[2]			! ASCII storage for
+		    INITIAL(%ASCID 'ENABLE',	! qualifiers
+			    %ASCID 'DISABLE'),
+
+
+    option_code : VECTOR[2]			! Corresponding codes
+		  INITIAL(sjc$_start_accounting,
+			  sjc$_stop_accounting),
+
+!
+! List the accounting types, in ASCII, and the corresponding bitmasks
+!
+! The following tables contain data in a specific order, and that order 
+! is the $BITPOSITION order of the ACM$V_ accounting types fields.  If new
+! accounting types are added to LIB:ACMDEF and SJCDEF, then corresponding 
+! entriesshould be added to the tables here.  
+!		*******Note that currently, the ACM$V_  fields
+!		start at bit position 0 and are incremented by 1
+!		for each accounting  type.  If this changes in the
+!		future, it may be necessary to change the way this
+!		module, specifically the logging part, is
+!    		implemented. 
+!
+!
+    acc_name : VECTOR[10]				! ASCII descriptors for
+    		INITIAL(%ASCID 'PROCESS,',		! accounting categories
+			%ASCID 'IMAGE,',
+			%ASCID 'INTERACTIVE,',
+			%ASCID 'LOGIN_FAILURE,',
+			%ASCID 'SUBPROCESS,',
+			%ASCID 'DETACHED,',
+			%ASCID 'BATCH,',
+    			%ASCID 'NETWORK,',
+    			%ASCID 'PRINT,',
+    			%ASCID 'MESSAGE,'),
+
+    acc_code : VECTOR[10]				! Corresponding masks
+    		INITIAL(sjc$m_acct_process,
+			sjc$m_acct_image,
+			sjc$m_acct_interactive,
+			sjc$m_acct_login_failure,
+			sjc$m_acct_subprocess,
+			sjc$m_acct_detached,
+			sjc$m_acct_batch,
+			sjc$m_acct_network,
+			sjc$m_acct_print,
+			sjc$m_acct_message);
+
+
+
+!
+! Table of contents
+!
+
+FORWARD ROUTINE
+    set$accounting: NOVALUE,		! Main module of SET ACCOUNTING
+    process_request : NOVALUE,		! Process qualifiers
+    send_request;			! Send request to acc. mgr.
+
+!
+! Declare the accounting manager flags in the exec
+!
+EXTERNAL
+    exe$gl_acmflags;
+
+!
+! External routines
+!
+EXTERNAL ROUTINE
+    str$append,				! Append one string to another
+    cli$get_value,			! Get value from CLI
+    cli$present;			! See if qualifier is present
+
+!
+! Declare literals defined elsewhere
+!
+EXTERNAL LITERAL
+    set$_accenab,			! List currently enabled types
+    set$_accdisab,			! Accounting now disabled
+    set$_writeerr,			! Error modifying accntng. params
+    set$_newfile,			! New accounting file created
+    set$_nonewfile;			! New acc. file not created
+
+
+GLOBAL ROUTINE set$accounting : NOVALUE =
+BEGIN
+
+!++
+! Functional description
+!
+!	This is the routine for the SET ACCOUNTING command.  It is called
+!	from the SET command processor,	and enables/disables certain types
+!	of accounting, as well as starting a new accounting file.
+!
+! Inputs
+!	None
+!
+! Outputs
+!	None
+!
+!----
+
+LOCAL
+    status,				! Status return
+    log : BYTE,				! Tell whether to log or not
+    flags : VOLATILE,			! Flags to show what was done
+    buffer : VECTOR[4];			! Message buffer to send request
+
+!
+! See if logging is required.
+!
+log = cli$present(%ASCID 'LOG');
+
+!
+! If something is to be enabled, process the qualifiers, then request
+! the change from the accounting manager.  If something went wrong,
+! signal an error.  Otherwise, if the operation is to be logged, issue
+! an informational message.
+!
+INCR i FROM 0 TO 1 DO
+    BEGIN
+    IF cli$present(.option_string[.i])
+    THEN
+	BEGIN
+!
+! Call the routine to determine what is to be enabled/disabled.
+!
+    	flags = 0;					! Clear all flags
+	process_request(.option_string[.i], flags);	! See what to change
+
+!
+! If nothing to set, then put a zero at the end of the itemlist.
+!
+    	IF .flags EQL 0				! If no flags set,
+    	THEN buffer[0] = 0			! then all done
+
+!
+! If there is something to enable/disable, then add another item to
+! the itemlist, the accounting types.  
+!
+	ELSE
+	    BEGIN
+	    buffer[0] = sjc$_accounting_types^16	! Accounting types
+	    		OR 4;				! are a longword
+	    buffer[1] = flags;				! located here
+	    buffer[2] = 0;				! no return length
+	    buffer[3] = 0;				! end of list
+	    END;
+
+!
+! Call the routine to actually send the request to the job controller.
+!
+	IF NOT (status = send_request(.option_code[.i],	! This is the function,
+    			      	      buffer))		! this is the itemlist
+	THEN
+	    BEGIN					! If an error,
+	    SIGNAL(set$_writeerr, 1,			! tell user
+    		   %ASCID 'accounting parameters',
+		   .status);
+	    RETURN;					! and go away
+	    END;
+	END;
+    END;
+
+!
+! If /LOG was specified, then display the current accounting types enabled.
+!
+IF .log 
+THEN
+    BEGIN
+    LOCAL
+	types : $BBLOCK[dsc$c_s_bln],	! Place to build the types string
+	acmflags : BITVECTOR[32];	! Temporary place for accntng. flags
+    $init_dyndesc(types);		! Make a dynamic descriptor
+    acmflags = .exe$gl_acmflags;	! Get a copy of current settings.
+    INCR i FROM 0 TO 9 DO
+	IF .acmflags[.i]
+	THEN str$append(types, .acc_name[.i]);
+    IF .types[dsc$w_length] EQL 0	! If nothing set, all disabled
+    THEN SIGNAL(set$_accdisab)
+    ELSE				! Otherwise, strip trailing ","
+	BEGIN				! and display enabled types
+	types[dsc$w_length] = .types[dsc$w_length] - 1;
+	SIGNAL(set$_accenab, 1, types);
+	END;
+    END;
+
+!
+! If a new accounting file is requested, try to do that.  If something went
+! wrong, signal an error.  Otherwise, if the operation is to be logged,
+! issue an informational message. 
+!
+IF cli$present(%ASCID 'NEW_FILE')
+THEN
+    BEGIN
+    buffer[0] = sjc$_new_version^16;		! Open a new file
+    buffer[1] = 0;
+    buffer[2] = 0;
+    buffer[3] = 0;
+    IF NOT (status = send_request(.option_code[0],
+    				  buffer))
+    THEN SIGNAL(set$_nonewfile, 0,		! If an error,
+    		.status)			! tell user
+    ELSE IF .log				! If /LOG, tell user
+    THEN SIGNAL(set$_newfile);
+    END;
+
+    
+RETURN;
+END;
+
+ROUTINE process_request (option, flags) : NOVALUE =
+BEGIN
+
+!++
+! Functional description
+!
+!	This routine collects the qualifiers to indicate what types
+!	of accounting data to enable or disable.  A corresponding bit
+!	is set in the FLAGS word.
+!
+! Inputs
+!
+!	OPTION - address of descriptor for operation (ENABLE or DISABLE)
+!	FLAGS  - longword bitmask describing what was set
+!
+! Outputs
+!	FLAGS  - bitmask set to indicate what was requested
+!
+!----
+
+LOCAL
+    desc : $BBLOCK[dsc$c_s_bln];	! CLI value descriptor
+
+$init_dyndesc(desc);			! Make the descriptor dynamic
+
+!
+! For each accounting category specified by the user, OR in the corresponding 
+! bitmask to the flags longword.
+!
+WHILE cli$get_value(.option, desc) DO
+    BEGIN
+    INCR i FROM 0 TO 9 DO
+	BEGIN
+	BIND name = .acc_name[.i] : VECTOR;
+	IF CH$EQL(.desc[dsc$w_length], .desc[dsc$a_pointer],
+    		  .desc[dsc$w_length], .name[1])
+	THEN EXITLOOP (.flags = ..flags OR .acc_code[.i]);
+	END;
+    END;
+
+RETURN;
+END;
+
+ROUTINE send_request (function, buffer) =
+BEGIN
+
+!++
+!
+!	This routine sends the request to the accounting manager, and
+!	obtains a status return.
+!
+! Inputs
+!	FUNCTION - function to perform - start, stop accounting
+!	BUFFER - message buffer to send to the acc. manager.
+!
+! Outputs
+!	Final status is returned.
+!
+!----
+
+LOCAL
+    status,
+    iosb : VECTOR[2];
+
+!
+! Send the request to the accounting manager.
+!
+status = $SNDJBCW(FUNC   = .function,
+    		  ITMLST = .buffer,
+    		  IOSB   = iosb);
+IF .status 
+THEN status = .iosb[0];
+
+RETURN .status;				! Return the final status
+END;
+
+END
+ELUDOM

@@ -1,0 +1,396 @@
+MODULE staclint (IDENT='V04-000',
+	ADDRESSING_MODE(NONEXTERNAL=LONG_RELATIVE,
+			EXTERNAL=GENERAL)) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:  Stand-alone command language interface routines
+!
+! ABSTRACT:
+!
+!	These routines are used to enable a stand-alone
+!	image to obtain the command parameters and qualifiers
+!	from the command language interpreter.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system. unprivileged user mode,
+!
+! AUTHOR:  Peter George, October 1981
+!
+! Modified by:
+!
+!	V03-006	PCG0006		Peter George	17-Feb-1983
+!		Include INTDEF instead of CLIDEF.
+!
+!	V03-005	PCG0005		Peter George	14-Dec-1982
+!		Allocate local descriptor for command string.
+!
+!	V03-004	PCG0004		Peter George	29-Nov-1982
+!		Add argument to str$analyze_sdesc call.
+!
+!	V03-003	PCG0003		Peter George	02-Nov-1982
+!		Add CLI$NEXT_QUAL.  Fix optional length assignment
+!		in CLI$GET_VALUE.  Analyze input string descriptors.
+!
+!	V03-002	PCG0002		Peter George	18-Oct-1982
+!		Add prompt argument to CLI$DCL_PARSE.
+!
+!	V03-001	PCG0001		Peter George	17-Sep-1982
+!		Use INT data structure.
+!		Add prompt and continuation routines to CLI$DCL_PARSE.
+!		Add value address to CLI$GET_VALUE.
+!		Add user argument to CLI$DISPATCH.
+!--
+
+!
+! Include files
+!
+LIBRARY 'SYS$LIBRARY:STARLET';
+
+REQUIRE 'SYS$LIBRARY:UTILDEF';		! Common VMS BLISS definitions
+
+REQUIRE 'LIB$:INTDEF';			! Interface definitions
+
+!
+! Table of contents
+!
+
+FORWARD ROUTINE
+    cli$present,			! Determine if entity present
+    cli$get_value,			! Get value of entity
+    cli$dcl_parse,			! Parse a command line
+    cli$dispatch,			! Dispatch to user processing routine
+    cli$end_parse,			! Signal any unprocessed modifiers
+    cli$next_qual;			! Get next qualifier
+
+EXTERNAL ROUTINE
+    dcl$present,
+    dcl$getvalue,
+    dcl$dclparse,
+    dcl$dispatch,
+    dcl$nextqual,
+    dcl$endparse,
+    str$analyze_sdesc,			! Analyze input descriptor
+    lib$get_vm,				! Allocate virtual memory
+    lib$free_vm,			! Deallocate virtual memory
+    str$copy_dx;			! Copy to any class string
+
+!
+! External message definitions
+!
+
+EXTERNAL LITERAL
+    cli$_nocomd,			! Prompt was ctrl/z-ed
+    cli$_concat,			! Value is concatenated
+    cli$_comma,				! Value is comma separated
+    cli$_present,			! Entity is explicitly globally present
+    cli$_negated,			! Entity is explicitly not globally present
+    cli$_locpres,			! Entity is explicitly locally present
+    cli$_locneg,			! Entity is explicitly not locally present
+    cli$_defaulted,			! Entity is implicitly present
+    cli$_absent;			! Entity is implicitly not present
+
+GLOBAL ROUTINE cli$present (name) =
+
+!---
+!
+!	Determine if an entity is present on the command line.
+!
+! Inputs:
+!
+!	name = Address of entity name descriptor
+!
+! Outputs:
+!
+!	routine value = True if present, else false.
+!---
+
+BEGIN
+
+LOCAL
+    req_desc :	BBLOCK [cli$c_reqdesc],	! Request descriptor block
+    rpw :	BBLOCK [cli$c_workarea],! Result parse work area
+    req_flags :	BITVECTOR [32];		! Request flags array
+
+CH$FILL(0, cli$c_reqdesc, req_desc);		! Zero request descriptor block
+req_desc [int_b_type] = cli$k_present;		! Set request type
+req_desc [int_l_getvm] = lib$get_vm;		! Set address of get vm routine
+req_desc [int_l_freevm] = lib$free_vm;		! Set address of free vm routine
+!
+! Set entity name
+!
+str$analyze_sdesc (.name, req_desc [int_w_entlen], req_desc [int_l_entaddr]);
+RETURN (dcl$present (req_desc, rpw, req_flags));! Call DCL utility
+END;
+
+GLOBAL ROUTINE cli$get_value (name, retdesc, retlength) =
+
+!---
+!
+!	This routine is called to obtain the next value
+!	associated with a named entity on the command line.
+!
+! Inputs:
+!
+!	name = Address of entity name descriptor
+!	retdesc = Address of a return buffer descriptor
+!	retlength = Address of a longword to return the value
+!		    length in
+!
+! Outputs:
+!
+!	True = A value was returned (there may be more).
+!	False = There is no more values associated with entity.
+!
+!	All other errors are signaled.
+!---
+
+BEGIN
+
+MAP
+    retdesc : REF BBLOCK;
+
+BUILTIN
+    NULLPARAMETER;
+
+LOCAL
+    req_desc :	BBLOCK [cli$c_reqdesc],	! Request descriptor block
+    rpw :	BBLOCK [cli$c_workarea],! Result parse work area
+    req_flags :	BITVECTOR [32],		! Request flags array
+    copy_status,
+    status;
+
+CH$FILL(0, cli$c_reqdesc, req_desc);		! Zero request descriptor block
+req_desc [int_b_type] = cli$k_getvalue;		! Set request type
+req_desc [int_l_getvm] = lib$get_vm;		! Set address of get vm routine
+req_desc [int_l_freevm] = lib$free_vm;		! Set address of free vm routine
+
+!
+! Set entity name
+!
+str$analyze_sdesc (.name, req_desc [int_w_entlen], req_desc [int_l_entaddr]);
+status = dcl$getvalue (req_desc, rpw, req_flags);! Call DCL utility
+
+!
+! If return length was requested, then find it now.
+!
+IF NOT NULLPARAMETER (3)			! If return length requested
+   THEN (.retlength) <0,16> = 			! then original estimate
+		.req_desc [int_w_retlen]; 	!
+
+IF NOT (copy_status = str$copy_dx (.retdesc, 	! Copy result into return desc
+	req_desc [int_w_retlen]))		!
+   THEN SIGNAL (.copy_status);			! Signal any errors
+
+IF NOT NULLPARAMETER (3)			! If return length requested
+   THEN BEGIN					! Then return correct value
+	LOCAL temp : BBLOCK [dsc$c_s_bln];	!
+        str$analyze_sdesc (.retdesc, 		! Get latest estimate
+		temp [dsc$w_length], temp [dsc$a_pointer]);
+	IF .temp LSSU .retdesc [dsc$w_length]	! Return the smaller estimate
+	   THEN (.retlength) <0,16> = .temp;	!
+	END;
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE cli$dcl_parse (command, tables, promptrtn, continrtn, prompt) =
+
+!---
+!
+!	This routine can be called to parse a command line.
+!
+! Inputs:
+!
+!	command = address of descriptor of command string
+!	tables =  address of command tables
+!	promptrtn = address of user missing parameter prompt routine
+!	continrtn = address of user line continuation routine
+!	prompt = address of user prompt string descriptor
+!
+! Outputs:
+!
+!	The command is parsed and the command work area is initialized.
+!
+!---
+
+BEGIN
+
+BUILTIN
+    NULLPARAMETER;
+
+LITERAL
+    elements = 4;
+
+LOCAL
+    command_desc : BBLOCK [dsc$c_s_bln],	! Local command descriptor
+    rtnlist : BBLOCK [4*(elements+1)],		! Routine list
+    req_desc :	BBLOCK [cli$c_reqdesc],		! Request descriptor block
+    rpw :	BBLOCK [cli$c_workarea],	! Result parse work area
+    req_flags :	BITVECTOR [32];			! Request flags array
+
+CH$FILL(0, cli$c_reqdesc, req_desc);		! Zero request descriptor block
+req_desc [int_b_type] = cli$k_dclparse;		! Set request type
+req_desc [int_l_getvm] = lib$get_vm;		! Set address of get vm routine
+req_desc [int_l_freevm] = lib$free_vm;		! Set address of free vm routine
+
+IF NOT NULLPARAMETER(1)				! Set command line descriptor
+   THEN BEGIN
+	str$analyze_sdesc (.command, command_desc [dsc$w_length], 
+				command_desc [dsc$a_pointer]);
+	req_desc [int_l_entaddr] = command_desc;
+	END;
+
+req_desc [int_l_tables] = .tables;		! Set address of command tables
+
+IF NOT NULLPARAMETER(3) OR NOT NULLPARAMETER(4)	! If prompt or continue routine
+   THEN BEGIN
+	CH$FILL(0, 4*(elements+1), rtnlist);	! Zero the list
+	rtnlist [int_l_listlen] = elements;	! Set number of elements in list
+	req_desc [int_l_list] = rtnlist;	! And connect it
+	END;
+
+IF NOT NULLPARAMETER(3)   
+   THEN rtnlist [int_l_promptrtn] = .promptrtn;	! Set address of prompt routine
+IF NOT NULLPARAMETER(4)
+   THEN rtnlist [int_l_continrtn] = .continrtn;	! Set address of continue routine
+IF NOT NULLPARAMETER(5)				! Set prompt descriptor
+   THEN str$analyze_sdesc (.prompt, rtnlist [int_w_pmptlen], 
+				rtnlist [int_l_pmptaddr]);
+
+RETURN (dcl$dclparse (req_desc, rpw, req_flags));! Call DCL utility
+END;
+
+GLOBAL ROUTINE cli$dispatch (argument) =
+
+!---
+!
+!	This routine can be called to dispatch to any verb processing
+!	routines if the command has the ROUTINE attribute.
+!
+! Inputs:
+!
+!	argument = address of user supplied argument to his own routine
+!
+! Outputs:
+!
+!	The verb routine is called (if any).
+!
+!	The status passed back from the routine is returned in R0.
+!	If no routine is specified, success is returned.
+!---
+
+BEGIN
+
+BUILTIN
+    NULLPARAMETER;
+
+LOCAL
+    req_desc :	BBLOCK [cli$c_reqdesc],	! Request descriptor block
+    rpw :	BBLOCK [cli$c_workarea],! Result parse work area
+    req_flags :	BITVECTOR [32];		! Request flags array
+
+CH$FILL(0, cli$c_reqdesc, req_desc);		! Zero request descriptor block
+req_desc [int_b_type] = cli$k_dispatch;		! Set request type
+req_desc [int_l_getvm] = lib$get_vm;		! Set address of get vm routine
+req_desc [int_l_freevm] = lib$free_vm;		! Set address of free vm routine
+IF NOT NULLPARAMETER (1)
+   THEN req_desc [int_l_entaddr] = .argument;	! Set address of user argument
+RETURN (dcl$dispatch (req_desc, rpw, req_flags));! Call callback utility
+END;
+
+GLOBAL ROUTINE cli$end_parse =
+
+!---
+!
+!	This routine is called when the user has completed
+!	all command line parsing.  It checks that all qualifiers
+!	which appeared on the command line were processed in one
+!	way or another by the utility.
+!
+! Inputs:
+!
+!	None
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+LOCAL
+    req_desc :	BBLOCK [cli$c_reqdesc],	! Request descriptor block
+    rpw :	BBLOCK [cli$c_workarea],! Result parse work area
+    req_flags :	BITVECTOR [32];		! Request flags array
+
+CH$FILL(0, cli$c_reqdesc, req_desc);		! Zero request descriptor block
+req_desc [cli$a_prsact] = lib$get_vm;		! Set address of get vm routine
+req_desc [cli$a_absact] = lib$free_vm;		! Set address of free vm routine
+RETURN (dcl$endparse (req_desc, rpw, req_flags));  ! Call DCL utility
+END;
+
+GLOBAL ROUTINE cli$next_qual (name) =
+
+!---
+!
+!	Move to the next command qualifier on the line.
+!
+! Inputs:
+!
+!	name = Address of entity name descriptor
+!
+! Outputs:
+!
+!	routine value = True if present, else false.
+!---
+
+BEGIN
+
+MAP
+    name : REF BBLOCK;
+
+LOCAL
+    req_desc :	BBLOCK [cli$c_reqdesc],	! Request descriptor block
+    rpw :	BBLOCK [cli$c_workarea],! Result parse work area
+    req_flags :	BITVECTOR [32];		! Request flags array
+
+CH$FILL(0, cli$c_reqdesc, req_desc);		! Zero request descriptor block
+req_desc [int_b_type] = cli$k_nextqual;		! Set request type
+req_desc [int_l_getvm] = lib$get_vm;		! Set address of get vm routine
+req_desc [int_l_freevm] = lib$free_vm;		! Set address of free vm routine
+!
+! Set entity name
+!
+str$analyze_sdesc (.name, req_desc [int_w_entlen], req_desc [int_l_entaddr]);
+RETURN (dcl$nextqual (req_desc, rpw, req_flags));! Call DCL utility
+END;
+
+END
+ELUDOM

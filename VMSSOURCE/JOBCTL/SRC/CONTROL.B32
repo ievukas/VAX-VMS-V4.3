@@ -1,0 +1,1021 @@
+MODULE CONTROL	(%TITLE	'Main control logic'
+		MAIN = JOBCTL,
+		IDENT = 'V04-002'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:
+!	Job controller.
+!
+! ABSTRACT:
+!	This module contains the main control logic.
+!
+! ENVIRONMENT:
+!	VAX/VMS user and kernel mode.
+!--
+!
+! AUTHOR: M. Jack, CREATION DATE: 16-Feb-1982
+!
+! MODIFIED BY:
+!
+!	V04-002	JAK0236		J A Krycka	14-Sep-1984
+!		Collect more diagnostic information.
+!
+!	V04-001	JAK0236		J A Krycka	13-Sep-1984
+!		Set control flags to have the job controller take the abort-
+!		restart patch instead of the bugcheck patch on encountering a
+!		severe (fata) error.
+!
+!	V03-012	JAK0230		J A Krycka	28-Aug-1984
+!		Conditionally bypass close of the system job queue file on the
+!		job controller bug check error path to preserve internal RMS
+!		data structures in the dump.
+!
+!	V03-011	JAK0219		J A Krycka	17-Jul-1984
+!		Track changes in JOBCTLDEF.REQ.
+!
+!	V03-010	JAK0215		J A Krycka	25-May-1984
+!		For the time being, bug check on encountering a severe error
+!		instead of aborting/restarting the job controller.
+!
+!	V03-009	JAK0213		J A Krycka	18-May-1984
+!		Make $ENQ/$DEQ lock errors reported via the JBC$_COMREMJBC code
+!		into severe (fatal) errors.
+!
+!	V03-008	JAK0209		J A Krycka	09-May-1984
+!		Log diagnostic information in the DIAG_TRACE vector.
+!
+!	V03-007	JAK0206		J A Krycka	06-May-1984
+!		Conditionally request image dump on creating the symbiont and
+!		(recreated) job controller processes depending on whether or not
+!		the job controller was initiated with image dump enabled.
+!
+!	V03-006	GRR3006		Gregory R. Robert	06-May-1984
+!		Enable image dumps for newly created job controller process.
+!		Also resignal errors so that the last chance handler will
+!		terminate the process as appropriate instead of calling $EXIT.
+!
+!	V03-005	MLJ0115		Martin L. Jack,	30-Jul-1983
+!		Changes for job controller baselevel.
+!
+!	V03-004	MLJ0114		Martin L. Jack,	23-Jun-1983
+!		Changes for job controller baselevel.
+!
+!	V03-003	MLJ0113		Martin L. Jack,	26-May-1983
+!		Changes for job controller baselevel.
+!
+!	V03-002	MLJ0112		Martin L. Jack,	29-Apr-1983
+!		Changes for job controller baselevel.
+!
+!	V03-001	MLJ0109		Martin L. Jack,	14-Apr-1983
+!		Changes for job controller baselevel.
+!
+!**
+
+REQUIRE 'SRC$:JOBCTLDEF';
+REQUIRE 'SHRLIB$:OPCDEFTMP';		! To support internal diagnostic option
+
+
+FORWARD ROUTINE
+	JOBCTL:				NOVALUE,
+	RESET_USERNAME,
+	SCHEDULE_NONAST:		NOVALUE,
+	MAILBOX_NONAST:			NOVALUE,
+	MAILBOX_AST:			NOVALUE,
+	SIGNAL_FILE_ERROR:		NOVALUE,
+	MAIN_HANDLER_ACTION,
+	MAIN_HANDLER,
+	BUG_CHECK_SYSTEM:		NOVALUE;
+
+
+EXTERNAL ROUTINE
+	ALLOCATE_MEMORY,
+	CLOSE_ACCOUNTING_FILE:		NOVALUE,
+	DEALLOCATE_MEMORY:		NOVALUE,
+	DELETE_SYMBIONTS:		NOVALUE,
+	GETQUI_SERVICE,
+	INITIALIZE_RESTRICTED:		NOVALUE,
+	LOCK_QUEUE_FILE:		NOVALUE,
+	OPEN_ACCOUNTING_FILE:		NOVALUE,
+	PROCESS_ACCOUNTING:		NOVALUE,
+	PROCESS_DELETION:		NOVALUE,
+	SEND_SERVICE_RESPONSE:		NOVALUE,
+	SYS$SETDDIR,
+	SNDACC_SERVICE,
+	SNDJBC_SERVICE,
+	SNDSMB_SERVICE,
+	SYMBIONT_SERVICE:		NOVALUE,
+	UNSOLICITED_INPUT:		NOVALUE,
+	UNLOCK_QUEUE_FILE:		NOVALUE,
+	WARM_START_EXISTING_FILE:	NOVALUE;
+
+
+EXTERNAL
+	SGN$GL_VMSD2:	BBLOCK[4]	ADDRESSING_MODE(GENERAL),
+	CTL$GL_PHD:	REF BBLOCK	ADDRESSING_MODE(GENERAL),
+	CTL$T_USERNAME:	VECTOR[,BYTE]	ADDRESSING_MODE(GENERAL);
+
+
+EXTERNAL LITERAL
+	SYS$C_JOBCTLMB;
+
+
+GLOBAL BIND
+	NLA0_DESC=		$DESCRIPTOR('_NLA0:'),
+	OPA0_DESC=		$DESCRIPTOR('_OPA0:'),
+	JOBCTLMBX_DESC=		UPLIT(6, UPLIT BYTE ('_', LONG(SYS$C_JOBCTLMB), ':')),
+	ALL_PRIVILEGES=		UPLIT(-1, -1);
+
+
+BIND
+	JOB_CONTROL_DESC=	$DESCRIPTOR('JOB_CONTROL'): BBLOCK;
+
+
+MACRO
+
+	! Fields for non-AST work queue block.
+	!
+	NWB_FLINK=		0,0,32,0 %,	! Forward link
+	NWB_BLINK=		4,0,32,0 %,	! Backward link
+	NWB_ROUT=		8,0,32,0 %,	! Routine address
+	NWB_PAGES=		12,0,32,0 %,	! Size of NWB in pages
+	NWB_PARAM=		16,0,0,0 %;	! Routine parameters
+
+
+BUILTIN
+	INSQUE,
+	REMQUE,
+	TESTBITCS;
+
+ROUTINE JOBCTL: NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine is the main entry point for the job controller.
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	STATUS_1,			! Status return
+	STATUS_2;			! Status return
+OWN
+	PRIVILEGE_MASK: BBLOCK[8] PSECT(CODE) PRESET(
+		[PRV$V_NOACNT]	= TRUE,
+		[PRV$V_ALTPRI]	= TRUE,
+		[PRV$V_BYPASS]	= TRUE,
+		[PRV$V_CMKRNL]	= TRUE,
+		[PRV$V_DETACH]	= TRUE,
+		[PRV$V_EXQUOTA]	= TRUE,
+		[PRV$V_LOG_IO]	= TRUE,
+		[PRV$V_NETMBX]	= TRUE,
+		[PRV$V_OPER]	= TRUE,
+		[PRV$V_PSWAPM]	= TRUE,
+		[PRV$V_SETPRV]	= TRUE,
+		[PRV$V_TMPMBX]	= TRUE,
+		[PRV$V_WORLD]	= TRUE);
+
+BUILTIN
+	FP;
+
+
+! Initialize error processing control flags.
+!
+FLAGS[FLAGS_V_READ_VMSD2] = TRUE;	! Reset debugging control flags from VMSD2 sysgen parameter
+					! On encountering a severe (fatal) error:
+FLAGS[FLAGS_V_CLUSTER_SCRAM] = FALSE;	!  Synchronously bug check entire cluster
+FLAGS[FLAGS_V_LEAVE_OPEN] = FALSE;	!  Leave system job queue file open on exit
+FLAGS[FLAGS_V_BUGCHECK] = FALSE;	!  Bug check system vs abort/restart image
+					! Other debugging flags:
+FLAGS[FLAGS_V_CS_QF_DEADLOCK] = FALSE;	!  Bug check cluster on queue file deadlock error
+FLAGS[FLAGS_V_LOG_QF_REPAIR] = FALSE;	!  Log occurrence of on-the-fly repair of queue file
+FLAGS[FLAGS_V_OMIT_QF_INIT] = FALSE;	!  Omit queue file initializaton after opening it
+
+IF .FLAGS[FLAGS_V_READ_VMSD2]		! Reset debugging control flags
+    THEN FLAGS<17,15> = .SGN$GL_VMSD2<1,15>;
+
+
+! Set the privileges that we need.
+!
+$SETPRV(ENBFLG=TRUE, PRVADR=PRIVILEGE_MASK);
+
+
+! Define SYS$DISK to set the default device for image dumps.
+!
+$CRELOG(
+    TBLFLG=LOG$C_PROCESS,
+    LOGNAM=$DESCRIPTOR ('SYS$DISK'),
+    EQLNAM=$DESCRIPTOR('SYS$SYSROOT:') );
+
+
+! Set the default directory for image dumps.
+! Note that optional arguments must be specified as zero.
+!
+SYS$SETDDIR ($DESCRIPTOR ('[SYSEXE]'), 0, 0);
+
+
+! Get the image dump flag from the process header which will be used later
+! to determine whether or not image dump will be requested when a symbiont
+! (or the job controller itself upon termnation) is created.
+!
+IF (.CTL$GL_PHD[PHD$W_FLAGS] AND PHD$M_IMGDMP) EQL 0
+THEN IMAGE_DUMP_STSFLG = 0
+ELSE IMAGE_DUMP_STSFLG = PRC$M_IMGDMP;
+
+
+! Execute a $GETJPI to get process information that will be needed later.
+!
+$GETJPIW(
+    EFN=JBC$K_SYNC_EFN,
+    ITMLST=UPLIT(
+	WORD(4, JPI$_ASTLM),	LONG(JBC_QUOTAS[ 1,0,32,0], 0),
+	WORD(4, JPI$_BIOLM),	LONG(JBC_QUOTAS[ 6,0,32,0], 0),
+	WORD(4, JPI$_BYTLM),	LONG(JBC_QUOTAS[11,0,32,0], 0),
+	WORD(4, JPI$_DIOLM),	LONG(JBC_QUOTAS[21,0,32,0], 0),
+	WORD(4, JPI$_ENQLM),	LONG(JBC_QUOTAS[26,0,32,0], 0),
+	WORD(4, JPI$_FILLM),	LONG(JBC_QUOTAS[31,0,32,0], 0),
+	WORD(4, JPI$_PGFLQUOTA),LONG(JBC_QUOTAS[36,0,32,0], 0),
+	WORD(4, JPI$_PRCLM),	LONG(JBC_QUOTAS[41,0,32,0], 0),
+	WORD(4, JPI$_TQLM),	LONG(JBC_QUOTAS[46,0,32,0], 0),
+	WORD(4, JPI$_DFWSCNT),	LONG(JBC_QUOTAS[51,0,32,0], 0),
+	WORD(4, JPI$_WSAUTHEXT),LONG(JBC_QUOTAS[56,0,32,0], 0),
+	WORD(4, JPI$_WSAUTH),	LONG(JBC_QUOTAS[61,0,32,0], 0),
+	WORD(4, JPI$_PRIB),	LONG(JBC_PRIORITY, 0),
+	WORD(8, JPI$_CURPRIV),	LONG(JBC_PRIVILEGES, 0),
+	WORD(4, JPI$_UIC),	LONG(JBC_UIC, 0),
+	LONG(0)));
+
+JBC_QUOTAS[ 0,0,8,0] = PQL$_ASTLM;
+JBC_QUOTAS[ 5,0,8,0] = PQL$_BIOLM;
+JBC_QUOTAS[10,0,8,0] = PQL$_BYTLM;
+JBC_QUOTAS[15,0,8,0] = PQL$_CPULM;
+JBC_QUOTAS[20,0,8,0] = PQL$_DIOLM;
+JBC_QUOTAS[25,0,8,0] = PQL$_ENQLM;
+JBC_QUOTAS[30,0,8,0] = PQL$_FILLM;
+JBC_QUOTAS[35,0,8,0] = PQL$_PGFLQUOTA;
+JBC_QUOTAS[40,0,8,0] = PQL$_PRCLM;
+JBC_QUOTAS[45,0,8,0] = PQL$_TQELM;
+JBC_QUOTAS[50,0,8,0] = PQL$_WSDEFAULT;
+JBC_QUOTAS[55,0,8,0] = PQL$_WSEXTENT;
+JBC_QUOTAS[60,0,8,0] = PQL$_WSQUOTA;
+JBC_QUOTAS[65,0,8,0] = PQL$_LISTEND;
+
+
+! Establish the condition handler.
+!
+.FP = MAIN_HANDLER;
+
+
+! Set the process name and the username to JOB_CONTROL.
+!
+$SETPRN(PRCNAM=JOB_CONTROL_DESC);
+$CMKRNL(ROUTIN=RESET_USERNAME);
+
+
+! Assign a channel to the job controller input mailbox.
+!
+STATUS_1 = $ASSIGN(DEVNAM=JOBCTLMBX_DESC, CHAN=MBX_CHAN);
+IF NOT .STATUS_1 THEN SIGNAL(JBC$_OPEJBCMBX OR STS$K_SEVERE, 0, .STATUS_1);
+
+
+! Get the current time.
+!
+$GETTIM(TIMADR=CUR_TIME);
+
+
+! Initialize the restricted login hours subsystem.
+!
+INITIALIZE_RESTRICTED();
+
+
+! Initialize the accounting manager.
+!
+OPEN_ACCOUNTING_FILE(FALSE);
+
+
+! Initialize the static queue headers.
+!
+NONAST_WORK_QUEUE[0] = NONAST_WORK_QUEUE[1] = NONAST_WORK_QUEUE[0];
+INCR I FROM 0 TO %ALLOCATION(MEMORY_FREE_QUEUES)/4-2 BY 2 DO
+    MEMORY_FREE_QUEUES[.I] = MEMORY_FREE_QUEUES[.I+1] = MEMORY_FREE_QUEUES[.I];
+
+
+! Queue the first read from the mailbox.
+!
+FLAGS[FLAGS_V_READ_POSTED] = TRUE;
+STATUS_2 = $QIO(
+    FUNC=IO$_READVBLK,
+    CHAN=.MBX_CHAN,
+    IOSB=MBX_IOSB,
+    ASTADR=MAILBOX_AST,
+    P1=MBX_BUFFER,
+    P2=%ALLOCATION(MBX_BUFFER));
+IF NOT .STATUS_2 THEN SIGNAL(JBC$_REAJBCMBX OR STS$K_SEVERE, 0, .STATUS_2);
+
+
+! Hibernate, waiting for non-AST work.
+!
+WHILE TRUE DO
+    BEGIN
+    LOCAL
+	NWB:		REF BBLOCK;	! Pointer to non-AST work block
+
+
+    UNTIL REMQUE(.NONAST_WORK_QUEUE[0], NWB) DO
+	BEGIN
+	(.NWB[NWB_ROUT])(NWB[NWB_PARAM]);
+	DEALLOCATE_MEMORY(.NWB, .NWB[NWB_PAGES]);
+	END;
+    $HIBER;
+    END;
+END;
+
+ROUTINE RESET_USERNAME=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine sets the process username to JOB_CONTROL.  It executes in
+!	kernel mode.
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	CTL$T_USERNAME set to JOB_CONTROL.
+!
+! ROUTINE VALUE:
+!	SS$_NORMAL
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+CH$COPY(
+    .JOB_CONTROL_DESC[DSC$W_LENGTH], .JOB_CONTROL_DESC[DSC$A_POINTER],
+    %C' ',
+    12, CTL$T_USERNAME);
+SS$_NORMAL
+END;
+
+GLOBAL ROUTINE SCHEDULE_NONAST(ROUT,LENGTH,ADDRESS): NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine is called by an AST routine to schedule a specified routine
+!	to execute at non-AST level.  The requests are processed first in, first
+!	out.
+!
+! INPUT PARAMETERS:
+!	ROUT		- Address of the routine to be executed.
+!	LENGTH		- (Optional) Descriptor for parameter data.
+!	ADDRESS		-
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	NWB:		REF BBLOCK;	! Pointer to non-AST work block
+BUILTIN
+	ACTUALCOUNT;
+
+
+IF ACTUALCOUNT() LSSU 2
+THEN
+    BEGIN
+    NWB = ALLOCATE_MEMORY();
+    NWB[NWB_ROUT] = .ROUT;
+    NWB[NWB_PAGES] = 1;
+    END
+ELSE
+    BEGIN
+    LOCAL
+	NP;
+
+    NP = (.LENGTH + 16 + 511) / 512;
+    NWB = ALLOCATE_MEMORY(.NP);
+    NWB[NWB_ROUT] = .ROUT;
+    NWB[NWB_PAGES] = .NP;
+    CH$MOVE(.LENGTH, .ADDRESS, NWB[NWB_PARAM]);
+    END;
+
+
+IF INSQUE(.NWB, .NONAST_WORK_QUEUE[1]) THEN $WAKE();
+END;
+
+ROUTINE MAILBOX_NONAST(MSG): NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine is scheduled to execute by the completion AST routine for
+!	a mailbox read.  It processes the buffered message.
+!
+! INPUT PARAMETERS:
+!	MSG		- Pointer to message IOSB followed by message.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	STATUS;				! Status return
+
+
+! Initialize global pointers to the message.
+!
+MBX = .MSG + 8;
+MBX_END = .MBX + .MBX[ACM$W_MSGLEN];
+
+IF .FLAGS[FLAGS_V_READ_VMSD2]		! Reset debug control flags
+    THEN FLAGS<17,15> = .SGN$GL_VMSD2<1,15>;
+
+DIAG_TRACE[0] = .MBX[MSG_W_TYPE];	! ***** diagnostic info *****
+DIAG_TRACE[1] = 0;			! ***** diagnostic info *****
+DIAG_COUNT[0] = DIAG_COUNT[1] = DIAG_COUNT[2] = DIAG_COUNT[3] = 0;
+DIAG_COUNT[4] = DIAG_COUNT[5] = DIAG_COUNT[6] = DIAG_COUNT[7] = 0;
+
+
+! Process the message.
+!
+CASE .MBX[MSG_W_TYPE] FROM MSG$_DELPROC TO MSG$_GETQUI OF
+    SET
+
+
+    [INRANGE, OUTRANGE]:
+	SIGNAL(JBC$_INVMSG OR STS$K_ERROR);
+
+
+    [MSG$_DELPROC]:
+	BEGIN
+	COPY_TIME(MBX[ACM$Q_SYSTIME], CUR_TIME);
+	PROCESS_DELETION();
+	END;
+
+
+    [MSG$_SNDSMB]:
+	BEGIN
+	COPY_TIME(MBX[ACM$Q_SYSTIME], CUR_TIME);
+	RSP[RSP_W_TYPE] = MSG$_SMBRSP;
+	RSP[RSP_W_ENTRY_NUMBER] = 0;
+	RSP[RSP_L_STATUS] = SNDSMB_SERVICE();
+	UNLOCK_QUEUE_FILE();
+	SEND_SERVICE_RESPONSE();
+	END;
+
+
+    [MSG$_SMBINI]:
+	BEGIN
+	$GETTIM(TIMADR=CUR_TIME);
+	SYMBIONT_SERVICE();
+	END;
+
+
+    [MSG$_SMBDON]:				! Connection manager message
+	BEGIN
+	$GETTIM(TIMADR=CUR_TIME);
+	IF .QUEUE_FAB[FAB$W_IFI] NEQ 0
+	THEN
+	    BEGIN
+	    LOCAL
+		SYSID:	BBLOCK[6];
+
+	    CH$COPY(.MBX[8,0,8,0], MBX[9,0,0,0], %C' ', 6, SYSID);
+	    LOCK_QUEUE_FILE();
+	    WARM_START_EXISTING_FILE(SYSID);
+	    UNLOCK_QUEUE_FILE();
+	    END;
+	END;
+
+
+    [MSG$_SNDACC]:
+	BEGIN
+	COPY_TIME(MBX[ACM$Q_SYSTIME], CUR_TIME);
+	RSP[RSP_W_TYPE] = MSG$_ACCRSP;
+	RSP[RSP_W_ENTRY_NUMBER] = 0;
+	RSP[RSP_L_STATUS] = SNDACC_SERVICE();
+	SEND_SERVICE_RESPONSE();
+	END;
+
+
+    [MSG$_PURPROC, MSG$_DELIMAG, MSG$_PURIMAG]:
+	BEGIN
+	COPY_TIME(MBX[ACM$Q_SYSTIME], CUR_TIME);
+	PROCESS_ACCOUNTING();
+	END;
+
+
+    [MSG$_SNDJBC]:
+	BEGIN
+	COPY_TIME(MBX[ACM$Q_SYSTIME], CUR_TIME);
+	RSP[RSP_W_ENTRY_NUMBER] = 0;
+	RSP[RSP_L_STATUS] = SNDJBC_SERVICE();
+	UNLOCK_QUEUE_FILE();
+	SEND_SERVICE_RESPONSE();
+	END;
+
+
+    [MSG$_GETQUI]:
+	BEGIN
+	COPY_TIME(MBX[ACM$Q_SYSTIME], CUR_TIME);
+	RSP[RSP_W_ENTRY_NUMBER] = 0;
+	RSP[RSP_L_STATUS] = GETQUI_SERVICE();
+	UNLOCK_QUEUE_FILE();
+	SEND_SERVICE_RESPONSE();
+	END;
+
+
+    TES;
+
+
+DIAG_COUNT[12] = .DIAG_COUNT[12] + .DIAG_COUNT[0];
+DIAG_COUNT[13] = .DIAG_COUNT[13] + .DIAG_COUNT[1];
+DIAG_COUNT[14] = .DIAG_COUNT[14] + .DIAG_COUNT[2];
+DIAG_COUNT[15] = .DIAG_COUNT[15] + .DIAG_COUNT[3];
+DIAG_COUNT[16] = .DIAG_COUNT[16] + .DIAG_COUNT[4];
+DIAG_COUNT[17] = .DIAG_COUNT[17] + .DIAG_COUNT[5];
+DIAG_COUNT[18] = .DIAG_COUNT[18] + .DIAG_COUNT[6];
+DIAG_COUNT[19] = .DIAG_COUNT[19] + .DIAG_COUNT[7];
+
+
+! Queue another read from the mailbox if there is no read in progress -- it
+! was shut down because the maximum was exceeded.
+!
+MBX_MESSAGE_COUNT = .MBX_MESSAGE_COUNT - 1;
+IF TESTBITCS(FLAGS[FLAGS_V_READ_POSTED])
+THEN
+    BEGIN
+    LOCAL
+	STATUS;			! Status return
+
+    STATUS = $QIO(
+	FUNC=IO$_READVBLK,
+	CHAN=.MBX_CHAN,
+	IOSB=MBX_IOSB,
+	ASTADR=MAILBOX_AST,
+	P1=MBX_BUFFER,
+	P2=%ALLOCATION(MBX_BUFFER));
+    IF NOT .STATUS THEN SIGNAL(JBC$_REAJBCMBX OR STS$K_SEVERE, 0, .STATUS);
+    END;
+END;
+
+ROUTINE MAILBOX_AST: NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This is the completion AST routine for a mailbox read.  It processes
+!	the message just read and queues another read.
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	MBX_IOSB	- IOSB for read.
+!	MBX_BUFFER	- Buffer containing data.
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	STATUS;				! Status return
+
+
+IF NOT .MBX_IOSB[0]
+THEN
+    SIGNAL(JBC$_REAJBCMBX OR STS$K_ERROR, 0, .MBX_IOSB[0])
+ELSE
+    IF .MBX_BUFFER[MSG_W_TYPE] EQL MSG$_TRMUNSOLIC
+    OR .MBX_BUFFER[MSG_W_TYPE] EQL MSG$_CRUNSOLIC
+    THEN
+	UNSOLICITED_INPUT()
+    ELSE
+	BEGIN
+	SCHEDULE_NONAST(MAILBOX_NONAST, .MBX_IOSB[1] + 8, MBX_IOSB);
+	MBX_MESSAGE_COUNT = .MBX_MESSAGE_COUNT + 1;
+	END;
+
+
+! Queue another read from the mailbox.
+!
+IF .MBX_MESSAGE_COUNT LSSU JBC$K_MAXBUFMSG
+THEN
+    BEGIN
+    STATUS = $QIO(
+	FUNC=IO$_READVBLK,
+	CHAN=.MBX_CHAN,
+	IOSB=MBX_IOSB,
+	ASTADR=MAILBOX_AST,
+	P1=MBX_BUFFER,
+	P2=%ALLOCATION(MBX_BUFFER));
+    IF NOT .STATUS THEN SIGNAL(JBC$_REAJBCMBX OR STS$K_SEVERE, 0, .STATUS);
+    END
+ELSE
+    FLAGS[FLAGS_V_READ_POSTED] = FALSE;
+END;
+
+GLOBAL ROUTINE SIGNAL_FILE_ERROR(MESSAGE,FAB,FRAB): NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine handles signalling of file-related errors.
+!
+! INPUT PARAMETERS:
+!	MESSAGE		- Message code to be signalled.
+!	FAB		- FAB for the file, to obtain the file specification.
+!	FRAB		- FAB or RAB that sustained the error, to obtain
+!			  STS and STV.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	Message signalled.
+!
+!--
+
+BEGIN
+MAP
+	FAB:		REF BBLOCK,	! Pointer to FAB
+	FRAB:		REF BBLOCK;	! Pointer to FAB or RAB
+LOCAL
+	NAM:		REF BBLOCK,	! Pointer to NAM block
+	DESC:		VECTOR[2];	! Descriptor for file specification
+
+
+! Set up the file name descriptor.
+!
+NAM = .FAB[FAB$L_NAM];
+IF .NAM[NAM$B_RSL] NEQ 0
+THEN
+    BEGIN
+    DESC[0] = .NAM[NAM$B_RSL];
+    DESC[1] = .NAM[NAM$L_RSA];
+    END
+ELSE IF .NAM[NAM$B_ESL] NEQ 0
+THEN
+    BEGIN
+    DESC[0] = .NAM[NAM$B_ESL];
+    DESC[1] = .NAM[NAM$L_ESA];
+    END
+ELSE
+    BEGIN
+    DESC[0] = .FAB[FAB$B_FNS];
+    DESC[1] = .FAB[FAB$L_FNA];
+    END;
+
+
+! Signal the message.
+!
+SIGNAL(.MESSAGE, 1, DESC, .FRAB[FAB$L_STS], .FRAB[FAB$L_STV]);
+END;
+
+ROUTINE MAIN_HANDLER_ACTION(MSG_DESC)=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This is an action routine for the $PUTMSG that issues a signalled
+!	message to the system console.  It writes the record to the operator
+!	via OPCOM or via broadcast.
+!
+! INPUT PARAMETERS:
+!	MSG_DESC	- Descriptor for message.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	FALSE, to signal $PUTMSG not to write the message.
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+MAP
+	MSG_DESC:	REF BBLOCK;	! Descriptor for message text
+LOCAL
+	LENGTH:		WORD,		! Length of message, minimized
+	OPC_BUFFER:	BBLOCK[$BYTEOFFSET(OPC$L_MS_TEXT) + 132],
+					! Buffer for OPCOM message
+	OPC_DESC:	VECTOR[2],	! Descriptor for message buffer
+	STATUS;				! Status return
+
+
+! Set up the OPCOM message buffer.
+!
+OPC_BUFFER[OPC$B_MS_TYPE] = OPC$_RQ_RQST;
+OPC_BUFFER[OPC$B_MS_TARGET] = OPC$M_NM_CENTRL;
+OPC_BUFFER[OPC$W_MS_STATUS] = 0;
+OPC_BUFFER[OPC$L_MS_RQSTID] = 0;
+LENGTH = .MSG_DESC[DSC$W_LENGTH];
+IF .LENGTH GTRU 132 THEN LENGTH = 132;
+CH$MOVE(.LENGTH, .MSG_DESC[DSC$A_POINTER], OPC_BUFFER[OPC$L_MS_TEXT]);
+OPC_DESC[0] = $BYTEOFFSET(OPC$L_MS_TEXT) + .LENGTH;
+OPC_DESC[1] = OPC_BUFFER;
+
+
+! Try to send the message by OPCOM.  If this fails, send a broadcast to the
+! system console.
+!
+STATUS = $SNDOPR(MSGBUF=OPC_DESC);
+IF NOT .STATUS OR .STATUS EQL OPC$_NOPERATOR
+THEN
+    $BRKTHRU(
+	MSGBUF=.MSG_DESC,
+	SENDTO=OPA0_DESC,
+	SNDTYP=BRK$C_DEVICE,
+	TIMOUT=10);
+
+
+! Return FALSE, to signal $PUTMSG not to write the message.
+!
+FALSE
+END;
+
+ROUTINE MAIN_HANDLER(SIG,MECH)=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine is the condition handler for the main routine.  It
+!	intercepts signals and writes the message to the operator.
+!
+! INPUT PARAMETERS:
+!	Standard VMS condition handler parameters.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	SS$_CONTINUE
+!
+! SIDE EFFECTS:
+!	If the condition is fatal, the image exits.
+!
+!--
+
+BEGIN
+MAP
+	SIG:		REF BBLOCK,	! Signal parameters
+	MECH:		REF BBLOCK;	! Mechanism parameters
+LOCAL
+	OPC_BUFFER:	$BBLOCK[OPC$K_SHUTDOWN_MIN_SIZE],	! Data structures
+	OPC_DESC:	VECTOR [2]				!  to support
+			PRESET ([0] = OPC$K_SHUTDOWN_MIN_SIZE,	!  cluster-wide
+				[1] = OPC_BUFFER);		!  take down
+
+
+! Adjust the signal parameter count to remove the PC and PSL, and call $PUTMSG
+! to issue the message to the operator.
+!
+SIG[CHF$L_SIG_ARGS] = .SIG[CHF$L_SIG_ARGS] - 2;
+$PUTMSG(MSGVEC=.SIG, ACTRTN=MAIN_HANDLER_ACTION);
+
+
+! If the condition is not a job controller message, force the severity to
+! fatal.  It must be a real system exception.
+!
+IF .BBLOCK[SIG[CHF$L_SIG_NAME], STS$V_FAC_NO] NEQ JBC$_FACILITY
+THEN
+    BBLOCK[SIG[CHF$L_SIG_NAME], STS$V_SEVERITY] = STS$K_SEVERE;
+
+
+! Turn $ENQ/$DEQ errors reported via the JBC$_COMREMJBC code into fatal errors.
+!
+IF .SIG[CHF$L_SIG_NAME] EQL (JBC$_COMREMJBC OR STS$K_ERROR)
+THEN
+    BBLOCK[SIG[CHF$L_SIG_NAME], STS$V_SEVERITY] = STS$K_SEVERE;
+
+
+! If the exception was fatal, exit the image.  Otherwise, signal the error and
+! continue. Note that certain control flags can alter this behavior.
+!
+DIAG_TRACE[14] = .SIG[CHF$L_SIG_NAME];	! ***** diagnostic info *****
+IF .BBLOCK[SIG[CHF$L_SIG_NAME], STS$V_SEVERITY] EQL STS$K_SEVERE
+THEN
+    BEGIN
+
+
+    ! For debugging purposes, conditionally force a synchronous cluster-wide
+    ! crash.
+    !
+    IF .FLAGS[FLAGS_V_CLUSTER_SCRAM] THEN
+	BEGIN
+	OPC_BUFFER[OPC$B_RQSTCODE] = OPC$_X_SHUTDOWN;
+	OPC_BUFFER[OPC$L_RQ_OPTIONS] = OPC$M_CLUSTER;
+	IF(WORK_AREA[2] = $SNDOPR(MSGBUF=OPC_DESC))
+	THEN WHILE TRUE DO
+	    BEGIN
+	    $HIBER;				! Wait for system to crash ...
+	    END;
+	END;
+
+
+    ! Delete all symbiont processes.
+    !
+    DELETE_SYMBIONTS();
+
+
+    ! Close the accounting file.
+    !
+    CLOSE_ACCOUNTING_FILE();
+
+
+    ! Close the system job queue file unless it is desired to leave it open
+    ! for debugging purposes to preserve internal RMS data structures.
+    !
+    IF NOT .FLAGS[FLAGS_V_LEAVE_OPEN] THEN $CLOSE(FAB=QUEUE_FAB);
+
+
+    ! Conditionally bug check the system instead of aborting/restarting the job
+    ! controller.
+    !
+    IF .FLAGS[FLAGS_V_BUGCHECK] THEN $CMKRNL(ROUTIN=BUG_CHECK_SYSTEM);
+
+
+    ! Make the process name null to avoid a name conflict with the new process.
+    !
+    $SETPRN();
+
+
+    ! Create a new job controller process.
+    !
+    $CREPRC(
+	IMAGE=$DESCRIPTOR('SYS$SYSTEM:JOBCTL.EXE'),
+	INPUT=OPA0_DESC,
+	OUTPUT=OPA0_DESC,
+	ERROR=OPA0_DESC,
+	PRVADR=JBC_PRIVILEGES,
+	QUOTA=JBC_QUOTAS,
+	PRCNAM=JOB_CONTROL_DESC,
+	BASPRI=.JBC_PRIORITY,
+	STSFLG=.IMAGE_DUMP_STSFLG,
+	UIC=.JBC_UIC);
+
+
+    ! Resignal the error to allow last chance handler to write the dump. Then
+    ! the process will exit after the dump has been written. In addition,
+    ! further display of the message will be inhibited so that it is displayed
+    ! only once.
+    !
+    SIG[CHF$L_SIG_NAME] = .SIG[CHF$L_SIG_NAME] OR STS$M_INHIB_MSG;
+    RETURN SS$_RESIGNAL
+    END;
+
+
+SS$_CONTINUE
+END;
+
+ROUTINE BUG_CHECK_SYSTEM: NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine crashes the system via a bug check.
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	The system crashes!!!
+!
+!--
+
+BEGIN
+BUG_CHECK(UNXINTEXC);
+END;
+
+END
+ELUDOM

@@ -1,0 +1,1242 @@
+MODULE	opc$replybrd	(	%TITLE 'Broadcast command module' %SBTTL 'Copyright notice'
+			 LANGUAGE (BLISS32),
+			 IDENT = 'V04-000'
+			) =
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:
+!
+!	OPCOM - OPCOM process and REPLY command
+!
+! ABSTRACT:
+!
+!	This module formats and outputs user broadcast requests.
+!
+! Environment:
+!
+!	VAX/VMS operating system.
+!
+! Author:
+!
+!	CW Hobbs
+!
+! Creation date:
+!
+!	3-Aug-1983
+!
+! Revision history:
+!
+!	V03-003	CWH3169		CW Hobbs			5-May-1984
+!		Second pass for cluster-wide OPCOM:
+!		 - Liberal rewrite to use ast-driven, queued brkthru writes.
+!
+!	V03-002	CWH3002		CW Hobbs		16-Sep-1983
+!		Improve timeout calculation and error handling.
+!--
+
+BEGIN						%SBTTL 'Start of replybrd'
+
+LIBRARY	'SYS$LIBRARY:LIB.L32';
+LIBRARY 'LIB$:OPCOMLIB';
+
+FORWARD ROUTINE
+    replybrd_brkthru_ast	: NOVALUE,	! AST routine for brkthru completion
+    replybrd_brkthru_queue	: NOVALUE,	! Add an entry to the brkthru work queue
+    replybrd_format,				! Format the message
+    replybrd_io,				! Do the actual io to the devices
+    replybrd_io_list		: NOVALUE,	! Do the actual io to a list of targets
+    replybrd_notify_all		: NOVALUE,	! Format message for /ALL or /USER
+    replybrd_notify_dev		: NOVALUE,	! Format message for /TERM=(...)
+    replybrd_notify_io		: NOVALUE,	! Do something to actually display the message
+    replybrd_notify_use		: NOVALUE,	! Format message for /USER=(...)
+    replybrd_ok_to_queue_write;			! Is it ok to actually start the $brkthru?
+
+EXTERNAL ROUTINE
+    cluscomm_send : WEAK,			! The reply image doesn't need this
+    share_full_devname;
+
+EXTERNAL
+    lcl_csid : WEAK;				! The reply image doesn't need this
+
+GLOBAL
+    bod_allocated,				! Count of BODs created
+    bod_busy_count,				! Current count of i/os pending
+    bod_busy_max	: INITIAL (32),		! Maximum number of brkthrus pending
+    bod_requests,				! Count of requests made
+    bod_busy_queue	: VECTOR [2, LONG]	! Queue of BODs pending for I/O
+			  INITIAL (REP 2 OF (bod_busy_queue)),
+    bod_free_queue	: VECTOR [2, LONG]	! Queue of BODs available for use
+			  INITIAL (REP 2 OF (bod_free_queue)),
+    bod_wait_queue	: VECTOR [2, LONG]	! Queue of BODs waiting for actual $BRKTHRU to be queued
+			  INITIAL (REP 2 OF (bod_wait_queue)),
+    bod_garbage_queue	: VECTOR [2, LONG]	! Pointer to list of virtual memory to deallocate
+			  INITIAL (REP 2 OF (bod_garbage_queue)),
+    replybrd_status,				! Status for REPLY image
+    reply_image		: INITIAL (0);		! Zero if in OPCOM image, one if in REPLY image
+
+!
+! A macro to put virtual memory back on the queue of garbage to be deallocated
+!
+MACRO
+    COLLECT_GARBAGE (INP_DESC) =
+		    BEGIN
+		    BIND
+			desc = (INP_DESC) : VECTOR [, LONG],
+			garbage = .desc [1] : VECTOR [, LONG];
+		    garbage [2] = .desc [0];			! Store length as second longword in block
+		    $queue_insert_tail (garbage, bod_garbage_queue);
+		    END %;
+
+BUILTIN
+    CALLG;
+
+!
+! Define the positions in the argument list for the calls to replybrd_brkthru_queue and replybrd_io_list
+!
+LITERAL
+    count = 0,		! ar
+    text = 1,
+    targ = 2,
+    type = 3,
+    cntl = 4,
+    bflg = 5,
+    rqid = 6,
+    rtn = 7,
+    node = 8,
+    csid = 9,
+    sflg = 10,
+    term = 11,		! last arg for replybrd_brkthru_queue
+    queue_args = 11,
+    llen = 12,
+    lptr = 13;
+
+GLOBAL ROUTINE replybrd_brkthru_ast (parm) : NOVALUE =
+
+!++
+! Functional descripton:
+!
+!	This routine is the I/O completion for a $BRKTHRU write
+!
+! Input:
+!	None.
+!
+! Output:
+!	None.
+!
+! Routine Value:
+!	Address of block
+!--
+
+BEGIN						! Start of REPLYBRD_BRKTHRU_AST
+
+LOCAL
+     bod : $ref_bblock,
+     status;
+
+!
+! If the parameter is non-zero, release that block
+!
+bod = .parm;
+IF .bod NEQ 0
+THEN
+    BEGIN
+    !
+    ! Check the I/O status, if not ok, save the worst status.  If ok,
+    ! call the completion routine if there is one
+    !
+    IF NOT .bod [bod_w_iosb0]
+    THEN
+	BEGIN
+	IF .(bod [bod_q_iosb])<0,3,0> GTR .replybrd_status<0,3,0>
+	THEN
+	    replybrd_status = .bod [bod_w_iosb0];
+	END
+    ELSE
+	IF .bod [bod_a_completion_routine] NEQ 0
+	THEN
+	    (.bod [bod_a_completion_routine]) (.bod);
+    !
+    ! Free the message string buffer
+    !
+    collect_garbage (bod [bod_q_msgbuf]);
+    !
+    ! Place the BOD in the free queue, put it at the head so that any old bods that get
+    ! out-faulted will stay out until we really need 'em.
+    !
+    $queue_remove (.bod);			! Remove it from the que (should be in the busy queue)
+    $queue_insert_head (.bod, bod_free_queue);
+    bod_busy_count = .bod_busy_count - 1;
+    END;
+!
+! If we can queue another brkthru, then do so
+!
+bod = .bod_wait_queue [0];
+WHILE .bod NEQ bod_wait_queue			! Loop until we see the end
+    AND
+     .bod_busy_count LSS .bod_busy_max		! or until we have filled our quota
+DO
+    BEGIN
+    LOCAL
+	next;
+    next = .bod [bod_l_flink];			! Save the pointer to the next, since we might pull it out
+    IF replybrd_ok_to_queue_write (.bod, bod_busy_queue) 	! Control number of $BRKTHRUs pending per target
+    THEN
+	BEGIN
+	$queue_remove (.bod);			! Remove it from the waiting queue
+	status = $brkthru (efn = efn_k_asynch,
+			   msgbuf = bod [bod_q_msgbuf],
+			   sendto = bod [bod_q_sendto],
+			   iosb   = bod [bod_q_iosb],
+			   sndtyp = .bod [bod_l_sndtyp],
+			   carcon = .bod [bod_l_carcon],
+			   flags  = .bod [bod_l_flags],
+			   reqid  = .bod [bod_l_reqid],
+			   timout = (IF .bod [bod_v_short_timeout]	! If the human is waiting for a reply,
+				     THEN 20				!  then timeout after 20 seconds
+				     ELSE 20*60),			!  otherwise try for 20 minutes
+			   astadr = replybrd_brkthru_ast,
+			   astprm = .bod);
+	IF NOT .status						! If it didn't work, free the bod
+	THEN
+	    BEGIN
+	    IF .status<0,3,0> GTR .replybrd_status<0,3,0>	! Save the worst status
+	    THEN
+		replybrd_status = .status;
+	    collect_garbage (bod [bod_q_msgbuf]);		! Free the message
+	    $queue_insert_head (.bod, bod_free_queue);		! Free the bod
+	    END
+	ELSE
+	    BEGIN
+	    bod_busy_count = .bod_busy_count + 1;
+	    $queue_insert_tail (.bod, bod_busy_queue);
+	    $gettim (timadr=bod [bod_q_quetime]);
+	    END;
+	END;
+    !
+    ! Advance to the next one, using the saved next pointer
+    !
+    bod = .next;
+    END;
+
+!
+! Set an event flag if we have emptied both of the queues
+!
+IF $queue_empty (bod_wait_queue) AND $queue_empty (bod_busy_queue)
+THEN
+    $setef (efn=efn_k_brkthru);
+
+RETURN;
+END;						! End of REPLYBRD_BRKTHRU_AST
+
+GLOBAL ROUTINE replybrd_brkthru_queue (msgbuf : $ref_bblock, sendto : $ref_bblock,
+				       sndtyp, carcon, flags, reqid,
+				       routin, node : $ref_bblock, csid,
+				       stflg, term : $ref_bblock) : NOVALUE =
+
+!++
+! Functional descripton:
+!
+!	This routine queues a breakthru write
+!
+! Input:
+!	msgbuf	Text string to broadcast
+!	sendto	Target name for $BRKTHRU
+!	sndtyp	Type of target
+!	carcon	Carriage control
+!	flags	Misc flags
+!	reqid	Type of requestor
+!	routin	Address of completion routine (following arguments used by completion routine)
+!	node	Nodename
+!	csid	CSID of originating system
+!	stflg	Initial contents of STATUS flags
+!	term	Name of originating terminal
+!
+! Output:
+!	None.
+!
+! Routine Value:
+!	Address of block
+!--
+
+BEGIN						! Start of REPLYBRD_BRKTHRU_QUEUE
+
+LOCAL
+     bod 	: $ref_bblock,			! BOD data structure
+     garb	: REF VECTOR [, LONG],
+     ptr,
+     status;
+
+!
+! If any garbage nodes are in the hopper, send them away.  Garbage is reclaimed this
+! way so that the user ast routines do not do free_vm calls on memory allocated
+! from user non-ast mode.
+!
+$queue_remove_head (bod_garbage_queue, garb);
+WHILE .garb NEQ 0
+DO
+    BEGIN
+    IF NOT (status = opc$free_vm (garb [2], garb))
+    THEN
+	$signal_stop (.status);
+    $queue_remove_head (bod_garbage_queue, garb);
+    END;
+!
+! Get a BOD, a Brkthru Output Descriptor, if none available on the queue then
+! allocate and initialize one.
+!
+$queue_remove_head (bod_free_queue, bod);
+IF .bod EQL 0
+THEN
+    BEGIN
+    IF NOT (status = opc$get_vm (%ref (bod_k_size), ptr))
+    THEN
+	$signal_stop (.STATUS);
+    bod_allocated = .bod_allocated + 1;
+    bod = .ptr;
+    CH$FILL (0, bod_k_size, .bod);
+    bod [bod_w_size] = bod_k_size;
+    bod [bod_b_type] = %x'01';
+    bod [bod_a_senptr] = bod [bod_t_senbuf];
+    bod [bod_a_nodptr] = bod [bod_t_nodbuf];
+    bod [bod_a_trmptr] = bod [bod_t_trmbuf];
+    END;
+!
+! Init the block and copy the longword inputs
+!
+(bod [bod_q_quetime]) = 0;
+(bod [bod_q_quetime]+4) = 0;
+bod [bod_l_senlen] = 0;
+bod [bod_l_nodlen] = 0;
+bod [bod_l_trmlen] = 0;
+bod [bod_l_sndtyp] = .sndtyp;
+bod [bod_l_carcon] = .carcon;
+bod [bod_l_flags]  = .flags;
+bod [bod_l_reqid]  = .reqid;
+bod [bod_a_completion_routine] = .routin;
+bod [bod_l_csid] = .csid;
+bod [bod_l_status] = .stflg;
+!
+! Copy the target string to the BOD, zero fill for a later test
+!
+IF .sendto NEQ 0
+THEN
+    BEGIN
+    IF .sndtyp EQL brk$c_device			! If a device breakthru, then see if we can see the device
+    THEN
+	BEGIN
+	LOCAL
+	    terminal,
+	    dvi_items	: VECTOR [4, LONG];
+	dvi_items [0] = (dvi$_trm^16 OR 4);
+	dvi_items [1] = terminal;
+	dvi_items [2] = dvi_items [3] = 0;
+	status = $getdvi (devnam=.sendto, itmlst=dvi_items);	! Can we see the device?
+	IF .status						! If we can see it, is it a terminal
+	THEN
+	    IF NOT .terminal
+	    THEN
+		status = ss$_ivdevnam;				! Invalid device name seems ok
+	IF NOT .status						! Something went wrong
+	THEN
+	    BEGIN 
+	    replybrd_status = .status;				! Save the status
+	    $queue_insert_head (.bod, bod_free_queue);		! Replace the new bod
+	    RETURN;						! And return
+	    END;
+	END;
+    bod [bod_l_senlen] = .sendto [dsc$w_length];
+    CH$COPY (.sendto [dsc$w_length], .sendto [dsc$a_pointer], 0, bod_s_senbuf, bod [bod_t_senbuf]);
+    END
+ELSE
+    CH$FILL (0, bod_s_senbuf, bod [bod_t_senbuf]);	! For the test
+!
+! Copy the output string to the BOD
+!
+bod [bod_l_msglen] = MAX (12, .msgbuf [dsc$w_length]);
+IF NOT (status = opc$get_vm (bod [bod_l_msglen], bod [bod_a_msgptr]))
+THEN
+    $signal_stop (.status);
+CH$COPY (.msgbuf [dsc$w_length], .msgbuf [dsc$a_pointer], 0, .bod [bod_l_msglen], .bod [bod_a_msgptr]);
+!
+! Copy the nodename to the BOD, if present
+!
+IF .node NEQ 0
+THEN
+    BEGIN
+    bod [bod_l_nodlen] = .node [dsc$w_length];
+    CH$COPY (.node [dsc$w_length], .node [dsc$a_pointer], 0, bod_s_nodbuf, bod [bod_t_nodbuf]);
+    END;
+!
+! Copy the terminal to the BOD, if present
+!
+IF .term NEQ 0
+THEN
+    BEGIN
+    bod [bod_l_trmlen] = .term [dsc$w_length];
+    CH$COPY (.term [dsc$w_length], .term [dsc$a_pointer], 0, bod_s_trmbuf, bod [bod_t_trmbuf]);
+    END;
+!
+! Place the BOD on the queue of outputs waiting
+!
+$queue_insert_tail (.bod, bod_wait_queue);
+!
+! Declare an AST, the 0 parameter means try to start
+!
+bod_requests = .bod_requests + 1;
+IF NOT (status = $dclast (astadr=replybrd_brkthru_ast, astprm=0))
+THEN
+    $signal_stop (.status);
+
+END;						! End of REPLYBRD_BRKTHRU_QUEUE
+
+GLOBAL ROUTINE replybrd_format (msg : $ref_bblock, local_node : $ref_bblock) =	%SBTTL 'Replybrd_Format (msg, local_node)'
+
+!++
+! Functional description:
+!
+!	This routine makes a formatted message from a broadcast message block.  The formatted
+!	message is placed off the message block.
+!
+! Input:
+!
+!	msg	   - Pointer to RPYBRD message block
+!	local_node - Pointer to string descriptor with local node name
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of replybrd_format
+
+LOCAL
+	send_term_dsc	: VECTOR [2, LONG],
+	send_user_dsc	: VECTOR [2, LONG],
+	send_node_dsc	: VECTOR [2, LONG],
+	message_dsc	: VECTOR [2, LONG],
+	on_buf		: VECTOR [64, BYTE],
+	on_dsc		: VECTOR [2, LONG] INITIAL (64, on_buf),
+	tim_buf		: VECTOR [12, BYTE],
+	tim_dsc		: VECTOR [2, LONG] INITIAL (11, tim_buf),
+	fmt_buf		: VECTOR [512, BYTE],
+	fmt_dsc		: VECTOR [2, LONG] INITIAL (512, fmt_buf),
+	ctr_buf		: VECTOR [256, BYTE],
+	ctr_dsc		: VECTOR [2, LONG] INITIAL (256, ctr_buf),
+	bell_start,
+	bell_mid,
+	bell_end,
+	msgid,
+	ptr,
+	status;
+
+BIND
+    bells  = UPLIT BYTE (7,7,7,7);
+
+!
+! If /BELLS, then set things up to make some noise
+!
+bell_start = bell_mid = bell_end = 0;
+IF .msg [rpybrd_v_bell]
+THEN 
+    BEGIN
+    bell_start = 1;
+    IF .msg [rpybrd_v_shutdown]
+    THEN
+	BEGIN
+	bell_end = 2;
+	bell_mid = 1;
+	END;
+    IF .msg [rpybrd_v_urgent]
+    THEN
+	bell_mid = 1;
+    END;
+!
+! Make descriptors for the four required items in the message (the optional items don't change the
+! formatting)
+!
+ptr = msg [rpybrd_t_text];
+send_term_dsc [1] = .ptr;
+ptr = .ptr + (send_term_dsc [0] = .msg [rpybrd_w_send_term_len]);
+send_user_dsc [1] = .ptr;
+ptr = .ptr + (send_user_dsc [0] = .msg [rpybrd_w_send_user_len]);
+send_node_dsc [1] = .ptr;
+ptr = .ptr + (send_node_dsc [0] = .msg [rpybrd_w_send_node_len]);
+message_dsc [1] = .ptr;
+ptr = .ptr + (message_dsc [0] = .msg [rpybrd_w_message_len]);
+!
+! Set the message id.  This will be a general broadcast unless /URGENT or /SHUTDOWN is requested.
+!
+msgid =    (SELECTONE true OF
+	    SET
+		[.msg [rpybrd_v_urgent]] :	opc$_reply_urgent;
+		[.msg [rpybrd_v_shutdown]] :	opc$_reply_shutdown;
+		[OTHERWISE] :			opc$_reply_general;
+	    TES);
+!
+! Get the $FAO control string text associated with the message id via $GETMSG.
+!
+IF NOT (status = $GETMSG (MSGID=.msgid, MSGLEN=ctr_dsc, BUFADR=ctr_dsc, FLAGS=1))
+THEN
+    RETURN .status;
+!
+! If we have a net or cluster, then set the preposition to precede the node name
+!
+IF .local_node [dsc$w_length] NEQ 0
+THEN
+    BEGIN
+    IF NOT (status = $GETMSG (MSGID=opc$_on_node, MSGLEN=on_dsc, BUFADR=on_dsc, FLAGS=1))
+    THEN
+	RETURN .status;
+    END
+ELSE
+    on_dsc [0] = 0;				! Null prepositions
+!
+! Format the time, we can make it look a little cleaner if we strip the hundredths
+!
+$ASCTIM (timbuf=tim_dsc, cvtflg=1);
+tim_dsc [0] = 8;
+!
+! Format the message, the general form of the control string is:
+!
+!	"!/!ADReply received!AS!AF from user !AF at !AS   !AS!AD!/!AS!AD!/"
+!
+IF NOT (status = $FAO (	ctr_dsc,			! Control string
+			fmt_dsc, fmt_dsc, 		! Return length, output buffer
+			.bell_start, bells,		! First bell
+			on_dsc,				! Preposition (like in "on " for "on ATHENS")
+			.local_node [dsc$w_length],	! Local node name
+			.local_node [dsc$a_pointer],	! Local node name
+			.send_user_dsc [0],		! Sender's username
+			.send_user_dsc [1],		! Sender's username
+			send_term_dsc,			! Name of sender's terminal
+			tim_dsc,			! Use the reformatted time
+			.bell_mid, bells,		! Second bell
+			message_dsc,			! Actual message text
+			.bell_end, bells))		! Third bell
+THEN
+    RETURN .status;
+!
+! Get a chunk of memory to hang the formatted message from the block.  We make a descriptor in the block.
+!
+msg [rpybrd_l_format_len] = .fmt_dsc [0];
+IF NOT (status = OPC$GET_VM (msg [rpybrd_l_format_len], msg [rpybrd_a_format_ptr]))
+THEN
+    RETURN .status;
+!
+! Move the formatted message to the block.  As we copy the message, change
+! any escape characters to dollar signs.
+!
+BEGIN
+REGISTER
+    char : BYTE,
+    iptr,
+    optr;
+iptr = .fmt_dsc [1];
+optr = .msg [rpybrd_a_format_ptr];
+INCR i FROM 1 TO .fmt_dsc [0]
+DO
+    BEGIN
+    char = CH$RCHAR_A (iptr);
+    IF .char EQL 27 THEN char = %C '$';
+    CH$WCHAR_A (.char, optr);
+    END;
+END;
+    
+RETURN true;
+END;						! End of replybrd_format
+
+GLOBAL ROUTINE replybrd_io (msg : $ref_bblock, local_node : $ref_bblock) =	%SBTTL 'Replybrd_IO (msg, local_node)'
+
+!++
+! Functional description:
+!
+!	This routine sends the formatted message from a broadcast message block to the terminals,
+!	using the $BRKTHRU system service.
+!
+! Input:
+!
+!	msg	   - Pointer to RPYBRD message block
+!	local_node - Pointer to string descriptor with local node name
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	Messages might be sent to terminals.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of replybrd_io
+
+LOCAL
+	flags,					! Initial flags for BOD_L_STATUS
+    	sndtyp,					! Type of brkthru
+	reqid,					! ID of brkthru sender
+	arglist		: VECTOR [16, LONG],	! Argument list for callg
+	trmdsc		: VECTOR [2, LONG],
+	ptr,
+	timout,
+	status;
+
+!
+! Initialize the global status to zero.  Determine the miscellaneous flags.
+!
+replybrd_status = 0;
+flags = bod_m_short_timeout;
+IF .msg [rpybrd_v_wait] 
+THEN
+    flags = .flags + bod_m_wait;
+IF .msg [rpybrd_v_local_node]
+THEN
+    flags = .flags + bod_m_local_node;
+
+!
+! Set the send type.  If REPLY /ALL, then send to all terms.  If /USER, send to all logged in users,
+! If /USER=(...), send to those users.  If /TERM=(...), send to those terminals.
+!
+sndtyp =   (SELECTONE true OF
+	    SET
+		[.msg [rpybrd_v_all]] :		brk$c_allterms;
+		[.msg [rpybrd_v_username]] :	IF .msg [rpybrd_w_targ_user_len] EQL 0
+						THEN brk$c_allusers
+						ELSE brk$c_username;
+		[.msg [rpybrd_v_terminal]] :	brk$c_device;
+		[OTHERWISE] :			RETURN ss$_badparam;
+	    TES);
+!
+! Set the request id.  This will be a general broadcast unless /URGENT or /SHUTDOWN is requested.
+!
+reqid =    (SELECTONE true OF
+	    SET
+		[.msg [rpybrd_v_urgent]] :	brk$c_urgent;
+		[.msg [rpybrd_v_shutdown]] :	brk$c_shutdown;
+		[OTHERWISE] :			brk$c_general;
+	    TES);
+!
+! Build the argument list for the callg.  Since most of the arguments are the same, this both saves
+! execution time and makes it easier to update.  Also note that the list io routine will modify
+! this arglist
+!
+arglist [count]	= queue_args;				! assume args for an ALL reply
+arglist [text]  = msg [rpybrd_q_format_desc]; 		! text to send
+arglist [targ]  = 0;					! target of send
+arglist [type]  = .sndtyp;				! type of target
+arglist [cntl]  = 32;					! carriage control
+arglist [bflg]  = 0;					! brkthru flags
+arglist [rqid]  = .reqid;				! requestor id
+arglist [rtn]   = 0;					! assume no completion routine
+arglist [node]  = .local_node;				! local node name
+arglist [csid]  = .msg [rpybrd_l_send_csid];		! remote csid name
+arglist [sflg]  = .flags;				! miscellaneous flags for BOD_L_STATUS
+arglist [term]  = trmdsc;				! pass the address of and
+trmdsc [0]      = .msg [rpybrd_w_send_term_len];	!  create a descriptor
+trmdsc [1]      = msg [rpybrd_t_text];			!  for the sending terminal
+
+!
+! If we are supposed to wait, then disable ASTs while we are queueing the brkthrus
+!
+IF .msg [rpybrd_v_wait]
+THEN
+    $setast (enbflg=0);
+
+!
+! Now send it on to the world.  If it is /ALL or /USER, then do a brkthru and
+! return.  If /USER=(...) or /TERM=(...), set up pointers so that we can do one
+! brkthru per specified user or terminal and call the list io routine.
+!
+CASE .sndtyp FROM 1 TO brk$c_maxsendtype OF
+SET
+    [brk$c_allterms, brk$c_allusers] :
+		BEGIN
+		IF .msg [rpybrd_v_notify] 				! if notify then pass
+		THEN arglist [rtn] = replybrd_notify_all;		!  address of notification routine
+		CALLG (arglist, replybrd_brkthru_queue);
+		END;
+
+    [brk$c_device] :
+		BEGIN
+		IF .msg [rpybrd_v_notify] 				! if notify then pass
+		THEN arglist [rtn] = replybrd_notify_dev;		!  address of notification routine
+		arglist [lptr] = .msg + .msg [rpybrd_w_optional_off];	! send list address
+		arglist [llen] = .msg [rpybrd_w_targ_term_len];		! send list length
+		arglist [count] = queue_args+2;
+		CALLG (arglist, replybrd_io_list);
+		END;
+
+    [brk$c_username] :
+		BEGIN
+		IF .msg [rpybrd_v_notify] 				! if notify then pass
+		THEN arglist [rtn] = replybrd_notify_use;		!  address of notification routine
+		arglist [lptr] = .msg + .msg [rpybrd_w_optional_off] +	! send list address
+					.msg [rpybrd_w_targ_term_len];
+		arglist [llen] = .msg [rpybrd_w_targ_user_len];		! send list length
+		arglist [count] = queue_args+2;
+		CALLG (arglist, replybrd_io_list);
+		END;
+
+    [INRANGE, OUTRANGE] :
+		RETURN ss$_badparam;
+TES;
+
+!
+! If we are supposed to wait, then fire off an AST to start the ball rolling and wait for our flag
+!
+IF .msg [rpybrd_v_wait]
+  AND
+   .replybrd_status EQL 0				! Don't wait if an error occurred
+THEN
+    BEGIN
+    $clref (efn=efn_k_brkthru);				! Clear our flag
+    $setast (enbflg=1);					! Enable pending ASTs
+    $waitfr (efn=efn_k_brkthru);			! Wait for the queues to empty
+    END;
+
+!
+! If nobody has modified the status, then return success
+!
+IF (status = .replybrd_status) EQL 0
+THEN
+    status = ss$_normal;
+
+RETURN .status;
+END;						! End of replybrd_io
+
+GLOBAL ROUTINE replybrd_io_list : NOVALUE =	%SBTTL 'Replybrd_IO_list (callg with AP)'
+
+!++
+! Functional description:
+!
+!	This routine sends the formatted message from a broadcast message block to the terminals,
+!	using the $BRKTHRU system service.
+!
+! Input:
+!
+!	msg	   - Pointer to RPYBRD message block
+!	local_node - Pointer to string descriptor with local node name
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	Messages might be sent to terminals.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of replybrd_io
+
+BUILTIN
+	AP;
+
+LOCAL
+	mlen,					! Length of message field
+	mptr		: $ref_bvector,		! Pointer to message field
+	sendto		: VECTOR [2, LONG];	! User or terminal name
+
+BIND
+	arglist = .AP : VECTOR [, LONG];
+
+mlen = .arglist [llen];				! Get length and pointer to list
+mptr = .arglist [lptr];
+arglist [targ] = sendto;			! Point the arglist at the new desc
+arglist [count] = queue_args;			! Set correct argument count for queue routine
+!
+! We are doing it to a list of terminals or usernames, mptr and mlen are set up
+!
+WHILE .mlen GTR 0
+DO
+    BEGIN
+    REGISTER
+	len;
+    !
+    ! Build a descriptor to the next ASCIC item, and move the pointers along
+    !
+    len = .mptr [0];				! Get the length
+    sendto [0] = .len;				! Put the length in the desc
+    sendto [1] = mptr [1];			! Put the address in the desc
+    len = .len + 1;				! Adjust the length for the count byte
+    mlen = .mlen - .len;			! Drop the total length by this item
+    mptr = .mptr + .len;			! Bump pointer to next item
+    !
+    ! Queue the call
+    !
+    CALLG (.AP, replybrd_brkthru_queue);
+
+    END;
+
+RETURN;
+END;						! End of replybrd_io_list
+
+GLOBAL ROUTINE replybrd_notify_all (bod : $ref_bblock) : NOVALUE = %SBTTL 'Replybrd_notify_all (bod)'
+!++
+! Functional description:
+!
+!	Format a message for REPLY /ALL /NOTIFY or REPLY /USER /NOTIFY, then send the message.
+!
+! Input:
+!
+!	bod	   - Pointer to brkthru output descriptor
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of replybrd_notify_all
+
+LOCAL
+	on_buf		: VECTOR [64, BYTE],
+	on_dsc		: VECTOR [2, LONG] INITIAL (64, on_buf),
+	fmt_buf		: VECTOR [512, BYTE],
+	fmt_dsc		: VECTOR [2, LONG] INITIAL (512, fmt_buf),
+	ctr_buf		: VECTOR [256, BYTE],
+	ctr_dsc		: VECTOR [2, LONG] INITIAL (256, ctr_buf),
+	id,
+	status;
+
+!
+! Get the $FAO control string text associated with the message id via $GETMSG.
+!
+id = (IF .bod [bod_w_iosb1] EQL 1 THEN opc$_reply_notall ELSE opc$_reply_notalln);
+IF NOT (status = $GETMSG (MSGID=.id, MSGLEN=ctr_dsc, BUFADR=ctr_dsc, FLAGS=1))
+THEN
+    RETURN .status;
+!
+! If we have a net or cluster, then set the preposition to precede the node name
+!
+IF .bod [bod_l_nodlen] NEQ 0
+THEN
+    BEGIN
+    IF NOT (status = $GETMSG (MSGID=opc$_on_node, MSGLEN=on_dsc, BUFADR=on_dsc, FLAGS=1))
+    THEN
+	RETURN .status;
+    END
+ELSE
+    on_dsc [0] = 0;				! Null prepositions
+!
+! Format the message, the general form of the control string is:
+!
+IF NOT (status = $FAO (	ctr_dsc,			! Control string
+			fmt_dsc, fmt_dsc, 		! Return length, output buffer
+			.bod [bod_w_iosb1],		! Number of terminals notified
+			on_dsc,				! Preposition (like in "on " for "on ATHENS")
+			.bod [bod_l_nodlen],		! Local node name
+			.bod [bod_a_nodptr]))		! Local node name
+THEN
+    RETURN .status;
+!
+! Call the routine to queue the io
+!
+replybrd_notify_io (.bod, fmt_dsc);
+
+RETURN;
+END;						! End of replybrd_notify_all
+
+GLOBAL ROUTINE replybrd_notify_dev (bod : $ref_bblock) : NOVALUE = %SBTTL 'Replybrd_notify_dev (bod)'
+
+!++
+! Functional description:
+!
+!	Format a message for REPLY /NOTIFY /TERMINAL, then send the message.
+!
+! Input:
+!
+!	bod	   - Pointer to brkthru output descriptor
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of replybrd_notify_dev
+
+LOCAL
+	fmt_buf		: VECTOR [512, BYTE],
+	fmt_dsc		: VECTOR [2, LONG] INITIAL (512, fmt_buf),
+	ctr_buf		: VECTOR [256, BYTE],
+	ctr_dsc		: VECTOR [2, LONG] INITIAL (256, ctr_buf),
+	full_desc	: $ref_bblock,
+	status;
+
+!
+! Get the $FAO control string text associated with the message id via $GETMSG.
+!
+IF NOT (status = $GETMSG (MSGID=opc$_reply_notdev, MSGLEN=ctr_dsc, BUFADR=ctr_dsc, FLAGS=1))
+THEN
+    RETURN .status;
+!
+! Get the full device name
+!
+full_desc = share_full_devname (bod [bod_q_sendto], dvi$_fulldevnam);
+!
+! Format the message
+!
+IF NOT (status = $FAO (	ctr_dsc,			! Control string
+			fmt_dsc, fmt_dsc, 		! Return length, output buffer
+			.full_desc))			! Device name
+THEN
+    RETURN .status;
+!
+! Call the routine to dispose of it
+!
+replybrd_notify_io (.bod, fmt_dsc);
+
+RETURN;
+END;						! End of replybrd_notify_dev
+
+GLOBAL ROUTINE replybrd_notify_io (bod : $ref_bblock, text : $ref_bblock) : NOVALUE =	%SBTTL 'Replybrd_notify_IO (bod, text)'
+
+!++
+! Functional description:
+!
+!	This routine sends the formatted message from a reply notification back to the sending
+!	terminal.
+!
+! Input:
+!
+!	bod	   - Pointer to brkthru output descriptor
+!	text	   - Pointer to string descriptor with reply notification message
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	Messages might be sent to terminals.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of replybrd_notify_io
+
+LOCAL
+	rpynot	: $bblock [512],
+	ptr	: $ref_bvector,
+	len,
+	status;
+
+!
+! If /WAIT, then we can simply write it to SYS$OUTPUT
+!
+IF .bod [bod_v_wait]
+THEN
+    RETURN lib$put_output (.text);
+
+!
+! Following code executes on OPCOM process only, cannot be executed from within REPLY image
+!
+
+!
+! If on the local node, queue up the broadcast from here and return
+!
+IF .bod [bod_v_local_node]
+THEN
+    BEGIN
+    replybrd_brkthru_queue (
+			.text,			! text to send
+			bod [bod_q_trmdsc],	! target
+			brk$c_device,		! send type
+			32,			! carriage control
+			0,			! brkthru flags
+			brk$c_general,		! request id
+			0,0,0,0,0);		! no completion routine or arguments
+    RETURN;
+    END;
+!
+! Not wait or local, send it back to the OPCOM on the host node.  First init the message header.
+!
+CH$FILL (0, rpynot_k_min_size, rpynot);
+rpynot [clm_b_rqstcode] 	= opc$_x_clusmsg;
+rpynot [clm_b_clm_code]		= clm__rpynot;
+rpynot [clm_b_ds_version]	= rpynot_k_ds_version;
+rpynot [clm_b_sw_version]	= opc$k_sw_version;
+rpynot [clm_l_csid]		= .lcl_csid;
+!
+! Copy the originating terminal to the message
+!
+ptr = rpynot [rpynot_t_text];
+len = .bod [bod_l_trmlen];
+rpynot [rpynot_w_term_len] = .len;
+CH$MOVE (.len, .bod [bod_a_trmptr], .ptr);
+ptr = .ptr + .len;
+!
+! Copy the text to the message
+!
+len = .text [dsc$w_length];
+rpynot [rpynot_w_message_len] = .len;
+CH$MOVE (.len, .text [dsc$a_pointer], .ptr);
+ptr = .ptr + .len;
+!
+! Store the final length and send it back from whence it came
+!
+len = .ptr - rpynot;
+rpynot [clm_w_length] = .len;
+cluscomm_send (.bod [bod_l_csid], .len, rpynot);
+
+RETURN;
+END;						! End of replybrd_notify_io
+
+GLOBAL ROUTINE replybrd_notify_use (bod : $ref_bblock) : NOVALUE = %SBTTL 'Replybrd_notify_use (bod)'
+!++
+! Functional description:
+!
+!	Format a message for REPLY /USER=(...) /NOTIFY, then send the message.
+!
+! Input:
+!
+!	bod	   - Pointer to brkthru output descriptor
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of replybrd_notify_use
+
+LOCAL
+	on_buf		: VECTOR [64, BYTE],
+	on_dsc		: VECTOR [2, LONG] INITIAL (64, on_buf),
+	fmt_buf		: VECTOR [512, BYTE],
+	fmt_dsc		: VECTOR [2, LONG] INITIAL (512, fmt_buf),
+	ctr_buf		: VECTOR [256, BYTE],
+	ctr_dsc		: VECTOR [2, LONG] INITIAL (256, ctr_buf),
+	id,
+	status;
+
+!
+! Get the $FAO control string text associated with the message id via $GETMSG.
+!
+id = (IF .bod [bod_w_iosb1] EQL 1 THEN opc$_reply_notuse ELSE opc$_reply_notusen);
+IF NOT (status = $GETMSG (MSGID=.id, MSGLEN=ctr_dsc, BUFADR=ctr_dsc, FLAGS=1))
+THEN
+    RETURN .status;
+!
+! If we have a net or cluster, then set the preposition to precede the node name
+!
+IF .bod [bod_l_nodlen] NEQ 0
+THEN
+    BEGIN
+    IF NOT (status = $GETMSG (MSGID=opc$_on_node, MSGLEN=on_dsc, BUFADR=on_dsc, FLAGS=1))
+    THEN
+	RETURN .status;
+    END
+ELSE
+    on_dsc [0] = 0;				! Null prepositions
+!
+! Format the message, the general form of the control string is:
+!
+IF NOT (status = $FAO (	ctr_dsc,			! Control string
+			fmt_dsc, fmt_dsc, 		! Return length, output buffer
+			bod [bod_q_sendto],		! Username
+			on_dsc,				! Preposition (like in "on " for "on ATHENS")
+			.bod [bod_l_nodlen],		! Local node name
+			.bod [bod_a_nodptr],		! Local node name
+			.bod [bod_w_iosb1]))		! Number of terminals notified
+THEN
+    RETURN .status;
+!
+! Call the routine to dispose of it
+!
+replybrd_notify_io (.bod, fmt_dsc);
+
+RETURN;
+END;						! End of replybrd_notify_all
+
+GLOBAL ROUTINE replybrd_ok_to_queue_write (bod : $ref_bblock, queue : $ref_bblock) =
+
+!++
+! Functional descripton:
+!
+!	Check to see if the SENDTO field in the BOD is in any of the bods in the queue.
+!	We assume that we are operating at AST level so that we do not have to worry
+!	about interlocking the queue.  After counting the number of times it appears
+!	in the queue, make a decision as to whether another write can be started.
+!
+! Input:
+!	bod	pointer to a bod
+!	queue	head of a queue of bods
+!
+! Output:
+!	None.
+!
+! Routine Value:
+!	true if OK to send another write, false otherwise
+!--
+
+BEGIN						! Start of REPLYBRD_OK_TO_QUEUE_WRITE
+
+LOCAL
+    count,
+    ok,
+    head : $ref_bblock,
+    cur : $ref_bblock;
+
+!
+! Scan the queue, counting the number of times the target appears
+!
+count = 0;
+head = .queue;
+cur = .head [bod_l_flink];
+WHILE .cur NEQ .head				! Loop until we see the end
+DO
+    BEGIN
+    IF CH$EQL (bod_s_senbuf, bod [bod_t_senbuf], bod_s_senbuf, cur [bod_t_senbuf])
+    THEN
+	count = .count + 1;
+    cur = .cur [bod_l_flink];			! Get the next bod
+    END;
+!
+! Now make a decision based on the type of breakthru
+!
+ok = false;
+CASE .bod [bod_l_sndtyp]
+FROM MIN (brk$c_device, brk$c_username, brk$c_allusers, brk$c_allterms)
+TO   MAX (brk$c_device, brk$c_username, brk$c_allusers, brk$c_allterms) OF
+SET
+    [brk$c_username, brk$c_device] :
+			BEGIN
+			IF .count EQL 0
+			THEN ok = true				! Only one to devices or users
+			ELSE 
+			    BEGIN
+			    IF CH$FIND_SUB (bod_s_senbuf, bod [bod_t_senbuf], 4, UPLIT BYTE ('OPA0')) NEQ 0
+			     AND
+			       .count LEQ 2			! Allow 3 queued to the console
+			    THEN
+				ok = true;
+			    END;
+			END;
+    [brk$c_allusers, brk$c_allterms] :
+			IF .count LEQ 3 THEN ok = true;		! Allow four if alldevices or allusers
+    [INRANGE, OUTRANGE] :
+			$signal_stop (ss$_illiofunc);		! If anything else, we did bad
+TES;
+
+RETURN .ok;
+END;						! End of REPLYBRD_OK_TO_QUEUE_WRITE
+
+END
+ELUDOM						! End of replybrd

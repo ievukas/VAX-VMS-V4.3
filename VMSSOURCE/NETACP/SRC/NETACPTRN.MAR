@@ -1,0 +1,2488 @@
+	.TITLE	NETACPTRN  - Control network local node state transitions
+	.IDENT	'V04-000'
+	.DEFAULT DISPLACEMENT,WORD
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+; FACILITY:	NETWORK ACP
+;
+; ABSTRACT:
+; 
+;	This module performs ACP state transitions including initialization,
+;	termination, and  allocating/deallocating I/O database control blocks
+;	in system non-paged pool.
+;
+; ENVIRONMENT:
+;
+;	Kernel mode 
+;
+;	.SBTTL	HISTORY
+;
+; AUTHOR:	SCOTT G. DAVIS, CREATION DATE: 03-AUG-77
+;
+; MODIFIED BY:
+;
+;	V03-022	PRB0343		Paul Beck	24-Jul-1984  20:48
+;		Synchronize with NETDRIVER before decrementing transaction count.
+;
+;	V021	RNG0021		Rod Gamache	27-Mar-1984
+;		Fix problem in timer code in previous modification, the
+;		WQE was never being deallocated.
+;
+;	V020	RNG0020		Rod Gamache	13-Feb-1984
+;		Change macro call from $NDCDEF to $LLIDEF. Add new timer
+;		element that allows the XPORT layer to stop sending
+;		'hello' messages in the event the cluster stalls and the
+;		NETACP process cannot process events.
+;
+;	V019	TMH0019		Tim Halvorsen	11-Jul-1983
+;		Store new LNI alias (cluster address) parameter in RCB.
+;
+;	V018	TMH0018		Tim Halvorsen	06-Apr-1983
+;		Reduce initial size of virtual pool, since automatic
+;		pool expansion will increase it when necessary.
+;
+;	V017	TMH0017		Tim Halvorsen	05-Mar-1983
+;		Add initialization of DLE driver during NETACP
+;		initialization.
+;		Support SEGMENT BUFFER SIZE.
+;
+;	V016	TMH0016		Tim Halvorsen	14-Feb-1983
+;		Make buffer size calculation assume a point-to-point
+;		datalink, thus backing out TMH0015.  Instead, the
+;		line BUS action routine will add the additional Ethernet
+;		route header overhead if it is an NI datalink.
+;
+;	V015	TMH0015		Tim Halvorsen	14-Jan-1983
+;		Fix problem with sending messages (close to or equal
+;		to the segment buffer size) between two older ECLs
+;		thru an intermediate node having an Ethernet datalink.
+;
+;	V014	TMH0014		Tim Halvorsen	07-Dec-1982
+;		Fix bugs in deallocation of control blocks during
+;		shutdown, which was causing a non-fatal bugcheck.
+;
+;	V013	TMH0013		Tim Halvorsen	13-Oct-1982
+;		Add area routing support.
+;		Allow STATE to be changed to SHUT while the executor
+;		address is still not set, so that the network can be
+;		shutdown with STATE SHUT at this point.
+;		Double size of virtual pool - it was getting close.
+;
+;	V012	TMH0012		Tim Halvorsen	15-Sep-1982
+;		Do not use PSI mutex channel for PSI incoming
+;		call declaration, since deassigning the channel
+;		(when the parameter is cleared) causes the mutex
+;		to be lost, and PSI to clean out it's databases.
+;		Modify PSI declare code so that it doesn't report
+;		an error if PSI is not yet initialized.  Make it
+;		callable so that when the declaration is actually
+;		needed, it can be tried again when PSI is loaded.
+;		Remove check that MAX BUFFERS must be greater than
+;		MAX CIRCUITS, because it was never really needed.
+;		Allow MAX CIRCUITS to be reduced as long as no active
+;		LPD slot is removed in the process.
+;
+;	V011	TMH0011		Tim Halvorsen	07-Jul-1982
+;		Change LPD vector into a vector of longword pointers
+;		to the actual LPD blocks.
+;		Remove allocation of local IRP.
+;		Allocate the local LPD when the LPD vector is being
+;		created, and use the LPD index LPD$C_LOC_INX to represent
+;		it, rather than a negative index.
+;		Move code to initialize routing database into DLLTRN,
+;		and add a call here to a routine to initialize routing.
+;		Do not allow EXECUTOR TYPE to be changed unless there
+;		are no active LPDs.
+;
+;	V010	TMH0010		Tim Halvorsen	22-Jun-1982
+;		Fix allocation of private ACP pool.  The last page
+;		was not getting allocated properly.
+;		Initialize CXB_FREE listhead in RCB.
+;		Initialize local LPD to look just like a normal LPD.
+;		Add $DYNDEF definition.
+;
+;	V009	TMH0009		Tim Halvorsen	04-Apr-1982
+;		Remove unused NOP instructions.
+;		Add check for error trying to lock down pages.
+;		Change all references to SCH$GL_CURPCB to CTL$GL_PCB.
+;		Use G^ for absolute references to executive symbols.
+;		Change check for MNT already set into same segment
+;		which checks for DMT already set.
+;		Allocate AQB along with VCB, LPD, local IRP and TQE.
+;		Remove storing of MY_PID, since it is never used.
+;		Increase pool size to nice round number.
+;		Use .ADDRESS to generate longword addresses.
+;		Fix psect naming conventions
+;		Change OPCOM calling interface.
+;		Add code to declare NETACP as a PSI process (which
+;		accepts incoming X.25 calls) if the EXECUTOR SUBADDRESS
+;		parameter is specified.
+;		Log event 2.0 if the executor state is changed.
+;
+;	V008	TMH0008		Tim Halvorsen	05-Mar-1982
+;		Mark ACP in "dismount" state when the mount count goes
+;		to zero, to avoid a race between the final DLE XWB coming
+;		back from NETDRIVER and a new ACCESS function coming in
+;		from a user.  The "dismount" state will signal the EXEC
+;		to reject the QIO request.
+;		Fix ACP state transition table, to disallow changing from
+;		the OFF state to the SHUT state.  This closes off a window
+;		which could cause the mount count to stay positive forever.
+;		Remove code to insert default setting of default proxy
+;		access executor parameter into the LNI database, leaving
+;		the parameter to be defaulted when it is referenced.
+;
+;	V02-07	ADE0028		A.Eldridge	16-Feb-82
+;		Added support for PIPELINE QUOTA
+;
+;	V02-06	ADE0027		A.Eldridge	10-Feb-82
+;		Exit with error status from call to NET$CREATE_MBX.
+;
+;	V02-05	ADE0026		A.Eldridge	05-FEB-82
+;		For the IRP used to deliver packets from the Transport to 
+;		the NSP layer, init the IRP$L_ASTPRM field to point to the
+;		RCB.
+;
+;	V02-04	ADE0025		A.Eldridge	30-Nov-81
+;		Added setting of default values for both the proxy login
+;		and default access LNI fields.
+;
+;	V02-03	ADE0024		A.Eldridge	23-NOV-81
+;		Cosmetic cleanup to comments etc.  No code changes.
+;
+;	V02-02			A.Eldridge	23-SEP-81
+;		Allocate the Cost/Hops matrix according to the number of
+;		circuits specified in the database.
+;
+;	V02-01			A.Eldridge	20-JUL-81
+;		Remove all references to the DLI database
+;
+;	V02-00			A.Eldridge	20-NOV-80
+;		Added code to setup running UIC, process name, privileges,
+;		directory.
+;
+;	V01-05			A.Eldridge	20-MAR-80
+;		Enhanced to include local node state transitions.  Renamed
+;		module to NETACPTRN (formerly NETINI).  Re-implemented the
+;		ACP "run-down".
+;
+;	V01-04	SGDX01		S.G.D.		17-Mar-1980
+;		Get address of XMB update routine for connect delivery.      
+;		Reenable OPCOM call.                                         
+;
+;	V01-03 			A.Eldridge	11-JUL-79
+;		Extensive rewrite.  Added code so that the ACP mounts itself 
+;		by building its own I/O database control structures.  Added 
+;		support for the new configuration database.
+;
+;	V01-02	 		S.G.D.		11-JUN-79
+;		Modify for routing version.
+;
+;-
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+	;
+	;  System data structure definitions
+	;
+	$AQBDEF   		; ACP Queue Block
+	$CCBDEF			; Channel Control Block
+	$CRBDEF			; Controller Request Block
+	$CXBDEF			; Complex Chained Buffer
+	$DDBDEF			; Device Data Block
+	$DEVDEF			; Device characteristics bits
+	$DYNDEF			; Dynamic structure types
+	$IPLDEF			; Interrupt Priority Levels
+	$IRPDEF			; I/O Request Packet
+	$JIBDEF			; Job Information Block
+	$LOGDEF			; Logical name table definitions
+	$MSGDEF			; Mailbox message definitions
+	$NDBDEF			; Node Descriptor Block
+	$NMADEF			; Network management definitions
+	$PCBDEF			; Process Control Block
+	$PHDDEF			; Process Header 
+	$TQEDEF			; Timer Queue Element
+	$UCBDEF			; Unit Control Block
+	$VECDEF			; Interrupt dispatch Vector
+
+	;
+	;  Network Specific Definitions
+	;
+	$CNRDEF			; Configuration Root block
+	$CNFDEF			; Configuration data block
+	$NFBDEF			; Network Function Block
+	$LLIDEF			; Logical link information block
+	$LNIDEF			; Local Node Information block
+	$LPDDEF			; Logical Path Descriptor block
+	$ADJDEF			; Adjacency block
+	$LTBDEF			; Logical-link Table
+	$NETSYMDEF		; Some general network symbol definitions
+	$NETUPDDEF		; Describes ACP function calls to NETDRIVER
+	$RCBDEF			; Routing Control Block (DECnet Volume Control
+				; block)
+	$WQEDEF			; Work Queue Element
+	$EVCDEF			; Event logging definitions
+	$NSPMSGDEF		; DNA message definitions
+	;
+	;   PSI specific definitions
+	;
+	$PSIDEF			; PSI user definitions
+
+;
+; EQUATED SYMBOLS:
+;
+					; The routing tables are zero indexed
+NUM_LINES = NET$C_MAX_LINES + 1		; line 0 is an "internal" path
+NUM_NODES = NET$C_MAX_NODES + 1		; node 0 is the "local" node
+
+POOL_LENGTH = 100000			; no. of bytes in pool
+
+
+;
+;  MACROS
+;
+.MACRO	$EVT  event, i,n,r,s,f,h	; Create state table entries 
+					; for the specified event
+
+	ACP$C_MAX_EVT = ACP$C_MAX_EVT + 1	; Bump max event value
+	ACP$C_'event' = ACP$C_MAX_EVT		; Define line event symbol
+
+		$ENT	i,_i			; Create table entry
+		$ENT	n,_n
+		$ENT	r,_r
+		$ENT	s,_s
+		$ENT	f,_f
+		$ENT	h,_h
+
+.ENDM
+
+.MACRO	$ENT	entry,def_sta			; Create single state table
+						; entry
+
+		acp$c_sta_. = acp$c_sta'def_sta'; Redefine default next state
+	.BYTE	acp$c_sta_%EXTRACT(0,1,entry)	; Setup next state
+
+		_$ent = %LENGTH(entry)-1
+	.BYTE	%EXTRACT(1,_$ent,entry)		; Setup action routine index
+.ENDM
+
+;
+; Overview of ACP state transitions
+;
+; NETACP is responsible for mounting and dismounting itself.  When it is 
+; initially started, NETACP builds its own non-paged pool I/O data structures 
+; (VCB, AQB, etc) and sets up a default configuration data base.   A  network
+; control process issues Qios to the ACP to update the configuration data base
+; and to change the state of the ACP.  When this process requests either the
+; "off" or "shut" state, the ACP (eventually) deallocates its non-paged pool
+; data structures and exits.  The dismount procedure is complicated by the
+; fact that NETDRIVER also accesses the non-paged pool data structures.  Hence,
+; NETDRIVER must rundown before the ACP can dismount.  RCB$W_MCOUNT and
+; RCB$W_TRANS are used to co-ordinate NETDRIVER and NETACP rundown activities 
+; as outlined below.
+;
+; NETDRIVER is responsible for queuing all IRPs to the datalink drivers by 
+; using a special form of an IRP, sometimes referred to as an "internal IRP".
+; One of the data links is the so called "local datalink" which is used when
+; both ends of a logical link reside in the local node.  There is no actual
+; hardware for this datalink and its "driver" is actually a small routine found
+; at the end of NETDRIVER.
+;
+; When NETACP brings up a datalink, NETDRIVER is notified so that it can build
+; a single IRP which is continually recycled to receive all messages over that
+; particular datalink.  Each time the IRP is returned to NETDRIVER the device
+; status bits stored in the IRP are checked.  If the device is still active
+; then the IRP is requeued to the datalink driver, otherwise NETDRIVER signals
+; NETACP by queuing the IRP to the AQB.   RCB$W_TRANS is incremented by 
+; NETDRIVER when it allocates the IRP; unmodifed when NETDRIVER queues the IRP
+; to the AQB to signal that the datalink has gone inactive; and decremented by
+; NETACP when it deallocates the IRP.
+;
+; NETDRIVER maintains a pool of IRPs to be used to transmit messages over the
+; various datalinks.  NETACP uses field RCB$W_MAX_PKT to specify the number of
+; IPRs in this pool.  NETDRIVER allocates and deallocates IRPs as needed to 
+; adjust to the specified pool size, and uses RCB$W_CUR_PKT to indicate the
+; current size of the pool.  RCB$W_TRANS is incremented by NETDRIVER when it 
+; allocates an IRP and decremented when it deallocates one.
+;
+; NETACP allocates a timer queue element (TQE) upon initialization.  This TQE
+; is used by NETDRIVER for timing out connects and for retransmitting unACKed
+; messages.  NETDRIVER starts the TQE ticking when it allocates the receive IRP
+; for the "local datalink". If RCB$W_MCOUNT = 0 when the timer fires, NETDRIVER
+; senses that the ACP is dismounting.  It shuts off the TQE$V_REPEAT bit to 
+; stop the timer and signals the ACP that it is done by queuing to the AQB the 
+; "local datalink's" receive IRP.
+;
+;
+;  RCB$W_MCOUNT
+;
+;   This field is used to keep track of the number of active logical links and
+;   to allow NETACP to signal NETDRIVER that it wishes to dismount.  The UCB
+;   DEV$V_DMT bit is not used since setting it would prevent all subsequent
+;   logical link connects.  The goal is to always permit logical link connects
+;   on behalf of users with the OPER privilege.
+;
+;   1.	Initialized by NETACP to 1 when the ACP mounts.
+;   2.	Incremented by NETDRIVER for each logical link context block (XWB).
+;   3.	Decremented by NETACP each time it deallocates an XWB.
+;   4.	Decremented by NETACP when entering either the OFF or SHUT state.
+;
+;
+;  RCB$W_TRANS
+;
+;   This field is used to keep track of all in-progress network activity, not
+;   including active logical links.  When decremented to zero by NETACP it
+;   serves a signal to dismount. (When RCB$W_TRANS becomes zero, RCB$W_MCOUNT
+;   should also be at zero according to the current design.)
+;
+;   1.	Initialized by NETACP to 0 when the ACP mounts. 
+;   2.	Incremented by the EXEC whenever it queues anything to the AQB.
+;   3.	Incremented by NETDRIVER for each message buffer it queues to the AQB.
+;   4.	Incremented by NETDRIVER for each Transport IRP which it allocates.
+;   5.	Decremented by NETDRIVER for each Transport IPR which it deallocates.
+;   6.	Decremented by NETACP for each block it deques from its AQB.
+;   7.  Unmodified when NETDRIVER queues the datalink receive IRP to the AQB
+;	in order to signal datalink shutdown.  RCB$W_TRANS was incremented by
+;	NETDRIVER when it allocated this IRP and will be decremented by NETACP
+;	when it deallocates it.
+;
+;
+; 
+
+;
+;  States:
+;
+;  The following states control the ACP transitions. 
+;
+;$EQULST ACP$C_STA_,GLOBAL,0,1,<-
+;
+;	<I>	-; Initializing	All connects are allowed
+;	<N>	-; On		All connects are allowed
+;	<R>	-; Restricted	Connect initiates only
+;	<S>	-; Shut		Soft shutdown, no new links allowed.  Dismount
+;		-;		when the last link disconnects.
+;	<F>	-; Off		Hard shutdown, break all links, clear all data
+;		-;		links, dismount.
+;	<H>	-; Hibernate	The ACP is permanently hibernating to avoid a
+;		-;		bugcheck.  A message is printed to reboot.
+;		-;		(*** NOT YET IMPLEMENTED ***).
+;>
+
+;
+; OWN STORAGE:
+;
+	.PSECT	NET_PURE,NOWRT,NOEXE,LONG
+
+ACP$C_MAX_EVT  = -1 
+ACP$AW_STA_TAB::
+;
+;		   I    N    R    S    F    H
+;      		  -----------------------------
+$EVT  evt_nop	   .	.    .	  .    .    .
+
+$EVT  opr_init	   .	.8   .8   .8   .8   .7
+$EVT  opr_on	   N    .    N    N1   N1   .7
+$EVT  opr_rstr	   R    R    .    R1   R1   .7
+$EVT  opr_shut	   S3   S3   S3   .5   .8   .7
+$EVT  opr_off	   F2   F2   F2   F4   .4   .7
+
+$EVT  lpd_loc	   F2   F2   F2   F4   .4   .7
+
+$EVT  evt_bug	   H6   H6   H6   H6   H6   .7
+
+
+ACP$C_STATES  = 6
+ACP$C_EVENTS  = ACP$C_MAX_EVT+1
+
+ACP$AL_ACTION::			; Action routine dispatch table
+				;
+	.ADDRESS  ACT_NOP	;  0	NOP
+	.ADDRESS  ACT_REVIVE	;  1	If MOUNT neq 0 	Then   inc MOUNT
+				;			Else   abort with error
+	.ADDRESS  ACT_NODE_OFF	;  2	Dec MOUNT
+				;	Shut off all lines
+				;	Break all links
+	.ADDRESS  ACT_NODE_SHUT	;  3	Dec MOUNT
+	.ADDRESS  ACT_CLEANUP	;  4	Shut off all lines
+				;	Break all links
+	.ADDRESS  ACT_BRDCST	;  5	Broadcast node is shutting down
+	.ADDRESS  ACT_STALL	;  6	Disable
+	.ADDRESS  ACT_BUG	;  7	
+	.ADDRESS  ACT_ERROR	;  8	Return error
+
+
+OPR_EVT_MAP:			; Convert requested states to events
+
+	.BYTE	ACP$C_OPR_OFF,	LNI$C_STA_OFF
+	.BYTE	ACP$C_OPR_ON,	LNI$C_STA_ON
+	.BYTE	ACP$C_OPR_SHUT,	LNI$C_STA_SHUT
+	.BYTE	ACP$C_OPR_RSTR,	LNI$C_STA_RSTR
+	.BYTE	ACP$C_OPR_INIT,	LNI$C_STA_INIT
+	.BYTE	ACP$C_EVT_BUG,	0		; Mark end of table
+
+
+EVL_STA_MAP:			; Convert internal ACP state to EVL state
+	.BYTE	ACP$C_STA_I, NMA$C_STATE_OFF
+	.BYTE	ACP$C_STA_N, NMA$C_STATE_ON
+	.BYTE	ACP$C_STA_R, NMA$C_STATE_RES
+	.BYTE	ACP$C_STA_S, NMA$C_STATE_SHU
+	.BYTE	ACP$C_STA_F, NMA$C_STATE_OFF
+	.BYTE	ACP$C_STA_H, NMA$C_STATE_OFF
+	.BYTE	-1, NMA$C_STATE_OFF		; End of table; default state
+
+	.PSECT	NET_IMPURE,WRT,NOEXE,LONG
+
+ACP_L_EVT:		.LONG 0		; Value of state field
+
+NET$GW_DLECHAN:		.BLKW 1		; Channel number to DLE driver
+NET$GL_DLE_UCB::	.BLKL 1		; Address of UCB for DLE driver
+NET$GL_DLE_UCB0::	.BLKL 1		; Address of UCB0 for DLE driver
+
+NET$GL_MY_POOL::	.LONG 2		; IPL for pool synchronization
+			.LONG 0		; Ptr to first free block
+			.LONG 0		; Size of this block
+
+SAVE_STA_TAB:		.LONG 0		; Save the state table address
+
+IOSB:			.BLKL	2	; I/O status block
+
+CURRENT_SAD:		.LONG	0	; Current PSI subaddress declaration
+PSI_DECL_CHAN:		.WORD	0	; PSI declaration channel
+
+
+	.PSECT	NET_LOCK_IMPURE,WRT,GBL,LONG
+
+
+NET$GL_LOC_LPD:		.LONG 0		; Saved address of local LPD block
+
+NEW_LNI_IMAGE:	.BLKB	LNI$C_LENGTH	; Holds image of new local CNF (without
+					; storage for strings).  This is needed
+					; since this CNF is referrenced at high
+					; IPL and must therefore be locked in
+					; the working set.
+
+	.PSECT	NET_PURE,NOWRT,NOEXE,LONG
+
+NET_DESC:	.ASCID	'_NET:'		; For assign channel to NET driver
+DLE_DESC:	.ASCID	'_ND:'		; For assign channel to DLE driver
+NET_NAME:	.ASCIC	'NET'		; For DDB search
+NODE_DESC:	.ASCID	'SYS$NODE'	; For deleting local node's logical
+					; name on shutdown
+
+
+PRIVMSK:	.LONG	-1		; For setting up running privileges
+		.LONG	-1		;! *** IS THIS OVERKILL ? ***
+
+UIC		=	^O1@16+^O4	; For setting NETACP's UIC
+SYSDISK:	.ASCID	'SYS$DISK'	; Default disk logical name
+SYSTEM_ROOT:	.ASCID	'SYS$SYSROOT:'	; Default disk equivalence name
+SYSMGR:		.ASCID	'[SYSMGR]'	; Default directory
+USERNAME:	.ASCII	'DECNET'	; Username for NETACP process
+USERNAMLEN = .-USERNAME
+
+
+LKWSET_ADDR:	.ADDRESS BEGLCK		; Descriptor for locking stuff running
+		.ADDRESS ENDLCK		; at high IPL into working set
+
+
+	.PSECT	NET_LOCK_A,GBL,NOWRT,LONG ; PSECTs are linked alpabetically - all
+					; locked regions should use a PSECT
+BEGLCK:					; begining with "NET_LOCK"
+
+	.PSECT	NET_LOCK_Z,GBL,WRT	; Mark end of locked region
+					; The WRT attribute is to ensure it is
+					; the last NET_LOCKxxx .psect in the
+					; linker's collating sequence
+ENDLCK:
+
+	.SBTTL	INITIALIZATION
+;++
+; NET$INITIALIZE			; ACP entry point
+;
+; This is the ACP transfer address.  All the control sturctures required
+; to mount device NET are allocated, initialized, and attached to the NET
+; UCB(s).  A channel to NET is created in order to allow NETDRIVER to send
+; mailbox messages to the ACP.  The configuration database is initialized.
+; Control is then passed to the ACP work queue processing module.
+;
+;--
+	.PSECT	NET_CODE,NOWRT,EXE
+
+NET$INITIALIZE::
+	.WORD	0			; ACP entry point
+
+	$LKWSET_S LKWSET_ADDR		; Lock I/O data base code into
+					; working set
+	BLBC	R0,90$			; Exit if error detected
+	;
+	;   Set the default disk to SYS$SYSROOT: and the default directory to 
+	;   [SYSMGR]
+	;
+	$CRELOG_S LOGNAM=SYSDISK,-	; Set default disk
+		  EQLNAM=SYSTEM_ROOT,-	;
+		  TBLFLG=#LOG$C_PROCESS	;
+	CLRQ	-(SP)			; No arguments 2 and 3
+	PUSHAB	SYSMGR			; Address of new default directory
+	CALLS	#3,G^SYS$SETDDIR	; Set default directory
+	;
+	;   The remainder of the ACP executes in kernel mode
+	;
+	$CMKRNL_S B^STARTUP		; Go to kernel mode forever
+90$:	RET				; Come here upon error during startup
+
+
+STARTUP:
+	.WORD	0			; entry point
+
+	;
+	;   Set the UIC = [1,4]
+	;
+	MOVL	G^CTL$GL_PCB,R5		; Get current PCB address
+	MOVL	#UIC,PCB$L_UIC(R5)	; Set permanent UIC
+	;
+	;   Enable all privileges
+	;
+	ASSUME	PHD$Q_PRIVMSK EQ 0
+	MOVQ	PRIVMSK,@PCB$L_PHD(R5)	; Setup running privileges
+	;
+	;   Set the user name
+	;
+	MOVL	PCB$L_JIB(R5),R6	; Get JIB address
+	MOVC5	#USERNAMLEN,USERNAME,#^A' ',#12,JIB$T_USERNAME(R6)
+	MOVC5	#USERNAMLEN,USERNAME,#^A' ',#12,G^CTL$T_USERNAME
+	;
+	;   Assign a channel to DLE driver, to make sure it is present
+	;
+	$ASSIGN_S DEVNAM = DLE_DESC,-	; Assign channel to DLE driver
+		CHAN = NET$GW_DLECHAN	; Store channel number
+	BLBC	R0,10$			; Exit if error detected
+	MOVZWL	NET$GW_DLECHAN,R0	; Get channel to DLE driver
+	JSB	G^IOC$VERIFYCHAN	; CCB -> R1, Status -> R0,
+					; R2,R3 are garbaged
+					; NO need to check return status since 
+					; the info is always returned 
+	MOVL	CCB$L_UCB(R1),R5	; Get DLE's UCB address
+	MOVL	R5,NET$GL_DLE_UCB	; Save the UCB address
+	MOVL	UCB$L_DDB(R5),R0	; Get the DDB
+	MOVL	DDB$L_UCB(R0),-		; Save the DLE UCB0 address
+		NET$GL_DLE_UCB0
+	;
+	;   Set up mailbox for process termination and received connect
+	;   notifications.  Assign a channel to NETDRIVER with this associated
+	;   mailbox.
+	;
+	BSBW	NET$CREATE_MBX		; Create the mailbox
+	BLBC	R0,10$			; If LBC then error
+	$ASSIGN_S -
+	    DEVNAM = NET_DESC,-		; "_NET:" refers to control path
+	    CHAN   = NET$GW_NETCHAN,-	; Store channel #
+	    MBXNAM = NET$GQ_MBX_NAME	; Specify associated mailbox
+	BLBS	R0,20$			; If lbc error
+10$:	BRW	100$			; Error
+20$:	MOVZWL	NET$GW_NETCHAN,R0	; Get channel to "_NET:"
+	JSB	G^IOC$VERIFYCHAN	; CCB -> R1, Status -> R0,
+					; R2,R3 are garbaged
+					; NO need to check return status since 
+					; the info is always returned 
+	MOVL	CCB$L_UCB(R1),R5	; Get _NET:'s UCB address
+	MOVL	R5,NET$GL_NET_UCB	; Save the UCB address
+	MOVL	UCB$L_DDB(R5),R0	; Get the DDB
+	MOVL	DDB$L_UCB(R0),-		; Save the NET0 UCB address
+		NET$GL_PTR_UCB0
+	MOVQ	G^SYS$GQ_VERSION,-	; Stuff system version into
+		NET$GQ_VERSION 		; default executor ident string
+	;
+	;   Create a pool for internally generated messages and control blocks.
+	;
+	MOVAB	NET$GL_MY_POOL+4,R6	; Point to pool head
+	$EXPREG_S -
+		PAGCNT = #<POOL_LENGTH+511>/512,- ; no. of pages
+		RETADR = (R6)+		   ; Address for pool address
+	BLBC	R0,100$			; If LBC then error
+	CLRL	-(R6)			; Set up pool head
+	MOVL	-(R6),R6		; Get address of pool
+	CLRL	(R6)+			; Init 1st pool block
+	MOVL	#POOL_LENGTH,(R6)	; It's this long
+	;
+	;   Set up control blocks
+	;
+	BSBW	MOUNT			; Setup VCB,AQB, init UCB's
+	BLBC	R0,100$			;
+	BSBW	NET$INIT_ROUTING	; Initialize routing database
+	BLBC	R0,90$			; Br on error
+	CALLS	#0,G^NET$INI_CONFIG	; Initialize CNR/CNF database
+	BLBC	R0,90$			; Br on error
+	;
+	;   Initialize NETDRIVER
+	;
+	BSBW	INIT_NETDRIVER		; Initialize NETDRIVER
+	BLBC	R0,90$			; Branch if error detected
+	;
+	;   Announce we are up
+	;
+	MOVB	#NDB$C_MSG_START,R0	; DECnet starting
+	JSB	NET$OPCOM		; Print it       
+	;
+	;   Activate mailbox and ACP queue
+	;
+	BSBW	NET$MBX_QIO		; Post the read to mailbox
+	BRW	NET$DISPATCH		; Process all the work queues
+					; - will hibernate
+
+;
+; Come here on errors
+;
+
+90$:	PUSHL	R0			; Save final status
+	BSBW	DISMOUNT		; Dismount - remove control blocks
+	POPL	R0			; Restore final status
+100$:	RET				; Come here on error during startup
+
+	.SBTTL	MOUNT - Mount the NET device
+;+
+; MOUNT - Load/Init I/O data base control blocks
+;
+; This routine is called to create the I/O database control blocks
+; necessary to allow communication with the ACP.
+;
+; Inputs:
+;
+;	None
+;
+; Outputs:
+;
+;	None
+;-
+	.SAVE_PSECT
+	.PSECT	NET_LOCK_CODE,NOWRT,GBL
+
+MOUNT:	CALLS	#0,LOCK_IODB		; Lock the io database
+	BSBB	10$			; Mount the device
+	PUSHL	R0			; Save status
+	CALLS	#0,UNLOCK_IODB		; Unlock database
+	POPL	R0			; Recover status
+	RSB
+
+	;
+	;   Check to see if ACP is already mounted somewhere else
+	;   in the system.  Check to see if ACP is marked for dismount.
+	;
+10$:	MOVL	NET$GL_PTR_UCB0,R3	; Get the NET0 UCB address
+	BBS	#DEV$V_MNT,-		; Exit if NETACP already mounted
+		UCB$L_DEVCHAR(R3),20$	; elsewhere in the system
+	BBC	S^#DEV$V_DMT,-		; Br unless device marked for
+		UCB$L_DEVCHAR(R3),40$	; dismount
+20$:	MOVZWL	#SS$_DEVMOUNT,R0	; Set return code
+	RSB
+
+40$:	;
+	;  Allocate the ACP queue block (AQB), Volume Control Block (VCB),
+	;  LPD for primary ECL (NSP), an IRP for local LPD, and a Timer
+	;  Queue Element (TQE) for NETDRIVER's clock (eventually, allocation
+	;  of the TQE should be moved to NETDRIVER).
+	;
+
+      XMSK = ^X<F>				; Used for quadword alignment
+
+AQB$C_XLNG = <AQB$C_LENGTH+XMSK> & ^C<XMSK>	; Define rounted lth for alloc
+RCB$C_XLNG = <RCB$C_LENGTH+XMSK> & ^C<XMSK>	; Define rounded lth for alloc
+LPD$C_XLNG = <LPD$C_LENGTH+XMSK> & ^C<XMSK>	; Define rounded lth for alloc
+TQE$C_XLNG = <TQE$C_LENGTH+XMSK> & ^C<XMSK>	; Define rounded lth for alloc
+
+LNG =	AQB$C_XLNG + -				; Compute size of all blocks
+	RCB$C_XLNG + -
+	LPD$C_XLNG + -
+	TQE$C_XLNG
+
+	CLRL	NET$GL_PTR_AQB			; Flag 'no AQB'
+	CLRL	NET$GL_PTR_VCB			; Flag 'no VCB'
+	CLRL	NET$GL_LOC_LPD			; Flag 'no local LPD'
+	MOVZWL	#LNG,R1				; Get length of block
+	BSBW	NET$ALONPGD_Z			; Get and zero the block
+	BLBS	R0,INIT_AQB			; Br if successful
+	RSB					; Else, exit with status
+
+INIT_AQB:					; Initialize the AQB
+	MOVL	R2,NET$GL_PTR_AQB		; Save AQB address
+	MOVL	R2,AQB$L_ACPQFL(R2)		; Set queue forward link
+	MOVL	R2,AQB$L_ACPQBL(R2)		; Set queue back link
+	MOVB	#1,AQB$B_MNTCNT(R2)		; Initialize mount count
+	MOVL	G^CTL$GL_PCB,R0			; Get current PCB
+	MOVL	PCB$L_PID(R0),AQB$L_ACPPID(R2)	; Store ACP's PID
+	MOVB	#DYN$C_AQB,   AQB$B_TYPE(R2)	; Note type of block
+	MOVZBW	#AQB$C_LENGTH,AQB$W_SIZE(R2)	; Record size of AQB
+	MOVB	#AQB$K_NET,   AQB$B_ACPTYPE(R2)	; Flag ACP type
+	BISB	#AQB$M_UNIQUE,AQB$B_STATUS(R2)	; Note status of ACP
+	MOVAB	AQB$C_XLNG(R2),R2		; Point to rest of storage
+
+INIT_RCB:					; Initialize the RCB
+	MOVL	R2,NET$GL_PTR_VCB		  ; Store VCB address
+	MOVW	#1,		RCB$W_MCOUNT(R2)  ; Init mount count
+	MOVB	#DYN$C_VCB,     RCB$B_TYPE(R2) 	  ; Init block type
+	MOVL	NET$GL_PTR_AQB, RCB$L_AQB(R2)	  ; Link to AQB
+	MOVL	NET$GL_NET_UCB, RCB$L_ACP_UCB(R2) ; Set pointer to the ACP's
+	MOVL	G^EXE$GL_ABSTIM,RCB$L_ABS_TIM(R2) ; Reset time last zeroed
+	;
+	;   Initialize queue headers
+	;
+	ASSUME	RCB$Q_IRP_FREE EQ 0
+	ASSUME	RCB$Q_LOC_XMT  EQ RCB$Q_LOC_RCV+8
+	ASSUME	RCB$Q_IRP_WAIT EQ RCB$Q_LOC_XMT+8
+
+	MOVL	R2,(R2)				; Free IRP listhead
+	MOVL	R2,4(R2)			;
+	MOVAB	RCB$Q_LOC_RCV(R2),R0		;
+	MOVL	R0,(R0)				; Local-datalink rcv listhead
+	MOVAL	(R0)+,(R0)+			;
+	MOVL	R0,(R0)				; Local-datalink xmt listhead
+	MOVAL	(R0)+,(R0)+			;
+	MOVL	R0,(R0)				; Wait for IRP listhead
+	MOVAL	(R0)+,(R0)+			;
+
+	MOVAB	RCB$Q_CXB_FREE(R2),R0
+	MOVL	R0,(R0)				; Free CXB listhead
+	MOVAL	(R0)+,(R0)+			;
+	MOVAB	RCB$C_XLNG(R2),R3		; Point to "local datalink"
+
+INIT_LPD:
+	MOVL	R3,NET$GL_LOC_LPD		; Save address of local LPD
+
+	ASSUME	LPD$Q_REQ_WAIT EQ 0
+
+	MOVL	R3,(R3)				; Init wait queue listhead
+	MOVL	R3,4(R3)			;
+	MOVB	#1,LPD$B_XMT_SRL(R3)		; Init square root limiter
+	MOVB	#1,LPD$B_XMT_IPL(R3)		; Init input packet limiter
+	MOVB	#LPD$C_LOC_INX,LPD$B_PTH_INX(R3) ; Init path i.d.
+	;
+	;   Initialize status flags - don't set ACTIVE flag, since NETDRIVER
+	;   "owns" the flag for it's own purposes.
+	;
+	MOVW	#LPD$M_XBF!-			; Reads and writes are Buffered
+		 LPD$M_RBF!-
+		 LPD$M_RUN,-			; Mark it up
+		LPD$W_STS(R3)
+	MOVAB	LPD$C_XLNG(R3),R3		; Point to next block
+
+INIT_TQE:					; Init timer queue element
+	MOVL	R3,RCB$L_PTR_TQE(R2)		; Store TQE address
+	MOVB	#DYN$C_TQE,TQE$B_TYPE(R3)	; Setup structure type
+						; Let TQE$W_SIZE stay at zero
+						; to trap deallocation bugs
+	;
+	;   Link data structures into I/O data base
+	;
+	MOVL	NET$GL_PTR_UCB0,R3		; Get NET UCB0 pointer
+	MOVL	NET$GL_DLE_UCB0,R1		; Get DLE UCB0 pointer
+	ASSUME	IPL$_SYNCH  LE  NET$C_IPL
+	DSBINT	#NET$C_IPL			; Synch I/O data base
+	;
+	;   Make all DLE UCBs mounted, by storing the ACP
+	;   VCB address, and setting the MNT bit.
+	;
+40$:	MOVL	R2,UCB$L_VCB(R1)		; Link DLE driver to VCB
+	SETBIT	#DEV$V_MNT,UCB$L_DEVCHAR(R1)	; DLE device is mounted
+	MOVL	UCB$L_LINK(R1),R1		; Get next UCB
+	BNEQ	40$				; If EQL then done
+	;
+	;   Make all NET UCBs mounted, by storing the ACP
+	;   VCB address, and setting the MNT bit.
+	;
+50$:	MOVL	R2,UCB$L_VCB(R3)		; Link NET driver to VCB
+	SETBIT	#DEV$V_MNT,UCB$L_DEVCHAR(R3)	; Device is mounted
+	MOVL	UCB$L_LINK(R3),R3		; Get next UCB
+	BNEQ	50$				; If EQL then done
+	;
+	;   Add our AQB to the system-wide AQB list
+	;
+	MOVL	NET$GL_PTR_AQB,R2		; Get AQB
+	MOVAB	G^IOC$GL_AQBLIST,R1		; Get ptr to list head
+	MOVL	(R1),AQB$L_LINK(R2)		; Link list to AQB
+	MOVL	R2,(R1)				; Make this AQB the 1st
+	ENBINT					; Restore IPL
+	MOVL	#1,R0				; Return success
+	RSB
+
+	.RESTORE_PSECT
+
+	.SBTTL	INIT_NETDRIVER - Tell NETDRIVER to initialize
+;++
+; INIT_NETDRIVER - Tell NETDRIVER to initialize itself
+;
+; This routine is called when all nonpaged data structures have
+; been setup.
+;
+; Inputs:
+;
+;	None
+;
+; Outputs:
+;
+;	None
+;-
+INIT_NETDRIVER:
+	;
+	;   Tell NETDRIVER we've mounted the ACP
+	;
+	MOVL	NET$GL_NET_UCB,R5		; Get the UCB address
+	MOVL	UCB$L_VCB(R5),R2		; Get RCB address
+	MOVL	#LPD$C_LOC_INX,R1		; Get local LPD index
+	MOVL	@RCB$L_PTR_LPD(R2)[R1],R1	; Get local LPD address
+	MOVL	S^#NETUPD$_DLL_ON,R0		; Set function code
+	BSBB	CALL_NETDRIVER			; Tell NETDRIVER about LPD
+	RSB
+
+	.SBTTL	CALL_NETDRIVER - Call NETDRIVER entry point
+;+
+; CALL_NETDRIVER - Call NETDRIVER entry point
+;
+; This routine is called to call NETDRIVER's entry point.
+;
+; Inputs:
+;
+;	R0-R5 are setup according to function code in R0.
+;
+; Outputs:
+;
+;	R0 = status
+;-
+CALL_NETDRIVER::
+	PUSHL	R1			; Save R1
+	MOVL	NET$GL_PTR_UCB0,R1	; Get UCB0 address
+	MOVL	UCB$L_CRB(R1),R1	; Get the CRB address           
+	PUSHL	CRB$L_INTD+VEC$L_START(R1) ; Push NETDRIVER entry address
+	MOVL	4(SP),R1		; Restore R1
+	JSB	@(SP)+			; Call NETDRIVER entry point
+	ADDL	#4,SP			; Pop saved value of R1
+	RSB				; Return to caller
+
+	.SBTTL	NET$DEC_TRANS - Decrement transaction count
+;++
+; NET$DEC_TRANS - Decrement the transaction count
+;
+; Decrement the transaction count in the RCB (really a Volume Control Block)
+; and dismount if it goes to zero.
+;
+; Inputs:
+;
+;	None
+;
+; Outputs:
+;
+;	None
+;
+;	R0 is destroyed; all other registers are preserved.
+;
+; RCB and related structures are deallocated if the device is dismounted.
+;--
+NET$DEC_TRANS::				;
+	PUSHR	#^M<R1,R2,R3,R4,R5>	; Save R4
+	MOVL	NET$GL_PTR_UCB0,R0	; Address the NET0 UCB
+	MOVL	UCB$L_VCB(R0),R0	; Get the RCB address
+	DECW	RCB$W_TRANS(R0)		; Decrement the Transaction count
+	BNEQ	20$			; If NEQ then don't dismount
+	TSTW	RCB$W_MCOUNT(R0)	; Is mount count zero ?
+	BEQL	50$			; If so, time to go away
+	BUG_CHECK NETNOSTATE,FATAL	; Else there's a bug
+
+20$:	POPR	#^M<R1,R2,R3,R4,R5>	; Restore regs
+	RSB
+
+;
+; The reference count has gone to zero.  Dismount the ACP and go away.
+;
+
+50$:	BSBW	DISMOUNT		; Dismount the ACP
+	TSTL	NET$GL_PTR_AQB		; Is the AQB still being referenced?
+	BNEQ	20$			; If so, stick around (this is a bug)
+	MOVB	#NDB$C_MSG_SHUT,R0	; Decnet shutting down
+	JSB	NET$OPCOM		; Print it
+	$DELPRC_S			; Go away safely
+	BUG_CHECK NETSYSSRV,FATAL	; Should never get here
+
+	.SBTTL	DISMOUNT - Dismount the NET device
+;+
+; DISMOUNT - Dismount the NET device
+;
+; This routine is called to cleanup the I/O database, before going away.
+;
+; Inputs:
+;
+;	None
+;
+; Outputs:
+;
+;	None
+;-
+	.SAVE_PSECT
+	.PSECT	NET_LOCK_CODE,NOWRT,GBL
+
+DISMOUNT:
+	CALLS	#0,LOCK_IODB		; Lock the i/o data base
+	ASSUME	IPL$_SYNCH LE NET$C_IPL
+	DSBINT	#NET$C_IPL		; Sync with I/O data base and NETDRIVER
+	BSBB	100$			; Dismount the NET device
+	ENBINT				; Restore IPL
+	CALLS	#0,UNLOCK_IODB		; Unlock the data base
+	BSBW	NET$KILL_MBX		; Delete the mailbox
+	$DASSGN_S CHAN = NET$GW_NETCHAN	; Deassign the network channel
+	$DASSGN_S CHAN = NET$GW_DLECHAN	; Deaasign channel to DLE driver
+	$CANTIM_S ACMODE = #0,-		; Cancel all timers (an Exec fatal bug
+		  REQIDT = #0		;  could occur on rundown otherwise)
+	$DELLOG_S  LOGNAM = NODE_DESC	; Deassign SYS$NODE
+	RSB
+
+100$:	MOVL	NET$GL_PTR_UCB0,R5	; Address the NET UCB0
+	MOVL	NET$GL_DLE_UCB0,R1	; Address the DLE UCB0
+	MOVL	UCB$L_VCB(R5),R4	; Get RCB address
+	PUSHL	#1			; Mark end of deallocation list
+	;
+	;   Mark all DLE UCB's as dismounted, by clearing the VCB
+	;   pointer in each one.
+	;
+105$:	BICL	#DEV$M_MNT!DEV$M_DMT,-	;
+		UCB$L_DEVCHAR(R1) 	; Device is dismounted
+	CLRL	UCB$L_VCB(R1)		; No more VCB
+	MOVL	UCB$L_LINK(R1),R1	; Get next UCB address
+	BNEQ	105$			; If NEQ more to go
+	;
+	;   Mark all NET UCB's as dismounted, by clearing the VCB
+	;   pointer in each one.
+	;
+110$:	BICL	#DEV$M_MNT!DEV$M_DMT,-	;
+		UCB$L_DEVCHAR(R5) 	; Device is dismounted
+	CLRL	UCB$L_VCB(R5)		; No more VCB
+	MOVL	UCB$L_LINK(R5),R5	; Get next UCB address
+	BNEQ	110$			; If NEQ more to go
+	;
+	;   Decrement AQB reference count, and make sure its zero.
+	;
+	MOVL	RCB$L_AQB(R4),R1	; Get the AQB address
+	DECB	AQB$B_MNTCNT(R1)	; Another device not mounted
+	BEQL	115$			; If equal, then ok
+	BUG_CHECK NETNOSTATE,FATAL	; Only one device allowed for now
+	;
+	;   Unhook the AQB from the system AQB list
+	;
+115$:	MOVAB	G^IOC$GL_AQBLIST-AQB$L_LINK,R2	; Setup for AQB scan
+	BRB	130$			; Start scan from listhead
+120$:	MOVL	AQB$L_LINK(R2),R2	; Get next AQB
+130$:	CMPL	AQB$L_LINK(R2),R1	; Does this point to our AQB
+	BNEQ	120$			; If NEQ no
+	MOVL	AQB$L_LINK(R1),-	; Unhook the AQB
+		AQB$L_LINK(R2)		;
+	PUSHL	R1			; Include AQB in deallocation list
+	CLRL	NET$GL_PTR_AQB		; Say "no AQB"
+	CLRL	NET$GL_PTR_VCB		; Say "no VCB"
+	;
+	;
+	;   Deallocate the RCB and all associated data structures
+	;
+	;
+	PUSHL	RCB$L_PTR_LTB(R4)	; Build list of blocks to deallocate
+	PUSHL	RCB$L_PTR_LPD(R4)	; Get LPD block offset by 8
+	BEQL	150$
+	SUBL	#8,(SP)			; Adjust actual start of block
+150$:	PUSHL	RCB$L_PTR_ADJ(R4)	; Get ADJ block offset by 8
+	BEQL	152$
+	SUBL	#8,(SP)			; Adjust actual start of block
+152$:	PUSHL	RCB$L_PTR_NDC(R4)	; Get actual start of block
+	PUSHL	RCB$L_PTR_OA(R4)	; Get OA block offset by 12
+	BEQL	154$
+	SUBL	#12,(SP)		; Adjust actual start of block
+154$:	PUSHL	RCB$L_PTR_AOA(R4)	; Get AOA block offset by 12
+	BEQL	170$
+	SUBL	#12,(SP)		; Adjust actual start of block
+
+170$:	POPL	R0			; Get next block
+	BEQL	170$			; If EQL then try next entry
+	BLBS	R0,190$			; If LBS then at end of list
+	BSBW	NET$DEALLOCATE		; Deallocate the block pointed to by R0
+	BRB	170$
+190$:	RSB
+
+	.RESTORE_PSECT
+
+	.SBTTL	I/O data base synchronization
+;+
+; LOCK_IODB	- Lock the I/O data base for write
+; UNLOCK_IODB	- Unlock the I/O data base
+;
+; CALLING SEQUENCE:
+;
+;	CALL LOCK_IODB ()
+;	CALL UNLOCK_IODB ()
+;
+; ROUTINE VALUE:
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	I/O Data Base MUTEX and IPL are affected as shown
+;
+;--
+LOCK_IODB::
+	.WORD	^M<R0,R1,R2,R3,R4,R5>	; Save registers
+	MOVAL	G^IOC$GL_MUTEX,R0	; Specify I/O data base mutex
+	MOVL	G^CTL$GL_PCB,R4		; Get own PCB address
+	JSB	G^SCH$LOCKW		; Get mutex, raise to IPL$_ASTDEL
+	RET
+
+UNLOCK_IODB::
+	.WORD	^M<R0,R1,R2,R3,R4,R5>	; Save registers
+	MOVAL	G^IOC$GL_MUTEX,R0	; Get I/O data base mutex
+	MOVL	G^CTL$GL_PCB,R4		; And own PCB address
+	JSB	G^SCH$UNLOCK		; Return mutex
+	SETIPL	#0			; Also lower ipl
+	RET
+
+	.SBTTL	START_TIMER - Startup ACP activity timer
+;+
+; START_TIMER	- Startup ACP activity timer
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine is called to start the ACP activity timer. This timer is
+; mearly used to reset the timeout cell in the RCB. The XPORT layer is
+; continuously decrementing the activity timer to see if the ACP has been
+; stalled - as in the event that the cluster in re-configuring. This will
+; make the XPORT stop transmitting 'hello' messages and helps to prevent
+; the stalled system from becoming a 'black hole'. The 'black hole' effect
+; is caused because the ACP cannot process events and so cann send routing
+; messages to notify other systems when a node becomes 'unreachable'.
+;
+; Inputs:
+;		R5 = WQE address or zero
+;
+; Outputs:
+;		None.
+;
+;		R0-R2 are destroyed.
+;
+;-
+NET$START_TIMER:
+	MOVQ	R3,-(SP)			; Save R3,R4
+	MOVL	R5,R0				; Copy WQE address
+	BEQL	10$				; Br if none
+	BSBW	WQE$DEALLOCATE			; Deallocate the WQE
+10$:	MOVL	NET$GL_PTR_VCB,R2		; Get RCB address
+	BEQL	90$				; Br if not available
+	MOVZWL	#<<WQE$C_QUAL_ACT>@8>!-		; Set activity timer i.d.
+		  NET$C_TID_ACT,R1
+	BSBW	WQE$CANCEL_TIM			; Cancel all previous timers
+	$DISPATCH  RCB$B_ETY(R2),TYPE=B,-
+	<-	; type		; action
+		<ADJ$C_PTY_AREA	50$>,-		; Areas, have timers
+		<ADJ$C_PTY_PH4  50$>,-		; So do other routers,
+		<ADJ$C_PTY_PH3	50$>,-		;  but endnodes don't
+	>
+
+	BRB	90$				; All others, just exit
+
+50$:	MOVB	#NET$C_ACT_TIMER,-		; Reset activity timer
+		 RCB$B_ACT_TIMER(R2)
+	MOVAB	B^NET$START_TIMER,R2		; Set up action routine
+	MOVQ	#5*1000*1000*NET$C_ACT_TIMER,R3	; Set half the delta interval
+	BSBW	WQE$RESET_TIM			; Reactivate the activity timer
+90$:	MOVQ	(SP)+,R3			; Restore R3,R4
+	RSB					; Return to caller
+
+	.SBTTL	PROC_EVT - Process ACP event
+;+
+; PROC_EVT	- Process ACP event
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine processes the ACP events and is state table driven.  Action
+; routines are called until the null event is detected.  Each action routine
+; generates a new event, which it returns in R1, and returns with the low bit
+; set in R0 only if the indicated state change is to be performed.
+;
+; INPUTS:	R1	Event code
+;
+; OUTPUTS:	R0	Status
+;		All registers are clobbered
+;
+;-
+NET$LOCLPD_DOWN::					; Local LPD shut down
+	PUSHR	#^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>	; Save regs
+	MOVL	S^#ACP$C_LPD_LOC,R1			; Set event
+	BSBB	PROC_EVT				; Process it
+	POPR	#^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>	; Restore regs
+	RSB
+
+
+PROC_EVT:				; Process all ACP events
+	MOVL	#1,R0			; Assume success
+	MOVL	NET$GL_PTR_VCB,R2	; Get RCB pointer
+	;
+	;
+	;   Find appropriate state table entry
+	;
+	;
+5$:	ASSUME	ACP$C_EVT_NOP  EQ  0
+	MOVL	R1,R4			; Save event; is this the NOP event ?
+	BEQL	25$			; If so, we're done
+	CMPL	#ACP$C_MAX_EVT,R1	; Is event within range ?
+	BLSSU	30$			; If LSSU then bug exists
+	MULL	#ACP$C_STATES,R1	; Bias for current event
+	MOVZBL	RCB$B_STI(R2),R3	; Get internal ACP state
+	ADDL	R3,R1			; Add current state offset
+	MOVAW	ACP$AW_STA_TAB[R1],R1	; Address state table entry
+	;
+	;
+	;   Dispatch to the action routine with the following:
+	;
+	;   INPUTS:	R2	RCB ptr
+	;		R1,R0	Scratch
+	;
+	;   ON RETURN:	R1	Next event to be processed
+	;		R0	Low bit set if state change is permitted,
+	;			Low bit clear to avoid state change
+	;
+	;		All other regs may be clobbered
+	;
+	;
+	MOVL	R1,SAVE_STA_TAB		; Save state table address
+	BSBW	NET$JNX_CO		; Log this event into the journal
+					; Clobbers R0
+	BLBC	R0,7$			; If LBC journalling is inactive
+	MOVZBW	#^X<AE>,(R1)+		; Enter journal record type
+	SUBL3	#ACP$AW_STA_TAB,-	;
+		SAVE_STA_TAB,(R1)+ 	; Enter state table offset
+	MOVW	RCB$W_TRANS(R2),(R1)+	; Enter transaction count
+	MOVW	RCB$W_MCOUNT(R2),(R1)+	; Enter mount count
+	MOVW	RCB$W_MAX_PKT(R2),(R1)+	; Enter max xmt IRPs allowed
+	MOVW	RCB$W_CUR_PKT(R2),(R1)+	; Enter current xmt IRPs active
+	JSB	@(SP)+			; Journal it
+7$:	PUSHL	R4			; Save original event code
+	MOVZBL	(R1)+,-(SP)		; Save next state value
+	PUSHL	R2			; Save RCB
+	MOVZBL	(R1),R1			; Get action routine index
+	MOVL	ACP$AL_ACTION[R1],R1	; Address action routine
+	JSB	(R1)			; Dispatch
+10$:	POPR	#^M<R2,R3,R4>		; Get RCB ptr, next state and orig. event
+	BLBC	R0,5$			; Avoid state change if LBC
+	CMPB	R3,RCB$B_STI(R2)	; Any change in state?
+	BEQL	5$			; Branch if not
+	BSBB	100$			; Log executor state change event
+	MOVB	R3,RCB$B_STI(R2)	; Change state
+	BRB	5$			; Process next event
+25$:	RSB
+
+30$:	BUG_CHECK NETNOSTATE,FATAL	; Bugcheck
+
+;
+; Log an event indicating that the executor state has changed
+;
+; R3 = New state
+; R2 = RCB address
+; R4 = Event which triggered state change
+;
+
+100$:	PUSHR	#^M<R1,R2>		; Save registers
+	CLRL	R1			; Indicate no extra WQE space needed
+	MOVL	#WQE$C_SUB_ACP,R0	; Set WQE subtype
+	BSBW	WQE$ALLOCATE		; Allocate a WQE to log an event
+	MOVL	R2,R5			; Transfer WQE address
+	POPR	#^M<R1,R2>		; Restore registers
+	MOVW	#EVC$C_SCL_LNS,WQE$W_EVL_CODE(R5) ; Set event code
+	MOVB	#EVC$C_SCL_PRSN_NOR,WQE$L_EVL_PKT(R5) ; Assume "normal operation"
+	CMPB	R4,#ACP$C_OPR_INIT	; Is it one of the "operator events"?
+	BLSSU	110$			; Branch if not
+	CMPB	R4,#ACP$C_OPR_OFF
+	BGTRU	110$
+	MOVB	#EVC$C_SCL_PRSN_OPC,WQE$L_EVL_PKT(R5) ; Set "operator initated"
+110$:	MOVB	RCB$B_STI(R2),R0	; Get previous internal state
+	BSBB	200$			; Convert to EVL coding scheme
+	MOVB	R0,WQE$B_EVL_DT1(R5)	; Set previous executor state in event
+	MOVB	R3,R0			; Get new internal state
+	BSBB	200$			; Convert to EVL coding scheme
+	MOVB	R0,WQE$B_EVL_DT2(R5)	; Set new executor state
+	BSBW	NET$EVT_INTRAW		; Log the event
+	MOVL	R5,R0			; Get WQE address
+	BSBW	WQE$DEALLOCATE		; Deallocate the WQE
+	MOVL	#1,R0			; Successful
+	RSB
+
+;
+; Convert internal ACP state (R0) to EVL state (R0)
+;
+
+200$:	PUSHL	R1			; Save registers
+	MOVAB	EVL_STA_MAP,R1		; Point to translation table
+210$:	TSTB	(R1)			; End of table?
+	BLSS	220$			; If so, use default state
+	CMPB	(R1),R0			; Does state match?
+	BEQL	220$			; Branch if so
+	ADDL	#2,R1			; Skip to next entry
+	BRB	210$
+220$:	MOVZBL	1(R1),R0		; Return EVL state code
+	POPL	R1			; Restore registers
+	RSB
+
+	.SBTTL	Event action routines
+;+
+; ACT_REVIVE	- Try to turn the node back on from the "shut" or "off" state
+; ACT_NODE_SHUT	- Turn the local node to the "shut" state
+; ACT_NODE_OFF	- Turn the local node off
+; ACT_CLEANUP	- Break all logical links, turn off all lines
+; ACT_NOP	- Nop action routine
+; ACT_BUG	- Bug_check
+; ACT_ERROR	- Return error
+; 
+;-
+	.SAVE_PSECT
+	.PSECT	NET_LOCK_CODE,NOWRT,GBL
+
+ACT_REVIVE:				; Try to abort the dismount procedure
+	DSBINT	#NET$C_IPL		; Raise IPL to sync with NETDRIVER
+	TSTW	RCB$W_MCOUNT(R2)	; Does NETDRIVER know we're dismounting
+	BEQL	10$			; If EQL then yes, we must allow the
+					; dismount to complete
+	INCW	RCB$W_MCOUNT(R2)	; Cancel the dismount
+	MOVL	#1,R0			; Indicate success
+10$:	ENBINT				; Restore IPL
+	BRW	RETURN_NULL		; Return to terminate event processing
+
+	.RESTORE_PSECT
+
+ACT_NODE_SHUT:				; Turn local node to the "shut" state
+	BSBW	NET$DECR_MCOUNT		; Return ACP's claim on the RCB
+					; Fall thru
+ACT_BRDCST:
+	BSBB	MBX_NET_SHUT		; Tell the world we're going away
+	BRB	ACT_NOP			; Return success and null new event
+
+ACT_NODE_OFF:				; Turn local node off
+	BSBW	NET$DECR_MCOUNT		; Return ACP's claim on the RCB
+					; Fall thru
+ACT_CLEANUP:				; Break all links
+	BSBB	MBX_NET_SHUT		; Tell the world we're going away
+	MOVL	NET$GL_PTR_UCB0,R5	; Setup UCB pointer
+	MOVL	RCB$L_PTR_LTB(R2),R1	; Get LTB pointer
+	BEQL	20$			; If EQL then no LTB
+	MOVZBL	#NETUPD$_ABOLNK,R0	; Fct code is "abort all links"
+	BSBW	CALL_NETDRIVER		; Call NETDRIVER to abort the links
+20$:	BSBW	NET$DLL_ALL_OFF		; Pass to module which knows about lines
+					; Fall thru
+ACT_NOP:				; Nop Action routine
+	MOVB	#1,R0			; Allow state change
+RETURN_NULL:
+	ASSUME	ACP$C_EVT_NOP  EQ  0
+	CLRL	R1			; Signal done
+	RSB				;
+
+ACT_ERROR:				; Return error
+	MOVZWL	#SS$_WRITLCK,R0		; Indicate wrong state
+	BRB	RETURN_NULL		; Return null new event
+
+ACT_STALL:				; Stall to prevent further processing
+					;! *** NYI ***
+ACT_BUG:
+	BUG_CHECK NETNOSTATE,FATAL	; Bugcheck
+
+	.SBTTL	MBX_NET_SHUT - Broadcast shutdown message
+;++
+;
+; MBX_NET_SHUT - Broadcast msg that node is shutting down
+;
+;--
+MBX_NET_SHUT:
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; Save regs
+	MOVL	NET$GL_PTR_UCB0,R5	; Get the master UCB address
+	CLRQ	R3			; Broadcast to everyone and no data
+	MOVZWL	#MSG$_NETSHUT,R2	; Mailbox message code
+	MOVZWL	#NETUPD$_BRDCST,R0	; This is the function
+	BSBW	CALL_NETDRIVER		; Call the driver
+	POPR	#^M<R0,R1,R2,R3,R4,R5>	; Restore regs
+	RSB				; Done
+
+	.SBTTL	NET$DECR_MCOUNT - Decrement ACP mount count
+;+
+; NET$DECR_MCOUNT - Decrement ACP mount count
+;
+; The ACP mount count is decremented.  If the mount count goes to zero,
+; then the "ACP dismounting" flag is set, causing the VMS executive to
+; prevent any further ACCESS QIO's from coming in.
+;
+; Inputs:
+;
+;	R2 = Address of RCB
+;
+; Outputs:
+;
+;	R0 destroyed.
+;-
+	.SAVE_PSECT
+	.PSECT	NET_LOCK_CODE,NOWRT,GBL
+
+NET$DECR_MCOUNT::
+	DECW	RCB$W_MCOUNT(R2)	; Decrement mount count
+	BGTR	90$			; Exit if still positive
+	MOVL	NET$GL_PTR_UCB0,R0	; Get address of base UCB
+	BBSS	#DEV$V_DMT,UCB$L_DEVCHAR(R0),90$ ; Make VMS stop sending ACCESS QIO's
+90$:	RSB
+
+	.RESTORE
+
+	.SBTTL	NET$UPD_LOCAL - Update local state
+;+
+; NET$UPD_LOCAL	- Update local state
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; The contents of the new LNI CNF are assume to have been already checked
+; for consistency with the NDI data base.  The CNF values are used to update 
+; the structure and content of the control blocks residing in non-paged pool.
+;
+; INPUTS:	R11	LNI CNR pointer
+;		R10	New LNI CNF pointer
+;
+; OUTPUTS:	R11,R10	Clobbered
+;		R9	Bit i.d. of bad parameter if LBC in R0
+;		R8-R1	Clobbered
+;		R0	Status
+;-
+NET$UPD_LOCAL::				; Update local state
+	;
+	;   If the SEGMENT BUFFER SIZE is not specified, then zero
+	;   the LNI cell.   Check to make sure that an explicit SBS
+	;   value is always less than or equal to the BUS value.
+	;
+	$GETFLD	lni,l,bus		; Get forwarding buffer size
+	MOVL	R8,R6			; Save it
+	$GETFLD	lni,l,sbs		; SEGMENT BUFFER SIZE specified?
+	MOVW	R8,CNF$C_LENGTH -	; Overwrite cell in CNF, so that SBS
+		+LNI$W_SBS(R10)		; cell is zeroed if not set
+	BLBC	R0,2$			; Branch if not specified
+	CMPL	R6,R8			; Is BUS < SBS?
+	BGEQ	2$			; If not, everything is ok
+	BRW	300$			; If so, report an error
+2$:	;
+	;   For a number of LNI parameters, if the parameter is not "set",
+	;   then zero the corresponding LNI field to make life easier later.
+	;   This code relies on $GETFLD returning R8=0 if the parameter is
+	;   not "set".
+	;
+	$GETFLD	lni,l,piq		; PIPELINE QUOTA
+	MOVW	R8,CNF$C_LENGTH+LNI$W_PIQ(R10)
+	$GETFLD	lni,l,mar		; MAX AREAS
+	MOVB	R8,CNF$C_LENGTH+LNI$B_MAR(R10)
+	$GETFLD	lni,l,ali		; alias address (cluster address)
+	MOVW	R8,CNF$C_LENGTH+LNI$W_ALI(R10)
+	;
+	;
+	;   Setup nonpaged CNF image
+	;
+	;
+	MOVAB	NEW_LNI_IMAGE,R6	; Point to non-pageable CNF image
+	MOVC3	#LNI$C_LENGTH,-		; Copy the basic new LNI block (no CNF
+		 CNF$C_LENGTH(R10),(R6)	; superstructure and no string storage)
+	MOVL	NET$GL_PTR_VCB,R8	; Get RCB pointer
+	;
+	;
+	;   Map the requested state into an event code
+	;
+	;
+	$CNFFLD	lni,l,sta,R9		; Identify state field in case of error
+	MOVAB	OPR_EVT_MAP,R2		; Get reguested state/event map
+10$:	MOVZBL	(R2),ACP_L_EVT		; Assume this is it
+	CMPB	(R2)+,#ACP$C_EVT_BUG	; At end of table ?
+	BEQL	110$			; If EQL then invalid state value
+	CMPB	(R2)+,LNI$B_STA(R6)	; Does the entry match new state?
+	BNEQ	10$			; If NEQ then keep trying
+	;
+	;
+	;   New node address may only be zero if the new state is OFF/INIT/SHUT
+	;
+	;
+	$CNFFLD	lni,l,add,R9		; Identify parameter assuming error
+	TSTW	LNI$W_ADD(R6)		; Test the new local node address
+	BNEQ	30$			; If NEQ then check is unnecessary
+	CMPL	ACP_L_EVT,#ACP$C_OPR_INIT ; Is the ACP initializing
+	BEQL	30$			; If so, allow it
+	CMPL	ACP_L_EVT,#ACP$C_OPR_SHUT ; Is the ACP shutting down?
+	BEQL	30$			; If so, allow it
+	CMPL	ACP_L_EVT,#ACP$C_OPR_OFF; Is the ACP shutting down?
+	BNEQ	110$			; If NEQ then bad ADDRESS parameter
+	;
+	;
+	;   If the local address is already non-zero then it must not be
+	;   changed again.
+	;
+	;
+30$:	CMPW	LNI$W_ADD(R6),RCB$W_ADDR(R8) ; Are the addresses the same?
+	BEQL	60$			; If EQL then okay
+	TSTW	RCB$W_ADDR(R8)		; Is the address currently zero?
+	BNEQ	110$			; If NEQ report bad address, else okay
+60$:	;
+	;   If a local alias address is being specified, make sure it is
+	;   in the same area as in primary local address.
+	;
+	$CNFFLD	lni,l,ali,R9		; Set field ID in case of error
+	TSTW	LNI$W_ALI(R6)		; Alias specified?
+	BEQL	100$			; Skip if not
+	EXTZV	#TR4$V_ADDR_AREA,-	; Get area of alias address
+		#TR4$S_ADDR_AREA,LNI$W_ALI(R6),R0
+	CMPZV	#TR4$V_ADDR_AREA,-	; Make sure it matches our area
+		#TR4$S_ADDR_AREA,LNI$W_ADD(R6),R0
+	BNEQ	110$			; If NEQ, report bad address
+100$:	;
+	;   The EXECUTOR TYPE parameter is only allowed to be Phase IV
+	;   routing, Phase IV area routing, Phase IV endnode or Phase III.
+	;   In addition, TYPE is not allowed to be changed while there are
+	;   active datalinks in operation.
+	;
+	$CNFFLD	lni,l,ety,R9		; Set field ID in case of error
+	MOVZBL	LNI$B_ETY(R6),R0	; Get executor type
+	$DISPATCH R0,<-			; Allow the following values:
+		<ADJ$C_PTY_PH3,120$>,-	; Phase III routing
+		<ADJ$C_PTY_PH4,120$>,-	; Phase IV routing
+		<ADJ$C_PTY_PH4N,120$>,-	; Phase IV endnode
+		<ADJ$C_PTY_AREA,120$>>	; Phase IV area routing
+110$:	BRW	300$			; Otherwise, report an error
+120$:	CMPB	R0,RCB$B_ETY(R8)	; Same as existing type?
+	BEQL	200$			; Skip check if no change
+
+	TSTL	RCB$L_PTR_LPD(R8)	; Check LPD vector
+	BEQL	190$			; If EQL then none
+	MOVZBL	RCB$B_MAX_LPD(R8),R2	; Get number of circuits
+	MOVL	#LPD$C_LOC_INX,R1	; Start just after local LPD
+	BRB	180$
+160$:	TSTL	@RCB$L_PTR_LPD(R8)[R1]	; Check if LPD slot active
+	BGEQ	180$			; Branch if slot not in use
+170$:	MOVZWL	#SS$_WRITLCK,R0		; Indicate "executor in wrong state"
+	BRW	400$			; Report the error
+180$:	AOBLEQ	R2,R1,160$		; Loop through all LPDs
+
+190$:	ASSUME	CNR$L_FLINK EQ 0
+	MOVL	NET$GL_CNR_PLI,R1	; Get PLI root pointer
+	CMPL	CNR$L_FLINK(R1),R1	; Is CNF list empty?
+	BNEQ	170$			; If not, error - all lines must be cleared
+200$:	;
+	;   Do not allow MAXIMUM CIRCUITS to be increased if there are
+	;   BRAs or BEAs active.  This is because there is a one-to-one
+	;   correspondence between the LPD vector and the first NC ADJs.
+	;
+	ADDB3	#1,LNI$B_MLN(R6),-(SP)	; Get new Max circuits
+					; plus one for local LPD
+	CMPB	(SP)+,RCB$B_MAX_LPD(R8)	; Same as existing size?
+	BEQL	230$			; Skip check if no change
+	TSTL	RCB$L_PTR_ADJ(R8)	; Check ADJ vector
+	BEQL	230$			; Skip if none
+	MOVZWL	RCB$W_MAX_ADJ(R8),R2	; Get number of adjacencies
+	BEQL	230$			; Skip if none
+	MOVZBL	RCB$B_MAX_LPD(R8),R1	; Get number of circuits
+	BRB	220$			; Start at NC+1
+210$:	MOVL	@RCB$L_PTR_ADJ(R8)[R1],R0 ; Get ADJ address
+	BBC	#ADJ$V_INUSE,ADJ$B_STS(R0),220$ ; Branch if slot unused
+	MOVZWL	#SS$_WRITLCK,R0		; Indicate "executor in wrong state"
+	BRW	400$			; Report the error
+220$:	AOBLEQ	R2,R1,210$		; Loop through all ADJs
+230$:	;
+	;
+	;   MAX ADDRESS must be larger than any of the adjacent
+	;   node addresses but not so large that a routing message
+	;   could not be sent to the adjacent node.
+	;
+	;
+	$CNFFLD	lni,l,mad,R9		; Specify MAX ADDRESS in case error
+	MULW3	#NET$C_TRCTL_CEL,-	; Determine variable size of Phase III
+		    LNI$W_MAD(R6),R1	; routing message
+	ADDW	#NET$C_TRCTL_OVR,R1	; Add in fixed size of routing msg
+	;
+	;   Scan ADJ vector to determine the max Phase III partner's node
+	;   address and the minimum adjacent routing node's buffer size.
+	;
+	TSTL	RCB$L_PTR_ADJ(R8)	; Check ADJ vector
+	BEQL	280$			; If EQL then none
+	MOVZWL	RCB$W_MAX_ADJ(R8),R4	; Get number of cells
+240$:	MOVL	@RCB$L_PTR_ADJ(R8)[R4],R0 ; Get ADJ address
+	BBC	#ADJ$V_INUSE,ADJ$B_STS(R0),270$ ; Skip if slot not in use
+	BBC	#ADJ$V_RUN,ADJ$B_STS(R0),270$ ; Skip if circuit not up
+	EXTZV	#TR4$V_ADDR_AREA,-	; Get the area for adjacency
+		#TR4$S_ADDR_AREA,ADJ$W_PNA(R0),R2
+	BEQL	250$			; If area = 0, then use our area
+	CMPZV	#TR4$V_ADDR_AREA,-	; Is this adjacency in our area?
+		#TR4$S_ADDR_AREA,LNI$W_ADD(R6),R2
+	BNEQ	260$			; If not, then skip MAX ADDR check
+250$:	EXTZV	#TR4$V_ADDR_DEST,-	; Get the node within area
+		#TR4$S_ADDR_DEST,ADJ$W_PNA(R0),R3
+	CMPW	R3,LNI$W_MAD(R6)	; Does partner have a larger address?
+	BGTRU	300$			; If so, invalid MAX ADDRESS param
+260$:	BBC	#ADJ$V_RTG,-		; If partner non-routing,
+		ADJ$B_STS(R0),270$	; then ignore buffer size
+	CMPB	ADJ$B_PTYPE(R0),-	; Is it a Phase III adjacency?
+		#ADJ$C_PTY_PH3
+	BNEQ	270$			; If not, don't worry about routing msgs
+	CMPW	ADJ$W_BUFSIZ(R0),R1	; Is partner's buffer too small
+	BLSSU	300$			; If LSSU, invalid MAX ADDRESS param
+270$:	SOBGTR	R4,240$			; Loop for each adjacency
+280$:	;
+	;
+	;   The FORWARDING BUFFER SIZE must be as least 192 bytes (max. size
+	;   NSP connect initiate message plus route-header is 190 bytes  --
+	;   192 was chosen since that was the DECnet-VAX version 1 minimum)
+	;
+	;   Also, check to make sure that SEGMENT BUFFER SIZE is larger than
+	;   the minimum buffer size.
+	;
+	;
+	$CNFFLD	lni,l,bus,R9		; Identify param in case of error
+	CMPW	LNI$W_BUS(R6),-		; Does buffer meet the minimum size
+		    #NET$C_MINBUFSIZ	; requirements?
+	BLSSU	300$			; If LSSU report invalid BUFFER SIZE
+	$CNFFLD	lni,l,sbs,R9		; Identify param in case of error
+	MOVZWL	LNI$W_SBS(R6),R0	; Get segment buffer size
+	BEQL	290$			; Branch if not set
+	CMPW	R0,#NET$C_MINBUFSIZ	; SBS big enough?
+	BLSSU	300$			; Error if not
+290$:	;
+	;
+	;   MAXIMUM VISITS must be at least as large as MAXIMUM HOPS
+	;
+	;
+	$CNFFLD	lni,l,mvi,R9		; Identify  MAX VISITS in case error
+	CMPB	LNI$B_MVI(R6),LNI$B_MHO(R6) ; Is MAX VISITS gequ MAX HOPS
+	BLSSU	300$			; If LSSU report MAX VISITS is invalid
+	;
+	;
+	;    DELAY FACTOR must be at least 16
+	;
+	;
+	$CNFFLD	lni,l,dfa,R9		; Identify DELAY FACTOR in case error
+	CMPB	#16,LNI$B_DFA(R6)	; Is DELAY FACTOR large enough ?
+	BLEQU	310$			; If GTRU report DELAY FACTOR invalid
+300$:	MOVZWL	S^#SS$_BADPARAM,R0	; Indicate error
+	BRW	400$
+310$:	;
+	;
+	;    Make sure that default access states have values
+	;
+	;
+	PUSHR	#^M<R7,R8>		; Save regs
+	$GETFLD	lni,l,dpx		; Get current default proxy access value
+	BLBS	R0,320$			; If LBS then okay
+	MOVZBL	#NMA$C_ACES_NONE,R8	; Else setup default value
+	MOVB	R8,LNI$B_DPX(R6)	; And in its non-pageable copy
+320$:	$GETFLD	lni,l,dac		; Get current default access value
+	BLBS	R0,330$			; If LBS then okay
+	MOVZBL	#NMA$C_ACES_BOTH,R8	; Else setup default value
+	BSBW	CNF$PUT_FIELD		; Store in the new CNF entry
+	MOVB	R8,LNI$B_DAC(R6)	; And in its non-pageable copy
+330$:	POPR	#^M<R7,R8>		; Restore regs
+	;
+	;   If X.25 datalink mapping is enabled (by the presence of
+	;   the EXECUTOR SUBADDRESSES parameter), then notify PSI that
+	;   we want to handle a given range of incoming calls.
+	;
+	BSBW	NET$DECLARE_PSI		; Declare PSI process
+	BLBS	R0,340$			; Branch if ok
+	CMPW	R0,#SS$_NOSUCHDEV	; Is PSI not yet initialized?
+	BNEQ	409$			; If not, defer until actually needed
+340$:	;
+	;
+	;   Update non-paged control structures
+	;
+	;
+	BSBW	UPDATE_DATABASE		; Change state, update database
+	BLBS	R0,350$			; If LBS then okay
+409$:	BRW	400$			; Else report error
+350$:	MOVL	R10,NET$GL_PTR_LNI	; Save pointer to LNI CNF
+	;
+	;
+	;   Update miscellaneous RCB fields.  Any races with respect to
+	;   NETDRIVER regarding the update of the RCB fields are of no 
+	;   consequence since they are independent values and are not pointers.
+	;   IPL cannot be raised here since the LNI block is not locked down.
+	;
+	;
+	MOVB	LNI$B_ETY(R6),RCB$B_ETY(R8)	; Store node type
+	MOVW	LNI$W_ADD(R6),RCB$W_ADDR(R8)	; Local address
+	MOVW	LNI$W_ALI(R6),RCB$W_ALIAS(R8)	; Alias local address
+	EXTZV	#TR4$V_ADDR_AREA,#TR4$S_ADDR_AREA,-
+		LNI$W_ADD(R6),R0		; Extract our area address
+	MOVB	R0,RCB$B_HOMEAREA(R8)		; Store in a convenient place
+
+	DIVW3	LNI$W_BUS(R6),LNI$W_PIQ(R6),R0	; Get packets in pipeline quota
+	MOVB	R0,	     RCB$B_ECL_RFLW(R8)	; Store in RCB
+	DIVB3	#16,-
+		LNI$B_DFA(R6),RCB$B_ECL_DFA(R8)	; Delay factor
+	MOVB	LNI$B_DWE(R6),RCB$B_ECL_DWE(R8)	; Delay weight
+	MOVB	LNI$B_RFA(R6),RCB$B_ECL_RFA(R8)	; Rexmt factor
+	MOVB	LNI$B_DAC(R6),RCB$B_ECL_DAC(R8)	; Default access state
+	MOVB	LNI$B_DPX(R6),RCB$B_ECL_DPX(R8)	; Default proxy access state
+
+	MOVW	LNI$W_ITI(R6),RCB$W_TIM_CNI(R8)	; Inbound connect timer
+	MOVW	LNI$W_OTI(R6),RCB$W_TIM_CNO(R8)	; Outbound connect timer
+	MOVW	LNI$W_IAT(R6),RCB$W_TIM_IAT(R8)	; Inactivity timer
+
+	ADDB3	#1,LNI$B_MLN(R6),RCB$B_MAX_LPD(R8) ; Max circuits
+						; plus one for local LPD
+	MOVZBL	RCB$B_MAX_LPD(R8),R0		; Get number of LPDs
+	ADDW3	LNI$W_MBR(R6),R0,-		; # of "routing destinations"
+		RCB$W_MAX_RTG(R8)		; (NC + NBRA)
+	ADDW3	LNI$W_MBE(R6),RCB$W_MAX_RTG(R8),- ; # of adjacencies
+		RCB$W_MAX_ADJ(R8)		; (NC + NBRA + NBEA)
+
+	MOVB	LNI$B_MAR(R6),RCB$B_MAX_AREA(R8) ; Max area address
+	MOVW	LNI$W_MAD(R6),RCB$W_MAX_ADDR(R8); Max node addr
+	MOVW	LNI$B_MVI(R6),RCB$B_MAX_VISIT(R8) ; Max visits
+	MOVW	LNI$W_MLK(R6),RCB$W_MAX_LNK(R8)	; Max logical links
+	;
+	;   The total datalink buffer size is calculated here.  The
+	;   size is computed by adding the EXECUTOR BUFFER SIZE (which
+	;   includes the NSP header plus exactly 6 bytes), plus the
+	;   CXB overhead used by datalink drivers.
+	;
+	ADDW3	#CXB$C_OVERHEAD,-		; Total buffer size
+		LNI$W_BUS(R6),RCB$W_TOTBUFSIZ(R8)
+	;
+	;
+	;    Update state sensitive settings
+	;
+	;
+	$DISPATCH TYPE=B,RCB$B_STI(R8),-	; Case on internal state
+	<-
+		<ACP$C_STA_N,	370$>,-		; "on"
+		<ACP$C_STA_R,	370$>,-		; "restrict"
+		<ACP$C_STA_S,	370$>,-		; "shut"
+		<ACP$C_STA_F,	390$>,-		; "off" - avoid setting MAX_PKT
+		-				;	  to allow run-down
+		-				; else fall thru
+	>
+	MOVW	LNI$W_MBU(R6),RCB$W_MAX_PKT(R8)	; Max xmt packets
+	MOVW	#NET$C_MINBUFSIZ,R0		; Use smallest possible size
+	BRB	380$
+370$:	MOVW	LNI$W_MBU(R6),RCB$W_MAX_PKT(R8)	; Max xmt packets
+	MOVZWL	LNI$W_SBS(R6),R0		; Get segment buffer size
+	BNEQ	380$				; Branch if set
+	MOVZWL	LNI$W_BUS(R6),R0		; Else, use forwarding buffer size
+380$:	SUBW3	#6+NSP$C_MAXHDR,-		; ECL msg size = total msg size
+		R0,RCB$W_ECLSEGSIZ(R8)		; minus max route header size
+	;
+	;
+	;   Update the datalink control layer
+	;
+	;
+390$:	BSBW	NET$DLLUPDLNI
+	BLBC	R0,400$				; Br if error
+	;
+	;   Start up timer that keeps 'hello' messages going
+	;
+	CLRL	R5				; Indicate no WQE to deallocate
+	BSBW	NET$START_TIMER			; Startup the activity timer
+	MOVZBL	#SS$_NORMAL,R0			; Timer is always successful
+400$:	RSB
+
+
+	.SBTTL	NET$DECLARE_PSI - Declare ourselves as a PSI process
+;+
+; NET$DECLARE_PSI - Declare ourselves as a PSI process to receive incoming calls
+;
+; Inputs:
+;
+;	R11 = LNI CNR address
+;	R10 = LNI CNF address
+;
+; Outputs:
+;
+;	R0 = Status code
+;
+;	R1 is destroyed.
+;-
+NET$DECLARE_PSI::
+	PUSHR	#^M<R7,R8>		; Save registers
+	;
+	;   If X.25 datalink mapping is enabled (by the presence of
+	;   the EXECUTOR SUBADDRESSES parameter), then notify PSI that
+	;   we want to handle a given range of incoming calls.
+	;
+	$GETFLD	lni,l,sad		; Subaddresses specified?
+	BLBS	R0,10$			; Branch if specified
+	TSTL	CURRENT_SAD		; Are we declared right now?
+	BEQL	5$			; If not, then nothing to worry about
+	BSBW	UNDECLARE_PSI		; Remove existing declaration
+5$:	MOVL	#1,R0			; No subaddress - exit successful
+	BRW	90$
+	;
+	;   If it hasn't changed, then don't bother to do anything
+	;   (this prevents excessive QIOs when the network manager
+	;   is constantly changing an executor parameter).
+	;
+10$:	CMPL	R8,CURRENT_SAD		; Different than current declaration?
+	BEQL	5$			; Branch if not
+	;
+	;   Remote the existing subaddress declaration.  This can only
+	;   be done by deassigning the PSI channel, and reassigning it.
+	;
+	TSTL	CURRENT_SAD		; Are we declared right now?
+	BEQL	15$			; Branch if not
+	BSBW	UNDECLARE_PSI		; Undeclare the subaddress declaration
+	;
+	;   Tell PSI that we want to handle the given range of calls
+	;
+15$:	MOVW	R8,-(SP)		; Push lowest subaddress
+	MOVW	#PSI$C_NTD_SALO,-(SP)	; Push item identifier
+	MOVW	#6,-(SP)		; Push length of item
+	ASHL	#-16,R8,R0		; Get high order word
+	MOVW	R0,-(SP)		; Push highest subaddress
+	MOVW	#PSI$C_NTD_SAHI,-(SP)	; Push item identifier
+	MOVW	#6,-(SP)		; Push length of item
+	PUSHL	#^A"25L3"		; Push the string "X25L3"
+	MOVB	#^A"X",-(SP)
+	MOVB	#5,-(SP)		; Push byte count of X25L3 string
+	MOVW	#PSI$C_NTD_ACCLVL,-(SP)	; Push item identifier
+	MOVW	#10,-(SP)		; Push item length
+	PUSHL	SP			; Construct descriptor of NTD
+	PUSHL	#22
+	CLRL	-(SP)			; Construct NFB
+	MOVB	#NFB$C_DECLNAME,-(SP)
+	PUSHL	SP			; Construct descriptor of NFB
+	PUSHL	#5
+	TSTW	NET$GW_X25_CHAN		; Have we tried to talk to PSI yet?
+	BNEQ	30$			; If so, proceed
+	BSBW	NET$GET_X25_CHAN	; If not, try to grab PSI mutex
+	BLBC	R0,50$			; Exit if error detected
+30$:	TSTW	PSI_DECL_CHAN		; Is there a "declare channel" to PSI?
+	BNEQ	40$			; Branch if so
+	$ASSIGN_S CHAN=PSI_DECL_CHAN,-	; Assign a channel to PSI
+		DEVNAM=NET$GQ_X25_DEV,-
+		MBXNAM=NET$GQ_MBX_NAME
+	BLBC	R0,50$			; Branch if unsuccessful
+40$:	MOVL	SP,R0			; Point to NFB descriptor
+	MOVAB	8+5(SP),R1		; Point to NTD descriptor
+	$QIOW_S	CHAN=PSI_DECL_CHAN,-	; Tell PSI to send us X.25 calls
+		FUNC=#IO$_ACPCONTROL,-
+		IOSB=IOSB,-
+		P1=(R0),-		; Address of NFB descriptor
+		P2=R1			; Address of NTD descriptor
+	BLBC	R0,50$			; Branch if request failed
+	MOVZWL	IOSB,R0			; Get I/O status
+	BLBC	R0,50$			; Branch if I/O failed
+	MOVL	R8,CURRENT_SAD		; Store current subaddress declaration
+50$:	ADDL	#8+5+8+22,SP		; Deallocate NFB and NTD
+90$:	POPR	#^M<R7,R8>		; Restore registers
+	RSB				; Exit with status
+
+	.SBTTL	UNDECLARE_PSI - Remove PSI declaration
+;+
+; UNDECLARE_PSI - Remove PSI subaddress declarations
+;
+; With the PSI software as it exists, the only method of removing a
+; subaddress declaration is to deassign the PSI channel.  This may
+; disrupt activity on the associated mailbox, but that's ok, since
+; the system manager must expect some disruption when the subaddress
+; range is changed.  We leave the channel deassigned, rather than
+; re-assigning it, since there may no longer be any need to have a
+; PSI channel if there are no more X.25 circuits, and the subaddress
+; parameter has been removed.  If there is a future need for a PSI
+; channel, it will be assigned just before using it.
+;
+; Inputs:
+;
+;	None
+;
+; Outputs:
+;
+;	None
+;-
+UNDECLARE_PSI:
+	$DASSGN_S CHAN=PSI_DECL_CHAN	; Remove X.25 declaration
+	CLRW	PSI_DECL_CHAN		; Indicate channel no longer active
+	CLRL	CURRENT_SAD		; Indicate nothing declared
+	RSB
+
+	.SBTTL	UPDATE_DATABASE - Update non-paged control blocks
+;+
+; UPDATE_DATABASE - Update nonpaged control blocks
+;
+; This routine updates/replaces the nonpaged control blocks as a result
+; of a change to the executor database.
+;
+; Inputs:
+;
+;	R11 = LNI CNR address
+;	R10 = New LNI CNF address
+;	R8 = RCB address
+;	R6 = Address of LNI nonpaged copy
+;
+; Outputs:
+;
+;	R0 = Status code
+;-
+	.SAVE_PSECT
+	.PSECT	NET_LOCK_CODE,NOWRT,GBL
+
+UPDATE_DATABASE:			; Build non-paged control blocks
+
+	LTB	=  0
+	NDC	=  4
+	LPD	=  8
+	OA	= 12
+	ADJ	= 16
+	AOA	= 20
+
+20$:	PUSHL	#1			; Mark end of deallocation list
+	CLRQ	-(SP)			; Initialize storeage on stack for
+	CLRQ	-(SP)			; new vector block addresses
+	CLRQ	-(SP)
+	;
+	;
+	;   Allocate and initialize whatever new control blocks are needed.
+	;   These blocks cannot replace the old ones until the last operation
+	;   which may possibly end in error has been performed.
+	;
+	;   Wherever possible, if an error condition arizes, the bit i.d. of
+	;   the LNI parameter is returned in R9 and the error code in R0.
+	;
+	;
+	BSBW	BUILD_LTB		; Build a new LTB
+	BLBC	R0,50$			; Br on error
+	MOVL	R2,LTB(SP)		; Store the new LTB address
+	BSBW	BUILD_NDC		; Else build a new vector
+	BLBC	R0,50$			; Br on error
+	MOVL	R2,NDC(SP)		; Save its address
+	BSBW	BUILD_LPD		; Build the LPD vector
+	BLBC	R0,50$			; Br on error
+	MOVL	R2,LPD(SP)		; Store the LPD vector address
+	BSBW	BUILD_OA		; Build OA vector
+	BLBC	R0,50$			; Br on error
+	MOVL	R2,OA(SP)		; Save its address
+	BSBW	BUILD_ADJ		; Build the ADJ block vector
+	BLBC	R0,50$			; Br on error
+	MOVL	R2,ADJ(SP)		; Store the ADJ block vector address
+	BSBW	BUILD_AOA		; Build AOA vector
+	BLBC	R0,50$			; Br on error
+	MOVL	R2,AOA(SP)		; Save its address
+	;
+	;   Process the event
+	;
+	MOVL	ACP_L_EVT,R1		; Get the event
+	PUSHR	#^M<R6,R8,R10,R11>	; Save regs
+	BSBW	PROC_EVT		; Process event indicated in R1
+	POPR	#^M<R6,R8,R10,R11>	; Restore regs
+	BLBC	R0,50$			; If LBC then event was aborted
+	;
+	;   Attach new control blocks to the RCB.  Get the data base mutex
+	;   and raise IPL to synchronize with NETDRIVER.
+	;
+	CALLS	#0,LOCK_IODB		; Get mutex
+	MOVL	SP,R9			; Save pointer to vector of blocks
+	DSBINT	#NET$C_IPL		; Raise IPL
+	BSBB	REPLACE			; Replace old blocks with new blocks
+	ENBINT				; Restore IPL
+	PUSHL	R0			; Save status
+	CALLS	#0,UNLOCK_IODB		; Unlock the database
+	POPL	R0			; Restore status
+	;
+	;
+	;   Deallocate old or unused control blocks
+	;
+	;
+50$:	MOVL	R0,R7			; Save error code
+100$:	POPL	R0			; Get next block
+	BEQL	100$			; If EQL then try next entry
+	BLBS	R0,200$			; If LBS then at end of list
+	BSBW	NET$DEALLOCATE		; Deallocate the block pointed to by R0
+	BRB	100$			; Loop
+200$:	MOVL	R7,R0			; Restore error code
+	RSB
+
+REPLACE:
+	;
+	;
+	;   Attach new LTB vector
+	;
+	;
+	MOVL	LTB(R9),R5		; Get new LTB address
+	BEQL	100$			; Branch if no new LTB to insert
+	MOVL	RCB$L_PTR_LTB(R8),R4	; Get old LTB address
+	MOVL	R5,RCB$L_PTR_LTB(R8)	; Attach new LTB
+	MOVL	R4,LTB(R9)		; Get old LTB address for deallocation
+	BEQL	100$			; Br if none
+	MOVL	LTB$L_XWB(R4),LTB$L_XWB(R5) ; Fix up the linkage
+	MOVZWL	LTB$W_SLT_TOT(R4),R0	; Get number of slots to copy
+	MULL	#4,R0			; Get number of bytes to copy
+	MOVC3	R0,LTB$L_SLOTS+4(R4),-	; Copy the slots starting at slot #1
+		   LTB$L_SLOTS+4(R5)	; (slot #0 always contains a zero)
+100$:	;
+	;
+	;   Attach new NDC vector
+	;
+	;
+	MOVL	NDC(R9),R5		; Get new NDC address
+	BEQL	120$			; Branch if no new NDC block to insert
+	MOVL	RCB$L_PTR_NDC(R8),R4	; Get old NDC address
+	MOVL	R5,RCB$L_PTR_NDC(R8)	; Attach new NDC
+	MOVL	R4,NDC(R9)		; Copy old NDC address for deallocation
+	BEQL	120$			; Br if none
+	MOVZWL	RCB$W_MAX_ADDR(R8),R0	; Get number of cells to copy
+	MULL	#NDC$C_LENGTH,R0	; Get number of bytes to copy
+	MOVC3	R0,12(R4),12(R5)	; Copy valid cells, now that
+					; NETDRIVER is interlocked
+120$:	;
+	;
+	;   Attach new LPD vector
+	;
+	;
+	MOVL	LPD(R9),R5		; Get new LPD vector
+	BEQL	135$			; If none, then leave LPD vector alone
+	MOVL	RCB$L_PTR_LPD(R8),R4	; Get old LPD vector address
+	BEQL	130$			; Branch if none
+	SUBL	#8,R4			; Get address of real LPD vector
+130$:	MOVL	R4,LPD(R9)		; Copy old LPD vector address
+					; for later deallocation
+	MOVAB	8(R5),RCB$L_PTR_LPD(R8) ; Attach new LPD vector
+	TSTL	R4			; Any old LPD vector?
+	BEQL	135$			; If not, skip copy
+	MOVZBL	RCB$B_MAX_LPD(R8),R0	; Get old number of LPDs
+	MULL	#4,R0			; Compute size of old LPD vector
+	MOVC	R0,12(R4),12(R5)	; Copy valid pointers, now that
+					; NETDRIVER is interlocked
+	
+135$:	;
+	;
+	;   Attach local LPD block to new LPD vector
+	;
+	;
+	MOVL	NET$GL_LOC_LPD,R3	; Get address of local LPD
+	MOVL	#LPD$C_LOC_INX,R1	; Get local LPD index
+	MOVL	R3,@RCB$L_PTR_LPD(R8)[R1] ; Store address into new LPD vector
+	;
+	;
+	;   Attach new OA vector
+	;
+	;
+	MOVL	OA(R9),R5		; Get new OA address
+	BEQL	140$			; Branch if no new OA to insert
+	MOVL	RCB$L_PTR_OA(R8),R4	; Get old OA vector address
+	BEQL	138$			; Branch if none
+	SUBL	#12,R4			; Get address of real OA vector
+138$:	MOVAB	12(R5),RCB$L_PTR_OA(R8)	; Point to first entry in vector
+	MOVL	R4,OA(R9)		; Copy old OA vector address
+	BEQL	139$			; for later deallocation
+	MOVZWL	RCB$W_MAX_ADDR(R8),R0	; Get number of cells to copy
+	MULL	#2,R0			; Compute number of bytes to copy
+	MOVC3	R0,12(R4),12(R5)	; Copy valid cells, now that
+					; NETDRIVER is interlocked
+139$:	;
+	;   Update path descriptor to local node
+	;
+	EXTZV	#TR4$V_ADDR_DEST,-	; Get old local address
+		#TR4$S_ADDR_DEST,RCB$W_ADDR(R8),R0
+	CLRB	@RCB$L_PTR_OA(R8)[R0]	; Make unreachable in case local the
+					; local address is being changed
+	EXTZV	#TR4$V_ADDR_DEST,-	; Get old local alias address
+		#TR4$S_ADDR_DEST,RCB$W_ALIAS(R8),R0
+	CLRB	@RCB$L_PTR_OA(R8)[R0]	; Make unreachable in case local the
+					; alias is being changed
+	MOVL	#LPD$C_LOC_INX,R1	; Get local LPD/ADJ index
+	MOVW	R1,@RCB$L_PTR_OA(R8)	; Node "0" is a synonym for the local address
+	EXTZV	#TR4$V_ADDR_DEST,-	; Get new local address
+		#TR4$S_ADDR_DEST,LNI$W_ADD(R6),R0
+	MOVW	R1,@RCB$L_PTR_OA(R8)[R0] ; Point OA for local node to local LPD
+	EXTZV	#TR4$V_ADDR_DEST,-	; Get new local alias address
+		#TR4$S_ADDR_DEST,LNI$W_ALI(R6),R0
+	BEQL	140$			; Skip if no alias specified
+	MOVW	R1,@RCB$L_PTR_OA(R8)[R0] ; Point OA for alias node to local LPD
+140$:	;
+	;   Attach new AOA vector
+	;
+	MOVL	AOA(R9),R5		; Get new AOA address
+	BEQL	144$			; Branch if no new OA to insert
+	MOVL	RCB$L_PTR_AOA(R8),R4	; Get old AOA vector address
+	BEQL	142$			; Branch if none
+	SUBL	#12,R4			; Get address of real AOA vector
+142$:	MOVAB	12(R5),RCB$L_PTR_AOA(R8) ; Point to first entry in vector
+	MOVL	R4,AOA(R9)		; Copy old AOA vector address
+	BEQL	143$			; for later deallocation
+	MOVZBL	RCB$B_MAX_AREA(R8),R0	; Get number of cells to copy
+	MULL	#2,R0			; Compute number of bytes to copy
+	MOVC3	R0,12(R4),12(R5)	; Copy valid cells, now that
+					; NETDRIVER is interlocked
+143$:	;
+	;   Update path descriptor to local area
+	;
+	EXTZV	#TR4$V_ADDR_AREA,-	; Get old local area
+		#TR4$S_ADDR_AREA,RCB$W_ADDR(R8),R0
+	CLRB	@RCB$L_PTR_AOA(R8)[R0]	; Make unreachable in case local the
+					; local address is being changed
+	EXTZV	#TR4$V_ADDR_AREA,-	; Get new local area
+		#TR4$S_ADDR_AREA,LNI$W_ADD(R6),R0
+	MOVL	#LPD$C_LOC_INX,R1	; Get local LPD/ADJ index
+	MOVW	R1,@RCB$L_PTR_AOA(R8)[R0] ; Point AOA for local area to local LPD
+	MOVW	R1,@RCB$L_PTR_AOA(R8)	; Area "0" is a synonym for the local area
+144$:	;
+	;   Attach new ADJ block vector
+	;
+	MOVL	ADJ(R9),R5		; Get new ADJ address
+	BEQL	149$			; Branch if no new ADJ to insert
+	MOVL	RCB$L_PTR_ADJ(R8),R4	; Get old ADJ block vector address
+	BEQL	145$			; Branch if none
+	SUBL	#8,R4			; Get address of real ADJ vector
+145$:	MOVL	R4,ADJ(R9)		; Copy old ADJ vector address
+					; for later deallocation
+	MOVAB	8(R5),RCB$L_PTR_ADJ(R8) ; Point to first entry in vector
+	TSTL	R4			; Any old ADJ vector?
+	BEQL	149$			; Branch if not
+	MOVZWL	RCB$W_MAX_ADJ(R8),R1	; Get previous number of ADJ slots
+	MULL	#ADJ$C_LENGTH,R1	; Compute # bytes which are still valid
+	MOVL	4(R4),R0		; Get old number of adjacencies in block
+	MOVAL	12(R4)[R0],R0		; Point to first old ADJ(1)
+	MOVL	4(R5),R2		; Get number of new adjacencies in block
+	MOVAL	12(R5)[R2],R2		; Point to first new ADJ(1)
+	MOVC	R1,(R0),(R2)		; Copy old adjacencies to new
+149$:	;
+	;   Initialize local adjacency block
+	;
+	TSTL	RCB$L_PTR_ADJ(R8)	; Is there an ADJ vector?
+	BEQL	150$			; Skip if none
+	MOVL	#LPD$C_LOC_INX,R0	; Get local ADJ index
+	MOVL	@RCB$L_PTR_ADJ(R8)[R0],R0 ; Get local ADJ address
+	MOVW	#32767,ADJ$W_BUFSIZ(R0)	; Remove restrictions on block size
+	MOVB	#ADJ$M_INUSE!ADJ$M_RUN,-	; Set slot in use
+		ADJ$B_STS(R0)			; and mark it up
+	MOVB	LNI$B_ETY(R6),ADJ$B_PTYPE(R0)	; Set executor node type
+	MOVW	LNI$W_ADD(R6),ADJ$W_PNA(R0)	; Set new local address
+	MOVB	#LPD$C_LOC_INX,ADJ$B_LPD_INX(R0); Set LPD index of circuit
+150$:	MOVB	#1,R0			; Set success flag
+	RSB				; Done
+
+	.RESTORE_PSECT
+
+	.SBTTL	BUILD_LTB - Build logical link table
+;+
+; BUILD_LTB	- Build Logical Link Table
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; The LTB contains a vector of pointers to the logical link context blocks
+; (XWBs).  When a given cell in the dispatch vector is not pointing to an XWB
+; its low bit is set and its high word contains the last 'address' to be used
+; for this slot. 
+;
+; The low order portion of a link 'address' is its index into the vector.  The
+; high order portion is a sequence number used to prevent cross-talk between
+; links when the slots are reused.
+;
+; The first slot in the vector corresonds to link index zero and is unused.
+; The vector is terminated with a longword -1 followed by a longword zero.
+; This is done in order to allow NETDRIVER to optimize its search for a 
+; free vector slot.
+;
+; The total number of slots in the vector is greater than the maximum number
+; of allowed links in order to prevent sequence numbers from cycling too
+; rapidly when the current number of links is close to the maximum number of
+; links.  This assumes that links slots are assigned in round-robin fashion
+; rather than first-available-first-used starting from the top.
+;
+; If there is no current LTB, or if the old LTB is too small to support the
+; maximum links, then a new table is allocated and initialized.
+;
+; INPUTS:	R10	Ptr to new LNI CNF
+;		R8	Ptr to RCB
+;		R6	Ptr to start of non-pageable new LNI image
+;		R5-R0	Scratch
+;
+; OUTPUTS:	R11,R10	Preserved
+;		R9	Bit i.d. used to qualify the error
+;		R8-R6	Preserved
+;		R2	New LTB pointer or zero if no new LTB needed
+;			Invalid if R0 has low bit clear.
+;		R0	Status
+;
+;-
+BUILD_LTB:				; Build logical link table
+	CLRL	R2			; Assume no new LTB is needed
+	MOVZWL	LNI$W_MLK(R6),R5	; Get new max links
+	ADDL	#NSP$C_EXT_LNK,R5	; Add in extra slots
+	MOVL	RCB$L_PTR_LTB(R8),R1	; Get current LTB
+	BEQL	15$			; If EQL then none
+	CMPW	R5,LTB$W_SLT_TOT(R1)	; Can current LTB be used ?
+	BLEQU	25$			; If LEQU then yes
+	;
+	;
+	;   Allocate a new LTB.  Note that the +12 below is for the two marker
+	;   slots at the end of the LTB and for slot #0 (at offset LTB$L_SLOTS)
+	;   which is not counted in LTB$W_SLT_TOT and which is never used.
+	;
+	;
+15$:	MOVAL	LTB$L_SLOTS+12(R2)[R5],R1 ; Get total LTB size - assumes R2=0
+	$CNFFLD	lni,l,mlk,R9		; Specify 'max links' in case there's
+					; insufficent memory
+	BSBW	NET$ALONPAGED		; Get buffer
+	BLBC	R0,30$			; Br if error
+	;
+	;
+	;   Initialize  LTB
+	;
+	;
+	MOVAB	LTB$L_SLOTS(R2),-	;
+		LTB$L_SLT_NXT(R2) 	; Setup "next slot" candidate
+	MOVW	R5,LTB$W_SLT_TOT(R2)	; Setup total slots - does not include
+					; the two marker slots at the end,
+					; or slot number zero.
+	CLRL	LTB$L_XWB(R2)		; Terminate the XWB chain
+	MOVAL	LTB$L_SLOTS+12(R2)[R5],R1 ; Point just past slot vector
+	CLRL	-(R1)			; End of slot marker
+	MNEGL	#1,-(R1)		; End of slot marker
+20$:	MOVW	R5,-(R1)		; Enter slot index value
+	MOVW	#1,-(R1)		; Enter slot available flag
+	SOBGTR	R5,20$			; Continue for entire vector
+	CLRL	-(R1)			; Slot zero is not usable
+	MOVL	R2,R1			; Copy LTB pointer
+25$:	MOVW	LNI$W_MLK(R6),-		; Setup the number of slots that may be
+		LTB$W_SLT_LMT(R1)	; in use at any given time.
+	MOVB	#1,R0			; Set low bit for success
+30$:	RSB
+
+	.SBTTL	BUILD_LPD - Build the LPD vector
+;+
+; BUILD_LPD	- Build the LPD vector
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; The maximum allowed datalinks can be modified only if the there is no current
+; LPD vector.  This restriction may be relaxed in future releases.
+;
+; The LPD vector is allocated and intialized.
+;
+; INPUTS:	R10	Ptr to new LNI CNF
+;		R8	Ptr to RCB
+;		R6	Ptr to start of non-pageable new LNI image
+;		R5-R0	Scratch
+;
+; OUTPUTS:	R11,R10	Preserved
+;		R9	LNI bit i.d. used to qualify any errors
+;		R8-R6	Preserved
+;		R2	New LPD pointer or zero if no new LPD needed
+;			Invalid if R0 has low bit clear.
+;		R0	Status
+;
+;-
+BUILD_LPD:				; Build LPD vector
+	MOVB	#1,R0			; Assume no new LPD is needed
+	CLRL	R2			;   "	 "   "	 "   "	 "
+	MOVZBL	LNI$B_MLN(R6),R5	; Get maximum lines (circuits) allowed
+	INCL	R5			; Add one for local LPD
+	CMPB	R5,RCB$B_MAX_LPD(R8)	; Same as current maximum?
+	BEQL	90$			; If so, then nothing to do
+	BGTR	10$			; Branch if increasing size
+	TSTL	RCB$L_PTR_LPD(R8)	; Is there a current LPD vector?
+	BEQL	10$			; If none, then go ahead
+	MOVZBL	RCB$B_MAX_LPD(R8),R1	; Get current number of LPDs
+	SUBL3	R5,R1,R3		; Get number of LPDs to be removed
+5$:	TSTL	@RCB$L_PTR_LPD(R8)[R1]	; Is LPD slot in use?
+	BGEQ	8$			; OK if slot not in use
+	MOVZWL	#SS$_WRITLCK,R0		; Error - cannot remove active slot
+	$CNFFLD	lni,l,mln,R9		; Set qualifying parameter
+	BRB	90$			; Return with error
+8$:	DECL	R1			; Decrement LPD index
+	SOBGTR	R3,5$			; Loop thru all LPDs to be removed
+	MOVL	#1,R0			; It's ok - current block can be used
+	BRB	90$			; Exit with success
+
+10$:	MOVZBL	#4,R4			; Specify cell size
+	BSBW	COM_BLD_CO		; Allocate and init LPD
+	;
+	;
+	;   The following code is executed for each cell in the vector
+	;
+	;	R4  Cell address
+	;	R5  Cell index	- there is no cell with index zero
+	;
+	;
+	ADDW3	#^X<0100>,R5,(R4)	; Store current path index & seq. no
+90$:	RSB
+
+	.SBTTL	BUILD_ADJ - Build the ADJ vector
+;+
+; BUILD_ADJ	- Build the ADJ vector
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; The maximum allowed adjacencies can be modified only if the there is no
+; current ADJ vector.  This restriction may be relaxed in future releases.
+;
+; The ADJ vector is allocated and intialized.
+;
+; INPUTS:	R10	Ptr to new LNI CNF
+;		R8	Ptr to RCB
+;		R6	Ptr to start of non-pageable new LNI image
+;		R5-R0	Scratch
+;
+; OUTPUTS:	R11,R10	Preserved
+;		R9	LNI bit i.d. used to qualify any errors
+;		R8-R6	Preserved
+;		R2	New LPD pointer or zero if no new LPD needed
+;			Invalid if R0 has low bit clear.
+;		R0	Status
+;
+;-
+BUILD_ADJ:				; Build ADJ vector
+	MOVB	#1,R0			; Assume no new structure is needed
+	CLRL	R2			;   "	 "   "	 "   "	 "
+	MOVZBL	LNI$B_MLN(R6),R5	; Get maximum circuits allowed
+	INCL	R5			; Add one for local LPD
+	ADDW	LNI$W_MBR(R6),R5	; Add number of broadcast routers
+	ADDW	LNI$W_MBE(R6),R5	; Add number of broadcast endnodes
+	CMPW	R5,RCB$W_MAX_ADJ(R8)	; Same as current maximum?
+	BEQL	90$			; If so, then nothing to do
+	BGTR	10$			; Branch if increasing size
+	TSTL	RCB$L_PTR_ADJ(R8)	; Is there a current ADJ vector?
+	BEQL	10$			; If none, then go ahead
+	MOVZWL	RCB$W_MAX_ADJ(R8),R1	; Get current number of ADJs
+	SUBL3	R5,R1,R3		; Get number of ADJs to be removed
+5$:	MOVL	@RCB$L_PTR_ADJ(R8)[R1],R0 ; Get ADJ address
+	BBC	#ADJ$V_INUSE,ADJ$B_STS(R0),8$ ; OK if slot not in use
+	MOVZWL	#SS$_WRITLCK,R0		; Error - cannot remove active slot
+	$CNFFLD	lni,l,mbr,R9		; Set qualifying parameter
+	BRB	90$			; Return with error
+8$:	DECL	R1			; Decrement ADJ index
+	SOBGTR	R3,5$			; Loop thru all ADJs to be removed
+	MOVL	#1,R0			; It's ok - current block can be used
+	BRB	90$			; Exit with success
+
+10$:	MOVZBL	#ADJ$C_LENGTH,R4	; Specify cell size
+	MULL3	R5,R4,R1		; Get total vector size
+	MULL3	R5,#4,R0		; Compute size of pointer vector
+	MOVAB	12(R1)[R0],R1		; Add in VMS header + pointer vector
+	PUSHL	R1			; Save it
+	BSBW	NET$ALONPGD_Z		; Allocate and zero the block
+	POPL	R1			; Restore R1
+	BLBC	R0,90$			; Br on error
+	MOVL	R4,(R2)			; Save size of each cell
+	MOVL	R5,4(R2)		; Save number of adjacencies in vector
+	MOVAL	12(R2)[R5],R3		; Point to last pointer + 1
+	MOVAB	(R2)[R1],R0		; Get ptr to first byte past last cell
+	TSTL	R5			; Any cells ?
+	BEQL	40$			; If so, continue 
+30$:	SUBL	R4,R0			; Skip to next block
+	MOVL	R0,-(R3)		; Initialize pointer to actual block
+	SOBGTR	R5,30$			; Loop for each cell
+40$:	MOVL	#1,R0			; Indicate success
+90$:	RSB				; Return to his caller
+
+	.SBTTL	BUILD_NDC - Build the Node counter vector
+;+
+; BUILD_NDC	- Build the Node counter vector
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; If the maximum node address is being increased then a new vector must be
+; allocated.
+;
+; INPUTS:	R10	Ptr to new LNI CNF
+;		R8	Ptr to RCB
+;		R6	Ptr to start of non-pageable new LNI image
+;		R5-R0	Scratch
+;
+; OUTPUTS:	R11,R10	Preserved
+;		R9	LNI field bit i.d. used to qualify any errors
+;		R8-R6	Preserved
+;		R2	New NDC vector pointer or zero if new one isn't needed
+;			Invalid if R0 has low bit clear.
+;		R0	Status
+;
+BUILD_NDC:				; Build node counter vector
+	MOVZWL	LNI$W_MAD(R6),R5	; Get new max address
+	MOVL	#NDC$C_LENGTH,R4	; Get size of each cell
+	MOVB	#1,R0			; Assume new NDC vector is not needed
+	CLRL	R2			;   "	  "   "	   "	 "  "	  "
+	MOVL	RCB$L_PTR_NDC(R8),R1	; Get current NDC vector
+	BEQL	10$			; If EQL then none
+	CMPW	RCB$W_MAX_ADDR(R8),R5	; Can this NDC vector be used?
+	BGEQU	20$			; If GEQU then yes
+10$:	INCL	R5			; Account for cell with index 0
+	BSBW	COM_BLD_CO		; Allocate and init the vector 
+	;
+	;
+	;   The following code is called once for each cell in the vector
+	;   with:
+	;
+	;	R5  Cell index	- there is an index 0
+	;	R4  Cell address
+	;
+	;
+	MOVL	G^EXE$GL_ABSTIM,-	; Enter time last zeroed
+		NDC$L_ABS_TIM(R4)
+20$:	RSB
+
+	.SBTTL	BUILD_OA - Build Output Adjacency Vector
+;+
+; BUILD_OA	- Build Output Adjacency Vector
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; The Output Adjacency Vector is used to determine the default adjacency to
+; be used to get to  a given node.  The index is the node address, the vector
+; cell contains the ADJ index.  The first vector cell corresponds to node
+; address 0.
+;
+; A new OA vector must be allocated whenever the maximum supported node address
+; is increased.
+;
+; INPUTS:	R10	Ptr to new LNI CNF
+;		R8	Ptr to RCB
+;		R6	Ptr to start of non-pageable new LNI image
+;		R5-R0	Scratch
+;
+; OUTPUTS:	R11,R10	Preserved
+;		R9	Bit i.d. used to qualify any errors
+;		R8-R6	Preserved
+;		R2	New LTB pointer or zero if no new LTB needed
+;			Invalid if R0 has low bit clear.
+;		R0	Status
+;
+;-
+BUILD_OA:				; Init Output Adjacency vector
+	CLRL	R2			; Assume no new vector is needed
+	MOVB	#1,R0			;    "    "  "     "    "   "
+	MOVZWL	LNI$W_MAD(R6),R5	; Get number of vector cells required
+	INCL	R5			; Add one for OA(0)
+	MOVL	#2,R4			; Indicate cell size
+	MOVL	RCB$L_PTR_OA(R8),R1	; Get current vector
+	BEQL	10$			; If EQL then none
+	CMPW	RCB$W_MAX_ADDR(R8),R5	; Can this vector be used ?
+	BGEQU	20$			; If GEQU then yes
+	$CNFFLD	lni,l,mad,R9		; Further errors would be due to not 
+					; enough memory left since 'max addr'
+					; is too large
+10$:	BSBW	COM_BLD_CO		; Call co-routine to allocate block
+	;
+	;
+	;   The following code is executed for each vector cell with:
+	;
+	;	R5  Cell index	- there is no index 0
+	;	R4  Cell address
+	;
+	;
+20$:	RSB				; There is no cell intialization 
+					; required.
+
+	.SBTTL	BUILD_AOA - Build Area Output Adjacency Vector
+;+
+; BUILD_AOA	- Build Area Output Adjacency Vector
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; The Area Output Adjacency Vector is used to determine the default adjacency to
+; be used to get to a given area.  The index is the area address, the vector
+; cell contains the ADJ index.  The first vector cell corresponds to area
+; number 0.
+;
+; A new AOA vector must be allocated whenever the maximum supported area address
+; is increased.
+;
+; INPUTS:	R10	Ptr to new LNI CNF
+;		R8	Ptr to RCB
+;		R6	Ptr to start of non-pageable new LNI image
+;		R5-R0	Scratch
+;
+; OUTPUTS:	R11,R10	Preserved
+;		R9	Bit i.d. used to qualify any errors
+;		R8-R6	Preserved
+;		R2	New LTB pointer or zero if no new LTB needed
+;			Invalid if R0 has low bit clear.
+;		R0	Status
+;
+;-
+BUILD_AOA:				; Init Area Output Adjacency vector
+	CLRL	R2			; Assume no new vector is needed
+	MOVB	#1,R0			;    "    "  "     "    "   "
+	CMPB	LNI$B_ETY(R6),#ADJ$C_PTY_AREA ; Are we an area router?
+	BNEQ	20$			; If not, don't create any AOA
+	MOVZBL	LNI$B_MAR(R6),R5	; Get number of vector cells required
+	INCL	R5			; Add one for AOA(0)
+	MOVL	#2,R4			; Indicate cell size
+	MOVL	RCB$L_PTR_AOA(R8),R1	; Get current vector
+	BEQL	10$			; If EQL then none
+	CMPB	RCB$B_MAX_AREA(R8),R5	; Can this vector be used ?
+	BGEQU	20$			; If GEQU then yes
+	$CNFFLD	lni,l,mar,R9		; Further errors would be due to not 
+					; enough memory left since 'max area'
+					; is too large
+10$:	BSBW	COM_BLD_CO		; Call co-routine to allocate block
+	;
+	;
+	;   The following code is executed for each vector cell with:
+	;
+	;	R5  Cell index	- there is no index 0
+	;	R4  Cell address
+	;
+	;
+20$:	RSB				; There is no cell intialization 
+					; required.
+
+	.SBTTL	COM_BLD_CO - Common build vector co-routine
+;+
+; COM_BLD_CO	- Common build vector co-routine.
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine allocates a zeroed block of non-paged pool to be used as a
+; vector of cells.  The calling routine is returned to for each cell in the
+; vector. 
+;
+; Note that this routine is not a co-routine in the true sense of the word.
+; After the last cell is initialized, the return is to the caller's caller.
+;
+; INPUTS:	R5	Number of cells
+;		R4	Cell size
+;
+; CALL BACK:	R5	Cell index (assumes first index is zero)
+;		R4	Pointer to cell
+;		R3	Scratch
+;		R2	Vector address
+;		R1	Scratch
+;		R0	Scratch
+;
+; OUTPUTS:	R2	Vector address if successful
+;		R0	Status
+;-
+COM_BLD_CO:				; Common build vector co-routine
+	MULL3	R5,R4,R1		; Get total vetor size
+	ADDL	#12,R1			; Add in standard VMS header
+	PUSHL	R1			; Save it
+	BSBW	NET$ALONPGD_Z		; Allocate and zero the block
+	POPL	R1			; Restore R1
+	BLBC	R0,30$			; Br on error
+	MOVZWL	R4,(R2)			; Save cell size
+	MOVZWL	R5,4(R2)		; Save number of cells
+	MOVAB	(R2)[R1],R4		; Get ptr to first byte past last cell
+	TSTL	R5			; Any cells ?
+	BEQL	20$			; If so, continue 
+10$:	SUBL	(R2),R4			; Advance to top of cell
+	JSB	@(SP)			; Call back caller - note not (SP)+
+	SOBGTR	R5,10$			; Loop for each cell
+20$:	MOVL	#1,R0			; Indicate success
+30$:	TSTL	(SP)+			; Pop caller's address
+	RSB				; Return to his caller
+
+.END	NET$INITIALIZE

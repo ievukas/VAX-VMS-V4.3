@@ -1,0 +1,483 @@
+MODULE GETREQ (
+		LANGUAGE (BLISS32),
+		IDENT = 'V04-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 1
+!
+! ABSTRACT:
+!
+!	This routine gets the next I/O request from the ACP queue.
+!	If no requests are queued, it hibernates.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines. This routine must be called
+!	in kernel mode.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  19-Dec-1976  17:26
+!
+! MODIFIED BY:
+!
+!	V03-012	CDS0008		Christian D. Saether	29-July-1984
+!		Reflect the addition of a fourth buffer pool.
+!
+!	V03-011	CDS0007		Christian D. Saether	 8-July-1984
+!		Break up routine into more blocks with their own
+!		bind_common declaration so compiler does not
+!		generate so many cse pointers.
+!
+!	V03-010	ACG0424		Andrew C. Goldstein,	26-Apr-1984  21:50
+!		Don't convert BYPASS to SYSPRV in building LOCAL_ARB;
+!		include READALL in CLF_SYSPRV.
+!
+!	V03-009	LMP0221		L. Mark Pilant,		27-Mar-1984  13:22
+!		Change UCB$L_OWNUIC to ORB$L_OWNER and UCB$W_VPROT to
+!		ORB$W_PROT.
+!
+!	V03-008	ACG0408		Andrew C. Goldstein,	20-Mar-1984  16:13
+!		Reduce size of LOCAL_ARB
+!
+!	V03-007	CDS0006		Christian D. Saether	13-Feb-1984
+!		Do not initialize BUFFER_NEW anymore - it's gone.
+!
+!	V03-006	CDS0005		Christian D. Saether	19-Dec-1983
+!		Use BIND_COMMON macro to reduce number of
+!		external declarations.
+!		Move COMMON initialization and context save/restore
+!		routines here such that COMMON module contains only
+!		data declarations.
+!
+!	V03-005	CDS0004		Christian D. Saether	15-Sep-1983
+!		Call the per request init routine here only if
+!		a packet is actually present.
+!
+!	V03-004	CDS0003		Christian D. Saether	 2-Sep-1983
+!		Don't save channel ucb here.  It may have already
+!		been changed from a previous operation that got
+!		put on the queue.
+!
+!	V03-003	CDS0002		Christian D. Saether	27-Aug-1983
+!		Move get_ccb routine to inifcp module.  Use IO_CCB
+!		instead of calling get_ccb.
+!
+!	V03-002	CDS0001		C Saether		18-Jul-1982
+!		Changes to support procedure based file system.
+!
+!	V03-001	LMP0037		L. Mark Pilant,		28-Jun-1982  15:10
+!		Remove the addressing mode module switch.
+!
+!	V02-008	LMP0003		L. Mark Pilant,		 9-Dec-1981  13:30
+!		Make external references use general mode addressing
+!
+!	V02-007	ACG38100	Andrew C. Goldstein,	3-Jun-1981  12:00
+!		Fix granting of SYSPRV to volume owner
+!
+!	V02-006	ACG0167		Andrew C. Goldstein,	16-Apr-1980  19:26
+!		Previous revision history moved to F11B.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+FORWARD ROUTINE
+	INIT_COMMON	: L_NORM NOVALUE; ! initialize common
+
+
+GLOBAL ROUTINE GET_REQUEST : L_NORM =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine gets the next I/O request from the ACP queue.
+!
+! CALLING SEQUENCE:
+!	GET_REQUEST ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	XQP_QUEUE: Queue of request packets for this process
+!	IO_CHANNEL: I/O channel number
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	CURRENT_UCB: address of UCB of request
+!	CURRENT_VCB: address of VCB of request
+!	CURRENT_WINDOW: window of file if accessed
+!	PRIMARY_FCB: FCB of file if accessed
+!
+! ROUTINE VALUE:
+!	address of request I/O packet
+!	0 if no more packets.
+!
+! SIDE EFFECTS:
+!	I/O channel assigned to device of request
+!
+!--
+
+BEGIN
+
+LOCAL
+	ORB		: REF BBLOCK,	! local address of ORB
+	ABD		: REF BBLOCKVECTOR [,ABD$C_LENGTH],
+					! pointer to buffer descriptor packet
+	ARB		: REF BBLOCK,	! pointer to caller's ARB
+	PACKET		: REF BBLOCK;	! address of new I/O packet
+
+EXTERNAL
+	EXE$GL_SYSUIC	: ADDRESSING_MODE (ABSOLUTE);
+					! highest SYSTEM UIC
+
+BIND_COMMON;
+
+EXTERNAL ROUTINE
+	PMS_START	: L_NORM;	! init pms database.
+
+! Attempt to dequeue a packet. If unsuccessful, return 0.
+!
+
+IF REMQUE (.XQP_QUEUE, PACKET)
+THEN RETURN 0;
+
+! Initialize common and start pms monitering.
+!
+
+PMS_START ();
+INIT_COMMON ();
+
+! First check the type code in the packet.
+!
+
+IF .PACKET[IRP$B_TYPE] NEQ DYN$C_IRP
+THEN BUG_CHECK (NOTIRPAQB, FATAL, 'Not IRP pointer in AQB');
+
+! Set up the UCB and VCB pointers and assign the I/O channel to the UCB.
+! Check the type codes on all packets and control blocks.
+!
+
+CURRENT_UCB = .PACKET[IRP$L_UCB];
+IF .CURRENT_UCB[UCB$B_TYPE] NEQ DYN$C_UCB
+THEN BUG_CHECK (NOTUCBIRP, FATAL, 'Not UCB pointer in IRP');
+
+CURRENT_FIB = LOCAL_FIB;
+
+! Get the window and FCB addresses if there is a file open on the channel.
+! If the low bit of the window pointer is on, ignore the pointer (deaccess pending).
+!
+
+CURRENT_WINDOW = .PACKET[IRP$L_WIND];
+IF .(PACKET[IRP$L_WIND])<0,1>
+THEN CURRENT_WINDOW = 0;
+IF .(PACKET[IRP$L_WIND])<1,2> NEQ 0
+THEN BUG_CHECK (BADWCBPT, FATAL, 'Bad WCB pointer in IRP');
+
+IF .CURRENT_WINDOW NEQ 0
+THEN
+    BEGIN
+    IF .CURRENT_WINDOW[WCB$B_TYPE] NEQ DYN$C_WCB
+    THEN BUG_CHECK (NOTWCBIRP, FATAL, 'Not WCB Pointer in IRP');
+
+    IF .CURRENT_WINDOW[WCB$V_NOTFCP]
+    THEN BUG_CHECK (NOTFCPWCB, FATAL, 'Not FCP window in IRP');
+
+    CURRENT_UCB = .CURRENT_WINDOW[WCB$L_ORGUCB];
+    IF .CURRENT_UCB[UCB$B_TYPE] NEQ DYN$C_UCB
+    THEN BUG_CHECK (NOTUCBWCB, FATAL, 'Bad UCB pointer in window');
+
+    PRIMARY_FCB = .CURRENT_WINDOW[WCB$L_FCB];
+    IF .PRIMARY_FCB[FCB$B_TYPE] NEQ DYN$C_FCB
+    THEN BUG_CHECK (NOTFCBWCB, FATAL, 'Bad FCB pointer in window');
+
+    CH$MOVE (FID$C_LENGTH, PRIMARY_FCB[FCB$W_FID], LOCAL_FIB[FIB$W_FID]);
+    END;
+ORB = .CURRENT_UCB[UCB$L_ORB];
+
+CURRENT_VCB = .CURRENT_UCB[UCB$L_VCB];
+IF .CURRENT_VCB[VCB$B_TYPE] NEQ DYN$C_VCB
+THEN BUG_CHECK (NOTVCBUCB, FATAL, 'Not VCB pointer in UCB');
+
+CURRENT_RVT = .CURRENT_VCB[VCB$L_RVT];
+IF .CURRENT_RVT[RVT$B_TYPE] NEQ DYN$C_RVT
+AND .CURRENT_RVT[RVT$B_TYPE] NEQ DYN$C_UCB
+THEN BUG_CHECK (NOTRVTVCB, FATAL, 'Not RVT pointer in VCB');
+
+CURRENT_RVN = .CURRENT_VCB[VCB$W_RVN];
+
+! Stuff the UCB of the device we want into our channel.
+!
+
+IO_CCB[CCB$L_UCB] = .CURRENT_UCB;
+
+! If this is a normal file processor request (as opposed to a window turn),
+! clear the byte count in the descriptor for the channel window pointer
+! to inhibit write-back. Set the spool file bit is this is I/O to a spool file.
+! This is denoted for ACP functions by noting that IRP$L_UCB is different
+! from IRP$L_MEDIA (the latter containing the spooled device UCB address.
+!
+
+IF .PACKET[IRP$V_COMPLX]
+THEN
+    BEGIN
+    ABD = .BBLOCK [.PACKET[IRP$L_SVAPTE], AIB$L_DESCRIPT];
+    ABD[ABD$C_WINDOW, ABD$W_COUNT] = 0;
+    IF .PACKET[IRP$L_UCB] NEQ .PACKET[IRP$L_MEDIA]
+    THEN CLEANUP_FLAGS[CLF_SPOOLFILE] = 1;
+    END
+
+! If there is no buffer packet, the function must be an ACP control function.
+!
+
+ELSE
+    BEGIN
+    IF .PACKET[IRP$V_FCODE] GTRU IO$_LOGICAL
+    AND .PACKET[IRP$V_FCODE] NEQ IO$_ACPCONTROL
+    THEN BUG_CHECK (NOBUFPCKT, FATAL, 'Required buffer packet not present');
+    END;
+
+! Set the system privilege flag bit, based on the caller's UIC and
+! privileges.
+!
+
+ARB = .PACKET[IRP$L_ARB];
+CH$MOVE (ARB$C_HEADER, .ARB, LOCAL_ARB);
+IF .(ARB[ARB$L_UIC])<16,16> LEQU .EXE$GL_SYSUIC
+OR
+    BEGIN
+    IF .ARB[ARB$L_UIC] EQL .ORB[ORB$L_OWNER]
+    THEN
+	BEGIN
+	CLEANUP_FLAGS[CLF_VOLOWNER] = 1;
+	1
+	END
+    ELSE 0
+    END
+OR
+    BEGIN
+    IF (.(ARB[ARB$L_UIC])<16,16> EQL .(ORB[ORB$L_OWNER])<16,16>
+    AND .BBLOCK [LOCAL_ARB[ARB$Q_PRIV], PRV$V_GRPPRV])
+    THEN
+	BEGIN
+	CLEANUP_FLAGS[CLF_VOLOWNER] = 1;
+	CLEANUP_FLAGS[CLF_GRPOWNER] = 1;
+	1
+	END
+    ELSE 0
+    END
+THEN BBLOCK [LOCAL_ARB[ARB$Q_PRIV], PRV$V_SYSPRV] = 1;
+
+IF .BBLOCK [LOCAL_ARB[ARB$Q_PRIV], PRV$V_SYSPRV]
+OR .BBLOCK [LOCAL_ARB[ARB$Q_PRIV], PRV$V_BYPASS]
+OR .BBLOCK [LOCAL_ARB[ARB$Q_PRIV], PRV$V_READALL]
+THEN CLEANUP_FLAGS[CLF_SYSPRV] = 1;
+
+RETURN .PACKET;
+
+END;					! end of routine GETREQ
+
+ROUTINE INIT_COMMON : L_NORM NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine contains the impure data base for FCP, and is called
+!	to initialize it.
+!
+! CALLING SEQUENCE:
+!	INIT_COMMON ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	DATABASE INITIALIZED
+!
+!--
+
+BEGIN
+
+BIND_COMMON;
+
+EXTERNAL LITERAL
+	IMPURE_SIZE;
+
+LOCAL
+	BFRQ;
+
+! Initialization consists of zeroing the impure area and then setting the
+! user request status to 1 (success).
+! Also init the per-process buffer queues.  These can be moved out of
+! per-request initialized common and only initialized at process creation.
+!
+
+CH$FILL (0, IMPURE_SIZE, IMPURE_START);
+USER_STATUS[0] = 1;
+
+BFRQ = BFR_LIST;
+
+INCR POOL FROM 0 TO 3
+DO
+    BEGIN
+    .BFRQ = .BFRQ;
+    BFRQ = .BFRQ + 4;
+    .BFRQ = .BFRQ - 4;
+    BFRQ = .BFRQ + 4;
+    END;
+
+END;					! end of routine INIT_COMMON
+
+GLOBAL ROUTINE SAVE_CONTEXT : L_NORM NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine saves the reentrant context area in the context save
+!	area and initializes the context for a secondary operation.
+!
+!
+! CALLING SEQUENCE:
+!	SAVE_CONTEXT ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	ACP impure area
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+BIND_COMMON;
+
+MAP
+	CONTEXT_SAVE	: BITVECTOR;
+
+! Check for excessive recursion in the ACP; then save the context and do the
+! setup.
+!
+
+IF .CONTEXT_SAVE NEQ 0
+THEN BUG_CHECK (ACPRECURS, FATAL, 'Attempted recursion in ACP secondary operation');
+
+CH$MOVE (CONTEXT_SIZE, CONTEXT_START, CONTEXT_SAVE);
+CH$FILL (0, CONTEXT_SIZE, CONTEXT_START);
+CH$FILL (0, FIB$C_LENGTH, SECOND_FIB);
+CURRENT_FIB = SECOND_FIB;
+CONTEXT_SAVE[CLF_CLEANUP] = 1;
+
+END;					! end of routine SAVE_CONTEXT
+
+GLOBAL ROUTINE RESTORE_CONTEXT : L_NORM NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine restores the reentrant context area from the context save
+!	area.
+!
+!
+! CALLING SEQUENCE:
+!	RESTORE_CONTEXT ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	ACP impure area
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+BIND_COMMON;
+
+! Check for excessive unstacking in the ACP; then restore the context.
+!
+
+IF .CONTEXT_SAVE EQL 0
+THEN BUG_CHECK (ACPUNSTAK, FATAL, 'Attempted unstack in ACP primary context');
+
+CH$MOVE (CONTEXT_SIZE, CONTEXT_SAVE, CONTEXT_START);
+CLEANUP_FLAGS[CLF_CLEANUP] = 0;
+CONTEXT_SAVE = 0;
+
+END;					! end of routine RESTORE_CONTEXT
+
+END
+ELUDOM

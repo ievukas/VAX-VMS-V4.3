@@ -1,0 +1,356 @@
+	$BEGIN	NT0DISCON,000,NF$NETWORK,<NETWORK DISCONNECT STREAM>
+
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; Facility: RMS
+;
+; Abstract:
+;
+;	This module communicates with the File Access Listener (FAL) at the
+;	remote node to disconnect the specified record stream.
+;
+; Environment: VAX/VMS, executive mode
+;
+; Author: James A. Krycka,	Creation Date:	09-DEC-1977
+;
+; Modified By:
+;
+;	V02-020	JAK0122		J A Krycka	22-AUG-1983
+;		Unlock the remote FAL by sending a Continue Transfer interrupt
+;		message on encountering an error due to a $PUT/$WRITE failure
+;		that is reported after an Access Complete message has been sent
+;		to terminate the file transfer.
+;		Rewrite NT$LOOK_FOR_CMP routine to better handle obscure error
+;		recovery conditions.
+;		Also, move NT$RESUME_FAL routine here from NT0PUT module and
+;		modify it to return status of the interrupt I/O operation.
+;
+;--
+
+	.SBTTL	DECLARATIONS
+
+;
+; Include Files:
+;
+
+	$DAPPLGDEF			; Define DAP prologue symbols
+	$DAPHDRDEF			; Define DAP message header
+	$DAPCMPDEF			; Define DAP Access Complete message
+	$DAPCNFDEF			; Define DAP Configuration message
+	$DAPCONDEF			; Define DAP Continue Transfer message
+	$DAPDATDEF			; Define DAP Data message
+	$DAPSTSDEF			; Define DAP Status message
+	$IFBDEF				; Define IFAB symbols
+	$NWADEF				; Define Network Work Area symbols
+
+;
+; Macros:
+;
+;	None
+;
+; Equated Symbols:
+;
+
+	ASSUME	DAP$Q_DCODE_FLG EQ 0
+	ASSUME	NWA$Q_FLG EQ 0
+
+;
+; Own Storage:
+;
+;	None
+;
+
+	.SBTTL	NT$DISCONNECT - PERFORM NETWORK DISCONNECT FUNCTION
+
+;++
+;  NT$DISCONNECT - engages in a DAP dialogue with the remote FAL to disconnect
+;	the record stream.
+;
+; Calling Sequence:
+;
+;	BSBW	NT$DISCONNECT
+;
+; Input Parameters:
+;
+;	R8	RAB address
+;	R9	IRAB address
+;	R10	IFAB address
+;	R11	Impure Area address
+;
+; Implicit Inputs:
+;
+;	DAP$Q_SYSCAP
+;	DAP$V_GEQ_V42
+;	DAP$V_GEQ_V56
+;	DAP$V_VAXVMS
+;	IFB$V_SQO
+;
+; Output Parameters:
+;
+;	R0	Status code (RMS)
+;	R1-R7	Destroyed
+;	AP	Destroyed
+;
+; Implicit Outputs:
+;
+;	NWA$V_FTM_RETRV cleared
+;	NWA$V_FTM_STORE cleared
+;
+; Completion Codes:
+;
+;	Standard RMS completion codes
+;
+; Side Effects:
+;
+;	None
+;
+;--
+
+NT$DISCONNECT::				; Entry point
+	$TSTPT	NTDISCON		;
+	MOVL	IFB$L_NWA_PTR(R10),R7	; Get address of NWA (and DAP)
+
+;++
+; Build and send DAP Access Complete message to partner.
+;
+; Note:	The Access Complete message exchange sequence is skipped if the remote
+;	FAL is a nonVMS partner implemented to DAP before V5.6 (thus the record
+;	stream is not disconnected at the remote node at this time). However,
+;	these systems do not support record access mode, and for file transfer
+;	mode a close operation will follow which will implicitly disconnect
+;	the record stream.
+;--
+
+SEND_CMP:				;
+	BBS	#DAP$V_VAXVMS,(R7),10$	; Send message if partner is VAX/VMS
+	BBC	#DAP$V_GEQ_V56,(R7),SUC	;  or if partner uses DAP since V5.6
+10$:	$SETBIT	#NWA$V_LAST_MSG,(R7)	; Declare this last message to block
+	MOVL	#DAP$K_CMP_MSG,R0	; Get message type value
+	BSBW	NT$BUILD_HEAD		; Construct message header
+	MOVB	#DAP$K_DISCONN,(R5)+	; Store CMPFUNC field
+	BSBW	NT$BUILD_TAIL		; Finish building message
+	BSBW	NT$TRANSMIT		; Send Access Complete message to FAL
+	BLBC	R0,EXIT			; Branch on failure
+
+;++
+; Receive DAP Access Complete message from partner.
+;
+; Note:	The DAP V4.1 specification did not permit a response to Access Complete
+;	(end-of-stream)!!
+;--
+
+RECV_CMP:				;
+	BBC	#DAP$V_GEQ_V42,(R7),SUC	; Response to Access Complete required
+					;  iff partner uses DAP since V4.2
+	BSBB	NT$LOOK_FOR_CMP		; Wait for response from FAL
+	BLBC	R0,EXIT			; Branch if not Access Complete message
+SUC:	RMSSUC				; Return success
+	$CLRBIT	#NWA$V_FTM_RETRV,(R7)	; Clear file transfer mode status bits
+	$CLRBIT	#NWA$V_FTM_STORE,(R7)	;
+EXIT:	RSB				; Exit with RMS code in R0
+
+	.SBTTL	NT$LOOK_FOR_CMP
+
+;++
+; This routine is called after an Access Complete message has been sent to FAL
+; to terminate the record stream (which may be in an active file transfer mode
+; state). This routine waits for an Access Complete message response from FAL
+; to establish a synchronization point while carefully filtering out other valid
+; messages that may be in the pipe.
+;--
+
+NT$LOOK_FOR_CMP::			; Entry point
+	BBS	#NWA$V_FTM_EOF,(R7),-	; Branch if we're in file transfer
+		ALREADY_SYNCHRONIZED	;  retrieval mode with eof reached
+	BBS	#NWA$V_FTM_RETRV,(R7),-	; Branch if we're in file transfer
+		PULLING_FILE		;  retrieval mode without eof seen
+	BBS	#NWA$V_FTM_STORE,(R7),-	; Branch if we're in file transfer
+		PUSHING_FILE		;  storage mode
+
+;+
+; We're either in record access mode or in file transfer retrieval mode with
+; end-of-file encountered. Thus RMS and FAL are synchronized (nothing should
+; be in the pipe), so we expect an Access Complete message to be returned in
+; response to the Access Complete message already sent.
+;-
+
+ALREADY_SYNCHRONIZED:			; Terminating record access mode
+	$SETBIT	#DAP$K_CMP_MSG,DAP$L_MSG_MASK(R7)
+					; Expect response of Access Complete msg
+	BSBW	NT$RECEIVE		; Get reply from FAL
+	RSB				; Exit with RMS code in R0
+
+;+
+; We're in file transfer mode retrieving a file and have just requested FAL to
+; terminate the transfer prematurely (i.e., before we've processed end-of-file).
+; The following actions will be taken while emptying the pipe:
+;   (1)	Access Complete message will cause exit with success.
+;   (2)	Data messages in the pipe will be discarded after computing their CRC
+;	value (to keep in sync with FAL's CRC computation).
+;  (3a)	Status message pertaining to disconnecting the record stream (and/or
+;	closing the file) will cause exit with status.
+;  (3b)	Status message pertaining to the interrupted data transfer (end-of-file
+;	in particular) will be ignored.
+;   (4)	Any error from NT$RECEIVE that is not the result of a valid Status
+;	message will cause exit with status (link down, protocol error, etc.).
+;-
+
+PULLING_FILE:				; Terminating file transfer retrieval
+	BISL2	#<<1@DAP$K_DAT_MSG>!-	; Expect response of Access Complete,
+		  <1@DAP$K_CMP_MSG>!-	;  Data, or Status (end-of-file) message
+		0>,DAP$L_MSG_MASK(R7)	;
+	BSBW	NT$RECEIVE		; Get reply from FAL
+	BLBC	DAP$L_DCODE_STS(R7),30$	; Branch on failure to obtain a valid
+					;  DAP message
+
+	ASSUME	DAP$K_CMP_MSG EQ 7
+	ASSUME	DAP$K_DAT_MSG EQ 8
+	ASSUME	DAP$K_STS_MSG EQ 9
+
+	$CASEB	SELECTOR=DAP$B_TYPE(R7)-; Dispatch on message type:
+		BASE=#DAP$K_CMP_MSG-	;
+		DISPL=<-		;
+		    30$-		;  Access Complete
+		    10$-		;  Data
+		    20$-		;  Status
+		>			; Should never take this path
+10$:	BBC	#DAP$V_DAPCRC,-		; Branch if partner does not support
+		DAP$Q_SYSCAP(R7),-	;  file level CRC checksum, then discard
+		PULLING_FILE		;  data and process next message
+	MOVQ	DAP$Q_FILEDATA(R7),R2	; Put descriptor of record in <R2,R3>
+	CRC	W^NT$CRC_TABLE,-	; Compute CRC (destroying R0-R3)
+		DAP$L_CRC_RSLT(R7),-	;  using result of previous CRC
+		R2,(R3)			;  calculation as initial CRC value
+	MOVL	R0,DAP$L_CRC_RSLT(R7)	; Store CRC resultant value
+	BRB	PULLING_FILE		; Process next message
+20$:	CMPW	R0,#<RMS$_EOF&^XFFFF>	; Discard end-of-file Status message
+	BEQL	PULLING_FILE		;  in pipe
+	EXTZV	#12,#4,DAP$W_STSCODE(R7),R1 ; Examine MACCODE status value
+	CMPB	R1,#DAP$_FILE_CLOS	; Is this an error response to the
+					;  Access Complete message we sent?
+	BNEQ	PULLING_FILE		; No, ignore error and get next message
+30$:	RSB				; Exit with RMS code in R0
+
+;+
+; We're in file transfer mode storing a file and have just requested FAL to
+; terminate the transfer (i.e., Access Complete signals end-of-data to FAL).
+; The following actions will be taken while emptying the pipe:
+;   (1)	Access Complete message will cause exit with success.
+;  (2a)	Status message pertaining to disconnecting the record stream (and/or
+;	closing the file) will cause exit with status.
+;  (2b)	Status message pertaining to the processing of a Data message (ahead
+;	of the Access Complete message in the pipe for FAL) will result in the
+;	sending of an interrupt Continue Transfer message to unlock FAL, and
+;	this (write behind) error will be reported to the caller.
+;   (3)	Any error from NT$RECEIVE that is not the result of a valid Status
+;	message will cause exit with status (link down, protocol error, etc.).
+;-
+
+PUSHING_FILE:				; Terminating file transfer storage
+	$SETBIT	#DAP$K_CMP_MSG,DAP$L_MSG_MASK(R7)
+					; Expect response of Access Complete msg
+	BSBW	NT$RECEIVE		; Get reply from FAL
+	BLBC	DAP$L_DCODE_STS(R7),10$	; Branch on failure to obtain a valid
+					;  DAP message
+	CMPB	DAP$B_TYPE(R7),-	; We're done if this is an Access
+		#DAP$K_CMP_MSG		;  Complete message; otherwise it must
+	BEQL	10$			;  be a Status message
+	EXTZV	#12,#4,DAP$W_STSCODE(R7),R1 ; Examine MACCODE status value
+	CMPB	R1,#DAP$_FILE_CLOS	; Is this an error response to the
+					;  Access Complete message we sent?
+	BEQL	10$			; Yes, return status code and exit
+	CMPB	R1,#DAP$_FILE_XFER	; Branch if this was not the result of
+					;  a $PUT or $WRITE failure; otherwise
+	BNEQ	PUSHING_FILE		;  we're sure FAL is in a wait state
+
+;+
+; FAL has reported an error on a put or write operation while processing a Data
+; message that was in the pipe ahead of the Access Complete message, and is
+; waiting for a Continue Transfer interrupt message before it can proceed to
+; empty its pipe and finally process our Access Complete message.
+;-
+
+	PUSHR	#^M<R0>			; Save primary error code
+	BSBW	NT$RESUME_FAL		; Then unlock remote FAL by sending a
+					;  Continue Transfer interrupt message
+	$SETBIT	#DAP$K_CMP_MSG,DAP$L_MSG_MASK(R7)
+					; Expect response of Access Complete msg
+	BSBW	NT$RECEIVE		; Get reply from FAL
+	POPR	#^M<R0>			; Restore primary error code
+10$:	RSB				; Exit with RMS code in R0
+
+	.SBTTL	NT$RESUME_FAL
+
+;++
+; This routine handles $PUT and $WRITE error recovery for both record access
+; and file transfer modes of operation. The DAP specification requires that
+; a Continue Transfer message be sent to FAL as an interrupt message to tell
+; it what to do with the record (or block) that it failed to $PUT/$WRITE to
+; to the file. After sending a Status message to indicate the error condition,
+; FAL waits for receipt of an interrupt message, then processes the next
+; message in the pipe.
+;
+; Note:	The Continue Transfer message must not be sent on error from an $UPDATE
+;	operation; just on an error from a $PUT or $WRITE operation.
+;
+; Note:	If the error occurs in file transfer mode, the file transfer operation
+;	will be aborted. Consequently, the next RMS operation that the user
+;	requests must be $DISCONNECT or $CLOSE (because FAL expects to receive
+;	an Access Complete message). This restriction does not apply to record
+;	transfer mode.
+;
+; Input parameters:
+;
+;	R7	NWA (=DAP) address
+;
+; Output Parameters:
+;
+;	R0	Status code (RMS) to return to user
+;	R1-R5	Destroyed
+;--
+
+NT$RESUME_FAL::				; Entry point
+
+;+
+; Build and send DAP Continue Transfer message to partner.
+;-
+
+SEND_CON:				;
+	MOVL	#DAP$K_CON_MSG,R0	; Get message type value
+	BSBW	NT$BUILD_HEAD		; Construct message header
+	MOVB	#DAP$K_ABORT,(R5)+	; Store CONFUNC field assuming that
+					;  file transfer mode is in effect
+	BBS	#NWA$V_FTM_STORE,(R7),10$;Branch if we guessed right
+	MOVB	#DAP$K_SKIP_REC,-1(R5)	; Store CONFUNC field appropriate for
+					;  record access mode
+10$:	BSBW	NT$BUILD_TAIL		; Finish building message
+	BSBW	NT$INTERRUPT		; Send Continue Transfer message to FAL
+					;  as an interrupt message
+	RSB				; Exit with RMS code in R0
+
+	.END				; End of module

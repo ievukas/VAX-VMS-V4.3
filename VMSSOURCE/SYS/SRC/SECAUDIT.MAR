@@ -1,0 +1,438 @@
+	.TITLE	SECAUDIT - SECURITY AUDITING ROUTINES
+	.IDENT	'V04-000'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+; Facility: Executive
+;
+; Abstract:
+;	This module contains the centralized Security Auditing routines.
+;
+; Enviornment:
+;	VMS Paged Exec - Kernel mode
+;--
+;
+; Author:
+;
+;	R. Scott Hanna, CREATION DATE: 04-Mar-1983
+;
+; Modified by:
+;
+;	V03-009	ACG0425		Andrew C. Goldstein,	27-Apr-1984  11:06
+;		Move code to a paged psect (and fix up the one leg
+;		at elevated IPL).
+;
+;	V03-008	MHB0119		Mark Bramhall		26-Mar-1984
+;		Support mandatory auditing flag NSA$x_ARG_FLAG_MANDY.
+;		Have mandatory auditing imply alarm for now.
+;
+;	V03-007	RSH0108		R. Scott Hanna		28-Feb-1984
+;		Change time field in security auditing record header
+;		from a longword to a quadword.
+;
+;	V03-006	RSH0094		R. Scott Hanna		01-Feb-1984
+;		Changes for field test 2.
+;
+;	V03-005 RSH0072		R. Scott Hanna		06-Oct-1983
+;		Change journal name and access mode. Eliminate PROT and
+;		FLAGS keywords from $ASSJNL_S.
+;
+;	V03-004	RSH0066		R. Scott Hanna		15-Sep-1983
+;		Fix problem in ALARM_FORMAT_FILACC.
+;
+;	V03-003 RSH0061		R. Scott Hanna		06-Sep-1983
+;		Modify PRV$KEYWORD routine to not return keyword length.
+;		Remove trailing CRLF from alarm messages. Change
+;		BUILD_RECORD_DTPKT to reference field size as a word.
+;		Change ALARM_RECORD to set SECURITY privilege in OPCOM
+;		message header. Fix problem in ALARM_FORMAT_PRVMSK related
+;		to bogus privilege bits.
+;
+;	V03-002 RSH0045		R. Scott Hanna		24-Jul-1983
+;		Replace temporary OPC$M_NM_OPER1 and OPC$_RQ_RQST with
+;		OPC$M_NM_SECURITY and OPC$_RQ_SECURITY
+;
+;	V03-001	RSH0038		R. Scott Hanna		17-Jun-1983
+;		Make changes due to the addition of NSA$L_ARG_COUNT in
+;		$NSAARGDEF.
+;--
+
+	.SBTTL	Declarations and Assumptions
+;
+;	Define Symbols
+;
+
+	$DSCDEF					; Argument descriptor defs
+	$IPLDEF					; Priority defs
+	$JIBDEF					; Job Information Block defs
+	$MSGDEF					; Operator message defs
+	$NSAARGDEF				; Auditing argument list defs
+	$NSAIDTDEF				; Auditing impure data table defs
+	$NSARECDEF				; Auditing record defs
+	$OPCDEF					; Operator class defs
+	$PCBDEF					; Process control block defs
+	$PRDEF					; Processor register defs
+	$PRVDEF					; Privilege bits defs
+	$PSLDEF					; Processor status longword defs
+	$RSNDEF					; Resource wait defs
+	$SBDEF					; SCS System Block defs
+	$SSDEF					; System service defs
+
+; Minimum size in record to allow insertion of another packet
+
+	REC_MIN_SIZE_LEFT = NSA$K_PKTHDR_LENGTH*4
+
+; Make sure that the largest record will fit in the buffer
+
+	ASSUME	NSA$K_REC_MAXLENGTH LE NSA$S_IDT_RECORD_BUF
+
+; All code is pageable.
+
+	.PSECT	Y$EXEPAGED
+
+.SBTTL	NSA$EVENT_AUDIT - Event Auditing Routine
+;++
+; NSA$EVENT_AUDIT - Event Auditing Routine
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called when an auditable system event occurs. It
+;	takes the data in the argument list and builds the journal record.
+;	The record is then written to the security audit journal and/or
+;	sent to OPCOM to print a security alarm message.
+;
+;	This routine must be called in KERNEL mode at IPL 0 in the context
+;	of the process which caused the event being audited.
+;
+; CALLING SEQUENCE:
+;
+;	CALLS or CALLG to NSA$EVENT_AUDIT
+;
+; INPUTS:
+;
+;	AP = Pointer to the event argument list. Event argument lists are
+;	     defined by the $NSAARGDEF macro.
+;
+; OUTPUT:
+;
+;	R0 = status of operation
+;	R1 = Destroyed
+;--
+
+	.ENTRY	NSA$EVENT_AUDIT,^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	MOVAL	@#NSA$T_IDT,R6			; Get impure data block pointer
+	MOVL	G^SCH$GL_CURPCB,R7		; Get PCB
+	MOVL	#1@PSL$C_KERNEL,-(SP)		; Assume kernel ast's enabled
+	BBSC	#PSL$C_KERNEL,PCB$B_ASTEN(R7),1$ ; Br if kernel ast's enabled
+	CLRL	(SP)				; Kernel ast's were not enabled
+1$:	BSBB	BUILD_RECORD_DT			; Build the record descriptor table
+	MOVL	#1,R8				; Init record number
+	MOVAL	NSA$T_IDT_RECORD_DT+1(R6),R9	; Get record descr table pointer
+2$:	BSBW	BUILD_RECORD			; Build the record
+	BBC	#NSA$V_ARG_FLAG_JOURN,-		; Br if this record is
+		NSA$B_ARG_FLAG(AP),3$		; ...not to be journaled
+	BSBW	JOURNAL_RECORD			; Journal the record
+	BLBC	R0,5$				; Br if error
+3$:	BITB	#<NSA$M_ARG_FLAG_ALARM!-	; Alarm and/or
+		  NSA$M_ARG_FLAG_MANDY>,-	;  mandatory audit
+		NSA$B_ARG_FLAG(AP)		;   for this record?
+	BEQL	4$				; Br if neither
+	BSBW	ALARM_RECORD			; Alarm the record
+	BLBC	R0,5$				; Br if error
+4$:	ACBB	NSA$T_IDT_RECORD_DT(R6),#1,R8,2$ ; Br if more records
+	MOVL	#SS$_NORMAL,R0			; Return success
+5$:	BISB	(SP),PCB$B_ASTEN(R7)		; Restore kernel ast enable bit
+	RET
+
+.SBTTL	Record building routines
+;++
+; BUILD_RECORD_DT - Build the record descriptor table
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine builds the record descriptor table.
+;
+; INPUTS:
+;
+;	R6 = Impure data block pointer
+;	AP = Pointer to the event argument list.
+;
+; OUTPUT:
+;
+;	NSA$T_IDT_RECORD_DT(R6) = The record descriptor table
+;
+;	R0-R4,R9-R11  = Destroyed
+;--
+
+BUILD_RECORD_DT:
+	MOVAL	NSA$T_IDT_RECORD_DT+1(R6),R1 	; Init packet pointer
+	MOVL	#1,-1(R1)			; Init rec count, flgs, & pkt count
+	MOVZBL	NSA$B_ARG_PKTNUM(AP),R4		; Get total number of packets
+	BEQLU	7$				; Br if none (header only)
+	MOVAL	NSA$T_ARG_LIST(AP),R3		; Init arglist pointer
+	BSBB	GET_NEXT_PKT			; Get first pkt type, size, addr
+	BRB	5$				; Init first record
+1$:	BSBB	GET_NEXT_PKT			; Get next pkt type, size, addr
+2$:	SUBL	#NSA$K_PKTHDR_LENGTH,R0		; Subtract out packet header size
+	CMPL	R10,R0				; Will packet fit in current rec?
+	BLEQ	3$				; Br if yes
+	CMPL	R0,#REC_MIN_SIZE_LEFT		; Put part of pkt in this rec?
+	BLSS	4$				; Br if no
+	ADDL3	R0,R11,-(SP)			; Save remaining address
+	SUBL3	R0,R10,-(SP)			; Save remaining size
+	MOVL	R0,R10				; Size = size left in record
+	MOVB	#NSA$M_REC_FLAGS_PKTCON,(R2)	; Indicate packet continuation
+3$:	MOVW	R9,(R1)+			; Insert pkt type in descr table
+	MOVW	R10,(R1)+			; Insert size in rec descr table
+	MOVL	R11,(R1)+			; Insert addr in rec descr table
+	INCB	1(R2)				; Increment packet count
+	SUBL	R10,R0				; Subtract out packet size
+	TSTB	(R2)				; Is curr pkt cont in next rec?
+	BEQLU	6$				; Br if not
+	MOVQ	(SP)+,R10			; Get remaining size and address
+4$:	INCB	NSA$T_IDT_RECORD_DT(R6)		; Increment record count	
+5$:	MOVZWL	#NSA$S_IDT_RECORD_BUF- -	; Init size remaining
+		NSA$K_RECHDR_LENGTH,R0
+	MOVL	R1,R2				; Get new flags byte pointer
+	CLRW	(R1)+				; Init flags byte and pkt count
+	BRB	2$
+6$:	SOBGTR	R4,1$				; Br if more packets
+7$:	RSB
+
+;++
+; GET_NEXT_PKT - Get next data packet information
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine returns the type, size, and data address of the next
+;	packet to be placed in the record.
+;
+; INPUTS:
+;
+;	R3 = arglist pointer
+;
+; OUTPUT:
+;
+;	R3 = updated arglist pointer
+;	R9  = packet type
+;	R10  = packet size
+;	R11  = Address of packet data
+;--
+
+GET_NEXT_PKT:
+	MOVZWL	(R3)+,R9			; Get packet type
+	MOVZWL	(R3)+,R10			; Get argument passing mechanism
+	CMPL	R10,#NSA$K_ARG_MECH_DESCR	; Determine arg passing mechanism
+	BEQLU	1$				; Descriptor
+	BGTRU	2$				; Address of descriptor
+	ASHL	R10,#1,R10			; Value	R10 = size
+	MOVAL	(R3),R11			;	R11 = address
+	ADDL3	#3,R10,-(SP)			; Round size up to next longword
+	BICL2	#3,(SP)
+	ADDL2	(SP)+,R3			; Point to next argument
+	BRB	4$
+1$:	MOVQ	(R3)+,R10			; Get size and addr from descr
+	BRB	3$
+2$:	MOVQ	@(R3)+,R10			; Get size and addr from descr
+3$:	MOVZWL	R10,R10				; Convert first longword to size
+4$:	RSB
+
+;++
+; BUILD_RECORD - Build a record
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine builds a record
+;
+; INPUTS:
+;
+;	R6  = Impure data block pointer
+;	R7  = PCB pointer
+;	R8 = Record sequence number
+;	R9  = Record descriptor table pointer
+;
+; OUTPUT:
+;
+;	R9 = Updated record descriptor table pointer
+;
+;	NSA$T_IDT_RECORD_BUF(R6) = Record 
+;
+;	R0-R5,R10-R11 = Destroyed
+;--
+
+BUILD_RECORD:
+	MOVAQ	NSA$Q_IDT_RECORD_DESCR(R6),R10	; Get record descr pointer
+	MOVAL	NSA$T_IDT_RECORD_BUF(R6),R3	; Get record address
+	MOVL	#NSA$K_RECHDR_LENGTH! -		; Init the record descriptor
+		<DSC$K_DTYPE_T@16>! -
+		<DSC$K_CLASS_S@24>,(R10)
+	MOVL	R3,4(R10)
+	MOVL	NSA$L_ARG_ID(AP),(R3)+		; Insert record type
+	MOVB	R8,(R3)+			; Insert record sequence number
+	MOVB	NSA$T_IDT_RECORD_DT(R6),(R3)+	; Insert last sequence number
+	MOVW	(R9)+,(R3)+			; Insert flags byte & pkt count
+	ADDW3	#NSA$K_PKTHDR_LENGTH,(R10),(R3)+ ; Insert offset to first packet
+	MOVW	#NSA$K_PKTHDR_LENGTH,(R3)+	; Insert packet header size
+	MOVL	PCB$L_EPID(R7),(R3)+		; Insert EPID
+	MOVQ	G^EXE$GQ_SYSTIME,(R3)+		; Insert event time
+	MOVAB	G^SCS$GA_LOCALSB+SB$T_NODENAME,R1 ; Get node name ASCIC pointer
+	MOVZBL	(R1)+,R0			; Get size
+	MOVC5	R0,(R1),#^X20,#SB$S_NODENAME,(R3) ; Insert node name
+	MOVAB	PCB$T_LNAME(R7),R1 		; Get process name ASCIC pointer
+	MOVZBL	(R1)+,R0			; Get size
+	MOVC5	R0,(R1),#^X20,#PCB$S_LNAME,(R3) ; Insert process name
+	MOVC3	#JIB$S_USERNAME+JIB$S_ACCOUNT,-	; Insert Username and Account name
+		@#CTL$T_USERNAME,(R3)
+	MOVZBL	-1(R9),R11			; Get number of packets
+	BEQLU	2$				; Br if none
+1$:	MOVW	(R9)+,(R3)+			; Insert packet type
+	ADDW3	#NSA$K_PKTHDR_LENGTH,(R9),(R3)	; Insert packet size
+	ADDW2	(R3)+,(R10)			; Add packet size to record size
+	MOVC3	(R9)+,@(R9)+,(R3)		; Insert field in packet
+	SOBGTR	R11,1$				; Br if more packets
+2$:	RSB
+
+.SBTTL	JOURNAL_RECORD - Journal the audit record
+;++
+; JOURNAL_RECORD - Journal the audit record
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine assigns a channel to the security audit journal, (if it
+;	has not been assigned already), and writes the event record.
+;
+; INPUTS:
+;
+;	R6 = Impure data block pointer
+;
+; OUTPUT:
+;
+;	R0 = Status of operation
+;	R1 = Destroyed
+;
+; NOTE:	This routine has been removed. It will be replaced when Journaling is
+;	supported.
+;--
+
+JOURNAL_RECORD:
+	MOVL	#SS$_NORMAL,R0		
+	RSB
+
+.SBTTL	ALARM_RECORD - Generate Security Alarm
+;++
+; ALARM_RECORD - Generate Security Alarm
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine sends the security audit record to the OPCOM process
+;
+; INPUTS:
+;
+;	R6 = Impure data block pointer
+;	R7 = PCB pointer
+;
+; OUTPUT:
+;
+;	R0 = status of operation
+;	R1-R5 = Destroyed
+;--
+
+ALARM_RECORD:
+	MOVAL	NSA$T_IDT_ALARM_HDR(R6),R3	; Get alarm header address
+	MOVW	#MSG$_OPRQST,(R3)+		; Insert message type
+	CLRW	(R3)+				; No reply mailbox
+	ASSUME	PRV$V_SECURITY GE 32		; Assume SECURITY in second longword
+	CLRL	(R3)+				; Zero first longword of mask
+	MOVZBL	#<1@<PRV$V_SECURITY-32>>,(R3)+	; Insert security mask
+	MOVL	PCB$L_UIC(R7),(R3)+		; Insert UIC
+	MOVC3	#JIB$S_USERNAME+JIB$S_ACCOUNT,-	; Insert Username and Account name
+		@#CTL$T_USERNAME,(R3)
+	CLRW	(R3)+				; Zero base priority and spare bytes
+	MOVL	#<OPC$M_NM_SECURITY@8+OPC$_RQ_SECURITY>,(R3)+ ; Insert opcom header
+	CLRL	(R3)+
+	MOVZWL	NSA$Q_IDT_RECORD_DESCR(R6),R3	; Get record size
+	ADDL2	#NSA$S_IDT_ALARM_HDR,R3		; Add header size
+	MOVAL	G^SYS$GL_OPRMBX,R5		; Get UCB addr of operator mailbox
+1$:	MOVAL	NSA$T_IDT_ALARM_HDR(R6),R4	; Get address of buffer
+	SETIPL	#IPL$_ASTDEL			; Block ast delivery
+	; The buffer must be page aligned and LE 3 pages
+	ASSUME	NSA$T_IDT_ALARM_HDR EQ 0
+	ASSUME	NSA$S_IDT_ALARM_HDR+NSA$S_IDT_RECORD_BUF LE 512*3
+	CMPL	510(R4),1024(R4)		; Fault in 3 pages
+	JSB	G^EXE$WRTMAILBOX		; Write message
+	SETIPL	#0				; Enable ast delivery
+	BLBS	R0,4$				; Br if success
+	BBS	#PSL$C_KERNEL,PCB$B_ASTACT(R7),4$ ; Br if we are in a kernel ast
+	CMPL	R0,#SS$_MBFULL			; Mailbox full?
+	BNEQU	2$				; br if not
+	MOVZWL	#RSN$_MAILBOX,R0		; Set resource to mailbox full
+	BRB	3$
+2$:	CMPL	R0,#SS$_INSFMEM			; Not enough pool?
+	BNEQU	4$				; Br if some other error
+	MOVZWL	#RSN$_NPDYNMEM,R0		; Set resource to non-paged pool
+3$:	MOVL	R7,R4				; R4 = PCB
+	MOVPSL	-(SP)				; Push PSL on stack
+	SETIPL	B^5$				; Raise IPL to SYNCH
+	JSB	G^SCH$RWAIT			; Wait for resource
+	BRB	1$				; Try again
+4$:	RSB
+
+5$:	.LONG	IPL$_SYNCH			; Lock between the SETIPL and here
+
+.SBTTL Arglist Packet Entry Insertion Routines
+;++
+; NSA$ARGLST_IMGNAM - Insert The Argument List Entry For The IMGNAM Packet
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine inserts the IMGNAM packet entry in the callers arglist.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	NSA$ARGLST_IMGNAM
+;
+; INPUTS:
+;
+;	R2 = Pointer to the IMGNAM packet entry in arglist
+;
+; OUTPUT:
+;
+;	R2 = Pointer to the next packet entry in arglist
+;--
+
+
+NSA$ARGLST_IMGNAM::
+	PUSHR	#^M<R3,R4,R5>			; Save registers
+	MOVL	#NSA$K_PKTTYP_IMGNAM+< -	; Store packet type and passing
+		NSA$K_ARG_MECH_DESCR@16>,(R2)+	; ...mechanism in arglist
+	MOVAL	@#CTL$GL_IMGHDRBF,R4		; Get address of longword that has
+						; the image header buffer address
+	JSB	G^EXE$CHKIMAGNAME		; Get the image name
+	MOVQ	R3,(R2)+			; Put size and address in arglist
+	POPR	#^M<R3,R4,R5>			; Restore registers
+	RSB
+
+	.END

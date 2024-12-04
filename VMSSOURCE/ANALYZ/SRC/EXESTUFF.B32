@@ -1,0 +1,987 @@
+%title 'EXESTUFF - Analyze Various Parts of an Image'
+	module exestuff (
+			ident='V04-001') = begin
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! Facility:	VAX/VMS Analyze Facility, Analyze Parts of an Image
+!
+! Abstract:	This module is responsible for analyzing various parts of
+!		an image, including the header, patch text, and global
+!		symbol table.
+!
+!
+! Environment:
+!
+! Author: Paul C. Anagnostopoulos, Creation Date: 31 March 1981
+!
+! Modified By:
+!
+!	V04-001	MSH0074		Michael S. Harvey	7-Sep-1984
+!		Recognize global demand zero ISDs when validating
+!		the ISD's length.
+!
+!	V03-008	ROP0022		Robert Posniak		14-JUL-1984
+!		Shift proper field for ISD base virtual
+!		address output.
+!
+!	V03-007	ROP0008		Robert Posniak		14-JUN-1984
+!		Change allocation of local_described_buffers from
+!		80 to 512.
+!
+!	V03-006	MCN0168		Maria del C. Nasr	08-May-1984
+!		If the image being analyzed was created by V3 or earlier,
+!		then use old offsets to get image name and identification
+!		information.
+!
+!	V03-005	MCN0158		Maria del C. Nasr	22-Mar-1984
+!		Use SHL$C_MAXNAMLNG as the image name length to pass
+!		to ANL$CHECK_SYMBOL.  Also, eliminate declaration of
+!		local loop counter.
+!
+!	V03-004 LJA0115		Laurie J. Anderson	 2-Mar-1984
+!		Move the variable 'alias' from local (stack) storage to
+!		own storage.  This masks the problem that if you say:
+!		anal/image image1,image2 the second image gets the error
+!		"not a VAX/VMS image".  Do not know why, except has to
+!		to do with the stack.
+!
+!	V03-003 LJA0106		Laurie J. Anderson	26-Jan-1984
+!		1) Change the calls to ANL$GET_IMAGE_BLOCK to the new image
+!		   decode routines.  
+!		2) Check for header block count of 0. Return error if so.  
+!		3) Also, print out any indirect	message filenames when 
+!		   processing the ISD's.  
+!		4) Plus in answer to SPR 11-62167, the maximum number of 
+!		   characters in the patch text is increased from 80 to 
+!		   something more reasonable, 255.
+! 
+!	V03-002	PCA1011		Paul C. Anagnostopoulos  1-Apr-1983
+!		Change the message prefix to ANLOBJ$_ to ensure that
+!		message symbols are unique across all ANALYZEs.  This
+!		is necessitated by the new merged message files.
+!
+!	V03-001	JWT0075		Jim Teague		14-Dec-1982
+!		Update to accomodate changes in image header: 1)CLI images,
+!		2)IHD$V_DBGDMT bit, 3)IHS$L_DMTVBN, 4)IHS$L_DMTBYTES.
+!
+!--
+
+%sbttl 'Module Declarations'
+!
+! Libraries and Requires:
+!
+
+library 'lib';
+require 'imgmsgdef';
+require 'objexereq';
+
+!
+! Table of Contents:
+!
+
+forward routine
+	anl$image_header,
+	anl$image_isd: novalue,
+	anl$image_patch_text,
+	anl$image_gst;
+
+!
+! External References:
+!
+
+external routine
+	anl$check_flags,
+	anl$check_symbol,
+	anl$format_error,
+	anl$format_flags,
+	anl$format_hex,
+	anl$format_line,
+	anl$get_image_block,
+	anl$object_eom,
+	anl$object_gsd,
+	anl$object_hdr,
+	anl$interact,
+	anl$object_record_size,
+	anl$report_line,
+	anl$report_page,
+	anl$get_image_header,
+	anl$get_isd;
+
+external
+	anl$gb_interactive: byte;
+
+!
+! Own Variables:
+!
+! The following table defines the match control values used throughout.
+
+own
+	match_control: vector[8,long] initial(
+				uplit byte(%ascic 'ISD$K_MATALL'),
+				uplit byte(%ascic 'ISD$K_MATEQU'),
+				uplit byte(%ascic 'ISD$K_MATLEQ'),
+				uplit byte(%ascic 'ISD$K_MATNEV'));
+
+%sbttl 'ANL$IMAGE_HEADER - Analyze Image Header'
+!++
+! Functional Description:	
+!	This routine is responsible for analyzing an image header.  THis
+!	includes formatting it in the report and checking its contents.
+!
+! Formal Parameters:
+!	image_base	Return starting address of image here.
+!	fixup_size	If a fixup section exists, return size here,
+!	fixup_vbn	and VBN here.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	If interactive session: true if we are to continue, false if not.
+!
+! Side Effects:
+!
+!--
+
+
+global routine anl$image_header(image_base,fixup_size,fixup_vbn) = begin
+
+own
+	link_flags_def: vector[7,long] initial(
+				5,
+				uplit byte(%ascic 'IHD$V_LNKDEBUG'),
+				uplit byte(%ascic 'IHD$V_LNKNOTFR'),
+				uplit byte(%ascic 'IHD$V_NOP0BUFS'),
+				uplit byte(%ascic 'IHD$V_PICIMG'),
+				uplit byte(%ascic 'IHD$V_P0IMAGE'),
+				uplit byte(%ascic 'IHD$V_DBGDMT')),
+	alias : word;
+
+local
+	status: long,
+	hp: ref block[,byte],
+	sp: ref block[,byte],
+	vbn: long,
+	fixup_address: long;
+
+! Offsets to image name and identification information in images created by
+! VMS V3.x or earlier.
+!
+macro
+	IHI$_IMGNAM = 0,0,0,0 %,
+	IHI$_IMGID = 16,0,0,0 %,
+	IHI$_LINKTIME = 32,0,0,0 %,
+	IHI$_LINKID = 40,0,0,0 %;
+
+bind
+	v3_majorid = uplit (%ascii'02'),	! linker major id in V3
+	v3_minorid = uplit (%ascii'04');	! linker minor id in V3
+
+! We are going to analyze the image header.  Get it.
+
+anl$format_line(0,0,anlobj$_exehdr);
+anl$report_line(-1);
+
+status = anl$get_image_header(hp,alias);
+
+! If we couldn't get the first header block, or if it doesn't end with
+! a %x'ffff' or %x'0003' or %x'0002', then this can't be a native image.
+! 	-1 = produced by the VAX-11 Linker
+!	0  = RSX compatibility mode
+!	1  = Activate BPA
+!	2  = Name of image to activate is in image header
+!	3  = It's a CLI
+!
+if not .status or 
+   (.alias nequ %x'ffff' and .alias nequ %x'0003' and .alias nequ %x'0002')
+then (anl$format_error(anlobj$_exenotnative);
+    return false;);
+
+! Begin with the fixed fields at the beginning of the header.
+
+anl$format_line(3,1,anlobj$_exehdrfixed);
+anl$report_line(-1);
+
+! Analyze the image identification info.
+
+anl$format_line(0,2,anlobj$_exehdrimageid,2,hp[ihd$w_majorid],2,hp[ihd$w_minorid]);
+
+! Analyze the header block count.  If the count is zero, this is a bad 
+! image.  The image activator will not activate it.
+
+if .hp[ihd$b_hdrblkcnt] eqlu 0
+then
+    anl$format_error(anlobj$_badhdrblkcount,.hp[ihd$b_hdrblkcnt])
+else
+    anl$format_line(0,2,anlobj$_exehdrblkcount,.hp[ihd$b_hdrblkcnt]);
+
+! Analyze the image type code.  If shared, print the global section IDs and
+! the match control.
+
+selectoneu .hp[ihd$b_imgtype] of set
+[ihd$k_exe]:	anl$format_line(0,2,anlobj$_exehdrtypeexe);
+
+[ihd$k_lim]:	(anl$format_line(2,2,anlobj$_exehdrtypelim);
+		anl$format_line(0,3,anlobj$_exehdrgblident,.hp[ihd$l_ident]);
+		selectoneu .hp[ihd$v_matchctl] of set
+		[isd$k_matall,
+		 isd$k_matequ,
+		 isd$k_matleq,
+		 isd$k_matnev]:	anl$format_line(0,3,anlobj$_exehdrmatch,
+					.match_control[.hp[ihd$v_matchctl]]);
+		[otherwise]:	anl$format_error(anlobj$_exebadmatch,.hp[ihd$v_matchctl]);
+		tes;);
+
+[otherwise]:	anl$format_error(anlobj$_exebadtype,.hp[ihd$b_imgtype]);
+tes;
+
+! Analyze the I/O channel count.
+
+if .hp[ihd$w_iochancnt] eqlu 0 then
+	anl$format_line(0,2,anlobj$_exehdrchandef)
+else
+	anl$format_line(0,2,anlobj$_exehdrchancount,.hp[ihd$w_iochancnt]);
+
+! Analyze the I/O section page count.
+
+if .hp[ihd$w_imgiocnt] eqlu 0 then
+	anl$format_line(0,2,anlobj$_exehdrpagedef)
+else
+	anl$format_line(0,2,anlobj$_exehdrpagecount,.hp[ihd$w_imgiocnt]);
+
+! Analyze the linker-produced flags.  Don't get confused by the match control.
+
+anl$format_flags(2,anlobj$_exehdrflags,.hp[ihd$l_lnkflags] and %x'00ffffff',link_flags_def);
+anl$check_flags(.hp[ihd$l_lnkflags] and %x'00ffffff',link_flags_def);
+
+! Analyze the system version, if specified.
+
+if .hp[ihd$l_sysver] nequ 0 then
+	anl$format_line(0,2,anlobj$_exehdrsysver,4,hp[ihd$l_sysver]);
+
+! If the fixed portion is long enough to accomodate a fixup section
+! virtual address (V3A and later), then remember the address.
+
+if .hp+.hp[ihd$w_activoff] gtra hp[ihd$l_iafva] then
+	fixup_address = .hp[ihd$l_iafva]
+else
+	fixup_address = 0;
+
+! If this is an interactive session, give the user a chance to quit.
+
+if .anl$gb_interactive then
+	if not anl$interact() then
+		return false;
+
+! Now we are going to analyze the information in the activation section.
+! It is always present.
+
+anl$report_line(-1);
+anl$format_line(3,1,anlobj$_exehdractive);
+anl$report_line(-1);
+
+sp = .hp + .hp[ihd$w_activoff];
+
+! Analyze the three transfer addresses.
+
+anl$format_line(0,2,anlobj$_exehdrxfer1,.sp[iha$l_tfradr1]);
+anl$format_line(0,2,anlobj$_exehdrxfer2,.sp[iha$l_tfradr2]);
+anl$format_line(0,2,anlobj$_exehdrxfer3,.sp[iha$l_tfradr3]);
+
+! Make sure the thing ends with a trailing zero.
+
+if .sp[12,0,32,0] nequ 0 then
+	anl$format_error(anlobj$_exebadxfer0);
+
+! If this is an interactive session, give the user a chance to quit.
+
+if .anl$gb_interactive then
+	if not anl$interact() then
+		return false;
+
+! Now we are going to analyze the stuff in the symbol table and debug section.
+! It is always present.
+
+anl$report_line(-1);
+anl$format_line(3,1,anlobj$_exehdrsymdbg);
+anl$report_line(-1);
+
+sp = .hp + .hp[ihd$w_symdbgoff];
+
+! Analyze the debug symbol table VBN and block count.
+
+anl$format_line(0,2,anlobj$_exehdrdst,.sp[ihs$l_dstvbn],.sp[ihs$w_dstblks]);
+
+! Analyze the global symbol table VBN and record count.
+
+anl$format_line(0,2,anlobj$_exehdrgst,.sp[ihs$l_gstvbn],.sp[ihs$w_gstrecs]);
+
+! Analyze the Debugger DMT, if present
+
+if .hp[ihd$v_dbgdmt]
+then
+    anl$format_line(0,2,anlobj$_exehdrdmt,.sp[ihs$l_dmtvbn],.sp[ihs$l_dmtbytes]);
+
+! If this is an interactive session, give the user a chance to quit.
+
+if .anl$gb_interactive then
+	if not anl$interact() then
+		return false;
+
+! Now we are going to tackle the image identification section.
+! It is always present.
+
+anl$report_line(-1);
+anl$format_line(3,1,anlobj$_exehdrident);
+anl$report_line(-1);
+
+sp = .hp + .hp[ihd$w_imgidoff];
+
+begin
+local
+	name_dsc: descriptor;
+
+! Analyze the image name, image identification, date and time of linking,
+! and linker identification.  If the image was linked with V3 linker, then
+! use old offsets to get information, otherwise use latest values.
+!
+
+if .hp[ihd$w_majorid] gtr .v3_majorid
+  or .hp[ihd$w_minorid] gtr .v3_minorid
+then						! after V3 linker
+	begin
+	anl$format_line(0,2,anlobj$_exehdrname,sp[ihi$t_imgnam]);
+	build_descriptor(name_dsc,.sp[0,0,8,0],sp[1,0,8,0]);
+	anl$check_symbol(name_dsc, shl$c_maxnamlng);
+	anl$format_line(0,2,anlobj$_exehdrfileid,sp[ihi$t_imgid]);
+	anl$format_line(0,2,anlobj$_exehdrtime,sp[ihi$q_linktime]);
+	anl$format_line(0,2,anlobj$_exehdrlinkid,sp[ihi$t_linkid]);
+	end
+else						! V3 or earlier
+	begin
+	anl$format_line(0,2,anlobj$_exehdrname,sp[ihi$_imgnam]);
+	build_descriptor(name_dsc,.sp[0,0,8,0],sp[1,0,8,0]);
+	anl$check_symbol(name_dsc, shl$c_maxnamlng);
+	anl$format_line(0,2,anlobj$_exehdrfileid,sp[ihi$_imgid]);
+	anl$format_line(0,2,anlobj$_exehdrtime,sp[ihi$_linktime]);
+	anl$format_line(0,2,anlobj$_exehdrlinkid,sp[ihi$_linkid]);
+	end;
+end;			! of local "name_dsc"
+
+
+! If this is an interactive session, give the user a chance to quit.
+
+if .anl$gb_interactive then
+	if not anl$interact() then
+		return false;
+
+! Now we are going to analyze the patch section.
+! It may not necessarily exist.
+
+anl$report_line(-1);
+anl$format_line(3,1,anlobj$_exehdrpatch);
+anl$report_line(-1);
+
+if .hp[ihd$w_patchoff] nequ 0 then (
+	sp = .hp + .hp[ihd$w_patchoff];
+
+	! Begin with the Digital ECO bits.
+
+	anl$format_line(0,2,anlobj$_exehdrdececo,.sp[ihp$l_eco1],.sp[ihp$l_eco2],.sp[ihp$l_eco3]);
+
+	! And the user ECO bits.
+
+	anl$format_line(0,2,anlobj$_exehdrusereco,.sp[ihp$l_eco4]);
+
+	! Analyze the read/write and read-only patch area info.
+
+	anl$format_line(0,2,anlobj$_exehdrrwpatch,.sp[ihp$l_rw_patadr],.sp[ihp$l_rw_patsiz]);
+	anl$format_line(0,2,anlobj$_exehdrropatch,.sp[ihp$l_ro_patadr],.sp[ihp$l_ro_patsiz]);
+
+	! Now the VBN of the patch command text.
+
+	anl$format_line(0,2,anlobj$_exehdrtextvbn,.sp[ihp$l_patcomtxt]);
+
+	! And the date of most recent patch.
+
+	anl$format_line(0,2,anlobj$_exehdrpatchdate,sp[ihp$q_patdate]);
+
+	! If this is an interactive session, give the user a chance to quit.
+
+	if .anl$gb_interactive then
+		if not anl$interact() then
+			return false;
+) else (
+
+	! There is no patch section now.
+
+	anl$format_line(0,2,anlobj$_exehdrnopatch);
+);
+
+! Analyze the image section descriptors.  These begin after all the above
+! sections and can go on for multiple blocks.
+! We also use this loop to search for the fixup section.  If we don't find
+! one, we will inform the caller with zero fixup parameters.
+
+.fixup_size = .fixup_vbn = 0;
+
+anl$report_line(-1);
+anl$format_line(3,1,anlobj$_exehdrisd);
+
+vbn = 1;
+incru isd from 1 do (
+
+	! First we see if we have run out of ISDs in this block.  If so,
+	! we advance to the next block.  This routine keeps track of how
+	! many ISD's we've looked at so far.
+
+	status = anl$get_isd(hp);
+
+	! Now we see if we are all done with the ISDs.  The return status 
+	! is IMG$_ENDOFHDR
+
+exitif (.status eqlu img$_endofhdr);
+
+	increment (vbn);
+	if not .status then (
+		anl$format_error(.status);
+exitloop;
+	);
+	sp = .hp;
+
+
+	! Seems we have an ISD to analyze.  Make sure it fits completely
+	! within the block.
+
+	if .sp[isd$w_size] gtru .hp+512-.sp then (
+		anl$format_error(anlobj$_exehdrisdlong);
+exitloop;
+	);
+
+	! Format and analyze the ISD.
+
+	anl$image_isd(.sp,.isd);
+
+	! If this is the first ISD, then we want to return its base address,
+	! which is the starting address of the entire image.
+
+	if .isd eqlu 1 then
+		.image_base = .sp[isd$v_vpn]^9;
+
+	! If we have a fixup section, let's see if this is it.  If so,
+	! return its size and VBN.  If they are bad, tell the user.
+
+	if .fixup_address neqa 0 then
+		if .fixup_address eqla .sp[isd$v_vpg]^9 then
+			if .sp[isd$w_pagcnt] eqlu 0 or .sp[isd$l_vbn] eqlu 0 then
+				anl$format_error(anlobj$_exebadfixupisd)
+			else (
+				.fixup_size = .sp[isd$w_pagcnt];
+				.fixup_vbn  = .sp[isd$l_vbn];
+			);
+
+	! If this is an interactive session, give the user a chance to quit.
+
+	if .anl$gb_interactive then
+		if not anl$interact() then
+			return false;
+
+);
+
+return true;
+
+end;
+
+%sbttl 'ANL$IMAGE_ISD - Analyze ISD Structure'
+!++
+! Functional Description:
+!	This routine is responsible for formatting and analyzing an
+!	Image Section Descriptor.
+!
+! Formal Parameters:
+!	the_isd		Address of the ISD.
+!	isd_number	The sequence number of this ISD.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine anl$image_isd(the_isd,isd_number): novalue = begin
+
+bind
+	sp = the_isd: ref block[,byte];
+
+own
+	space_names: vector[4,long] initial(
+				uplit byte (%ascic 'P0'),
+				uplit byte (%ascic 'P1'),
+				uplit byte (%ascic 'S0'),
+				uplit byte (%ascic 'S1???')),
+
+	isd_flags_def: vector[20,long] initial(
+				18,
+				uplit byte(%ascic 'ISD$V_GBL'),
+				uplit byte(%ascic 'ISD$V_CRF'),
+				uplit byte(%ascic 'ISD$V_DZRO'),
+				uplit byte(%ascic 'ISD$V_WRT'),
+				0,0,0,
+				uplit byte(%ascic 'ISD$V_LASTCLU'),
+				uplit byte(%ascic 'ISD$V_COPYALWAY'),
+				uplit byte(%ascic 'ISD$V_BASED'),
+				uplit byte(%ascic 'ISD$V_FIXUPVEC'),
+				0,0,0,0,0,0,
+				uplit byte(%ascic 'ISD$V_VECTOR'),
+				uplit byte(%ascic 'ISD$V_PROTECT')),
+
+	isd_types: vector[5,long] initial(
+				uplit byte (%ascic 'NORMAL'),
+				uplit byte (%ascic 'SHRFXD'),
+				uplit byte (%ascic 'PRVFXD'),
+				uplit byte (%ascic 'SHRPIC'),
+				uplit byte (%ascic 'PRVPIC'));
+
+local
+	blk_ptr: ref block[, byte],
+	status;
+
+literal
+	section_suffix_size = 4,
+	long_c	= 4;
+
+macro
+	long_u = 0, 0, 32, 0 %;
+
+! It is assumed that the ISD fits in the header block.  We can freely 
+! reference the fields.
+
+! Begin with a heading line for this ISD.
+
+anl$report_line(-1);
+anl$format_line(3,2,anlobj$_exehdrisdnum,.isd_number,.sp[isd$w_size]);
+
+! Analyze the page count.
+
+anl$format_line(0,3,anlobj$_exehdrisdcount,.sp[isd$w_pagcnt]);
+
+! Analyze the base virtual page number and space bits.
+
+anl$format_line(0,3,anlobj$_exehdrisdbase,.sp[isd$v_vpg]^9,.space_names[.sp[4,21,2,0]]);
+if .sp[isd$v_p1] and .sp[isd$v_system] then
+	anl$format_error(anlobj$_exebadisds1);
+
+! Analyze the page fault cluster size.
+
+if .sp[isd$b_pfc] eqlu 0 then
+	anl$format_line(0,3,anlobj$_exehdrisdpfcdef)
+else
+	anl$format_line(0,3,anlobj$_exehdrisdpfcsiz,.sp[isd$b_pfc]);
+
+! Analyze the ISD flags, ignoring the match control bits.
+
+anl$format_flags(3,anlobj$_exehdrisdflags,.sp[isd$l_flags] and %x'00ffff8f',isd_flags_def);
+anl$check_flags(.sp[isd$l_flags] and %x'00ffff8f',isd_flags_def);
+
+! Analyze the ISD type code.
+
+selectoneu .sp[isd$b_type] of set
+[0 to 4]:		anl$format_line(0,3,anlobj$_exehdrisdtype,.isd_types[.sp[isd$b_type]]);
+
+[isd$k_usrstack]:	anl$format_line(0,3,anlobj$_exehdrisdtype,uplit byte (%ascic 'USRSTACK'));
+
+[otherwise]:		anl$format_error(anlobj$_exebadisdtype,.sp[isd$b_type]);
+tes;
+
+! If this is a demand-zero section, we are done.
+
+if .sp[isd$v_dzro] then (
+	if .sp[isd$w_size] gtru (
+		if .sp[isd$v_gbl] then isd$c_maxlenglbl		
+		else isd$c_lendzro)
+	then
+		anl$format_error(anlobj$_exeisdlendzro);
+	return;
+);
+
+! Analyze the base VBN.
+
+anl$format_line(0,3,anlobj$_exehdrisdvbn,.sp[isd$l_vbn]);
+
+! Before we leave, let's see if this ISD points to an indirect message
+! file.  If so, print out this filename.  To check this, the vector and
+! protect flags must be set, and the page count is 1.  If the page count
+! is greater than 1, this ISD is probably a "direct" message section in
+! which the messages in text have spanned more than one block, so don't
+! bother continuing, we only want indirect.  Then reading the VBN which 
+! this ISD points to, the type field will tell if it's a privileged sharable 
+! image or a user written system service, or a message section.  Only if it 
+! is an indirect message section, is any further information given.
+
+if .sp[isd$v_vector] and .sp[isd$v_protect] and (.sp[isd$w_pagcnt] eqlu 1)
+then
+    begin
+    status = anl$get_image_block( .sp[isd$l_vbn], blk_ptr );
+    if not .status
+    then
+	return (.status);
+    if .blk_ptr[plv$l_type ] eqlu plv$c_typ_msg
+    then
+	begin
+	blk_ptr = .blk_ptr + $byteoffset(plv$l_usrundwn);
+	while .blk_ptr[long_u] nequ 0 do
+	    begin
+	    bind msc_ptr = .blk_ptr + .blk_ptr[long_u] : block[,byte];
+	    if .msc_ptr[ msc$b_type ] eqlu msc$c_ind
+	    then
+	        anl$format_line(0,3,anlobj$_indmsgsec,msc_ptr[msc$b_indnamlen]);
+	    blk_ptr = .blk_ptr + long_c;	! Add the size of a longword
+	    end;
+	end;
+    end;
+
+! If this isn't a global section, we're done.
+
+if not .sp[isd$v_gbl] then (
+	if .sp[isd$w_size] gtru isd$c_lenpriv then
+		anl$format_error(anlobj$_exeisdlenpriv);
+	return;
+);
+
+! Analyze the global section identification.
+
+anl$format_line(0,3,anlobj$_exehdrgblident,.sp[isd$l_ident]);
+
+! Analyze the match control.
+
+selectoneu .sp[isd$v_matchctl] of set
+[isd$k_matall,
+ isd$k_matequ,
+ isd$k_matleq,
+ isd$k_matnev]:	anl$format_line(0,3,anlobj$_exehdrmatch,.match_control[.sp[isd$v_matchctl]]);
+
+[otherwise]:	anl$format_error(anlobj$_exebadmatch,.sp[isd$v_matchctl]);
+tes;
+
+! Analyze the global section name.
+
+anl$format_line(0,3,anlobj$_exehdrisdgblnam,sp[isd$t_gblnam]);
+begin
+local
+	name_dsc: descriptor;
+
+build_descriptor(name_dsc,.sp[20,0,8,0],sp[21,0,8,0]);
+anl$check_symbol(name_dsc, shl$c_maxnamlng+section_suffix_size);
+end;
+
+! We are done.
+
+if .sp[isd$w_size] gtru isd$c_lenglbl then
+	anl$format_error(anlobj$_exeisdlengbl);
+
+return;
+
+end;
+
+%sbttl 'ANL$IMAGE_PATCH_TEXT - Print Image Patch Text'
+!++
+! Functional Description:
+!	This routine is responsible for printing the patch text in the
+!	analysis report.
+!
+! Formal Parameters:
+!	none
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	If interactive session: true if we are to continue, false otherwise.
+!
+! Side Effects:
+!
+!--
+
+
+global routine anl$image_patch_text = begin
+
+local
+	bp: ref block[,byte],
+	sp: ref block[,byte],
+	patch_vbn: long,
+	length: signed long,
+	take: long,
+	alias,
+	local_described_buffer(out_record_dsc,512);
+	
+
+! The image header patch section has already been checked.  If this image
+! doesn't have any patches, then we can leave.
+
+anl$get_image_header(bp,alias);
+if .bp[ihd$w_patchoff] eqlu 0 then
+	return true;
+sp = .bp + .bp[ihd$w_patchoff];
+if .sp[ihp$l_patcomtxt] eqlu 0 then
+	return true;
+
+! We seem to have patch text.  Let's eject the page and start with a heading.
+
+anl$report_page();
+anl$format_line(0,0,anlobj$_exepatch);
+anl$report_line(0);
+anl$report_line(0);
+
+! We need the VBN of the patch text.  Get the first block.
+
+patch_vbn = .sp[ihp$l_patcomtxt];
+anl$get_image_block(.patch_vbn,bp);
+sp = .bp;
+
+! OK, now we are going to loop through the patch records in the patch
+! text area.  We construct each record from the blocks of the image and
+! print them.
+
+loop (
+
+	! Sit in a loop and build the next patch record.  PATCH_VBN is the
+	! block number we are at.  SP points to the beginning of the record,
+	! which is a length.  If not positive, that's the end of the 
+	! patch text.
+
+	length = .sp[0,0,16,1];
+exitif (.length leq 0);
+
+	if .length gtru 255 then (
+		anl$format_error(anlobj$_exebadpatchlen,255);
+exitloop;
+	);
+	sp = .sp + 2;
+
+	out_record_dsc[len] = 0;
+	loop (
+
+		! If we have run off the end of this block, let's get another.
+
+		if .sp geqa .bp+512 then (
+			increment (patch_vbn);
+			anl$get_image_block(.patch_vbn, bp);
+			sp = .bp;
+		);
+
+		! If we have built the entire record, drop out.
+
+	exitif (.length eql 0);
+
+		! Take as many bytes as we can from this block to build
+		! the record.  Adjust things.
+
+		take = minu(.length, .bp+512-.sp);
+		ch$move(.take,.sp, .out_record_dsc[ptr]+.out_record_dsc[len]);
+		out_record_dsc[len] = .out_record_dsc[len] + .take;
+		sp = .sp + .take + .take mod 2;
+		length = .length - .take;
+	);
+
+	! Now we print the record.
+
+	anl$format_line(0,1,anlobj$_anything,out_record_dsc);
+);
+
+! If this is an interactive session, let's find out if the user wants to
+! continue or quit.
+
+if .anl$gb_interactive then
+	return anl$interact()
+else
+	return true;
+
+end;
+
+%sbttl 'ANL$IMAGE_GST - Analyze Global Symbol Table'
+!++
+! Functional Description:
+!	This routine is responsible for analyzing the global symbol table
+!	of a shareable image.  We format the information in the report and
+!	check its validity.
+!
+! Formal Parameters:
+!	none
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	If interactive session:  true if we are to continue, false if not.
+!
+! Side Effects:
+!
+!--
+
+
+global routine anl$image_gst = begin
+
+local
+	bp: ref block[,byte],
+	sp: ref block[,byte],
+	gst_vbn: long,
+	gst_record_count: long,
+	length: long,
+	take: long,
+	alias,
+	local_described_buffer(record_dsc,512);
+
+
+! The global symbol table origin information has already been checked.
+! If this isn't a shareable image or the information is missing, forget it.
+
+anl$get_image_header(bp,alias);
+if .bp[ihd$b_imgtype] nequ ihd$k_lim or .bp[ihd$w_symdbgoff] eqlu 0 then
+	return true;
+sp = .bp + .bp[ihd$w_symdbgoff];
+if .sp[ihs$l_gstvbn] eqlu 0 then
+	return true;
+
+! We seem to have a GST.  Let's eject the page and start with a heading.
+
+anl$report_page();
+anl$format_line(0,0,anlobj$_exegst);
+anl$report_line(0);
+anl$report_line(0);
+
+! We need the VBN of the global symbol table and its record count.  Get
+! the first block of the table.
+
+gst_vbn = .sp[ihs$l_gstvbn];
+gst_record_count = .sp[ihs$w_gstrecs];
+anl$get_image_block(.gst_vbn,bp);
+sp = .bp;
+
+! OK, now we are going to loop through the object records in the global
+! symbol table.  We construct each record from the blocks of the image and
+! analyze them using the object file analysis routines.
+
+incru record_number from 1 to .gst_record_count do (
+
+	! Sit in a loop and build the next object record.  GST_VBN is the
+	! block number we are at.  SP points to the beginning of the record,
+	! which is a length.
+
+	length = .sp[0,0,16,0];
+	sp = .sp + 2;
+	record_dsc[len] = 0;
+
+	loop (
+
+		! If we have run off the end of this block, let's get another.
+
+		if .sp geqa .bp+512 then (
+			increment (gst_vbn);
+			anl$get_image_block(.gst_vbn, bp);
+			sp = .bp;
+		);
+
+		! If we have built the entire record, drop out.
+
+	exitif (.length eqlu 0);
+
+		! Take as many bytes as we can from this block to build
+		! the record.  Adjust things.
+
+		take = minu(.length, .bp+512-.sp);
+		ch$move(.take,.sp, .record_dsc[ptr]+.record_dsc[len]);
+		record_dsc[len] = .record_dsc[len] + .take;
+		sp = .sp + .take + .take mod 2;
+		length = .length - .take;
+	);
+
+	! Now we can analyze the record, assuming it is a least one byte
+	! in length.  Select on its type.
+
+	if .record_dsc[len] gequ 1 then (
+
+		selectoneu ch$rchar(.record_dsc[ptr]) of set
+		[obj$c_hdr]:	anl$object_hdr(.record_number,record_dsc);
+
+		[obj$c_gsd]:	anl$object_gsd(.record_number,record_dsc);
+
+		[obj$c_eom]:	anl$object_eom(.record_number,record_dsc);
+
+		[otherwise]:	(anl$format_error(anlobj$_exebadobj,.record_number,ch$rchar(.record_dsc[ptr]));
+				anl$format_hex(1,record_dsc););
+		tes;
+
+		! Make sure that this record isn't longer than the maximum size
+		! specified in the module header.
+
+		anl$object_record_size(.record_dsc[len]);
+
+		! Skip a couple of lines to make it look nice.
+
+		anl$report_line(-1);
+		anl$report_line(-1);
+
+		! If this is an interactive session, let's find out if the
+		! user wants to continue or quit.
+
+		if .anl$gb_interactive then
+			if not anl$interact() then
+				return false;
+
+	) else (
+
+		! There was no record type.  Tell the user.
+
+		anl$format_error(anlobj$_objnullrec,.record_number);
+		anl$report_line(-1);
+		anl$report_line(-1);
+	);
+);
+
+return true;
+
+end;
+
+end eludom

@@ -1,0 +1,623 @@
+	.TITLE	VAX$CVTLP - VAX-11 Instruction Emulator for CVTLP
+	.IDENT	/V04-000/
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; Facility: 
+;
+;	VAX-11 Instruction Emulator
+;
+; Abstract:
+;	The routine in this module emulates the VAX-11 packed decimal 
+;	CVTLP instruction. This procedure can be a part of an emulator 
+;	package or can be called directly after the input parameters 
+;	have been loaded into the architectural registers.
+;
+;	The input parameters to this routine are the registers that
+;	contain the intermediate instruction state. 
+;
+; Environment: 
+;
+;	This routine runs at any access mode, at any IPL, and is AST 
+;	reentrant.
+;
+; Author: 
+;
+;	Lawrence J. Kenah	
+;
+; Creation Date:
+;
+;	18 October 1983
+;
+; Modified by:
+;
+;	V01-004	LJK0040		Lawrence J. Kenah	24-Jul-1984
+;		Do not use an INCL instruction to modify the contents of
+;		the sign byte of the output string.
+;
+;	V01-003	LJK0032		Lawrence J. Kenah	5-Jul-1984
+;		Fix restart routine to take into account the fact that restart
+;		codes are based at one when computing restart PC.
+;
+;	V01-002	LJK0024		Lawrence J. Kenah	22-Feb-1984
+;		Add code to handle access violations. Perform minor cleanup.
+;
+;	V01-001	LJK0008		Lawrence J. Kenah	18-Oct-1983
+;		The emulation code for CVTLP was moved into a separate module.
+;--
+
+	.SUBTITLE	Declarations
+
+; Include files:
+
+	.NOCROSS			; No cross reference for these
+	.ENABLE		SUPPRESSION	; No symbol table entries either
+
+	CVTLP_DEF			; Bit fields in CVTLP registers
+	PACK_DEF			; Stack usage by exception handler
+	STACK_DEF			; Stack usage for original exception
+
+	$PSLDEF				; Define bit fields in PSL
+
+	.DISABLE	SUPPRESSION	; Turn on symbol table again
+	.CROSS				; Cross reference is OK now
+
+; External declarations
+
+	.DISABLE	GLOBAL
+
+	.EXTERNAL -
+			DECIMAL$BINARY_TO_PACKED_TABLE
+
+	.EXTERNAL -
+			VAX$EXIT_EMULATOR,-
+			VAX$REFLECT_FAULT,-
+			VAX$ROPRAND,-
+			VAX$DECIMAL_OVERFLOW
+
+; PSECT Declarations:
+
+	.DEFAULT	DISPLACEMENT , WORD
+
+	.PSECT _VAX$CODE PIC, USR, CON, REL, LCL, SHR, EXE, RD, NOWRT, LONG
+
+	BEGIN_MARK_POINT	RESTART
+
+	.SUBTITLE	VAX$CVTLP - Convert Long to Packed
+;+
+; Functional Description:
+;
+;	The source operand is converted to  a  packed  decimal  string  and  the
+;	destination  string  operand  specified  by  the  destination length and
+;	destination address operands is replaced by the result.
+;
+; Input Parameters:
+;
+;	R0 - src.rl		Input longword to be converted
+;	R2 - dstlen.rw		Length of output decimal string
+;	R3 - dstaddr.ab		Address of output packed decimal string
+;
+; Output Parameters:
+;
+;	R0 = 0
+;	R1 = 0
+;	R2 = 0
+;	R3 = Address of byte containing most significant digit of
+;	     the destination string
+;
+; Condition Codes:
+;
+;	N <- destination string LSS 0
+;	Z <- destination string EQL 0
+;	V <- decimal overflow
+;	C <- 0
+;
+; Register Usage:
+;
+;	This routine uses R0 through R5 and R11 as scratch registers. R10 
+;	serves its usual function as an access violation routine pointer. The 
+;	condition codes are stored in R11 as the routine executes.
+;
+; Notes:
+;
+;	The algorithm used in this routine builds the packed decimal from
+;	least significant digit to most significant digit. The least
+;	significant digit is obtained by dividing the input longword by 10 and
+;	storing the remainder as the least significant digit. The rest of the
+;	result is obtained by taking the quotient from the first step,
+;	repeatedly dividing by 100, and converting the resulting remainder
+;	into a pair of packed decimal digits. This process continues until the
+;	quotient goes to zero. 
+;
+;	No special processing is observed for an input longword of zero. The
+;	correct results for this case drops out of normal processing. 
+;-
+
+	.ENABLE		LOCAL_BLOCK
+
+	ASSUME CVTLP_B_STATE EQ 7	; Make sure we test the right FPD bit
+
+2$:	BRW	VAX$CVTLP_RESTART	; Restart somewhere else
+
+VAX$CVTLP::
+	BBS	#<CVTLP_V_FPD+24>,R1,2$	; Branch if this is a restart
+	PUSHR	#^M<R4,R5,R10,R11>	; Save some registers
+	ESTABLISH_HANDLER	-	; Store address of access
+		CVTLP_ACCVIO		;  violation handler
+
+; Get initial settings for condition codes. The initial settings for V and C
+; will be zero. The initial setting of N depends on the sign of the source
+; operand. The Z-bit starts off set and remains set until a nonzero digit is
+; stored in the output string. Note that the final Z-bit may be set for
+; nonzero input if the output string is not large enough. (The V-bit is set
+; in this case.) In this case, the saved DV bit will determine whether to
+; reflect an exception or merely report the result to the caller. 
+
+	MOVPSL	R11			; Get DV bit from PSL on input
+	INSV	#PSL$M_Z,#0,#4,R11	; Start with Z-bit set, others clear
+	ROPRAND_CHECK	R2		; Insure that R2 LEQU 31
+	ASHL	#-1,R2,R1		; Convert digit count to byte count
+	ADDL	R1,R3			; Get address of sign byte
+	MARK_POINT	CVTLP_1 , RESTART
+	MOVB	#12,(R3)		; Assume that sign is PLUS
+	TSTL	R0			; Check sign of source operand
+	BGEQ	10$			; Start getting digits if not negative
+
+; Source operand is minus. We remember that by setting the saved N-bit but work
+; with the absolute value of the input operand from this point on.
+
+	MARK_POINT	CVTLP_2 , RESTART
+	INCB	(R3)			; Convert "+" to "-" (12 -> 13)
+	MNEGL	R0,R0			; Normalize source operand
+	BISB	#PSL$M_N,R11		; Set N-bit in saved PSW
+
+;+ 
+; The first (least significant) digit is obtained by dividing the source 
+; longword by ten and storing the remainder in the high order nibble of the
+; sign byte. Note that at this point, the upper four bits of the sign byte
+; contain zero.
+;-
+
+10$:	CLRL	R1			; Prepare R1 for input to EDIV
+	MOVL	R2,R4			; Special exit if zero source length
+	BEQL	90$			; Only overflow check remains
+	EDIV	#10,R0,R0,R5		; R5 gets remainder, first digit
+	ASHL	#4,R5,R5		; Shift digit to high nibble position
+	BEQL	20$			; Leave Z-bit alone if digit is zero
+	BICB	#PSL$M_Z,R11		; Turn off Z-bit if nonzero
+	MARK_POINT	CVTLP_3 , RESTART
+	ADDB	R5,(R3)			; Merge this digit with low nibble
+20$:	DECL	R4			; One less output digit
+	BEQL	90$			; No more room in output string
+	ASHL	#-1,R4,R4		; Number of complete bytes remaining
+	BEQL	80$			; Check for last digit if none
+	TSTL	R0			; Is source exhausted?
+	BNEQ	30$			; Go get next digits if not
+	MARK_POINT	CVTLP_4 , RESTART
+	CLRB	-(R3)			; Store a pair of zeros
+	BRB	50$			; Fill rest of output with zeros
+
+;+
+; The following loop obtains two digits at a time from the source longword. It
+; accomplishes this by dividing the current value of R0 by 100 and converting
+; the remainder to a pair of decimal digits using the table that converts
+; binary numbers in the range from 0 to 99 to their packed decimal equivalents.
+; Note that this technique may cause nonzero to be stored in the upper nibble
+; of the most significant byte of an even length string. This condition will
+; be tested for at the end of the loop.
+;-
+
+30$:	EDIV	#100,R0,R0,R5		; R5 gets remainder, next digit
+	MARK_POINT	CVTLP_5 , RESTART
+	MOVB	DECIMAL$BINARY_TO_PACKED_TABLE[R5],-(R3)
+					; Store converted remainder
+	BEQL	40$			; Leave Z-bit alone if digit is zero
+	BICB	#PSL$M_Z,R11		; Turn off Z-bit if nonzero
+40$:	TSTL	R0			; Is source exhausted?
+	BEQL	50$			; Exit loop is no more source
+	SOBGTR	R4,30$			; Check for end of loop
+	
+	BRB	80$			; Check for remaining digit
+
+; The following code executes if the source longword is exhausted. If there
+; are any remaining digits in the destination string, they must be filled
+; with zeros. Note that one more byte is cleared if the original input length
+; was odd. This includes the most significant digit and the unused nibble.
+
+50$:	BLBS	R2,65$			; One less byte to zero if odd input length
+
+	MARK_POINT	CVTLP_6 , RESTART
+60$:	CLRB	-(R3)			; Set a pair of digits to zero
+65$:	SOBGTR	R4,60$			; Any more digits to zero?
+
+; The following code is the exit path for this routine. Note that all code
+; paths that arrive here do so with R0 containing zero. R1 and R2, however,
+; must be cleared on exit. 
+
+70$:	CLRQ	R1			; Comform to architecture
+	BICPSW	#<PSL$M_N!PSL$M_Z!PSL$M_V!PSL$M_C>	; Clear condition codes
+	BISPSW	R11			; Set appropriate condition codes
+	POPR	#^M<R4,R5,R10,R11>	; Restore registers, preserving PSW
+	RSB
+
+;+
+; The following code executes when there is no more room in the destination
+; string. We first test for the parity of the output length and, if even, 
+; determine whether a nonzero digit was stored in the upper nibble of the 
+; most significant byte. Such a nonzero store causes an overflow condition.
+;
+; If the source operand is not yet exhausted, then decimal overflow occurs.
+; If decimal overflow exceptions are enabled, an exception is signalled.
+; Otherwise, the V-bit in the PSW is set and a normal exit is issued. Note
+; that negative zero is only an issue for this instruction when overflow
+; occurs. In the no overflow case, the entire converted longword is stored in
+; the output string and there is only one form of binary zero. 
+;-
+
+80$:	BLBS	R2,90$			; No last digit if odd output length
+	EDIV	#10,R0,R0,R5		; Get next input digit
+	MARK_POINT	CVTLP_7 , RESTART
+	MOVB	R5,-(R3)		; Store in last output byte
+	BEQL	90$			; Leave Z-bit alone if zero
+	BICB	#PSL$M_Z,R11
+
+90$:	TSTL	R0			; Is source also all used up?
+	BEQL	70$			; Yes, continue with exit processing
+
+; An overflow has occurred. If the Z-bit is still set, then the N-bit is cleared. 
+; Note that, because all negative zero situations occur simultaneously with
+; overflow, the output sign is left as minus. 
+
+100$:	CLRL	R0			; R0 must be zero on exit
+	BBC	#PSL$V_Z,R11,110$	; Z-bit and N-bit cannot both be set
+	BICB	#PSL$M_N,R11		; Clear N-bit if Z-bit still set
+110$:	BISB	#PSL$M_V,R11		; Set V-bit in saved PSW
+
+; If the V-bit is set and decimal traps are enabled (DV-bit is set), then
+; a decimal overflow trap is generated. Note that the DV-bit can be set in
+; the current PSL or, if this routine was entered as the result of an emulated
+; instruction exception, in the saved PSL on the stack.
+
+	BBS	#PSL$V_DV,R11,120$	; Report exception if current DV-bit set
+	MOVAB	VAX$EXIT_EMULATOR,R4	; Set up R4 for PIC address comparison
+	CMPL	R4,<4*4>(SP)		; Is return PC EQLU VAX$EXIT_EMULATOR ?
+	BNEQU	70$			; No. Simply return V-bit set
+	BBC	#PSL$V_DV,<<4*<4+1>>+EXCEPTION_PSL>(SP),70$
+					; Only return V-bit if DV-bit is clear
+
+; Restore the saved registers and transfer control to DECIMAL_OVERFLOW
+
+120$:	CLRQ	R1			; Comform to architecture
+	BICPSW	#<PSL$M_N!PSL$M_Z!PSL$M_V!PSL$M_C>	; Clear condition codes
+	BISPSW	R11			; Set appropriate condition codes
+	POPR	#^M<R4,R5,R10,R11>	; Restore registers, preserving PSW
+	BRW	VAX$DECIMAL_OVERFLOW	; Report overflow exception
+
+	.DISABLE	LOCAL_BLOCK
+
+	.SUBTITLE	DECIMAL_ROPRAND
+;-
+; Functional Description:
+;
+;	This routine receives control when a digit count larger than 31
+;	is detected. The exception is architecturally defined as an
+;	abort so there is no need to store intermediate state. The digit
+;	count is made after registers are saved. These registers must be
+;	restored before reporting the exception.
+;
+; Input Parameters:
+;
+;	00(SP) - Saved R4
+;	04(SP) - Saved R5
+;	08(SP) - Saved R10
+;	12(SP) - Saved R11
+;	16(SP) - Return PC from VAX$CVTLP routine
+;
+; Output Parameters:
+;
+;	00(SP) - Offset in packed register array to delta PC byte
+;	04(SP) - Return PC from VAX$CVTLP routine
+;
+; Implicit Output:
+;
+;	This routine passes control to VAX$ROPRAND where further
+;	exception processing takes place.
+;-
+
+DECIMAL_ROPRAND:
+	POPR	#^M<R4,R5,R10,R11>	; Restore registers
+	PUSHL	#CVTLP_B_DELTA_PC	; Store offset to delta PC byte
+	BRW	VAX$ROPRAND		; Pass control along
+
+	.SUBTITLE	CVTLP_ACCVIO - Reflect an Access Violation
+;+
+; Functional Description:
+;
+;	This routine receives control when an access violation occurs while
+;	executing within the VAX$CVTLP emulator routine.
+;
+;	The routine header for ASHP_ACCVIO in module VAX$ASHP contains a
+;	detailed description of access violation handling for the decimal
+;	string instructions. This routine differs from most decimal 
+;	instruction emulation routines in that it preserves intermediate 
+;	results if an access violation occurs. This is accomplished by 
+;	storing the number of the exception point, as well as intermediate 
+;	arithmetic results, in the registers R0 through R3.
+;
+; Input Parameters:
+;
+;	See routine ASHP_ACCVIO in module VAX$ASHP
+;
+; Output Parameters:
+;
+;	See routine ASHP_ACCVIO in module VAX$ASHP
+;-
+
+CVTLP_ACCVIO:
+	CLRL	R2			; Initialize the counter
+	PUSHAB	MODULE_BASE		; Store base address of this module
+	SUBL2	(SP)+,R1		; Get PC relative to this base
+
+10$:	CMPW	R1,PC_TABLE_BASE[R2]	; Is this the right PC?
+	BEQL	30$			; Exit loop if true
+	AOBLSS	#TABLE_SIZE,R2,10$	; Do the entire table
+
+; If we drop through the dispatching based on PC, then the exception is not 
+; one that we want to back up. We simply reflect the exception to the user.
+
+20$:	POPR	#^M<R0,R1,R2,R3>	; Restore saved registers
+	RSB				; Return to exception dispatcher
+
+; The exception PC matched one of the entries in our PC table. R2 contains
+; the index into both the PC table and the handler table. R1 has served
+; its purpose and can be used as a scratch register.
+
+30$:	MOVZWL	HANDLER_TABLE_BASE[R2],R1	; Get the offset to the handler
+	JMP	MODULE_BASE[R1]		; Pass control to the handler
+	
+; In all of the instruction-specific routines, the state of the stack
+; will be shown as it was when the exception occurred. All offsets will
+; be pictured relative to R0. 
+
+	.SUBTITLE	Context-Specific Access Violation Handling for VAX$CVTLP
+;+
+; Functional Description:
+;
+;	The intermediate state of the instruction is packed into registers R0 
+;	through R3 and control is passed to VAX$REFLECT_FAULT that will, in 
+;	turn, reflect the access violation back to the user. The intermediate 
+;	state reflects the point at which the routine was executing when the 
+;	access violation occurred.
+;
+; Input Parameters:
+;
+;	R0 - Address of top of stack when access violation occurred
+;
+;	00(R0) - Saved R4 on entry to VAX$CVTLP
+;	04(R0) - Saved R5
+;	08(R0) - Saved R10
+;	12(R0) - Saved R11
+;	16(R0) - Return PC from VAX$CVTLP routine
+;
+;	00(SP) - Saved R0 (restored by VAX$HANDLER)
+;	04(SP) - Saved R1
+;	08(SP) - Saved R2
+;	12(SP) - Saved R3
+;
+; Output Parameters:
+;
+;	R0 - Address of return PC from VAX$CVTLP
+;	R1 - Byte offset to delta-PC in saved register array
+;		(PACK_V_FPD and PACK_M_ACCVIO set to identify exception)
+;
+;	See list of input parameters for CVTLP_RESTART for a description of the
+;	contents of the packed register array.
+;
+; Implicit Output:
+;
+;	R4, R5, R10, and R11 are restored to the values that they had
+;	when VAX$CVTLP was entered.
+;-
+
+	.ENABLE		LOCAL_BLOCK
+
+;+
+; CVTLP_1 or CVTLP_2
+;
+; An access violation occurred while storing the initial sign in the output
+; string. R1, R4, and R5 contain junk at this point.
+;
+;	R0  - Input source longword
+;	R2  - Digit count of destination string
+;	R3  - Address of sign byte in destination string
+;	R11 - Current PSW (with Z-bit set and all others clear)
+;
+;	R1 - Not important
+;	R4 - Scratch but saved anyway
+;	R5 - Scratch but saved anyway
+;-
+
+CVTLP_1:
+	MOVB	#<CVTLP_1_RESTART!-	; Store code that locates exception PC
+		CVTLP_M_FPD>,-
+		CVTLP_B_STATE(SP)	
+	BRB	10$			; Join common code
+
+CVTLP_2:
+	MOVB	#<CVTLP_2_RESTART!-	; Store code that locates exception PC
+		CVTLP_M_FPD>,-
+		CVTLP_B_STATE(SP)	
+	BRB	10$			; Join common code
+
+;+
+; CVTLP_3 through CVTLP_7
+;
+; An access violation occurred while storing a digit or digit pair in the 
+; output string. 
+;
+;	R0  - Input source longword (updated)
+;	R1  - Zero (so that R0/R1 can be used as input quadword to EDIV)
+;	R2  - Digit count of destination string
+;	R3  - Address of current byte in destination string
+;	R4  - Updated digit or byte count
+;	R5  - Most recent remainder from EDIV
+;	R11 - Current PSW (condition codes reflect results so far)
+;-
+
+CVTLP_3:
+	MOVB	#<CVTLP_3_RESTART!-	; Store code that locates exception PC
+		CVTLP_M_FPD>,-
+		CVTLP_B_STATE(SP)	
+	BRB	10$			; Join common code
+
+CVTLP_4:
+	MOVB	#<CVTLP_4_RESTART!-	; Store code that locates exception PC
+		CVTLP_M_FPD>,-
+		CVTLP_B_STATE(SP)	
+	BRB	10$			; Join common code
+
+CVTLP_5:
+	MOVB	#<CVTLP_5_RESTART!-	; Store code that locates exception PC
+		CVTLP_M_FPD>,-
+		CVTLP_B_STATE(SP)	
+	BRB	10$			; Join common code
+
+CVTLP_6:
+	MOVB	#<CVTLP_6_RESTART!-	; Store code that locates exception PC
+		CVTLP_M_FPD>,-
+		CVTLP_B_STATE(SP)	
+	BRB	10$			; Join common code
+
+CVTLP_7:
+	MOVB	#<CVTLP_7_RESTART!-	; Store code that locates exception PC
+		CVTLP_M_FPD>,-
+		CVTLP_B_STATE(SP)	
+
+10$:	MOVB	R4,CVTLP_B_SAVED_R4(SP)	; Store current digit/byte count
+	MOVB	R5,CVTLP_B_SAVED_R5(SP)	; Store latest EDIV remainder
+	MOVB	R11,CVTLP_B_SAVED_PSW(SP) ; Store current condition codes
+
+; At this point, all intermediate state has been preserved in the register
+; array on the stack. We now restore the registers that were saved on entry 
+; to VAX$CVTLP and pass control to VAX$REFLECT_FAULT where further exception
+; dispatching takes place.
+
+	MOVQ	(R0)+,R4		; Restore R4 and R5
+	MOVQ	(R0)+,R10		; ... and R10 and R11
+
+	MOVL	#<CVTLP_B_DELTA_PC!-	; Indicate offset for delta PC
+		PACK_M_FPD!-		; FPD bit should be set
+		PACK_M_ACCVIO>,R1	; This is an access violation
+	BRW	VAX$REFLECT_FAULT	; Continue exception handling
+
+	.DISABLE	LOCAL_BLOCK
+
+	.SUBTITLE	CVTLP_RESTART - Unpack and Restart CVTLP Instruction
+;+
+; Functional Description:
+;
+;	This routine receives control when a CVTLP instruction is restarted. 
+;	The instruction state (stack and general registers) is restored to the 
+;	state that it was in when the instruction (routine) was interrupted and 
+;	control is passed to the PC at which the exception occurred.
+;
+; Input Parameters:
+;
+;     31               23               15               07            00
+;    +----------------+----------------+----------------+----------------+
+;    |                                src                                | : R0
+;    +----------------+----------------+----------------+----------------+
+;    |     state      |   saved_PSW    |    saved_R5    |    saved_R4    | : R1
+;    +----------------+----------------+----------------+----------------+
+;    |    delta-PC    |      XXXX      |             dstlen              | : R2
+;    +----------------+----------------+----------------+----------------+
+;    |                              dstaddr                              | : R3
+;    +----------------+----------------+----------------+----------------+
+;
+;	Depending on where the exception occurred, some of these parameters 
+;	may not be relevant. They are nevertheless stored as if they were 
+;	valid to make this restart code as simple as possible.
+;
+;	R0        - Updated source longword
+;	R1<07:00> - Latest digit or byte count (loaded into R4)
+;	R1<15:08> - Most recent remainder from EDIV (loaded into R5)
+;	R1<23:16> - Saved condition codes (loaded into R11)
+;	R1<26:24> - Restart code (identifies point where routine will resume)
+;	R1<27>    - Internal FPD flag
+;	R2<15:00> - Initial value of "dstlen"
+;	R2<23:16> - spare
+;	R2<31:24> - Size of instruction in instruction stream
+;	R3        - Address of current byte in destination string
+;
+;	00(SP) - Return PC from VAX$CVTLP routine
+;
+; Output Parameters:
+;
+;	R0  - Updated source longword (unchanged from input)
+;	R1  - scratch
+;	R2  - Initial value of "dstlen"
+;	R3  - Address of current byte in output string (unchanged from input)
+;	R4  - Latest digit or byte count 
+;	R5  - Most recent remainder from EDIV 
+;	R10 - Address of CVTLP_ACCVIO, this module's "condition handler"
+;	R11 - Condition codes
+;
+;	00(SP) - Saved R4
+;	04(SP) - Saved R5
+;	08(SP) - Saved R10
+;	12(SP) - Saved R11
+;	16(SP) - Return PC from VAX$CVTLP routine
+;
+; Implicit Output:
+;
+;	Control is passed to the instruction that was executing when the
+;	access violation occurred.
+;-
+
+VAX$CVTLP_RESTART::
+	PUSHR	#^M<R0,R1,R4,R5,R10,R11>	; Save some registers
+	ESTABLISH_HANDLER	CVTLP_ACCVIO	; Reload R10 with handler address
+	EXTZV	#CVTLP_V_STATE,-
+		#CVTLP_S_STATE,-
+		CVTLP_B_STATE(SP),R1		; Put restart code into R1
+	MOVZBL	CVTLP_B_SAVED_R4(SP),R4		; Restore digit/byte count
+	MOVZBL	CVTLP_B_SAVED_R5(SP),R5		; Restore latest EDIV remainder
+	MOVZBL	CVTLP_B_SAVED_PSW(SP),R11	; Restore condition codes
+	MOVZBL	R2,R2				; Clear out R2<31:8>
+	ADDL	#8,SP				; Discard saved R0 and R1
+	MOVZWL	RESTART_PC_TABLE_BASE-2[R1],R1	; Convert code to PC offset
+
+; In order to get back to the restart point with R1 containing zero, we cannot
+; use R1 to transfer control as we did in other routines like VAX$CVTPL.
+
+	PUSHAB	MODULE_BASE[R1]		; Store "return PC"
+	CLRL	R1			; Restart with R1 set to zero
+	RSB				; Get back to work
+
+	END_MARK_POINT		CVTLP_M_STATE
+
+	.END

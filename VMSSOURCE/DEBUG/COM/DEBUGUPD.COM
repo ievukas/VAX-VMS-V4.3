@@ -1,0 +1,15 @@
+!	[ D E B U G . C O M ] D E B U G U P D . C O M
+!
+!	This file is used to apply the updates to the master source of the
+!	require files during the system build procedure, UPDATE phase.
+!
+$ SRCUPDATE DBGMSG.MDL
+$ SRCUPDATE DEBUGHLP.RNH
+$ SRCUPDATE DBGEXT.REQ
+$ SRCUPDATE DBGGEN.REQ
+$ SRCUPDATE DBGLIB.REQ
+$ SRCUPDATE DBGPROLOG.REQ
+$ SRCUPDATE DSTRECRDS.REQ
+$ SRCUPDATE SSIDEF.REQ
+$ SRCUPDATE STRUCDEF.REQ
+$ SRCUPDATE TEMPREQ.REQ

@@ -1,0 +1,1224 @@
+MODULE type_main (	! STARLET Native Type Utility
+                        IDENT = 'V04-000',
+                        MAIN = type$main,
+			ADDRESSING_MODE(EXTERNAL=GENERAL)
+                        ) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  TYPE
+!
+! ABSTRACT:
+!
+!	This utility program types one or more user-specified files.
+!
+! ENVIRONMENT:  
+!
+!	VAX/VMS operating system, unprivileged user mode utility,
+!	operates at non-AST level.
+!
+! AUTHOR:  Stephen H. Zalewski,		CREATION DATE:  10-Aug-1982
+!
+! Modified by:
+!
+!	V03-011	SHZ0011		Stephen Zalewski	26-Jul-1984
+!		Use seperate descriptor when parsing output qualifier.
+!
+!	V03-010	SHZ0010		Stephen H. Zalewski, 	20-Jul-1984
+!		Fix type/page for .log files.  Make /OUTPUT
+!		default to NL:
+!
+!	V03-009	ROP0010		Robert Posniak		19-JUN-1984
+!		Only find image symbols for screen formating when
+!		in page mode.
+!
+!	V03-008	SHZ0008		Stephen H. Zalewski, 	12-Apr-1984
+!		Make TYPE/OUTPUT default to TYPE.LIS instead of SYS$OUTPUT.
+!		
+!	V03-007	SHZ0007		Stephen H. Zalewski,	07-Mar-1984
+!		Add /PAGE support for non-vt100 type terminals.
+!
+!	V03-006	SHZ0006		Stephen H. Zalewski	28-Feb-1984
+!		Do not continue reading records from input file if a
+!		$GET fails.  The only exception is if rms$_rtb is returned.
+!
+!	V03-005	SHZ0005		Stephen H. Zalewski	16-Feb-1984
+!		Add support for /PAGE.  Add support for sticky searchlists.
+!
+!	V03-004	SHZ0004		Stephen H. Zalewski	01-Jan-1984
+!		Fix line spacing problem when printing headers for
+!		files with no RAT attributes.  Do not allow a user to
+!		specify SYS$OUTPUT as the input file.
+!
+!	V03-003	SHZ0003		Stephen H. Zalewski	31-Oct-1983
+!		Do not update related file name pointer in related file
+!		name block.  Also no longer bother doing a $PARSE for each
+!		file spec.  Both of these functions are now done in
+!		lib$file_scan.
+!
+!	V03-002	SHZ0002		Stephen H. Zalewski	20-Apr-1983
+!		Add functionality to allow a user to type CNTRL/C,
+!		which causes type to immediately go to next file spec.
+!
+!	V03-001	SHZ0001		Stephen H. Zalewski	5-Apr-1983
+!		Set default Recored attribute to be CR on open of a file.
+!		This is needed if either we are getting input from TT: or
+!		the user did a "task=foo".
+!
+!--
+
+LIBRARY 'SYS$LIBRARY:STARLET.L32';			! VAX/VMS common definitions
+REQUIRE	'SRC$:TYPE.REQ';				! COPY literal definitions and macros
+
+
+FORWARD ROUTINE
+    type$main,						! Main TYPE control routine
+    type_file : 	NOVALUE,			! Type one file
+    write_header,					! Write a file header to output file
+    write_line,						! Write a line to the output file
+    ast_routine :	NOVALUE,			! Ast routine called by CNTRL/C
+    type$get_cmdqual :	NOVALUE,			! Get command qualifiers.
+    get_term_info:	NOVALUE,			! Determine terminal characteristics
+    type$open_output,					! Open the output file.
+    type$search_error:	NOVALUE,			! Error searching for a file.
+    condit_handler,					! Condition handler for errors and messages
+    type$file_error : 	NOVALUE;			! Handles errors on RMS file functions
+
+
+EXTERNAL ROUTINE
+    lib$find_image_symbol,
+    lib$get_command,
+    lib$qual_file_parse,				! Get common command qualifiers
+    lib$qual_file_match,				! Check to see if a file should be typed.
+    lib$get_vm,						! Get some address space
+    cli$get_value,					! Get qualifier value
+    cli$present,					! Check for qualifiers
+    lib$file_scan;					! Search wildcard specifications.
+
+
+EXTERNAL
+    cli$_negated,
+    lib$_quipro,					! Quit processing
+    lib$_filfaimat;					! File failed to meet criteria
+
+
+GLOBAL
+    channel : VECTOR[1,WORD],
+    top_line,
+    bottom_line,
+    bottom_scroll,
+    bottom_of_page,
+    line_width,
+    middle_of_line,
+    screen_flags 	: INITIAL(2),
+    type$context,					! Context longword for common qualifier package
+    type$gen_flags	: $BBLOCK [4] INITIAL(0),	! General flags
+    type$exit_status	: $BBLOCK [4]			! Holds most severe error code
+                          INITIAL (ss$_normal),
+    type$input_esa	: VECTOR [nam$c_maxrss, BYTE],	! Expanded string address for input filename
+    type$input_rsa	: VECTOR [nam$c_maxrss, BYTE],	! Related string address for input filename.
+    type$output_rsa	: VECTOR [nam$c_maxrss, BYTE],	! Related output address for output file name.
+    rh_buffer		: VECTOR [type$c_rhb_size, BYTE],! Address of record header fubber.
+    line_buffer,					! Address of line buffer.
+    line_counter,					! Used if we paginate file.
+    input_desc		: $BBLOCK [dsc$c_s_bln],	! CLI input file descriptor block
+    output_desc		: $BBLOCK [dsc$c_s_bln],	! CLI output file descriptor block
+    command_desc	: $BBLOCK [dsc$c_s_bln],	! Used to get a command if we are paginating
+    input_fab		: $FAB_DECL,			! Input FAB.
+    input_rab		: $RAB_DECL,			! Input RAB.
+    input_nam		: $NAM_DECL,			! Input NAM.
+    output_fab		: $FAB_DECL,			! Output FAB.
+    output_rab		: $RAB_DECL,			! Output RAB.
+    output_nam		: $NAM_DECL;			! Output NAM.
+                                
+
+MACRO LBRSYM(LBRNAME) =
+    PSECT OWN = $OWN$;
+
+    OWN %NAME('LBR_',LBRNAME) : LONG;
+
+    PSECT OWN = LBR_ADDRESSES (NOWRITE,EXECUTE);
+
+    OWN %NAME(LBRNAME,'_ADDR'): INITIAL(%NAME('LBR_',LBRNAME));
+
+    PSECT OWN = LBR_NAMES (NOWRITE,EXECUTE);
+
+    OWN %NAME(LBRNAME) : VECTOR[2,LONG]
+		INITIAL(%CHARCOUNT(%NAME('LIB$',LBRNAME)),
+			UPLIT(%STRING('LIB$',%NAME(LBRNAME))));
+
+    UNDECLARE %NAME(LBRNAME)%;
+
+
+
+PSECT OWN = LBR_ADDRESSES(NOWRITE,EXECUTE);
+
+OWN
+    LBR_ADDR_HEAD : VECTOR[0,LONG];
+
+PSECT OWN = LBR_NAMES(NOWRITE,EXECUTE);
+
+OWN
+    LBR_NAMES_HEAD : VECTOR[0,LONG];
+
+LBRSYM(ERASE_PAGE);
+LBRSYM(ERASE_LINE);
+LBRSYM(PUT_SCREEN);
+LBRSYM(SCREEN_INFO);
+LBRSYM(SET_CURSOR);
+LBRSYM(SET_SCROLL);
+LBRSYM(UP_SCROLL);
+
+PSECT OWN = LBR_ADDRESSES;
+
+OWN
+    LBR_ADDR_END : LONG INITIAL(0);
+
+PSECT OWN = $OWN$;
+
+
+ROUTINE type$main =
+
+!++
+! Functional description
+!
+!	This routine is the central control routine for the TYPE utility.
+!	It determines the basic logical flow and calls support routines
+!	that perform each logical function in typing files.
+!
+! Calling sequence
+!
+!	type$main ()
+!
+! Input parameters
+!
+!	none
+!
+! Implicit inputs
+!
+!	none
+!
+! Output parameters
+!
+!	none
+!
+! Implicit outputs
+!
+!	type$exit_status	- set whenever an error occurs
+!
+! Routine value
+!
+!	Most severe error encountered during processing or SS$_NORMAL
+!
+! Side effects
+!
+!	The specified files are typed.
+!
+!--
+
+BEGIN
+
+LOCAL
+    scan_context : INITIAL(0),
+    status;						! General routine return code
+
+ENABLE condit_handler;					! Enable a local handler.
+
+CH$FILL(0, dsc$c_d_bln, input_desc);			! Make descriptor dynamic
+input_desc[dsc$b_class] = dsc$k_class_d;
+CH$MOVE(dsc$c_d_bln,input_desc,command_desc);
+CH$MOVE(dsc$c_d_bln,input_desc,output_desc);
+
+status = lib$get_vm(UPLIT(32767),line_buffer);		! Get space for line buffer.
+IF NOT .status
+    THEN SIGNAL_STOP (.status);
+
+$FAB_INIT (FAB = input_fab,				! Initialize the input FAB
+	   CTX = input_rab,				! Store address of input RAB.
+	   RAT = CR,					! Set record attr. in case TT input
+           FAC = <GET>,					! Input file.
+           SHR = <UPI,GET,PUT>,				! Allow others to read, write to the input file.
+	   DNA = UPLIT BYTE ('.LIS'),			! Default file type is .LIS
+	   DNS = 4,					! Size is 4.
+           FOP = <NAM,SQO>,				! Open by name block.
+           NAM = input_nam);				! NAM block address.
+
+$RAB_INIT (RAB = input_rab,				! Initialize input RAB
+	   RAC = SEQ,					! Record access is sequential.
+	   ROP = LOC,					! Record options
+	   USZ = 32767,					! Input buffer size
+	   UBF = .line_buffer,				! Input buffer address.
+	   RHB = rh_buffer,				! Record header buffer address
+	   FAB = input_fab);				! Address of input FAB.
+
+$NAM_INIT (NAM = input_nam,				! Initialize NAM block.
+	   ESS = nam$c_maxrss,				! Expanded string size
+	   ESA = type$input_esa,			! Expanded string address
+	   RSS = nam$c_maxrss,				! Related string size
+	   RSA = type$input_rsa);			! Related string address
+
+
+type$get_cmdqual();					! Get the command qualifiers.
+get_term_info();
+
+
+!
+! The following loop is executed for each file specification supplied by the user.
+!
+
+    WHILE true DO					! Beginning of repeat loop
+	BEGIN
+	IF NOT cli$get_value($descriptor('INPUT'), input_desc)	! If no more file specs are coming,
+    	    THEN EXITLOOP;
+	input_fab[fab$l_fna] = .input_desc [dsc$a_pointer];	! Move the file name address
+	input_fab[fab$b_fns] = .input_desc [dsc$w_length];	!  and length into the file FAB block.
+        lib$file_scan(input_fab,			! Type every file specified in the
+			type_file,			!  file spec just found.
+			type$search_error,		! Go here if file is not found.
+			scan_context);
+	END;						! End of "WHILE true DO" file spec processing loop.
+
+
+IF .output_fab[fab$w_ifi] NEQ 0				! If the output file is open, close it.
+THEN
+    BEGIN
+    status = $CLOSE(fab = output_fab);			! Close the output file.
+    IF NOT .status					! Report an error is we fail.
+    THEN 
+	type$file_error(msg$_closeout,output_fab);
+    END;
+
+
+RETURN .type$exit_status OR sts$m_inhib_msg;		! EXIT with no message
+END;
+
+
+ROUTINE type_file : NOVALUE =
+
+!++
+! Functional description
+!
+!	This routine types one file.   If the output file is SYS$OUTPUT, it is closed after we 
+!	finish writing the input file.  The reason for this is that there could have been several files 
+!	given on the input line, and they could each have different record characteristics.  By closing
+!	the output file each time, we make sure that we pick up the correct record charactersitics for
+!	each file when we type it.  This is not possible when the output file is directed to something
+!	other that sys$output because we would create a new version of the output file every time we
+!	opened and closed. it.
+!
+!
+! Calling sequence
+!
+!	type_file
+!
+! Input parameters
+!
+!	none
+!
+! Implicit inputs
+!
+!	none
+!
+! Output parameters
+!
+!	none
+!
+! Implicit outputs
+!
+!	none
+!
+! Routine value
+!
+!	novalue
+!
+!--
+BEGIN
+
+LOCAL
+    name_desc : VECTOR[2],				! Descriptor for file name being typed
+    prompt_desc,					! Descriptor to hold prompt arguments.
+    status;						! Holds RMS status codes.
+
+prompt_desc = name_desc;				! Point prompt descriptor to name descriptor.
+name_desc[0] = .input_nam[nam$b_rsl];			! Load name desc with related string for file.
+name_desc[1] = .input_nam[nam$l_rsa];
+status = lib$qual_file_match( type$context,		! Context pointer.
+			      input_fab,		! Fab Pointer.
+			      0,			! No file name.
+			      $descriptor('!AS, type? [N]:'),! Prompt string.
+			      prompt_desc,		! Prompt arguments.
+			      0);			! No prompt routine.
+
+IF NOT .status						! If error status returned
+THEN							! 
+    BEGIN						
+    IF (.status NEQ lib$_filfaimat) AND			! and the error was not "file failed to meet criteria"
+       (.status NEQ lib$_quipro)			! or "quit processing"
+    THEN						! Then report an error.
+	type$file_error(msg$_filnotacc,input_fab);
+    RETURN true;					! Skip this file.
+    END;
+
+IF (NOT $OPEN(FAB=input_fab)) OR			! If we cannot OPEN
+   (NOT $CONNECT(RAB=input_rab))			! or CONNECT to this file
+THEN							! then
+    BEGIN						! Report an error and skip this file.
+    type$file_error(msg$_openin,input_fab);
+    RETURN false;
+    END;
+
+IF .output_fab[fab$w_ifi] EQL 0				! If output file is not open
+    THEN type$open_output();				!  then go open and connect to it.
+
+
+IF .type$gen_flags[type$v_paginate]
+THEN
+    BEGIN
+    IF .type$gen_flags[type$v_eof]
+    THEN
+	BEGIN
+        (.LBR_PUT_SCREEN)($descriptor('Press RETURN to continue'),bottom_of_page,middle_of_line,screen_flags);
+        lib$get_command(command_desc);
+	type$gen_flags[type$v_eof] = false;
+	END;
+    (.LBR_ERASE_PAGE)(top_line,top_line);
+    IF .output_fab[fab$v_cr]
+    THEN 
+	BEGIN
+	bottom_scroll = .bottom_of_page - 2;
+    	line_counter = 0;
+	END
+    ELSE
+	BEGIN
+	bottom_scroll = .bottom_of_page - 1;
+	line_counter = -1;
+	END;
+    (.LBR_SET_SCROLL)(top_line,bottom_scroll);
+    END;
+
+
+IF .type$gen_flags[type$v_write_header] OR		! If write header flag is set
+   .input_nam[nam$v_wildcard]				!  or there are wildcards in the input file spec
+THEN							! then write the file name to the output file.
+    write_header();
+
+type$gen_flags[type$v_write_header] = TRUE;		! set write header flag to true so we print the next file header.
+
+
+WHILE true DO						! Until we see "end of file" DO
+    BEGIN
+    IF .type$gen_flags[type$v_controlc]			! IF user says CNTRL/C
+    THEN						! then 
+	BEGIN
+	type$gen_flags[type$v_controlc] = false;	! reset the flag
+	EXITLOOP;					! and go to next file.
+	END;
+    status = $GET(rab = input_rab);			! Get a record from the input file.
+    IF .status EQL rms$_eof				! If we are at eof then exit loop.
+    THEN
+    	BEGIN
+	type$gen_flags[type$v_eof] = true;
+	EXITLOOP;
+	END;
+    IF NOT .status					! We have an error, so report it.
+    THEN
+	BEGIN
+        type$file_error(msg$_readerr,input_fab);
+	IF .status NEQ rms$_rtb				! Ignore record to big error.
+	    THEN EXITLOOP;
+	END;
+    output_rab[rab$w_rsz] = .input_rab[rab$w_rsz];	! Read succeeded.
+    output_rab[rab$l_rbf] = .input_rab[rab$l_rbf];	!  write it to the output file
+    status = write_line();
+    IF NOT .status
+    	THEN EXITLOOP;
+    END;
+
+status = $CLOSE(fab = input_fab);			! All done with the input file
+IF NOT .status						!  so close it.
+THEN
+    type$file_error(msg$_closein,input_fab);		! Report an error is CLOSE fails.
+
+IF .type$gen_flags[type$v_sysoutput]			! If we are writing to sys$output
+THEN							!  then close the output file to.
+    BEGIN
+    status = $CLOSE(fab = output_fab);			! Report an error if CLOSE fails.
+    IF NOT .status
+    THEN 
+	type$file_error(msg$_closeout,output_fab);
+    END;
+
+
+RETURN .status;
+END;
+
+
+ROUTINE write_header =
+
+!++
+! Functional description
+!
+!	This routine write the current file specification to the output file.
+!
+! Calling sequence
+!
+!	write_header ()
+!
+! Input parameters
+!
+!	none
+!
+! Implicit inputs
+!
+!	none
+!
+! Output parameters
+!
+!	none
+!
+! Implicit outputs
+!
+!	none
+!
+! Routine value
+!
+!	novalue
+!
+!--
+BEGIN
+
+LOCAL
+    blank_buffer : INITIAL('    '),
+    temp_buffer : VECTOR[nam$c_maxrss+1,BYTE];
+
+output_rab[rab$v_cco] = true;			! Cancel CNTRL/O at start of each new file.
+
+IF .output_fab[fab$v_ftn]			! If FTN format file
+THEN						! Then
+    BEGIN
+    temp_buffer[0] = %ASCII' ';			! Set single space carriage control
+    output_rab[rab$w_rsz] = 1;
+    output_rab[rab$l_rbf] = temp_buffer;
+    write_line();
+    CH$MOVE(.input_nam[nam$b_rsl],input_nam[nam$l_rsa],temp_buffer[1]);
+    write_line();
+    output_rab[rab$w_rsz] = 1;
+    write_line();
+    END;
+
+IF .output_fab[fab$v_prn]			! If PRN format file
+THEN						! Then
+    rh_buffer = %X'8D01';			! Set single space PRN carriage control
+
+IF .output_fab[fab$v_prn] OR			! If PRN or CR
+   .output_fab[fab$v_cr]
+THEN						! Then
+    BEGIN
+    output_rab[rab$w_rsz] = 1;			! Print blank line.
+    output_rab[rab$l_rbf] = blank_buffer;
+    write_line();
+    output_rab[rab$w_rsz] = .input_nam[nam$b_rsl];
+    output_rab[rab$l_rbf] = .input_nam[nam$l_rsa];
+    write_line();
+    output_rab[rab$w_rsz] = 1;			! Print blank line.
+    output_rab[rab$l_rbf] = blank_buffer;
+    write_line();
+    END;
+
+IF NOT .output_fab[fab$v_prn] AND		! If no carriage control
+   NOT .output_fab[fab$v_cr] AND
+   NOT .output_fab[fab$v_ftn]
+THEN						! Then
+    BEGIN
+    blank_buffer = %x'0D0A0A';			! But <CR><LF><LF> into buffer
+    output_rab[rab$w_rsz] = 3;			! Print blank line.
+    output_rab[rab$l_rbf] = blank_buffer;
+    write_line();
+    output_rab[rab$w_rsz] = .input_nam[nam$b_rsl];
+    output_rab[rab$l_rbf] = .input_nam[nam$l_rsa];
+    write_line();
+    output_rab[rab$w_rsz] = 3;			! Print blank line.
+    output_rab[rab$l_rbf] = blank_buffer;
+    write_line();
+    END;
+
+output_rab[rab$v_cco] = false;			! Renable CNTRL/O
+
+RETURN true;
+END;
+
+
+ROUTINE write_line =
+
+!++
+! Functional description
+!
+!	This routine writes one line of the input file to the output file.  If an
+!	error occurs writing to the output file, a severe error is signaled
+!	and the program terminates.
+!
+! Calling sequence
+!
+!	write_line ()
+!
+! Input parameters
+!
+!	none
+!
+! Implicit inputs
+!
+!	none
+!
+! Output parameters
+!
+!	none
+!
+! Implicit outputs
+!
+!	none
+!
+! Routine value
+!
+!	novalue
+!
+!--
+BEGIN
+
+LOCAL
+    form_feed : BYTE INITIAL(26),
+    offset : INITIAL (0),
+    desc : VECTOR[2],
+    status;
+
+
+IF .type$gen_flags[type$v_paginate]
+THEN
+    BEGIN
+    LOCAL pointer;
+    desc[0] = .output_rab[rab$w_rsz];
+    desc[1] = .output_rab[rab$l_rbf];
+    IF NOT CH$FAIL(CH$FIND_CH(.desc[0],.desc[1],%CHAR(12)))
+    THEN
+   	BEGIN
+	LIB$GET_VM(desc[0],desc[1]);
+	CH$MOVE(.desc[0],.output_rab[rab$l_rbf],.desc[1]);
+    	WHILE true DO
+            BEGIN
+    	    pointer = CH$FIND_CH(.desc[0],.desc[1],%CHAR(12));
+	    IF NOT CH$FAIL(.pointer)
+	        THEN 
+		    BEGIN
+		    BIND string = .pointer : VECTOR[,BYTE];
+		    string[0] = .form_feed;
+		    END
+	 	ELSE EXITLOOP;
+	    END;
+	output_rab[rab$l_rbf] = .desc[1];
+	END;
+    line_counter = .line_counter+(.output_rab[rab$w_rsz]/.line_width)+1;
+    IF .line_counter GTR .bottom_line
+    THEN
+        BEGIN
+        line_counter = 2+(.output_rab[rab$w_rsz]/.line_width);
+        (.LBR_PUT_SCREEN)($descriptor('Press RETURN to continue'),bottom_of_page,middle_of_line,screen_flags);
+        status = lib$get_command(command_desc);
+	IF .type$gen_flags[type$v_controlc]
+	    THEN RETURN true;
+        (.LBR_ERASE_LINE)(bottom_of_page,middle_of_line);
+	IF .command_desc[dsc$w_length] NEQ 0
+	 OR .status EQL rms$_eof
+	    THEN RETURN false;
+	IF .type$gen_flags[type$v_vt100]
+	THEN
+	    BEGIN
+	    (.LBR_SET_CURSOR)(bottom_scroll,top_line);
+	    IF .output_fab[fab$v_cr]
+	     OR .output_fab[fab$v_prn]
+                THEN (.LBR_UP_SCROLL)();
+	    END
+ 	ELSE
+	    (.LBR_ERASE_PAGE)(top_line,top_line);
+        END;
+    END;
+
+status = $PUT(rab = output_rab);				! Put the buffer to the output file.
+IF NOT .status							! If we fail, signal an error.
+THEN
+    type$file_error(msg$_writeerr,output_fab);
+
+RETURN .status
+END;
+
+ROUTINE ast_routine :NOVALUE =
+
+!++
+! Functional description
+!
+!  This ast routine is called when a user types CNTRL/C.  Its purpose
+!  is to set a flag so that we skip to the next file in the file spec.
+!
+! Calling sequence
+!
+!	write_line ()
+!
+! Input parameters
+!
+!	none
+!
+! Implicit inputs
+!
+!	none
+!
+! Output parameters
+!
+!	none
+!
+! Implicit outputs
+!
+!	none
+!
+! Routine value
+!
+!	novalue
+!
+!--
+BEGIN
+
+LOCAL
+    status;
+
+type$gen_flags[type$v_controlc] = TRUE;		! User typed CNTRL/C.
+
+status = $CANCEL (CHAN = .channel);		! Flush any I/O on queue.
+IF NOT .status
+    THEN SIGNAL(msg$_syserror,.status);
+
+status = $QIOW	(CHAN =	.channel,		! Reenable CNTRL/C handler.
+	 	 FUNC =	(IO$_SETMODE OR IO$M_CTRLCAST),
+	 	 P1   =	ast_routine,
+		 P3   = %X'3');
+IF NOT .status
+    THEN SIGNAL(msg$_syserror,.status);
+
+RETURN;
+END;
+
+
+ROUTINE type$get_cmdqual : NOVALUE =
+
+!++
+! Functional description
+!
+! 	This routine gets the command qualifiers for the command line.
+!
+! Calling sequence
+!
+!	type$get_cmdqual()
+!
+! Input parameters
+!
+!	none
+!
+! Implicit inputs
+!
+!	none
+!
+! Output parameters
+!
+!	none
+!
+! Implicit outputs
+!
+!	none
+!
+! Routine value
+!
+!	novalue
+!
+!--
+BEGIN
+
+LOCAL
+    bitmap,
+    lbrindex,
+    status;
+
+bitmap= lib$m_cqf_confirm  OR  lib$m_cqf_exclude  OR	! Bitmap of qualifiers
+     	lib$m_cqf_before   OR  lib$m_cqf_since    OR	!  that the common qualifier
+     	lib$m_cqf_created  OR  lib$m_cqf_modified OR	!  package is to check for.
+     	lib$m_cqf_expired  OR  lib$m_cqf_backup   OR
+     	lib$m_cqf_byowner;
+
+
+IF NOT (status = lib$qual_file_parse(bitmap,type$context))! Get common qualifiers
+THEN
+    SIGNAL_STOP(.status);
+
+type$gen_flags[type$v_paginate] = cli$present($descriptor('PAGE'));
+
+!
+! Find the image symbols only if we need them 
+!
+
+IF .type$gen_flags[type$v_paginate] THEN
+  BEGIN
+    lbrindex = 0;
+    WHILE .lbr_addr_head[.lbrindex] NEQ 0
+    DO BEGIN
+       status = LIB$FIND_IMAGE_SYMBOL($descriptor('SCRSHR'),
+              lbr_names_head[.lbrindex*2],.lbr_addr_head[.lbrindex]);
+       IF NOT .status
+           THEN SIGNAL_STOP (.status);
+       lbrindex = .lbrindex + 1;
+       END;
+  END;
+END;
+
+
+ROUTINE get_term_info : NOVALUE =
+BEGIN
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Determine the file characteristics, i.e., page height and line width,
+!	of the file specified by the input fab.  Also, check to see if device
+!	is suitable for page breaks.
+!
+! INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	Always true.
+!
+!--
+LOCAL
+    status;
+
+MACRO
+    ddp$b_pagelen = 3,0,8,0%;			! *** Hardwired page length offset ***
+
+LITERAL 
+    getdvilen = 4*12 + 4;
+
+LOCAL
+    getdvidesc : $BBLOCK [getdvilen],
+    devnamdesc : $BBLOCK [dsc$c_s_bln],
+    devbufsiz  : INITIAL(0),
+    devclass   : INITIAL(0),
+    devdepend : $BBLOCK [4],
+    devdepend2:	$BBLOCK	[4];
+
+
+!
+! Do a $GETDVI to get the parameters of interest.
+!
+CH$FILL (0, getdvilen, getdvidesc);				! Init the $GETDVI buffer
+
+getdvidesc [0,0,16,0] = 4;					! Get the device class
+getdvidesc [2,0,16,0] = dvi$_devclass;				!
+getdvidesc [4,0,32,0] = devclass;				!
+getdvidesc [8,0,32,0] = getdvidesc [0,0,16,0];			!
+
+getdvidesc [12,0,16,0] = 4;					! Get the device dependent chars
+getdvidesc [14,0,16,0] = dvi$_devdepend;			!
+getdvidesc [16,0,32,0] = devdepend;				!
+getdvidesc [20,0,32,0] = getdvidesc [12,0,16,0];		!
+
+getdvidesc [24,0,16,0] = 4;					! Get the device type
+getdvidesc [26,0,16,0] = dvi$_devdepend2;			!
+getdvidesc [28,0,32,0] = devdepend2;				!
+getdvidesc [32,0,32,0] = getdvidesc [24,0,16,0];		!
+
+getdvidesc [36,0,16,0] = 4;					! Get the device buffer size
+getdvidesc [38,0,16,0] = dvi$_devbufsiz;			!
+getdvidesc [40,0,32,0] = devbufsiz;				!
+getdvidesc [44,0,32,0] = getdvidesc [36,0,16,0];		!
+
+status = $GETDVI (DEVNAM = $descriptor('SYS$COMMAND'),		! Get the device characteristics
+		  ITMLST = getdvidesc);
+
+IF NOT .status
+THEN
+    BEGIN
+    type$gen_flags[type$v_paginate] = false;
+    RETURN;
+    END;
+
+IF .type$gen_flags[type$v_paginate]
+THEN
+    BEGIN
+    IF (.devclass NEQ dc$_term) 				! If output device is not a terminal
+    THEN 
+   	BEGIN
+	type$gen_flags[type$v_paginate] = false;
+	END
+    ELSE
+	BEGIN
+	IF .devdepend2[tt2$v_deccrt]
+	    THEN type$gen_flags[type$v_vt100] = true;
+    	top_line = 1;
+    	line_width = MINU (.devbufsiz, 132);			! Get the listing width
+    	middle_of_line = (.line_width - 22)/2;			! Calculate middle of line
+    	bottom_of_page = .devdepend [ddp$b_pagelen];		! Get the listing height
+    	bottom_line = .bottom_of_page - 2;
+    	END;
+    END;
+
+!
+! Enable CNTRL/C handler if this is a terminal.
+!
+
+IF (.devclass EQL dc$_term) 					! If output device is a terminal
+THEN
+    BEGIN
+    status = $ASSIGN (DEVNAM = $descriptor('SYS$COMMAND'),	! Get a channel
+		      CHAN   = channel);
+    IF NOT .status
+        THEN SIGNAL(msg$_syserror,0,.status);
+
+    status = $QIOW (CHAN = .channel,				! Enable CNTRL/C handling
+ 	 	    FUNC = (IO$_SETMODE OR IO$M_CTRLCAST),
+	 	    P1   = ast_routine,
+		    P3   = %X'3');
+    IF NOT .status
+        THEN SIGNAL(msg$_syserror,0,.status);
+    END;
+
+END;
+
+
+ROUTINE type$open_output  =
+
+!++
+! Functional description:
+!
+!	This routine open the output file.
+!
+! Input parameters:
+!
+!	none
+!
+! Implicit inputs:
+!
+!	none
+!
+! Output parameters:
+!
+!	none
+!
+! Implicit outputs:
+!
+!	none
+!
+! Routine value:
+!
+!	none
+!
+!--
+
+BEGIN
+
+LOCAL
+    status;
+
+
+$FAB_INIT (FAB = output_fab,				! Initialize the output FAB.
+	   CTX = output_rab,				! Save address of output RAB.
+	   FAC = PUT,					! File access is write.
+	   ORG = SEQ,					! File organization is sequential.
+	   NAM = output_nam,				! Address of output NAM block.
+    	   FNS = %CHARCOUNT('SYS$OUTPUT'),		! Default name is SYS$OUTPUT
+    	   FNA = UPLIT BYTE('SYS$OUTPUT'),
+	   FOP = <SUP,OFP,SQO>,				! File options are supersede, output file parse, sequential put only.
+ 	   MRS = .input_fab[fab$w_mrs],			! Maximum recored size from $GET.
+	   FSZ = .input_fab[fab$b_fsz]);		! Fixed control area size.
+
+$RAB_INIT (RAB = output_rab,				! Initialize output RAB.
+	   RAC = SEQ,					! Record access is sequential.
+	   RHB = rh_buffer,				! Record header buffer address
+	   FAB = output_fab);				! Address of output FAB.
+
+$NAM_INIT (NAM = output_nam,				! Initalize output NAM.
+	   ESS = nam$c_maxrss,				! Expanded string size
+	   ESA = type$output_rsa,			! Expanded string address
+	   RSS = nam$c_maxrss,				! Resultant string size
+	   RSA = type$output_rsa,			! Resultant string address
+	   RLF = input_nam);				! Related file NAM block.
+
+
+type$gen_flags[type$v_sysoutput] = TRUE;		! Assume writing to sys$output
+output_fab[fab$b_rfm] = .input_fab[fab$b_rfm];		! Init output record format to input format.
+output_fab[fab$b_rat] = .input_fab[fab$b_rat];		! Init outpur record attr to input attr.
+
+status = cli$present($descriptor('OUTPUT'));
+IF .status THEN
+    BEGIN
+    type$gen_flags[type$v_sysoutput] = false;		! Not writing to sys$output
+    cli$get_value($descriptor('OUTPUT'), output_desc); ! Get output file
+    output_fab[fab$b_fns] = .output_desc[dsc$w_length];
+    output_fab[fab$l_fna] = .output_desc[dsc$a_pointer];
+    END
+ELSE
+    BEGIN
+    IF .status EQL cli$_negated
+    THEN
+	BEGIN
+    	type$gen_flags[type$v_sysoutput] = false;		! Not writing to sys$output
+    	output_fab[fab$b_fns] = %CHARCOUNT('NL:');	! Default name is NL:
+    	output_fab[fab$l_fna] = UPLIT BYTE('NL:');
+    	END;
+    END;
+
+
+IF (NOT $CREATE(FAB=output_fab)) OR			! If we fail CREATING or
+   (NOT $CONNECT(RAB=output_rab))			! CONNECTING to the output file
+THEN							! then signal an error and return.
+    BEGIN
+    type$file_error(msg$_openout,output_fab);
+    RETURN false;
+    END;
+	   
+RETURN true;
+END;
+
+
+GLOBAL ROUTINE type$search_error (fab_block) : NOVALUE =
+
+!++
+! Functional description:
+!
+!	This routine reports an error as a result of searching for the
+!	next file to be typed.
+!
+! Calling sequence:
+!
+!	type_error (fab_block.ra.v)
+!
+! Input parameters:
+!
+!	fab_block	- the FAB associated with the file
+!
+! Implicit inputs:
+!
+!	none
+!
+! Output parameters:
+!
+!	none
+!
+! Implicit outputs:
+!
+!	none
+!
+! Routine value:
+!
+!	none
+!
+! Side effects:
+!
+!	none
+!
+!--
+
+BEGIN
+
+type$file_error(msg$_searchfail,.fab_block);		! Report specified RMS error.
+
+END;
+
+
+GLOBAL ROUTINE type$file_error (message_id, fab_block) : NOVALUE =
+
+!++
+! Functional description
+!
+!	This RMS error action routine sends an error message to the user.
+!
+! Calling sequence
+!
+!	type$file_error (message_id.rv, fab_block.ra.v)
+!
+! Input parameters
+!
+!	message_id	- The message code for the message to send.
+!	fab_block	- Address of the FAB block of the file for which the error occurred
+!
+! Implicit inputs
+!
+!	The associated NAM block.
+!
+! Output parameters
+!
+!	none
+!
+! Implicit outputs
+!
+!	none
+!
+! Routine value
+!
+!	novalue
+!
+! Side effects
+!
+!	none
+!
+!--
+
+BEGIN
+
+MAP
+    fab_block	: REF $BBLOCK;
+
+BIND
+    rab_block = .fab_block [fab$l_ctx]  : $BBLOCK,	! Associated RAB block address
+    nam_block = .fab_block [fab$l_nam]  : $BBLOCK;	! Associated NAM block address
+
+LOCAL
+    status		: VECTOR [2],
+    name_desc	: VECTOR [2];			! String descriptor for the file name
+
+!
+! Fill in the file name descriptor with the most complete name possible.
+!
+
+    IF .nam_block [nam$b_rsl] NEQ 0			! If a resultant name string exists,
+    THEN						!
+	BEGIN						!
+	name_desc [0] = .nam_block [nam$b_rsl];		! then fill in the resultant name length
+	name_desc [1] = .nam_block [nam$l_rsa];		! and address.
+	END
+    ELSE
+	IF .nam_block [nam$b_esl] NEQ 0			! If RMS created an expanded string
+	THEN						! but couldn't open the file,
+	    BEGIN					!
+	    name_desc [0] = .nam_block [nam$b_esl];	! then fill in the expanded name length
+	    name_desc [1] = .nam_block [nam$l_esa];	! and address.
+	    END
+	ELSE						! Otherwise, no RMS name information is available.
+	    BEGIN
+	    name_desc [0] = .fab_block [fab$b_fns];	! So use the file name length
+	    name_desc [1] = .fab_block [fab$l_fna];	! and length passed by the CLI.
+	    END;
+
+IF NOT .fab_block[fab$l_sts]				! Check to see if the FAB
+THEN							!  or RAB contains the error
+    BEGIN						!  status, and retrieve it.
+    status[0] = .fab_block [fab$l_sts];			! The primary RMS completion code,
+    status[1] = .fab_block [fab$l_stv];			!  and the scondary RMS completion code.
+    END
+ELSE
+    BEGIN						! Error status is located in RAB.
+    status[0] = .rab_block [rab$l_sts];			! The primary RMS completion code,
+    status[1] = .rab_block [rab$l_stv];			!  and the scondary RMS completion code.
+    END;
+
+!
+! Signal the error condition.
+!
+
+    SIGNAL (						! Signal error with the following arguments:
+            .message_id,				!    the message identifier,
+            1,						!    the number of message arguments,
+            name_desc,					!    the address of input name descriptor,
+            .status[0],					!    the primary RMS completion code,
+            .status[1]);				!    and the scondary RMS completion code.
+
+
+    END;
+
+
+ROUTINE condit_handler (signal_array, mechan_array) =
+
+!++
+! Functional description
+!
+!	This routine is the condition handler for the main routine.  It
+!	saves the most severe condition as the exit status.
+!
+! Calling sequence
+!
+!	condit_handler (signal_array.ra.v, mechan_array.ra.v)
+!
+! Input parameters
+!
+!	signal_array	- the address of the signal array for the condition
+!	mechan_array	- the address of the mechanism array for the condition
+!
+! Implicit inputs
+!
+!	none
+!
+! Output parameters
+!
+!	none
+!
+! Implicit outputs
+!
+!	TYPE$EXIT_STATUS	-  Contains the most severe status encountered.
+!
+! Routine value
+!
+!	SS$_RESIGNAL
+!
+!--
+
+BEGIN
+
+MAP
+    signal_array	: REF $BBLOCK;
+
+BIND
+    signame = signal_array [chf$l_sig_name] : $BBLOCK;	! Get the condition name
+
+
+!
+! Update the "most severe error" if the current error is more severe.
+!
+
+IF
+    NOT .signame					! If an error signal
+    AND ((.signame[sts$v_severity]			! and severity is worse
+	GTRU .type$exit_status[sts$v_severity])
+	OR .type$exit_status[sts$v_severity])		! or no errors yet
+THEN
+    type$exit_status = .signame;			! then save it for exit
+
+
+RETURN SS$_RESIGNAL;					! Resignal to get message
+END;
+
+
+END
+ELUDOM

@@ -1,0 +1,389 @@
+	.TITLE	CVBTDRIVR - 11/790 CONSOLE RL02 BOOTDRIVER
+	.IDENT	'V04-000'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; FACILITY:	BOOTS
+;
+; ABSTRACT:
+;	This module contains the bootstrap device driver for the
+;	11/790 RL02 console disk.
+;
+; ENVIRONMENT:	IPL 31, kernel mode, code must be PIC
+;
+; AUTHOR:  Trudy Matthews,	CREATION DATE:   14-Nov-1982
+;
+; MODIFIED BY:
+;
+;	V03-005	TCM0005		Trudy C. Matthews	13-Aug-1984
+;		Fix DO_MAPPING routine so that it doesn't overwrite the
+;		STXCS status in R0.  Fix GETWORD and PUTWORD so they call
+;		DO_MAPPING at every page boundary.
+;
+;	V03-004	TCM0004		Trudy C. Matthews	03-Jan-1984
+;		Correct some bugs.
+;
+;	V03-003	TCM0003		Trudy C. Matthews	17-Oct-1983
+;		Make sure routines READ_1_BLK and WRITE_1_BLK exit with
+;		correct status in R0.
+;
+;	V03-002	TCM0002		Trudy C. Matthews	31-May-1983
+;		Restore R4 correctly from stack on error paths in READ_1_BLK
+;		and WRITE_1_BLK.  Also add correct name of standard console
+;		RL02 driver (CVDRIVER), and change module name from VENBTDRVR
+;		to CVBTDRIVR.
+;
+;	V03-001	TCM0001		Trudy C. Matthews	27-Apr-1983
+;		Change number of "interrupts" per block of data transferred
+;		from 256 to 257 (1 per word + 1 completion).  Use
+;		"READ_PHYSICAL" and "WRITE_PHYSICAL" I/O function codes
+;		to avoid using the VENUS console RL02 driver's bad block
+;		replacement scheme.
+;--
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+
+	$BTDDEF				; Boot device types
+	$IODEF				; I/O function codes
+	$PRDEF				; Processor registers
+	$PTEDEF				; PTE definitions
+	$RPBDEF				; RPB offsets
+	$SSDEF				; Status codes
+	$STXCSDEF			; Console storage device CSR
+	$STXDBDEF			; Console storage device data register
+	$VADEF				; Virtual address fields
+
+;
+; MACROS:
+;
+
+;
+; EQUATED SYMBOLS:
+;
+
+;
+; OWN STORAGE:
+;
+
+;
+; Boot driver table entry
+;
+
+	$BOOT_DRIVER	DEVTYPE = BTD$K_CONSOLE,-  ; Device type (console)
+			CPUTYPE = PR$_SID_TYP790,- ; Cpu type (11/790)
+			SIZE = CONSRL_DRVSIZ,-	   ; Driver size
+			ADDR = CONSRL_DRIVER,-	   ; Driver address
+			DRIVRNAME = CONSRL_NAME	   ; Driver file name
+
+	.SBTTL	11/790 Console RL02 Bootstrap Driver Code
+
+;++
+;
+; Inputs:
+;
+;	R1	Address of page table for virtual -> physical mapping
+;	R2	Base VPN of transfer (Bits 29:9 of R10)
+;	R5	LBN for current piece of transfer
+;	R8	Size of transfer in bytes
+;	R9	Address of the RPB
+;	R10	Starting address of transfer
+;
+;	FUNC(AP)  I/O operation (IO$_READLBLK or IO$_WRITELBLK only)
+;	MODE(AP)  Address interpretation mode:
+;		     0 -> Physical,  1 -> Virtual
+;
+; Outputs:
+;
+;	R0	Status code:
+;
+;		SS$_NORMAL	Successful transfer
+;		SS$_CTRLERR	Fatal controller error
+;--
+
+FUNC = 16
+MODE = 20
+
+CONSRL_DRIVER:
+	PUSHR	#^M<R1,R2,R3,R5,R8,R10,R11>	; Save some registers
+
+;
+; Perform initialization:  Set up a mapping switch in R11.
+; There are 4 possibilities concerning mapping:  the I/O can be 
+; done virtual or physical (MODE(AP)) and we can be executing virtual
+; or physical (contents of processor register PR$_MAPEN).  If both
+; modes match, then we can just copy data to/from the user buffer.
+; If the I/O is to be done virtual and we are executing physical
+; then the buffer address has to be translated using the page table
+; pointed to by R1.  If the I/O is to be done physical and we are
+; executing virtual then we have to double map the buffer using a spare
+; PTE.  At this point, we just compute a mapping switch in R11 as follows:
+;
+;	0	Both modes match, just copy the data
+;	1	Do virtual -> physical translation using page table
+;	-1	Do physical -> virtual mapping using a spare PTE
+;
+	MFPR	#PR$_MAPEN,R11		; Get mapping enabled switch
+	MNEGL	R11,R11			; Negate it
+	ADDL	MODE(AP),R11		; Add I/O mode switch
+;
+; Set up mapping if required
+;
+	BSBW	DO_MAPPING
+
+;
+; Transfer data, one block at a time.
+;
+	MOVAL	W^WRITE_1_BLK,R7	; Assume we're doing a write.
+	CMPW	FUNC(AP),#IO$_WRITELBLK	; Function = write?
+	BEQL	TRANSFER		; Yes, go get started.
+	MOVAL	W^READ_1_BLK,R7		; We're reading.
+
+TRANSFER:
+	MOVL	#512,R3			; Assume transferring 1 block.
+	CMPL	R8,R3			; Minimize assumed byte count (512
+	BGEQ	10$			; bytes) with actual byte count in R8.
+	MOVL	R8,R3			; R3 <- byte count for this iteration.
+10$:
+	JSB	(R7)			; Read or write 1 block (or less).
+	BLBC	R0,20$			; Return if there was an error.
+	SUBL	#512,R8			; Done with another block.
+	BLEQ	20$			; Branch if we're all done.
+	INCL	R5			; Next LBN.
+	BRB	TRANSFER		; Go do another block.
+20$:
+	POPR	#^M<R1,R2,R3,R5,R8,R10,R11>	; Restore registers.
+	RSB
+
+;++
+; READ_1_BLOCK	- Subroutine to read 1 block of data
+; WRITE_1_BLOCK	- Subroutine to write 1 block of data
+;
+; Inputs:
+;	R1:	  addr of page table for virtual -> physical mapping
+;	R2:	  base VPN of transfer
+;	R3:	  # bytes to transfer (<= 512)
+;	R5:	  LBN of block to transfer
+;	R10:	  address of memory buffer
+;	R11:	  mapping switch
+;
+; Outputs:
+;	Specified number of bytes are transferred.
+;	If an error occurs, R0 contains SS$_CTRLERR.
+;	R10:	  next free byte in memory buffer
+;	All other registers preserved.
+;--
+
+READ_1_BLK:
+	PUSHL	R4			; Save a register.
+	ASHL	#8,R5,R4		; Position LBN of block to transfer.
+	MOVB	#STXCS$C_READP,R4	; Form console command in R4.
+;
+; Move the read data into the memory buffer.
+;
+10$:
+	BSBW	DL_READ			; Read a word from the console.
+	BSBW	PUTWORD			; Put the word in memory data buffer.
+	CMPV	#STXCS$V_STATUS,-	; Check that status = continue
+		#STXCS$S_STATUS,R0,-	; transaction.
+		#STXCS$C_CONT		;
+	BEQL	10$			; Branch if so.
+
+	MOVL	(SP)+,R4		; Restore R4.
+	EXTZV	#STXCS$V_STATUS,-	; Put final status in R0 and check that
+		#STXCS$S_STATUS,R0,R0	; it signals "transaction complete".
+	CMPB	R0,#STXCS$C_COMPLT	;
+	BNEQ	HW_ERROR		; If not, report an error.
+	RSB
+
+;
+; Come here if there is an error during the transfer.
+;
+HW_ERROR:
+	MOVL	#SS$_CTRLERR,R0		; Set failure status.
+	RSB				; Return and retry.
+	
+;
+; Write data from memory buffer to the console.
+;
+WRITE_1_BLK:
+	PUSHL	R4			; Save a register.
+	ASHL	#8,R5,R4		; Position LBN of block to transfer.
+	MOVB	#STXCS$C_WRITEP,R4	; Form console command in R4.
+
+10$:	BSBW	GETWORD			; Get a word from memory data buffer.
+	BSBW	DL_WRITE		; Write it to the console.
+	CMPV	#STXCS$V_STATUS,-	; Check that status = continue
+		#STXCS$S_STATUS,R0,-	; transaction.
+		#STXCS$C_CONT		;
+	BEQL	10$			; Loop to continue writing.
+
+	MOVL	(SP)+,R4		; Restore R4.
+	EXTZV	#STXCS$V_STATUS,-	; Put final status in R0 and check that
+		#STXCS$S_STATUS,R0,R0	; it signals "transaction complete".
+	CMPB	R0,#STXCS$C_COMPLT	;
+	BNEQ	HW_ERROR		; If not, report an error.
+	RSB
+
+;++
+; DL_READ - Subroutine to read a word from console RL02.
+; DL_WRITE - Subroutine to write a word of data to console RL02
+;
+; Inputs:
+;	R4	Console command to write to STXCS.
+;	R6	Word of data to write to RL02 (DL_WRITE only).
+;
+; Outputs:
+;	R6	Word read from console (DL_READ only).
+;	R0	Contents of STXCS after read completes.
+;--
+DL_READ:
+	MFPR	#PR$_STXCS,R0		; Get console status.
+	BBC	#STXCS$V_READY,R0,DL_READ ; Loop until ready.
+	MTPR	R4,#PR$_STXCS		; Console command to read a word of data.
+10$:	MFPR	#PR$_STXCS,R0		; Get console status.
+	BBC	#STXCS$V_READY,R0,10$	; Loop until ready.
+	MFPR	#PR$_STXDB,R6		; Read a word of data.
+	RSB
+
+
+DL_WRITE:
+	MFPR	#PR$_STXCS,R0		; Get console status.
+	BBC	#STXCS$V_READY,R0,DL_WRITE ; Loop until ready.
+	MTPR	R6,#PR$_STXDB		; Write data to console.
+	MTPR	R4,#PR$_STXCS		; Notify console that data is present.
+10$:	MFPR	#PR$_STXCS,R0		; Get console status.
+	BBC	#STXCS$V_READY,R0,10$	; Loop until ready.
+	RSB
+
+;++
+; GETWORD - Subroutine to get a word from memory
+; PUTWORD - Subroutine to store a word in memory
+;
+;	These two subroutines do two things special:
+;
+;		1)  Since you must always read or write one entire block
+;		    (512 bytes) through the console interface to the RL02,
+;		    these routines simply return if the memory buffer is
+;		    empty/full before the entire block has been transferred.
+;		2)  These routines take care of page boundaries if
+;		    mapping is required.
+;
+; Inputs:
+;	R1	Address of page table
+;	R2	Virtual page number of buffer
+;	R3	Size of remaining buffer (in bytes)
+;	R6	Word to store (PUTWORD only)
+;	R10	Address of current spot in buffer
+;	R11	Mapping switch:
+;			-1   Do physical -> virtual map
+;			0    No mapping required
+;			1    Do virtual -> physical translation
+;
+; Outputs:
+;	R6	Word fetched from memory (GETWORD only)
+;--
+
+GETWORD:
+	CLRL	R6			; Return 0 if byte count = 0
+	TSTL	R3			; Is byte count 0?
+	BEQL	10$			; Yes, return 0 data.
+	MOVZBL	(R10)+,R6		; Get first byte from memory.
+	BSBB	CHECK_BOUNDS		; Eles check for page boundary.
+	DECL	R3			; Decrement byte count.
+	BEQL	10$			; If 0 we're done.
+	ROTL	#8,R6,R6		; Move 1st byte up to bit 8.
+	MOVB	(R10)+,R6		; Get 2nd byte in low-order byte of R6.
+	DECL	R3			; Decrement byte count.
+	BGEQ	CHECK_BOUNDS		; If positive, check for page boundary.
+10$:	RSB
+
+PUTWORD:
+	TSTL	R3			; Is byte count 0?
+	BEQL	10$			; Yes, don't write anything in buffer.
+	MOVB	R6,(R10)+		; Put 1st byte in memory buffer.
+	BSBB	CHECK_BOUNDS		; Check for page boudary.
+	DECL	R3			; Decrement byte count.
+	BEQL	10$			; If 0 we're done.
+	ASHL	#-8,R6,R6		; Bring 2nd byte down to bit 0.
+	MOVB	R6,(R10)+		; Put 2nd byte into memory buffer.
+	DECL	R3			; Decrement byte count.
+	BGEQ	CHECK_BOUNDS		; If positive, check for page boundary.
+10$:	RSB
+
+CHECK_BOUNDS:
+	BITW	#VA$M_BYTE,R10		; Did address overflow onto new page?
+	BEQL	10$			; Yes, must update mapping.
+	RSB
+
+10$:	INCL	R2			; Yes, increment virtual page number
+					; and fall through to DO_MAPPING.
+
+;++
+; DO_MAPPING - Subroutine to perform necessary mapping
+;
+; Inputs:
+;	R1	Address of page table
+;	R2	Page number of buffer
+;	R10	Address to map
+;	R11	Mapping switch:
+;			-1	Do physical -> virtual map
+;			0	No mapping required
+;			1	Do virtual -> physical translation
+;
+; Outputs:
+;	R10	Address to use
+;	R0	destroyed
+;--
+
+DO_MAPPING:
+	TSTL	R11			; Any mapping required?
+	BEQL	90$			; No
+	BLSS	100$			; Yes, map physical to virtual
+	BICL	#^C<VA$M_BYTE>,R10	; Yes, translate virtual to physical
+					; Clear everything but byte offset
+	PUSHL	R0			; save R0
+	MOVL	(R1)[R2],R0		; Get PFN in R0
+	INSV	R0,#VA$V_VPN,#PTE$S_PFN,R10   ; Insert PFN after byte offset 
+	MOVL	(SP)+,R0		; Restore previous value of R0
+90$:	RSB
+
+
+; 
+; Map physical to virtual
+;
+100$:	HALT				; Not implemented yet
+
+	.DSABL	LSB
+
+CONSRL_NAME:	.ASCIC	/CVDRIVER.EXE/
+
+CONSRL_DRVSIZ=.-CONSRL_DRIVER
+
+	.END

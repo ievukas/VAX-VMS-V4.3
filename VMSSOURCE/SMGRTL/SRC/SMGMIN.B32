@@ -1,0 +1,1431 @@
+%TITLE 'Minimal update calculation'
+MODULE SMG$MIN (
+		IDENT = '1-016'	! File: SMGMIN.B32	Edit:STAN1016
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	Screen Management
+!
+! ABSTRACT:
+!
+!	This module contains routines which inspect two screen 
+!	representations and calculate the near-minimal sequence of 
+!	terminal commands to change the current contents of the screen 
+!	to the new representation of the screen.
+!
+! ENVIRONMENT:	User mode, SMG package.
+!
+! AUTHOR: Stanley Rabinowitz, CREATION DATE: 1-May-1983.
+!	  FIND_MIN_CURSOR_POS is by RKR.
+!
+! MODIFIED BY:
+!
+! 1-016 - STAN  6-Jun-1984. Change error messages in MSG$SET_PHYSICAL_CURSOR.
+! 1-001	- STAN, 1-May-1983. Initial version, mimicked SCRMIN.B32.
+!--
+
+%SBTTL 'Declarations'
+!
+! SWITCHES:
+!
+!	NONE
+!
+! LINKAGES:
+!
+!	NONE
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+
+	SMG$SET_PHYSICAL_CURSOR,	! Move physical cursor on screen
+	SMG$$OUTPUT_MINIMAL_UPDATE,	! Output minumal update sequence
+	SMG$$FIND_MIN_CURSOR_POS,	! Output minimum cursor sequence
+	SMG$$UPDATE_PHYSICAL_CURSOR,	! Update physical cursor position
+	ERASE_LINE,			! Erase to end-of-line
+	SET_CURSOR;			! Generate general set-cursor
+					! positioning sequence.
+
+!
+! INCLUDE FILES
+!
+
+REQUIRE 'RTLIN:SMGPROLOG';		! defines psects, macros, structures,
+					! & terminal symbols
+REQUIRE 'RTLIN:STRLNK.REQ';		! JSB linkages
+
+!
+! EXTERNAL REFERENCES
+!
+
+EXTERNAL ROUTINE
+
+	SMG$$OUTPUT;
+
+!+
+! $OUTPUT_STRING
+! --------------
+!-
+
+MACRO
+
+    $OUTPUT_STRING(LEN,ADDR,ATTR) =
+
+	BEGIN
+	EXTERNAL ROUTINE SMG$$PUT_SCREEN;
+	LOCAL STATUS;
+	STATUS=SMG$$PUT_SCREEN(PBCB,LEN,ADDR,0,0,ATTR);
+	IF NOT .STATUS THEN RETURN .STATUS
+	END
+%;
+
+!+
+! $L
+! --
+! Macro $L linearizes a two dimensional subcript formed by a 1-based
+! row number and a 1-based column number, into a single 0-based
+! subscript.
+!-
+
+MACRO
+
+	$L (ROW_NUMBER, COLUMN_NUMBER) =
+	(ROW_NUMBER-1)*.NUM_COLS + COLUMN_NUMBER -1 %;
+
+!+
+! $MAKE_ROW_COL
+! -------------
+! Macro $MAKE_ROW_COL takes as an input a 0-based linear index into
+! and array and converts it into a 1-based row and 1-based column
+! form.  INDEX needs to be re-expressed as a quadword for use in the
+! EDIV instruction.
+!-
+
+MACRO
+
+    $MAKE_ROW_COL ( INDEX, ROW_NUMBER, COLUMN_NUMBER) =
+    BEGIN	! MAKE_ROW_COL
+    BUILTIN
+	EDIV;
+    LOCAL
+	WIDTH,
+	LOCAL_INDEX : VECTOR [2, LONG];
+    LOCAL_INDEX [1] = 0; ! Second longword is always 0
+    LOCAL_INDEX [0] = .INDEX;
+    WIDTH=.NUM_COLS;	! Store width in longword
+
+    EDIV ( WIDTH, LOCAL_INDEX, ROW_NUMBER, COLUMN_NUMBER);
+    ROW_NUMBER = .ROW_NUMBER + 1;
+    COLUMN_NUMBER = .COLUMN_NUMBER + 1;
+    END;	! MAKE_ROW_COL
+    %;
+
+%SBTTL 'SMG$$OUTPUT_MINIMAL_UPDATE - Calculate minimum update sequence'
+GLOBAL ROUTINE SMG$$OUTPUT_MINIMAL_UPDATE (P_PBCB) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine compares CURR_TEXT and CURR_ATTR (which reflect
+!	what is currently on the screen), with NEW_TEXT and NEW_ATTR
+!	(which reflect what should be on the screen) and calculates a 
+!	sequences of characters which when output to the screen changes
+!	the current screen contents to reflect the new (desired) screen
+!	contents. These characters are actually output to the screen.
+!
+! CALLING SEQUENCE:
+!
+!	ret_status.wlc.v = SMG$$MINIMUM_UPDATE ( P_PBCB.rab.r)
+!
+! FORMAL PARAMETERS:
+!
+!	P_PBCB,rab.r		Address of pasteboard control block
+!
+! IMPLICIT INPUTS:
+!
+!	Contents of PBCB and WCB
+!
+! IMPLICIT OUTPUTS:
+!
+!	Internal buffers change.
+!
+! COMPLETION STATUS:
+!
+!	SS$_NORMAL	Normal successful completion
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+
+BEGIN
+
+BUILTIN
+
+	CMPC3;
+
+BIND
+
+	PBCB		= .P_PBCB			: BLOCK[,BYTE],
+	WCB		= .PBCB[PBCB_A_WCB]		: BLOCK[,BYTE],
+	NUM_ROWS	=  WCB[WCB_W_NO_ROWS]		: WORD,
+	NUM_COLS	=  WCB[WCB_W_NO_COLS]		: WORD,
+	CUR_TEXT	= .WCB[WCB_A_SCR_TEXT_BUF]	: VECTOR[,BYTE],
+	CUR_ATTR	= .WCB[WCB_A_SCR_ATTR_BUF]	: VECTOR[,BYTE],
+	NEW_TEXT	= .WCB[WCB_A_TEXT_BUF]		: VECTOR[,BYTE],
+	NEW_ATTR	= .WCB[WCB_A_ATTR_BUF]		: VECTOR[,BYTE],
+	NEW_LCV		= .WCB[WCB_A_LINE_CHAR]		: VECTOR[,BYTE],
+	CUR_LCV		= .WCB[WCB_A_SCR_LINE_CHAR]	: VECTOR[,BYTE],
+	OLD_CURSOR_ROW	=  WCB[WCB_W_OLD_CUR_ROW]	: WORD,
+	OLD_CURSOR_COL	=  WCB[WCB_W_OLD_CUR_COL]	: WORD,
+	NEW_CURSOR_ROW	=  WCB[WCB_W_CURR_CUR_ROW]	: WORD,
+	NEW_CURSOR_COL	=  WCB[WCB_W_CURR_CUR_COL]	: WORD,
+	SIZE		=  WCB[WCB_L_BUFSIZE],		! Size of buffers
+	FIRST_ROW	=  PBCB[PBCB_W_FIRST_CHANGED_ROW] : WORD,
+	LAST_ROW	=  PBCB[PBCB_W_LAST_CHANGED_ROW]  : WORD,
+	FIRST_COL	=  PBCB[PBCB_W_FIRST_CHANGED_COL] : WORD,
+	LAST_COL	=  PBCB[PBCB_W_LAST_CHANGED_COL]  : WORD,
+	TERM_TYPE	=  PBCB[PBCB_B_DEVTYPE]		: BYTE;
+
+LOCAL
+
+	STATUS,		! Status to return to caller
+	INDEX,		! Working index into the buffers
+	ROW,		! Working row number
+	COL,		! Working column number
+	LEN,		! local length
+	ADJUSTED_COL,	! Wide line adjusted column number
+	CUR_TEXT_PTR : REF VECTOR [,BYTE],  ! Current pointer into 
+					    ! current text buffer
+	CUR_ATTR_PTR : REF VECTOR [,BYTE],  ! Current pointer into 
+					    ! current attribute buffer
+	NEW_TEXT_PTR : REF VECTOR [,BYTE],  ! Current pointer into new 
+					    ! text buffer
+	NEW_ATTR_PTR : REF VECTOR [,BYTE],  ! Current pointer into new 
+					    ! attribute buffer
+	END_ROW_INDEX,	! Index to last character in current row
+	RENDITION,	! local rendition
+	FINAL_INDEX,	! local index representing end of a changed sequence
+	CURSOR_ROW,	! Current cursor row
+	CURSOR_COL,	! Current cursor column
+
+	NEW_CHARS_LEFT,
+	CHARS_LEFT;	! Number of characters left to be inspected.
+			! Starts out equal to number of characters
+			! in the four buffers.
+
+!+
+! If CTRL/O was typed previously, some QIO has returned with
+! that success status and our CTRL/O bit is set.  We don't
+! really know what the screen looks like anymore, so we
+! clear out the screen buffer.
+!-
+
+IF .PBCB[PBCB_V_CONTROLO]
+  THEN	BEGIN	! Clear screen buffer
+	CH$FILL(0,.SIZE,CUR_TEXT);
+	FIRST_ROW=1;
+	FIRST_COL=1;
+	LAST_ROW =.NUM_ROWS;
+	LAST_COL =.NUM_COLS;
+	PBCB[PBCB_V_CONTROLO]=0
+	END;	! Clear screen buffer
+
+!+
+! Initialize our working pointers into the buffers.
+! For now: we invalidate the initial cursor position
+! to force the first update to use full cursor addressing.
+!-
+
+!CURSOR_ROW = .OLD_CURSOR_ROW;
+!CURSOR_COL = .OLD_CURSOR_COL;
+
+CURSOR_ROW=0;
+CURSOR_COL=0;
+
+INCR ROW FROM .FIRST_ROW TO .LAST_ROW DO
+    BEGIN	! Scan row .ROW
+    LOCAL PTEXT,PATTR;
+    LOCAL BLANK_COL;
+    LOCAL PRE_PTR_IN_ROW;	! Pointer position just before first character
+				! in this row
+    CUR_TEXT_PTR = CUR_TEXT+(.ROW-1)*.NUM_COLS;
+    CUR_ATTR_PTR = CUR_ATTR+(.ROW-1)*.NUM_COLS;
+    NEW_TEXT_PTR = NEW_TEXT+(.ROW-1)*.NUM_COLS;
+    NEW_ATTR_PTR = NEW_ATTR+(.ROW-1)*.NUM_COLS;
+
+    IF .NEW_LCV[.ROW] EQL 0
+    THEN
+	CHARS_LEFT=.NUM_COLS
+    ELSE
+	CHARS_LEFT=.NUM_COLS/2;
+!    CHARS_LEFT=.NUM_COLS;
+    PRE_PTR_IN_ROW=.CUR_TEXT_PTR-1;
+
+    !+
+    ! See if the characteristics of this line must change.
+    !-
+
+    IF .CUR_LCV[.ROW] NEQ .NEW_LCV[.ROW]
+    THEN
+	BEGIN	! Change line characteristics
+
+	LOCAL	BUFFER	: VECTOR[SMG$K_LONGEST_SEQUENCE,BYTE],
+		BUFLEN;
+
+	EXTERNAL ROUTINE
+
+		SMG$$OUTPUT;
+
+	!+
+	! Move to the desired row.
+	!-
+
+	SMG$$FIND_MIN_CURSOR_POS (  PBCB,	! Pasteboard Control block
+				   .CURSOR_ROW,	! Current row
+				   .CURSOR_COL, ! Current column
+				   .ROW,	! Desired row
+				   1);		! Desired column
+
+	!+
+	! Update our record of where we are on screen.
+	!-
+
+	CURSOR_ROW = .ROW ;
+	CURSOR_COL = 1 ;
+
+	BUFLEN=0;
+
+	!+
+	! Get escape sequence to change the line characteristics.
+	!-
+
+	SELECTONE .NEW_LCV[.ROW] OF
+		SET
+		[LINE_K_WIDE]:		$SMG$GET_TERM_DATA(DOUBLE_WIDE);
+		[LINE_K_UPPER_HIGH]:	$SMG$GET_TERM_DATA(DOUBLE_HIGH_TOP);
+		[LINE_K_LOWER_HIGH]:	$SMG$GET_TERM_DATA(DOUBLE_HIGH_BOTTOM);
+		[LINE_K_NORMAL]:	$SMG$GET_TERM_DATA(SINGLE_HIGH)
+		TES;
+
+	!+
+	! Output it.
+	!-
+
+	IF .PBCB[PBCB_L_CAP_LENGTH] NEQ 0
+	  THEN	BEGIN
+		STATUS=SMG$$OUTPUT(PBCB,.PBCB[PBCB_L_CAP_LENGTH],
+					.PBCB[PBCB_A_CAP_BUFFER]);
+		IF NOT .STATUS THEN RETURN .STATUS
+		END
+
+	END;	! Change line characteristics
+
+    !+
+    ! Scan backwards looking for the largest sequence of trailing spaces.
+    ! Set BLANK_COL to the column number of the start of such a suffix.
+    !-
+
+    BLANK_COL=.NUM_COLS+1;
+    PTEXT=NEW_TEXT+.ROW*.NUM_COLS;
+    PATTR=NEW_ATTR+.ROW*.NUM_COLS;
+    DECR C FROM .NUM_COLS TO 1 DO
+	BEGIN
+	PTEXT=.PTEXT-1;
+	PATTR=.PATTR-1;
+		BEGIN
+		BIND	TEXT_CHAR=.PTEXT : BYTE,
+			ATTR_CHAR=.PATTR : BYTE;
+		IF .TEXT_CHAR EQL %C' ' AND .ATTR_CHAR EQL 0
+		  THEN	BLANK_COL=.C
+		  ELSE	EXITLOOP
+		END;
+	END;
+
+    WHILE .CHARS_LEFT NEQ 0 DO
+	BEGIN	! scan
+	IF .CUR_TEXT_PTR[0] EQL .NEW_TEXT_PTR[0] AND
+	   .CUR_ATTR_PTR[0] EQL .NEW_ATTR_PTR[0]
+	  THEN	BEGIN	! Characters agree
+		CUR_TEXT_PTR=.CUR_TEXT_PTR+1;
+		CUR_ATTR_PTR=.CUR_ATTR_PTR+1;
+		NEW_TEXT_PTR=.NEW_TEXT_PTR+1;
+		NEW_ATTR_PTR=.NEW_ATTR_PTR+1;
+		CHARS_LEFT=.CHARS_LEFT-1
+		END	! Characters agree
+	  ELSE	BEGIN	! Characters disagree
+
+		INDEX=.CUR_TEXT_PTR-CUR_TEXT;
+
+!		!+
+!		! Re-express address as a row and column number
+!		!-
+!
+!		$MAKE_ROW_COL(INDEX,ROW,COL);
+
+		COL=.CUR_TEXT_PTR-.PRE_PTR_IN_ROW;
+
+		!+
+		! At this point, the cursor is positioned at
+		! .CURSOR_ROW, .CURSOR_COL.  The first character that
+		! needs to be rewritten is at .ROW, .COL.
+		! Determine a minimal update sequence to get us from
+		! where cursor is to where it needs to be to do rewrite.
+		!-
+
+		!+
+		! Set the column to "unknown" if we are past the end of
+		! the terminal width.  We cannot assume that the cursor
+		! has become stuck in the last column, because the
+		! user may have done a SET TERMINAL/WIDTH=n command
+		! to shorten his logical terminal width.
+		!-
+
+		IF .CURSOR_COL GTRU .NUM_COLS
+		  THEN	CURSOR_COL=0;
+
+		SMG$$FIND_MIN_CURSOR_POS (  PBCB,	! Pasteboard Control block
+					   .CURSOR_ROW,	! Current row
+					   .CURSOR_COL, ! Current column
+					   .ROW,	! Desired row
+					   .COL);	! Desired column
+
+		!+
+		! Update our record of where we are on screen after
+		! we output as much of the string as is currently in
+		! our buffer.
+		!-
+
+		CURSOR_ROW = .ROW ;
+		CURSOR_COL = .COL ;
+
+		!+
+		! Now that we are positioned at first difference,
+		! figure out what needs to be written.
+		!-
+
+		!+
+		! If we are at or past the blank pointer, then
+		! just blank the remainder of the line and exit.
+		!-
+
+		IF .CURSOR_COL GEQU .BLANK_COL
+		  THEN	BEGIN	! erase rest of line
+			LOCAL STATUS;
+			STATUS=ERASE_LINE(PBCB);
+			IF NOT .STATUS THEN RETURN .STATUS;
+			EXITLOOP
+			END;	! erase rest of line
+
+		!+
+		! Note that our linear position within the buffer
+		! is given by the index INDEX.
+		! We now calculate the linear position of the last
+		! character on this row, storing the resulting index
+		! in END_ROW_INDEX.
+		!-
+
+		END_ROW_INDEX=$L(.ROW,.NUM_COLS);
+
+		!+
+		! We now must search between INDEX and END_ROW_INDEX
+		! for the longest sequence (all of the same rendition)
+		! of changed characters.
+		!-
+
+		!+
+		! Step 1: find the longest sequence of characters
+		! that are all of the same rendition.
+		! Put our currently desired attributes in RENDITION.
+		!-
+
+		RENDITION = .NEW_ATTR[.INDEX];
+		FINAL_INDEX = .END_ROW_INDEX+1;
+
+		!+
+		! Set up FINAL_INDEX to be the first index past
+		! the longest such difference sequence.
+		!-
+
+		INCR I FROM .INDEX+1 TO .END_ROW_INDEX DO
+			BEGIN	! scan for end of change
+			IF (.NEW_TEXT[.I] EQL .CUR_TEXT[.I] AND
+			    .NEW_ATTR[.I] EQL .CUR_ATTR[.I])
+			OR .NEW_ATTR[.I] NEQ .RENDITION
+			  THEN	BEGIN	! end-of-change
+				FINAL_INDEX=.I;
+				EXITLOOP
+				END;	! end-of-change
+			END;	! scan for end of change
+
+		!+
+		! We now must update the screen from .INDEX to .FINAL_INDEX-1
+		! positions using the attributes stored in RENDITION.
+		! The final SPACE_COUNT positions are to be erased.
+		!-
+
+		LEN=.FINAL_INDEX-.INDEX;
+
+		IF .LEN GTRU 0
+		  THEN	BEGIN	! output revised sequence
+			$OUTPUT_STRING( .LEN,.NEW_TEXT_PTR,.RENDITION);
+			CURSOR_COL=.CURSOR_COL+.LEN
+			END;	! output revised sequence
+
+		!+
+		! Update our pointers and the number of chars left.
+		!-
+
+		CUR_TEXT_PTR =.CUR_TEXT_PTR+.LEN;
+		CUR_ATTR_PTR =.CUR_ATTR_PTR+.LEN;
+		NEW_TEXT_PTR =.NEW_TEXT_PTR +.LEN;
+		NEW_ATTR_PTR =.NEW_ATTR_PTR +.LEN;
+
+		CHARS_LEFT=.CHARS_LEFT-.LEN
+
+		END	! Characters disagree
+
+	END;	! scan
+    END;	! scan row .ROW
+
+!+
+! Make the two buffers agree.
+! The screen now contains what we think should be there.
+!-
+
+CH$MOVE(.SIZE,NEW_TEXT,CUR_TEXT);
+CH$MOVE(.SIZE,NEW_ATTR,CUR_ATTR);
+CH$MOVE(.NUM_ROWS+1,NEW_LCV,CUR_LCV);
+
+!+
+! Move the cursor to the place where the user thinks it is.
+! (But only if we are not already there.)
+!-
+
+IF .CUR_LCV[.NEW_CURSOR_ROW] NEQ 0
+  THEN	ADJUSTED_COL=.CURSOR_COL
+  ELSE	ADJUSTED_COL=2*.CURSOR_COL-1;
+
+OLD_CURSOR_ROW=.CURSOR_ROW;
+OLD_CURSOR_COL=.CURSOR_COL;
+
+SMG$$UPDATE_PHYSICAL_CURSOR(PBCB);
+
+RETURN SS$_NORMAL
+
+END;			! End of routine SMG$$OUTPUT_MINIMAL_UPDATE
+
+%SBTTL 'SMG$$UPDATE_PHYSICAL_CURSOR'
+GLOBAL ROUTINE SMG$$UPDATE_PHYSICAL_CURSOR (P_PBCB) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine forces the physical cursor to move to
+!	a new location specified in the WCB.
+!	It also updates any internal structures.
+!	The cursor is clipped to an appropriate place if it
+!	falls outside the physical screen.
+!
+! CALLING SEQUENCE:
+!
+!	ret_status.wlc.v = SMG$$UPDATE_PHYSICAL_CURSOR ( P_PBCB.rab.r)
+!
+! FORMAL PARAMETERS:
+!
+!	P_PBCB,rab.r		Address of pasteboard control block
+!
+! IMPLICIT INPUTS:
+!
+!	WCB[WCB_W_CURR_CUR_ROW]	Desired new row for physical cursor
+!
+!	WCB[WCB_W_CURR_CUR_COL]	Desired new col for physical cursor
+!
+!	WCB[WCB_W_OLD_CUR_ROW]	Physical row where cursor now is
+!
+!	WCB[WCB_W_OLD_CUR_COL]	Physical col where cursor now is
+!
+! IMPLICIT OUTPUTS:
+!
+!	WCB[WCB_W_CURR_CUR_ROW]	New cursor row
+!
+!	WCB[WCB_W_CURR_CUR_COL]	New cursor col
+!
+!	WCB[WCB_W_OLD_CUR_ROW]	New cursor row
+!
+!	WCB[WCB_W_OLD_CUR_COL]	New cursor col
+!
+! COMPLETION STATUS:
+!
+!	SS$_NORMAL	Normal successful completion
+!
+! SIDE EFFECTS:
+!
+!	The cursor may move to a new physical location
+!--
+
+BEGIN
+
+BIND
+
+	PBCB		= .P_PBCB			: BLOCK[,BYTE],
+	WCB		= .PBCB[PBCB_A_WCB]		: BLOCK[,BYTE],
+	NUM_ROWS	=  WCB[WCB_W_NO_ROWS]		: WORD,
+	NUM_COLS	=  WCB[WCB_W_NO_COLS]		: WORD,
+	NEW_LCV		= .WCB[WCB_A_LINE_CHAR]		: VECTOR[,BYTE],
+	CUR_LCV		= .WCB[WCB_A_SCR_LINE_CHAR]	: VECTOR[,BYTE],
+	OLD_CURSOR_ROW	=  WCB[WCB_W_OLD_CUR_ROW]	: SIGNED WORD,
+	OLD_CURSOR_COL	=  WCB[WCB_W_OLD_CUR_COL]	: SIGNED WORD,
+	NEW_CURSOR_ROW	=  WCB[WCB_W_CURR_CUR_ROW]	: SIGNED WORD,
+	NEW_CURSOR_COL	=  WCB[WCB_W_CURR_CUR_COL]	: SIGNED WORD;
+
+IF .OLD_CURSOR_ROW NEQ .NEW_CURSOR_ROW
+OR .OLD_CURSOR_COL NEQ .NEW_CURSOR_COL
+  THEN	BEGIN
+
+	!+
+	! If the desired location is off the screen,
+	! Clip it to the nearest edge.
+	!-
+
+	IF .NEW_CURSOR_ROW LSS 1
+	  THEN	NEW_CURSOR_ROW=1;
+
+	IF .NEW_CURSOR_COL LSS 1
+	  THEN	NEW_CURSOR_COL=1;
+
+	IF .NEW_CURSOR_ROW GTRU .NUM_ROWS
+	  THEN	NEW_CURSOR_ROW=.NUM_ROWS;
+
+	IF .NEW_CURSOR_COL GTRU .NUM_COLS
+	  THEN	NEW_CURSOR_COL=.NUM_COLS;
+
+	!+
+	! Physically move the cursor there.
+	!-
+
+	SMG$$FIND_MIN_CURSOR_POS(
+		  PBCB,			! Pasteboard control block
+		 .OLD_CURSOR_ROW,	! Current location on screen
+		 .OLD_CURSOR_COL,
+		 .NEW_CURSOR_ROW,	! Desired location
+		 .NEW_CURSOR_COL);
+
+	END;
+
+!+
+! Make the new and the old cursor positions agree.
+!-
+
+OLD_CURSOR_ROW=.NEW_CURSOR_ROW;
+OLD_CURSOR_COL=.NEW_CURSOR_COL;
+
+! Special try:
+! If current line is special, mark the column as unknown.
+
+IF .CUR_LCV[.NEW_CURSOR_ROW] NEQ 0
+  THEN	OLD_CURSOR_COL=0;
+
+RETURN	SS$_NORMAL
+
+END;
+
+%SBTTL 'SMG$SET_PHYSICAL_CURSOR'
+GLOBAL ROUTINE SMG$SET_PHYSICAL_CURSOR (PBID,P_ROW,P_COL) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine moves the physical cursor on a physical
+!	screen to a particular location.
+!
+! CALLING SEQUENCE:
+!
+!	ret_status.wlc.v = SMG$SET_PHYSICAL_CURSOR ( PBID.rl.r,P_ROW.rl.r,
+!							P_COL.rl.r)
+!
+! FORMAL PARAMETERS:
+!
+!	PBID.rl.r		Pasteboard id
+!
+!	P_ROW.rl.r		The row number to move to
+!
+!	P_COL.rl.r		The column number to move to
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS:
+!
+!	SMG$_WRONUMARG	Wrong number of arguments
+!	SMG$_INVPAS_ID	Invalid pasteboard id
+!	SMG$_INVROW	Position is not within pasteboard (off top or bottom)
+!	SMG$_INVCOL	Position is not within pasteboard (off left or right)
+!	SS$_NORMAL	Normal successful completion
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+
+BEGIN
+BIND
+
+	ROW		= .P_ROW,
+	COL		= .P_COL;
+
+LOCAL
+
+	STATUS,
+	PBCB		: REF $PBCB_DECL,
+	WCB		: REF $WCB_DECL;
+
+EXTERNAL LITERAL
+
+	SMG$_INVROW,
+	SMG$_INVCOL;
+
+$SMG$VALIDATE_ARGCOUNT(3,3);
+
+$SMG$GET_PBCB(.PBID,PBCB);
+
+WCB=.PBCB[PBCB_A_WCB];
+
+	BEGIN
+
+	BIND
+
+		NUM_ROWS	=  WCB[WCB_W_NO_ROWS]		: WORD,
+		NUM_COLS	=  WCB[WCB_W_NO_COLS]		: WORD,
+		CUR_ROW		=  WCB[WCB_W_CURR_CUR_ROW]	: WORD,
+		CUR_COL		=  WCB[WCB_W_CURR_CUR_COL]	: WORD;
+
+	IF .ROW GTRU .NUM_ROWS
+	  THEN	RETURN	SMG$_INVROW;
+	IF .COL GTRU .NUM_COLS
+	  THEN	RETURN	SMG$_INVCOL;
+
+	CUR_ROW=.ROW;
+	CUR_COL=.COL;
+
+	END;
+
+!+
+! Immediately move it there now if batching is not in effect.
+!-
+
+IF .PBCB[PBCB_L_BATCH_LEVEL] EQL 0
+  THEN	BEGIN	! Move cursor
+	STATUS=SMG$$UPDATE_PHYSICAL_CURSOR(.PBCB);
+	IF NOT .STATUS THEN RETURN .STATUS
+	END;	! Move cursor
+
+RETURN	SS$_NORMAL
+
+END;
+
+%SBTTL 'SMG$$FIND_MIN_CURSOR_POS - Find minimum cursor pos. sequence'
+GLOBAL ROUTINE SMG$$FIND_MIN_CURSOR_POS (
+					P_PBCB,
+					LINE_NO,
+					COL_NO,
+					DESIRED_LINE_NO,
+					DESIRED_COL_NO
+					) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!
+! CALLING SEQUENCE:
+!
+!	ret_status.wlc.v = SMG$$FIND_MIN_CURSOR_POS ( 
+!					P_PBCB.rab.r,
+!					LINE_NO.rl.v,
+!					COL_NO.rl.v,
+!					DESIRED_LINE_NO.rl.v,
+!					DESIRED_COL_NO.rl.v)
+!
+! FORMAL PARAMETERS:
+!
+!	P_PBCB.rab.r		Address of PBCB
+!
+!	LINE_NO.rl.v		Current cursor line number
+!				0 means it is unknown.
+!
+!	COL_NO.rl.v		Current cursor column number
+!				0 means it is unknown.
+!
+!	DESIRED_LINE_NO.rl.v	Desired cursor line number position
+!
+!	DESIRED_COL_NO.rl.v	Desired cursor column number position
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS:
+!
+!	SS$_NORMAL	Normal successful completion
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+
+BEGIN
+
+BIND
+
+	PBCB		= .P_PBCB			: BLOCK[,BYTE],
+	WCB		= .PBCB[PBCB_A_WCB]		: BLOCK[,BYTE],
+	NUM_ROWS	=  WCB[WCB_W_NO_ROWS]		: WORD,
+	NUM_COLS	=  WCB[WCB_W_NO_COLS]		: WORD,
+	CURR_TEXT	= .WCB[WCB_A_SCR_TEXT_BUF]	: VECTOR[,BYTE],
+	CURR_ATTR	= .WCB[WCB_A_SCR_ATTR_BUF]	: VECTOR[,BYTE],
+	LCV		= .WCB[WCB_A_LINE_CHAR]		: VECTOR[,BYTE],
+	TERM_TYPE	=  PBCB[PBCB_B_DEVTYPE]		: BYTE;
+
+LITERAL
+
+	INFINITY = 1000;	! Prohibitively large number, used
+				! to reject a sequence.
+
+BUILTIN
+
+	EDIV;
+
+LOCAL
+
+	TRIAL_STRING : VECTOR [SMG$K_LONGEST_SEQUENCE,BYTE], 
+				! Buffer in which to construct string 
+				! to be output.
+	TS_LEN,			! Current length of TRIAL_STRING.
+	ADJUSTED_WIDTH,		! Width or width/2
+	SET_CUR_LEN;		! Length of the general set_cursor
+				! sequence to reposition cursor.
+
+!+
+! If the current position is unknown,
+! then we must use the most general sequence.
+!-
+
+IF .LINE_NO EQL 0
+OR .COL_NO  EQL 0
+  THEN	RETURN SET_CURSOR(PBCB,.DESIRED_LINE_NO,.DESIRED_COL_NO,.LINE_NO);
+
+!+
+! General strategy is to come up with a sequence of characters that
+! will position us to the desired line and column number in less
+! characters than a set_cursor sequence will need.
+! The short-cut sequences to get to a specific line include:
+!	1. <LF's> to move down the screen.
+! The short-cut sequences to get to a specific column include:
+!	1. <TAB> to tab-stop immediately before desired column and 
+!	repeat a number of the current characters until we get to 
+!	desired column position.
+!	2. <TAB> to tab-stop immediately beyond desired column and
+! 	follow that by a number of <BS's> to get to the desired column.
+!	If at any point the trial sequence of characters gets to be 
+! greater than the set_cursor sequence, abandon the effort and use the 
+! set_cursor sequence.
+!-
+
+TS_LEN = 0;			! Length of string constructed so far
+
+!+
+! Calculate what the cost of a set_cursor sequence is will be for the 
+! desired line and column number.  This will give us the lower bound we 
+! must beat if an alternate sequence is better.
+!-
+
+$SMG$GET_TERM_DATA(SET_CURSOR_ABS,.DESIRED_LINE_NO,.DESIRED_COL_NO);
+SET_CUR_LEN = .PBCB[PBCB_L_CAP_LENGTH];
+
+!+
+! Now see if we are already on the proper line.
+!-
+
+IF .LINE_NO NEQ .DESIRED_LINE_NO
+THEN
+	BEGIN	! Adjust line number
+	IF .DESIRED_LINE_NO LSS .LINE_NO
+	THEN
+	    BEGIN	! Move upward
+
+	    !+
+	    ! No choice -- must use general cursor sequencing to move
+	    ! upward.  Output general set_cursor sequence
+	    ! (using DESIRED_LINE_NO and 
+	    ! DESIRED_COL_NO) and return to caller.
+	    !-
+
+	    RETURN SET_CURSOR(PBCB,.DESIRED_LINE_NO,.DESIRED_COL_NO,.LINE_NO)
+
+	    END		! Move upward
+	ELSE
+	    BEGIN	! Move downward
+	    LOCAL
+		WIDE_WARNING,	! TRUE if spanning across a wide line
+		LINES_DOWN ;	! No. of lines down we need to move
+
+	    !+
+	    ! See if we can reach DESIRED_LINE_NO in a number of <LF's>
+	    ! which is less than the number of characters in the
+	    ! set_cursor sequence.
+	    ! We do not permit line feed through the bottom of the scrolling
+	    ! region, since the cursor would not be able to cross it that way
+	    ! (and it would cause a scroll to occur).
+	    ! We do not permit line feed through a double wide (or double high)
+	    ! line, because in some cases, this doesn't work.  In particular,
+	    ! on a VT100, if you are in column 60, say and line feed down
+	    ! through a double wide line, when you get back to a single
+	    ! wide line, the cursor has now gotten to column 40!
+	    !-
+
+	    LINES_DOWN = .DESIRED_LINE_NO - .LINE_NO;
+
+	    !+
+	    ! Set WIDE_WARNING to TRUE if we would cross through or into or
+	    ! from a wide line.  Double high lines are considered to be wide.
+	    !-
+
+	    WIDE_WARNING=0;
+	    IF .LCV[0] NEQ 0
+	    THEN
+		INCR L FROM .LINE_NO TO .DESIRED_LINE_NO DO
+			IF .LCV[.L] NEQ 0
+			  THEN	BEGIN
+				WIDE_WARNING=1;
+				EXITLOOP
+				END;
+
+	    IF (.LINES_DOWN LSS .SET_CUR_LEN)     AND
+	       (.LINE_NO + .LINES_DOWN LEQU .PBCB[PBCB_W_BOT_SCROLL_LINE]
+		OR .LINE_NO GTRU .PBCB[PBCB_W_BOT_SCROLL_LINE])	AND
+	       (NOT .WIDE_WARNING)
+	    THEN
+		BEGIN	! Do it with <LF's>
+		!+
+		! Put (.LINES_DOWN) <LF's> into TRIAL_STRING and set 
+		! TS_LEN to .LINES_DOWN.
+		!-
+		CH$FILL (LF, .LINES_DOWN, TRIAL_STRING);
+		TS_LEN = .LINES_DOWN;
+		END 	! Do it with <LF's>
+	    ELSE
+		BEGIN	! Too far
+		!+
+		! Too far down or we would be crossing a lower scroll 
+		! boundary or a wide line -- use general set cursor sequence
+		!-
+		RETURN SET_CURSOR(PBCB,.DESIRED_LINE_NO,.DESIRED_COL_NO,.LINE_NO)
+		END;	! Too far
+	    END;	! Move downward
+	END;	! Adjust line number
+
+!+
+! Reach here when we have constructed the minimal sequence to reach the
+! desired line --not using general cursor addressing sequence.  TS_LEN 
+! tells us how long that sequence is.
+!-
+
+IF .COL_NO NEQ .DESIRED_COL_NO
+THEN
+        BEGIN    ! Column adjustment
+	LOCAL
+	    LEAST_COST,	! Least cost among considered strategies
+	    BEST_STRAT,	! Best update strategy which is better 
+			! then general cursor positioning sequence.
+	    INDEX,	! Index into CURR_TEXT and CURR_ATTR
+	    DCN_QUAD : VECTOR [2,LONG],	! Desired column number
+					! as a quadword
+	    DELTA_COL, 	! No. of columns between where we are and where
+			! we want to be.
+	    NO_TABS,	! No. of <TAB's> to get to tab-stop before 
+			! DESIRED_COL_NO.
+	    NO_RETYPES, ! No. of chars that need to be retyped if we 
+			! tab to tab-stop before
+	    NO_BS;	! No. of <BS's> to get from tab-stop beyond 
+			! DESIRED_COL_NO back to DESIRED_COL_NO.
+
+	!+
+	! Construct short-cut sequence to position to desired column
+	! number.
+	! If earlier on line, 3 strategies are possible:
+	!    1.  Do it with backspaces
+	!    2.  Do it with <CR> and <TAB's> to tab-stop before followed
+	!        by retypes.
+	!    3.  Do it with <CR> and <TAB's> to tab-stop beyond followed
+	!	 by <BS's>.
+	! If later on line, 3 strategies are possible:
+	!    4.  Do it with retypes.
+	!    5.  Do it with <TAB's> to tab-stop before followed by 
+	!        retypes.
+	!    6.  Do it with <TAB's> to tab-stop after followed by <BS's>.
+	!-
+
+	!+
+	! Calc. no of <TAB's> needed to get to tab-stop before 
+	! DESIRED_COL_NO and the no. of subsequent retypes needed.
+	!-
+
+	DCN_QUAD [0] = .DESIRED_COL_NO -1;
+	DCN_QUAD [1] = 0;
+	EDIV ( %REF(8), DCN_QUAD[0], NO_TABS, NO_RETYPES);
+
+	!+
+	! If terminal doesn't support tabs,
+	! or user doesn't want them,
+	! then set NO_TABS to infinity.
+	!-
+
+	IF .PBCB[PBCB_V_NOTABS] OR NOT .PBCB[PBCB_V_TABS]
+	  THEN	NO_TABS=INFINITY;
+
+	!+
+	! Calc. number of <BS's> needed if we go to tab-stop after
+	! DESIRED_COL_NO. This strategy can't be followed if the
+	! next tab stop is off past the right of the screen.  In
+	! that case, we make NO_BS prohibitively large.
+	!-
+
+	IF .LCV[.DESIRED_LINE_NO] NEQ 0
+	  THEN	ADJUSTED_WIDTH=.NUM_COLS/2
+	  ELSE	ADJUSTED_WIDTH=.NUM_COLS;
+
+	IF (.NO_TABS+1)*8+1 LSSU .ADJUSTED_WIDTH
+	  THEN	NO_BS = 8 - .NO_RETYPES
+	  ELSE	NO_BS = INFINITY;
+
+	!+
+	! Set NO_BS to infinity if the terminal does not support backspacing.
+	!-
+
+	IF NOT .PBCB[PBCB_V_BS]
+	  THEN	NO_BS=INFINITY;
+
+	!+
+	! In case we need to do retypes, calc. where in CURR_TEXT and 
+	! CURR_ATTR we need to look.
+	!-
+
+	INDEX = $L ( .DESIRED_LINE_NO, ((.NO_TABS*8) + 1));
+
+	IF .DESIRED_COL_NO  LEQ  .COL_NO
+	THEN
+	    BEGIN	! Earlier in line
+	    LOCAL
+
+		S1_COST, S2_COST, S3_COST;	! Cost of strategies
+						! S1: just BS
+						! S2: tabs then retype
+						! S3: tabs then BS
+
+	    ! Find the cost of stategies for moving back in line
+
+	    IF .PBCB[PBCB_V_BS]
+	    THEN
+		    S1_COST = .COL_NO - .DESIRED_COL_NO     ! No of <BS's>
+	    ELSE
+		    S1_COST=INFINITY;
+
+	    S2_COST = 1 		 ! For <CR>
+			+ .NO_TABS 	 ! For no. of tabs to tab-stop 
+					 ! before
+			+ .NO_RETYPES; 	 ! For no. of retypes
+
+	    S3_COST = 1 		 ! For <CR>
+			  + .NO_TABS + 1 ! For no. of tabs to tab-stop 
+					 ! after
+			  + .NO_BS;	 ! For no. of <BS's>
+
+	    ! Find best strategy for moving backward in line
+
+	    BEST_STRAT = 1;		LEAST_COST = .S1_COST;
+
+	    IF .S2_COST LSS .LEAST_COST THEN
+		BEGIN  BEST_STRAT = 2;  LEAST_COST = .S2_COST;  END;
+
+	    IF .S3_COST LSS .LEAST_COST THEN 
+		BEGIN BEST_STRAT =3 ;   LEAST_COST = .S3_COST; END;
+	    END	! Earlier in line
+
+	ELSE
+
+	    BEGIN	! Later in line
+	    LOCAL
+		S4_COST, S5_COST, S6_COST;	! Cost of strategies
+
+	    ! Find costs of strategies for moving forward in line
+
+	    S4_COST = .DESIRED_COL_NO - .COL_NO; ! For just retypes
+
+	    IF (.NO_TABS * 8)+1 GTR .COL_NO AND .PBCB[PBCB_V_TABS]
+		AND NOT .PBCB[PBCB_V_NOTABS]
+	    THEN
+		BEGIN	! Tabbing forward is possible
+		LOCAL
+		    COL_QUAD : VECTOR [2,LONG], ! COL_NO as quadword
+		    NEW_NO_TABS,
+		    NEW_NO_RETYPES;
+
+		COL_QUAD [0]  = .COL_NO  - 1;
+		COL_QUAD [1] = 0;
+		EDIV (%REF(8), COL_QUAD [0], NEW_NO_TABS, NEW_NO_RETYPES);
+		NO_TABS = .NO_TABS - .NEW_NO_TABS;
+		S5_COST = .NO_TABS      ! For no. of tabs to tab-stop 
+					! before from current position
+			      + .NO_RETYPES;! For no. of retypes
+
+		S6_COST = .NO_TABS + 1  ! For no. of tabs to tab-stop 
+					! after from current position
+			      + .NO_BS;	    ! For no. of <BS's>
+		END	! Tabbing forward is possible
+	    ELSE
+		BEGIN	! Tabbing forward not possible
+		S5_COST = INFINITY;	! Set to prohibitive value
+		S6_COST = INFINITY;	! Set to prohibitive value
+		END;	! Tabbing forward not possible
+
+	    ! Find best strategy
+
+	    BEST_STRAT = 4;			LEAST_COST = .S4_COST;
+
+	    IF .S5_COST LSS .LEAST_COST THEN
+		BEGIN  BEST_STRAT = 5;  LEAST_COST = .S5_COST;  END;
+	
+	    IF .S6_COST LSS .LEAST_COST THEN 
+		BEGIN  BEST_STRAT = 6; LEAST_COST = .S6_COST; END;
+	    END;	! Later in line
+
+	IF .TS_LEN + .LEAST_COST GTR .SET_CUR_LEN
+	THEN
+	    BEGIN	! Abandon effort
+	    RETURN SET_CURSOR(PBCB,.DESIRED_LINE_NO,.DESIRED_COL_NO,.LINE_NO)
+	    END;	! Abandon effort
+
+	CASE .BEST_STRAT FROM 1 TO 6 OF
+	SET
+	    [1]:BEGIN	! Backspaces only.
+		NO_BS = .COL_NO - .DESIRED_COL_NO ;
+		CH$FILL ( BS, .NO_BS, TRIAL_STRING [.TS_LEN]);
+		TS_LEN = .TS_LEN + .NO_BS;
+		END;	! Backspace only.
+
+	    [2]:BEGIN	! <CR>, <TAB's> to tab-stop before, retypes.
+
+		!+
+		! If there are actually characters to be retyped and 
+		! attributes are involved, give up and resort to general
+		! cursor positioning sequence.
+		! It will cost us too much to select-graphic-rendition 
+		! and undo select graphic rendition.
+		!-
+
+		IF .NO_RETYPES NEQ 0  AND
+		   CH$COMPARE (0, 0,	! len, addr
+			       .NO_RETYPES, CURR_ATTR[.INDEX],
+			       0 	! fill
+			      ) NEQ 0
+		THEN
+		    RETURN SET_CURSOR(PBCB,.DESIRED_LINE_NO,.DESIRED_COL_NO,.LINE_NO);
+
+		TRIAL_STRING [.TS_LEN] = CR;
+		TS_LEN = .TS_LEN + 1;
+		CH$FILL ( TAB, .NO_TABS, TRIAL_STRING [.TS_LEN]);
+		TS_LEN = .TS_LEN + .NO_TABS;
+		CH$MOVE ( .NO_RETYPES, CURR_TEXT [.INDEX], 
+			  TRIAL_STRING [.TS_LEN]);
+		TS_LEN = .TS_LEN + .NO_RETYPES;
+		END;	! <CR>, <TAB's> to tab-stop before, retypes.
+
+	    [3]:BEGIN	! <CR>, <TAB's> to tab-stop after, <BS's>
+		TRIAL_STRING [.TS_LEN] = CR;
+		TS_LEN = .TS_LEN + 1;
+		CH$FILL ( TAB, .NO_TABS + 1, TRIAL_STRING [.TS_LEN]);
+		TS_LEN = .TS_LEN + .NO_TABS + 1;
+		CH$FILL ( BS, .NO_BS, TRIAL_STRING [.TS_LEN]);
+		TS_LEN = .TS_LEN + .NO_BS;
+		END;	! <CR>, <TAB's> to tab-stop after, <BS's>
+
+	    [4]:BEGIN	! Retypes only.
+
+		!+
+		! If there are actually characters to be retyped and 
+		! attributes are involved, give up and resort to general
+		! cursor positioning sequence.
+		! It will cost us too much to select-graphic-rendition 
+		! and undo select graphic rendition.
+		!-
+
+		NO_RETYPES = .DESIRED_COL_NO - .COL_NO;
+		INDEX = $L ( .DESIRED_LINE_NO, .COL_NO);
+		IF .NO_RETYPES NEQ 0  AND
+		   CH$COMPARE (0, 0,	! len, addr
+			       .NO_RETYPES, CURR_ATTR[.INDEX],
+			       0 	! fill
+			      ) NEQ 0
+		THEN
+		    RETURN SET_CURSOR(PBCB,.DESIRED_LINE_NO,.DESIRED_COL_NO,.LINE_NO);
+
+		CH$MOVE ( .NO_RETYPES, CURR_TEXT [.INDEX], 
+			  TRIAL_STRING [.TS_LEN]);
+		TS_LEN = .TS_LEN + .NO_RETYPES;
+		END;	! Retypes only.
+
+	    [5]:BEGIN	! <TAB's> to tab-stop before, retypes.
+
+		!+
+		! If there are actually characters to be retyped and 
+		! attributes are involved, give up and resort to general
+		! cursor positioning sequence.
+		! It will cost us too much to select-graphic-rendition 
+		! and undo select graphic rendition.
+		!-
+
+		IF .NO_RETYPES NEQ 0  AND
+		   CH$COMPARE (0, 0,	! len, addr
+			       .NO_RETYPES, CURR_ATTR[.INDEX],
+			       0 	! fill
+			      ) NEQ 0
+		THEN
+		    RETURN SET_CURSOR(PBCB,.DESIRED_LINE_NO,.DESIRED_COL_NO,.LINE_NO);
+
+		CH$FILL ( TAB, .NO_TABS, TRIAL_STRING [.TS_LEN]);
+		TS_LEN = .TS_LEN + .NO_TABS;
+		CH$MOVE ( .NO_RETYPES, CURR_TEXT [.INDEX], 
+			  TRIAL_STRING [.TS_LEN]);
+		TS_LEN = .TS_LEN + .NO_RETYPES;
+		END;	! <TAB's> to tab-stop before, retypes.
+
+	    [6]:BEGIN	! <TAB's> to tab-stop after, <BS's>.
+		CH$FILL ( TAB, .NO_TABS + 1, TRIAL_STRING [.TS_LEN]);
+		TS_LEN = .TS_LEN + .NO_TABS + 1;
+		CH$FILL ( BS, .NO_BS, TRIAL_STRING [.TS_LEN]);
+		TS_LEN = .TS_LEN + .NO_BS;
+		END;	! <TAB's> to tab-stop after, <BS's>.
+	TES;
+	END;	! Column adjustment
+
+!+
+! At this point in the code we have a proper sequence of characters to
+! reposition the cursor from .LINE_NO/.COL_NO to .DESIRED_LINE_NO/
+! .DESIRED_COL_NO with a relatively minimum number of characters.
+! This sequence of characters is contained in TRIAL_STRING and its
+! length is contained in .TS_LEN
+! We output this string to the screen.
+!-
+
+$OUTPUT_STRING(.TS_LEN,TRIAL_STRING,0);
+
+RETURN SS$_NORMAL
+
+END;		! End of routine SMG$$FIND_MIN_CURSOR_POS
+
+%SBTTL 'SET_CURSOR - Generate set-cursor sequence'
+ROUTINE SET_CURSOR (
+		    P_PBCB,
+		    DESIRED_LINE_NO,
+		    DESIRED_COL_NO,
+		    CURRENT_ROW
+		   ) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+! Routine SET_CURSOR constructs the general set cursor
+! sequence to position to .DESIRED_LINE_NO/.DESIRED_COL_NO and outputs
+! it to the screen.
+!
+! CALLING SEQUENCE:
+!
+!	ret_status.wlc.v = SET_CURSOR (	P_PBCB.rab.r,
+!					DESIRED_LINE_NO.rl.v,
+!					DESIRED_COL_NO.rl.v,
+!					CURRENT_ROW.rl.v)
+!
+! FORMAL PARAMETERS:
+!
+!	P_PBCB.rab.r		Address of PBCB
+!
+!	DESIRED_LINE_NO.rl.v	Desired cursor line number position
+!
+!	DESIRED_COL_NO.rl.v	Desired cursor column number position
+!
+!	CURRENT_ROW.rl.v	Current row (0 means unknown)
+!				This matters if we are on a wide row.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS:
+!
+!	SS$_NORMAL	Normal successful completion
+!			errors from SMG$$OUTPUT
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+
+BEGIN
+
+BIND
+
+	PBCB		= .P_PBCB			: BLOCK[,BYTE],
+	WCB		= .PBCB[PBCB_A_WCB]		: BLOCK[,BYTE],
+	LCV		= .WCB[WCB_A_SCR_LINE_CHAR]	: VECTOR[,BYTE];
+
+LOCAL
+
+	STATUS;		! local status
+
+!+
+! If we are currently on a double wide or high row (or if the
+! possibility exists) then because of bugs in the VT100 hardware,
+! we first position to column 1 of the desired line.
+!-
+
+IF (.CURRENT_ROW EQL 0 AND .LCV[0] NEQ 0)
+OR .LCV[.CURRENT_ROW] NEQ 0
+  THEN	BEGIN		! Move to beginning of desired line
+
+	$SMG$GET_TERM_DATA(SET_CURSOR_ABS,.DESIRED_LINE_NO,1);
+
+	!+
+	! Output the escape sequence.
+	!-
+
+	IF .PBCB[PBCB_L_CAP_LENGTH] NEQ 0
+	  THEN	BEGIN
+		STATUS=SMG$$OUTPUT(PBCB,.PBCB[PBCB_L_CAP_LENGTH],
+					.PBCB[PBCB_A_CAP_BUFFER]);
+		IF NOT .STATUS THEN RETURN .STATUS
+		END;
+
+	END;		! Move to beginning of desired line
+
+!+
+! Create the appropriate escape sequence.
+!-
+
+$SMG$GET_TERM_DATA(SET_CURSOR_ABS,.DESIRED_LINE_NO,.DESIRED_COL_NO);
+
+!+
+! Output the escape sequence.
+!-
+
+IF .PBCB[PBCB_L_CAP_LENGTH] NEQ 0
+  THEN	BEGIN
+	STATUS=SMG$$OUTPUT(PBCB,.PBCB[PBCB_L_CAP_LENGTH],
+				.PBCB[PBCB_A_CAP_BUFFER]);
+	IF NOT .STATUS THEN RETURN .STATUS
+	END;
+
+RETURN SS$_NORMAL
+
+END;	! Routine SET_CURSOR
+
+%SBTTL 'ERASE_LINE - Erase to end-of-line'
+ROUTINE ERASE_LINE(P_PBCB) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+! Outputs an erase-to-end-of-line sequence to the screen.
+!
+! CALLING SEQUENCE:
+!
+!	ret_status.wlc.v = ERASE_LINE (	P_PBCB.rab.r)
+!
+! FORMAL PARAMETERS:
+!
+!	P_PBCB.rab.r		Address of PBCB
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS:
+!
+!	SS$_NORMAL	Normal successful completion
+!			errors from SMG$$OUTPUT
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+
+BEGIN
+
+BIND
+
+	PBCB		= .P_PBCB		: BLOCK[,BYTE];
+
+LOCAL
+
+	STATUS;		! local status
+
+!+
+! Create the appropriate escape sequence.
+!-
+
+$SMG$GET_TERM_DATA(ERASE_TO_END_LINE);
+
+!+
+! Output the escape sequence.
+!-
+
+IF .PBCB[PBCB_L_CAP_LENGTH] NEQ 0
+  THEN	BEGIN
+	STATUS=SMG$$OUTPUT(PBCB,.PBCB[PBCB_L_CAP_LENGTH],
+				.PBCB[PBCB_A_CAP_BUFFER]);
+	IF NOT .STATUS THEN RETURN .STATUS;
+	END;
+
+RETURN SS$_NORMAL
+
+END;	! Routine ERASE_LINE
+
+END
+ELUDOM

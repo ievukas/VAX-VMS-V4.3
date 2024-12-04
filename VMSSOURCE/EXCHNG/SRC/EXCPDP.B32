@@ -1,0 +1,2202 @@
+MODULE	exch$pdp				%TITLE 'Small PDP-11 record structure routines'
+		(
+		IDENT = 'V04-000',
+		ADDRESSING_MODE (EXTERNAL=LONG_RELATIVE, NONEXTERNAL=WORD_RELATIVE)
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:	EXCHANGE - Foreign volume interchange facility
+!
+! ABSTRACT:	Specific routines for record structures from small PDP-11
+!		systems, RT-11 and DOS-11
+!
+! ENVIRONMENT:	VAX/VMS User mode
+!
+! AUTHOR:	CW Hobbs		CREATION DATE: 26-Aug-1982
+!					Split from RT11 module: 28-Nov-1982
+!
+! MODIFIED BY:
+!
+!
+!--
+
+! Include files:
+!
+MACRO $module_name_string = 'exch$pdp' %;	! The require file needs to know our module name
+REQUIRE 'SRC$:EXCREQ'				! Facility-wide require file
+    ;
+
+%SBTTL 'Module table of contents'
+
+! Module table of contents:
+!
+FORWARD ROUTINE
+	 pdp_buffer_advance_read,		! Read some more data into the ctx buffer
+	 pdp_buffer_advance_write,		! Write some data from the ctx buffer
+	 pdp_buffer_check  : jsb_r2r3,		! Check the buffer
+	 pdp_buffer_update : jsb_r2r3,		! Update the buffer pointers in the context block
+	 pdp_check_ctx		: NOVALUE,	! Check the context block for consistency
+	 pdp_copy_binary_record : NOVALUE,	! Copy a formatted-binary record
+	 pdp_copy_stream_record,		! Copy a record to a stream format record
+    exch$pdp_filter_filename,			! Remove invalid characters from a filename
+	 pdp_find_binary_record,		! Find a formatted binary record in a given buffer
+	 pdp_find_stream_record,		! Find a stream record in a given buffer
+    exch$pdp_flush_write_buffer,		! Flush any records waiting in the output buffer
+    exch$pdp_get,				! Get routine dispatch
+	 pdp_get_binary : jsb_get,		! Get formatted binary record
+	 pdp_get_fixed  : jsb_get,		! Get fixed-length record
+	 pdp_get_stream : jsb_get,		! Get stream format record
+    exch$pdp_put,				! Put dispatcher
+	 pdp_put_binary : jsb_put,		! Put formatted binary record
+	 pdp_put_fixed  : jsb_put,		! Put fixed-length record
+	 pdp_put_stream : jsb_put		! Put stream format record
+    ;
+
+! EXCHANGE facility routines
+!
+EXTERNAL ROUTINE
+    exch$io_dos11_read,				! Read blocks from a sequential device
+    exch$io_dos11_skip_record,			! Space over blocks on a sequential device
+    exch$io_dos11_write,			! Write blocks to a sequential device
+    exch$io_rt11_read,				! Read blocks from a random access device
+    exch$io_rt11_write,				! Write blocks to a random access device
+    exch$rt11_bad_file	: NOVALUE,		! Erase an RT11 file because of error
+    exch$util_vm_allocate			! Get some virtual memory
+    ;
+
+! Equated symbols:
+!
+!LITERAL
+!    ;
+
+! Bound declarations:
+!
+!BIND
+!    ;
+
+! Local macros
+!
+MACRO
+    $$show_context = 	$trace_print_fao ('cur !SL, byt !SL, eof !SL, base !SL, high !SL, wr !SL',
+			.ctx [ctx$l_cur_block], .ctx [ctx$l_cur_byte], .ctx [ctx$l_eof_block],
+			.ctx [ctx$l_buf_base_block], .ctx [ctx$l_buf_high_block], .ctx [ctx$l_high_block_written])
+			%;
+
+GLOBAL ROUTINE pdp_buffer_advance_read (ctx : $ref_bblock) =	%SBTTL 'pdp_buffer_advance_read (ctx)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Move the current block to the leftmost position in the buffer, and read in new blocks
+!
+! INPUTS:
+!
+!	ctx - ctx pointer to context for an open RT11 file
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true if success, false if any error
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('pdp_buffer_advance_read> ');
+
+LOCAL
+    blks_in_use,
+    blks_to_read,
+    buf_start,				! Pointer to next byte in the buffer
+    buf_end,				! -> one past the end of buffer
+    buf_len,				! Length of good part of buffer
+    status
+    ;
+
+BIND
+    base = ctx [ctx$l_buf_base_block],
+    buf  = ctx [ctx$a_buffer],
+    byt  = ctx [ctx$l_cur_byte],
+    cur  = ctx [ctx$l_cur_block],
+    eof  = ctx [ctx$l_eof_block],
+    high = ctx [ctx$l_buf_high_block],
+    filb = ctx [ctx$a_assoc_filb]	: $ref_bblock,
+    volb = ctx [ctx$a_assoc_volb]	: $ref_bblock
+    ;
+
+
+$trace_print_lit ('entry');
+
+$check_call (2, pdp_check_ctx, .ctx, 441);		! $block_check (2, .ctx, (dos11ctx or rt11ctx), 441);
+
+! If the current block is at the beginning or the high block is EOF, we have made a grievous error
+!
+$$show_context;
+$logic_check (3, ((.cur GEQU .base) AND ((.cur LEQU .high+1) OR (.high EQL .base-1))), 214);
+
+! Get a pointer to the place to start shuffling, and a pointer to the first byte past the end of the buffer
+!
+$logic_check (2, (.buf NEQ 0), 181);
+buf_start = .buf + ((.cur - .base) * 512);
+buf_end   = .buf + ((1 + .high - .base) * 512);
+buf_len   = .buf_end - .buf_start;
+$logic_check (2, (.buf_len LSSU 65536), 116);	! Short-sighted architects
+
+! If current block is the base block, do some more looking.  
+!
+IF   (.cur EQL .base AND .high NEQ .base-1)	! initial condition
+THEN
+    BEGIN
+    $trace_print_fao ('*cur is base* buf_start !XL, buf !XL, buf_len !XW, ctx$k_buffer_length !XW',
+  		.buf_start, .buf, .buf_len, ctx$k_buffer_length);
+    $logic_check (3, ((.buf_start EQL .buf) AND (.buf_len EQL ctx$k_buffer_length)), 215);
+
+    ! If there are non-null characters in the end of the buffer, then the record is too big and we have an error
+    !
+    IF CH$NEQ (0, .cur, .buf_len - .byt, .buf + .byt, 0)
+    THEN
+	$exch_signal_return (exch$_rectoobig, 2, .filb [filb$l_result_name_len], filb [filb$t_result_name])
+
+    ! OK, we have some data in the first block, and nulls to the end of the buffer.  We will slide over the nulls
+    ! and refresh the end of the buffer, since stream and binary formats skip nulls.  This is done so that we can
+    ! handle a stream file with a large number of zeroed blocks at the end.
+    !
+    ELSE
+	BEGIN
+	$trace_print_lit ('*slide one block*');
+	cur = .high;				! "Slide" it to the end
+	buf_len = 512;				! One good block
+	END;
+    END
+
+ELSE
+    BEGIN
+
+    ! Current not the base, move the good data to the start of the buffer
+    !
+    $trace_print_fao ('*cur not base* buf_start !XL, buf !XL, buf_len !XW', .buf_start, .buf, .buf_len);
+    IF .buf_start NEQ .buf
+    THEN
+	BEGIN
+	$trace_print_lit ('shuffling data to the start of the buffer');
+	CH$MOVE (.buf_len, .buf_start, .buf);
+	END;
+    END;
+
+! Change the base pointer to show what we just did, buf_high_block is still valid
+!
+base = .cur;
+
+! Read a chunk into the buffer
+!
+blks_in_use = .buf_len / 512;
+blks_to_read = ctx$k_buffer_blocks - .blks_in_use;		! Blocks left in buffer
+IF (.eof - .high) GTR 0						! Blocks left in file
+THEN
+    blks_to_read = MINU (.blks_to_read, (.eof - .high));
+
+! If all of the blocks are in use, then we have no room to fit more data into the buffer.  Return with a recfmt
+! error, which our caller can examine.
+!
+IF .blks_in_use GEQU ctx$k_buffer_blocks
+THEN
+    RETURN exch$_stmrecfmt;
+
+$trace_print_fao ('blocks in use !UL, blocks to read !UL, ctx$k_buffer_blocks !UL', 
+		.blks_in_use, .blks_to_read, ctx$k_buffer_blocks);
+$$show_context;
+$logic_check (2, (.blks_to_read GTRU 0), 118);
+
+! Perform the appropriate read operation depending on the volume type
+!
+IF .volb [volb$b_vol_format] EQL volb$k_vfmt_rt11
+THEN
+    BEGIN
+    IF NOT (status = exch$io_rt11_read (.volb,			! All the rms stuff hangs from here
+					.high + 1,		! First block to read
+					.blks_to_read,		! Number of blocks
+					.buf + .buf_len))	! Address of the I/O buffer
+    THEN
+	RETURN .status;
+    END
+ELSE
+    BEGIN
+    LOCAL
+	bp,					! Buffer pointer
+	bc;					! Block count
+
+    bc = .blks_to_read;				! Number of blocks to read
+    bp = .buf + .buf_len;			! Address to put first block
+
+    WHILE 1
+    DO
+	BEGIN
+
+	! Read from the tape
+	!
+	status = exch$io_dos11_read (	.volb,	! All the stuff hangs from here
+					.bp);	! Address of the I/O buffer
+
+	! If the read didn't work, do some checking
+	!
+	IF NOT .status
+	THEN
+	    BEGIN
+	    IF .status EQL ss$_endoffile
+	      OR
+	       .status EQL ss$_endoftape
+	    THEN
+		BEGIN
+		$trace_print_lit ('registered END-OF-FILE');
+		$$show_context;
+		eof = MAX (0, (.high + (.blks_to_read - .bc)));	! Set the eof block to zero or more
+		blks_to_read = .blks_to_read - .bc;		! Adjust so that high block gets set right;
+		EXITLOOP;
+		END
+	    ELSE
+		RETURN .status;				! Return the error status
+	    END;
+
+	! Adjust our pointers
+	!
+	bp = .bp + 512;				! Move to the next block
+	bc = .bc - 1;
+	IF .bc LEQ 0 THEN EXITLOOP;		! Exit if all have been read
+
+	END;
+    END;
+
+! Change the high block pointer to show what we just did
+!
+high = .high + .blks_to_read;
+
+RETURN true;
+
+END;
+
+GLOBAL ROUTINE pdp_buffer_advance_write (ctx : $ref_bblock) =	%SBTTL 'pdp_buffer_advance_write (ctx)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Write the complete blocks in the buffer, then move the current block to the leftmost position in the 
+!	buffer.
+!
+! INPUTS:
+!
+!	ctx - ctx pointer to context for an open RT11 file
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true if success, false if any error
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('pdp_buffer_advance_write> ');
+
+LOCAL
+    temp,
+    blks_to_write,
+    buf_start,				! Pointer to next byte in the buffer
+    buf_end,				! -> one past the end of buffer
+    buf_len,				! Length of good part of buffer
+    status
+    ;
+
+BIND
+    base = ctx [ctx$l_buf_base_block],
+    buf  = ctx [ctx$a_buffer],
+    cur  = ctx [ctx$l_cur_block],
+    eof  = ctx [ctx$l_eof_block],
+    high = ctx [ctx$l_buf_high_block],
+    filb = ctx [ctx$a_assoc_filb]	: $ref_bblock,
+    volb = ctx [ctx$a_assoc_volb]	: $ref_bblock
+    ;
+
+
+$trace_print_lit ('entry');
+
+$check_call (2, pdp_check_ctx, .ctx, 458); 	! $block_check (2, .ctx, (), 458);
+
+! If the current block is before the beginning or the high block past EOF, we have made a grievous error
+!
+$logic_check (2, ((.cur GEQU .base) AND (.high LEQU .eof)), 242);
+
+! How many full blocks do we have?
+!
+blks_to_write = .cur - .base;
+
+! Get a pointer to the first partial block, the end of the buffer, and the length from the first partial to
+! the end of the block
+!
+$logic_check (2, (.buf NEQ 0), 194);
+buf_start = .buf + ((.cur - .base) * 512);
+buf_end   = .buf + ((1 + .high - .base) * 512);
+buf_len   = .buf_end - .buf_start;
+$logic_check (2, (.buf_len LSSU 65536), 173);		! Short-sighted architects
+
+! Do a flush operation if necessary.  The final partial block will be padded with nulls.
+!
+IF ((.ctx [ctx$v_flush])			! Has a flush been requested
+  AND
+    (.ctx [ctx$l_cur_byte] NEQ 0))		! And is there a partial block waiting
+THEN
+    BEGIN
+
+    blks_to_write = .blks_to_write + 1;		! Adjust the block count for the partial
+
+    CH$FILL (0, .buf_len - .ctx [ctx$l_cur_byte], .buf_start + .ctx [ctx$l_cur_byte]);
+    END;
+
+! If we are flushing, set the eof block so that we may update the entry when we close (DOS-11 only)
+!
+IF (.ctx [ctx$v_flush])
+  AND
+   (.eof EQL -1)				! DOS-11 has -1 for an EOF block
+THEN
+    BEGIN
+    $trace_print_lit ('flushing...');
+    $$show_context;
+    eof = .base + .blks_to_write - 1;
+    END;
+
+$trace_print_fao ('buf !XL, buf_start !XL, buf_end !XL, buf_len !XL, blocks to write !UL', 
+			.buf, .buf_start, .buf_end, .buf_len, .blks_to_write);
+$$show_context;
+
+! If no blocks, we don't have any more to do
+!
+IF .blks_to_write EQL 0
+THEN
+    RETURN true;
+
+! Write the front chunk from the buffer, operation depends on the volume type
+!
+$logic_check (2, ((.blks_to_write GTRU 0) AND (.blks_to_write LEQU ctx$k_buffer_blocks)), 174);
+IF .volb [volb$b_vol_format] EQL volb$k_vfmt_rt11
+THEN
+    BEGIN
+
+    IF NOT (status = exch$io_rt11_write (   .volb,			! All the rms stuff hangs from here
+					    .base,			! First block to write
+					    .blks_to_write,		! Number of blocks
+					    .buf))			! Address of the I/O buffer
+    THEN
+	BEGIN
+	exch$rt11_bad_file (.filb);
+	RETURN .status;
+	END;
+    END
+ELSE
+    BEGIN
+    LOCAL
+	bl,					! Buffer length
+	bp,					! Buffer pointer
+	bc;					! Block count
+
+    bl = 512;					! Most blocks are 512 bytes
+    bc = .blks_to_write;			! Number of blocks to write
+    bp = .buf;					! Address to find first block
+
+    WHILE 1
+    DO
+	BEGIN
+
+	! See if we are writing a final, short block
+	!
+	IF .ctx [ctx$v_flush]			! Only if we are flushing
+	THEN
+	    IF .bc EQL 1			! And if we are writing the last block
+	    THEN
+		IF .ctx [ctx$l_cur_byte] NEQ 0	! And if the block is partial
+		THEN
+		    bl = .ctx [ctx$l_cur_byte];	! Then the length is that partial
+
+	! Write to the tape
+	!
+	status = exch$io_dos11_write (	.volb,	! All the stuff hangs from here
+					.bp,	! Address of the I/O buffer
+					.bl);	! Length of the I/O buffer
+
+	! If the write didn't work, mark the buffer as empty before returning
+	!
+	IF NOT .status					! Probably ss$_endoftape
+	THEN
+	    BEGIN
+	    cur = .base + (.blks_to_write - .bc);	! Set cur to high block written before error
+	    base = .cur;				! Say that base is the current
+	    ctx [ctx$l_cur_byte] = 0;			! Say that no bytes in last block
+	    exch$io_dos11_skip_record (.volb, -1);	! Backup one record
+	    RETURN .status;				! Return the error status
+	    END;
+
+	! Adjust our pointers
+	!
+	bp = .bp + 512;				! Move to the next block
+	bc = .bc - 1;
+	IF .bc LEQ 0 THEN EXITLOOP;		! Exit if all have been read
+
+	END;
+    END;
+
+! If we have exceeded the previous high water mark, save the new mark
+!
+temp = (.base + (.blks_to_write-1));
+IF .temp GTRU .ctx [ctx$l_high_block_written]
+THEN
+    ctx [ctx$l_high_block_written] = .temp;
+
+! Move the good data to the start of the buffer
+!
+CH$MOVE (.buf_len, .buf_start, .buf);
+
+! Change the base pointer to show what we just did, buf_high_block is still valid
+!
+base = .cur;
+
+! Change the high block pointer to show what we just did
+!
+high = MINU ((.high + .blks_to_write), .eof);
+
+$trace_print_lit ('context at exit');
+$$show_context;
+
+RETURN true;
+
+END;
+
+GLOBAL ROUTINE pdp_buffer_check (ctx : $ref_bblock, out_filb : $ref_bblock) : jsb_r2r3 =	%SBTTL 'pdp_buffer_check'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Handle the situation of buffer overflow by either writing some blocks or signalling EOF.
+!
+! INPUTS:
+!
+!	ctx       - Output file context block
+!	out_filb  - Output file block
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true if success, false if any error
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('pdp_buffer_check> ');
+
+REGISTER
+    tmp
+    ;
+
+$debug_print_lit ('entry');
+
+! If the EOF block is in the buffer
+!
+IF .ctx [ctx$l_buf_high_block] GEQU .ctx [ctx$l_eof_block]
+THEN
+
+    ! Don't have any more room at the inn
+    !
+    $exch_signal_return (exch$_rtouteof, 2, .out_filb [filb$l_result_name_len], out_filb [filb$t_result_name])
+
+! Otherwise, write some data and recursively retry the put
+!
+ELSE
+    BEGIN
+    IF NOT (tmp = pdp_buffer_advance_write (.ctx))
+    THEN
+	RETURN .tmp;
+    RETURN exch$pdp_put ();		! And then try it again
+    END;
+
+END;
+
+GLOBAL ROUTINE pdp_buffer_update (ctx : $ref_bblock, next_buf) : jsb_r2r3 =	%SBTTL 'pdp_buffer_update'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Update the current byte information in the context
+!
+! INPUTS:
+!
+!	ctx       - Output file context block
+!	next_buf  - New current record pointer
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true if success, false if any error
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('pdp_buffer_update> ');
+
+REGISTER
+    five12,
+    tmp
+    ;
+
+$debug_print_lit ('entry');
+
+! Update the next record position
+!
+five12 = 512;
+$logic_check (2, (.ctx [ctx$a_buffer] NEQ 0), 201);
+tmp = .next_buf - .ctx [ctx$a_buffer];	! Save the updated position for the next put
+ctx [ctx$l_cur_byte]  = .tmp MOD .five12;
+ctx [ctx$l_cur_block] = (.tmp / .five12) + .ctx [ctx$l_buf_base_block];
+
+RETURN true;
+
+END;
+
+GLOBAL ROUTINE pdp_check_ctx (ctx : $ref_bblock, code) : NOVALUE =	%SBTTL 'pdp_check_ctx'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Check for a valid context block
+!
+! INPUTS:
+!
+!	ctx       - Output file context block
+!	code	  - Error code to use if the check fails
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('pdp_check_ctx> ');
+
+LOCAL
+    size,
+    type
+    ;
+
+BIND
+    filb = ctx [ctx$a_assoc_filb]	: $ref_bblock,
+    volb = ctx [ctx$a_assoc_volb]	: $ref_bblock
+    ;
+
+$debug_print_lit ('entry');
+
+! The context block must exist
+!
+IF .ctx EQL 0
+THEN
+    $exch_signal_stop (exch$_blockcheck0, 1, .code);
+
+! Now look for either an RT11CTX block or a DOS11CTX block
+!
+IF .ctx [ctx$b_type] EQL exchblk$k_rt11ctx
+THEN
+    BEGIN
+    IF .ctx [ctx$w_size] NEQ exchblk$s_rt11ctx
+    THEN
+	BEGIN
+	size = exchblk$s_rt11ctx;
+	type = exchblk$k_rt11ctx;
+	$exch_signal_stop (exch$_blockcheck, 6, .code, .ctx, .ctx [ctx$w_size], .size, .ctx [ctx$b_type], .type);
+	END;
+    END
+ELSE IF .ctx [ctx$b_type] EQL exchblk$k_dos11ctx
+THEN
+    BEGIN
+    IF .ctx [ctx$w_size] NEQ exchblk$s_dos11ctx
+    THEN
+	BEGIN
+	size = exchblk$s_dos11ctx;
+	type = exchblk$k_dos11ctx;
+	$exch_signal_stop (exch$_blockcheck, 6, .code, .ctx, .ctx [ctx$w_size], .size, .ctx [ctx$b_type], .type);
+	END;
+    END
+ELSE
+    BEGIN
+    size = exchblk$s_rt11ctx;
+    type = exchblk$k_rt11ctx;
+    $exch_signal_stop (exch$_blockcheck, 6, .code, .ctx, .ctx [ctx$w_size], .size, .ctx [ctx$b_type], .type);
+    END;
+
+IF .filb EQL 0
+THEN
+    $exch_signal_stop (exch$_blockcheck0, 1, (10000+.code));
+
+IF   .filb [filb$w_size] NEQ exchblk$s_filb
+  OR
+     .filb [filb$b_type] NEQ exchblk$k_filb
+THEN
+    $exch_signal_stop (exch$_blockcheck, 6, (10000+.code), .filb,
+	.filb [filb$w_size], exchblk$s_filb,
+	.filb [filb$b_type], exchblk$k_filb);
+
+IF .volb EQL 0
+THEN
+    $exch_signal_stop (exch$_blockcheck0, 1, (20000+.code));
+
+IF   .volb [volb$w_size] NEQ exchblk$s_volb
+  OR
+     .volb [volb$b_type] NEQ exchblk$k_volb
+THEN
+    $exch_signal_stop (exch$_blockcheck, 6, (20000+.code), .volb,
+	.volb [volb$w_size], exchblk$s_volb,
+	.volb [volb$b_type], exchblk$k_volb);
+
+END;
+
+GLOBAL ROUTINE pdp_copy_binary_record (in_len, in_buf : $ref_bvector,	%SBTTL 'pdp_copy_binary_record'
+					 out_buf : $ref_bvector) : NOVALUE =
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Copy the input record to a buffer, reformatting it as a valid formatted-binary record.
+!
+! INPUTS:
+!
+!	in_len  - length of the input record
+!	in_buf  - address of the input record
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	out_buf - address of the output buffer which receives the formatted-binary copy of the input
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('pdp_copy_binary_record> ');
+
+REGISTER
+    ip,					! Input pointer
+    op,					! Output pointer
+    chksum	: BYTE,
+    neg_chksum	: BYTE,
+    char	: BYTE			! Current character
+    ;
+
+BIND
+    sentinel = out_buf [0] : WORD,	! Sentinel word, first two bytes of the output
+    length   = out_buf [2] : WORD	! Length word, next two bytes
+    ;
+
+$debug_print_fao ('entry, len=!UL, buf[0:19]="!AF"', .in_len, 20, .in_buf);
+
+! Initialize our local data segments
+!
+op   = .out_buf;				! Output buffer pointer
+ip   = .in_buf;					! Input pointer at the start of the record
+chksum = 0;
+
+! Put the sentinel and length words in the buffer
+!
+sentinel = 1;
+length = .in_len + 4;
+
+! Prepare the checksum from the first four bytes
+!
+DECR c FROM 3 TO 0
+DO
+    chksum = .chksum + CH$RCHAR_A (op);
+
+! Start grabbing bytes
+!
+IF .in_len GTRU 0
+THEN
+    DECR c FROM .in_len-1 TO 0 
+    DO
+	BEGIN
+
+	char = CH$RCHAR_A (ip);			! Read the new character and advance the input pointer
+
+	chksum = .chksum + .char;		! Add this byte to the checksum
+
+	CH$WCHAR_A (.char, op);			! Move it to the output and advance the output pointer
+
+	END;
+
+! Store the negated checksum
+!
+neg_chksum = -.chksum;
+CH$WCHAR (.neg_chksum, .op);			! Move it to the output
+
+RETURN;
+END;
+
+GLOBAL ROUTINE pdp_copy_stream_record (in_len, in_buf : $ref_bvector, %SBTTL 'pdp_copy_stream_record'
+					 out_buf : $ref_bvector) =
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Copy the input record to a buffer, reformatting it as a valid stream format record.  The length of the
+!	output record is returned.
+!
+! INPUTS:
+!
+!	in_len  - length of the input record
+!	in_buf  - address of the input record
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	out_buf - address of the output buffer which receives the stream format copy of the input, including the
+!		  record terminator(s)
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	The length of the output record, including terminator
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('pdp_copy_stream_record> ');
+
+REGISTER
+    ip,					! Input pointer
+    op,					! Output pointer
+    ol,					! Output length
+    char	: BYTE			! Current character
+    ;
+
+$debug_print_fao ('entry, len=!UL, buf[0:19]="!AF"', .in_len, 20, .in_buf);
+
+! Initialize our local data segments
+!
+op   = .out_buf;				! Output buffer pointer
+ip   = .in_buf;					! Input pointer at the start of the record
+char = 0;					! Preset for the later test, in case 0 length input
+
+! Start grabbing bytes
+!
+IF .in_len GTRU 0
+THEN
+    DECR c FROM .in_len-1 TO 0 
+    DO
+	BEGIN
+
+	! Read the character and clear the high bit
+	!
+	char = CH$RCHAR_A (ip);		! Read the new character and advance the input pointer
+	char <7,1,0> = 0;		! Clear the high bit
+
+	! Now look at the character and do something with it
+	!
+	SELECTONEU .char OF
+	SET
+
+	    [NUL, DEL, VT] :
+		    ;
+
+	    [OTHERWISE] :
+		    CH$WCHAR_A (.char, op);
+
+	TES;
+
+	END;
+
+! If the final char was either a form feed or a line feed, we are done.  Otherwise add the <CR><LF> pair
+!
+IF ((.char NEQ LF)	! line feed
+  AND
+    (.char NEQ FF))	! form feed
+THEN
+    BEGIN
+    CH$WCHAR_A (CR, op);
+    CH$WCHAR_A (LF, op);
+    END;
+
+! Calculate the final length
+!
+ol = .op - .out_buf;
+
+$debug_print_fao ('output len !UL, record[0:19] "!AF"', .ol, 20, .out_buf);
+
+RETURN .ol;
+END;
+
+GLOBAL ROUTINE exch$pdp_filter_filename (nam_len, nam_start) =	%SBTTL 'exch$pdp_filter_filename'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Scan filename, removing characters which are invalid.  The string will be modified in place.
+!
+! INPUTS:
+!
+!	nam_len   - length of the name
+!	nam_start - starting address of the filename
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	the name string is modified in place
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('exch$pdp_filter_filename> ');
+
+
+REGISTER
+    ip,					! Input pointer
+    op,					! Output pointer
+    char	: BYTE			! Current character
+    ;
+
+$debug_print_lit ('entry');
+
+IF (.nam_len EQL 0) 				! Nothing to do in this case
+THEN 
+    RETURN .nam_len;
+
+! Initialize our local data segments
+!
+ip   = .nam_start;				! Input pointer at the start of the buffer
+op   = .ip;					! Output pointer starts at the beginning
+
+DECR len FROM .nam_len - 1 TO 0
+DO
+    BEGIN
+    char = CH$RCHAR_A (ip);
+    SELECTONE .char OF
+    SET
+	['A' TO 'Z', '0' TO '9'] :
+					CH$WCHAR_A (.char, op);
+	[OTHERWISE] :			;
+    TES;
+    END;
+
+! Return the length
+!
+RETURN .op - .nam_start;
+
+END;
+
+GLOBAL ROUTINE pdp_find_binary_record (filb : $ref_bblock, buf_start, %SBTTL 'pdp_find_binary_record'
+		buf_end : $ref_bvector, new_start) =
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Scan buffer from start to end (if necessary) looking for a single formatted binary record.  The address and
+!	length of the record are copied to the record buffer pointers in the filb.  The address of the next
+!	unscanned byte is returned.
+!
+! INPUTS:
+!
+!	filb      - pointer to the filb which contains the active record stream
+!	buf_start - starting address in buffer to scan
+!	buf_end   - one past the highest valid buffer address
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	new_start - receives address of first unscanned byte
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	findbin$k_success	- record 'placed' in filb, all is well
+!	  	k_eob		- at end of buffer without finding complete record
+!		k_bad_fmt	- problem with record format
+!		k_too_big	- record exceeds length of output buffer
+!		k_chksum	- computed checksum differs from stored checksum
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('pdp_find_binary_record> ');
+
+
+REGISTER
+    ip,					! Input pointer
+    ol,					! Output length
+    eob,				! End of buffer
+    chksum	: BYTE,			! Check sum accumulator
+    neg_chksum	: BYTE,			! Negative of checksum for compares
+    char	: BYTE			! Current character
+    ;
+
+$debug_print_lit ('entry');
+$block_check (2, .filb, filb, 495);
+
+! Initialize our local data segments
+!
+ip   = .buf_start;				! Input pointer at the start of the buffer
+eob  = .buf_end;				! End of buffer pointer one past the end of the buffer
+
+! Skip any null bytes at the start of the record
+!
+DO
+    BEGIN
+
+    ! Check for the end of the input buffer.  We make sure that the entire header is in the buffer
+    !
+    IF .ip+4 GEQU .eob
+    THEN
+	RETURN findbin$k_eob;
+
+    ! Read the character and advance the pointer
+    !
+    char = CH$RCHAR_A (ip);
+
+    END
+
+UNTIL .char NEQ 0;
+
+! A formatted binary record has a word containing 1 followed by a word containing the length of the data + header
+!
+IF (.char NEQ 1) OR (CH$RCHAR_A (ip) NEQ 0)
+THEN
+    RETURN findbin$k_bad_fmt;
+
+! Get the length, and initialize the checksum
+!
+ol = (BIND len = .ip : WORD; .len) - 4;		! Interpret datum at input pointer as a word
+chksum = 1 + CH$RCHAR_A (ip) + CH$RCHAR_A (ip);	! Checksum is 1 plus the two bytes of the length word
+
+! Although we use locate mode, lets do a sanity check and refuse oversize records
+!
+IF .ol GTRU filb$s_record_buffer
+THEN
+    RETURN findbin$k_too_big;
+
+! Make sure that the entire record plus the checksum byte are present in the buffer
+!
+IF (.ip + .ol + 1) GEQU .eob
+THEN
+    RETURN findbin$k_eob;
+
+! Point the filb record information at the record we have found
+!
+filb [filb$a_record] = .ip;
+filb [filb$l_record_len] = .ol;
+
+! Calculate the checksum, then negate it
+!
+DECR count FROM .ol-1 TO 0 DO chksum = .chksum + CH$RCHAR_A (ip);
+neg_chksum = -.chksum;
+
+! Get the stored checksum from the end of the record
+!
+char = CH$RCHAR_A (ip);				! Get the stored checksum
+.new_start = .ip;				! Send back the start of the next record
+
+IF .neg_chksum NEQ .char
+THEN
+    BEGIN
+
+    ! The RSX/VMS utility FLX has been calculating incorrect checksums for records longer than 255 bytes.  It fails
+    ! to include the high order byte of the length in the checksum.  If the checksum is correct when we assume
+    ! that this has occurred, accept it as correct.
+    !
+    $debug_print_fao ('Record length !UL, checksum !OB, calc chksum !OB', .ol, .char, .neg_chksum);
+    chksum = .chksum - ((.ol+4) / 256);		! Pretend we never added the high byte
+    neg_chksum = -.chksum;
+    IF .neg_chksum NEQ .char
+    THEN
+	BEGIN
+	$debug_print_fao ('Record length !UL, checksum !OB, calc chksum !OB', .ol, .char, .neg_chksum);
+	RETURN findbin$k_chksum;
+	END;
+    END;
+
+RETURN findbin$k_success;
+END;
+
+GLOBAL ROUTINE pdp_find_stream_record (filb : $ref_bblock, buf_start, %SBTTL 'pdp_find_stream_record'
+		buf_end : $ref_bvector, new_start) =
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Scan buffer from start to end (if necessary) looking for a single stream record.  The reformatted
+!	record is copied to the record buffer in the filb.  The address of the next unscanned byte is returned.
+!
+! INPUTS:
+!
+!	buf_start - starting address in buffer to scan
+!	buf_end   - one past the highest valid buffer address
+!	filb      - pointer to the filb which contains the active record stream
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	new_start - receives address of first unscanned byte
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	findstm$k_success	- record placed in filb, all is well
+!	  ...	k_ctrlz_eof	- ^Z at start of record
+!	  	k_eob		- at end of buffer, no record found
+!		k_no_term	- reached end of buffer in middle of record
+!		k_bad_fmt	- record exceeds length of output buffer
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('pdp_find_stream_record> ');
+
+LOCAL
+    status
+    ;
+
+REGISTER
+    ip,					! Input pointer
+    op,					! Output pointer
+    ol,					! Output length
+    eob,				! End of buffer
+    char	: BYTE			! Current character
+    ;
+
+$debug_print_lit ('entry');
+$block_check (2, .filb, filb, 429);
+
+! Set address of the filb record to the start of the filb record buffer
+!
+filb [filb$a_record]     = filb [filb$t_record_buffer];
+
+! Initialize our local data segments
+!
+op   = filb [filb$t_record_buffer];		! Output pointer to the filb buffer
+ol   = 0;					! Output length starts at zero
+ip   = .buf_start;				! Input pointer at the start of the buffer
+eob  = .buf_end;				! End of buffer pointer one past the end of the buffer
+status = findstm$k_success;
+
+! Start grabbing bytes
+!
+$debug_print_fao ('ip !XL, eob !XL, ol !XW, char "!AF"', .ip, .eob, .ol, 1, .ip);
+WHILE 1
+DO
+    BEGIN
+
+    ! Check for the end of either of the buffers
+    !
+    IF .ip GEQU .eob				! If the input pointer is past the end of the input buffer
+    THEN
+	BEGIN
+	IF .ol EQL 0				! If the output length is still zero
+	THEN
+	    status = findstm$k_eob		!  then end-of-buffer without any record
+	ELSE
+	    status = findstm$k_no_term;		!  otherwise record without terminator
+	EXITLOOP;
+	END;
+
+    IF .ol GTRU filb$s_record_buffer		! If the output length is gtr than the buffer (the buffer actually
+    THEN					!  has an extra guard byte at the end so no overrun problem)
+	BEGIN
+	status = findstm$k_bad_fmt;		! Our status is bad format record
+	EXITLOOP;
+	END;
+
+    ! Read the character and clear the high bit
+    !
+    char = CH$RCHAR_A (ip);		! Read the new character and advance the input pointer
+    char <7,1,0> = 0;			! Clear the high bit
+
+    ! Now look at the character and do something with it
+    !
+    SELECTONEU .char OF
+    SET
+
+	[NUL, DEL, VT] :
+		;
+
+	[CTRLZ] :				! Control/z marks end of file if the first char
+		BEGIN
+		IF .ol EQL 0
+		THEN
+		    BEGIN
+		    status = findstm$k_ctrlz_eof;	! Fine, no record
+		    EXITLOOP;
+		    END
+		ELSE
+		    BEGIN
+		    CH$WCHAR_A (.char, op);
+		    ol = .ol + 1;
+		    END;
+		END;
+
+	[FF] :
+		BEGIN
+		CH$WCHAR_A (.char, op);
+		ol = .ol + 1;
+		EXITLOOP;
+		END;
+
+	[LF] :
+		BEGIN
+		IF .ol GTRU 0
+		THEN
+		    BEGIN
+		    IF CH$RCHAR (.op-1) EQL cr
+		    THEN
+			ol = .ol - 1;
+		    END;
+		EXITLOOP;
+		END;
+
+	[OTHERWISE] :
+		BEGIN
+		CH$WCHAR_A (.char, op);
+		ol = .ol + 1;
+		END;
+
+    TES;
+
+    END;
+
+.new_start = .ip;
+filb [filb$l_record_len] = .ol;
+
+$debug_print_fao ('record "!AF", len !UL, status !UL', .ol, filb [filb$t_record_buffer], .ol, .status);
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE exch$pdp_flush_write_buffer (ctx : $ref_bblock) =	%SBTTL 'exch$pdp_flush_write_buffer (ctx)'
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	External entry to call buffer flush routine
+!
+! INPUTS:
+!
+!	ctx - ctx pointer to context for an open RT11 file
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true if success, false if any error
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+$dbgtrc_prefix ('pdp_flush_write_buffer> ');
+
+LOCAL
+    status
+    ;
+
+$debug_print_lit ('entry');
+
+$check_call (3, pdp_check_ctx, .ctx, 455);		! $block_check (2, .ctx, (dos11ctx or rt11ctx), 455);
+
+ctx [ctx$v_flush] = true;			! Tells advance routine to flush the last block
+status = pdp_buffer_advance_write (.ctx);	! Flush any blocks that are sitting in the output buffer
+ctx [ctx$v_flush] = false;			! Clear the flush flag
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE exch$pdp_get (filb : $ref_bblock) =	%SBTTL 'exch$pdp_get (filb)'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Common dispatch for RT11 get routines.
+!
+! INPUTS:
+!
+!	filb - pointer to filb for an open RT11 file
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true if success, false if any error
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('pdp_get> ');
+
+LOCAL
+    buf_start,				! Pointer to next byte in the buffer
+    buf_end,				! -> one past the end of buffer
+    routn				! Address of action routine
+    ;
+
+BIND
+    ctx  = filb [filb$a_context]	: $ref_bblock,
+    volb = filb [filb$a_assoc_volb]	: $ref_bblock
+    ;
+
+$debug_print_lit ('entry');
+
+$block_check (2, .filb, filb, 456);
+$block_check (2, .volb, volb, 493);
+$check_call (1, pdp_check_ctx, .ctx, 494);		! $block_check (1, .ctx, (dos11ctx or rt11ctx), 494);
+$logic_check (2, (.ctx [ctx$a_assoc_filb] EQL .filb), 134);
+$logic_check (2, (.ctx [ctx$a_assoc_volb] EQL .volb), 135);
+$logic_check (2, (IF .volb [volb$b_vol_format] EQL volb$k_vfmt_rt11 THEN (.ctx [ctx$l_cur_block] NEQ 0) ELSE 1), 177);
+
+! Get a pointer to the place to start scanning, and a pointer to the first byte past the end of the buffer
+!
+$logic_check (2, (.ctx [ctx$a_buffer] NEQ 0), 196);
+buf_start = .ctx [ctx$a_buffer] + .ctx [ctx$l_cur_byte] +
+		((.ctx [ctx$l_cur_block] - .ctx [ctx$l_buf_base_block]) * 512);
+buf_end = .ctx [ctx$a_buffer] +
+		((1 + .ctx [ctx$l_buf_high_block] - .ctx [ctx$l_buf_base_block]) * 512);
+
+$$show_context;
+
+! Get the routine address for this specific record format
+!
+$trace_print_fao ('record format !UL', .filb [filb$b_rec_format]);
+routn = (CASE .filb [filb$b_rec_format] FROM filb$k_rfmt_lobound TO filb$k_rfmt_hibound OF
+	SET
+	    [filb$k_rfmt_binary] :	pdp_get_binary;
+	    [filb$k_rfmt_fixed] :	pdp_get_fixed;
+	    [filb$k_rfmt_stream] :	pdp_get_stream;
+	    [INRANGE] :			$exch_signal_return (exch$_invrecfmt);
+	    [filb$k_rfmt_invalid,
+		OUTRANGE] :		BEGIN $logic_check (0, (false), 243); 0 END;
+	TES);
+
+! Now call the routine and return the status from it
+!
+RETURN jsb_get (.routn, .filb, .buf_start, .buf_end);
+
+END;
+
+GLOBAL ROUTINE pdp_get_binary (filb : $ref_bblock,	%SBTTL 'pdp_get_binary (filb, buf_start, buf_end)'
+				buf_start, buf_end) : jsb_get = 
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Return a pointer to the next formatted binary record in the file
+!
+! INPUTS:
+!
+!	filb      - pointer to filb for an open RT11 file
+!	buf_start - pointer to next byte in the buffer
+!	buf_end   - pointer to one past the end of buffer
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true if success, false if any error
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('pdp_get_binary> ');
+
+LOCAL
+    new_start,				! Pointer to look next time.
+    tmp,
+    status
+    ;
+
+BIND
+    ctx  = filb [filb$a_context]	: $ref_bblock,
+    volb = filb [filb$a_assoc_volb]	: $ref_bblock
+    ;
+
+$debug_print_lit ('entry');
+
+! Attempt to find a record in the current portion of the buffer
+!
+status = pdp_find_binary_record (.filb, .buf_start, .buf_end, new_start);
+
+! What did we see, what do we do
+!
+CASE .status FROM findbin$k_lobound TO findbin$k_hibound OF
+SET
+
+    ! Success, update our next record pointer and return true
+    !
+    [findbin$k_success, findbin$k_chksum] :
+
+		BEGIN
+		IF .status EQL findbin$k_chksum
+		THEN
+		    $exch_signal (exch$_binchksum, 2, .filb [filb$l_result_name_len], filb [filb$t_result_name]);
+
+		tmp = .new_start - .ctx [ctx$a_buffer];	! Save the updated position for the next get
+		ctx [ctx$l_cur_byte]  = .tmp MOD 512;
+		ctx [ctx$l_cur_block] = (.tmp / 512) + .ctx [ctx$l_buf_base_block];
+		RETURN true;					! Found a record
+		END;
+
+    ! Hit the end of the buffer with no record, determine if EOF or need to read more buffer
+    !
+    [findbin$k_eob] :
+
+		BEGIN
+
+		$trace_print_lit ('findbin$k_eob status');
+		$$show_context;
+
+		! If we are already at the eof block, then we have found EOF and can return
+		!
+		IF (.ctx [ctx$l_buf_high_block] GEQU .ctx [ctx$l_eof_block])
+		  AND
+		   (.ctx [ctx$l_eof_block] NEQ -1)
+		THEN
+		    status = false
+
+		! Otherwise, we can read in more data
+		!
+		ELSE
+		    BEGIN
+		    IF NOT (status = pdp_buffer_advance_read (.ctx))
+		    THEN
+			BEGIN
+			IF .status EQL exch$_stmrecfmt	! Means no room to read more blocks
+			THEN
+			    BEGIN
+			    status = exch$_binrecfmt;
+			    $exch_signal (.status, 2, .filb [filb$l_result_name_len], filb [filb$t_result_name]);
+			    END
+			ELSE
+			    RETURN .status;
+			END
+		    ELSE
+			RETURN exch$pdp_get (.filb);
+		    END;
+
+		END;
+
+    ! Found a badly formatted record
+    !
+    [findbin$k_bad_fmt] :
+		BEGIN
+		status = exch$_binrecfmt;
+		$exch_signal (.status, 2, .filb [filb$l_result_name_len], filb [filb$t_result_name]);
+		END;
+
+    [findbin$k_too_big] :
+
+		BEGIN
+		status = exch$_rectoobig;
+		$exch_signal (.status, 2, .filb [filb$l_result_name_len], filb [filb$t_result_name]);
+		END;
+
+    [INRANGE, OUTRANGE] :
+
+		$logic_check (0, (false), 244);
+
+TES;
+
+! Set the next record position to invalid, and return the error
+!
+ctx [ctx$l_cur_byte]  = 0;
+ctx [ctx$l_cur_block] = 0;
+
+$$show_context;
+$debug_print_lit ('returning status !XL', .status);
+
+RETURN .status;
+
+END;
+
+GLOBAL ROUTINE pdp_get_fixed (filb : $ref_bblock,	%SBTTL 'pdp_get_fixed (filb, buf_start, buf_end)'
+				buf_start, buf_end) : jsb_get =
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Return a pointer to the next fixed-length record in the file
+!
+! INPUTS:
+!
+!	filb      - pointer to filb for an open RT11 file
+!	buf_start - pointer to next byte in the buffer
+!	buf_end   - pointer to one past the end of buffer
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true if success, false if any error
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('pdp_get_fixed> ');
+
+REGISTER
+    five12,
+    rec_size
+    ;
+
+LOCAL
+    new_start,				! Pointer to look next time.
+    tmp,
+    status
+    ;
+
+BIND
+    ctx  = filb [filb$a_context]	: $ref_bblock,
+    volb = filb [filb$a_assoc_volb]	: $ref_bblock
+    ;
+
+$debug_print_lit ('entry');
+
+! Preset some registers for a bit more speed
+!
+five12 = 512;
+rec_size = .filb [filb$l_fixed_len];
+
+! Get a pointer to the start of the next record
+!
+new_start = .buf_start + .rec_size;
+
+! See if the next record is in the buffer, EOF or advance the buffer if it isn't
+!
+IF (.new_start - 1) GEQU .buf_end
+THEN
+    BEGIN
+
+    ! If the EOF block is in the buffer
+    !
+    IF (.ctx [ctx$l_buf_high_block] GEQU .ctx [ctx$l_eof_block])
+      AND
+       (.ctx [ctx$l_eof_block] NEQ -1)
+    THEN
+	BEGIN
+
+	! Set the next record position to invalid, and return false
+	!
+	ctx [ctx$l_cur_byte]  = 0;
+	ctx [ctx$l_cur_block] = 0;
+	RETURN false;
+	END
+
+    ! Otherwise, read some more data in and recursively retry the get
+    !
+    ELSE
+	BEGIN
+	IF NOT (status = pdp_buffer_advance_read (.ctx))
+	THEN
+	    RETURN .status;
+	RETURN exch$pdp_get (.filb);		! And then try it again
+	END;
+    END;
+
+$logic_check (2, ((.new_start - 1) LSSU .buf_end), 133);
+
+! Use locate mode - point the filb record info at the buffer
+!
+filb [filb$a_record] = .buf_start;
+filb [filb$l_record_len] = .rec_size;
+
+! Update the next record position
+!
+$logic_check (2, (.ctx [ctx$a_buffer] NEQ 0), 198);
+tmp = .new_start - .ctx [ctx$a_buffer];	! Save the updated position for the next get
+ctx [ctx$l_cur_byte]  = .tmp MOD .five12;
+ctx [ctx$l_cur_block] = (.tmp / .five12) + .ctx [ctx$l_buf_base_block];
+
+RETURN true;					! Found a record
+
+END;
+
+GLOBAL ROUTINE pdp_get_stream (filb : $ref_bblock,	%SBTTL 'pdp_get_stream (filb, buf_start, buf_end)'
+				buf_start, buf_end) : jsb_get =
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Return a pointer to the next stream record in the file
+!
+! INPUTS:
+!
+!	filb      - pointer to filb for an open RT11 file
+!	buf_start - pointer to next byte in the buffer
+!	buf_end   - pointer to one past the end of buffer
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true if success, false if any error
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('pdp_get_stream> ');
+
+LOCAL
+    new_start,				! Pointer to look next time.
+    find_stat,
+    status
+    ;
+
+BIND
+    ctx  = filb [filb$a_context]	: $ref_bblock,
+    volb = filb [filb$a_assoc_volb]	: $ref_bblock
+    ;
+
+$debug_print_lit ('entry');
+
+! Attempt to find a record in this portion of the buffer
+!
+find_stat = pdp_find_stream_record (.filb, .buf_start, .buf_end, new_start);
+
+! What did we see, what do we do
+!
+CASE .find_stat FROM findstm$k_lobound TO findstm$k_hibound OF
+SET
+
+    ! Success, update our next record pointer and return true
+    !
+    [findstm$k_success] :
+
+		BEGIN
+		LOCAL
+		    tmp;
+		tmp = .new_start - .ctx [ctx$a_buffer];	! Save the updated position for the next get
+		ctx [ctx$l_cur_byte]  = .tmp MOD 512;
+		ctx [ctx$l_cur_block] = (.tmp / 512) + .ctx [ctx$l_buf_base_block];
+		RETURN true;					! Found a record
+		END;
+
+    ! Found a control Z at the start of a record, done with this file
+    !
+    [findstm$k_ctrlz_eof] :
+
+		status = false;
+
+    ! Hit the end of the buffer with no record, determine if EOF or need to read more buffer
+    !
+    [findstm$k_eob] :
+
+		BEGIN
+
+		$trace_print_lit ('findstm$k_eob status');
+		$$show_context;
+
+		! If we are already at the eof block, then we have found EOF and can return
+		!
+		IF (.ctx [ctx$l_buf_high_block] GEQU .ctx [ctx$l_eof_block])
+		  AND
+		   (.ctx [ctx$l_eof_block] NEQ -1)
+		THEN
+		    status = false
+
+		! Otherwise, we can read in more data
+		!
+		ELSE
+		    BEGIN
+		    IF NOT (status = pdp_buffer_advance_read (.ctx))
+		    THEN
+			BEGIN
+			IF .status EQL exch$_stmrecfmt	! Means no room to read more blocks
+			THEN
+			    $exch_signal (.status, 2, .filb [filb$l_result_name_len], filb [filb$t_result_name])
+			ELSE
+			    RETURN .status;
+			END
+		    ELSE
+			RETURN exch$pdp_get (.filb);
+		    END;
+
+		END;
+
+    ! Hit the end of the buffer with some record, determine if can read more buffer or final record is missing term
+    !
+    [findstm$k_no_term] :
+
+		BEGIN
+
+		$trace_print_lit ('findstm$k_no_term status');
+		$$show_context;
+
+		! If we are already at the eof block, then the record reaches to the end of the block
+		!
+		IF (.ctx [ctx$l_buf_high_block] GEQU .ctx [ctx$l_eof_block])
+		  AND
+		   (.ctx [ctx$l_eof_block] NEQ -1)
+		THEN
+		    BEGIN
+		    LOCAL
+			tmp;
+		    tmp = .new_start - .ctx [ctx$a_buffer];	! Save the updated position for the next get
+		    ctx [ctx$l_cur_byte]  = .tmp MOD 512;
+		    ctx [ctx$l_cur_block] = (.tmp / 512) + .ctx [ctx$l_buf_base_block];
+		    RETURN true;					! Found a record
+		    END
+
+		! Otherwise, we can read in more data
+		!
+		ELSE
+		    BEGIN
+		    IF NOT (status = pdp_buffer_advance_read (.ctx))
+		    THEN
+			BEGIN
+			IF .status EQL exch$_stmrecfmt	! Means no room to read more blocks
+			THEN
+			    $exch_signal (.status, 2, .filb [filb$l_result_name_len], filb [filb$t_result_name])
+			ELSE
+			    RETURN .status;
+			END
+		    ELSE
+			RETURN exch$pdp_get (.filb);
+		    END;
+
+		END;
+
+    ! Found a badly formatted record
+    !
+    [findstm$k_bad_fmt] :
+
+		BEGIN
+		status = exch$_stmrecfmt;
+		$exch_signal (.status, 2, .filb [filb$l_result_name_len], filb [filb$t_result_name]);
+		END;
+
+    [INRANGE, OUTRANGE] :
+
+		$logic_check (0, (false), 245);
+
+TES;
+
+! Set the next record position to invalid, and return false
+!
+ctx [ctx$l_cur_byte]  = 0;
+ctx [ctx$l_cur_block] = 0;
+
+RETURN .status;
+
+END;
+
+GLOBAL ROUTINE exch$pdp_put =	%SBTTL 'exch$pdp_put'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Common dispatch for RT11-style put routines.  The main purpose of the extra dispatch is simplify the
+!	mechanism for optimizing i/o transfers to physical mode when possible (for example RT11 -> RT11 doesn't
+!	need record mode).
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	see the BIND expression
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	see the BIND expression
+!
+! ROUTINE VALUE:
+!
+!	value of format-specific put routine
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+$dbgtrc_prefix ('pdp_put> ');
+
+LOCAL
+    buf_start,
+    buf_end,
+    routn
+    ;
+
+BIND
+    copy = exch$a_gbl [excg$a_copy_work]: $ref_bblock,	! COPY verb work area
+    inp_filb = copy [copy$a_inp_filb]	: $ref_bblock,	! pointer to the input filb with the record info
+    out_filb = copy [copy$a_out_filb]	: $ref_bblock,	! pointer to filb for an open Files-11 output file
+    len  = inp_filb [filb$l_record_len],		! length of the record
+    buf  = inp_filb [filb$a_record],			! address of the record
+    ctx  = out_filb [filb$a_context]	: $ref_bblock,	! output file context block
+    volb = out_filb [filb$a_assoc_volb] : $ref_bblock	! output file volume block
+    ;
+
+$debug_print_fao ('entry, format=!UL, len=!UL, buf[0:19]="!AF"', .out_filb [filb$b_rec_format], .len, 20, .buf);
+
+$block_check (2, .inp_filb, filb, 466);
+$block_check (2, .out_filb, filb, 467);
+$check_call (1, pdp_check_ctx, .ctx, 537);		! $block_check (1, .ctx, (dos11ctx or rt11ctx), 537);
+$block_check (2, .volb, volb, 468);
+$logic_check (2, (.ctx [ctx$a_assoc_filb] EQL .out_filb), 168);
+$logic_check (2, (.ctx [ctx$a_assoc_volb] EQL .volb), 169);
+$logic_check (2, (IF .volb [volb$b_vol_format] EQL volb$k_vfmt_rt11 THEN (.ctx [ctx$l_cur_block] NEQ 0) ELSE 1), 176);
+$logic_check (2, (.len LEQU filb$s_record_buffer), 283);
+
+! Get pointers to the start of the next record position in the buffer, and to the end of the current buffer
+!
+$logic_check (2, (.ctx [ctx$a_buffer] NEQ 0), 200);
+buf_start = .ctx [ctx$a_buffer] + .ctx [ctx$l_cur_byte] +
+		((.ctx [ctx$l_cur_block] - .ctx [ctx$l_buf_base_block]) * 512);
+buf_end   = .ctx [ctx$a_buffer] +
+		((1 + .ctx [ctx$l_buf_high_block] - .ctx [ctx$l_buf_base_block]) * 512);
+
+! Get the address of the record format specific routine
+!
+$trace_print_fao ('record format !UL', .out_filb [filb$b_rec_format]);
+routn = (CASE .out_filb [filb$b_rec_format] FROM filb$k_rfmt_lobound TO filb$k_rfmt_hibound OF
+	SET
+	    [filb$k_rfmt_binary] :	pdp_put_binary;
+	    [filb$k_rfmt_fixed] :	pdp_put_fixed;
+	    [filb$k_rfmt_stream] :	pdp_put_stream;
+	    [INRANGE] :			$exch_signal_return (exch$_invrecfmt);
+	    [filb$k_rfmt_invalid,
+		OUTRANGE] :		BEGIN $logic_check (0, (false), 246); 0 END;
+	TES);
+
+! Now call that routine, returning the value of the routine
+!
+RETURN jsb_put (.routn, .buf_start, .buf_end, .ctx, .len, .buf);
+END;
+
+GLOBAL ROUTINE pdp_put_binary (buf_start, buf_end, ctx : $ref_bblock, len, buf) : jsb_put =	%SBTTL 'pdp_put_binary'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Add the next formatted binary record in the file
+!
+! INPUTS:
+!
+!	buf_start - Pointer to next byte in the buffer
+!	buf_end   - Pointer to one past the end of buffer
+!	ctx       - Output file context block
+!	len       - Length of the record to be put
+!	buf	  - Address of the record
+!
+! IMPLICIT INPUTS:
+!
+!	see the BIND expression
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	see the BIND expression
+!
+! ROUTINE VALUE:
+!
+!	true if success, false if any error
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('pdp_put_binary> ');
+
+REGISTER
+    next_rec,
+    tmp
+    ;
+
+BIND
+    copy = exch$a_gbl [excg$a_copy_work]: $ref_bblock,	! COPY verb work area
+    out_filb = copy [copy$a_out_filb]	: $ref_bblock	! pointer to filb for an open Files-11 output file
+    ;
+
+$debug_print_fao ('entry, len=!UL, buf[0:19]="!AF"', .len, 20, .buf);
+
+! Get a pointer to the start of the next record after this one
+!
+next_rec = .buf_start + .len + 5;		! <sentinel-word> <length-word> <record-data> <checksum-byte>
+
+! See if the next record will fit in the buffer, EOF or advance the buffer if it isn't
+!
+IF (.next_rec - 1) GEQU .buf_end
+THEN
+    RETURN pdp_buffer_check (.ctx, .out_filb);
+
+! Move the record to the buffer
+!
+pdp_copy_binary_record (.len, .buf, .buf_start);
+
+! Update the next record position and return
+!
+RETURN pdp_buffer_update (.ctx, .next_rec);
+
+END;
+
+GLOBAL ROUTINE pdp_put_fixed (buf_start, buf_end, ctx : $ref_bblock, len, buf) : jsb_put =	%SBTTL 'pdp_put_fixed'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+! INPUTS:
+!
+!	buf_start - Pointer to next byte in the buffer
+!	buf_end   - Pointer to one past the end of buffer
+!	ctx       - Output file context block
+!	len       - Length of the record to be put
+!	buf	  - Address of the record
+!
+! IMPLICIT INPUTS:
+!
+!	see the BIND expression
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	see the BIND expression
+!
+! ROUTINE VALUE:
+!
+!	true if success, false if any error
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('pdp_put_fixed> ');
+
+REGISTER
+    rec_size,
+    next_rec,				! Pointer to look next time.
+    tmp
+    ;
+
+BIND
+    copy = exch$a_gbl [excg$a_copy_work]: $ref_bblock,	! COPY verb work area
+    out_filb = copy [copy$a_out_filb]	: $ref_bblock	! pointer to filb for an open Files-11 output file
+    ;
+
+$debug_print_fao ('entry, len=!UL, buf[0:19]="!AF"', .len, 20, .buf);
+
+rec_size = .out_filb [filb$l_fixed_len];
+
+! Get a pointer to the start of the next record after this one
+!
+next_rec = .buf_start + .rec_size;
+
+! See if the next record will fit in the buffer, EOF or advance the buffer if it isn't
+!
+IF (.next_rec - 1) GEQU .buf_end
+THEN
+    RETURN pdp_buffer_check (.ctx, .out_filb);
+
+! Move the record to the buffer
+!
+CH$COPY (.len, .buf, .out_filb [filb$b_pad_char], .rec_size, .buf_start);
+
+! Update the next record position and return
+!
+RETURN pdp_buffer_update (.ctx, .next_rec);
+
+END;
+
+GLOBAL ROUTINE pdp_put_stream (buf_start, buf_end, ctx : $ref_bblock, len, buf) : jsb_put =	%SBTTL 'pdp_put_stream'
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Add the next stream record in the file
+!
+! INPUTS:
+!
+!	buf_start - Pointer to next byte in the buffer
+!	buf_end   - Pointer to one past the end of buffer
+!	ctx       - Output file context block
+!	len       - Length of the record to be put
+!	buf	  - Address of the record
+!
+! IMPLICIT INPUTS:
+!
+!	see the BIND expression
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	see the BIND expression
+!
+! ROUTINE VALUE:
+!
+!	true if success, false if any error
+!
+! SIDE EFFECTS:
+!
+!	error conditions will be signaled
+!--
+
+$dbgtrc_prefix ('pdp_put_stream> ');
+
+REGISTER
+    actual_len,
+    next_rec,
+    tmp
+    ;
+
+BIND
+    copy = exch$a_gbl [excg$a_copy_work]: $ref_bblock,	! COPY verb work area
+    out_filb = copy [copy$a_out_filb]	: $ref_bblock	! pointer to filb for an open Files-11 output file
+    ;
+
+$debug_print_fao ('entry, len=!UL, buf[0:19]="!AF"', .len, 20, .buf);
+
+! Get a pointer to the start of the next record after this one
+!
+next_rec = .buf_start + .len + 2;		! Assume record plus <CR><LF>
+
+! See if the next record will fit in the buffer, EOF or advance the buffer if it isn't
+!
+IF (.next_rec - 1) GEQU .buf_end
+THEN
+    RETURN pdp_buffer_check (.ctx, .out_filb);
+
+! Move the record to the buffer
+!
+actual_len = pdp_copy_stream_record (.len, .buf, .buf_start);
+
+! Update the next record position and return
+!
+RETURN pdp_buffer_update (.ctx, .buf_start + .actual_len);
+
+END;
+
+END
+ELUDOM

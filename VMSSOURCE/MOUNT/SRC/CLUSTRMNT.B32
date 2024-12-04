@@ -1,0 +1,1220 @@
+MODULE CLUSTRMNT (
+		LANGUAGE (BLISS32),
+		IDENT = 'V04-001'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  MOUNT Utility Structure Levels 1 & 2
+!
+! ABSTRACT:
+!
+!	This module contains routines used to verify mount consistency
+!	throughout a cluster.
+!
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Christian D. Saether	 CREATION DATE:  5-Aug-1983
+!
+! MODIFIED BY:
+!
+!	V04-001	HH0058		Hai Huang		13-Sep-1984
+!		Do not demote the device lock to CR mode in error path.
+!
+!	V03-010	HH0054		Hai Huang		30-Aug-1984
+!		Add another sanity check (count the number of device 
+!		locks) before making us the first mounter.
+!
+!	V03-009	HH0053		Hai Huang		29-Aug-1984
+! 		Clear the device context and make us the first mounter 
+!		if the device lock value block and the volume lock value 
+!		block are inconsistent.
+!
+!	V03-008	HH0045		Hai Huang		10-Aug-1984
+!		Take out the volume lock for shared foreign mounts.
+!
+!	V03-007	HH0042		Hai Huang		27-Jul-1984
+!		Define variables so GLOBAL storage can be cleared during 
+!		run time.		
+!
+!	V03-006	HH0041		Hai Huang		24-Jul-1984
+!		Remove REQUIRE 'LIBD$:[VMSLIB.OBJ]MOUNTMSG.B32'.
+!	
+!	V03-005	CDS0003		Christian D. Saether	11-Jul-1984
+!		Restore zealous checks on /WRITE, but remove
+!		them for /QUOTA until the day the DISKQUOTA utility
+!		plays correctly with it.
+!
+!	V03-004	HH0026		Hai Huang		25-Jun-1984
+!		Remove overzealous consistency check on the /[NO]WRITE
+!		option.
+!
+!	V03-003	HH0015		Hai Huang		20-Apr-1984
+!		Fix various problems caused by getting generic mount
+!		to work.
+!
+!	V03-002	CDS0002		Christian D. Saether	 1-Feb-1984
+!		Modify interlock checks to allow multiple writers
+!		if mounted /foreign.
+!		Add routine headers (comments).
+!
+!	V03-001	CDS0001		Christian D. Saether	 6-Dec-1983
+!		Set VCB$V_NOSHARE flag to signal lock are taken
+!		in non-shared namespace.
+!
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:MOUDEF.B32';
+
+OWN
+	LCKCNT_ITM	: BBLOCK [12 + 4] INITIAL (
+			WORD (4),
+			WORD (LKI$_LCKCOUNT),
+			LONG (0),
+			LONG (0),
+			LONG (0));
+
+!
+! Note: The following global storage area for various locks is cleared by 
+! VMOUNT during run time.
+!
+GLOBAL
+	LCK_GLOBAL_START: VECTOR [0],		! Mark start of global storage.	
+	DEVLCK_UCB	: REF BBLOCK,		! UCB of device lock.
+	DEVLCK_STS	: VECTOR [2, WORD],	! This MUST precede DEVLCK_LKID.
+	DEVLCK_LKID,				! This MUST follow DEVLCK_STS.
+	DEV_CTX		: BBLOCK [16] FIELD (DC),
+						! This MUST follow DEVLCK_LKID.
+	VOLOCK_STS	: VECTOR [2, WORD],	! This MUST precede VOLOCK_ID.
+	VOLOCK_ID,				! This MUST follow VOLOCK_STS.
+	VOL_CTX		: BBLOCK [16] FIELD (VC),! This MUST follow VOLOCK_ID.
+
+	VOLOCK_COUNT,				! Count of volume locks.
+
+	VLSETLCK_STS	: VECTOR [2, WORD],	! This MUST precede VLSETLCK_ID.
+	VLSETLCK_ID,				! This MUST follow VLSETLCK_STS.
+	VLSETLCK_CTX	: BBLOCK [16] FIELD (VC), ! MUST follow VLSETLCK_ID.
+	LCK_GLOBAL_END	: VECTOR [0];		! Mark end of global storage.
+
+
+GLOBAL ROUTINE GET_DEVICE_CONTEXT =
+
+!++
+!
+! Functional description:
+!
+! This routine initializes mount context relevant to the device and
+! volume locks.  It then acquires the device lock value block, if
+! it exists, which contains mount context for that device, if it is
+! mounted already.
+!
+! This also interlocks the MOUNT service with the final dismounting
+! functions performed by the file system.
+!
+! This routine must be called in kernel mode.
+!
+! Calling sequence:
+!
+!	GET_DEVICE_CONTEXT ()
+!
+! Input parameters:
+!
+!	NONE
+!
+! Implicit inputs:
+!
+!	CHANNEL - Channel on which volume is being mounted.
+!
+! Implicit outputs:
+!
+!	DEV_CTX [DC_FLAGS] - set to zero if first mounter, else contains
+!			     the value of pre-existing mounts.
+!	VOLOCK_ID	- zeroed
+!	VLSETLCK_ID	- zeroed
+!	DEVLCK_LKID	- zero if no device lock, else lockid of device lock
+!	DEVLCK_UCB	- address of UCB of input CHANNEL
+!
+! Routine value:
+!
+!	Success if no device lock, or if device allocated.
+!	Else status of $ENQW, with SS$_VALNOTVALID converted to success.
+!
+! Side effects:
+!
+!	A system owned shared mode device lock (LCK$K_CRMODE) will be
+!	converted to a process owned LCK$K_PWMODE lock.  This must
+!	be converted back before the MOUNT service completes.
+!
+!--
+
+BEGIN
+
+LOCAL
+	STATUS,
+	STSBLK		: VECTOR [4, WORD];
+
+EXTERNAL
+	CHANNEL;
+
+EXTERNAL ROUTINE
+	GET_CHANNELUCB;
+
+!
+! Mount now directly calls the IOC$SEARCH routine, which returns the
+! lock value block of the device lock. Thus the device lock context
+! should not be unconditionally cleared.
+!
+! DEV_CTX [DC_FLAGS] = 0;
+!
+
+VOLOCK_ID = 0;
+VLSETLCK_ID = 0;
+DEVLCK_LKID = 0;
+
+DEVLCK_UCB = GET_CHANNELUCB (.CHANNEL);
+
+IF (DEVLCK_LKID = .DEVLCK_UCB [UCB$L_LOCKID]) EQL 0
+THEN
+    RETURN 1;
+
+! If the PID field in the ucb is non-zero, then the device is allocated
+! to this process, therefore this is by definition the first mounter
+! on this device.  Because the lock is already held in EX mode, we
+! simply return now and it will be written later.
+!
+
+IF .DEVLCK_UCB [UCB$L_PID] NEQ 0
+THEN
+    RETURN 1;
+
+! Get the device lock in PW mode.  This both gets the current contents
+! of the value block, and gets it in a mode from which it can be written
+! later.
+! This is also necessary to interlock with the file system completing
+! the last dismount on a device.  In that case, the CHECK_DISMOUNT
+! routine in the file system will want to clear the value block to
+! remove the mount context information.  It must do this because the
+! device lock itself does not disappear until the last channel is
+! deassigned, and the mount context in the device lock value block
+! must be cleared when the last dismount occurs.
+!
+
+STATUS = $ENQW (LKMODE = LCK$K_PWMODE,
+		LKSB = DEVLCK_STS,
+		EFN = MOUNT_EFN,
+		FLAGS = LCK$M_CONVERT + LCK$M_SYNCSTS + LCK$M_VALBLK
+			+ LCK$M_NOQUOTA);
+
+IF NOT .STATUS
+THEN
+    RETURN .STATUS;
+
+IF (STATUS = .DEVLCK_STS [0])
+THEN
+    RETURN .STATUS;
+
+IF .STATUS<0,16> EQL SS$_VALNOTVALID
+THEN
+    STATUS = 1;
+
+.STATUS
+
+END;		! of routine GET_DEVICE_CONTEXT
+
+
+GLOBAL ROUTINE CHECK_CLUSTER_SANITY : NOVALUE =
+
+!++
+!
+! Functional description:
+!
+! This routine enforces consistency between the current mount
+! request and mounts that have already been executed for this
+! device on other nodes in the cluster.  It does so by comparing
+! information from this request with the value block of the
+! device lock (DEV_CTX) and signalling the appropriate error
+! if they are inconsistent.
+!
+! Input parameters:
+!	NONE
+!
+! Implicit inputs:
+!
+!	MOUNT_OPTIONS - bitvector
+!		OPT_FOREIGN
+!		OPT_WRITE
+!		OPT_GROUP
+!		OPT_SYSTEM
+!		OPT_NOQUOTA
+!		OPT_PROTECTION
+!		OPT_OWNER_UIC
+!	DEV_CTX - device lock value block
+!		DC_FOREIGN
+!		DC_NOINTERLOCK
+!		DC_GROUP
+!		DC_SYSTEM
+!		DC_WRITE
+!		DC_NOQUOTA
+!		DC_OVR_PROT
+!		DC_PROTECTION
+!		DC_OVR_OWNUIC
+!		DC_OWNER_UIC
+!	PROTECTION - desired protection mask for volume
+!	OWNER_UIC - owner UIC of volume
+!	STORED_CONTEXT - bitvector
+!		XQP - this is an XQP (as opposed to ACP)
+!
+! Output parameters:
+!	NONE
+!
+! Routine value:
+!	NONE
+!
+! Side effects:
+!	Signals an error condition if parameters inconsistent with
+!	pre-existing mount of this device on another node.
+!
+!--
+
+BEGIN
+
+EXTERNAL
+	MOUNT_OPTIONS	: BITVECTOR,
+	STORED_CONTEXT	: BITVECTOR,
+	PROTECTION	: WORD,
+	OWNER_UIC;
+
+LOCAL
+	STATUS,
+	DESC	: INITIAL (0);
+
+LABEL
+	TESTS;
+
+TESTS:
+BEGIN
+
+! Everyone mounts /foreign or no one mounts /foreign.
+!
+
+IF .DEV_CTX [DC_FOREIGN] NEQ .MOUNT_OPTIONS [OPT_FOREIGN]
+THEN
+    BEGIN
+    DESC = (IF .DEV_CTX [DC_FOREIGN]
+		THEN DESCRIPTOR ('/FOREIGN')
+		ELSE DESCRIPTOR ('/NOFOREIGN'));
+    STATUS = MOUN$_INCONFOR;
+    LEAVE TESTS
+    END;
+
+! NOINTERLOCK means it is not mounted with an xqp, and hence
+! does not synchronize access to the volume.  If an ACP is used,
+! only one writer is allowed.  If mounted foreign, multiple writers
+! are allowed (you're on your own).  If mounted with the xqp anywhere,
+! (not NOINTERLOCK), it must be mounted with the xqp everywhere (this
+! is only possible with the /proc=f11bacp switch, and f11bacp is
+! already gone as of field test 1).
+!
+
+IF (.DEV_CTX [DC_NOINTERLOCK]
+	AND (.MOUNT_OPTIONS [OPT_WRITE] AND .DEV_CTX [DC_WRITE])
+	AND NOT .MOUNT_OPTIONS [OPT_FOREIGN])
+    OR (NOT .DEV_CTX [DC_NOINTERLOCK] AND NOT .STORED_CONTEXT [XQP])
+THEN
+    BEGIN
+    STATUS = MOUN$_INCOMPACP;
+    LEAVE TESTS
+    END;
+
+! If this is not an xqp, it is an ods-1 volume, and the remaining
+! checks are not relevant.
+!
+
+IF NOT .STORED_CONTEXT [XQP]
+THEN
+    RETURN;
+
+IF .DEV_CTX [DC_GROUP] NEQ .MOUNT_OPTIONS [OPT_GROUP]
+	OR .DEV_CTX [DC_SYSTEM] NEQ .MOUNT_OPTIONS [OPT_SYSTEM]
+THEN
+    BEGIN
+    DESC = (IF .DEV_CTX [DC_GROUP]
+		THEN DESCRIPTOR ('/GROUP')
+		ELSE IF .DEV_CTX [DC_SYSTEM]
+		THEN DESCRIPTOR ('/SYSTEM')
+		ELSE DESCRIPTOR ('/SHARE'));
+    STATUS = MOUN$_INCONSHR;
+    LEAVE TESTS
+    END;
+
+!
+! Ironically, the following consistency check caused mount to be 
+! inconsistent with respect treatment of a physically write-locked disk.  
+! When mounting a write-locked disk cluster-wide without the /NOWRITE 
+! qualifier, the first node to attempt the mount succeeds with a warning 
+! that the device is write-locked. Subsequent nodes will fail with the 
+! "Inconsistent /WRITE option, cluster mounted /NOWRITE" error.  For this 
+! reason, we remove this overzealous consistency check.
+! 
+! The call to this routine in MOUNT_DISK2 has been moved to beyond the
+! point where we have determined whether the disk is physically writeable
+! or not.  This eliminates the problem discussed above, so the check
+! goes back in until we can figure out why it makes sense to allow
+! a mix of /write and /nowrite.
+
+IF .DEV_CTX [DC_WRITE] NEQ .MOUNT_OPTIONS [OPT_WRITE]
+THEN
+    BEGIN
+    DESC = (IF .DEV_CTX [DC_WRITE]
+		THEN DESCRIPTOR ('/WRITE')
+		ELSE DESCRIPTOR ('/NOWRITE'));
+    STATUS = MOUN$_INCONWRITE;
+    LEAVE TESTS
+    END;
+
+! As of field test 1, this check is incomplete in that the
+! DISKQUOTA utility can modify whether quotas are enabled or
+! not, and does not respect or modify this device lock value block flag.
+!
+! So lets take the check out until we know how to do it right.
+!
+
+!IF .DEV_CTX [DC_NOQUOTA] NEQ .MOUNT_OPTIONS [OPT_NOQUOTA]
+!THEN
+!    BEGIN
+!    DESC = (IF .DEV_CTX [DC_NOQUOTA]
+!		THEN DESCRIPTOR ('/NOQUOTA')
+!		ELSE DESCRIPTOR ('/QUOTA'));
+!    STATUS = MOUN$_INCONQUOTA;
+!    LEAVE TESTS
+!    END;
+
+IF .DEV_CTX [DC_OVR_PROT] NEQ .MOUNT_OPTIONS [OPT_PROTECTION]
+    OR (.DEV_CTX [DC_PROTECTION] NEQ .PROTECTION)
+THEN
+    BEGIN
+    STATUS = MOUN$_INCONPROT;
+    LEAVE TESTS
+    END;
+
+IF .DEV_CTX [DC_OVR_OWNUIC] NEQ .MOUNT_OPTIONS [OPT_OWNER_UIC]
+    OR (.DEV_CTX [DC_OWNER_UIC] NEQ .OWNER_UIC)
+THEN
+    BEGIN
+    STATUS = MOUN$_INCONOWNER;
+    LEAVE TESTS
+    END;
+
+! Passed all the consistency tests.
+! Return.
+!
+
+RETURN;
+END;			! of block TESTS
+
+! If here, there was a problem.  Signal the error.
+!
+
+IF .DESC EQL 0
+THEN
+    BEGIN
+    ERR_EXIT (.STATUS);
+    RETURN
+    END
+ELSE
+    BEGIN
+    ERR_EXIT (.STATUS, 2, .(.DESC)<0,16>, .(.DESC + 4));
+    RETURN
+    END;
+
+END;			! of shared mount cluster consistency checks.
+
+
+GLOBAL ROUTINE STORE_CONTEXT : NOVALUE =
+
+!++
+!
+! Functional description:
+!
+! This routine stores the various value block contexts by converting
+! the volume, volume set (if present), and device locks to their
+! system owned, compatible modes.  The order is which the locks are
+! released is important because the mount kernel mode handler needs
+! to know how to clean up if anything goes wrong.
+!
+! Volume and volume set locks may not be present if this volume
+! is serviced with an acp (ods-1, or /proc=f11bacp).  The device
+! lock may not be present if the device is not cluster accessible.
+!
+! This routine is called in kernel mode.
+!
+! Input parameters:
+!	NONE
+!
+! Implicit inputs:
+!
+!	VOLOCK_ID - nonzero if a volume lock is present
+!	VOL_CTX - volume context (value block), all of it
+!		specifically referenced in this routine -
+!		VC_NOTFIRST_MNT - clear if this is the first mounter
+!	VLSETLCK_ID - nonzero if a volume set lock is present
+!	VLSETLCK_CTX - volume set context (value block), all of it
+!		specifically referenced in this routine -
+!		VC_NOTFIRST_MNT - clear if this is the first mounter
+!	DEVLCK_LKID - nonzero if device lock is present
+!	DEV_CTX - device lock value block (mount context)
+!		DC_NOTFIRST_MNT - clear if this is the first mounter
+!	STORED_CONTEXT - bitvector
+!		XQP - set if this is an XQP
+!	MOUNT_OPTIONS - bitvector
+!		OPT_FOREIGN
+!		OPT_WRITE
+!		OPT_GROUP
+!		OPT_SYSTEM
+!		OPT_NOQUOTA
+!		OPT_PROTECTION
+!		OPT_OWNER_UIC
+!	PROTECTION - protection mask applied to the volume
+!	OWNER_UIC - owner UIC of the volume
+!
+! Output parameters:
+!	NONE
+!
+! Implicit outputs:
+!
+!	VOLOCK_ID - zeroed if all locks successfully converted
+!	VLSETLCK_ID - zeroed if all locks successfully converted
+!	DEVLCK_LKID - zeroed if all locks successfully converted
+!	REAL_RVT [RVT$L_STRUCLKID] - lock ID of volume set lock
+!	VOL_CTX [VC_NOTFIRST_MNT] - set to 1
+!	DEV_CTX [DC_NOTFIRST_MNT] - set to 1
+!	DEV_CTX - following fields are set as appropriate if first mounter
+!		DC_FOREIGN
+!		DC_WRITE
+!		DC_GROUP
+!		DC_SYSTEM
+!		DC_NOQUOTA
+!		DC_OVR_PROT
+!		DC_PROTECTION
+!		DC_OVR_OWNUIC
+!		DC_OWNER_UIC
+!		DC_NOINTERLOCK
+!	VOLOCK_STS - lock status block for volume lock
+!	VLSETLCK_STS - lock status lock for volume set lock
+!	DEVLCK_STS - lock status block for device lock
+!
+! Routine value:
+!	NONE
+!
+! Side effects:
+!
+!	All process locks are left in their mounted, system owned state
+!	if successful.  A full dismount must be done to undo after this.
+!	Errors are signalled and the kernel mode handler will undo
+!	already converted locks as necessary.
+!
+!--
+
+BEGIN
+
+BUILTIN
+	TESTBITCS;
+
+EXTERNAL
+	MOUNT_OPTIONS	: BITVECTOR,
+	REAL_RVT	: REF BBLOCK,
+	STORED_CONTEXT	: BITVECTOR,
+	PROTO_VCB	: BBLOCK,
+	PROTECTION,
+	OWNER_UIC;
+
+LOCAL
+	STATUS;
+
+! Convert the volume lock, if present, to system owned and store the
+! value block.  If this is the first mounter, relevant context
+! in the value block (e.g., volume free space) has already been
+! set up in the value block being stored.
+!
+
+IF .VOLOCK_ID NEQ 0
+THEN
+    BEGIN
+
+    VOL_CTX [VC_NOTFIRST_MNT] = 1;
+
+    STATUS = $ENQW (LKMODE = LCK$K_CRMODE,
+		    LKSB = VOLOCK_STS,
+		    EFN = MOUNT_EFN,
+		    FLAGS = LCK$M_VALBLK + LCK$M_CONVERT + LCK$M_SYNCSTS
+			+ LCK$M_CVTSYS + LCK$M_NOQUOTA + LCK$M_NOQUEUE);
+
+    IF NOT .STATUS
+    THEN
+	BEGIN
+	ERR_EXIT (.STATUS);
+	RETURN
+	END;
+
+    IF NOT (STATUS = .VOLOCK_STS [0])
+    THEN
+	BEGIN
+	ERR_EXIT (.STATUS);
+	RETURN
+	END;
+
+    END;
+
+! If this is a volume set, convert the volume set lock to system owned
+! and store the value block.
+!
+
+IF .VLSETLCK_ID NEQ 0
+THEN
+    BEGIN
+
+    VLSETLCK_CTX [VC_NOTFIRST_MNT] = 1;
+
+    STATUS = $ENQW (LKMODE = LCK$K_NLMODE,
+		EFN = MOUNT_EFN,
+		LKSB = VLSETLCK_STS,
+		FLAGS = LCK$M_CONVERT + LCK$M_CVTSYS + LCK$M_SYNCSTS
+			+ LCK$M_NOQUOTA + LCK$M_NOQUEUE + LCK$M_VALBLK);
+
+    IF NOT .STATUS
+    THEN
+	BEGIN
+	ERR_EXIT (.STATUS);
+	RETURN
+	END;
+
+    IF NOT (STATUS = .VLSETLCK_STS [0])
+    THEN
+	BEGIN
+	ERR_EXIT (.STATUS);
+	RETURN
+	END;
+
+! This is the only case where we are storing a lock ID in the real structure
+! before all lock conversions are complete.  The kernel mode handler knows
+! how to undo this if the device lock conversion fails.
+!
+
+    REAL_RVT [RVT$L_STRUCLKID] = .VLSETLCK_ID;
+
+    END;
+
+! If there is no device lock, we are done.
+!
+
+IF .DEVLCK_LKID EQL 0
+THEN
+    BEGIN
+    VOLOCK_ID = 0;
+    VLSETLCK_ID = 0;
+    RETURN
+    END;
+
+IF TESTBITCS (DEV_CTX [DC_NOTFIRST_MNT])
+THEN
+    BEGIN
+
+! This is the first mounter of this device, so set up appropriate context
+! in the value block.
+!
+
+    IF .MOUNT_OPTIONS [OPT_FOREIGN]
+    THEN
+	DEV_CTX [DC_FOREIGN] = 1;
+
+    IF .MOUNT_OPTIONS [OPT_WRITE]
+    THEN
+	DEV_CTX [DC_WRITE] = 1;
+
+    IF .MOUNT_OPTIONS [OPT_GROUP]
+    THEN
+	DEV_CTX [DC_GROUP] = 1;
+
+    IF .MOUNT_OPTIONS [OPT_SYSTEM]
+    THEN
+	DEV_CTX [DC_SYSTEM] = 1;
+
+    IF .MOUNT_OPTIONS [OPT_NOQUOTA]
+    THEN
+	DEV_CTX [DC_NOQUOTA] = 1;
+
+    IF .MOUNT_OPTIONS [OPT_PROTECTION]
+    THEN
+	BEGIN
+	DEV_CTX [DC_OVR_PROT] = 1;
+	DEV_CTX [DC_PROTECTION] = .PROTECTION;
+	END;
+
+    IF .MOUNT_OPTIONS [OPT_OWNER_UIC]
+    THEN
+	BEGIN
+	DEV_CTX [DC_OVR_OWNUIC] = 1;
+	DEV_CTX [DC_OWNER_UIC] = .OWNER_UIC;
+	END;
+
+    IF NOT .STORED_CONTEXT [XQP]
+    THEN
+	DEV_CTX [DC_NOINTERLOCK] = 1;
+
+    END;
+
+! Always store value block.  If this isn't the first mounter, this
+! simply rewrites the value block recovered.  This will clear any
+! value block not valid conditions as a result of node failures
+! in the cluster.
+!
+
+STATUS = $ENQW (LKMODE = IF NOT .MOUNT_OPTIONS [OPT_NOSHARE]
+			 THEN LCK$K_CRMODE
+			 ELSE LCK$K_EXMODE,
+		LKSB = DEVLCK_STS,
+		EFN = MOUNT_EFN,
+		FLAGS = LCK$M_CONVERT + LCK$M_CVTSYS + LCK$M_VALBLK
+			+ LCK$M_SYNCSTS + LCK$M_NOQUOTA);
+
+IF NOT .STATUS
+THEN
+    BEGIN
+    ERR_EXIT (.STATUS);
+    RETURN
+    END;
+
+IF (STATUS = .DEVLCK_STS [0])
+THEN
+    BEGIN
+    DEVLCK_LKID = 0;
+    VOLOCK_ID = 0;
+    VLSETLCK_ID = 0;
+    END
+ELSE
+    BEGIN
+    ERR_EXIT (.STATUS);
+    RETURN
+    END;
+
+END;			! of routine store_context
+
+GLOBAL ROUTINE GET_VOLUME_LOCK_NAME : NOVALUE =
+
+!++
+!
+! Functional description:
+!
+! This routine generates and stores the resource name used for the
+! volume (allocation) lock in the VCB.
+!
+! Input parameters:
+!	NONE
+!
+! Implicit inputs:
+!
+!	MOUNT_OPTIONS [OPT_NOSHARE] - set if not a shared mount
+!	SCS$GB_NODENAME - unique 8 byte node identifier
+!	DEVLCK_UCB - address of UCB (of device being mounted)
+!	DEV_CTX [DC_NOTFIRST_MNT] - set if not the first mounter
+!	DEV_CTX [DC_WRITE] - set if volume mounted for write access
+!	PROTO_VCB [VCB$T_VOLNAME] - volume label
+!	BUFFER [SCB$T_VOLOCKNAME] - lock name for already mounted disk
+!
+! Output parameters:
+!	NONE
+!
+! Implicit outputs:
+!
+!	PROTO_VCB [VCB$T_VOLCKNAM]
+!	PROTO_VCB [VCB$V_NOSHARE] - set if non-shared mount
+!
+! Routine value:
+!	NONE
+!
+! Side effects:
+!	NONE
+!
+!--
+
+BEGIN
+
+EXTERNAL
+	BUFFER			: BBLOCK,
+	MOUNT_OPTIONS		: BITVECTOR,
+	PROTO_VCB		: BBLOCK,
+	SCS$GB_NODENAME		: ADDRESSING_MODE (GENERAL);
+
+! If this is a non-shared mount, the resource name is a unique
+! node identifier plus a unique device identifier.
+!
+
+IF .MOUNT_OPTIONS [OPT_NOSHARE]
+THEN
+    BEGIN
+    CH$MOVE (8, SCS$GB_NODENAME, PROTO_VCB [VCB$T_VOLCKNAM]);
+    (PROTO_VCB [VCB$T_VOLCKNAM] + 8) = .DEVLCK_UCB;
+    PROTO_VCB [VCB$V_NOSHARE] = 1;
+    END
+
+! For shared mounts, the resource name is the volume label. Because 
+! volume labels may change after the volume is mounted, the first
+! mounter will write back the volume label used into the VOLOCKNAME
+! field in the SCB, which is where non-first mounters get it from.
+! Other checks being made guarantee that this name is unique throughout
+! the cluster.
+!
+
+ELSE
+    IF .DEV_CTX [DC_NOTFIRST_MNT] AND .DEV_CTX [DC_WRITE]
+    AND NOT .MOUNT_OPTIONS [OPT_FOREIGN]
+    THEN
+	CH$MOVE (12, BUFFER [SCB$T_VOLOCKNAME], PROTO_VCB [VCB$T_VOLCKNAM])
+    ELSE
+	CH$MOVE (12, PROTO_VCB [VCB$T_VOLNAME], PROTO_VCB [VCB$T_VOLCKNAM]);
+
+END;
+
+GLOBAL ROUTINE GET_VOLUME_LOCK =
+
+!++
+!
+! Functional description:
+!
+! This routine acquires the volume allocation lock in PW mode.
+! This is necessary to allow the value block to be written.
+! If this is a non-shared mount, the system lock will be used
+! as a parent to cause the lock to be mastered locally without
+! any cluster message traffic from the lock manager.
+!
+! It also performs a $GETLKIW function on the volume allocation
+! lock to determine the number of locks granted on that resource.
+! This is used later to determine whether a rebuild is necessary
+! on the volume after it is mounted.
+!
+! This routine is called in kernel mode.
+!
+! Input parameters:
+!	NONE
+!
+! Implicit inputs:
+!
+!	PROTO_VCB [VCB$V_NOSHARE] - set if nonshared mount
+!	PROTO_VCB [VCB$T_VOLCKNAM] - resource name string
+!	EXE$GL_SYSID_LOCK - lock ID of system lock
+!
+! Output parameters:
+!	NONE
+!
+! Implicit outputs:
+!
+!	VOLOCK_STS - status of ENQ request on volume allocation lock
+!	PROTO_VCB [VCB$L_VOLLKID] - lock id of volume allocation lock
+!	VOLOCK_CNT - count of granted locks on volume allocation lock
+!
+! Routine value:
+!
+!	success if no errors or VALNOTVALID on volume lock request,
+!	else error status from failing service.
+!
+! Side effects:
+!
+!	PW mode lock held on volume allocation lock.
+!	
+!--
+
+BEGIN
+
+EXTERNAL
+	PROTO_VCB		: BBLOCK,
+	EXE$GL_SYSID_LOCK	: ADDRESSING_MODE (GENERAL),
+	MOUNT_OPTIONS		: BITVECTOR,
+	PHYS_NAME		: VECTOR,		! Decriptor for physical device
+	DEVICE_INDEX		: VECTOR;		! index into PHYS_NAME vector
+
+LOCAL
+	LOCKNAME	: VECTOR [70,BYTE],		
+	RESNAM_D	: VECTOR [2] INITIAL (LONG (18), LONG (LOCKNAME)),
+	PARENT_ID,
+	STATUS,
+	K,
+	STSBLK		: VECTOR [4, WORD];
+
+MAP
+	PHYS_NAME	: BBLOCKVECTOR [DEVMAX,8];
+
+!
+! Define descriptor vector offsets.
+!
+MACRO	LEN	= 0,0,32,0%;
+MACRO	ADDR	= 4,0,32,0%;	
+
+PARENT_ID = 0;
+
+IF .PROTO_VCB [VCB$V_NOSHARE]
+THEN
+    PARENT_ID = .EXE$GL_SYSID_LOCK;
+
+(LOCKNAME [0])<0,32> = 'F11B';
+(LOCKNAME [4])<0,16> = '$v';
+
+DECR K FROM 2 TO 1 DO					
+
+BEGIN
+
+!
+! The resource name of the volume lock is derived in two ways:
+!
+!   1.  Mounted Files-11, use the lock name in the VCB (as set up by 
+!	the GET_VOLUME_LOCK_NAME routine). Resource name isof fixed 
+!	length (18 bytes, volume label with trailing blanks).
+!
+!   2.  Mounted foreign, use the full device name, e.g.
+!	F11B$v_allocdevnam. Resouce name is of variable length.
+!
+
+IF NOT .MOUNT_OPTIONS [OPT_FOREIGN]
+THEN
+    CH$MOVE (12, PROTO_VCB [VCB$T_VOLCKNAM], LOCKNAME [6])
+ELSE
+    BEGIN
+    CH$MOVE ( .PHYS_NAME [.DEVICE_INDEX,LEN],		! Length of device name 
+	      .PHYS_NAME [.DEVICE_INDEX,ADDR],		! Addres of device string 
+	      LOCKNAME [6] );				! Resource name buffer 
+    RESNAM_D [0] = .PHYS_NAME [.DEVICE_INDEX,LEN]+6;	! Calculate length of resource name
+    END;
+
+STATUS = $ENQW	(LKMODE = LCK$K_PWMODE,
+		EFN = MOUNT_EFN,
+		ACMODE = PSL$C_KERNEL,
+		LKSB = VOLOCK_STS,
+		FLAGS = LCK$M_VALBLK + LCK$M_SYSTEM + LCK$M_NOQUOTA
+			+ LCK$M_SYNCSTS,
+		PARID = .PARENT_ID,
+		RESNAM = RESNAM_D);
+
+IF NOT .STATUS
+THEN
+    RETURN .STATUS;
+
+STATUS = .VOLOCK_STS [0];
+
+IF NOT .STATUS
+    AND .STATUS<0,16> NEQ SS$_VALNOTVALID
+THEN
+    RETURN .STATUS;
+
+PROTO_VCB [VCB$L_VOLLKID] = .VOLOCK_ID;
+
+LCKCNT_ITM [4,0,32,0] = VOLOCK_COUNT;
+
+STATUS = $GETLKIW (EFN = MOUNT_EFN,
+		    LKIDADR = VOLOCK_ID,
+		    ITMLST = LCKCNT_ITM,
+		    IOSB = STSBLK);
+
+IF NOT .STATUS
+THEN
+    RETURN .STATUS;
+
+!
+! The device lock value block was read by IOC$SEARCH or routine GET_DEVICE_CONTEXT.
+! We just read the the volume lock value block. The following matrix represents
+! the possible states of these two value blocks:
+!
+!	DEV_CTX [DC_NOTFIRST_MNT]	VOL_CTX [VC_NOTFIRST_MNT]
+!  (a)		0				0
+!  (b)		0				1
+!  (c)		1				0
+!  (d)		1				1
+!
+! Cases (a) and (d) are valid (and therefore not interesting).
+!
+! Case  (b) shows that we are the first mounter on this device, yet the 
+!	    volume lock already exists. This implies that another volume
+!	    with the same label is already mounted. This error condition 
+!	    will be detected later on.
+!
+! Case  (c) If the device lock has a count of 1, this shows that 
+!	    when we first read the device context, there was another
+!	    mounter. However, by the time we read the volume context,
+!	    this mounter has disappeared. Since MOUNTs and DISMOUNTs 
+!	    are interlocked with the device lock, the mounter couldn't
+!	    have properly dismounted the volume. The only possibility is
+!	    that the node that originally mounted this volume had crashed
+!	    within this window.  In this case, clear the device context
+!	    block and make us the first mounter. Release the volume lock,
+!	    derive the volume lock name and try again.
+!	
+!	    Otherwise, this scenario would lead to a "VOLALRMNT" error 
+!	    as in case (b) above. 
+!
+!	    Note that we're only doing this for shared mounts. 
+!
+
+IF  ( .DEV_CTX [DC_NOTFIRST_MNT] )			
+AND ( NOT .VOL_CTX [VC_NOTFIRST_MNT] )
+AND ( NOT .MOUNT_OPTIONS [OPT_NOSHARE] )
+THEN
+    BEGIN
+    LOCAL
+	DEVLCK_COUNT,				! Device lock count
+	DEVLCK_ITM	: BBLOCK [12+4] INITIAL
+			 (WORD (4),
+			  WORD (LKI$_LCKCOUNT),
+			  LONG (DEVLCK_COUNT),
+			  LONG (0),
+			  LONG (0)),
+ 	DEVLCK_IOSB	: VECTOR [4,WORD];
+
+    STATUS = $GETLKIW ( EFN 	= MOUNT_EFN,	! Get number of device locks
+			LKIDADR = DEVLCK_LKID,
+			ITMLST  = DEVLCK_ITM,
+			IOSB 	= DEVLCK_IOSB );	
+
+    IF  ( .STATUS )				! If $GETLKI succeeded and 
+    AND ( .DEVLCK_IOSB [0] )			! number of device locks eq 1
+    AND ( .DEVLCK_COUNT EQL 1 )			! then make us the first mounter
+    THEN
+	BEGIN
+	DEV_CTX [DC_FLAGS] = 0;			! Clear device lock context
+	DEV_CTX [DC_PROTECTION] = 0;
+	DEV_CTX [DC_OWNER_UIC] = 0;
+	$DEQ ( LKID = .VOLOCK_ID );		! Release volume lock
+	GET_VOLUME_LOCK_NAME ();		! Get the volume lock name (this
+	END					! time, as the first mounter)
+    ELSE
+	EXITLOOP;				
+    END
+ELSE
+    EXITLOOP;					! Otherwise, get out of the loop
+
+END;						! End of DECR K loop
+
+STATUS = .STSBLK [0]
+
+END;			! of routine get_volume_lock
+
+
+GLOBAL ROUTINE GET_VOLSET_LOCK : NOVALUE =
+
+!++
+!
+! Functional description:
+!
+! This routine generates the resource name used to describe the
+! volume set name.  This is the same namespace used by the normal
+! volume allocation locks.  Its primary function is to guarantee
+! that volume and volume set names are unique throughout the cluster.
+!
+! This routine is called in kernel mode.
+!
+! Input parameters:
+!	NONE
+!
+! Implicit inputs:
+!
+!	HOME_BLOCK [HM2$T_STRUCNAME] - volume set structure name
+!	MOUNT_OPTIONS [OPT_NOSHARE] - set if nonshared mount
+!	SCS$GB_NODENAME - 8 byte unique node identifier
+!	EXE$GL_SYSID_LOCK - lock ID of system (node) lock
+!	REAL_RVT - address of RVT structure
+!	STORED_CONTEXT [XQP] - set for xqp serviced volumes
+!
+! Output parameters:
+!	NONE
+!
+! Implicit outputs:
+!
+!	REAL_RVT [RVT$T_VLSLCKNAM] - unique volume set identifier string
+!	VOLSETLCK_STS - status of volume set lock ENQW request
+!	VOLSETLCK_ID - lock ID of volume set lock
+!	VOLSETLCK_CTX - value block of volume set lock
+!
+! Routine value:
+!	NONE
+!
+! Side effects:
+!
+!	Error conditions are signalled.
+!	Volume set lock is held in PW mode by this process.
+!
+!--
+
+BEGIN
+
+EXTERNAL
+	HOME_BLOCK		: BBLOCK,
+	MOUNT_OPTIONS		: BITVECTOR,
+	REAL_RVT		: REF BBLOCK,
+	STORED_CONTEXT		: BITVECTOR,
+	SCS$GB_NODENAME		: ADDRESSING_MODE (GENERAL),
+	EXE$GL_SYSID_LOCK	: ADDRESSING_MODE (GENERAL);
+
+LOCAL
+	LOCKNAME	: VECTOR [20, BYTE],
+	RESNAM_D	: VECTOR [2] INITIAL (LONG (18), LONG (LOCKNAME)),
+	PARENT_ID,
+	STATUS;
+
+
+PARENT_ID = 0;
+
+IF .MOUNT_OPTIONS [OPT_NOSHARE]
+THEN
+    BEGIN
+    CH$MOVE (8, SCS$GB_NODENAME, REAL_RVT [RVT$T_VLSLCKNAM]);
+    (REAL_RVT [RVT$T_VLSLCKNAM] + 8) = .REAL_RVT;
+    PARENT_ID = .EXE$GL_SYSID_LOCK;
+    END
+
+ELSE
+    CH$MOVE (12, HOME_BLOCK [HM2$T_STRUCNAME], REAL_RVT [RVT$T_VLSLCKNAM]);
+
+IF NOT .STORED_CONTEXT [XQP]
+THEN
+    RETURN;
+
+(LOCKNAME [0])<0,32> = 'F11B';
+(LOCKNAME [4])<0,16> = '$v';
+
+CH$MOVE (12, REAL_RVT [RVT$T_VLSLCKNAM], LOCKNAME [6]);
+
+! Take out a lock on the volume set name.
+!
+
+STATUS = $ENQW (LKMODE = LCK$K_PWMODE,
+		EFN = MOUNT_EFN,
+		ACMODE = PSL$C_KERNEL,
+		RESNAM = RESNAM_D,
+		PARID = .PARENT_ID,
+		LKSB = VLSETLCK_STS,
+		FLAGS = LCK$M_SYSTEM + LCK$M_NOQUOTA + LCK$M_SYNCSTS
+			+ LCK$M_VALBLK);
+
+IF NOT .STATUS
+THEN
+    BEGIN
+    ERR_EXIT (.STATUS);
+    RETURN
+    END;
+
+IF NOT (STATUS = .VLSETLCK_STS [0])
+	AND .VLSETLCK_STS [0] NEQ SS$_VALNOTVALID
+THEN
+    BEGIN
+    ERR_EXIT (.STATUS);
+    RETURN
+    END;
+
+END;
+
+
+ROUTINE KERN_LCK_CLNUP : NOVALUE =
+
+!++
+!
+! Functional description:
+!
+! This routine is called in kernel mode to back off partial changes
+! to the locks that mount manipulates.
+! It backs off locks already converted when an error occurs.
+!
+! Input parameters:
+!	NONE
+!
+! Implicit inputs:
+!
+!	VOLOCK_ID - nonzero if the volume lock is to be dequeued.
+!	VLSETLCK_ID - nonzero if the volume set lock is to be dequeued.
+!
+! Output parameters:
+!	NONE
+!
+! Implicit outputs:
+!	NONE
+!
+! Routine value:
+!	NONE
+!
+! Side effects:
+!
+!	Volume and volume set locks acquired by the MOUNT system service
+!	so far are dequeued (they did not exist previously).
+!
+!--
+
+BEGIN
+
+IF .VOLOCK_ID NEQ 0
+THEN
+    $DEQ (LKID = .VOLOCK_ID);
+
+IF .VLSETLCK_ID NEQ 0
+THEN
+    $DEQ (LKID = .VLSETLCK_ID);
+
+END;
+
+GLOBAL ROUTINE LOCK_CLEANUP : NOVALUE =
+
+!++
+!
+! Functional description:
+!
+! This routine is called from the MOUNT_HANDLER in MOUDK2 when
+! errors occur.  If any locks have been acquired, it calls a
+! kernel mode routine to dequeue or convert them as appropriate.
+!
+! Implicit inputs:
+!
+!	VOLOCK_ID - nonzero if volume lock acquired
+!	VLSETLCK_ID - nonzero if volume set lock acquired	
+!
+!--
+
+BEGIN
+
+IF .VOLOCK_ID NEQ 0
+   OR .VLSETLCK_ID NEQ 0
+THEN
+    KERNEL_CALL (KERN_LCK_CLNUP);
+
+END;
+
+END
+ELUDOM

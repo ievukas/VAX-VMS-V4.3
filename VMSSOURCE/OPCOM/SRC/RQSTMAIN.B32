@@ -1,0 +1,500 @@
+MODULE	opc$rqstmain	(	%TITLE 'REQUEST command main module' %SBTTL 'Copyright notice'
+			 LANGUAGE (BLISS32),
+			 IDENT = 'V04-000',
+			 MAIN = rqstmain_main
+			) =
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:
+!
+!	REQUEST command
+!
+! ABSTRACT:
+!
+!	This module contains the top level logic for the DCL REQUEST command.
+!
+! Environment:
+!
+!	VAX/VMS operating system.
+!
+! Author:
+!
+!	CW Hobbs, macro module REQUEST.MAR used as guide
+!
+! Creation date:
+!
+!	22-Aug-1983
+!
+! Revision history:
+!
+!	V03-003	CWH3003		CW Hobbs			18-May-1984
+!		Add a . to the check for request pending.
+!
+!	V03-002	CWH3169		CW Hobbs			5-May-1984
+!		Second pass for cluster-wide OPCOM:
+!		 - If a reply is requested ($ REQUEST /REPLY), then return
+!		   the operator response code.  This restores the behaviour
+!		   of the V3 macro program.
+!
+!--
+
+BEGIN						%SBTTL 'Start of rqstmain'
+
+LIBRARY	'SYS$LIBRARY:LIB.L32';
+LIBRARY 'LIB$:OPCOMLIB';
+
+FORWARD ROUTINE
+    rqstmain_ctrlc_ast	: NOVALUE,		! Handle control c ast
+    rqstmain_init,				! Initializations
+    rqstmain_main,				! Entry point, main routine
+    rqstmain_setmode_qio : NOVALUE,		! Set up control c ast
+    rqstmain_wait_reply;			! Wait for reply from opcom
+
+EXTERNAL ROUTINE
+    share_lookup_oper_bit,			! Convert text string to operator bit number
+    share_trnlog	: NOVALUE;		! Recursively translate a name
+
+LITERAL
+    mb_buf_siz		= 256,
+    message_buf_siz	= 512;
+
+OWN
+    dvi_terminal_buf	: $bvector [max_dev_nam],
+    dvi_terminal_len,				! Length of terminal name
+    dvi_terminal_ptr	: INITIAL (dvi_terminal_buf),
+    dvi_devchar		: $bblock [4],
+    dvi_items		: VECTOR [7, LONG] PRESET (
+			    [0] = (dvi$_devchar^16 OR 4),
+			    [1] = dvi_devchar,
+			    [2] = 0,
+			    [3] = (dvi$_fulldevnam^16 OR max_dev_nam),
+			    [4] = dvi_terminal_buf,
+			    [5] = dvi_terminal_len,
+			    [6] = 0),
+    jpi_prcnam_buf	: $bvector [max_dev_nam],
+    jpi_prcnam_len,
+    jpi_prcnam_ptr	: INITIAL (jpi_prcnam_buf),
+    jpi_items		: VECTOR [4, LONG] PRESET (
+			    [0] = (jpi$_prcnam^16 OR max_dev_nam),
+			    [1] = jpi_prcnam_buf,
+			    [2] = jpi_prcnam_len,
+			    [3] = 0),
+    mb_chan,
+    mb_iosb		: VECTOR [4, WORD],
+    mb_buffer		: $bvector [mb_buf_siz],
+    tt_chan,
+    tt_iosb		: VECTOR [4, WORD],
+    text		: $dyn_str_desc,
+    message		: $bblock [message_buf_siz],		! Buffer to build message for sndopr
+    message_desc	: VECTOR [2, LONG] PRESET ([1] = message);
+!
+! Define ascii text descriptors once
+!
+BIND
+    ascid_P1		= %ASCID 'P1',
+    ascid_REPLY		= %ASCID 'REPLY', 
+    ascid_SYSCOMMAND	= %ASCID 'SYS$COMMAND',
+    ascid_TO		= %ASCID 'TO';
+
+GLOBAL ROUTINE rqstmain_ctrlc_ast : NOVALUE =			%SBTTL 'rqstmain_ctrlc_ast'
+
+!++
+! Functional description:
+!
+!	Handle a control c ast from the terminal.
+!
+! Input:
+!
+!	None.
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of rqstmain_ctrlc_ast
+
+LOCAL
+    prmpt : $bvector [128],
+    dsc : VECTOR [2, LONG] PRESET ([0] = 128, [1] = prmpt),
+    status;
+
+BIND
+    buf = (message [opc$t_request_text] + 2 + .dvi_terminal_len) : $bvector;
+!
+! Get the prompt string
+!
+IF NOT (status = $getmsg (msgid=opc$_rqst_prompt, msglen=dsc, bufadr=dsc, flags=0))
+THEN
+    $signal_stop (.status);
+!
+! Get the response from the user, read it into the message right after the terminal name.
+!
+status = $qiow (efn=1, chan=.tt_chan, func=io$_readprompt, iosb=tt_iosb,
+			p1=buf, p2=256, p5=.dsc [1], p6=.dsc [0]);
+IF .status
+THEN
+    status = .tt_iosb [0];
+IF NOT .status
+THEN
+    $signal_stop (.status);
+!
+! If ^Z, then cancel the request, otherwise send the message to the operator
+!
+IF .(tt_iosb [2]) <0,8,0> EQL %X'1A'
+THEN
+    BEGIN
+    message [opc$b_rqstcode] = opc$_x_cancel;
+    message [opc$w_request_length] = 0;
+    message_desc [0] = $byteoffset (opc$t_request_text);
+    IF NOT (status = $sndopr (msgbuf=message_desc, chan=.mb_chan))
+    THEN
+	$signal_stop (.status);
+    END
+ELSE IF .tt_iosb [1] EQL 0
+THEN
+    RETURN rqstmain_ctrlc_ast ()		! Try again if no input
+ELSE
+    BEGIN
+    LOCAL
+	add;
+    add = (2 + .dvi_terminal_len + .tt_iosb [1]);
+    message [opc$w_request_length] = .add;
+    message_desc [0] = $byteoffset (opc$t_request_text) + .add;
+    IF NOT (status = $sndopr (msgbuf=message_desc, chan=0))
+    THEN
+	$signal_stop (.status);
+    rqstmain_setmode_qio ();			! Reenable the AST
+    END;
+
+RETURN;
+END;						! End of rqstmain_ctrlc_ast
+
+GLOBAL ROUTINE rqstmain_init =			%SBTTL 'rqstmain_init routine'
+
+!++
+! Functional description:
+!
+!	This is the initialization routine for REQUEST.  Various common initializations are done.
+!
+! Input:
+!
+!	None.
+!
+! Implicit Input:
+!
+!	Command values from CLI routines.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of rqstmain_init
+
+LOCAL
+    status;
+!
+! Initialize the message
+!
+! NOTE:  We are using an internal interface to OPCOM which is subject to change!
+!
+CH$FILL (0, opc$k_request_min_size, message);	! Init all fixed fields to zero
+message [opc$b_rqstcode]	= opc$_x_request;
+message [opc$b_scope]		= opc$k_system;
+!
+! Do a $GETJPI to get information about the current process
+!
+IF NOT (status = $getjpi (itmlst=jpi_items))
+THEN
+    $signal_stop (.status);
+!
+! Do a $GETDVI to get the name of the command terminal.
+!
+IF NOT (status = $getdvi (devnam=ascid_SYSCOMMAND, itmlst=dvi_items))
+THEN
+    $signal_stop (.status);
+!
+! If sys$command is a terminal, assign a channel
+!
+IF .dvi_devchar [dev$v_trm]
+THEN
+    BEGIN
+    IF NOT (status = $assign (devnam=dvi_terminal_len, chan=tt_chan))
+    THEN
+	$signal_stop (.status);
+    END
+!
+! If sys$command is not a terminal, then substitute the process name for the terminal name
+!
+ELSE
+    BEGIN
+    dvi_terminal_len = .jpi_prcnam_len;
+    dvi_terminal_ptr = .jpi_prcnam_ptr;
+    END;
+!
+! If /TO is requested, then set the attention bitmask to those operators
+!
+IF cli$get_value (ascid_TO, text)
+THEN
+    BEGIN
+
+    DO
+	$bblock [message [opc$l_attnmask1], 0, share_lookup_oper_bit (text), 1, 0] = 1
+    UNTIL
+	NOT cli$get_value (ascid_TO, text);
+
+    END
+ELSE
+    BEGIN
+    message [opc$l_attnmask1] = known_attn_mask1;
+    message [opc$l_attnmask2] = known_attn_mask2;
+    END;
+!
+! If /REPLY is requested, create a mailbox
+!
+IF cli$present (ascid_REPLY)
+THEN
+    BEGIN
+    IF NOT (status = $crembx (chan=mb_chan, maxmsg=mb_buf_siz, bufquo=2*mb_buf_siz, promsk=%X'FF'))
+    THEN
+	$signal_stop (.status);
+    END; 
+!
+! Move the terminal (process) name and reply text, if any
+!
+cli$get_value (ascid_P1, text);			! Get the parameter, null is fine
+CH$COPY (.dvi_terminal_len, .dvi_terminal_ptr,
+	 2, UPLIT BYTE (', '), .text [dsc$w_length], .text [dsc$a_pointer], 0,
+	 message_buf_siz-$byteoffset (opc$t_request_text), message [opc$t_request_text]);
+message [opc$w_request_length] = .text [dsc$w_length] + 2 + .dvi_terminal_len;
+message_desc [0] = .message [opc$w_request_length] +	! Set total length
+			$byteoffset (opc$t_request_text);
+
+RETURN .status;
+END;						! End of rqstmain_init
+
+GLOBAL ROUTINE rqstmain_main =			%SBTTL 'rqstmain_main routine'
+
+!++
+! Functional description:
+!
+!	This is the main routine for REQUEST.  When REQUEST is started, control is transfered here.
+!
+! Input:
+!
+!	None.
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of rqstmain_main
+
+LOCAL
+    status;
+!
+! Perform common initializations
+!
+rqstmain_init ();
+!
+! Send the message to OPCOM
+!
+IF NOT (status = $sndopr (msgbuf=message_desc, chan=.mb_chan))
+THEN
+    $signal_stop (.status);
+!
+! If we are expecting a reply, then wait for it
+!
+IF .mb_chan NEQ 0
+THEN
+    DO
+        status = rqstmain_wait_reply ()
+    UNTIL
+	.status NEQ 0;
+
+RETURN .status;
+END;						! End of rqstmain_main
+
+GLOBAL ROUTINE rqstmain_setmode_qio : NOVALUE  =	%SBTTL 'rqstmain_setmode_qio'
+
+!++
+! Functional description:
+!
+!	This routine enables a control c ast
+!
+! Input:
+!
+!	None.
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of rqstmain_setmode_qio
+
+LOCAL
+    status;
+
+$qiow (efn=0, chan=.tt_chan, func=(io$_setmode OR io$m_ctrlcast), p1=rqstmain_ctrlc_ast);
+$signal (opc$_oprnotif, 1, 0);
+
+RETURN;						! End of rqstmain_setmode_qio
+END;
+
+GLOBAL ROUTINE rqstmain_wait_reply =			%SBTTL 'rqstmain_wait_reply routine'
+
+!++
+! Functional description:
+!
+!	This routines waits for a reply from OPCOM
+!
+! Input:
+!
+!	None.
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of rqstmain_wait_reply
+
+LOCAL
+    status;
+!
+! Enable the ast on control c
+!
+rqstmain_setmode_qio ();
+!
+! Read from the mailbox
+!
+status = $qiow (efn=2, chan=.mb_chan, func=io$_readvblk, iosb=mb_iosb, p1=mb_buffer, p2=mb_buf_siz);
+IF .status
+THEN
+    status = .mb_iosb [0];
+IF NOT .status
+THEN
+    $signal_stop (.status);
+!
+! Display the mailbox message on the terminal
+!
+$signal (opc$_opreply, 2, .mb_iosb [1]-8, mb_buffer [8]);
+!
+! If the code is RQSTPEND, then we should continue, return 0 so the outer routine will loop
+!
+IF .(mb_buffer [2]) <0,16,0> EQL (opc$_rqstpend AND %X'FFFF')
+THEN
+    RETURN 0;
+!
+! Request is done, force OPCOM facility code back into the high word and return the
+! status from the reply
+!
+(mb_buffer [4]) <0,16,0> = sts$m_inhib_msg^-16 OR opc$_facility;
+RETURN .(mb_buffer [2]);
+
+END;						! End of rqstmain_wait_reply
+
+END
+ELUDOM						! End of rqstmain

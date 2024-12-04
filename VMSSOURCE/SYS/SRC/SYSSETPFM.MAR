@@ -1,0 +1,929 @@
+	.TITLE  SYSSETPFM - SET PAGE FAULT MONITORING
+	.IDENT	'V04-000'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982, 1984 BY				    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+
+;++
+; FACILITY: Measurement System Service
+;
+; ABSTRACT:
+;
+;	This module enables a page fault monitoring service within the
+;	operating system. On each page fault, the virtual address, the PC,
+;	and the process CPU time are saved in a buffer to be output by either
+;	a cooperating subprocess or an image-based AST routine.
+;
+; ENVIRONMENT: Kernel Mode
+;
+; AUTHOR: Henry M. Levy	, CREATION DATE: 7-May-1977
+;
+; MODIFIED BY:
+;
+;	V03-007	SSA0026		Stan Amway	 9-Jul-1984
+;		In PFM$MON, raise IPL to IPL$_HWCLK when
+;		doing CPU time reference update.
+;
+;	V03-006	SSA0025		Stan Amway	25-Jun-1984
+;		Add global symbol PFM$C_BUFCNT for use by PCA.
+;
+;	V03-005	SSA0019		Stan Amway	12-Mar-1984
+;		Prevent subprocess running PFMFILWRT from deallocating PMB.
+;		Add access mode checking for subfunction and stop requests.
+;
+;	V03-004	SSA0013		Stan Amway	28-Feb-1984
+;		Properly handle monitoring termination by
+;		dequeueing AST block from PCB.
+;		Ensure that PFM$PURGE will be invoked if service
+;		is called with a stop monitoring request (notably
+;		from SYSRUNDWN) and a PMB is still allocated.
+;		Inhibit buffer flush if buffer contains no records.
+;		Fix bug that inhibited the entry of a CPU timestamp
+;		into the first page fault buffer.
+;		Move PFM$GETBUF and ALLPMB routines to paged
+;		PSECT.
+;
+;	V03-003	SSA0007		Stan Amway	 2-Feb-1984
+;		Removed restriction of 1 process per group.
+;		Added AST interlock flag to keep the number of
+;		ASTs delivered to a minimum.
+;		Track changes in buffer format.
+;
+;	V03-002	SSA0004		Stan Amway	12-Dec-1983
+;		Extensive changes to add support for the
+;		Performance & Coverage Analyzer (PCA) being done by
+;		the VMS Debug group.
+;
+;		Changes include:
+;		Removed use of PMB list. Use PCB$L_PMB (new) instead.
+;		Timestamping fault with process CPU time.
+;		Adding support for image-based buffer handling.
+;		Cleanup of error handling.
+;		Optimizing main code paths for speed.
+;
+;	V03-001	CWH1002		CW Hobbs	1-Mar-1983
+;		Convert to use extended pids.
+;
+;	02	RIH0033		R. I. HUSTVEDT	16-OCT-1979
+;		CHANGE PCB$W_BYTCNT TO JIB$L_BYTCNT.
+;
+;	03	BLS0001		B. L. SCHREIBER 28-NOV-1979
+;		CORRECT PAGE FAULT ERROR
+;
+;	04	BLS0002		B.L. SCHREIBER	28-JAN-1980
+;		CORRECT ERROR IN PURGE ROUTINE.
+;
+;	05	BLS0003		B.L. SCHREIBER	30-JAN-1980
+;		MORE ERRORS IN PURGE ROUTINE
+;
+;--
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+
+;
+; MACROS:
+;
+
+	$ACBDEF				; define AST control block
+	$DYNDEF				; define dynamic structure types
+	$IODEF				; define I/O function codes
+	$IPLDEF				; define interrupt priority levels
+	$JIBDEF				; define job information block
+	$PCBDEF				; define process control block
+	$PHDDEF				; define process header
+	$PFBDEF				; define PFM buffer layout
+	$PMBDEF				; define PFM control block
+	$PQLDEF				; define process quota codes
+	$PRDEF				; define processor registers
+	$PRIDEF				; define priority increment classes
+	$PSLDEF				; define PSL fields
+	$SGNDEF				; define system parameters
+	$SSDEF				; define service status codes
+
+	.MACRO	$QUOTA	NAME=LISTEND,VALUE=0
+	.BYTE	PQL$_'NAME
+	.LONG	VALUE
+	.ENDM	$QUOTA
+
+;
+; EQUATED SYMBOLS:
+;
+					; Argument list offsets
+PFMFLG = 4				; Function/subfunction flags
+ASTADR = 8				; AST Routine Address
+ASTPRM = 12				; AST Parameter
+ACMODE = 16				; AST Mode
+
+BUFCNT = 5				; number of buffers to allocate
+PFM$C_BUFCNT == BUFCNT			; global definition of BUFCNT
+BUFSIZ = PFB$C_LENGTH			; size of buffers
+MAXREC = <<BUFSIZ-PFB$B_BUFFER>/<2*4>>	; max records per buffer
+QUOTA_CHARGE = <<BUFCNT*BUFSIZ> + PMB$C_LENGTH> ; Amt to charge process byte quota
+FAULTVA = <4*7>+4+<7*4>			; offset to va of faulting instruction
+FAULTPC = <4*7>+8+<7*4>			; offset to pc of faulting instruction
+
+;
+; OWN STORAGE:
+;
+
+	.PSECT	YEXEPAGED,LONG
+
+;
+; Data for creation of subprocess to output filled
+; buffers to disk file.
+;
+
+PFMFILWRT:				; subprocess image name descriptor
+	.LONG	20$-10$
+	.LONG	10$
+10$:	.ASCII	/SYS$SYSTEM:PFMFILWRT.EXE/
+20$:
+PFMQUOTA:				; subprocess quota name
+	$QUOTA	CPULM,0			; infinite CPU time
+	$QUOTA	BYTLM,1024		; byte limit for buffered I/O
+	$QUOTA	FILLM,1			; open file count limit
+	$QUOTA	PGFLQUOTA,256		; paging file quota
+	$QUOTA	PRCLM,0			; no subprocesses
+	$QUOTA	TQELM,1			; timer queue entry
+	$QUOTA	LISTEND			; end of list
+FILWRT:					; subprocess process name
+	.ASCII	/PFMSUB_< EPID >/
+FILWRTPRV:				; subprocess privilege vector
+	.LONG	-1,-1			; all privileges
+
+	.SBTTL	SYSSETPFM - Initialize Page Fault Monitoring
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	Page fault monitoring initialization.  Buffers are allocated from
+;	the nonpaged pool and queued for use by the monitor.  In subprocess
+;	mode, a subprocess is created which outputs buffers which have been 
+;	filled. In image-based mode, ASTs are delivered to signal full buffers.
+;
+;	When the process calls SETPFM to turn off monitoring, all
+;	buffers are returned to the system and if in subprocess mode, the 
+;	subprocess is deleted.
+;
+;	In case of abnormal termination, the buffers are returned by SYSRUNDWN.
+;
+; CALLING SEQUENCE:
+;
+;	CALLS/CALLG
+;
+; INPUT PARAMETERS:
+;
+;	 4(AP)	PFMFLG	Function/subfunction
+;		bit   0   = off/on (0/1)
+;		bits 1-30 = subfunction field
+;		            bit 1 = Flush buffers
+;		bit  31   = 0 indicates initialization call
+;		            1 indicates subfunction call (if bit 0 = 1)
+;
+;	 8(AP)	ASTADR	AST Routine Address
+;		 = 0 Subprocess Mode
+;		<> 0 AST Routine address for image-based buffer handler
+;
+;	12(AP)	ASTPRM	AST parameter
+;
+;	16(AP)	ACMODE	Access Mode for AST delivery
+;
+;
+; IMPLICIT INPUTS:
+;
+;	none
+;
+; OUTPUT PARAMETERS:
+;
+;	none
+;
+; IMPLICIT OUTPUTS:
+;
+;	none
+;
+; COMPLETION CODES:
+;
+;	SS$_NORMAL  - Success
+;	SS$_EXQUOTA - A quota was exceeded while allocating buffers 
+;		      or creating the cooperating subprocess.
+;	SS$_INSFMEM - Insufficient dynamic memory was available for buffering
+;	SS$_PFMBSY  - Attempted to initialize page fault monitoring while
+;		      already active.
+;	SS$_NOPRIV  - Caller's access mode is less privileged than the mode
+;		      that started page fault monitoring.
+;
+; SIDE EFFECTS:
+;
+;	none
+;
+;--
+
+
+
+	.PSECT	YEXEPAGED
+
+	.ENABLE		LSB
+PFMBUSY:
+	MOVZWL	#SS$_PFMBSY,R0
+	BRB	10$
+ILLSEQOP:
+	MOVZWL	#SS$_ILLSEQOP,R0
+10$:
+	.DISABLE	LSB
+	SETIPL	#0			; Restore IPL
+	RET				; Return w/error in R0
+
+	.ENTRY	EXE$SETPFM,^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+
+	MOVL	L^SCH$GL_CURPCB,R4	; get our PCB address
+	MOVL	@#CTL$GL_PHD,R5		; and PHD address (P1 window)
+	SETIPL	#IPL$_ASTDEL		; Protect access to PMB
+	MOVL	PCB$L_PMB(R4),R6	; Get address of allocated PMB (if any)
+	MOVL	PFMFLG(AP),R3		; Get copy of PFMFLG
+
+;	From this point on, IPL is at IPL$_ASTDEL and registers are as follows:
+;
+;		R3	Copy of PFMFLG
+;		R4	PCB Address
+;		R5	PHD Address (P1 window)
+;		R6	PMB Address or 0 (initialize request only)
+
+					; *** Order of following tests makes 
+					; implicit checks on PFM state ***
+	BBC	#PHD$V_PFMFLG,-		; BR if monitoring not initialized
+		PHD$W_FLAGS(R5),START
+	BLBC	R3,STOP_VEC		; BR if termination request
+	BGEQ	ILLSEQOP		; BR if R3 >= 0 (not a subfunction call)
+
+;
+;	Subfunction Processing
+;
+
+SUBFUNC:
+	BSBB	CHECK_ACMODE		; If caller does not have privilege,
+	BLBC	R0,NOPRIV		; return with error status
+	BBC	#1,R3,10$		; If flush buffer request,
+	JSB	FLUSH_BUFFER		; do it now
+					; (R2, R4, R5 DESTROYED)
+	ASSUME	PMB$V_MODE EQ 0
+	ASSUME	PMB$K_IMAGE EQ 1
+10$:	BLBC	PMB$B_FLAGS(R6),20$	; If image-based mode,
+	BSBB	SET_ASTMODE		; update AST parameters
+20$:	SETIPL	#0			; Lower IPL
+	MOVZWL	#SS$_NORMAL,R0		; and return with success
+	RET
+
+					; Determine if caller is
+					; permitted to execute function
+CHECK_ACMODE:
+	CLRL	R0			; Assume function not allowed to caller
+	MOVPSL	R1			; R1 <= PSL
+	EXTZV	#PSL$V_PRVMOD,#PSL$S_PRVMOD,- ; R1 <= caller's mode
+		R1,R1
+	CMPB	R1,PMB$B_ACMODE(R6)	; If caller less privileged than owner,
+	BGTRU	10$			; return with no access indication in R0
+	INCL	R0			; else return access OK
+10$:	RSB
+
+NOPRIV:
+	MOVZWL	#SS$_NOPRIV,R0		; Return w/no privilege error
+	SETIPL	#0
+	RET
+
+STOP_VEC:
+	BRW	STOP
+PURGE_EXIT_R0_VEC:
+	BRW	PURGE_EXIT_R0
+PURGE_EXIT_VEC:
+	BRW	PURGE_EXIT
+
+CHECK_STOP:
+	BLBS	R3,ILLSEQOP		; Error if not termination request
+	TSTL	R6			; If PMB doesn't exist,
+	BEQL	ILLSEQOP		; don't proceed
+	BBS	#PMB$V_MODE,-		; If image mode, continue normally
+		PMB$B_FLAGS(R6),STOP_VEC
+	CMPL	PMB$L_EPID(R6),-	; Don't allow PFM rundown
+		PCB$L_EPID(R4)		; if the current process is the
+	BEQL	ILLSEQOP		; subprocess running PFMFILWRT
+	BRB	STOP_VEC		; Otherwise, join STOP monitoring code
+;
+;	Initialize page fault monitoring
+;
+
+START:
+	CMPL	R3,#1			; Valid request ?
+	BNEQ	CHECK_STOP		; BR if not
+	TSTL	R6			; PMB allocated ?
+	BEQL	10$
+	BRW	PFMBUSY			; Yes - can't proceed
+10$:	BSBW	ALLPMB			; Allocate PMB
+	SETIPL	#0			; It is now safe to lower IPL
+	BLBC	R0,PURGE_EXIT_R0_VEC	; If PMB allocation error, quit now
+	MOVPSL	R1			; Store caller's access mode
+	EXTZV	#PSL$V_PRVMOD,#PSL$S_PRVMOD,- 
+		R1,R1			; as owner's access mode
+	MOVB	R1,PMB$B_ACMODE(R6)	; for subsequent privilege checking
+	TSTL	ASTADR(AP)		; Are we initializing image-based mode ?
+	BEQL	SET_SUBPMODE		; If no, setup subprocess mode
+	BSBB	SET_ASTMODE		; Else setup image-based AST mode
+	ASSUME	PMB$V_MODE EQ 0
+	ASSUME	PMB$K_IMAGE EQ 1
+	INCB	PMB$B_FLAGS(R6)		; Set image-based AST mode flag
+START_OK:
+	BBSS	#PHD$V_PFMFLG,-		; Enable page fault monitoring
+		PHD$W_FLAGS(R5),10$
+10$:	MOVZWL	#SS$_NORMAL,R0		; and return with success status
+	RET
+
+;
+;	Setup image-based mode AST parameters
+;
+
+SET_ASTMODE:
+	ASSUME	PMB$L_ASTPRM EQ PMB$L_AST+4
+	ASSUME	ASTPRM EQ ASTADR+4
+	MOVQ	ASTADR(AP),PMB$L_AST(R6); Save AST address and parameter
+	EXTZV	#0,#2,ACMODE(AP),R0	; R0 <= request AST delivery mode
+	BSBW	EXE$MAXACMODE		; Maximize requested and allowable
+	BISB3	#<ACB$M_NODELETE!ACB$M_PKAST>,- ; access modes & store with
+		R0,PMB$B_RMOD(R6)	; nodelete, pkast set;quota, kast, clear
+	MOVAB	W^PFM_PKAST,PMB$L_KAST(R6) ; Set piggy-back kernel AST address
+	RSB
+
+;
+;	Setup subprocess mode
+;
+
+SET_SUBPMODE:				; (R0-R3 DESTROYED)
+
+	PUSHL	#SS$_NORMAL		; Save room for status on stack
+;
+; Create a termination mailbox for the subprocess.
+;
+
+	$CREMBX_S CHAN=PMB$W_MBXCHN(R6),MAXMSG=#120,-
+		BUFQUO=#120,PROMSK=#0
+	
+	MOVL	R0,(SP)
+	BLBS	R0,5$
+	BRW	PURGE_EXIT		; exit on error
+5$:	SUBL2	#16,SP			; buffer space for GETCHN on stack
+	PUSHL	SP			; build descriptor for buffer
+	PUSHL	#16			; length of buffer
+	MOVAL	(SP),R2			; get descriptor address
+	$GETCHN_S CHAN=PMB$W_MBXCHN(R6),PRIBUF=(R2) ; get mailbox unit #
+
+;
+; Form unique subprocess name using EPID of this process
+; (NOTE: The following code adds a NET 4 bytes to the stack local storage)
+;
+
+	PUSHR	#^M<R2,R3,R4,R5>
+	MOVC3	#15,W^FILWRT,4(R2)	; Move name template to stack storage
+	POPR	#^M<R2,R3,R4,R5>
+					; Convert hex EPID to ASCII
+	MOVL	PCB$L_EPID(R4),R1	; R1 <= EPID to be converted
+	MOVAB	11(R2),R7		; R7 <= address of 1st character
+	MOVL	#28,R8			; R8 <= position of 1st nibble
+10$:	EXTZV	R8,#4,R1,R0		; Get next four bits of value
+	MOVB	@#EXE$AB_HEXTAB[R0],(R7)+ ;Convert to ASCII and store
+	ACBB	#0,#-4,R8,10$		; Loop until all digits converted
+	MOVAB	4(R2),(R2)		; Form string descriptor
+	PUSHL	#15			; for resultant name
+;
+; Create subprocess with high priority, full privilege and termination mailbox
+;
+
+	$CREPRC_S	PIDADR=PMB$L_EPID(R6),- ; pid of created process
+			IMAGE=PFMFILWRT,-
+			PRCNAM=-4(R2),-
+			PRVADR=FILWRTPRV,-
+			BASPRI=#6,-
+			QUOTA=PFMQUOTA,-
+			MBXUNT=8+12(R2),- ; unit from get channel information
+			STSFLG=#4	; disable swapping
+	ADDL2	#<24+4>,SP		; Return stack local storage
+	MOVL	R0,(SP)
+	BLBS	R0,15$
+	BRW	DASSGN_EXIT		; exit on error
+15$:	MOVQ	R4,-(SP)		; Save R4, R5
+	SETIPL	B^20$			; Synchronize access to system database
+	MOVL	PMB$L_EPID(R6),R0	; Convert EPID to IPID
+	JSB	EXE$EPID_TO_IPID
+	MOVL	R0,PMB$L_PID(R6)	; and save in PMB
+	JSB	EXE$IPID_TO_PCB		; Convert IPID to PCB address
+	MOVL	R6,PCB$L_PMB(R0)	; Insert PMB address in subprocess PCB
+	SETIPL	#0
+	MOVQ	(SP)+,R4		; Restore R4, R5
+	TSTL	(SP)+			; Discard stacked status
+	BRW	START_OK		; and take successful exit path
+
+20$:	.LONG	IPL$_SYNCH
+
+;
+;	STOP - Termination Processing
+;
+
+STOP:
+	BSBW	CHECK_ACMODE		; If caller does not have privilege,
+	BLBS	R0,5$
+	BRW	NOPRIV			; return with error status
+5$:	BBCC	#PHD$V_PFMFLG,PHD$W_FLAGS(R5),10$ ; Turn off active monitoring
+10$:	JSB	FLUSH_BUFFER		; Flush outstanding buffers
+					; (R2, R4, R5 DESTROYED)
+	SETIPL	#0			; return to IPL 0
+	PUSHL	#SS$_NORMAL		; Assume success
+	ASSUME	PMB$V_MODE EQ 0
+	ASSUME	PMB$K_IMAGE EQ 1
+	BLBS	PMB$B_FLAGS(R6),PURGE_EXIT ; If subprocess mode,
+	BRB	STOP_PROCESS		; do orderly shutdown of subprocess
+PURGE_EXIT:				; (Assumes IPL=0, (SP) = status)
+	POPL	R0
+PURGE_EXIT_R0:
+	BSBB	PFM$PURGE		; Return process buffers to system
+	RET				; Return w/status in R0
+	
+;
+;	Orderly shutdown of subprocess
+;
+
+STOP_PROCESS:
+	$FORCEX_S PIDADR=PMB$L_EPID(R6)	; force subprocess to exit
+	BLBC	R0,DASSGN_EXIT		; don't wait for message if force failed
+	$QIOW_S	CHAN=PMB$W_MBXCHN(R6),FUNC=#IO$_READVBLK,-
+		P1=PMB$L_EPID(R6),-	; buffer four bytes of termination
+		P2=#4			; ...message in unneeded PID slot
+DASSGN_EXIT:
+	$DASSGN_S CHAN=PMB$W_MBXCHN(R6)	; release mailbox
+	BRB	PURGE_EXIT
+
+
+	.SBTTL	PFM$PURGE - Return all process buffers to pool
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	All data buffers and the control block are returned to pool.
+;
+; CALLING SEQUENCE:
+;
+;	BSB/JSB	PFM$PURGE
+;
+; INPUTS:
+;
+;	none
+;
+; IMPLICIT INPUTS:
+;
+;	PCB Address
+;
+; OUTPUTS:
+;
+;	none
+;
+; IMPLICIT OUTPUTS:
+;
+;	none
+;
+; SIDE EFFECTS:
+;
+;	none - all registers preserved
+;
+; ROUTINE VALUE:
+;
+;	none
+;
+; ENVIRONMENT:
+;
+;	Kernel mode, IPL <= IPL$_ASTDEL
+;--
+
+
+PFM$PURGE::
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5,R6> ; save registers
+	MOVL	L^SCH$GL_CURPCB,R4	; get our PCB address
+	DSBINT	#IPL$_ASTDEL		; protect manipulation of PMB
+	MOVL	PCB$L_PMB(R4),R6	; get PMB address (if any)
+	CLRL	PCB$L_PMB(R4)		; clear PMB pointer
+	TSTL	R6			; was there a PMB
+	BEQL	40$			; exit if not
+	BBCC	#PMB$V_QAST,PMB$B_FLAGS(R6),5$ ; Is ACB enqueued on PCB ?
+	BSBB	DEQUEUE_ACB		; Yes, remove it.
+5$:	TSTL	PMB$L_CURBUF(R6)	; check if current buffer there
+	BEQL	10$			; branch if none there
+	MOVL	PMB$L_BUFBASE(R6),R0	; else set buffer address
+	BSBB	50$			; return to system
+10$:	REMQUE	@PMB$Q_HDR(R6),R0	; remove buffer from queue
+	BVS	20$			; exit if none there
+	BSBB	50$			; return buffer
+	BRB	10$			; go back for more buffers
+20$:	REMQUE	@PMB$Q_SBPHDR(R6),R0	; check that subprocess queue is clear
+	BVS	30$			; exit if no entry
+	BSBB	50$			; else return buffer to system pool
+	BRB	20$			; check for any more
+30$:	MOVL	R6,R0			; get back PMB block address
+	BSBB	50$			; deallocate control block
+	MOVL	PCB$L_JIB(R4),R0	; Get JIB address
+	ADDL2	#QUOTA_CHARGE,JIB$L_BYTCNT(R0) ; Return quota to process
+40$:	ENBINT				; restore IPL
+	POPR	#^M<R0,R1,R2,R3,R4,R5,R6> ; restore registers
+	RSB				; return to caller
+
+;
+; Return buffer to pool.
+;
+
+50$:	CLRW	PMB$W_SIZE+2(R0)	; Clear type field for EXE$DEANONPAGED
+	JSB	EXE$DEANONPAGED		; deallocate memory
+	RSB
+
+;
+; The sole purpose of this routine is to mark the ACB as not queued.
+; It is called as a piggy-back kernel AST routine to effectively interlock the
+; operation with the monitoring termination code, which will conditionally
+; remove the ACB from the PCB.
+;
+; Inputs: R5 = ACB address, IPL = IPL$_ASTDEL
+; Outputs: PMB$V_QAST cleared, all registers preserved
+;
+
+PFM_PKAST:
+	BICB2	#PMB$M_QAST,PMB$B_FLAGS-PMB$L_ASTQFL(R5) ; Show ACB dequeued
+	RSB
+
+;
+; This routine is called from PFM$PURGE to dequeue the ACB
+; if PMB$V_QAST in PMB$B_FLAGS was set.
+;
+; Inputs:  R6 = PMB address, IPL=IPL$_ASTDEL, 
+;		PMB$V_QAST checked and cleared by caller
+; Outputs: ACB dequeued, R5 destroyed 
+;
+
+DEQUEUE_ACB:
+	MOVAB	PMB$L_ASTQFL(R6),R5	; R5 <= address of embedded ACB
+	SETIPL	B^10$
+	JSB	SCH$REMOVACB		; Remove ACB from PCB
+	SETIPL	#IPL$_ASTDEL
+	RSB
+10$:	.LONG	IPL$_SYNCH
+
+
+	.SBTTL	PFM$GETBUF - Return PFM Buffer to Caller
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Returns a filled PFM buffer to the caller.
+;	For efficiency, this routine and FLUSH_BUFFER assume
+;	that once the collection process is awakened, it will
+;	continue calling PFM$GETBUF until SS$_NODATA is returned, or
+;	an error is encountered.
+;
+; CALLING SEQUENCE:
+;
+;	BSB/JSB	PFM$GETBUF
+;
+; INPUTS:
+;
+;	R1 = Buffer address
+;	R2 = Buffer size
+;	     (Should be = PFB$S_USER_BUFFER, with which it is minimized)
+;
+;	NB: No checks are made for buffer accessability.
+;
+; IMPLICIT INPUTS:
+;
+;	SCH$GL_CURPCB - PCB address of current process
+;	PCB$L_PMB in PCB - pointer to PMB
+;
+; OUTPUTS:
+;
+;	If R0=SS$_NORMAL or SS$_BUFFEROVF, buffer is filled with page fault data
+;
+; IMPLICIT OUTPUTS:
+;
+;	none
+;
+; ROUTINE VALUE:
+;
+;	R0 = Status
+;
+;	     SS$_NORMAL
+;	     SS$_NODATA
+;	     SS$_ILLSEQOP
+;	     SS$_BUFFEROVF
+;
+; SIDE EFFECTS:
+;
+;	R1-R5 destroyed
+;
+; ENVIRONMENT:
+;
+;	Kernel mode, IPL 0
+;--
+
+; NB: This code assumes that IPL synchronization (above ASTDEL) is
+;     not required because
+;	a) a command/response protocol is used between the
+;	   main and sub processes
+;	b) SYSRUNDWN will unconditionally call SETPFM to 
+;	   turn off monitoring (i.e., assumption a) cannot be breached)
+;	c) no code outside of this module accesses PFM data structures
+
+PFM$GETBUF::
+	MOVL	L^SCH$GL_CURPCB,R4	; Get PCB address for this process
+	MOVL	PCB$L_PMB(R4),R4	; Get PMB address
+	BEQL	50$			; BR if none
+10$:	SETIPL	#IPL$_ASTDEL		; Protect buffer handling
+	REMQUE	@PMB$Q_SBPHDR(R4),R5	; Dequeue filled buffer
+	BVS	40$			; Exit if none
+	MOVZWL	#SS$_NORMAL,R0		; Assume adequate buffer size
+	MOVZWL	#PFB$S_USER_BUFFER,R3	; and set number of bytes to move
+	CMPL	R2,R3			; Is buffer big enough ?
+	BGEQ	15$			; BR if yes
+	MOVZWL	#SS$_BUFFEROVF,R0	; Indicate data loss
+	MOVL	R2,R3			; Adjust number of bytes to move
+15$:	PUSHR	#^M<R0,R4,R5>		; Save regs and status
+	MOVC3	R3,PFB$B_USER_BUFFER(R5),(R1) ; Move buffer
+	POPR	#^M<R0,R4,R5>		; Restore regs and status
+	INSQUE	(R5),PMB$Q_HDR(R4)	; Return buffer to free list
+20$:	SETIPL	#0			; Restore IPL
+30$:	RSB				; Return to caller
+
+40$:	MOVZWL	#SS$_NODATA,R0
+	BICB2	#PMB$M_ASTIP,PMB$B_FLAGS(R4) ; Show no AST in progress
+	BRB	20$
+50$:	MOVZWL	#SS$_ILLSEQOP,R0
+	BRB	30$
+
+
+	.SBTTL	ALLPMB - Allocate PMB control block and data buffers
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Allocates all process structures needed for page fault monitoring.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSB ALLPMB
+;
+; INPUTS:
+;
+;	R4	PCB address
+;	R5	PHD address
+;	
+;
+; IMPLICIT INPUTS:
+;
+;	none
+;
+; OUTPUTS:
+;
+;	R6 = PMB address
+;
+; IMPLICIT OUTPUTS:
+;
+;	PCB$L_PMB contains PMB address
+;
+; ROUTINE VALUE:
+;
+;	R0 = SS$_NORMAL
+;	   = Pool allocation error (SS$_INSFMEM, etc.)
+;
+; SIDE EFFECTS:
+;
+;	R0,R1,R2,R3,R8,R9 destroyed
+;
+; ENVIRONMENT:
+;
+;	Kernel mode, IPL = IPL$_ASTDEL
+;--
+
+ALLPMB:
+	PUSHL	#SS$_EXQUOTA		; stack no quota error code
+
+;
+; Process should have enough quota for data buffers and PMB
+;
+
+	MOVL	PCB$L_JIB(R4),R8	; get JIB address
+	CMPL	#QUOTA_CHARGE,JIB$L_BYTCNT(R8) ; quota left?
+	BGTRU	20$			; error if not
+
+;
+; Allocate PMB control block and insert address in PMB list
+;
+
+	MOVZWL	#SS$_INSFMEM,(SP)	; assume memory not available
+	MOVZWL	#PMB$C_LENGTH,R1	; get length of PMB block to allocate
+	JSB	EXE$ALLOCBUF		; allocate control block
+	BLBC	R0,20$			; check that memory available
+	SUBL2	#QUOTA_CHARGE,JIB$L_BYTCNT(R8) ; adjust quota
+	MOVL	R2,R6			; copy PMB block address
+	MOVL	R6,PCB$L_PMB(R4)	; insert PMB address in PCB
+					; N.B.: PFM$PURGE assumes that quota has
+					; been charged if PCB$L_PMB <> 0
+
+;
+; Initialize PMB and allocate and queue data buffers.
+;
+
+	MOVB	#DYN$C_PMB,PMB$B_TYPE(R6) ; Set structure type to PMB
+
+	ASSUME	PMB$Q_SBPHDR EQ PMB$Q_HDR+8
+	ASSUME	PMB$L_ASTQFL EQ PMB$Q_SBPHDR+8
+
+	MOVAB	PMB$Q_HDR(R6),R0	; get queue header address
+	MOVAL	(R0),(R0)		; init empty queue flink
+	MOVAL	(R0)+,(R0)+		; init empty queue blink
+	MOVAL	(R0),(R0)		; init subprocess queue flink
+	MOVAL	(R0)+,(R0)+		; init subprocess queue blink
+	MOVAL	(R0),(R0)		; init AST queue flink
+	MOVAL	(R0)+,(R0)		; init AST queue blink
+
+	ASSUME	PMB$L_BUFBASE EQ PMB$L_CURBUF+4
+	CLRQ	PMB$L_CURBUF(R6)	; note no current buffer
+
+	CLRB	PMB$B_FLAGS(R6)		; insure that all flags are clear
+	CLRL	PMB$L_OVERFLOW(R6)	; indicate no overflows
+	MOVL	PCB$L_PID(R4),PMB$L_PID(R6) ; Insert PID into PMB/ACB
+	MNEGL	#1,PMB$L_LASTCPU(R6)	; force timestamping of 1st record
+
+	MOVZWL	#BUFCNT,R9		; number of data buffers to allocate
+10$:	MOVZWL	#BUFSIZ,R1		; get size of buffer to allocate
+	JSB	EXE$ALLOCBUF		; allocate buffer
+	BLBC	R0,20$			; take error path if no memory available
+	MOVB	#DYN$C_PFB,PFB$B_TYPE(R2) ; Set structure type to PFB
+	INSQUE	(R2),PMB$Q_HDR(R6)	; queue on empty buffer list
+	SOBGTR	R9,10$			; back for more buffers
+
+	MOVZWL	#SS$_NORMAL,(SP)	; Indicate success
+20$:	POPL	R0			; Return w/status in R0
+	RSB
+
+
+	.SBTTL	PFM$MON - Resident Monitoring Code
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Resident code called by memory management to record
+;	page fault PC and VA.  Data is inserted into a buffer.
+;	When the buffer is full, it is queued for a cooperating
+;	process which outputs the data to disk.
+;
+; CALLING SEQUENCE:
+;
+;	BSB/JSB	PFM$MON
+;
+; INPUTS:
+;
+;	R4 = PCB address
+;	R5 = PHD address
+;
+; IMPLICIT INPUTS:
+;
+;	none
+;
+; OUTPUTS:
+;
+;	none
+;
+; IMPLICIT OUTPUTS:
+;
+;	none
+;
+; ROUTINE VALUE:
+;
+;	none
+;
+; SIDE EFFECTS:
+;
+;	none
+;
+; ENVIRONMENT:
+;
+;	Kernel mode, IPL = IPL$_SYNCH
+;--
+
+
+	.PSECT	AEXENONPAGED,LONG
+
+	.ENABLE		LSB
+5$:	CMPL	PFB$L_RECCNT(R2),#2	; Space for time stamp and PC/VA pair ?
+	BGEQU	6$			; BR if space in buffer
+	PUSHL	R5			; Save PHD address
+	BSBB	FLUSH_BUFFER_INT	; Flush buffer (R2, R4, R5 DESTROYED)
+	POPL	R5			; Restore PHD address
+	BSBW	GETBUF			; try to get next buffer
+	BVS	30$			; exit if none there, lose data
+6$:	MNEGL	#1,(R1)+		; Add time stamp to buffer
+	SETIPL	#IPL$_HWCLK		; Synchronize with CPU time updating
+	MOVL	PHD$L_CPUTIM(R5),(R1)+
+	MOVL	PHD$L_CPUTIM(R5),-	; Update reference CPU time
+		PMB$L_LASTCPU(R6)
+	SETIPL	#IPL$_SYNCH		; Lower IPL to entry IPL
+	DECL	PFB$L_RECCNT(R2)	; Adjust record count for time stamp
+	BRB	15$			; Rejoin mainline code
+
+	.ALIGN	LONG
+PFM$MON::
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5,R6> ; save registers
+	MOVL	PCB$L_PMB(R4),R6	; get PMB address
+
+	ASSUME	PMB$L_BUFBASE	EQ	PMB$L_CURBUF+4
+
+	MOVQ	PMB$L_CURBUF(R6),R1	; get buffer address & base
+	BNEQ	10$			; branch if buffer exists
+	BSBB	GETBUF			; try to get next buffer
+	BVS	30$			; exit if none there, lose data
+10$:	CMPL	PHD$L_CPUTIM(R5),PMB$L_LASTCPU(R6) ; Need a CPU time stamp ?
+	BNEQ	5$			; BR if yes
+15$:	MOVL	FAULTPC(SP),(R1)+	; insert pc of instruction
+	MOVL	FAULTVA(SP),(R1)+	; insert va which faulted
+	MOVL	R1,PMB$L_CURBUF(R6)	; save current buffer address
+	SOBGTR	PFB$L_RECCNT(R2),20$	; Buffer full ?
+	BSBB	FLUSH_BUFFER_INT	; Yes, flush it
+					; (R2, R4, R5 DESTROYED)
+20$:	POPR	#^M<R0,R1,R2,R3,R4,R5,R6> ; restore registers
+	RSB
+30$:	INCL	PMB$L_OVERFLOW(R6)	; Count an overflow
+	BRB	20$
+	.DISABLE	LSB
+
+	.ENABLE		LSB
+
+5$:	MOVL	#MAXREC,PFB$L_RECCNT(R2); Re-initialize records remaining
+	RSB				; and return
+
+					; (R2, R4, R5 DESTROYED)
+FLUSH_BUFFER:				; Entry with IPL=IPL$_ASTDEL
+	MOVL	PMB$L_BUFBASE(R6),R2	; Get current buffer base address
+	BEQL	20$			; Just exit if no current buffer
+FLUSH_BUFFER_INT:			; Entry with IPL=IPL$_SYNCH, R2 set
+	SUBL3	PFB$L_RECCNT(R2),#MAXREC,- ; Convert records remaining to
+		PFB$L_RECCNT(R2)	; number of records in buffer
+	BEQL	5$			; BR if no records in buffer
+	ASSUME	PFB$L_FLINK EQ 0
+	INSQUE	(R2),@PMB$Q_SBPHDR+4(R6) ; insert buffer at end of write queue
+	ASSUME	PMB$V_MODE EQ 0
+	ASSUME	PMB$K_IMAGE EQ 1
+	BLBC	PMB$B_FLAGS(R6),30$	; BR if subprocess mode
+	BBSS	#PMB$V_ASTIP,PMB$B_FLAGS(R6),10$ ; If AST in progress, return
+	BISB2	#PMB$M_QAST,PMB$B_FLAGS(R6) ; Show embedded ACB queued on PCB
+	MOVZBL	#PRI$_IOCOM,R2		; R2 <= priority increment class
+	MOVAL	PMB$L_ASTQFL(R6),R5	; R5 <= address of ACB
+	BSBW	SCH$QAST		; Signal full buffer available
+10$:	CLRQ	PMB$L_CURBUF(R6)	; Note that no current buffer exists
+20$:	RSB
+
+30$:	MOVL	PMB$L_PID(R6),R1	; get params to wake up other process
+	DSBINT	#IPL$_SYNCH
+	BSBW	SCH$WAKE		; and wake the process
+	ENBINT
+	BRB	10$
+
+	.DISABLE	LSB
+
+GETBUF:					; get next buffer from queue
+	REMQUE	@PMB$Q_HDR(R6),R2	; dequeue next buffer
+	BVS	10$			; leave with V set if none there
+	MOVL	R2,PMB$L_BUFBASE(R6)	; save buffer base address in PMB
+	MOVAB	PFB$B_BUFFER(R2),R1	; skip buffer overhead
+	MOVL	#MAXREC,PFB$L_RECCNT(R2); Initialize records remaining
+	MOVL	PMB$L_OVERFLOW(R6),PFB$L_OVERFLOW(R2) ; Copy overflow count
+	CLRL	PMB$L_OVERFLOW(R6)	; and then reset it (also clears V)
+					; (R1 & R2 point to buffer)
+10$:	RSB				; return with V set or clear
+
+	.END
